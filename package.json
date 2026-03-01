@@ -1,0 +1,27 @@
+{
+  "name": "lazy",
+  "version": "0.5.0",
+  "type": "module",
+  "bin": {
+    "lazy": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run generate:version && bun run ensure:agent-placeholder && bun run src/index.ts",
+    "build": "bun run generate:version && bun run typecheck && bun run scripts/build.ts",
+    "install:local": "bun run build && mkdir -p ~/.lazy/bin && mv lazy ~/.lazy/bin/lazy && mv lazy-agent ~/.lazy/bin/lazy-agent && echo 'Installation to ~/.lazy.bin complete.'",
+    "generate:version": "test -f scripts/generate-version.ts && bun run scripts/generate-version.ts || true",
+    "test": "bun run generate:version && bun run ensure:agent-placeholder && bun test",
+    "test:e2e": "bun run generate:version && bun run ensure:agent-placeholder && bun test test/e2e/",
+    "ensure:agent-placeholder": "test -f lazy-agent || echo placeholder > lazy-agent",
+    "prepare": "bun run generate:version && bun run ensure:agent-placeholder",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "diff": "^8.0.3",
+    "fuse.js": "^7.1.0"
+  }
+}

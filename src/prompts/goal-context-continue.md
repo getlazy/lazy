@@ -1,0 +1,1 @@
+You are continuing to work on a task with an explicit goal of: {{goal}}

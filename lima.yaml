@@ -1,0 +1,58 @@
+# Lima VM for testing lazy's host-process runner
+# Mirrors the project Dockerfile: Ubuntu + bun + git + claude code
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+mounts:
+  - location: "/Users/ierceg/prg/workshop"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # Install git, gh CLI, Node.js, and basic tools
+      apt-get update
+      apt-get install -y git curl unzip
+
+      # Install Node.js 22 (required by claude code's shebang)
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+
+      # Install GitHub CLI
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+
+      # Install GitLab CLI (glab) via WakeMeOps repository
+      curl -fsSL https://raw.githubusercontent.com/upciti/wakemeops/main/assets/install_repository | bash
+
+      apt-get update
+      apt-get install -y gh glab
+
+      # Clean up
+      rm -rf /var/lib/apt/lists/*
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # Install bun for the lima user
+      curl -fsSL https://bun.sh/install | bash
+
+      # Install claude code globally via bun
+      export BUN_INSTALL="$HOME/.bun"
+      export PATH="$BUN_INSTALL/bin:$PATH"
+      bun install -g @anthropic-ai/claude-code@latest
+
+      # Ensure PATH is set in .bashrc
+      echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
+      echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc

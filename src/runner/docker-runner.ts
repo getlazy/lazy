@@ -1,0 +1,333 @@
+/**
+ * DockerRunner — Runner implementation backed by Docker containers.
+ *
+ * Thin wrapper around the existing functions in capture/claude.ts.
+ * No functional changes from the pre-Runner behavior.
+ */
+
+import type { SandboxConfig } from '../capture/claude';
+import type { ClaudeResponse } from '../types';
+import type { Runner, RunInfo, FollowHandle } from './types';
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { join, basename } from 'path';
+import { homedir } from 'os';
+import { logger } from '../utils/logger';
+
+import {
+  checkDocker,
+  getAuthEnv,
+  ensureImage,
+  ensureAgentBinary,
+  containerNameForTask,
+  launchSupervisorAsync,
+  runClaude,
+  isContainerRunning,
+  containerExists,
+  getContainerInfo as dockerGetContainerInfo,
+  getContainerExitCode,
+  getContainerLogs,
+  removeContainer,
+} from '../capture/claude';
+
+import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
+import { writeToolPermissions } from '../mcp/config';
+
+const DOCKER_TIMEOUT_MS = 10_000;
+
+/**
+ * Read-only MCP tools that should be pre-approved in the builder session.
+ * These tools only read state and don't mutate tasks or trigger operations.
+ * Mutating tools (create, start, accept, reject, etc.) require user confirmation.
+ */
+const BUILDER_READ_ONLY_TOOLS = [
+  'lazy_search',
+  'lazy_show',
+  'lazy_status',
+  'lazy_conversations',
+  'lazy_conversation_search',
+  'lazy_conversation_read',
+  'lazy_list',
+  'lazy_blocked',
+  'lazy_active',
+  'lazy_diff',
+  'lazy_wait',
+];
+
+export class DockerRunner implements Runner {
+  readonly type = 'docker' as const;
+  readonly runLabel = 'Container';
+
+  runDisplayName(runName: string): string {
+    return runName;
+  }
+
+  checkAvailability(): void {
+    checkDocker();
+    getAuthEnv(); // Fail fast on missing auth before creating state
+  }
+
+  async ensureReady(): Promise<void> {
+    await ensureImage();
+    await ensureAgentBinary();
+  }
+
+  runNameForTask(taskShortId: string): string {
+    return containerNameForTask(taskShortId);
+  }
+
+  async launchSupervisor(
+    sandbox: SandboxConfig,
+    runName: string,
+    protocolDir: string,
+    debug?: boolean,
+  ): Promise<void> {
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false);
+  }
+
+  async runClaudeSync(
+    prompt: string,
+    sandbox: SandboxConfig,
+    verbose?: boolean,
+    debug?: boolean,
+    model?: string,
+  ): Promise<ClaudeResponse> {
+    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model);
+  }
+
+  isRunning(runName: string): boolean {
+    return isContainerRunning(runName);
+  }
+
+  runExists(runName: string): boolean {
+    return containerExists(runName);
+  }
+
+  getRunInfo(runName: string): RunInfo | null {
+    return dockerGetContainerInfo(runName);
+  }
+
+  getRunExitCode(runName: string): number | null {
+    return getContainerExitCode(runName);
+  }
+
+  getRunLogs(runName: string, tailLines?: number): string | null {
+    return getContainerLogs(runName, tailLines);
+  }
+
+  stopRun(runName: string): boolean {
+    try {
+      const result = Bun.spawnSync(
+        ['docker', 'stop', runName],
+        { stdout: 'ignore', stderr: 'pipe', timeout: 30_000 },
+      );
+      return result.exitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  removeRun(runName: string): void {
+    removeContainer(runName);
+  }
+
+  discoverRunningRuns(): string[] {
+    try {
+      const result = Bun.spawnSync(
+        ['docker', 'ps', '--filter', 'name=^lazy-', '--format', '{{.Names}}'],
+        { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+      );
+      if (result.exitCode !== 0) return [];
+      const output = result.stdout.toString().trim();
+      if (!output) return [];
+      return output.split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  followOutput(runName: string, since?: string): FollowHandle | null {
+    try {
+      const args = ['docker', 'logs', '--follow'];
+      if (since) {
+        args.push('--since', since);
+      } else {
+        args.push('--tail', '0');
+      }
+      args.push(runName);
+
+      const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
+      return {
+        process: { kill: () => proc.kill() },
+        stdout: proc.stdout as ReadableStream<Uint8Array>,
+        exited: proc.exited.then(code => code ?? 0),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  usesSandbox(): boolean {
+    return true;
+  }
+
+  supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
+    return [
+      { cmd: 'git', name: 'git', hint: 'Container missing required tool: git. Install with: apt-get install -y git' },
+      { cmd: 'claude', name: 'claude', hint: 'Container missing required tool: claude. Install with: npm install -g @anthropic-ai/claude-code' },
+      { cmd: 'lazy-agent', name: 'lazy-agent', hint: 'lazy-agent binary not found at /usr/local/bin/lazy-agent. This is likely a volume mount issue.' },
+    ];
+  }
+
+  mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] } {
+    return {
+      command: 'lazy-agent',
+      args: ['mcp', '--task-id', taskId, '--worktree', worktreePath],
+    };
+  }
+
+  // ----- Builder support -----
+
+  getBuilderInstructions(): string {
+    return dockerBuilderInstructions;
+  }
+
+  async launchBuilderInteractive(
+    lazyRoot: string,
+    systemPrompt: string,
+    builderConfigPath: string,
+    claudeExtraArgs: string[],
+    debug?: boolean,
+  ): Promise<number> {
+    const [imageName, agentBinaryPath] = await Promise.all([
+      ensureImage(),
+      ensureAgentBinary(),
+    ]);
+
+    const auth = getAuthEnv();
+
+    // Read the builder config to get port for the container config
+    const builderConfig = JSON.parse(readFileSync(builderConfigPath, 'utf-8'));
+
+    // Get the data directory path for mounting
+    const { loadConfig } = await import('../config/loader');
+    const config = loadConfig(lazyRoot);
+    const dataDir = join(lazyRoot, config.data.path);
+
+    // Write system prompt to a temp file in the data dir (accessible inside container)
+    const tmpDir = join(dataDir, 'tmp');
+    mkdirSync(tmpDir, { recursive: true });
+    const promptFile = join(tmpDir, `builder-prompt-${Date.now()}.txt`);
+    writeFileSync(promptFile, systemPrompt);
+
+    // Extract short ID from config filename (e.g., "builder-a1b2c3d4.json" → "a1b2c3d4")
+    const configBasename = basename(builderConfigPath, '.json');
+    const builderId = configBasename.replace('builder-', '');
+
+    // Write a container-specific config with host.docker.internal instead of 127.0.0.1.
+    // The container can't reach the host's localhost, so we use Docker's built-in DNS alias.
+    const containerConfigFile = join(tmpDir, `builder-container-${builderId}.json`);
+    const containerConfig = {
+      ...builderConfig,
+      host: 'host.docker.internal',
+    };
+    writeFileSync(containerConfigFile, JSON.stringify(containerConfig, null, 2));
+
+    // Prepare merged Claude config: host's ~/.claude.json + lazy MCP server entry.
+    // Claude Code reads config from ~/.claude.json (at $HOME root, not inside ~/.claude/).
+    // We merge to a temp file so the host's real config is never modified.
+    // The MCP entry points to the container config file (host.docker.internal).
+    const mergedConfigFile = join(tmpDir, `builder-claude-config-${Date.now()}.json`);
+    const hostConfigPath = join(homedir(), '.claude.json');
+    let hostConfig: Record<string, unknown> = {};
+    try {
+      if (existsSync(hostConfigPath)) {
+        hostConfig = JSON.parse(readFileSync(hostConfigPath, 'utf-8'));
+      }
+    } catch {
+      // Start fresh on parse error
+    }
+    const mergedConfig = {
+      ...hostConfig,
+      mcpServers: {
+        ...((hostConfig.mcpServers as Record<string, unknown>) ?? {}),
+        lazy: {
+          command: 'lazy-agent',
+          args: ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot],
+        },
+      },
+    };
+    writeFileSync(mergedConfigFile, JSON.stringify(mergedConfig, null, 2) + '\n');
+
+    // Pre-approve read-only lazy MCP tools so the builder doesn't prompt for permission.
+    // Mutating tools (create, start, accept, etc.) still require user confirmation.
+    writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
+
+    // Build Docker args: launch lazy-agent in builder mode
+    const dockerArgs = [
+      'docker', 'run', '-it', '--rm',
+      '--name', `lazy-builder-${builderId}`,
+      // Allow container to reach host TCP server via host.docker.internal
+      // (built-in on macOS Docker Desktop; needs this flag on Linux)
+      '--add-host=host.docker.internal:host-gateway',
+      // Mount repo READ-ONLY — all writes happen on host via HTTP
+      '-v', `${lazyRoot}:${lazyRoot}:ro`,
+      // Mount data dir read-write (conversation capture needs write access)
+      '-v', `${dataDir}:${dataDir}`,
+      // Container-specific builder config (has host.docker.internal)
+      '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
+      // MCP binary for proxy tool access
+      '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+      // Claude config dir (settings, conversations, credentials)
+      '-v', `${homedir()}/.claude:${homedir()}/.claude`,
+      // Merged Claude config with MCP server entry (writable — Claude Code updates it on startup)
+      '-v', `${mergedConfigFile}:${homedir()}/.claude.json`,
+      // Auth
+      '-e', `${auth.key}=${auth.value}`,
+      // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
+      '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+      // HOME must match host so Claude Code finds ~/.claude/ and ~/.claude.json
+      '-e', `HOME=${homedir()}`,
+      // Working directory
+      '-w', lazyRoot,
+      imageName,
+      // Run the builder supervisor (not Claude directly)
+      'lazy-agent', 'builder',
+      '--system-prompt-file', promptFile,
+      '--worktree', lazyRoot,
+      // Use container config (host.docker.internal) not the host config (127.0.0.1)
+      '--builder-config', containerConfigFile,
+    ];
+
+    // Pass through extra Claude args after --
+    if (claudeExtraArgs.length > 0) {
+      dockerArgs.push('--', ...claudeExtraArgs);
+    }
+
+    if (debug) {
+      dockerArgs.splice(dockerArgs.indexOf(imageName), 0, '-e', 'DEBUG=1');
+      console.log('[DEBUG] Running builder Docker command:', dockerArgs.join(' '));
+    }
+
+    logger.info('Launching builder container...');
+
+    const proc = Bun.spawn(dockerArgs, {
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+
+    const exitCode = await proc.exited;
+
+    // Clean up temp files
+    for (const tmpFile of [promptFile, mergedConfigFile, containerConfigFile]) {
+      try {
+        unlinkSync(tmpFile);
+      } catch {
+        // Best effort
+      }
+    }
+
+    return exitCode;
+  }
+}

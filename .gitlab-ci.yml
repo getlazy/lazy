@@ -1,0 +1,107 @@
+# GitLab CI/CD for lazy-dev
+#
+# This replaces the GitHub Actions workflows in .github/workflows/
+# DO NOT delete .github/workflows/ yet — we'll do that after verification.
+#
+# Pipeline structure:
+# - typecheck: Runs on merge requests to main
+# - alpha-publish: Scheduled daily at 4am UTC + manual trigger
+# - release: Manual trigger on version tags
+
+stages:
+  - check
+  - publish
+
+# Default settings
+default:
+  image: oven/bun:latest
+
+#
+# TypeScript Check
+# Runs on all merge requests targeting main
+#
+typecheck:
+  stage: check
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+  script:
+    - bun install
+    - bun run typecheck
+
+#
+# Alpha Channel Publish
+# Scheduled: daily at 4am UTC
+# Manual: can be triggered via GitLab UI
+#
+alpha-publish:
+  stage: publish
+  rules:
+    # Scheduled pipeline at 4am UTC daily
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    # Manual trigger via GitLab UI
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+  variables:
+    GIT_DEPTH: 0  # Full history needed for version derivation (git rev-list --count)
+    ALPHA: "1"
+    PUBLIC_REPO: "git@gitlab.com:getlazy/lazy-alpha.git"
+    PUBLIC_BRANCH: "main"
+  before_script:
+    # Configure SSH for pushing to lazy-alpha repo
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # Deploy key is base64-encoded in CI variables (GitLab can't mask multiline values)
+    - echo "$ALPHA_REPO_DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts 2>/dev/null
+    - |
+      cat >> ~/.ssh/config <<SSHEOF
+      Host gitlab.com
+        IdentityFile ~/.ssh/deploy_key
+        StrictHostKeyChecking accept-new
+      SSHEOF
+    # Configure git identity
+    - git config --global user.name "lazy-alpha[bot]"
+    - git config --global user.email "lazy-alpha-bot@gitlab.com"
+  script:
+    - scripts/release.sh HEAD
+  after_script:
+    # Always cleanup SSH key, even if job fails
+    - rm -f ~/.ssh/deploy_key
+
+#
+# Release to Public Repo
+# Manual trigger only, runs on version tags (v<major>.<minor>.<patch>)
+#
+release:
+  stage: publish
+  rules:
+    # Only run on tag pushes matching semantic version pattern
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+      when: manual
+  variables:
+    GIT_DEPTH: 0  # Full history needed for changelog generation
+    PUBLIC_REPO: "git@gitlab.com:getlazy/lazy.git"
+    PUBLIC_BRANCH: "main"
+  before_script:
+    # Configure SSH for pushing to public repo
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # Deploy key is base64-encoded in CI variables (GitLab can't mask multiline values)
+    - echo "$PUBLIC_REPO_DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts 2>/dev/null
+    - |
+      cat >> ~/.ssh/config <<SSHEOF
+      Host gitlab.com
+        IdentityFile ~/.ssh/deploy_key
+        StrictHostKeyChecking accept-new
+      SSHEOF
+    # Configure git identity
+    - git config --global user.name "lazy-release[bot]"
+    - git config --global user.email "lazy-release-bot@gitlab.com"
+  script:
+    - scripts/release.sh "$CI_COMMIT_TAG"
+  after_script:
+    # Always cleanup SSH key, even if job fails
+    - rm -f ~/.ssh/deploy_key

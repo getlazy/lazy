@@ -1,0 +1,31 @@
+node_modules/
+
+# Build files
+lazy
+lazy-agent
+
+# Lazy storage - we WANT to track these files in git
+# .lazy/tasks/ contains the file-based storage (JSON files)
+# .lazy/version.json tracks the storage schema version
+
+# But we DON'T want to track these:
+.lazy-task-sandbox/
+.lazy/worktrees/
+.lazy/bin/
+.lazy/logs/
+.lazy/recovery/
+.lazy/tasks/*.tmp.*
+.lazy/tasks/*.backup.*
+.lazy/tasks/*/protocol/
+.lazy/storage.lock
+.lazy/tmp
+
+# Bun build temporary files
+*.bun-build
+
+# Generated version file (from scripts/generate-version.ts)
+src/version.ts
+
+dist/
+
+.DS_Store
