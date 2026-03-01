@@ -1,0 +1,179 @@
+/**
+ * Tests for accept refusing when parent task is in 'working' state.
+ *
+ * INVARIANT: Accepting a child task merges into the parent's branch.
+ * If the parent is actively being worked on (status = 'working'), merging
+ * into its worktree mid-turn would corrupt the agent's state. Accept must
+ * refuse unless --force is passed.
+ */
+
+import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { writeFileSync, readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+
+/** Find the full task UUID from a short (8-char) prefix. */
+function findFullTaskId(root: string, shortId: string): string {
+  const tasksDir = join(root, '.lazy', 'tasks');
+  const dirs = readdirSync(tasksDir);
+  const match = dirs.find(d => d.startsWith(shortId));
+  if (!match) throw new Error(`Task directory not found for ${shortId}`);
+  return match;
+}
+
+/** Read task.json for direct manipulation in tests. */
+function readTaskJson(root: string, shortId: string): any {
+  const fullId = findFullTaskId(root, shortId);
+  const taskPath = join(root, '.lazy', 'tasks', fullId, 'task.json');
+  return JSON.parse(readFileSync(taskPath, 'utf-8'));
+}
+
+/** Write task.json for direct manipulation in tests. */
+function writeTaskJson(root: string, shortId: string, data: any): void {
+  const fullId = findFullTaskId(root, shortId);
+  const taskPath = join(root, '.lazy', 'tasks', fullId, 'task.json');
+  writeFileSync(taskPath, JSON.stringify(data, null, 2));
+}
+
+/** Extract child task ID from "Created variant task <id>" output */
+function extractVariantTaskId(output: string): string {
+  const match = output.match(/Created variant task ([a-f0-9]{8})/);
+  if (!match) {
+    throw new Error(`Could not extract variant task ID from output: ${output}`);
+  }
+  return match[1];
+}
+
+describe('accept with working parent', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: Accepting a child task when the parent is working would merge
+  // into the agent's active worktree, corrupting its state. Must refuse.
+  test('refuses accept when parent task is working', async () => {
+    // 1. Create and start a parent task
+    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
+    const parentStartResult = await ctx.lazyMocked(
+      ['start', parentId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(parentStartResult);
+
+    // 2. Create a child task (branch from parent)
+    const branchResult = await ctx.lazyMocked(
+      ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(branchResult);
+    const childId = extractVariantTaskId(branchResult.stdout);
+
+    // 3. Add a commit to the child worktree so accept has something to merge
+    const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
+    writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
+    ctx.git('-C', childWorktree, 'add', 'child-work.txt');
+    ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
+
+    // 4. Set parent task status to 'working' (simulates an active agent turn)
+    const parentJson = readTaskJson(ctx.root, parentId);
+    parentJson.status = 'working';
+    writeTaskJson(ctx.root, parentId, parentJson);
+
+    // 5. Accept should refuse
+    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
+    expectFailure(acceptResult);
+    expectError(acceptResult, 'currently working');
+    expectError(acceptResult, '--force');
+  });
+
+  // INVARIANT: --force bypasses the working-parent check when the user
+  // explicitly decides to merge despite the risk.
+  test('--force bypasses working parent check', async () => {
+    // 1. Create and start a parent task
+    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
+    const parentStartResult = await ctx.lazyMocked(
+      ['start', parentId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(parentStartResult);
+
+    // 2. Create a child task (branch from parent)
+    const branchResult = await ctx.lazyMocked(
+      ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(branchResult);
+    const childId = extractVariantTaskId(branchResult.stdout);
+
+    // 3. Add a commit to the child worktree
+    const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
+    writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
+    ctx.git('-C', childWorktree, 'add', 'child-work.txt');
+    ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
+
+    // 4. Remove parent worktree so the local driver's squash merge can
+    //    check out the parent branch. (The test is about the --force flag
+    //    bypassing the working-parent guard, not about worktree mechanics.)
+    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
+    ctx.git('worktree', 'remove', '--force', parentWorktree);
+
+    // 5. Set parent task status to 'working' (simulates active agent)
+    const parentJson = readTaskJson(ctx.root, parentId);
+    parentJson.status = 'working';
+    writeTaskJson(ctx.root, parentId, parentJson);
+
+    // 6. Accept with --force should succeed despite working parent
+    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM', '--force']);
+    expectSuccess(acceptResult);
+    expectOutput(acceptResult, 'Merged into parent task');
+  });
+
+  test('accept succeeds when parent is blocked (not working)', async () => {
+    // 1. Create and start a parent task (ends in blocked state after mock)
+    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
+    const parentStartResult = await ctx.lazyMocked(
+      ['start', parentId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(parentStartResult);
+
+    // 2. Create a child task
+    const branchResult = await ctx.lazyMocked(
+      ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(branchResult);
+    const childId = extractVariantTaskId(branchResult.stdout);
+
+    // 3. Add a commit to the child worktree
+    const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
+    writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
+    ctx.git('-C', childWorktree, 'add', 'child-work.txt');
+    ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
+
+    // 4. Remove parent worktree so the local driver's squash merge can
+    //    check out the parent branch. (The test is about verifying accept
+    //    works normally when parent is blocked — no guard should fire.)
+    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
+    ctx.git('worktree', 'remove', '--force', parentWorktree);
+
+    // 5. Parent is in 'blocked' state (default after mock completes) — accept should work
+    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
+    expectSuccess(acceptResult);
+    expectOutput(acceptResult, 'Merged into parent task');
+  });
+});

@@ -1,0 +1,33 @@
+# lazy.toml - Example configuration for lazy
+# Copy this to lazy.toml and customize as needed
+
+[models]
+# Default model for sessions
+# Options: "sonnet", "opus", "haiku"
+default = "sonnet"
+
+[session]
+# Show Docker output in real-time during session execution
+verbose = false
+
+# Extra logging for troubleshooting
+debug = false
+
+# Include commit guidelines in prompts sent to the agent
+auto_commit_instructions = true
+
+[database]
+# Location of the .lazy directory
+path = ".lazy"
+
+[git]
+# Default prefix for lazy branches (e.g., "lazy/abc123")
+default_branch_prefix = "lazy"
+
+[output]
+# Length of shortened IDs displayed in output
+shortid_length = 8
+
+[agent]
+# Default agent type to use for sessions
+agent_id = "claude-code"

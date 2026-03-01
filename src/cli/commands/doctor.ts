@@ -1,0 +1,880 @@
+/**
+ * `lazy doctor` — verify installation health and report issues.
+ *
+ * Runs a series of checks (Docker, auth, git, directory structure, image,
+ * locks, containers, disk space) and prints a pass/fail summary with
+ * actionable fix instructions for any failures.
+ */
+
+import { existsSync, readdirSync, readFileSync, statfsSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+import { findLazyRoot, getDataDir } from '../init';
+import { getProjectName } from '../../storage';
+import { TERMINAL_STATUSES } from '../../types';
+import { createStorage } from '../../storage';
+import { theme } from '../theme';
+import { shortId, displayId, parseFlags, taskRef } from '../helpers';
+import { repoHasCommits } from '../../git/operations';
+import { resolveImageName, calculateDockerfileHash } from '../../capture/claude';
+import { loadConfig, loadRawConfig } from '../../config/loader';
+import { createRunner } from '../../runner';
+import type { Runner } from '../../runner';
+import { findUnknownConfigKeys } from '../../config/schema';
+import { getKnownFeatures, getUnknownFlags, isFeatureEnabled } from '../../utils/features';
+import { createDriver } from '../../remote';
+import type { ResolvedConfig } from '../../config/types';
+import type { RepositoryDriver } from '../../remote';
+import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../../shell/detect';
+import type { ShellInfo } from '../../shell/detect';
+
+// ── types ────────────────────────────────────────────────────────────────
+
+interface CheckResult {
+  ok: boolean;
+  label: string;
+  detail?: string;  // shown on failure
+  warning?: string; // shown as yellow warning even when ok
+}
+
+// Docker timeout mirrors the one in capture/claude.ts
+const DOCKER_TIMEOUT_MS = 10_000;
+
+// Minimum free disk space (1 GB)
+const MIN_FREE_BYTES = 1_000_000_000;
+
+// ── individual checks ────────────────────────────────────────────────────
+
+function checkGit(): CheckResult {
+  try {
+    const result = Bun.spawnSync(['git', '--version'], {
+      stdout: 'pipe',
+      stderr: 'ignore',
+      timeout: 5_000,
+    });
+    if (result.exitCode === 0) {
+      const version = result.stdout.toString().trim().replace('git version ', '');
+      return { ok: true, label: `Git installed (v${version})` };
+    }
+  } catch { /* fall through */ }
+  return { ok: false, label: 'Git installed', detail: 'Git is not installed. Install it: https://git-scm.com/downloads' };
+}
+
+function checkGitHasCommits(): CheckResult {
+  if (repoHasCommits()) {
+    return { ok: true, label: 'Repository has commits' };
+  }
+  return {
+    ok: false,
+    label: 'Repository has commits',
+    detail: `Repository has no commits. Lazy requires at least one commit to function.\n  Run: ${theme.command("git commit --allow-empty -m 'Initial commit'")}`,
+  };
+}
+
+function checkDockerInstalled(): CheckResult {
+  try {
+    const result = Bun.spawnSync(['docker', '--version'], {
+      stdout: 'pipe',
+      stderr: 'ignore',
+      timeout: DOCKER_TIMEOUT_MS,
+    });
+    if (result.exitCode === 0) {
+      const raw = result.stdout.toString().trim();
+      const match = raw.match(/Docker version ([^\s,]+)/);
+      const version = match ? match[1] : raw;
+      return { ok: true, label: `Docker installed (v${version})` };
+    }
+  } catch { /* fall through */ }
+  return { ok: false, label: 'Docker installed', detail: 'Docker is not installed. Install it: https://docs.docker.com/get-docker/' };
+}
+
+function checkDockerDaemon(): CheckResult {
+  try {
+    const result = Bun.spawnSync(['docker', 'info'], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+      timeout: DOCKER_TIMEOUT_MS,
+    });
+    if (result.exitCode === 0) {
+      return { ok: true, label: 'Docker daemon running' };
+    }
+  } catch { /* fall through */ }
+  return { ok: false, label: 'Docker daemon running', detail: `Docker daemon is not responsive. Start Docker Desktop or run: ${theme.command('sudo systemctl start docker')}` };
+}
+
+function checkAuth(): CheckResult {
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return { ok: true, label: 'API auth configured (OAuth token)' };
+  }
+  if (process.env.ANTHROPIC_API_KEY) {
+    return { ok: true, label: 'API auth configured (API key)' };
+  }
+  return {
+    ok: false,
+    label: 'API auth configured',
+    detail: `No authentication found. Set CLAUDE_CODE_OAUTH_TOKEN (run ${theme.command('claude setup-token')}) or ANTHROPIC_API_KEY.`,
+  };
+}
+
+function checkDataDir(root: string): CheckResult {
+  const dataDir = getDataDir(root);
+  const dataPath = join(root, dataDir);
+
+  if (!existsSync(dataPath)) {
+    return { ok: false, label: 'Data directory exists', detail: `${dataDir}/ directory not found. Run ${theme.command('lazy init')}.` };
+  }
+
+  // Resolve the actual tasks directory based on storage backend config
+  const config = loadConfig(root);
+  let tasksDir: string;
+  let displayPath: string;
+
+  switch (config.storage.backend) {
+    case 'external': {
+      let externalPath = config.storage.external_path;
+      if (!externalPath || externalPath === '') {
+        const projectName = getProjectName(root, config.remote.git_remote);
+        externalPath = join(homedir(), '.lazy', projectName);
+      }
+      tasksDir = join(externalPath, 'tasks');
+      displayPath = externalPath;
+      break;
+    }
+    case 'orphan-branch':
+      tasksDir = join(dataPath, '.state-worktree', 'tasks');
+      displayPath = `${dataDir}/.state-worktree`;
+      break;
+    case 'in-repo':
+    default:
+      tasksDir = join(dataPath, 'tasks');
+      displayPath = `${dataDir}/`;
+      break;
+  }
+
+  if (!existsSync(tasksDir)) {
+    return { ok: false, label: 'Data directory valid', detail: `${displayPath}/tasks/ directory missing. Storage may be corrupted.` };
+  }
+
+  return { ok: true, label: `Data directory valid (${displayPath})` };
+}
+
+function checkContainerImage(imageName: string): CheckResult {
+  try {
+    const result = Bun.spawnSync(
+      ['docker', 'image', 'inspect', imageName, '--format', '{{.Id}}'],
+      { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+    );
+    if (result.exitCode === 0 && result.stdout.toString().trim().length > 0) {
+      return { ok: true, label: `Container image exists (${imageName})` };
+    }
+  } catch { /* fall through */ }
+  return {
+    ok: false,
+    label: 'Container image exists',
+    detail: `${imageName} image not found. It will be built automatically on first \`lazy start\`.`,
+  };
+}
+
+function checkImageUpToDate(root: string, imageName: string): CheckResult {
+  // Use the same Dockerfile hash logic as the build code in capture/claude.ts.
+  // This hashes the custom Dockerfile if configured, or the embedded default
+  // Dockerfile — never the project's own Dockerfile at the repo root.
+  let currentHash: string;
+  try {
+    currentHash = calculateDockerfileHash(root);
+  } catch (err) {
+    // calculateDockerfileHash throws if a custom Dockerfile is configured but missing
+    return {
+      ok: false,
+      label: 'Container image up to date',
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  try {
+    const inspect = Bun.spawnSync(
+      ['docker', 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
+      { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+    );
+    if (inspect.exitCode === 0) {
+      const imageHash = inspect.stdout.toString().trim();
+      if (imageHash === currentHash) {
+        return { ok: true, label: 'Container image up to date' };
+      }
+      return {
+        ok: false,
+        label: 'Container image up to date',
+        detail: `Dockerfile has changed since the image was built. Run ${theme.command('lazy upgrade')} to rebuild.`,
+      };
+    }
+  } catch { /* fall through */ }
+
+  // Image doesn't exist — already reported by checkContainerImage
+  return { ok: true, label: 'Container image up to date' };
+}
+
+function checkStaleLocks(root: string): CheckResult {
+  const dataDir = getDataDir(root);
+  const worktreesDir = join(root, dataDir, 'worktrees');
+  if (!existsSync(worktreesDir)) {
+    return { ok: true, label: 'No stale locks' };
+  }
+
+  const stale: string[] = [];
+  try {
+    const entries = readdirSync(worktreesDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const lockPath = join(worktreesDir, entry.name, '.lazy-lock');
+      if (!existsSync(lockPath)) continue;
+      try {
+        const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
+        if (lockData.pid) {
+          try {
+            process.kill(lockData.pid, 0);
+            // Process alive — lock is valid
+          } catch {
+            // Process dead — stale lock
+            stale.push(entry.name);
+          }
+        }
+      } catch {
+        stale.push(entry.name);
+      }
+    }
+  } catch { /* fall through */ }
+
+  if (stale.length === 0) {
+    return { ok: true, label: 'No stale locks' };
+  }
+  return {
+    ok: false,
+    label: 'No stale locks',
+    detail: `${stale.length} stale lock(s) found in worktrees: ${stale.join(', ')}. ` +
+            `Remove with: ${theme.command(`rm ${stale.map(s => join(worktreesDir, s, '.lazy-lock')).join(' ')}`)}`,
+  };
+}
+
+function checkStorageLock(root: string): CheckResult {
+  const dataDir = getDataDir(root);
+  const lockPath = join(root, dataDir, '.storage-lock');
+  if (!existsSync(lockPath)) {
+    return { ok: true, label: 'No stale storage lock' };
+  }
+
+  try {
+    const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
+    if (lockData.pid) {
+      try {
+        process.kill(lockData.pid, 0);
+        // Process alive — lock is valid
+        return { ok: true, label: 'No stale storage lock' };
+      } catch {
+        return {
+          ok: false,
+          label: 'No stale storage lock',
+          detail: `Storage lock held by dead process (pid ${lockData.pid}). Remove with: ${theme.command(`rm ${lockPath}`)}`,
+        };
+      }
+    }
+  } catch { /* fall through */ }
+
+  return { ok: true, label: 'No stale storage lock' };
+}
+
+// ── exit code explanations ───────────────────────────────────────────────
+
+export function explainExitCode(code: number): string {
+  switch (code) {
+    case 0: return 'clean exit';
+    case 137: return 'killed (OOM or manual stop)';
+    case 139: return 'segfault (possibly Docker daemon restart)';
+    case 255: return 'Docker daemon error';
+    default:
+      if (code > 128) return `signal ${code - 128}`;
+      return `exit code ${code}`;
+  }
+}
+
+function formatTimeSince(isoDate: string): string {
+  const ms = Date.now() - new Date(isoDate).getTime();
+  if (ms < 0) return 'just now';
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// ── crashed run detection ────────────────────────────────────────────────
+
+interface CrashedTask {
+  taskCode: string;
+  taskId: string;
+  taskStatus: string;
+  runName: string;
+  exitCode: number;
+  finishedAt: string | null;
+  explanation: string;
+}
+
+/**
+ * Find non-terminal tasks whose containers have crashed (stopped unexpectedly).
+ * Returns info about each crashed task for display and optional auto-resume.
+ */
+async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTask[]> {
+  const crashed: CrashedTask[] = [];
+  let storage;
+  try {
+    storage = await createStorage(root);
+    // Check interrupted tasks — these are the ones most likely to have crashed runs
+    // Also check working/blocked tasks whose runs may have died without reconciliation
+    const tasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
+
+    for (const task of tasks) {
+      // Only check tasks that have sessions (i.e., have been started)
+      const session = await storage.getSessionByTaskId(task.id);
+      if (!session) continue;
+
+      const tRef = taskRef(task);
+      const runName = session.container_name ?? runner.runNameForTask(tRef);
+
+      const info = runner.getRunInfo(runName);
+      if (!info) continue; // Run doesn't exist or runner unavailable
+
+      // We're looking for stopped runs with non-zero exit codes
+      // (or any stopped run for a non-interrupted task — that's unexpected)
+      if (info.running) continue;
+
+      // For interrupted tasks: report if run still exists (not yet cleaned up)
+      // For working/blocked tasks: run died but reconciler hasn't caught it yet
+      if (task.status === 'interrupted' || task.status === 'working' || task.status === 'blocked' || task.status === 'merging') {
+        crashed.push({
+          taskCode: displayId(task),
+          taskId: task.id,
+          taskStatus: task.status,
+          runName,
+          exitCode: info.exitCode,
+          finishedAt: info.finishedAt,
+          explanation: explainExitCode(info.exitCode),
+        });
+      }
+    }
+  } catch {
+    // Storage unavailable — skip
+  } finally {
+    if (storage) await storage.close();
+  }
+  return crashed;
+}
+
+// TERMINAL_STATUSES imported from ../../types
+
+async function checkOrphanedContainers(root: string | null): Promise<CheckResult> {
+  try {
+    const result = Bun.spawnSync(
+      ['docker', 'ps', '-a', '--filter', 'name=^lazy-', '--format', '{{.Names}} {{.Status}}'],
+      { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+    );
+    if (result.exitCode !== 0) {
+      return { ok: true, label: 'No orphaned containers' };
+    }
+
+    const output = result.stdout.toString().trim();
+    if (!output) {
+      return { ok: true, label: 'No orphaned containers' };
+    }
+
+    const lines = output.split('\n');
+
+    // Stopped containers are always orphaned
+    const exitedNames = lines
+      .filter(l => l.includes('Exited'))
+      .map(l => l.split(' ')[0]);
+
+    // Running containers may be orphaned if their task is in a terminal state
+    const runningNames = lines
+      .filter(l => l.includes('Up'))
+      .map(l => l.split(' ')[0]);
+
+    const runningOrphans: string[] = [];
+    if (root && runningNames.length > 0) {
+      let storage;
+      try {
+        storage = await createStorage(root);
+        for (const name of runningNames) {
+          // Container names follow the pattern lazy-{taskShortId}
+          const taskShortId = name.replace(/^lazy-/, '');
+          if (!taskShortId) continue;
+          const task = await storage.getTask(taskShortId);
+          if (task && TERMINAL_STATUSES.has(task.status)) {
+            runningOrphans.push(name);
+          }
+        }
+      } catch {
+        // Storage unavailable — skip running container checks
+      } finally {
+        if (storage) await storage.close();
+      }
+    }
+
+    const allOrphans = [...exitedNames, ...runningOrphans];
+    if (allOrphans.length === 0) {
+      return { ok: true, label: 'No orphaned containers' };
+    }
+
+    const parts: string[] = [];
+    if (exitedNames.length > 0) {
+      parts.push(`${exitedNames.length} stopped: ${exitedNames.join(', ')}`);
+    }
+    if (runningOrphans.length > 0) {
+      parts.push(`${runningOrphans.length} running for completed tasks: ${runningOrphans.join(', ')}`);
+    }
+
+    // Stopped containers need docker rm; running orphans need docker rm -f
+    const cleanupParts: string[] = [];
+    if (exitedNames.length > 0) {
+      cleanupParts.push(`docker rm ${exitedNames.join(' ')}`);
+    }
+    if (runningOrphans.length > 0) {
+      cleanupParts.push(`docker rm -f ${runningOrphans.join(' ')}`);
+    }
+
+    return {
+      ok: false,
+      label: 'No orphaned containers',
+      detail: `${allOrphans.length} orphaned lazy container(s): ${parts.join('; ')}. ` +
+              `Remove with: ${theme.command(cleanupParts.join(' && '))}`,
+    };
+  } catch { /* fall through */ }
+  return { ok: true, label: 'No orphaned containers' };
+}
+
+function checkShellDetected(): { result: CheckResult; shell: ShellInfo } {
+  const shell = detectShell();
+
+  if (shell.name === 'unknown') {
+    return {
+      result: {
+        ok: true,
+        label: 'Shell detected: unknown',
+        warning: '$SHELL is not set or unrecognized. Completion checks skipped.',
+      },
+      shell,
+    };
+  }
+
+  const versionSuffix = shell.version ? ` v${shell.version}` : '';
+  return {
+    result: { ok: true, label: `Shell detected: ${shell.name}${versionSuffix} (${shell.path})` },
+    shell,
+  };
+}
+
+function checkCompletionsInstalled(shell: ShellInfo): CheckResult {
+  if (shell.name === 'unknown') {
+    return { ok: true, label: 'Completions installed (skipped — unknown shell)' };
+  }
+
+  // fish doesn't have a completion flag in lazy yet
+  if (shell.name === 'fish') {
+    return {
+      ok: true,
+      label: 'Completions installed (fish)',
+      warning: 'lazy completion does not support fish yet. Bash and zsh are supported.',
+    };
+  }
+
+  if (shell.completionInstalled) {
+    return { ok: true, label: `Completions installed (${shell.name})` };
+  }
+
+  const setupCmd = getCompletionSetupCommand(shell.name);
+  const configFile = getShellConfigFile(shell.name);
+  const hint = setupCmd
+    ? `Add to ${configFile}:\n    ${setupCmd}`
+    : `Run: lazy completion --${shell.name}`;
+
+  return {
+    ok: true,
+    label: `Completions installed (${shell.name})`,
+    warning: `Tab completions not detected for ${shell.name}. ${hint}`,
+  };
+}
+
+function checkFeatureFlags(config: ResolvedConfig): CheckResult {
+  const vanilla = process.env.LAZY_VANILLA === '1';
+  const allEnabled = config.features.all === true;
+  const knownFeatures = getKnownFeatures();
+  const unknownFlags = getUnknownFlags(config);
+
+  // Build status summary
+  const parts: string[] = [];
+
+  if (vanilla) {
+    parts.push('LAZY_VANILLA=1');
+  } else if (allEnabled) {
+    parts.push('all = true');
+  }
+
+  // Show individual known flag states (getKnownFeatures() guarantees
+  // alphabetical order for prompt caching stability)
+  for (const flag of knownFeatures) {
+    const enabled = isFeatureEnabled(flag, config);
+    parts.push(`${flag}: ${enabled ? 'on' : 'off'}`);
+  }
+
+  const label = parts.length > 0
+    ? `Feature flags (${parts.join(', ')})`
+    : 'Feature flags (none configured)';
+
+  const warning = unknownFlags.length > 0
+    ? `Unknown feature flag(s) in config: ${unknownFlags.join(', ')}. These may be stale flags from graduated features.`
+    : undefined;
+
+  return { ok: true, label, warning };
+}
+
+function checkConfigKeys(raw: Record<string, unknown>, driver: RepositoryDriver): CheckResult[] {
+  const results: CheckResult[] = [];
+  const driverOpts = driver.getConfigOptions();
+
+  // Check for unknown keys (using driver-provided valid keys for [remote])
+  const deprecatedKeys = driverOpts.deprecated.map(d => d.key);
+  const unknownWarnings = findUnknownConfigKeys(raw, driverOpts.valid, deprecatedKeys);
+
+  if (unknownWarnings.length === 0) {
+    results.push({ ok: true, label: 'No unknown config options' });
+  }
+  for (const w of unknownWarnings) {
+    results.push({ ok: true, label: 'Config option', warning: w });
+  }
+
+  // Check for deprecated remote keys in [remote] section
+  const remoteSection = raw.remote;
+  const hasDeprecated = driverOpts.deprecated.some(dep => {
+    if (typeof remoteSection !== 'object' || remoteSection === null) return false;
+    return dep.key in remoteSection;
+  });
+
+  if (!hasDeprecated) {
+    results.push({ ok: true, label: 'No deprecated config options' });
+  } else {
+    for (const dep of driverOpts.deprecated) {
+      if (typeof remoteSection === 'object' && remoteSection !== null && dep.key in remoteSection) {
+        results.push({
+          ok: true,
+          label: `Config option 'remote.${dep.key}'`,
+          warning: `'remote.${dep.key}' is obsolete. ${dep.alternative}. Remove it from [remote].`,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+async function checkRemoteDriver(config: ResolvedConfig): Promise<{ driver: RepositoryDriver | null; driverResults: CheckResult[] }> {
+  const driverResults: CheckResult[] = [];
+  const driverName = config.remote.driver;
+  let driver: RepositoryDriver | null = null;
+
+  // Show which driver is configured
+  driverResults.push({ ok: true, label: `Remote driver: ${driverName}` });
+
+  // Create the driver and render its health checks
+  try {
+    driver = createDriver(config);
+    const checks = await driver.checkHealth();
+
+    for (const check of checks) {
+      switch (check.state) {
+        case 'ok':
+          driverResults.push({ ok: true, label: check.what });
+          break;
+        case 'warn':
+          driverResults.push({ ok: true, label: check.what, warning: check.reason });
+          break;
+        case 'fail':
+          driverResults.push({ ok: false, label: check.what, detail: check.reason });
+          break;
+      }
+    }
+  } catch (err) {
+    driverResults.push({
+      ok: false,
+      label: 'Remote driver health',
+      detail: `Failed to check driver "${driverName}": ${err instanceof Error ? err.message : err}`,
+    });
+  }
+
+  return { driver, driverResults };
+}
+
+function checkSplitStorage(root: string): CheckResult {
+  const config = loadConfig(root);
+  if (config.storage.backend === 'in-repo') {
+    return { ok: true, label: 'No split storage' };
+  }
+
+  // External or orphan-branch storage: check if .lazy/tasks/ also has task data
+  const dataDir = getDataDir(root);
+  const inRepoTasksDir = join(root, dataDir, 'tasks');
+  if (!existsSync(inRepoTasksDir)) {
+    return { ok: true, label: 'No split storage (external storage clean)' };
+  }
+
+  try {
+    const entries = readdirSync(inRepoTasksDir, { withFileTypes: true });
+    const taskDirs = entries.filter(e => e.isDirectory() && e.name.length === 36);
+    if (taskDirs.length === 0) {
+      return { ok: true, label: 'No split storage' };
+    }
+
+    return {
+      ok: false,
+      label: 'No split storage',
+      detail: `Storage backend is "${config.storage.backend}" but ${dataDir}/tasks/ in the repo ` +
+              `contains ${taskDirs.length} task director${taskDirs.length === 1 ? 'y' : 'ies'}. ` +
+              `This is stale data from before external storage was configured. ` +
+              `Remove with: ${theme.command(`rm -rf ${join(root, dataDir, 'tasks')}`)}`,
+    };
+  } catch {
+    return { ok: true, label: 'No split storage' };
+  }
+}
+
+function checkDiskSpace(root: string): CheckResult {
+  try {
+    const stats = statfsSync(root);
+    const freeBytes = stats.bsize * stats.bavail;
+    const freeGB = (freeBytes / 1_000_000_000).toFixed(1);
+
+    if (freeBytes >= MIN_FREE_BYTES) {
+      return { ok: true, label: `Disk space adequate (${freeGB} GB free)` };
+    }
+    return {
+      ok: false,
+      label: 'Disk space adequate',
+      detail: `Only ${freeGB} GB free. Lazy needs at least 1 GB for Docker images and worktrees.`,
+    };
+  } catch {
+    // statfsSync not available on all platforms
+    return { ok: true, label: 'Disk space (check skipped)' };
+  }
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+
+export async function commandDoctor(args: string[]): Promise<void> {
+  // Parse flags
+  const parsed = parseFlags(args, [
+    { name: 'no-resume', takesValue: false },
+  ], 'doctor');
+
+  const noResume = parsed.flags.get('no-resume') === true;
+
+  const results: CheckResult[] = [];
+
+  // Always run these regardless of lazy root
+  results.push(checkGit());
+  results.push(checkGitHasCommits());
+
+  // Checks that require a lazy root
+  const root = findLazyRoot();
+  let crashedTasks: CrashedTask[] = [];
+
+  // Determine runner type for conditional checks
+  const config = root ? loadConfig(root) : null;
+  const runnerType = config?.runner ?? 'docker';
+  const runner = root ? createRunner(root) : null;
+
+  if (runnerType === 'docker') {
+    results.push(checkDockerInstalled());
+    // Docker daemon check only makes sense if Docker is installed
+    if (results[results.length - 1].ok) {
+      results.push(checkDockerDaemon());
+    }
+  } else {
+    // Host-process mode: check that claude is on PATH
+    try {
+      const claudeResult = Bun.spawnSync(['claude', '--version'], {
+        stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+      });
+      if (claudeResult.exitCode === 0) {
+        const version = claudeResult.stdout.toString().trim();
+        results.push({ ok: true, label: `Claude Code CLI installed (${version})` });
+      } else {
+        results.push({ ok: false, label: 'Claude Code CLI installed', detail: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
+      }
+    } catch {
+      results.push({ ok: false, label: 'Claude Code CLI installed', detail: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
+    }
+    results.push({ ok: true, label: `Runner mode: host-process (no Docker isolation)` });
+  }
+
+  results.push(checkAuth());
+
+  // Shell and completion checks
+  const { result: shellResult, shell } = checkShellDetected();
+  results.push(shellResult);
+  results.push(checkCompletionsInstalled(shell));
+
+  const dockerOk = runnerType === 'docker' &&
+    results.find(r => r.label.includes('Docker installed'))?.ok &&
+    results.find(r => r.label.startsWith('Docker daemon'))?.ok;
+
+  if (root) {
+    results.push(checkDataDir(root));
+
+    // Docker-dependent checks
+    if (runnerType === 'docker' && dockerOk) {
+      const imageName = resolveImageName(root);
+      results.push(checkContainerImage(imageName));
+      results.push(checkImageUpToDate(root, imageName));
+      results.push(await checkOrphanedContainers(root));
+    }
+
+    // Detect crashed runs for non-terminal tasks (works for both runner types)
+    if (runner) {
+      crashedTasks = await findCrashedTasks(root, runner);
+      if (crashedTasks.length === 0) {
+        results.push({ ok: true, label: 'No crashed task runs' });
+      } else {
+        const interrupted = crashedTasks.filter(c => c.taskStatus === 'interrupted');
+        const other = crashedTasks.filter(c => c.taskStatus !== 'interrupted');
+        const parts: string[] = [];
+        if (interrupted.length > 0) {
+          parts.push(`${interrupted.length} interrupted`);
+        }
+        if (other.length > 0) {
+          parts.push(`${other.length} with dead run`);
+        }
+        results.push({
+          ok: false,
+          label: 'No crashed task runs',
+          detail: `${crashedTasks.length} task(s) with crashed runs (${parts.join(', ')})`,
+        });
+      }
+    }
+
+    results.push(checkStaleLocks(root));
+    results.push(checkStorageLock(root));
+    results.push(checkSplitStorage(root));
+    results.push(checkDiskSpace(root));
+
+    // Remote driver checks and config validation
+    const rawConfig = loadRawConfig(root);
+    const { driver, driverResults } = await checkRemoteDriver(config!);
+    results.push(...driverResults);
+
+    // Config validation (uses driver to know valid/deprecated remote keys)
+    if (rawConfig && driver) {
+      results.push(...checkConfigKeys(rawConfig, driver));
+    }
+
+    // Feature flags status
+    results.push(checkFeatureFlags(config!));
+  } else {
+    console.log('Note: Not in a lazy project. Skipping project-specific checks.\n');
+  }
+
+  // Print results
+  for (const r of results) {
+    if (r.ok) {
+      console.log(theme.success(`\u2713 ${r.label}`));
+      if (r.warning) {
+        console.log(theme.warning(`  ! ${r.warning}`));
+      }
+    } else {
+      console.log(theme.error(`\u2717 ${r.label}`));
+      if (r.detail) {
+        console.log(`  ${r.detail}`);
+      }
+    }
+  }
+
+  // Print crashed run details and auto-resume
+  if (crashedTasks.length > 0) {
+    console.log('');
+    console.log(theme.header('Crashed runs:'));
+    for (const c of crashedTasks) {
+      const timePart = c.finishedAt ? `, died ${formatTimeSince(c.finishedAt)}` : '';
+      console.log(`  ${theme.taskId(c.taskCode)} ${theme.status(c.taskStatus)} — ${c.runName} (${c.explanation}${timePart})`);
+    }
+
+    // Auto-resume interrupted tasks (default behavior per design)
+    const resumable = crashedTasks.filter(c => c.taskStatus === 'interrupted');
+    if (resumable.length > 0 && !noResume) {
+      console.log('');
+      console.log(`Resuming ${resumable.length} interrupted task(s)...`);
+      for (const c of resumable) {
+        const code = c.taskCode;
+        console.log(`  Resuming ${theme.taskId(code)}...`);
+        try {
+          const proc = Bun.spawnSync(
+            [process.argv[0], process.argv[1], 'resume', code],
+            {
+              stdout: 'pipe',
+              stderr: 'pipe',
+              cwd: root!,
+              env: process.env,
+              timeout: 60_000,
+            }
+          );
+          if (proc.exitCode === 0) {
+            console.log(theme.success(`    Resumed ${code}`));
+          } else {
+            const stderr = proc.stderr.toString().trim();
+            console.log(theme.error(`    Failed to resume ${code}: ${stderr || `exit ${proc.exitCode}`}`));
+          }
+        } catch (err) {
+          console.log(theme.error(`    Failed to resume ${code}: ${err instanceof Error ? err.message : err}`));
+        }
+      }
+    } else if (resumable.length > 0 && noResume) {
+      console.log('');
+      console.log(`${resumable.length} task(s) can be resumed. Run without --no-resume or use: lazy resume <task_id>`);
+    }
+  }
+
+  // Summary
+  const failures = results.filter(r => !r.ok);
+  console.log('');
+  if (failures.length === 0) {
+    console.log(theme.success('All good! Lazy is ready to use.'));
+  } else {
+    console.log(theme.error(`${failures.length} issue${failures.length > 1 ? 's' : ''} found.`));
+    process.exit(1);
+  }
+}
+
+export function doctorUsage(): void {
+  console.log(`Usage: lazy doctor [--no-resume]
+
+Check the health of your lazy installation and report any issues.
+
+Options:
+  --no-resume   Report crashed containers without auto-resuming interrupted tasks
+
+Checks performed:
+  - Git installed and functional
+  - Repository has at least one commit
+  - Docker installed and daemon running
+  - Anthropic API key or OAuth token configured
+  - Shell detected and completions installed
+  - Data directory structure valid
+  - Container image exists and up to date
+  - No stale locks or orphaned containers
+  - No split storage (when external storage is configured)
+  - Crashed task containers (auto-resumes interrupted tasks by default)
+  - Adequate disk space
+  - Unknown or deprecated config options in lazy.toml
+  - Remote driver health checks
+  - Feature flags status and unknown flag warnings
+
+Exit code is 0 if all checks pass, 1 if any issues are found.`);
+}

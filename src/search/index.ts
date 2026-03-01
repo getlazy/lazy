@@ -1,0 +1,7 @@
+export { parseQuery, isStructuredQuery, QueryParseError } from './parser';
+export type { QueryNode, AndNode, OrNode, NotNode, FieldNode, InNode, HasNode, DateNode, TextNode } from './parser';
+export { evaluateQuery, buildSearchResults } from './evaluator';
+export type { TaskData } from './evaluator';
+export { getAllSearchableContent } from './searchable';
+export type { SearchableItem } from './searchable';
+export { structuredSearch } from './structured';

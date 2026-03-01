@@ -1,0 +1,1 @@
+You are resuming work on a task after an interruption. The goal is: {{goal}}

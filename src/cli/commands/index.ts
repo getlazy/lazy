@@ -1,0 +1,41 @@
+// Flat CLI command exports
+// Each command operates on task_id - session is an internal concept
+
+export { commandCreate, createUsage } from './create';
+export { commandEdit, editUsage } from './edit';
+export { commandBranch, branchUsage } from './branch';
+export { commandClone, cloneUsage } from './clone';
+export { commandStart, startUsage } from './start';
+export { commandUnblock, unblockUsage } from './unblock';
+export { commandList, listUsage, commandActive, activeUsage, commandBlocked, blockedUsage } from './list';
+export { commandShow, showUsage } from './show';
+export { commandStatus, statusUsage } from './status';
+export { commandDiff, diffUsage } from './diff';
+export { commandShell, shellUsage } from './shell';
+export { commandPair, pairUsage } from './pair';
+export { commandAccept, acceptUsage } from './accept';
+export { commandReject, rejectUsage } from './reject';
+export { commandClose, closeUsage } from './close';
+export { commandSearch, searchUsage } from './search';
+export { commandComment, commentUsage } from './comment';
+export { commandLink, linkUsage } from './link';
+export { commandImportConversation, importConversationUsage } from './import-conversation';
+export { commandServer, serverUsage } from './server';
+export { commandReopen, reopenUsage } from './reopen';
+export { commandResume, resumeUsage } from './resume';
+export { commandWait, waitUsage } from './wait';
+export { commandBuilder, builderUsage } from './builder';
+export { commandDoctor, doctorUsage } from './doctor';
+export { commandLoop, loopUsage } from './loop';
+export { commandRevert, revertUsage } from './revert';
+export { commandPropose, proposeUsage } from './propose';
+export { commandSync, syncUsage } from './sync';
+export { commandCompletion, completionUsage } from './completion';
+export { commandReview, reviewUsage } from './review';
+export { commandRedo, redoUsage } from './redo';
+export { commandUpgrade, upgradeUsage } from './upgrade';
+export { commandSystem, systemUsage } from './system';
+export { commandDocument, documentUsage } from './document';
+export { commandRefactor, refactorUsage } from './refactor';
+export { commandFix, fixUsage } from './fix';
+export { commandRework, reworkUsage } from './rework';
