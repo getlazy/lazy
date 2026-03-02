@@ -12,6 +12,7 @@ import {
   forceRemovePairingLock,
 } from '../../utils/pairing-lock';
 import { runClaude, hasAuthEnv } from '../../capture/claude';
+import { loadConfig } from '../../config/loader';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { getActor } from '../../constants';
@@ -451,10 +452,12 @@ Keep the summary concise and factual.`;
         logger.configure({ consoleLevel: LogLevel.WARN });
 
         const sandboxPath = join(worktreePath, SANDBOX_DIR);
+        const pairConfig = loadConfig(root);
+        const binary = (pairConfig.runner.type === 'docker' || pairConfig.runner.type === 'podman') ? pairConfig.runner.type : 'docker';
         const response = await runClaude(summaryPrompt, {
           worktreePath,
           sandboxPath,
-        }, false, false, 'haiku');
+        }, false, false, 'haiku', binary);
 
         logger.configure({ consoleLevel: LogLevel.INFO });
 

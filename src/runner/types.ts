@@ -10,8 +10,10 @@
 import type { SandboxConfig } from '../capture/claude';
 import type { ClaudeResponse } from '../types';
 import type { RunnerType } from '../config/types';
+import type { HealthCheck } from '../remote/driver';
 
 export type { RunnerType } from '../config/types';
+export type { HealthCheck };
 
 /** Information about a run (container or process). */
 export interface RunInfo {
@@ -129,6 +131,14 @@ export interface Runner {
    * Docker returns the container name; host-process returns "PID <pid>".
    */
   runDisplayName(runName: string): string;
+
+  /**
+   * Runner-specific health checks for `lazy doctor`.
+   * Each runner knows what infrastructure it needs and returns appropriate checks.
+   * DockerRunner checks Docker; HostProcessRunner checks `claude` on PATH; etc.
+   * Follows the same HealthCheck pattern as remote driver's checkHealth().
+   */
+  diagnose(): HealthCheck[];
 
   // ----- Builder support -----
 

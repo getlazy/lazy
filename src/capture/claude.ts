@@ -61,16 +61,17 @@ export function getModelId(modelName: ModelName): string {
   return modelMap[modelName];
 }
 
-export function checkDocker(): void {
-  logger.debug('Checking Docker...');
+export function checkDocker(binary: string = 'docker'): void {
+  logger.debug(`Checking ${binary}...`);
 
-  const result = Bun.spawnSync(['docker', 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
+  const result = Bun.spawnSync([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
   if (result.exitCode !== 0) {
-    logger.error('Docker is not installed or not running. Install Docker: https://docs.docker.com/get-docker/');
+    const name = binary.charAt(0).toUpperCase() + binary.slice(1);
+    logger.error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
     process.exit(1);
   }
 
-  logger.debug('Docker is running ✓');
+  logger.debug(`${binary} is running ✓`);
 }
 
 function getLazyRoot(): string {
@@ -157,9 +158,9 @@ export function resolveImageName(lazyRoot: string): string {
   return IMAGE_NAME;
 }
 
-function getImageDockerfileHash(imageName: string): string | null {
+function getImageDockerfileHash(imageName: string, binary: string = 'docker'): string | null {
   const inspect = Bun.spawnSync(
-    ['docker', 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${DOCKERFILE_HASH_LABEL}"}}`],
+    [binary, 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${DOCKERFILE_HASH_LABEL}"}}`],
     { stdout: 'pipe', stderr: 'ignore' }
   );
 
@@ -171,8 +172,8 @@ function getImageDockerfileHash(imageName: string): string | null {
   return hash || null;
 }
 
-async function buildImage(lazyRoot: string, imageName: string, currentHash: string): Promise<void> {
-  logger.info(`Building ${imageName} Docker image...`);
+async function buildImage(lazyRoot: string, imageName: string, currentHash: string, binary: string = 'docker'): Promise<void> {
+  logger.info(`Building ${imageName} container image...`);
 
   const customPath = resolveCustomDockerfile(lazyRoot);
 
@@ -201,7 +202,7 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
   }
 
   const proc = Bun.spawn(
-    ['docker', 'build', '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${currentHash}`, '-f', dockerfileName, '.'],
+    [binary, 'build', '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${currentHash}`, '-f', dockerfileName, '.'],
     { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe' }
   );
 
@@ -214,39 +215,39 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
     proc.exited,
   ]);
 
-  logger.stream('Docker build stdout:\n' + stdout);
-  logger.stream('Docker build stderr:\n' + stderr);
+  logger.stream('Container build stdout:\n' + stdout);
+  logger.stream('Container build stderr:\n' + stderr);
 
   if (exitCode !== 0) {
     const stderrLines = stderr.trim().split('\n');
     const lastOutput = stderrLines.slice(-10).join('\n');
-    logger.error(`Docker build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
-    throw new Error(`Docker build failed with exit code ${exitCode}`);
+    logger.error(`Container build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
+    throw new Error(`Container build failed with exit code ${exitCode}`);
   }
 
-  logger.debug('Docker build completed successfully');
+  logger.debug('Container build completed successfully');
 }
 
 /**
  * Ensure the Docker image is built and up to date.
  * Returns the image name to use for container creation.
  */
-export async function ensureImage(): Promise<string> {
-  checkDocker();
+export async function ensureImage(binary: string = 'docker'): Promise<string> {
+  checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
   const imageName = resolveImageName(lazyRoot);
   const currentHash = calculateDockerfileHash(lazyRoot);
-  const imageHash = getImageDockerfileHash(imageName);
+  const imageHash = getImageDockerfileHash(imageName, binary);
 
   if (imageHash === null) {
-    logger.info('Docker image not found.');
-    await buildImage(lazyRoot, imageName, currentHash);
+    logger.info('Container image not found.');
+    await buildImage(lazyRoot, imageName, currentHash, binary);
   } else if (imageHash !== currentHash) {
     logger.info('Dockerfile has changed, rebuilding image...');
-    await buildImage(lazyRoot, imageName, currentHash);
+    await buildImage(lazyRoot, imageName, currentHash, binary);
   } else {
-    logger.debug('Docker image is up to date ✓');
+    logger.debug('Container image is up to date ✓');
   }
 
   return imageName;
@@ -495,12 +496,12 @@ export function getAuthEnv(): { key: string; value: string } {
   );
 }
 
-function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string): string[] {
+function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker'): string[] {
   const auth = getAuthEnv();
   const repoRoot = getLazyRoot();
 
   return [
-    'docker', 'run', '--rm', '--init',
+    binary, 'run', '--rm', '--init',
     '-v', `${repoRoot}:${repoRoot}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
@@ -518,10 +519,11 @@ export async function runClaude(
   sandbox: SandboxConfig,
   verbose: boolean = false,
   debug: boolean = false,
-  model?: string
+  model?: string,
+  binary: string = 'docker',
 ): Promise<ClaudeResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(),
+    ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
@@ -536,10 +538,10 @@ export async function runClaude(
   }
 
   logger.debug('Setting up sandbox...');
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary);
 
   if (debug) {
-    console.log('[DEBUG] Running Docker command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
   logger.info('Running Claude Code...');
@@ -582,10 +584,11 @@ export async function resumeClaude(
   sandbox: SandboxConfig,
   verbose: boolean = false,
   debug: boolean = false,
-  model?: string
+  model?: string,
+  binary: string = 'docker',
 ): Promise<ClaudeResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(),
+    ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
@@ -603,10 +606,10 @@ export async function resumeClaude(
   logger.info('Resuming Claude Code session...');
   logger.debug(`Claude session ID: ${claudeSessionId}`);
 
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary);
 
   if (debug) {
-    console.log('[DEBUG] Running Docker command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
   const proc = Bun.spawn(args, {
@@ -662,13 +665,14 @@ function buildDockerArgsAsync(
   sandbox: SandboxConfig,
   claudeArgs: string[],
   agentBinaryPath: string,
-  imageName: string
+  imageName: string,
+  binary: string = 'docker',
 ): string[] {
   const auth = getAuthEnv();
   const repoRoot = getLazyRoot();
 
   return [
-    'docker', 'run', '-d', '--init',
+    binary, 'run', '-d', '--init',
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,
     '-w', sandbox.worktreePath,
@@ -691,10 +695,11 @@ export async function launchClaudeAsync(
   sandbox: SandboxConfig,
   containerName: string,
   debug: boolean = false,
-  model?: string
+  model?: string,
+  binary: string = 'docker',
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(),
+    ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
@@ -709,10 +714,10 @@ export async function launchClaudeAsync(
   }
 
   logger.debug('Setting up sandbox for async launch...');
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName);
+  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary);
 
   if (debug) {
-    console.log('[DEBUG] Running Docker command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
   logger.info('Launching Claude Code (async)...');
@@ -741,10 +746,11 @@ export async function resumeClaudeAsync(
   sandbox: SandboxConfig,
   containerName: string,
   debug: boolean = false,
-  model?: string
+  model?: string,
+  binary: string = 'docker',
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(),
+    ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
@@ -762,10 +768,10 @@ export async function resumeClaudeAsync(
   logger.info('Launching Claude Code resume (async)...');
   logger.debug(`Claude session ID: ${claudeSessionId}`);
 
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName);
+  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary);
 
   if (debug) {
-    console.log('[DEBUG] Running Docker command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
   const result = Bun.spawnSync(args, {
@@ -786,10 +792,10 @@ export async function resumeClaudeAsync(
  * Check if a Docker container is currently running.
  * Returns false if Docker is not available.
  */
-export function isContainerRunning(containerName: string): boolean {
+export function isContainerRunning(containerName: string, binary: string = 'docker'): boolean {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'ps', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
+      [binary, 'ps', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     return result.exitCode === 0 && result.stdout.toString().trim().length > 0;
@@ -802,10 +808,10 @@ export function isContainerRunning(containerName: string): boolean {
  * Check if a Docker container exists (running or stopped).
  * Returns false if Docker is not available.
  */
-export function containerExists(containerName: string): boolean {
+export function containerExists(containerName: string, binary: string = 'docker'): boolean {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'ps', '-a', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
+      [binary, 'ps', '-a', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     return result.exitCode === 0 && result.stdout.toString().trim().length > 0;
@@ -818,10 +824,10 @@ export function containerExists(containerName: string): boolean {
  * Get the exit code of a stopped container, or null if still running.
  * Returns null if Docker is not available.
  */
-export function getContainerExitCode(containerName: string): number | null {
+export function getContainerExitCode(containerName: string, binary: string = 'docker'): number | null {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}}'],
+      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     if (result.exitCode !== 0) return null;
@@ -839,10 +845,10 @@ export function getContainerExitCode(containerName: string): number | null {
  * Get the stdout output of a stopped container.
  * Returns null if Docker is not available.
  */
-export function getContainerOutput(containerName: string): string | null {
+export function getContainerOutput(containerName: string, binary: string = 'docker'): string | null {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'logs', containerName],
+      [binary, 'logs', containerName],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     if (result.exitCode !== 0) return null;
@@ -856,10 +862,10 @@ export function getContainerOutput(containerName: string): string | null {
  * Get the last N lines of container logs (stdout + stderr combined).
  * Returns null if Docker is not available or container doesn't exist.
  */
-export function getContainerLogs(containerName: string, tailLines: number = 50): string | null {
+export function getContainerLogs(containerName: string, tailLines: number = 50, binary: string = 'docker'): string | null {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'logs', '--tail', String(tailLines), containerName],
+      [binary, 'logs', '--tail', String(tailLines), containerName],
       { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
     if (result.exitCode !== 0) return null;
@@ -876,10 +882,10 @@ export function getContainerLogs(containerName: string, tailLines: number = 50):
  * Remove a Docker container. Logs a warning on failure but does not throw.
  * No-op if Docker is not available.
  */
-export function removeContainer(containerName: string): void {
+export function removeContainer(containerName: string, binary: string = 'docker'): void {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'rm', '-f', containerName],
+      [binary, 'rm', '-f', containerName],
       { stdout: 'ignore', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
     if (result.exitCode !== 0) {
@@ -901,10 +907,10 @@ export interface ContainerInfo {
  * Get detailed info about a container: running state, exit code, and finished time.
  * Returns null if the container doesn't exist or Docker is unavailable.
  */
-export function getContainerInfo(containerName: string): ContainerInfo | null {
+export function getContainerInfo(containerName: string, binary: string = 'docker'): ContainerInfo | null {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
+      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     if (result.exitCode !== 0) return null;
@@ -986,9 +992,10 @@ export async function launchSupervisorAsync(
   containerName: string,
   protocolDir: string,
   debug: boolean = false,
+  binary: string = 'docker',
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(),
+    ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
@@ -998,7 +1005,7 @@ export async function launchSupervisorAsync(
   const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);
 
   const args = [
-    'docker', 'run', '-d', '--init',
+    binary, 'run', '-d', '--init',
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,
     '-v', `${protocolDir}:${protocolDir}`,
@@ -1013,7 +1020,7 @@ export async function launchSupervisorAsync(
   ];
 
   if (debug) {
-    console.log('[DEBUG] Running Docker command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
   logger.info('Launching supervisor container...');

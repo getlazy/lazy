@@ -56,7 +56,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       dockerfile: '',
       toolchain: '',
     },
-    runner: 'docker' as const,
+    runner: { type: 'docker' as const },
     documents: {
       path: '',
     },

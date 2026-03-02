@@ -162,7 +162,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     console.log('');
     console.log('WARNING: Builder is running on the host without isolation.');
     console.log('Agent output may contain prompt injection from untrusted sources.');
-    console.log('Configure runner = "docker" in lazy.toml for safe-by-default execution.');
+    console.log('Configure [runner] type = "docker" in lazy.toml for safe-by-default execution.');
   }
 
   if (isTTY()) {
@@ -199,8 +199,8 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   let exitCode: number;
 
-  if (runner.type === 'docker') {
-    // Docker mode: start an HTTP server on localhost for tool calls.
+  if (runner.usesSandbox()) {
+    // Container mode (Docker/Podman): start an HTTP server on localhost for tool calls.
     // The supervisor inside the container connects via host.docker.internal.
     const dataDir = config.data.path;
     const { configPath, config: builderConfig } = generateBuilderConfig(root, dataDir);

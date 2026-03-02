@@ -334,7 +334,7 @@ export async function cleanupTaskContainer(
  * Returns 0 if the git command fails (e.g. worktree is gone).
  */
 function getDirtyFileCount(worktreePath: string): number {
-  const result = Bun.spawnSync(['git', 'status', '--porcelain'], {
+  const result = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'ignore',

@@ -71,37 +71,6 @@ function checkGitHasCommits(): CheckResult {
   };
 }
 
-function checkDockerInstalled(): CheckResult {
-  try {
-    const result = Bun.spawnSync(['docker', '--version'], {
-      stdout: 'pipe',
-      stderr: 'ignore',
-      timeout: DOCKER_TIMEOUT_MS,
-    });
-    if (result.exitCode === 0) {
-      const raw = result.stdout.toString().trim();
-      const match = raw.match(/Docker version ([^\s,]+)/);
-      const version = match ? match[1] : raw;
-      return { ok: true, label: `Docker installed (v${version})` };
-    }
-  } catch { /* fall through */ }
-  return { ok: false, label: 'Docker installed', detail: 'Docker is not installed. Install it: https://docs.docker.com/get-docker/' };
-}
-
-function checkDockerDaemon(): CheckResult {
-  try {
-    const result = Bun.spawnSync(['docker', 'info'], {
-      stdout: 'ignore',
-      stderr: 'ignore',
-      timeout: DOCKER_TIMEOUT_MS,
-    });
-    if (result.exitCode === 0) {
-      return { ok: true, label: 'Docker daemon running' };
-    }
-  } catch { /* fall through */ }
-  return { ok: false, label: 'Docker daemon running', detail: `Docker daemon is not responsive. Start Docker Desktop or run: ${theme.command('sudo systemctl start docker')}` };
-}
-
 function checkAuth(): CheckResult {
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     return { ok: true, label: 'API auth configured (OAuth token)' };
@@ -158,10 +127,10 @@ function checkDataDir(root: string): CheckResult {
   return { ok: true, label: `Data directory valid (${displayPath})` };
 }
 
-function checkContainerImage(imageName: string): CheckResult {
+function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'image', 'inspect', imageName, '--format', '{{.Id}}'],
+      [binary, 'image', 'inspect', imageName, '--format', '{{.Id}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
     if (result.exitCode === 0 && result.stdout.toString().trim().length > 0) {
@@ -175,7 +144,7 @@ function checkContainerImage(imageName: string): CheckResult {
   };
 }
 
-function checkImageUpToDate(root: string, imageName: string): CheckResult {
+function checkImageUpToDate(root: string, imageName: string, binary: string = 'docker'): CheckResult {
   // Use the same Dockerfile hash logic as the build code in capture/claude.ts.
   // This hashes the custom Dockerfile if configured, or the embedded default
   // Dockerfile — never the project's own Dockerfile at the repo root.
@@ -193,7 +162,7 @@ function checkImageUpToDate(root: string, imageName: string): CheckResult {
 
   try {
     const inspect = Bun.spawnSync(
-      ['docker', 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
+      [binary, 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
     if (inspect.exitCode === 0) {
@@ -373,10 +342,10 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
 // TERMINAL_STATUSES imported from ../../types
 
-async function checkOrphanedContainers(root: string | null): Promise<CheckResult> {
+async function checkOrphanedContainers(root: string | null, binary: string = 'docker'): Promise<CheckResult> {
   try {
     const result = Bun.spawnSync(
-      ['docker', 'ps', '-a', '--filter', 'name=^lazy-', '--format', '{{.Names}} {{.Status}}'],
+      [binary, 'ps', '-a', '--filter', 'name=^lazy-', '--format', '{{.Names}} {{.Status}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
     if (result.exitCode !== 0) {
@@ -434,13 +403,13 @@ async function checkOrphanedContainers(root: string | null): Promise<CheckResult
       parts.push(`${runningOrphans.length} running for completed tasks: ${runningOrphans.join(', ')}`);
     }
 
-    // Stopped containers need docker rm; running orphans need docker rm -f
+    // Stopped containers need rm; running orphans need rm -f
     const cleanupParts: string[] = [];
     if (exitedNames.length > 0) {
-      cleanupParts.push(`docker rm ${exitedNames.join(' ')}`);
+      cleanupParts.push(`${binary} rm ${exitedNames.join(' ')}`);
     }
     if (runningOrphans.length > 0) {
-      cleanupParts.push(`docker rm -f ${runningOrphans.join(' ')}`);
+      cleanupParts.push(`${binary} rm -f ${runningOrphans.join(' ')}`);
     }
 
     return {
@@ -689,31 +658,27 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
   // Determine runner type for conditional checks
   const config = root ? loadConfig(root) : null;
-  const runnerType = config?.runner ?? 'docker';
+  const runnerType = config?.runner?.type ?? 'docker';
   const runner = root ? createRunner(root) : null;
 
-  if (runnerType === 'docker') {
-    results.push(checkDockerInstalled());
-    // Docker daemon check only makes sense if Docker is installed
-    if (results[results.length - 1].ok) {
-      results.push(checkDockerDaemon());
-    }
-  } else {
-    // Host-process mode: check that claude is on PATH
-    try {
-      const claudeResult = Bun.spawnSync(['claude', '--version'], {
-        stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
-      });
-      if (claudeResult.exitCode === 0) {
-        const version = claudeResult.stdout.toString().trim();
-        results.push({ ok: true, label: `Claude Code CLI installed (${version})` });
-      } else {
-        results.push({ ok: false, label: 'Claude Code CLI installed', detail: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
+  const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
+
+  // Runner-specific health checks — each runner knows what it needs.
+  // DockerRunner checks Docker; PodmanRunner checks Podman; HostProcessRunner checks claude CLI.
+  if (runner) {
+    for (const check of runner.diagnose()) {
+      switch (check.state) {
+        case 'ok':
+          results.push({ ok: true, label: check.what });
+          break;
+        case 'warn':
+          results.push({ ok: true, label: check.what, warning: check.reason });
+          break;
+        case 'fail':
+          results.push({ ok: false, label: check.what, detail: check.reason });
+          break;
       }
-    } catch {
-      results.push({ ok: false, label: 'Claude Code CLI installed', detail: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
     }
-    results.push({ ok: true, label: `Runner mode: host-process (no Docker isolation)` });
   }
 
   results.push(checkAuth());
@@ -723,19 +688,24 @@ export async function commandDoctor(args: string[]): Promise<void> {
   results.push(shellResult);
   results.push(checkCompletionsInstalled(shell));
 
-  const dockerOk = runnerType === 'docker' &&
-    results.find(r => r.label.includes('Docker installed'))?.ok &&
-    results.find(r => r.label.startsWith('Docker daemon'))?.ok;
+  // Container-dependent checks only run if the runner's own diagnostics all passed
+  const runnerDiagnosticsOk = runner
+    ? runner.diagnose().every(c => c.state !== 'fail')
+    : false;
 
   if (root) {
     results.push(checkDataDir(root));
 
-    // Docker-dependent checks
-    if (runnerType === 'docker' && dockerOk) {
+    // Container-dependent checks (Docker or Podman) — only if runtime is healthy
+    if (isContainerRunner && runnerDiagnosticsOk) {
       const imageName = resolveImageName(root);
-      results.push(checkContainerImage(imageName));
-      results.push(checkImageUpToDate(root, imageName));
-      results.push(await checkOrphanedContainers(root));
+      results.push(checkContainerImage(imageName, runnerType));
+      results.push(checkImageUpToDate(root, imageName, runnerType));
+      if (runnerType === 'docker') {
+        results.push(await checkOrphanedContainers(root));
+      } else {
+        results.push(await checkOrphanedContainers(root, 'podman'));
+      }
     }
 
     // Detect crashed runs for non-terminal tasks (works for both runner types)

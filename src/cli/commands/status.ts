@@ -85,7 +85,7 @@ export async function commandStatus(args: string[]): Promise<void> {
     console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
 
     if (hasUncommitted) {
-      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain'], { cwd: worktreePath }).stdout.toString();
+      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout.toString();
       const files = gitStatus.trim().split('\n').filter(l => l.trim());
       console.log(`  Modified files: ${files.length}`);
       for (const line of files.slice(0, 10)) {

@@ -217,13 +217,15 @@ describe('lazy init', () => {
     const gitignore = readFileSync(join(tmpDir, '.gitignore'), 'utf-8');
     expect(gitignore).toContain('.lazy-task-sandbox/');
     expect(gitignore).toContain('.lazy/worktrees/');
-    expect(gitignore).toContain('.lazy/logs/');
     expect(gitignore).toContain('.lazy/bin/');
-    expect(gitignore).toContain('.lazy/protocol/');
+    expect(gitignore).toContain('.lazy/logs/');
     expect(gitignore).toContain('.lazy/recovery/');
-    expect(gitignore).toContain('.lazy/tasks/**/*.tmp.*');
-    expect(gitignore).toContain('.lazy/tasks/**/*.backup.*');
-    expect(gitignore).toContain('.lazy/.builder-launched');
+    expect(gitignore).toContain('.lazy/tasks/*/*.tmp.*');
+    expect(gitignore).toContain('.lazy/tasks/*/*.backup.*');
+    expect(gitignore).toContain('.lazy/tasks/*/protocol/');
+    expect(gitignore).toContain('.lazy/storage.lock');
+    expect(gitignore).toContain('.lazy/.reconcile-lock');
+    expect(gitignore).toContain('.lazy/tmp');
   });
 
   test('no Dockerfile → no Dockerfile prompt shown', async () => {

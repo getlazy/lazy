@@ -7,7 +7,8 @@
 
 import type { SandboxConfig } from '../capture/claude';
 import type { ClaudeResponse } from '../types';
-import type { Runner, RunInfo, FollowHandle } from './types';
+import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
+import type { RunnerType } from '../config/types';
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, basename } from 'path';
@@ -55,20 +56,26 @@ const BUILDER_READ_ONLY_TOOLS = [
 ];
 
 export class DockerRunner implements Runner {
-  readonly type = 'docker' as const;
+  readonly type: RunnerType;
   readonly runLabel = 'Container';
+  protected readonly binary: string;
+
+  constructor(binary: string = 'docker', type: RunnerType = 'docker') {
+    this.binary = binary;
+    this.type = type;
+  }
 
   runDisplayName(runName: string): string {
     return runName;
   }
 
   checkAvailability(): void {
-    checkDocker();
+    checkDocker(this.binary);
     getAuthEnv(); // Fail fast on missing auth before creating state
   }
 
   async ensureReady(): Promise<void> {
-    await ensureImage();
+    await ensureImage(this.binary);
     await ensureAgentBinary();
   }
 
@@ -82,7 +89,7 @@ export class DockerRunner implements Runner {
     protocolDir: string,
     debug?: boolean,
   ): Promise<void> {
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false);
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary);
   }
 
   async runClaudeSync(
@@ -92,33 +99,33 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<ClaudeResponse> {
-    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model);
+    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary);
   }
 
   isRunning(runName: string): boolean {
-    return isContainerRunning(runName);
+    return isContainerRunning(runName, this.binary);
   }
 
   runExists(runName: string): boolean {
-    return containerExists(runName);
+    return containerExists(runName, this.binary);
   }
 
   getRunInfo(runName: string): RunInfo | null {
-    return dockerGetContainerInfo(runName);
+    return dockerGetContainerInfo(runName, this.binary);
   }
 
   getRunExitCode(runName: string): number | null {
-    return getContainerExitCode(runName);
+    return getContainerExitCode(runName, this.binary);
   }
 
   getRunLogs(runName: string, tailLines?: number): string | null {
-    return getContainerLogs(runName, tailLines);
+    return getContainerLogs(runName, tailLines, this.binary);
   }
 
   stopRun(runName: string): boolean {
     try {
       const result = Bun.spawnSync(
-        ['docker', 'stop', runName],
+        [this.binary, 'stop', runName],
         { stdout: 'ignore', stderr: 'pipe', timeout: 30_000 },
       );
       return result.exitCode === 0;
@@ -128,13 +135,13 @@ export class DockerRunner implements Runner {
   }
 
   removeRun(runName: string): void {
-    removeContainer(runName);
+    removeContainer(runName, this.binary);
   }
 
   discoverRunningRuns(): string[] {
     try {
       const result = Bun.spawnSync(
-        ['docker', 'ps', '--filter', 'name=^lazy-', '--format', '{{.Names}}'],
+        [this.binary, 'ps', '--filter', 'name=^lazy-', '--format', '{{.Names}}'],
         { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
       if (result.exitCode !== 0) return [];
@@ -148,7 +155,7 @@ export class DockerRunner implements Runner {
 
   followOutput(runName: string, since?: string): FollowHandle | null {
     try {
-      const args = ['docker', 'logs', '--follow'];
+      const args = [this.binary, 'logs', '--follow'];
       if (since) {
         args.push('--since', since);
       } else {
@@ -186,6 +193,60 @@ export class DockerRunner implements Runner {
     };
   }
 
+  diagnose(): HealthCheck[] {
+    const results: HealthCheck[] = [];
+    const timeout = 10_000;
+
+    // Check binary installed
+    try {
+      const result = Bun.spawnSync([this.binary, '--version'], {
+        stdout: 'pipe', stderr: 'ignore', timeout,
+      });
+      if (result.exitCode === 0) {
+        const raw = result.stdout.toString().trim();
+        const match = this.binary === 'podman'
+          ? raw.match(/podman version ([^\s,]+)/)
+          : raw.match(/Docker version ([^\s,]+)/);
+        const version = match ? match[1] : raw;
+        const name = this.binary === 'podman' ? 'Podman' : 'Docker';
+        results.push({ state: 'ok', what: `${name} installed (v${version})` });
+      } else {
+        const name = this.binary === 'podman' ? 'Podman' : 'Docker';
+        const url = this.binary === 'podman'
+          ? 'https://podman.io/docs/installation'
+          : 'https://docs.docker.com/get-docker/';
+        results.push({ state: 'fail', what: `${name} installed`, reason: `${name} is not installed. Install it: ${url}` });
+        return results; // No point checking daemon if binary is missing
+      }
+    } catch {
+      const name = this.binary === 'podman' ? 'Podman' : 'Docker';
+      results.push({ state: 'fail', what: `${name} installed`, reason: `${name} is not installed.` });
+      return results;
+    }
+
+    // Check daemon running
+    try {
+      const result = Bun.spawnSync([this.binary, 'info'], {
+        stdout: 'ignore', stderr: 'ignore', timeout,
+      });
+      if (result.exitCode === 0) {
+        const name = this.binary === 'podman' ? 'Podman' : 'Docker';
+        results.push({ state: 'ok', what: `${name} daemon running` });
+      } else {
+        if (this.binary === 'podman') {
+          results.push({ state: 'fail', what: 'Podman daemon running', reason: 'Podman is not responsive. Start the Podman machine or run: podman machine start' });
+        } else {
+          results.push({ state: 'fail', what: 'Docker daemon running', reason: 'Docker daemon is not responsive. Start Docker Desktop or run: sudo systemctl start docker' });
+        }
+      }
+    } catch {
+      const name = this.binary === 'podman' ? 'Podman' : 'Docker';
+      results.push({ state: 'fail', what: `${name} daemon running`, reason: `${name} is not responsive.` });
+    }
+
+    return results;
+  }
+
   // ----- Builder support -----
 
   getBuilderInstructions(): string {
@@ -200,7 +261,7 @@ export class DockerRunner implements Runner {
     debug?: boolean,
   ): Promise<number> {
     const [imageName, agentBinaryPath] = await Promise.all([
-      ensureImage(),
+      ensureImage(this.binary),
       ensureAgentBinary(),
     ]);
 
@@ -263,9 +324,14 @@ export class DockerRunner implements Runner {
     // Mutating tools (create, start, accept, etc.) still require user confirmation.
     writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
 
-    // Build Docker args: launch lazy-agent in builder mode
+    // Build container args: launch lazy-agent in builder mode
+    // --init provides a proper PID 1 init process (tini/catatonit) that forwards
+    // signals and reaps zombies. Required for Podman where conmon doesn't provide
+    // PID 1 protection, and harmless for Docker. Without it, interactive applications
+    // (like Claude Code's trust prompt TUI) can hang in Podman after terminal mode
+    // switches — see https://github.com/google-gemini/gemini-cli/issues/17275.
     const dockerArgs = [
-      'docker', 'run', '-it', '--rm',
+      this.binary, 'run', '-it', '--init', '--rm',
       '--name', `lazy-builder-${builderId}`,
       // Allow container to reach host TCP server via host.docker.internal
       // (built-in on macOS Docker Desktop; needs this flag on Linux)
@@ -306,7 +372,7 @@ export class DockerRunner implements Runner {
 
     if (debug) {
       dockerArgs.splice(dockerArgs.indexOf(imageName), 0, '-e', 'DEBUG=1');
-      console.log('[DEBUG] Running builder Docker command:', dockerArgs.join(' '));
+      console.log('[DEBUG] Running builder container command:', dockerArgs.join(' '));
     }
 
     logger.info('Launching builder container...');

@@ -93,23 +93,23 @@ function discoverRunningBuilderContainers(runner: Runner): string[] {
 // stopRun is now handled by runner.stopRun()
 
 /**
- * Force-rebuild the Docker image by removing the existing one first.
+ * Force-rebuild the container image by removing the existing one first.
  */
-async function forceRebuildImage(root: string): Promise<string> {
+async function forceRebuildImage(root: string, binary: string = 'docker'): Promise<string> {
   const imageName = resolveImageName(root);
 
   // Remove existing image to force rebuild
   try {
     Bun.spawnSync(
-      ['docker', 'rmi', '-f', imageName],
+      [binary, 'rmi', '-f', imageName],
       { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
   } catch {
-    // Docker not available — ensureImage will handle this
+    // Container runtime not available — ensureImage will handle this
   }
 
   // ensureImage will detect the missing image and rebuild
-  return ensureImage();
+  return ensureImage(binary);
 }
 
 /**
@@ -387,12 +387,14 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // Step 3: Rebuild image and binary
     console.log('\nRebuilding...');
     const config = loadConfig(root);
-    if (config.runner === 'docker') {
+    const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
+    if (isContainerRunner) {
+      const binary = config.runner.type; // 'docker' or 'podman'
       const [imageName] = await Promise.all([
-        forceRebuildImage(root),
+        forceRebuildImage(root, binary),
         forceRebuildAgentBinary(),
       ]);
-      console.log(`  ${theme.success('rebuilt')} Docker image (${imageName})`);
+      console.log(`  ${theme.success('rebuilt')} container image (${imageName})`);
       console.log(`  ${theme.success('rebuilt')} agent binary`);
     } else {
       // Host-process mode: only rebuild agent binary

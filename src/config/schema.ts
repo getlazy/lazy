@@ -8,7 +8,12 @@
  * The 'remote' section's valid keys are extended at runtime by the driver.
  */
 
-/** Known top-level scalar keys (not sections). */
+/**
+ * Known top-level scalar keys (not sections).
+ * 'runner' appears here for backward compat (top-level `runner = "docker"` string)
+ * AND in KNOWN_CONFIG_SCHEMA for the new `[runner]\ntype = "docker"` section format.
+ * The validation logic handles both: strings are skipped, objects are validated as sections.
+ */
 export const KNOWN_TOP_LEVEL_KEYS: readonly string[] = ['runner'];
 
 /** Known top-level sections and their known keys. */
@@ -21,8 +26,16 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   output: ['shortid_length'],
   agent: ['agent_id'],
   server: ['port', 'sync_interval'],
-  remote: ['driver'], // extended at runtime by driver.getConfigOptions()
+  remote: [
+    'driver', 'git_remote',
+    // Driver-specific keys are also valid at the schema level — a user may
+    // configure GitHub keys while temporarily using the local driver, and we
+    // should not warn about them. Drivers extend this list at runtime too.
+    'github_auto_push', 'github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
+    'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
+  ],
   docker: ['dockerfile', 'toolchain'],
+  runner: ['type'],
   documents: ['path'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
@@ -52,8 +65,9 @@ export function findUnknownConfigKeys(
   ];
 
   for (const section of Object.keys(raw)) {
-    // Skip known top-level scalar keys (they are not sections)
-    if (KNOWN_TOP_LEVEL_KEYS.includes(section)) continue;
+    // Skip known top-level scalar keys when they are scalars (backward compat).
+    // If the value is an object, fall through to section validation.
+    if (KNOWN_TOP_LEVEL_KEYS.includes(section) && typeof raw[section] !== 'object') continue;
 
     if (!(section in KNOWN_CONFIG_SCHEMA)) {
       warnings.push(`Unknown config section '[${section}]' in lazy.toml`);

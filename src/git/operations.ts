@@ -265,7 +265,9 @@ export function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: strin
 }
 
 export function hasUncommittedChanges(cwd?: string): boolean {
-  const result = Bun.spawnSync(['git', 'status', '--porcelain'], { cwd });
+  // Exclude .lazy-task-sandbox/ from dirty worktree checks — it contains lazy's own
+  // runtime artifacts (agent sessions, protocol files) and should never affect dirty state.
+  const result = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
   if (result.exitCode !== 0) {
     return false;
   }

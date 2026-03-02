@@ -4,7 +4,7 @@ import type { ModelName } from '../types';
 export type StorageBackendConfig = 'in-repo' | 'orphan-branch' | 'external';
 
 /** Runner types for task execution */
-export type RunnerType = 'docker' | 'dangerously-host-process-without-any-isolation';
+export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
 
 export interface LazyConfig {
   models?: {
@@ -48,7 +48,7 @@ export interface LazyConfig {
     dockerfile?: string;
     toolchain?: string;
   };
-  runner?: RunnerType;
+  runner?: RunnerType | { type?: RunnerType };
   documents?: {
     path?: string;
   };
@@ -97,7 +97,9 @@ export interface ResolvedConfig {
     dockerfile: string;
     toolchain: string;
   };
-  runner: RunnerType;
+  runner: {
+    type: RunnerType;
+  };
   documents: {
     path: string;
   };

@@ -5,6 +5,11 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
+/** Replace the [runner] section's type value in a lazy.toml config string. */
+function setRunnerType(config: string, type: string): string {
+  return config.replace(/^type\s*=\s*"[^"]*"/m, `type = "${type}"`);
+}
+
 describe('runner configuration', () => {
   let ctx: TestContext;
 
@@ -25,7 +30,7 @@ describe('runner configuration', () => {
   test('host-process runner config is recognized', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n${existingConfig}`);
+    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['doctor']);
     // Should show host-process mode checks instead of Docker checks
@@ -41,7 +46,7 @@ describe('runner configuration', () => {
     // Switch to host-process runner
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n${existingConfig}`);
+    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     // List should work — it uses the runner for crash detection only
     const result = await ctx.lazy(['list', '--all']);
@@ -51,7 +56,8 @@ describe('runner configuration', () => {
 
   test('invalid runner config fails with error', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, `runner = "invalid-runner"\n`);
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, setRunnerType(existingConfig, 'invalid-runner'));
 
     // doctor always creates a runner, so it should fail with an invalid runner type
     const result = await ctx.lazy(['doctor']);
@@ -62,7 +68,7 @@ describe('runner configuration', () => {
   test('doctor shows claude CLI check for host-process mode', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n${existingConfig}`);
+    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['doctor']);
     // Should check for Claude Code CLI instead of Docker
@@ -72,18 +78,15 @@ describe('runner configuration', () => {
   test('doctor skips Docker image checks in host-process mode', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n${existingConfig}`);
+    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['doctor']);
     expectOutputExcludes(result, 'Container image');
     expectOutputExcludes(result, 'orphaned containers');
   });
 
-  test('runner config key is not reported as unknown by doctor', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "docker"\n${existingConfig}`);
-
+  test('runner section is not reported as unknown by doctor', async () => {
+    // Default config already has [runner] section — just verify no warnings
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, 'No unknown config options');
   });
@@ -94,10 +97,24 @@ describe('runner configuration', () => {
     // Switch to host-process runner
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n${existingConfig}`);
+    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
     expectOutput(result, 'Show in host-process mode');
+  });
+
+  // INVARIANT: Old top-level `runner = "docker"` format still works (backward compat).
+  // Users with existing configs shouldn't break on upgrade.
+  test('backward compat: top-level runner string is accepted with deprecation warning', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    // Write a minimal config with old format only (no [runner] section)
+    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n[models]\ndefault = "sonnet"\n`);
+
+    const result = await ctx.lazy(['doctor']);
+    // Should work — backward compat converts string to section format
+    expectOutput(result, 'Claude Code CLI');
+    // Deprecation warning goes to stderr
+    expectError(result, "deprecated");
   });
 });

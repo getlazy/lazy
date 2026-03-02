@@ -21,10 +21,6 @@ provision:
       apt-get update
       apt-get install -y git curl unzip
 
-      # Install Node.js 22 (required by claude code's shebang)
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-      apt-get install -y nodejs
-
       # Install GitHub CLI
       curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
@@ -51,8 +47,10 @@ provision:
       # Install claude code globally via bun
       export BUN_INSTALL="$HOME/.bun"
       export PATH="$BUN_INSTALL/bin:$PATH"
-      bun install -g @anthropic-ai/claude-code@latest
 
       # Ensure PATH is set in .bashrc
       echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
       echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc
+
+      # Install claude code globally via curl
+      curl -fsSL https://claude.ai/install.sh | bash

@@ -14,7 +14,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { SandboxConfig } from '../capture/claude';
 import type { ClaudeResponse } from '../types';
-import type { Runner, RunInfo, FollowHandle } from './types';
+import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import { getAuthEnv } from '../capture/claude';
 import { logger } from '../utils/logger';
 
@@ -69,16 +69,24 @@ function pidFileDir(): string {
 
 /**
  * Get the command prefix to re-invoke the current lazy CLI.
- * In compiled mode: ['/path/to/lazy']
- * In dev mode: ['bun', '/path/to/src/index.ts']
+ *
+ * Re-derived at each call site (not cached) so that if the process was
+ * started via `bun run ./src/index.ts` and later resumed via compiled
+ * `lazy`, the correct command is always used.
+ *
+ * Handles these invocation patterns:
+ *   - Compiled:         process.argv = ['/path/to/lazy', 'start', ...]
+ *   - bun script:       process.argv = ['/path/to/bun', '/path/to/src/index.ts', 'start', ...]
+ *   - bun run script:   process.argv = ['/path/to/bun', '/path/to/src/index.ts', 'start', ...]
+ *     (bun strips the 'run' subcommand from argv)
  */
 function getLazyCliCommand(): string[] {
-  // In dev mode, process.argv[1] is the script path (e.g. /path/to/src/index.ts)
-  if (process.argv.length > 1 && /index\.[tj]s$/.test(process.argv[1])) {
-    return [process.argv[0], process.argv[1]];
+  // Dev mode: argv[0] is bun, argv[1] is a TypeScript/JavaScript file
+  if (process.argv.length > 1 && /\.[tj]sx?$/.test(process.argv[1])) {
+    return [process.execPath, process.argv[1]];
   }
   // Compiled mode: just the binary
-  return [process.argv[0]];
+  return [process.execPath];
 }
 
 /** Check if a process with the given PID is alive. */
@@ -206,12 +214,18 @@ export class HostProcessRunner implements Runner {
     // Redirect stdout/stderr to a log file via Bun.file
     const logFileHandle = Bun.file(logFile);
 
+    // Build a clean env: strip CLAUDECODE to prevent "nested session" errors
+    // when lazy is invoked from inside a Claude Code session (e.g., lazy builder).
+    // Docker mode doesn't have this issue because containers get clean environments.
+    const cleanEnv = { ...process.env } as Record<string, string>;
+    delete cleanEnv.CLAUDECODE;
+
     const proc = Bun.spawn(supervisorArgs, {
       cwd: sandbox.worktreePath,
       stdout: logFileHandle,
       stderr: logFileHandle,
       env: {
-        ...process.env as Record<string, string>,
+        ...cleanEnv,
         [auth.key]: auth.value,
         // Ensure HOME is set for Claude Code
         HOME: homedir(),
@@ -256,12 +270,16 @@ export class HostProcessRunner implements Runner {
 
     logger.info('Running Claude Code...');
 
+    // Strip CLAUDECODE to prevent "nested session" errors (same as launchSupervisor).
+    const cleanEnv = { ...process.env } as Record<string, string>;
+    delete cleanEnv.CLAUDECODE;
+
     const proc = Bun.spawn(claudeArgs, {
       cwd: sandbox.worktreePath,
       stdout: 'pipe',
       stderr: verbose || debug ? 'inherit' : 'pipe',
       env: {
-        ...process.env as Record<string, string>,
+        ...cleanEnv,
         [auth.key]: auth.value,
         HOME: homedir(),
       },
@@ -452,6 +470,28 @@ export class HostProcessRunner implements Runner {
       command: lazyCmd[0],
       args: [...lazyCmd.slice(1), 'mcp', '--task-id', taskId, '--worktree', worktreePath],
     };
+  }
+
+  diagnose(): HealthCheck[] {
+    const results: HealthCheck[] = [];
+
+    // Check that claude is on PATH
+    try {
+      const result = Bun.spawnSync(['claude', '--version'], {
+        stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
+      });
+      if (result.exitCode === 0) {
+        const version = result.stdout.toString().trim();
+        results.push({ state: 'ok', what: `Claude Code CLI installed (${version})` });
+      } else {
+        results.push({ state: 'fail', what: 'Claude Code CLI installed', reason: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
+      }
+    } catch {
+      results.push({ state: 'fail', what: 'Claude Code CLI installed', reason: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
+    }
+
+    results.push({ state: 'ok', what: 'Runner mode: host-process (no container isolation)' });
+    return results;
   }
 
   // ----- Builder support -----

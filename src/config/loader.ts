@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import type { LazyConfig, ResolvedConfig } from './types';
 
-const CONFIG_FILENAME = 'lazy.toml';
+const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
 let _configOverrideWarned = false;
 
@@ -19,7 +19,7 @@ function findConfigDir(lazyRoot: string): string {
     if (existsSync(join(dir, CONFIG_FILENAME))) {
       if (dir !== root && !_configOverrideWarned) {
         _configOverrideWarned = true;
-        console.warn(`Warning: Using lazy.toml from ${dir} (not the git root ${root})`);
+        console.warn(`Warning: Using ${CONFIG_FILENAME} from ${dir} (not the git root ${root})`);
       }
       return dir;
     }
@@ -75,7 +75,9 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     dockerfile: '',
     toolchain: '',
   },
-  runner: 'docker',
+  runner: {
+    type: 'docker',
+  },
   documents: {
     path: '',
   },
@@ -168,8 +170,20 @@ export function loadConfig(lazyRoot: string): ResolvedConfig {
     );
   }
 
+  // Backward compat: top-level `runner = "docker"` (string) → `runner.type = "docker"`
+  if (typeof raw.runner === 'string') {
+    console.warn(
+      `Warning: Top-level 'runner' in lazy.toml is deprecated. Move it to:\n` +
+      `  [runner]\n` +
+      `  type = "${raw.runner}"`,
+    );
+    parsed.runner = { type: raw.runner as import('./types').RunnerType };
+  }
+
   // Merge with defaults
-  return deepMerge(DEFAULT_CONFIG, parsed);
+  // After backward-compat normalization above, runner is always object form.
+  // Cast to satisfy DeepPartial<ResolvedConfig> which expects { type: RunnerType }.
+  return deepMerge(DEFAULT_CONFIG, parsed as DeepPartial<ResolvedConfig>);
 }
 
 /**
@@ -201,6 +215,8 @@ export function getDefaultConfigTemplate(storageBackend?: 'in-repo' | 'external'
   const remoteName = gitRemote || 'origin';
 
   return `# lazy.toml - Configuration for lazy
+# Override the config filename with the LAZY_CONFIG environment variable
+# (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
 [models]
 # Default model for sessions
@@ -247,6 +263,12 @@ port = 26024
 # Interval in seconds for background sync when running lazy server (0 to disable)
 # sync_interval = 60
 
+[runner]
+# Runner type: "docker" (default), "podman", or "dangerously-host-process-without-any-isolation"
+# Docker/Podman modes run agents in isolated containers. Host-process mode runs agents
+# directly on the host — use only in VMs or other already-isolated environments.
+type = "docker"
+
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
 driver = "local"
@@ -258,11 +280,6 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 # When using the GitLab driver, these options are also available:
 # gitlab_auto_push = true   # Automatically push after each agent turn
 # Authentication is handled by glab CLI (run: glab auth login)
-
-# Runner mode: "docker" (default) or "dangerously-host-process-without-any-isolation"
-# Docker mode runs agents in isolated containers. Host-process mode runs agents
-# directly on the host — use only in VMs or other already-isolated environments.
-# runner = "docker"
 
 [docker]
 # Auto-detected or manually set toolchain (e.g., "node", "rust", "ruby-rails")

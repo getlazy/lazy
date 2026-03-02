@@ -445,7 +445,7 @@ async function handleCompletedResponse(
   try {
     if (hasUncommittedChanges(worktreePath)) {
       const uncommittedDiff = getUncommittedDiff(worktreePath);
-      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain'], { cwd: worktreePath }).stdout.toString();
+      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout.toString();
       await storage.createWorktreeSnapshot(session.id, agentTurnSeq, uncommittedDiff, gitStatus);
     }
   } catch {

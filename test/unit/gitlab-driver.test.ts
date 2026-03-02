@@ -29,7 +29,7 @@ const mockConfig: ResolvedConfig = {
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: 'docker' as const,
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
 };

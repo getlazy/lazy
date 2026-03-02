@@ -714,7 +714,7 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
       });
       branch = branchResult.exitCode === 0 ? branchResult.stdout.toString().trim() : '';
 
-      const statusResult = Bun.spawnSync(['git', 'status', '--porcelain'], {
+      const statusResult = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
         cwd,
         stdout: 'pipe',
         stderr: 'pipe',

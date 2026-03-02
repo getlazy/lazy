@@ -475,14 +475,15 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   const ignoreEntries = [
     '.lazy-task-sandbox/',
     '.lazy/worktrees/',
-    '.lazy/logs/',
     '.lazy/bin/',
-    '.lazy/protocol/',
+    '.lazy/logs/',
     '.lazy/recovery/',
-    '.lazy/tmp/',
-    '.lazy/tasks/**/*.tmp.*',
-    '.lazy/tasks/**/*.backup.*',
-    '.lazy/.builder-launched',
+    '.lazy/tasks/*/*.tmp.*',
+    '.lazy/tasks/*/*.backup.*',
+    '.lazy/tasks/*/protocol/',
+    '.lazy/storage.lock',
+    '.lazy/.reconcile-lock',
+    '.lazy/tmp',
   ];
 
   if (existsSync(gitignorePath)) {
@@ -499,6 +500,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   } else {
     writeFileSync(gitignorePath, ignoreEntries.join('\n') + '\n');
   }
+  console.log('Adding lazy entries to .gitignore');
 
   // Display storage location
   let storageDesc: string;

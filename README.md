@@ -3,7 +3,7 @@
 Lazy is three things:
 
 * A [proxy](#the-proxy) for AI-human collaboration: Lazy captures conversations, reviews, and decisions in a searchable data store, under your control.
-* A secure, locally hosted agent [orchestrator](#the-orchestrator): Lazy is at the same time a software development lead (aka builder) and a fleet of agents working on your behalf
+* A secure, locally hosted agent [orchestrator](#the-orchestrator): Lazy is at the same time a software development lead (aka builder) and a fleet of autonomous agents working on your behalf
 * An integrated [software development lifecycle](#the-task-manager) tool. Lazy treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction rather than an afterthought.
 
 ## Core Concepts
@@ -17,27 +17,29 @@ Lazy is three things:
 
 Lazy is **alpha software** under active development. The core workflow is stable, but:
 
-- Breaking changes may occur in storage schema or CLI interface
-- Some (maybe even most) features are experimental (marked in `--help` output)
-- Error messages are improving but may be cryptic
 - I make no guarantees to its quality, correctness or safety
+- Breaking changes may occur in storage schema or CLI interface
+- Some (maybe even most) features are experimental
+- Error messages are improving but may be cryptic
 
 Lazy is definitely not in an awesome shape, it's test fail, it's inconsistent, etc. but it's very, very fun to use. At least for me!
 
 ### Contributing
 
-Lazy is actively developed. You can contribute by:
+Lazy is being actively developed. You can contribute by:
 
 - Reporting [bugs or feature](https://github.com/getlazy/lazy/issues) requests
-- Submitting [**Prompt** Requests](https://github.com/getlazy/lazy/issues) for fixes or enhancements also
+- Submitting [**Prompt** Requests](https://github.com/getlazy/lazy/issues) for fixes or enhancements.
 
-Lazy is built using lazy itself. At this time, I am not accepting code contributions to its code base.
+Lazy is built using lazy itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
 
 ## Motivations
 
 ### Why build this
 
-On one hand I felt that by throwing away prompts, we are not raising the abstraction of software development. On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do.
+On one hand I felt that by throwing away prompts, we are not raising the abstraction of software development. I feel that that is akin to writing in a higher level language, compiling that to machine or p-code, then committing *that* code and deleting the original source code. It's not *exactly* the same of course but it is... akin.
+
+On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do. I don't want to chat with agents and become a blocker. Instead, I want to give them actionable feedback, asynchronously, on my own good time, and let them do their thing in the meantime.
 
 ### Why "lazy"
 
@@ -76,15 +78,19 @@ Lazy is a thin proxy that sits between you and AI coding agents, managing tasks 
 - Use deterministic CLI tools for that task and work management including agent feedback
 - Or do both at the same time!
 
-All builder and agent sessions run in isolated containers with only the repo being mounted on them. Each tasks gets its own worktree and branch as a sandbox.
+All builder and agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and git branch.
 
-The mechanism for isolation is [Docker](https://docker.com). Docker is a lousy choice for *development*  but it's easy to isolate. Alternative is to run lazy on its own VM and direct processes mode - but this is still highly experimental. I **strongly discourage** running lazy on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
+The process isolation is necessary as lazy runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the builder agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
+
+The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run lazy on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running lazy on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
 
 ### The task manager
 
 - Create tasks with explicit goals and prompts for agents, track them through turns, accept or reject them
 - Assemble tasks into larger coherent wholes (features, releases) and hierarchies (tasks -> features -> releases -> main)
 - Sync with remote repos for PR creation, comment syncing, and remote collaboration (GitHub and GitLab support)
+
+The feel is one of task-aware git. For example, if an agent is working on a task and you accept its sub-task, lazy will refuse to merge until the parent task has finished running. Also, on every agent turn, the first thing that is done is syncing with upstream (parent's branch) and resolving conflicts. This can sometimes lead to suboptimal results but the sooner the conflicts are resolved the better it is. And in case the task is really falling behind its parent, then you can always run `lazy redo` to redo the task from scratch (from parent's current HEAD). This is in a way `rebase` powered by LLMs.
 
 ## Prerequisites
 
@@ -596,7 +602,3 @@ Coding is cheap, prompts are valuable, this will inject the original prompt plus
 - **Repository**: [github.com/getlazy/lazy](https://github.com/getlazy/lazy)
 - **Issues**: [github.com/getlazy/lazy/issues](https://github.com/getlazy/lazy/issues)
 - **Claude Code**: [claude.ai/claude-code](https://claude.ai/claude-code)
-
-## Changelog
-
-### 2026-02-28, v0.5: first public release

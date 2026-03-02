@@ -117,8 +117,8 @@ export function commitChanges(worktreePath: string, message: string): boolean {
     throw new Error(`Failed to stage changes: ${add.stderr.toString()}`);
   }
 
-  // Check if there's anything to commit
-  const status = Bun.spawnSync(['git', 'status', '--porcelain'], { cwd: worktreePath });
+  // Check if there's anything to commit (exclude lazy sandbox artifacts)
+  const status = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath });
   if (status.exitCode !== 0 || status.stdout.toString().trim() === '') {
     return false; // Nothing to commit
   }
