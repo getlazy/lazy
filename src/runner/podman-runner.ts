@@ -12,14 +12,15 @@
  */
 
 import { DockerRunner } from './docker-runner';
+import type { DockerRunnerOptions } from './docker-runner';
 import { getAuthEnv } from '../capture/claude';
 import { logger } from '../utils/logger';
 
 const PODMAN_TIMEOUT_MS = 10_000;
 
 export class PodmanRunner extends DockerRunner {
-  constructor() {
-    super('podman', 'podman');
+  constructor(options?: DockerRunnerOptions) {
+    super('podman', 'podman', options);
   }
 
   /**

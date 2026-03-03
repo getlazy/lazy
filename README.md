@@ -166,8 +166,9 @@ glab auth login
 ## Quick Start
 
 ```bash
-# Initialize lazy in your git repository
-cd your-project/
+# Initialize lazy in your git repository. This will detect the remote repository
+# and other things like different runners (e.g. is there Docker)
+cd your-hello-lazy-project/
 lazy init
 
 # Launch the agent in interactive mode with an additional Lazy's system prompt
@@ -193,6 +194,40 @@ lazy accept <task-id>
 # Or reject if it's not right
 lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 ```
+
+## Real-World Configurations
+
+What follows are recommendations for real-world configurations.
+
+### Host development
+
+If developing on host, I **strongly** encourage leaving the default docker runner. It is built for this use case where its necessary to isolate autonomous agents from the host system. When running in docker, the agents only have access to repo itself and network (by default - though that can be turned off) and nothing else.
+
+```
+[runner]
+type = "docker"
+```
+
+Or just leave out the configuration of the runner - it's docker by default.
+
+### VM development
+
+If you have a complex toolchain, I recommend developing in an isolated VM, which doesn't have anything but the repo and the toolchain. I **strongly** recommend creating a specifically crafted token for remote repositories to minimize any dangers of possible prompt injections affecting remote repositories.
+
+If all of the above is true, then yes, with trepidation, you can use:
+
+```
+[runner]
+type = "dangerously-host-process-without-any-isolation"
+```
+
+The name says it all - you really **ought** to **never** run like that unless in an isolated environment.
+
+Regarding VM, there is one more thing that you will likely want to do which is to configure a different lazy.tom file to be used inside of VM. This is useful if you sometimes work in the VM and sometimes on the host or if there is a difference the way team mates work. To make use of that, override `LAZY_CONFIG` envvar inside of the VM to point to the alternative lazy.toml. For example, in this repo you will find `lazy.lima.toml` which uses this technique to pass the correct **VM** configuration which has the host runners unlike the host lima configuration which uses docker runners.
+
+### Centralized Store
+
+Starting with release v0.6, PostgreSQL can be used for centralized lazy store. This allows team coordination and collaboration which is difficult and prone to conflicts with same-repo storage configurations. That said, I wouldn't call support for it 1st class because lazy still lacks guarantees around say starting one task on one machine and finishing it on another. As a matter of fact, this should "just work", but it has not been thoroughly tested and depends very much on running `lazy sync` after each turn.
 
 ## Details
 
@@ -300,29 +335,7 @@ Configuration lives in `lazy.toml` at the repository root. Created by `lazy init
 
 ### Example Configuration
 
-```toml
-[models]
-# default = "sonnet"  # Options: "sonnet", "opus", "haiku" or leave it unset for builder to decide
-# In each turn you can always upgrade or downgrade the agent that is working on the task
-
-[storage]
-backend = "orphan-branch"          # Options: "in-repo", "orphan-branch", "external"
-orphan_branch_name = "lazy-state"  # Branch name for orphan-branch backend
-# external_path = ""        # Path for external backend - can be a separate repo
-
-[git]
-default_branch_prefix = "lazy"  # Branch naming: lazy/task-code-with-disambiguation
-
-[docker]
-toolchain = ""  # Override auto-detected toolchain
-# dockerfile = ""  # Path to custom Dockerfile
-# Toolchain options: base, bun, node, deno, rust, go, cpp, ruby-rails,
-#   ruby-rails-rust, dotnet, python, python-ml, java, kotlin, swift
-# To list all toolchains run `lazy system toolchains`
-
-[remote]
-driver = "local"  # Options: "local", "github", "gitlab"
-```
+See [`lazy.toml.exammple`](./lazy.toml.example)
 
 Run `lazy doctor` to validate your configuration.
 

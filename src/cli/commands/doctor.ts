@@ -85,6 +85,83 @@ function checkAuth(): CheckResult {
   };
 }
 
+async function checkPostgresConnectivity(config: ResolvedConfig): Promise<CheckResult> {
+  if (config.storage.backend !== 'postgres') {
+    return { ok: true, label: 'PostgreSQL connectivity (not using postgres backend)' };
+  }
+
+  // Credentials come from environment variables, never from lazy.toml
+  const url = process.env.LAZY_POSTGRES_URL;
+  const host = process.env.PGHOST ?? 'localhost';
+  const port = process.env.PGPORT ? parseInt(process.env.PGPORT, 10) : 5432;
+  const database = process.env.PGDATABASE ?? 'lazy';
+
+  if (!url && !process.env.PGHOST) {
+    return {
+      ok: false,
+      label: 'PostgreSQL connectivity',
+      detail: 'No PostgreSQL connection configured. Set LAZY_POSTGRES_URL in .env or set PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD.',
+    };
+  }
+
+  try {
+    const postgres = await import('postgres');
+    const ssl = config.storage.postgres_ssl ? { rejectUnauthorized: true } : undefined;
+    const sql = url
+      ? postgres.default(url, { max: 1, ssl })
+      : postgres.default({
+          host,
+          port,
+          database,
+          user: process.env.PGUSER,
+          password: process.env.PGPASSWORD,
+          max: 1,
+          ssl,
+        });
+
+    try {
+      // Test connection with a simple query
+      await sql`SELECT 1 as test`;
+
+      // Check schema version
+      const [version] = await sql`
+        SELECT version FROM schema_version ORDER BY version DESC LIMIT 1
+      `.catch(() => [] as { version: number }[]);
+
+      await sql.end();
+
+      const connLabel = url ? 'LAZY_POSTGRES_URL' : `${host}:${port}/${database}`;
+      if (version) {
+        return {
+          ok: true,
+          label: `PostgreSQL connected (${connLabel}, schema v${version.version})`
+        };
+      } else {
+        return {
+          ok: true,
+          label: `PostgreSQL connected (${connLabel}, schema not initialized)`,
+          warning: 'Schema not initialized. Run any lazy command to initialize the database schema.'
+        };
+      }
+    } catch (err) {
+      await sql.end();
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        label: 'PostgreSQL connectivity',
+        detail: `Failed to connect to PostgreSQL: ${message}\n  Check LAZY_POSTGRES_URL in .env or PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD env vars.`,
+      };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      label: 'PostgreSQL connectivity',
+      detail: `Failed to load postgres driver: ${message}`,
+    };
+  }
+}
+
 function checkDataDir(root: string): CheckResult {
   const dataDir = getDataDir(root);
   const dataPath = join(root, dataDir);
@@ -99,6 +176,9 @@ function checkDataDir(root: string): CheckResult {
   let displayPath: string;
 
   switch (config.storage.backend) {
+    case 'postgres':
+      // PostgreSQL backend doesn't use local directories
+      return { ok: true, label: 'Data storage valid (PostgreSQL)' };
     case 'external': {
       let externalPath = config.storage.external_path;
       if (!externalPath || externalPath === '') {
@@ -359,45 +439,60 @@ async function checkOrphanedContainers(root: string | null, binary: string = 'do
 
     const lines = output.split('\n');
 
-    // Stopped containers are always orphaned
+    // Extract stopped and running container names
     const exitedNames = lines
       .filter(l => l.includes('Exited'))
       .map(l => l.split(' ')[0]);
 
-    // Running containers may be orphaned if their task is in a terminal state
     const runningNames = lines
       .filter(l => l.includes('Up'))
       .map(l => l.split(' ')[0]);
 
+    // Filter containers to only those belonging to the current project
+    const exitedOrphans: string[] = [];
     const runningOrphans: string[] = [];
-    if (root && runningNames.length > 0) {
+
+    if (root) {
       let storage;
       try {
         storage = await createStorage(root);
-        for (const name of runningNames) {
-          // Container names follow the pattern lazy-{taskShortId}
+
+        // Check stopped containers - orphaned if task belongs to this project
+        for (const name of exitedNames) {
           const taskShortId = name.replace(/^lazy-/, '');
           if (!taskShortId) continue;
           const task = await storage.getTask(taskShortId);
+          // Only report if task exists in this project (meaning container belongs here)
+          if (task) {
+            exitedOrphans.push(name);
+          }
+        }
+
+        // Check running containers - orphaned if task is in terminal state in this project
+        for (const name of runningNames) {
+          const taskShortId = name.replace(/^lazy-/, '');
+          if (!taskShortId) continue;
+          const task = await storage.getTask(taskShortId);
+          // Only report if task exists in this project AND is in terminal status
           if (task && TERMINAL_STATUSES.has(task.status)) {
             runningOrphans.push(name);
           }
         }
       } catch {
-        // Storage unavailable — skip running container checks
+        // Storage unavailable — skip checks
       } finally {
         if (storage) await storage.close();
       }
     }
 
-    const allOrphans = [...exitedNames, ...runningOrphans];
+    const allOrphans = [...exitedOrphans, ...runningOrphans];
     if (allOrphans.length === 0) {
       return { ok: true, label: 'No orphaned containers' };
     }
 
     const parts: string[] = [];
-    if (exitedNames.length > 0) {
-      parts.push(`${exitedNames.length} stopped: ${exitedNames.join(', ')}`);
+    if (exitedOrphans.length > 0) {
+      parts.push(`${exitedOrphans.length} stopped: ${exitedOrphans.join(', ')}`);
     }
     if (runningOrphans.length > 0) {
       parts.push(`${runningOrphans.length} running for completed tasks: ${runningOrphans.join(', ')}`);
@@ -405,8 +500,8 @@ async function checkOrphanedContainers(root: string | null, binary: string = 'do
 
     // Stopped containers need rm; running orphans need rm -f
     const cleanupParts: string[] = [];
-    if (exitedNames.length > 0) {
-      cleanupParts.push(`${binary} rm ${exitedNames.join(' ')}`);
+    if (exitedOrphans.length > 0) {
+      cleanupParts.push(`${binary} rm ${exitedOrphans.join(' ')}`);
     }
     if (runningOrphans.length > 0) {
       cleanupParts.push(`${binary} rm -f ${runningOrphans.join(' ')}`);
@@ -695,6 +790,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
   if (root) {
     results.push(checkDataDir(root));
+    results.push(await checkPostgresConnectivity(config!));
 
     // Container-dependent checks (Docker or Podman) — only if runtime is healthy
     if (isContainerRunner && runnerDiagnosticsOk) {

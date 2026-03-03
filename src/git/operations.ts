@@ -1,4 +1,7 @@
+import { existsSync, mkdirSync, copyFileSync, statSync, chmodSync } from 'fs';
+import { join, dirname } from 'path';
 import { LAZY_COAUTHOR_TRAILER } from '../constants';
+import { logger } from '../utils/logger';
 
 export interface GitCommitInfo {
   sha: string;
@@ -589,5 +592,53 @@ export function squashMergeTaskBranch(
 ): void {
   const commitMessage = buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root);
   squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
+}
+
+/**
+ * Copy untracked files matching glob patterns into a worktree.
+ * Used to copy files like .env that aren't checked into git but are needed at runtime.
+ */
+export function copyUntrackedFilesIntoWorktree(
+  repoRoot: string,
+  worktreePath: string,
+  includePatterns: string[],
+): void {
+  if (includePatterns.length === 0) return;
+
+  for (const pattern of includePatterns) {
+    const glob = new Bun.Glob(pattern);
+
+    // Scan the repo root for matches (dot: true enables matching dotfiles like .env)
+    for (const relativePath of glob.scanSync({ cwd: repoRoot, absolute: false, onlyFiles: true, dot: true })) {
+      const sourcePath = join(repoRoot, relativePath);
+      const destPath = join(worktreePath, relativePath);
+
+      // Skip if file doesn't exist (shouldn't happen with scanSync but be safe)
+      if (!existsSync(sourcePath)) continue;
+
+      // Skip if file is tracked by git
+      const checkTracked = Bun.spawnSync(
+        ['git', 'ls-files', '--error-unmatch', relativePath],
+        { cwd: repoRoot, stdout: 'ignore', stderr: 'ignore' }
+      );
+      if (checkTracked.exitCode === 0) {
+        // File is tracked, skip it
+        continue;
+      }
+
+      // Create parent directories in worktree
+      const destDir = dirname(destPath);
+      if (!existsSync(destDir)) {
+        mkdirSync(destDir, { recursive: true });
+      }
+
+      // Copy file preserving permissions
+      copyFileSync(sourcePath, destPath);
+      const stats = statSync(sourcePath);
+      chmodSync(destPath, stats.mode);
+
+      logger.info(`Copied ${relativePath} to worktree`);
+    }
+  }
 }
 

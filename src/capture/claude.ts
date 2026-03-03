@@ -24,30 +24,20 @@ export interface SandboxConfig {
   sandboxPath: string;
 }
 
+export interface DockerRunOptions {
+  dockerAgentRoot?: boolean;
+  dockerAgentNoNetwork?: boolean;
+}
+
 const IMAGE_NAME = 'lazy-runner';
 const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
 // Timeout for Docker inspection commands (ms). Prevents process hangs if Docker daemon is unresponsive.
 const DOCKER_TIMEOUT_MS = 10_000;
 
 /**
- * Default Dockerfile for lazy containers.
- * Used when the project doesn't have its own Dockerfile.
- * This is lazy infrastructure, not project-specific.
+ * Default Dockerfile uses the base toolchain — no duplication.
  */
-const DEFAULT_DOCKERFILE = `FROM oven/bun:slim
-
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
-# bun install -g puts packages in /root/.bun/ and symlinks binaries to /usr/local/bin/.
-# The symlinks point into /root/ which is 700 by default, so the non-root user can't
-# follow them. Open /root for traversal so the "user" account can run claude.
-RUN bun install -g @anthropic-ai/claude-code@latest && chmod o+x /root && chmod -R o+rX /root/.bun
-
-RUN useradd -m -s /bin/bash user
-USER user
-
-WORKDIR /work
-`;
+const DEFAULT_DOCKERFILE = getToolchainDockerfileContent('base');
 
 /**
  * Map friendly model names to Claude model IDs
@@ -496,12 +486,14 @@ export function getAuthEnv(): { key: string; value: string } {
   );
 }
 
-function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker'): string[] {
+function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', options?: DockerRunOptions): string[] {
   const auth = getAuthEnv();
   const repoRoot = getLazyRoot();
 
   return [
     binary, 'run', '--rm', '--init',
+    ...(options?.dockerAgentRoot ? ['--user', 'root'] : []),
+    ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '-v', `${repoRoot}:${repoRoot}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
@@ -521,6 +513,7 @@ export async function runClaude(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
+  dockerOptions?: DockerRunOptions,
 ): Promise<ClaudeResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
@@ -538,7 +531,7 @@ export async function runClaude(
   }
 
   logger.debug('Setting up sandbox...');
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, dockerOptions);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -667,12 +660,15 @@ function buildDockerArgsAsync(
   agentBinaryPath: string,
   imageName: string,
   binary: string = 'docker',
+  options?: DockerRunOptions,
 ): string[] {
   const auth = getAuthEnv();
   const repoRoot = getLazyRoot();
 
   return [
     binary, 'run', '-d', '--init',
+    ...(options?.dockerAgentRoot ? ['--user', 'root'] : []),
+    ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,
     '-w', sandbox.worktreePath,
@@ -993,6 +989,7 @@ export async function launchSupervisorAsync(
   protocolDir: string,
   debug: boolean = false,
   binary: string = 'docker',
+  dockerOptions?: DockerRunOptions,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
@@ -1006,6 +1003,8 @@ export async function launchSupervisorAsync(
 
   const args = [
     binary, 'run', '-d', '--init',
+    ...(dockerOptions?.dockerAgentRoot ? ['--user', 'root'] : []),
+    ...(dockerOptions?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,
     '-v', `${protocolDir}:${protocolDir}`,

@@ -162,7 +162,7 @@ async function checkDriverHealth(driverName: string): Promise<void> {
 }
 
 interface StorageChoice {
-  backend: 'in-repo' | 'external' | 'orphan-branch';
+  backend: 'in-repo' | 'external' | 'orphan-branch' | 'postgres';
   path?: string;
 }
 
@@ -276,6 +276,7 @@ async function chooseGitRemote(repoDir: string): Promise<string> {
  */
 async function promptStorageChoice(targetDir: string, gitRemote: string = 'origin'): Promise<StorageChoice> {
   const options = [
+    'PostgreSQL: Shared database for team collaboration\n     Best for teams. Requires PostgreSQL server (configure via LAZY_POSTGRES_URL or PG* env vars).',
     'External (recommended): Outside the repo in ~/.lazy/<project-name>\n     Keeps repo completely clean. Not tracked in git.',
     'Orphan branch: Git orphan branch "lazy-state"\n     Keeps code branches clean. Tracked in git separately.',
     'In-repo (not recommended): .lazy/ directory on the default branch\n     Simple but noisy. State files appear in your working tree and commits.',
@@ -285,7 +286,10 @@ async function promptStorageChoice(targetDir: string, gitRemote: string = 'origi
   const choice = await promptChoice('Where would you like to store lazy state?', options);
 
   switch (choice) {
-    case 0: {
+    case 0:
+      return { backend: 'postgres' };
+
+    case 1: {
       const projectName = getProjectName(targetDir, gitRemote);
       const defaultPath = join(homedir(), '.lazy', projectName);
       console.log('');
@@ -293,15 +297,15 @@ async function promptStorageChoice(targetDir: string, gitRemote: string = 'origi
       return { backend: 'external', path };
     }
 
-    case 1:
+    case 2:
       return { backend: 'orphan-branch' };
 
-    case 2:
+    case 3:
       return { backend: 'in-repo' };
 
     default:
       // promptChoice defaults to 0 on invalid input, so this shouldn't happen
-      return { backend: 'external' };
+      return { backend: 'postgres' };
   }
 }
 
@@ -412,6 +416,9 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     storagePath = storageChoice.path || join(homedir(), '.lazy', getProjectName(targetDir, gitRemote));
     // Create external directory if it doesn't exist
     mkdirSync(storagePath, { recursive: true });
+  } else if (storageChoice.backend === 'postgres') {
+    // PostgreSQL storage doesn't use local paths
+    storagePath = lazyPath;
   } else {
     // in-repo or orphan-branch
     storagePath = lazyPath;
@@ -473,6 +480,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // Update .gitignore
   const gitignorePath = join(targetDir, '.gitignore');
   const ignoreEntries = [
+    '.env',
     '.lazy-task-sandbox/',
     '.lazy/worktrees/',
     '.lazy/bin/',
@@ -504,7 +512,13 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
   // Display storage location
   let storageDesc: string;
-  if (storageChoice.backend === 'external') {
+  if (storageChoice.backend === 'postgres') {
+    const url = process.env.LAZY_POSTGRES_URL;
+    const host = process.env.PGHOST ?? 'localhost';
+    const database = process.env.PGDATABASE ?? 'lazy';
+    const connLabel = url ? 'LAZY_POSTGRES_URL' : `${host}/${database}`;
+    storageDesc = `postgres (${connLabel})`;
+  } else if (storageChoice.backend === 'external') {
     storageDesc = `external (${storagePath})`;
   } else if (storageChoice.backend === 'orphan-branch') {
     storageDesc = 'orphan-branch (lazy-state)';

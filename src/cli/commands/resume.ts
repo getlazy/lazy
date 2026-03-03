@@ -5,7 +5,7 @@ import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, valida
 import { getAuthEnv, getModelId } from '../../capture/claude';
 import { recoverMissingWorktree } from '../../git/operations';
 import { loadConfig } from '../../config/loader';
-import { createRunner } from '../../runner';
+import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { followContainer } from './shared';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
@@ -91,6 +91,8 @@ export async function commandResume(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'follow', takesValue: false },
     { name: 'model', takesValue: true },
+    { name: 'docker-agent-root', takesValue: false },
+    { name: 'docker-agent-no-network', takesValue: false },
   ], 'resume');
 
   const taskId = parsed.positional[0];
@@ -101,6 +103,8 @@ export async function commandResume(args: string[]): Promise<void> {
 
   // Parse flags
   const follow = parsed.flags.get('follow') === true;
+  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
+  const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
   const modelValue = parsed.flags.get('model') as string | undefined;
   let modelOverride: ModelName | undefined;
@@ -146,7 +150,10 @@ export async function commandResume(args: string[]): Promise<void> {
     rejectIfPairing(root, tRef, displayId(task));
 
     // Pre-flight checks
-    const runner = createRunner(root);
+    const dockerOptions: Partial<DockerRunnerOptions> = {};
+    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
+    if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
+    const runner = createRunner(root, dockerOptions);
     try {
       runner.checkAvailability();
     } catch (err) {
@@ -353,6 +360,8 @@ Arguments:
 Options:
   --model <model>    Override model for this session (sonnet, opus, haiku)
   --follow           Wait for the agent to finish, streaming output in real time
+  --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
+  --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
 
 Examples:
   lazy resume abc12345

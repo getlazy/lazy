@@ -15,7 +15,7 @@ const mockConfig: ResolvedConfig = {
   models: { default: 'sonnet' as const },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'in-repo', orphan_branch_name: 'lazy-data', external_path: '' },
+  storage: { backend: 'in-repo', orphan_branch_name: 'lazy-data', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
   agent: { agent_id: 'test-agent' },
@@ -29,9 +29,10 @@ const mockConfig: ResolvedConfig = {
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const },
+  runner: { type: 'docker' as const, docker_agent_root: false, docker_agent_no_network: false },
   documents: { path: '' },
   features: {},
+  worktree: { include: [] },
 };
 
 function makeTask(overrides?: Partial<Task>): Task {

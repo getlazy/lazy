@@ -21,7 +21,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   models: ['default'],
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
-  storage: ['backend', 'orphan_branch_name', 'external_path'],
+  storage: ['backend', 'orphan_branch_name', 'external_path', 'postgres_ssl'],
   git: ['default_branch_prefix'],
   output: ['shortid_length'],
   agent: ['agent_id'],
@@ -35,8 +35,9 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
   docker: ['dockerfile', 'toolchain'],
-  runner: ['type'],
+  runner: ['type', 'docker_agent_root', 'docker_agent_no_network'],
   documents: ['path'],
+  worktree: ['include'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
 

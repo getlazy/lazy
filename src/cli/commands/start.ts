@@ -2,10 +2,10 @@ import { join } from 'path';
 import { existsSync, mkdirSync, copyFileSync, writeFileSync, statSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, rejectIfPairing, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
-import { getCurrentSha, getCurrentBranch, createWorktree, createWorktreeFromSha, recoverMissingWorktree } from '../../git/operations';
+import { getCurrentSha, getCurrentBranch, createWorktree, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { getAuthEnv, getModelId } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
-import { createRunner } from '../../runner';
+import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { createDriver } from '../../remote';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { openEditor, promptLine, removeRecoveryFile, promptYesNo, isTTY, readStdinIfPiped } from '../editor';
@@ -22,6 +22,7 @@ import { theme } from '../theme';
 import { isFeatureEnabled } from '../../utils/features';
 import { logger } from '../../utils/logger';
 import { getActor } from '../../constants';
+import { formatMarkdown } from '../../utils/markdown';
 
 import goalContextStartText from '../../prompts/goal-context-start.md' with { type: 'text' };
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
@@ -143,6 +144,8 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
+    { name: 'docker-agent-root', takesValue: false },
+    { name: 'docker-agent-no-network', takesValue: false },
   ], 'start');
 
   const goalFlag = parsed.flags.get('goal') as string | undefined;
@@ -154,6 +157,8 @@ export async function commandStart(args: string[]): Promise<void> {
   const follow = parsed.flags.get('follow') === true;
   const yes = parsed.flags.get('yes') === true;
   const forceLocal = parsed.flags.get('force-local') === true;
+  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
+  const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
   // Determine model override
   let modelOverride: ModelName | undefined;
@@ -294,7 +299,9 @@ export async function commandStart(args: string[]): Promise<void> {
       if (!yes && isTTY()) {
         console.log(`\nTask: ${displayId(t)}`);
         console.log(`Goal: ${t.goal}`);
-        console.log(`\nPrompt:\n${t.prompt}\n`);
+        console.log(`\nPrompt:`);
+        console.log(formatMarkdown(t.prompt).join('\n'));
+        console.log('');
 
         const confirmed = await promptYesNo('Start this task?', false);
         if (!confirmed) {
@@ -372,7 +379,10 @@ export async function commandStart(args: string[]): Promise<void> {
     }
 
     // --- Pre-flight checks (before creating container/worktree) ---
-    const runner = createRunner(root);
+    const dockerOptions: Partial<DockerRunnerOptions> = {};
+    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
+    if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
+    const runner = createRunner(root, dockerOptions);
     try {
       runner.checkAvailability();
     } catch (err) {
@@ -605,6 +615,12 @@ export async function commandStart(args: string[]): Promise<void> {
       }
     }
 
+    // Copy untracked files configured in worktree.include
+    if (!worktreeExisted) {
+      const config = loadConfig(root);
+      copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
+    }
+
     // Acquire lock
     acquireLock(worktreePath, 'lazy start');
 
@@ -828,6 +844,8 @@ Options:
   --code <code>      Set a human-readable code for the task
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompt when starting an existing task
+  --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
+  --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)
 
 Arguments:

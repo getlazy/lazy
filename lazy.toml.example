@@ -1,5 +1,6 @@
-# lazy.toml - Example configuration for lazy
-# Copy this to lazy.toml and customize as needed
+# lazy.toml - Configuration for lazy
+# Override the config filename with the LAZY_CONFIG environment variable
+# (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
 [models]
 # Default model for sessions
@@ -16,9 +17,20 @@ debug = false
 # Include commit guidelines in prompts sent to the agent
 auto_commit_instructions = true
 
-[database]
+[data]
 # Location of the .lazy directory
 path = ".lazy"
+
+[storage]
+# Storage backend: "in-repo" (default), "external", "orphan-branch", or "postgres"
+backend = "in-repo"
+# Path for external storage (only used when backend = "external")
+external_path = ""
+# Branch name for orphan-branch storage (only used when backend = "orphan-branch")
+orphan_branch_name = "lazy-state"
+# Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase)
+# Only used when backend = "postgres"
+# postgres_ssl = false
 
 [git]
 # Default prefix for lazy branches (e.g., "lazy/abc123")
@@ -31,3 +43,59 @@ shortid_length = 8
 [agent]
 # Default agent type to use for sessions
 agent_id = "claude-code"
+
+[server]
+# Default port for the web dashboard server
+port = 26024
+# Interval in seconds for background sync when running lazy server (0 to disable)
+# sync_interval = 60
+
+[runner]
+# Runner type: "docker" (default) or "dangerously-host-process-without-any-isolation"
+# Docker mode runs agents in isolated containers. Host-process mode runs agents
+# directly on the host — use **only** in VMs or other already-isolated environments.
+type = "docker"
+# Run containers as root (passes --user root to docker run).
+# Lets agents install packages at runtime (apt-get install, etc.).
+# docker_agent_root = false
+# Disable network access inside containers (passes --network none to docker run).
+# docker_agent_no_network = false
+
+[remote]
+# Remote driver: "local" (default), "github", or "gitlab"
+driver = "local"
+# Git remote name (default: "origin"). Change if your remote is named differently.
+# git_remote = "origin"
+# When using the GitHub driver, these options are also available:
+# github_auto_push = true   # Automatically push after each agent turn
+# github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = false
+# Authentication is handled by gh CLI (run: gh auth login)
+# When using the GitLab driver, these options are also available:
+# gitlab_auto_push = true   # Automatically push after each agent turn
+# gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = false
+# Authentication is handled by glab CLI (run: glab auth login)
+
+[docker]
+# Auto-detected or manually set toolchain (e.g., "node", "rust", "ruby-rails")
+# Determines which built-in Dockerfile to use for agent containers.
+# See available toolchains: base, bun, node, deno, rust, go, cpp, ruby-rails,
+# ruby-rails-rust, dotnet, python, python-ml, java, kotlin, swift
+toolchain = ""
+# Path to custom Dockerfile (relative to project root, empty = use built-in default)
+# When set, overrides the toolchain Dockerfile.
+dockerfile = ""
+
+[documents]
+# Path to a directory of documents to mount into the agent container
+# path = ""
+
+[features]
+# Enable experimental features. Set individual flags or use all = true.
+# Use LAZY_VANILLA=1 env var to disable all flags temporarily.
+# auto_sync_after_turn = true  # Sync task branch with upstream after each agent turn
+# all = true
+
+[worktree]
+# Untracked files to copy into new task worktrees (glob patterns)
+# Example: include = [".env", ".env.local", "config/local.yml"]
+# include = []

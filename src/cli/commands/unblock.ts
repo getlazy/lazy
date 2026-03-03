@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, resolveTaskOrExit, rejectIfPairing, taskRef, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
-import { createRunner } from '../../runner';
+import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { getCommitsBehindCount, getCurrentBranch } from '../../git/operations';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
 import { showTaskContext, runFeedbackFlow, getEditorFeedback, launchFeedbackTurn, syncTaskFromRemote, getNewNotesSince } from './shared';
@@ -40,6 +40,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'sync-with-upstream', takesValue: false },
     { name: 'merge-and-fix', takesValue: false },  // hidden alias for --sync-with-upstream
     { name: 'follow', takesValue: false },
+    { name: 'docker-agent-root', takesValue: false },
+    { name: 'docker-agent-no-network', takesValue: false },
   ], 'unblock');
 
   const taskId = parsed.positional[0];
@@ -51,6 +53,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
   // Parse flags
   const syncWithUpstream = parsed.flags.get('sync-with-upstream') === true || parsed.flags.get('merge-and-fix') === true;
   const follow = parsed.flags.get('follow') === true;
+  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
+  const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
   const messageValue = parsed.flags.get('message') as string | undefined;
 
   // --sync-with-upstream is combinable with feedback flags (--message, -f, piped stdin).
@@ -115,7 +119,10 @@ export async function commandUnblock(args: string[]): Promise<void> {
     // Pre-flight checks before doing expensive work
     // CRITICAL: These must happen before the human types feedback,
     // so we never lose their input to a pre-flight failure.
-    const runner = createRunner(root);
+    const dockerOptions: Partial<DockerRunnerOptions> = {};
+    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
+    if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
+    const runner = createRunner(root, dockerOptions);
     try {
       runner.checkAvailability();
     } catch (err) {

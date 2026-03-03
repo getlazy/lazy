@@ -1,7 +1,7 @@
 import type { ModelName } from '../types';
 
 /** Storage backend types — duplicated here to avoid circular dependency with storage module */
-export type StorageBackendConfig = 'in-repo' | 'orphan-branch' | 'external';
+export type StorageBackendConfig = 'in-repo' | 'orphan-branch' | 'external' | 'postgres';
 
 /** Runner types for task execution */
 export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
@@ -22,6 +22,8 @@ export interface LazyConfig {
     backend?: StorageBackendConfig;
     orphan_branch_name?: string;
     external_path?: string;
+    /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
+    postgres_ssl?: boolean;
   };
   git?: {
     default_branch_prefix?: string;
@@ -48,11 +50,18 @@ export interface LazyConfig {
     dockerfile?: string;
     toolchain?: string;
   };
-  runner?: RunnerType | { type?: RunnerType };
+  runner?: RunnerType | {
+    type?: RunnerType;
+    docker_agent_root?: boolean;
+    docker_agent_no_network?: boolean;
+  };
   documents?: {
     path?: string;
   };
   features?: Record<string, boolean>;
+  worktree?: {
+    include?: string[];
+  };
 }
 
 export interface ResolvedConfig {
@@ -71,6 +80,8 @@ export interface ResolvedConfig {
     backend: StorageBackendConfig;
     orphan_branch_name: string;
     external_path: string;
+    /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
+    postgres_ssl: boolean;
   };
   git: {
     default_branch_prefix: string;
@@ -99,9 +110,14 @@ export interface ResolvedConfig {
   };
   runner: {
     type: RunnerType;
+    docker_agent_root: boolean;
+    docker_agent_no_network: boolean;
   };
   documents: {
     path: string;
   };
   features: Record<string, boolean>;
+  worktree: {
+    include: string[];
+  };
 }

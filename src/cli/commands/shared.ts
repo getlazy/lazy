@@ -855,7 +855,12 @@ export async function getEditorFeedback(
           fallbackFromRef = taskData?.metadata?.remote_target_branch ?? getCurrentBranch(root);
         }
       }
-      turnDiffResult = getTurnDiff(lastAgentTurn, worktreePath, fallbackFromRef);
+
+      // Get the session to access upstream_merge_sha for backward compat turns
+      const session = await storage.getSession(sessionId);
+      const upstreamMergeSha = session?.upstream_merge_sha ?? undefined;
+
+      turnDiffResult = getTurnDiff(lastAgentTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
     }
 
     // Fetch notes added since the last agent turn

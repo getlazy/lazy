@@ -11,6 +11,11 @@ mounts:
   - location: "/Users/ierceg/prg/workshop"
     writable: true
 
+# Pass host env vars into the VM
+env:
+  LAZY_CONFIG:
+    value: "lazy.lima.toml" # Use a different config file in the VM
+
 provision:
   - mode: system
     script: |
@@ -54,3 +59,4 @@ provision:
 
       # Install claude code globally via curl
       curl -fsSL https://claude.ai/install.sh | bash
+

@@ -134,8 +134,58 @@ export async function commandBuilder(args: string[]): Promise<void> {
     return;
   }
 
+  // Extract --autonomous and --yes flags, pass through everything else to Claude Code
+  let autonomous = false;
+  let yes = false;
+  const claudeExtraArgs: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--autonomous') {
+      autonomous = true;
+    } else if (arg === '--yes') {
+      yes = true;
+    } else {
+      // Pass through all other args to Claude Code
+      claudeExtraArgs.push(arg);
+    }
+  }
+
   // Create the runner — determines Docker vs host-process mode
   const runner = createRunner(root);
+  const config = loadConfig(root);
+
+  // Autonomous mode warnings and confirmation
+  // Show these BEFORE pre-flight checks so users see the warnings even if infrastructure fails
+  if (autonomous) {
+    console.log('');
+    console.log('⚠ Autonomous mode: the builder will run without permission prompts.');
+
+    // Additional warning for host-process runner
+    if (runner.type === 'dangerously-host-process-without-any-isolation') {
+      console.log('⚠ DANGER: Running on the host WITHOUT isolation.');
+      console.log('  The agent has unrestricted access to your system.');
+      console.log('  Only proceed on an isolated/disposable machine.');
+    }
+
+    console.log('');
+
+    // Require confirmation
+    if (isTTY()) {
+      const response = await promptLine("Type 'yes' to proceed");
+      if (response !== 'yes') {
+        console.log('Aborted.');
+        process.exit(0);
+      }
+    } else {
+      if (!yes) {
+        console.error('Error: --autonomous requires --yes flag in non-interactive mode.');
+        process.exit(1);
+      }
+    }
+
+    console.log('');
+  }
 
   // Pre-flight: check that infrastructure is available before showing prompts.
   // This validates Docker availability and API key presence early, so the user
@@ -148,7 +198,6 @@ export async function commandBuilder(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const config = loadConfig(root);
   const systemPrompt = buildSystemPrompt(root, runner);
 
   // Session disclosure
@@ -197,6 +246,11 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
 
+  // Add --dangerously-skip-permissions when in autonomous mode
+  const finalClaudeExtraArgs = autonomous
+    ? [...claudeExtraArgs, '--dangerously-skip-permissions']
+    : claudeExtraArgs;
+
   let exitCode: number;
 
   if (runner.usesSandbox()) {
@@ -207,7 +261,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     const { cleanup: cleanupServer } = startBuilderServer(builderConfig, configPath);
 
     try {
-      exitCode = await runner.launchBuilderInteractive(root, systemPrompt, configPath, args);
+      exitCode = await runner.launchBuilderInteractive(root, systemPrompt, configPath, finalClaudeExtraArgs);
     } finally {
       cleanupServer();
       try {
@@ -221,7 +275,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   } else {
     // Host-process mode: launch Claude Code directly (no HTTP server needed).
     // The runner handles conversation capture internally.
-    exitCode = await runner.launchBuilderInteractive(root, systemPrompt, '', args);
+    exitCode = await runner.launchBuilderInteractive(root, systemPrompt, '', finalClaudeExtraArgs);
   }
 
   process.exit(exitCode);
@@ -243,10 +297,15 @@ into lazy's store so they're searchable alongside task data.
 Subcommands:
   list, ls             List captured builder conversations
 
+Flags:
+  --autonomous         Run without permission prompts (adds --dangerously-skip-permissions)
+  --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
+
 Any other arguments are passed through to claude.
 
 Examples:
   lazy builder                    # Start new session
   lazy builder list               # List captured conversations
-  lazy builder --model opus       # Start with a specific model`);
+  lazy builder --model opus       # Start with a specific model
+  lazy builder --autonomous       # Run without permission prompts`);
 }

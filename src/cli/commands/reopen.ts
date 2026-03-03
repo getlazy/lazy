@@ -1,9 +1,10 @@
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath, getWorktreePathForRef } from '../helpers';
-import { createWorktree, createWorktreeFromSha, getCurrentSha } from '../../git/operations';
+import { createWorktree, createWorktreeFromSha, getCurrentSha, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
 import { checkOrphanedChild, retargetOrphanedChild } from '../orphan';
+import { loadConfig } from '../../config/loader';
 
 import { getDataDir } from '../init';
 import { getActor } from '../../constants';
@@ -166,6 +167,10 @@ export async function commandReopen(args: string[]): Promise<void> {
         console.error(`Failed to recreate worktree: ${err instanceof Error ? err.message : err}`);
         process.exit(1);
       }
+
+      // Copy untracked files configured in worktree.include
+      const config = loadConfig(root);
+      copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
 
       // Reset session: clear ended_at, outcome, and claude_session_id
       await storage.resetSession(sess.id);

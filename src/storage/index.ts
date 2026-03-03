@@ -18,6 +18,7 @@
 
 export { FileStorage } from './file-storage';
 export { OrphanBranchStorage } from './orphan-branch-storage';
+export { PostgresStorage } from './postgres-storage';
 export type { Storage } from './interface';
 export type {
   Task,
@@ -48,6 +49,7 @@ export type {
 
 import { FileStorage } from './file-storage';
 import { OrphanBranchStorage } from './orphan-branch-storage';
+import { PostgresStorage } from './postgres-storage';
 import type { Storage } from './interface';
 import { loadConfig } from '../config/loader';
 import { join } from 'path';
@@ -87,8 +89,9 @@ export function getProjectName(lazyRoot: string, remoteName: string = 'origin'):
  * - 'in-repo': FileStorage with root at <repo>/.lazy/ (default, current behavior)
  * - 'orphan-branch': OrphanBranchStorage backed by a git orphan branch
  * - 'external': FileStorage with root at the configured external path
+ * - 'postgres': PostgresStorage backed by PostgreSQL database
  */
-export type StorageBackend = 'in-repo' | 'orphan-branch' | 'external';
+export type StorageBackend = 'in-repo' | 'orphan-branch' | 'external' | 'postgres';
 
 export interface CreateStorageOptions {
   /** Storage backend type (default: 'in-repo') */
@@ -135,6 +138,22 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       }
       storage = new FileStorage(lazyRoot, { basePath: externalPath });
       break;
+
+    case 'postgres': {
+      // Credentials come from environment variables, never from lazy.toml.
+      // LAZY_POSTGRES_URL takes priority; falls back to standard PG* env vars.
+      const config = loadConfig(lazyRoot);
+      storage = new PostgresStorage(lazyRoot, {
+        url: process.env.LAZY_POSTGRES_URL,
+        host: process.env.PGHOST,
+        port: process.env.PGPORT ? parseInt(process.env.PGPORT, 10) : undefined,
+        database: process.env.PGDATABASE,
+        user: process.env.PGUSER,
+        password: process.env.PGPASSWORD,
+        ssl: config.storage.postgres_ssl,
+      });
+      break;
+    }
 
     case 'in-repo':
     default:

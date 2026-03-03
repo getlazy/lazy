@@ -1129,6 +1129,58 @@ export class GitHubDriver implements RepositoryDriver {
       const workingPaths = new Set(workingTasks.map(t => getWorktreePath(lazyRoot, t)));
       shouldSkipWorktree = (path: string) => workingPaths.has(path);
     }
+
+    // Detect whether targetBranch is currently checked out in the root repo.
+    // `git fetch <remote> main:main` fails with "refusing to fetch into branch
+    // checked out at ..." when main is the current branch. The accept command
+    // typically runs from the user's main repo which is on main.
+    const headResult = this.git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+    const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
+    const remoteRef = `${this.remoteName}/${targetBranch}`;
+
+    if (currentBranch === targetBranch) {
+      // Target branch IS checked out — fetch then ff-only merge.
+      const fetchResult = this.git(['fetch', this.remoteName, targetBranch], root);
+      if (fetchResult.exitCode !== 0) {
+        const warning = `Failed to fetch ${targetBranch} from ${this.remoteName}: ${fetchResult.stderr.trim() || 'unknown error'}. Run \`git fetch ${this.remoteName}\` to retry.`;
+        logger.warn(`fastForwardLocal: fetch failed: ${fetchResult.stderr}`);
+        return { success: false, warning };
+      }
+
+      const mergeResult = this.git(['merge', '--ff-only', remoteRef], root);
+      if (mergeResult.exitCode === 0) {
+        logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
+        return { success: true };
+      }
+
+      // ff-only failed — could be divergence, dirty working tree, lock file, etc.
+      const stderr = mergeResult.stderr;
+      if (stderr.includes('Already up to date') || mergeResult.stdout.includes('Already up to date')) {
+        logger.debug(`fastForwardLocal: ${targetBranch} already up to date`);
+        return { success: true };
+      }
+
+      // Disambiguate: is this true divergence or a transient failure?
+      // Use merge-base --is-ancestor to check if local is an ancestor of remote.
+      const localSha = this.git(['rev-parse', targetBranch], root);
+      const remoteSha = this.git(['rev-parse', remoteRef], root);
+      if (localSha.exitCode === 0 && remoteSha.exitCode === 0) {
+        const ancestorCheck = this.git(['merge-base', '--is-ancestor', localSha.stdout.trim(), remoteSha.stdout.trim()], root);
+        if (ancestorCheck.exitCode === 0) {
+          // Local IS an ancestor of remote — not diverged. The ff-only failed
+          // for a transient reason (dirty working tree, lock file, etc.).
+          const mergeStderr = stderr.trim();
+          const warning = `Fast-forward of ${targetBranch} failed: ${mergeStderr || 'unknown error'}. Run \`git merge --ff-only ${remoteRef}\` to retry.`;
+          logger.warn(`fastForwardLocal: ff-only failed (not diverged): ${mergeStderr}`);
+          return { success: false, warning };
+        }
+      }
+
+      // True divergence: local has commits not in remote.
+      const warning = `Local ${targetBranch} has diverged from ${remoteRef}. Run \`git pull\` to reconcile.`;
+      logger.warn(`fastForwardLocal: ${warning}`);
+      return { success: false, warning };
+    }
     return sharedFastForwardLocal(targetBranch, this.remoteName, root, this.git, shouldSkipWorktree);
   }
 

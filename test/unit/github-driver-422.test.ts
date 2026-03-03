@@ -30,6 +30,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       backend: 'in-repo',
       orphan_branch_name: 'lazy-data',
       external_path: '',
+      postgres_ssl: false,
     },
     git: {
       default_branch_prefix: 'lazy',
@@ -56,11 +57,12 @@ describe('GitHubDriver 422 self-approval handling', () => {
       dockerfile: '',
       toolchain: '',
     },
-    runner: { type: 'docker' as const },
+    runner: { type: 'docker' as const, docker_agent_root: false, docker_agent_no_network: false },
     documents: {
       path: '',
     },
     features: {},
+    worktree: { include: [] },
   };
 
   // Minimal task with a PR number

@@ -64,6 +64,7 @@ Task Management:
   refactor               Create a refactoring task (restructure, no behavior change)
   edit <task_id>         Edit a task's goal or prompt
   comment <task_id>      Add a comment/annotation to a task
+  clone <task_id>        Duplicate task with optional reparenting
   list / tasks           List all non-terminal tasks
   active                 List active tasks (with sessions)
   blocked                List blocked tasks (waiting for user)
@@ -93,7 +94,6 @@ Inspect:
   rework <task_id>       Create follow-up task for accepted work that needs changes
   close <task_id>        Close task without work
   redo <task_id>         Close stale task and restart fresh on current main
-  clone <task_id>        Duplicate task with optional reparenting
 
 Proposals:
   propose                Propose a follow-up task

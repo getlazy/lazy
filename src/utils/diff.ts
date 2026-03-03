@@ -193,13 +193,15 @@ export interface TurnDiffResult {
  * Excludes .lazy/ state files from the diff.
  *
  * Prefers start_sha_work..end_sha_work (agent work only, excluding sync merges).
- * Falls back to start_sha..end_sha for older turns without the work SHAs.
+ * Falls back to upstream_merge_sha..end_sha for older turns (excludes upstream changes).
+ * Falls back to start_sha..end_sha if no upstream_merge_sha available.
  * Falls back to full task diff (fromRef..HEAD) if no SHAs available at all.
  */
 export function getTurnDiff(
   turn: Turn,
   worktreePath: string,
   fallbackFromRef?: string,
+  upstreamMergeSha?: string,
 ): TurnDiffResult | null {
   let fromSha: string;
   let toSha: string;
@@ -210,8 +212,10 @@ export function getTurnDiff(
     fromSha = turn.start_sha_work;
     toSha = turn.end_sha_work;
   } else if (turn.start_sha && turn.end_sha) {
-    // Backward compat: older turns without work SHAs
-    fromSha = turn.start_sha;
+    // Backward compat: older turns without work SHAs.
+    // Use upstream_merge_sha if available to exclude upstream changes that were
+    // merged during the turn. Otherwise fall back to start_sha (may include upstream).
+    fromSha = upstreamMergeSha ?? turn.start_sha;
     toSha = turn.end_sha;
   } else if (fallbackFromRef) {
     fromSha = fallbackFromRef;

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
-import type { LazyConfig, ResolvedConfig } from './types';
+import type { LazyConfig, ResolvedConfig, StorageBackendConfig } from './types';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -49,6 +49,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     backend: 'in-repo',
     orphan_branch_name: 'lazy-state',
     external_path: '',
+    postgres_ssl: false,
   },
   git: {
     default_branch_prefix: 'lazy',
@@ -77,11 +78,16 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   runner: {
     type: 'docker',
+    docker_agent_root: false,
+    docker_agent_no_network: false,
   },
   documents: {
     path: '',
   },
   features: {},
+  worktree: {
+    include: [],
+  },
 };
 
 /**
@@ -208,7 +214,7 @@ export function hasExplicitModelConfig(lazyRoot: string): boolean {
 /**
  * Get a default lazy.toml template content
  */
-export function getDefaultConfigTemplate(storageBackend?: 'in-repo' | 'external' | 'orphan-branch', storagePath?: string, toolchain?: string, gitRemote?: string): string {
+export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, storagePath?: string, toolchain?: string, gitRemote?: string): string {
   const backend = storageBackend || 'in-repo';
   const pathLine = backend === 'external' && storagePath ? `external_path = "${storagePath}"` : 'external_path = ""';
   const toolchainValue = toolchain || '';
@@ -268,6 +274,11 @@ port = 26024
 # Docker/Podman modes run agents in isolated containers. Host-process mode runs agents
 # directly on the host — use only in VMs or other already-isolated environments.
 type = "docker"
+# Run containers as root (passes --user root to docker run).
+# Lets agents install packages at runtime (apt-get install, etc.).
+# docker_agent_root = false
+# Disable network access inside containers (passes --network none to docker run).
+# docker_agent_no_network = false
 
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
@@ -291,10 +302,15 @@ toolchain = "${toolchainValue}"
 # When set, overrides the toolchain Dockerfile.
 dockerfile = ""
 
-# [features]
+[features]
 # Enable experimental features. Set individual flags or use all = true.
 # Use LAZY_VANILLA=1 env var to disable all flags temporarily.
 # auto_sync_after_turn = true  # Sync task branch with upstream after each agent turn
 # all = true
+
+[worktree]
+# Untracked files to copy into new task worktrees (glob patterns)
+# Example: include = [".env", ".env.local", "config/local.yml"]
+# include = []
 `;
 }

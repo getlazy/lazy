@@ -222,7 +222,11 @@ async function handleTurnDiff(
     // Non-fatal: use the local ref if driver resolution fails
   }
 
-  const result = getTurnDiff(targetTurn, worktreePath, fallbackFromRef);
+  // Get the session to access upstream_merge_sha for backward compat turns
+  const session = await storage.getSession(sessionId);
+  const upstreamMergeSha = session?.upstream_merge_sha ?? undefined;
+
+  const result = getTurnDiff(targetTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
 
   if (!result || !result.diff.trim()) {
     let output = 'No changes in this turn.';

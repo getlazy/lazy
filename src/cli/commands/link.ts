@@ -9,7 +9,7 @@
 import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateCode, deriveCode, resolveTaskOrExit, taskRef } from '../helpers';
-import { createWorktree, findWorktreeForBranch, getCurrentBranch } from '../../git/operations';
+import { createWorktree, findWorktreeForBranch, getCurrentBranch, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
 import { getDataDir } from '../init';
@@ -143,6 +143,8 @@ export async function commandLink(args: string[]): Promise<void> {
     if (!existsSync(worktreePath)) {
       console.log(`Creating worktree for branch ${result.branch}...`);
       createWorktree(worktreePath, result.branch, root);
+      // Copy untracked files configured in worktree.include
+      copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
     }
 
     // Detect the parent branch (the branch this was forked from).

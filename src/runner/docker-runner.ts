@@ -36,6 +36,11 @@ import { writeToolPermissions } from '../mcp/config';
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
+export interface DockerRunnerOptions {
+  dockerAgentRoot?: boolean;
+  dockerAgentNoNetwork?: boolean;
+}
+
 /**
  * Read-only MCP tools that should be pre-approved in the builder session.
  * These tools only read state and don't mutate tasks or trigger operations.
@@ -59,10 +64,12 @@ export class DockerRunner implements Runner {
   readonly type: RunnerType;
   readonly runLabel = 'Container';
   protected readonly binary: string;
+  private options: DockerRunnerOptions;
 
-  constructor(binary: string = 'docker', type: RunnerType = 'docker') {
+  constructor(binary: string = 'docker', type: RunnerType = 'docker', options?: DockerRunnerOptions) {
     this.binary = binary;
     this.type = type;
+    this.options = options ?? {};
   }
 
   runDisplayName(runName: string): string {
@@ -89,7 +96,7 @@ export class DockerRunner implements Runner {
     protocolDir: string,
     debug?: boolean,
   ): Promise<void> {
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary);
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, this.options);
   }
 
   async runClaudeSync(
@@ -99,7 +106,7 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<ClaudeResponse> {
-    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary);
+    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this.options);
   }
 
   isRunning(runName: string): boolean {
