@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.707] - 2026-03-07 - Agent Abstraction & Watchdog
+
+### Fixed
+
+- **README image broke** - now it's fixed.
+
 ## [0.7.702] - 2026-03-07 - Agent Abstraction & Watchdog
 
 Internal refactor to support multiple AI agents. The agent abstraction layer decouples the supervisor from Claude Code-specific details, enabling future support for additional agents.
