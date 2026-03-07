@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import type { LazyConfig, ResolvedConfig, StorageBackendConfig } from './types';
+import { listAgents } from '../agent/registry';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -35,7 +36,7 @@ function findConfigDir(lazyRoot: string): string {
 // Default configuration values
 export const DEFAULT_CONFIG: ResolvedConfig = {
   models: {
-    default: 'sonnet',
+    default: 'journeyman',
   },
   session: {
     verbose: false,
@@ -59,6 +60,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   agent: {
     agent_id: 'claude-code',
+    watchdog_output_timeout_ms: 0,
   },
   server: {
     port: 26024,
@@ -151,7 +153,16 @@ export function loadConfig(lazyRoot: string): ResolvedConfig {
   const configDir = findConfigDir(lazyRoot);
   const configPath = join(configDir, CONFIG_FILENAME);
 
-  // If no config file exists, return defaults
+  // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
+  if (process.env.LAZY_CONFIG && !existsSync(configPath)) {
+    throw new Error(
+      `LAZY_CONFIG is set to '${process.env.LAZY_CONFIG}' but the file does not exist.\n` +
+      `Searched from ${process.cwd()} up to ${lazyRoot}.\n` +
+      `Unset it with LAZY_CONFIG= or fix the path.`,
+    );
+  }
+
+  // If no config file exists (and LAZY_CONFIG was not set), return defaults
   if (!existsSync(configPath)) {
     return DEFAULT_CONFIG;
   }
@@ -189,7 +200,18 @@ export function loadConfig(lazyRoot: string): ResolvedConfig {
   // Merge with defaults
   // After backward-compat normalization above, runner is always object form.
   // Cast to satisfy DeepPartial<ResolvedConfig> which expects { type: RunnerType }.
-  return deepMerge(DEFAULT_CONFIG, parsed as DeepPartial<ResolvedConfig>);
+  const config = deepMerge(DEFAULT_CONFIG, parsed as DeepPartial<ResolvedConfig>);
+
+  // Validate agent_id against registry
+  const validAgents = listAgents();
+  if (!validAgents.includes(config.agent.agent_id)) {
+    throw new Error(
+      `Unknown agent "${config.agent.agent_id}" in lazy.toml [agent] section. ` +
+      `Valid agents: ${validAgents.join(', ')}`
+    );
+  }
+
+  return config;
 }
 
 /**
@@ -226,8 +248,9 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 
 [models]
 # Default model for sessions
-# Options: "sonnet", "opus", "haiku"
-default = "sonnet"
+# Universal monikers: "apprentice" (fast), "journeyman" (balanced), "master" (most capable)
+# Legacy aliases: "sonnet", "opus", "haiku" (still supported)
+default = "journeyman"
 
 [session]
 # Show Docker output in real-time during session execution

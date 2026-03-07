@@ -21,7 +21,7 @@ describe('GitHubDriver waitForChecks', () => {
     storage: { backend: 'in-repo', orphan_branch_name: 'lazy-data', external_path: '', postgres_ssl: false },
     git: { default_branch_prefix: 'lazy' },
     output: { shortid_length: 8 },
-    agent: { agent_id: 'test-agent' },
+    agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
     server: { port: 3000, sync_interval: 1000 },
     remote: {
       driver: 'github',
@@ -46,6 +46,7 @@ describe('GitHubDriver waitForChecks', () => {
     type: 'task',
     status: 'blocked',
     model: 'sonnet',
+    agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
     parent_task_id: null,

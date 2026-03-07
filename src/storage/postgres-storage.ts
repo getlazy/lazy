@@ -156,6 +156,7 @@ export class PostgresStorage implements Storage {
           type TEXT NOT NULL DEFAULT 'task',
           status TEXT NOT NULL,
           model TEXT,
+          agent_id TEXT NOT NULL DEFAULT 'claude-code',
           parent_task_id TEXT,
           branched_from_sha TEXT,
           close_reason TEXT,
@@ -334,20 +335,23 @@ export class PostgresStorage implements Storage {
     parentTaskId?: string,
     branchedFromSha?: string,
     code?: string,
-    type?: string
+    type?: string,
+    agentId?: string
   ): Promise<Task> {
     const id = randomUUID();
     const now = Date.now();
     const taskType = (type ?? DEFAULT_TASK_TYPE) as TaskType;
+    const resolvedAgentId = agentId ?? 'claude-code';
 
     await this.sql`
       INSERT INTO tasks (
         id, goal, prompt, code, type, status, parent_task_id, branched_from_sha,
-        created_at, metadata
+        created_at, metadata, agent_id
       )
       VALUES (
         ${id}, ${goal}, '', ${code ?? null}, ${taskType}, 'backlog',
-        ${parentTaskId ?? null}, ${branchedFromSha ?? null}, ${now}, ${null}
+        ${parentTaskId ?? null}, ${branchedFromSha ?? null}, ${now}, ${null},
+        ${resolvedAgentId}
       )
     `;
 
@@ -361,6 +365,7 @@ export class PostgresStorage implements Storage {
       type: taskType,
       status: 'backlog',
       model: null,
+      agent_id: resolvedAgentId,
       parent_task_id: parentTaskId ?? null,
       branched_from_sha: branchedFromSha ?? null,
       close_reason: null,
@@ -550,7 +555,7 @@ export class PostgresStorage implements Storage {
       git_branch: gitBranch,
       git_start_sha: gitStartSha,
       upstream_merge_sha: null,
-      claude_session_id: claudeSessionId ?? null,
+      agent_session_id: claudeSessionId ?? null,
       container_name: null,
       outcome: null,
       total_duration_ms: 0,

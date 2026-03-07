@@ -8,6 +8,16 @@ export function isTerminalStatus(status: TaskStatus): boolean {
   return TERMINAL_STATUSES.has(status);
 }
 
+/** Task has an active worktree that should not be merged into */
+export function isActiveStatus(status: TaskStatus): boolean {
+  return status === 'working' || status === 'interrupted' || status === 'pairing' || status === 'merging';
+}
+
+/** Task is waiting for human or agent action */
+export function isBlockedStatus(status: TaskStatus): boolean {
+  return status === 'blocked';
+}
+
 export type TaskType = 'task' | 'fix' | 'spike' | 'refactor' | 'test' | 'audit' | 'migrate' | 'document' | 'tidy' | 'rework' | 'feature' | 'release';
 
 export const DEFAULT_TASK_TYPE: TaskType = 'task';
@@ -22,7 +32,17 @@ export type TurnRole = 'human' | 'agent';
 /** Who performed an action: human (CLI), builder (MCP), or system (reconciler/auto-resume). */
 export type Actor = 'human' | 'builder' | 'system';
 
-export type ModelName = 'sonnet' | 'opus' | 'haiku';
+/** Universal model monikers — agent-agnostic capability tiers. */
+export type ModelMoniker = 'apprentice' | 'journeyman' | 'master';
+
+/** All accepted model names: universal monikers + legacy Claude-specific aliases. */
+export type ModelName = ModelMoniker | 'sonnet' | 'opus' | 'haiku';
+
+/** Ordered list of all valid model names for validation and help text. */
+export const VALID_MODEL_NAMES: readonly ModelName[] = [
+  'apprentice', 'journeyman', 'master',
+  'sonnet', 'opus', 'haiku',
+] as const;
 
 export interface TokenUsage {
   inputTokens: number;
@@ -44,6 +64,7 @@ export interface Task {
   branched_from_sha: string | null;
   close_reason: string | null;
   model: ModelName | null;
+  agent_id: string;
   metadata: Record<string, string> | null;
 }
 
@@ -56,7 +77,7 @@ export interface Session {
   outcome: SessionOutcome | null;
   git_branch: string;
   git_start_sha: string;
-  claude_session_id: string | null;
+  agent_session_id: string | null;
   last_interaction_at: number | null;
   total_duration_ms: number;
   total_usage: TokenUsage | null;
@@ -151,7 +172,7 @@ export interface Comment {
 /** @deprecated Use Comment instead */
 export type Note = Comment;
 
-export interface ClaudeResponse {
+export interface AgentResponse {
   result: string;
   session_id: string;
   usage: {

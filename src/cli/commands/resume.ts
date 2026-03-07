@@ -240,7 +240,7 @@ export async function commandResume(args: string[]): Promise<void> {
       }
 
       // Try to find Claude session ID from sandbox or storage
-      let claudeSessionId = sess.claude_session_id;
+      let claudeSessionId = sess.agent_session_id;
       if (!claudeSessionId) {
         claudeSessionId = findClaudeSessionId(sandboxPath);
         if (claudeSessionId) {
@@ -281,10 +281,15 @@ export async function commandResume(args: string[]): Promise<void> {
         task_id: task.id,
         goal: task.goal,
         prompt: fullPrompt,
+        agent_id: task.agent_id,
         system_prompt: systemPrompt,
         model_id: modelId,
-        claude_session_id: claudeSessionId ?? undefined,
+        agent_session_id: claudeSessionId ?? undefined,
         turn_started_at: new Date().toISOString(),
+        // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
+        ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+          watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+        }),
       };
       writeCommand(protoDir, unblockCommand);
 
@@ -358,7 +363,7 @@ Arguments:
   <task_id>    ID of the interrupted task to resume
 
 Options:
-  --model <model>    Override model for this session (sonnet, opus, haiku)
+  --model <model>    Override model for this session (apprentice, journeyman, master, sonnet, opus, haiku)
   --follow           Wait for the agent to finish, streaming output in real time
   --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
   --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)

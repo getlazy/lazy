@@ -1125,7 +1125,7 @@ export async function launchFeedbackTurn(
   // Acquire lock before doing work
   acquireLock(worktreePath, 'lazy unblock');
 
-  const canResume = !!sess.claude_session_id;
+  const canResume = !!sess.agent_session_id;
   const runner = createRunner(root);
   const tRef = taskRef(task);
   const containerName = runner.runNameForTask(tRef);
@@ -1300,15 +1300,20 @@ export async function launchFeedbackTurn(
       task_id: task.id,
       goal: task.goal,
       prompt: fullMessage,
+      agent_id: task.agent_id,
       system_prompt: systemPrompt,
       model_id: modelId,
-      claude_session_id: canResume ? sess.claude_session_id! : undefined,
+      agent_session_id: canResume ? sess.agent_session_id! : undefined,
       parent_branch: parentBranch ?? undefined,
       sync_before_work: !!upstreamChanged,
       sync_after_work: autoSyncAfterTurn,
       remote_branch: syncResult.remoteBranch,
       upstream_merge_context: upstreamMergeContext,
       turn_started_at: new Date().toISOString(),
+      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
+      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+      }),
     };
     writeCommand(protoDir, unblockCommand);
 

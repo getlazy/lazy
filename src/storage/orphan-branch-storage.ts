@@ -126,8 +126,8 @@ export class OrphanBranchStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string): Promise<Task> {
-    const result = await this.requireInner().createTask(goal, parentTaskId, branchedFromSha, code, type);
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task> {
+    const result = await this.requireInner().createTask(goal, parentTaskId, branchedFromSha, code, type, agentId);
     this.autoCommit(`Create task: ${goal.substring(0, 50)}`);
     return result;
   }

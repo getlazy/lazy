@@ -13,6 +13,7 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     branched_from_sha: null,
     close_reason: null,
     model: null,
+    agent_id: 'claude-code',
     metadata: null,
     code: null,
     ...overrides,

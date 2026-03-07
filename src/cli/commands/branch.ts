@@ -174,7 +174,7 @@ Arguments:
 Options:
   --goal <goal>      Goal for the variant (default: parent goal + "(variant)")
   --prompt <text>    Prompt for the variant (default: inherit parent's prompt)
-  --model <model>    Override model for the variant (sonnet, opus, haiku)
+  --model <model>    Override model for the variant (apprentice, journeyman, master, sonnet, opus, haiku)
   --code <code>      Set a human-readable code for the variant task
   --yes              Skip confirmation prompt when starting the variant task
 

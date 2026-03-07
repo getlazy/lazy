@@ -8,7 +8,7 @@
  */
 
 import type { SandboxConfig } from '../capture/claude';
-import type { ClaudeResponse } from '../types';
+import type { AgentResponse } from '../types';
 import type { RunnerType } from '../config/types';
 import type { HealthCheck } from '../remote/driver';
 
@@ -71,7 +71,7 @@ export interface Runner {
     verbose?: boolean,
     debug?: boolean,
     model?: string,
-  ): Promise<ClaudeResponse>;
+  ): Promise<AgentResponse>;
 
   /** Check if a run is currently active. */
   isRunning(runName: string): boolean;

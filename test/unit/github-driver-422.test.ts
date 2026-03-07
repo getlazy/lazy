@@ -40,6 +40,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     },
     agent: {
       agent_id: 'test-agent',
+      watchdog_output_timeout_ms: 0,
     },
     server: {
       port: 3000,
@@ -74,6 +75,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     type: 'task',
     status: 'blocked',
     model: 'sonnet',
+    agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
     parent_task_id: null,

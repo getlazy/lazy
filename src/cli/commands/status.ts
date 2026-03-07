@@ -106,8 +106,8 @@ export async function commandStatus(args: string[]): Promise<void> {
     }
 
     // Claude session info
-    if (sess.claude_session_id) {
-      console.log(`\n  Claude session: ${sess.claude_session_id}`);
+    if (sess.agent_session_id) {
+      console.log(`\n  Claude session: ${sess.agent_session_id}`);
       console.log(`  Can resume: ${sess.ended_at ? 'NO (session ended)' : 'YES'}`);
     } else {
       console.log(`\n  Claude session: (none)`);

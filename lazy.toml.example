@@ -41,8 +41,13 @@ default_branch_prefix = "lazy"
 shortid_length = 8
 
 [agent]
-# Default agent type to use for sessions
+# Default agent for task execution (default: "claude-code")
 agent_id = "claude-code"
+
+# Watchdog timeout for detecting hung agent processes (milliseconds)
+# 0 = use agent default (claude-code: disabled)
+# Set to positive number to override agent default
+# watchdog_output_timeout_ms = 0
 
 [server]
 # Default port for the web dashboard server

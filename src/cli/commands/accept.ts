@@ -1,6 +1,7 @@
 import { join } from 'path';
 import { existsSync } from 'fs';
 import type { Task } from '../../types';
+import { isActiveStatus } from '../../types';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, validateCode, rejectIfPairing, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
 import { hasUncommittedChanges, getCurrentSha } from '../../git/operations';
 import { removeLock } from '../../utils/lock';
@@ -36,7 +37,6 @@ export async function commandAccept(args: string[]): Promise<void> {
     { name: 'yes', takesValue: false },
     { name: 'reason', takesValue: true },
     { name: 'wait', takesValue: false },
-    { name: 'force', takesValue: false },
   ], 'accept');
 
   const taskId = parsed.positional[0];
@@ -47,7 +47,6 @@ export async function commandAccept(args: string[]): Promise<void> {
 
   const yes = parsed.flags.get('yes') === true;
   const wait = parsed.flags.get('wait') === true;
-  const force = parsed.flags.get('force') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
 
   const root = requireLazyRoot();
@@ -346,9 +345,9 @@ export async function commandAccept(args: string[]): Promise<void> {
 
       // Refuse to merge into a parent that has an active agent — merging into
       // the agent's working tree mid-turn would corrupt its state.
-      if (parentTask.status === 'working' && !force) {
-        console.error(`Error: Parent task ${displayId(parentTask)} is currently working. Accepting would merge into the agent's active worktree.`);
-        console.error(`Wait for the parent task to finish its turn, or use --force to merge now.`);
+      if (isActiveStatus(parentTask.status)) {
+        console.error(`Error: Parent task ${displayId(parentTask)} is currently ${parentTask.status}. Accepting would merge into its active worktree.`);
+        console.error(`Wait for the parent task to finish or become blocked.`);
         process.exit(1);
       }
 
@@ -684,7 +683,7 @@ export async function commandAccept(args: string[]): Promise<void> {
 }
 
 export function acceptUsage(): void {
-  console.log(`Usage: lazy accept <task_id> [--reason "..."] [--yes] [--wait] [--force]
+  console.log(`Usage: lazy accept <task_id> [--reason "..."] [--yes] [--wait]
 
 Accept a task's work and merge it into the appropriate branch.
 
@@ -699,7 +698,6 @@ Options:
   --yes           Skip interactive prompts (non-interactive mode)
   --wait          If merge fails due to pending CI checks, poll until checks
                   complete, then retry the merge. Timeout: 10 minutes.
-  --force         Bypass safety checks (e.g., merge into a working parent task)
 
 Reason input priority: --reason flag > piped stdin > interactive prompt > "LGTM"
 

@@ -33,6 +33,8 @@ export interface LazyConfig {
   };
   agent?: {
     agent_id?: string;
+    /** Kill agent process if no output for this many ms. 0 = use agent default. */
+    watchdog_output_timeout_ms?: number;
   };
   server?: {
     port?: number;
@@ -91,6 +93,8 @@ export interface ResolvedConfig {
   };
   agent: {
     agent_id: string;
+    /** Kill agent process if no output for this many ms. 0 = use agent default. */
+    watchdog_output_timeout_ms: number;
   };
   server: {
     port: number;

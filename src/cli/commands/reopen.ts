@@ -172,7 +172,7 @@ export async function commandReopen(args: string[]): Promise<void> {
       const config = loadConfig(root);
       copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
 
-      // Reset session: clear ended_at, outcome, and claude_session_id
+      // Reset session: clear ended_at, outcome, and agent_session_id
       await storage.resetSession(sess.id);
     }
 

@@ -93,9 +93,8 @@ export async function reconcileTasks(storage: Storage, lazyRoot: string): Promis
     return;
   }
 
-  const runner = createRunner(lazyRoot);
-
   try {
+    const runner = createRunner(lazyRoot);
     // Primary sweep: reconcile working tasks
     const workingTasks = await storage.listTasksWithOptions({ workingOnly: true });
 
@@ -110,26 +109,46 @@ export async function reconcileTasks(storage: Storage, lazyRoot: string): Promis
     // Sweep 2: process stale responses for interrupted tasks
     // This handles the race where the supervisor writes a new response AFTER
     // reconciliation already moved the task to interrupted.
-    await sweepInterruptedResponses(storage, lazyRoot);
+    try {
+      await sweepInterruptedResponses(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Sweep interrupted responses failed: ${err instanceof Error ? err.message : err}`);
+    }
 
     // Sweep 3: clean up orphaned runs for terminal-state tasks
     // This catches containers/processes that survived a failed cleanup during accept/close/reject.
-    await sweepTerminalContainers(storage, lazyRoot, runner);
+    try {
+      await sweepTerminalContainers(storage, lazyRoot, runner);
+    } catch (err) {
+      logger.warn(`Sweep terminal containers failed: ${err instanceof Error ? err.message : err}`);
+    }
 
     // Sweep 4: detect tasks whose branch was already merged into their target
     // This catches the zombie scenario where accept squash-merged the branch
     // but crashed before updating session/task metadata.
-    await sweepMergedBranches(storage, lazyRoot);
+    try {
+      await sweepMergedBranches(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Sweep merged branches failed: ${err instanceof Error ? err.message : err}`);
+    }
 
     // Sweep 5: recover stale pairing states
     // If a task is in 'pairing' state but the pairing process has exited,
     // transition it back to 'blocked'. This handles: terminal closed,
     // machine rebooted, process killed.
-    await sweepStalePairing(storage, lazyRoot);
+    try {
+      await sweepStalePairing(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Sweep stale pairing failed: ${err instanceof Error ? err.message : err}`);
+    }
 
     // Sweep 6: migrate blocked tasks with no session to backlog
     // This handles the one-time migration of unstarted tasks from blocked → backlog
-    await migrateBlockedToBacklog(storage);
+    try {
+      await migrateBlockedToBacklog(storage);
+    } catch (err) {
+      logger.warn(`Migrate blocked to backlog failed: ${err instanceof Error ? err.message : err}`);
+    }
   } finally {
     releaseReconcileLock(lazyRoot);
   }
@@ -340,7 +359,7 @@ export function enrichResponseWithPlanContent(result: string, worktreePath: stri
 async function handleCompletedResponse(
   storage: Storage,
   taskId: string,
-  session: { id: string; claude_session_id: string | null; git_start_sha: string; container_name: string | null },
+  session: { id: string; agent_session_id: string | null; git_start_sha: string; container_name: string | null },
   response: CompletedResponse,
   worktreePath: string,
   protoDir: string,
@@ -348,7 +367,7 @@ async function handleCompletedResponse(
   const taskShortId = shortId(taskId);
 
   // Update Claude session ID if we got one
-  if (response.session_id && !session.claude_session_id) {
+  if (response.session_id && !session.agent_session_id) {
     await storage.updateSessionClaudeId(session.id, response.session_id);
   }
 
@@ -768,15 +787,19 @@ async function migrateBlockedToBacklog(storage: Storage): Promise<void> {
     const blockedTasks = await storage.listTasksWithOptions({ blockedOnly: true });
 
     for (const task of blockedTasks) {
-      const session = await storage.getSessionByTaskId(task.id);
-      // If a blocked task has no session, it never started — migrate to backlog
-      if (!session) {
-        const taskShortId = shortId(task.id);
-        logger.debug(`Task ${taskShortId}: migrating blocked (never started) → backlog`);
-        await storage.updateTaskStatus(task.id, 'backlog', 'system');
+      try {
+        const session = await storage.getSessionByTaskId(task.id);
+        // If a blocked task has no session, it never started — migrate to backlog
+        if (!session) {
+          const taskShortId = shortId(task.id);
+          logger.debug(`Task ${taskShortId}: migrating blocked (never started) → backlog`);
+          await storage.updateTaskStatus(task.id, 'backlog', 'system');
+        }
+      } catch (err) {
+        logger.debug(`Failed to migrate task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
       }
     }
   } catch (err) {
-    logger.debug(`Failed to migrate blocked tasks to backlog: ${err instanceof Error ? err.message : err}`);
+    logger.debug(`Failed to list blocked tasks for migration: ${err instanceof Error ? err.message : err}`);
   }
 }

@@ -43,7 +43,9 @@ import type {
 } from '../protocol/types';
 import type { MergeConflict } from '../types';
 import { runSyncWithUpstream, runSyncWithRemote, hasMergeInProgress, hasUnmergedFiles, abortMergeIfInProgress } from './merge';
-import { runWork, CrashError, type RetryState } from './work';
+import { runWork, CrashError, WatchdogTimeoutError, type RetryState } from './work';
+import { resolveWatchdogTimeout } from './watchdog';
+import { getAgent } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
 import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
 import { allTools } from '../mcp/tools';
@@ -207,7 +209,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   if (command.type === 'stop') return; // handled by caller
 
   const cmd = command as StartCommand | UnblockCommand;
-  const isResume = command.type === 'unblock' && !!(command as UnblockCommand).claude_session_id;
+  const isResume = command.type === 'unblock' && !!(command as UnblockCommand).agent_session_id;
 
   // Pre-turn worktree health check: ensure no leftover merge state
   recoverWorktreeState(worktreePath);
@@ -324,7 +326,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
   try {
     const claudeSessionId = command.type === 'unblock'
-      ? (command as UnblockCommand).claude_session_id
+      ? (command as UnblockCommand).agent_session_id
       : undefined;
 
     // Callback to update status when entering retry mode
@@ -344,14 +346,27 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       }
     };
 
+    // Resolve the agent from the command (defaults to claude-code for backward compat)
+    const agent = getAgent(cmd.agent_id ?? 'claude-code');
+    log(`[supervisor] Using agent: ${agent.id}`);
+
+    // Resolve effective watchdog timeout: config value (0 = use agent default)
+    const effectiveWatchdogMs = resolveWatchdogTimeout(
+      cmd.watchdog_output_timeout_ms ?? 0,
+      agent.defaultWatchdogTimeoutMs(),
+    );
+
     const result = await runWork(
+      agent,
       worktreePath,
       cmd.prompt,
       cmd.system_prompt,
       cmd.model_id,
       claudeSessionId,
       protocolDir,
-      onRetryStateChange
+      onRetryStateChange,
+      undefined, // _executeOverride
+      effectiveWatchdogMs,
     );
 
     updatePhase(status, 'work_done', protocolDir);
@@ -416,6 +431,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       errorResponse.exit_code = err.exitCode;
       errorResponse.stderr = err.stderr;
       errorResponse.stdout_error = err.stdoutError;
+      errorResponse.duration_ms = err.durationMs;
+    } else if (err instanceof WatchdogTimeoutError) {
       errorResponse.duration_ms = err.durationMs;
     }
 

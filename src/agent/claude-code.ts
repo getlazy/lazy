@@ -1,0 +1,163 @@
+/**
+ * ClaudeCodeAgent — Agent implementation for Claude Code CLI.
+ *
+ * Extracted from src/capture/claude.ts. All Claude-specific execution logic
+ * (auth, models, CLI args, response parsing, error matching) lives here.
+ */
+
+import { join } from 'path';
+import { homedir } from 'os';
+import { existsSync, readdirSync } from 'fs';
+import { VALID_MODEL_NAMES } from '../types';
+import type { ModelName, AgentResponse } from '../types';
+import type { Agent } from './interface';
+
+export class ClaudeCodeAgent implements Agent {
+  readonly id = 'claude-code';
+
+  getAuthEnv(): { key: string; value: string } {
+    const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (oauthToken) {
+      return { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken };
+    }
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (apiKey) {
+      return { key: 'ANTHROPIC_API_KEY', value: apiKey };
+    }
+    throw new Error(
+      'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
+    );
+  }
+
+  hasAuthEnv(): boolean {
+    return !!(process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY);
+  }
+
+  resolveModelId(modelName: string): string {
+    const modelMap: Record<string, string> = {
+      // Universal monikers
+      'apprentice': 'claude-haiku-4-5-20251001',
+      'journeyman': 'claude-sonnet-4-5-20250929',
+      'master': 'claude-opus-4-6',
+      // Legacy Claude-specific aliases (backward compat)
+      'sonnet': 'claude-sonnet-4-5-20250929',
+      'opus': 'claude-opus-4-6',
+      'haiku': 'claude-haiku-4-5-20251001',
+    };
+    const id = modelMap[modelName];
+    if (!id) {
+      throw new Error(`Unknown model: ${modelName}. Valid options: ${VALID_MODEL_NAMES.join(', ')}`);
+    }
+    return id;
+  }
+
+  availableModels(): { name: string; modelId: string; isDefault: boolean }[] {
+    return [
+      { name: 'journeyman', modelId: 'claude-sonnet-4-5-20250929', isDefault: true },
+      { name: 'master', modelId: 'claude-opus-4-6', isDefault: false },
+      { name: 'apprentice', modelId: 'claude-haiku-4-5-20251001', isDefault: false },
+      // Agent-specific aliases
+      { name: 'sonnet', modelId: 'claude-sonnet-4-5-20250929', isDefault: false },
+      { name: 'opus', modelId: 'claude-opus-4-6', isDefault: false },
+      { name: 'haiku', modelId: 'claude-haiku-4-5-20251001', isDefault: false },
+    ];
+  }
+
+  buildExecArgs(opts: {
+    prompt: string;
+    systemPrompt?: string;
+    modelId?: string;
+    sessionId?: string;
+    dangerouslySkipPermissions: boolean;
+  }): string[] {
+    const args = ['claude', '-p', opts.prompt, '--output-format', 'json'];
+
+    if (opts.dangerouslySkipPermissions) {
+      args.push('--dangerously-skip-permissions');
+    }
+
+    if (opts.systemPrompt) {
+      args.push('--append-system-prompt', opts.systemPrompt);
+    }
+
+    if (opts.sessionId) {
+      args.push('--resume', opts.sessionId);
+    }
+
+    if (opts.modelId) {
+      args.push('--model', opts.modelId);
+    }
+
+    return args;
+  }
+
+  parseResponse(stdout: string, _opts?: { workingDir?: string }): AgentResponse {
+    let parsed: AgentResponse;
+    try {
+      parsed = JSON.parse(stdout) as AgentResponse;
+    } catch (err) {
+      throw new Error(`Failed to parse Claude Code JSON output: ${err instanceof Error ? err.message : err}`);
+    }
+
+    if (!parsed.result || !parsed.session_id) {
+      throw new Error('Claude Code response missing required fields (result, session_id)');
+    }
+
+    return parsed;
+  }
+
+  isPromptTooLongError(errorMessage: string): boolean {
+    return errorMessage.includes('Prompt is too long');
+  }
+
+  isSessionNotFoundError(errorMessage: string): boolean {
+    return errorMessage.includes('No conversation found with session ID');
+  }
+
+  defaultWatchdogTimeoutMs(): number {
+    return 0; // Claude Code doesn't hang — watchdog disabled by default
+  }
+
+  discoverSessionFiles(opts: {
+    sessionId?: string;
+    configDir?: string;
+  }): string[] {
+    // Claude Code stores session files in ~/.claude/projects/<project-hash>/<session-id>.jsonl
+    const configDir = opts.configDir ?? join(homedir(), '.claude');
+    const projectsDir = join(configDir, 'projects');
+
+    if (!existsSync(projectsDir)) {
+      return [];
+    }
+
+    const results: string[] = [];
+
+    try {
+      const projectDirs = readdirSync(projectsDir, { withFileTypes: true });
+      for (const projectDir of projectDirs) {
+        if (!projectDir.isDirectory()) continue;
+        const projectPath = join(projectsDir, projectDir.name);
+        try {
+          const files = readdirSync(projectPath);
+          for (const file of files) {
+            if (!file.endsWith('.jsonl')) continue;
+            if (opts.sessionId) {
+              // Filter to files matching the session ID
+              if (file === `${opts.sessionId}.jsonl`) {
+                results.push(join(projectPath, file));
+              }
+            } else {
+              results.push(join(projectPath, file));
+            }
+          }
+        } catch {
+          // Skip inaccessible project directories
+        }
+      }
+    } catch {
+      // Projects directory not readable
+    }
+
+    return results;
+  }
+}

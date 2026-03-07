@@ -6,7 +6,7 @@
  */
 
 import type { SandboxConfig } from '../capture/claude';
-import type { ClaudeResponse } from '../types';
+import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RunnerType } from '../config/types';
 
@@ -31,8 +31,12 @@ import {
   removeContainer,
 } from '../capture/claude';
 
+import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
 import { writeToolPermissions } from '../mcp/config';
+
+// Agent packaging for tool checks. Instantiated once; stateless.
+const agentPackaging = new ClaudeCodePackaging();
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
@@ -105,7 +109,7 @@ export class DockerRunner implements Runner {
     verbose?: boolean,
     debug?: boolean,
     model?: string,
-  ): Promise<ClaudeResponse> {
+  ): Promise<AgentResponse> {
     return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this.options);
   }
 
@@ -186,11 +190,7 @@ export class DockerRunner implements Runner {
   }
 
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
-    return [
-      { cmd: 'git', name: 'git', hint: 'Container missing required tool: git. Install with: apt-get install -y git' },
-      { cmd: 'claude', name: 'claude', hint: 'Container missing required tool: claude. Install with: npm install -g @anthropic-ai/claude-code' },
-      { cmd: 'lazy-agent', name: 'lazy-agent', hint: 'lazy-agent binary not found at /usr/local/bin/lazy-agent. This is likely a volume mount issue.' },
-    ];
+    return agentPackaging.supervisorToolChecks();
   }
 
   mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] } {

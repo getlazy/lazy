@@ -18,6 +18,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     branched_from_sha: null,
     close_reason: null,
     model: 'opus',
+    agent_id: 'claude-code',
     metadata: null,
     ...overrides,
   };

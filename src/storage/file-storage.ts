@@ -188,6 +188,12 @@ export class FileStorage implements Storage {
       needsWrite = true;
     }
 
+    // Ensure agent_id field exists (defaults to 'claude-code' for backward compat)
+    if (raw.agent_id === undefined) {
+      raw.agent_id = 'claude-code';
+      needsWrite = true;
+    }
+
     // Handle legacy 'draft' -> 'interrupted' migration
     // Draft tasks no longer exist; they're like a session that was started
     // but the container immediately crashed (no agent work done)
@@ -261,6 +267,13 @@ export class FileStorage implements Storage {
     }
     if (raw.auto_resumed === undefined) {
       raw.auto_resumed = false;
+    }
+
+    // Migrate claude_session_id to agent_session_id (backward compat)
+    if (raw.agent_session_id === undefined && raw.claude_session_id !== undefined) {
+      raw.agent_session_id = raw.claude_session_id;
+      delete raw.claude_session_id;
+      needsWrite = true;
     }
 
     // Migrate timestamp fields from string to number
@@ -522,7 +535,7 @@ export class FileStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string): Promise<Task> {
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task> {
     return this.lock.withLock(async () => {
       const id = randomUUID();
       const now = Date.now();
@@ -540,6 +553,7 @@ export class FileStorage implements Storage {
         branched_from_sha: branchedFromSha ?? null,
         close_reason: null,
         model: null,
+        agent_id: agentId ?? 'claude-code',
         metadata: null,
       };
 
@@ -971,7 +985,7 @@ export class FileStorage implements Storage {
         outcome: null,
         git_branch: gitBranch,
         git_start_sha: gitStartSha,
-        claude_session_id: claudeSessionId ?? null,
+        agent_session_id: claudeSessionId ?? null,
         last_interaction_at: now,
         total_duration_ms: 0,
         total_usage: null,
@@ -1056,7 +1070,7 @@ export class FileStorage implements Storage {
 
       session.ended_at = null;
       session.outcome = null;
-      session.claude_session_id = null;
+      session.agent_session_id = null;
 
       await this.atomicWriteTask(taskId, { 'session.json': session });
     });
@@ -1070,7 +1084,7 @@ export class FileStorage implements Storage {
       const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
       if (!session) return;
 
-      session.claude_session_id = claudeSessionId;
+      session.agent_session_id = claudeSessionId;
 
       await this.atomicWriteTask(taskId, { 'session.json': session });
     });

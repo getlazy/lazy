@@ -87,7 +87,7 @@ export interface Storage {
   /**
    * Create a new task
    */
-  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string): Promise<Task>;
+  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task>;
 
   /**
    * Get a task by ID (supports prefix matching and code lookup)

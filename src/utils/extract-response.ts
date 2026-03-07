@@ -7,20 +7,20 @@
  */
 
 import { logger } from './logger';
-import type { ClaudeResponse } from '../types';
+import type { AgentResponse } from '../types';
 
 /**
  * Parse Claude Code's JSON output from container logs.
- * Returns the ClaudeResponse if valid, null otherwise.
+ * Returns the AgentResponse if valid, null otherwise.
  */
-export function extractClaudeResponse(output: string): ClaudeResponse | null {
+export function extractAgentResponse(output: string): AgentResponse | null {
   if (!output || !output.trim()) {
     return null;
   }
 
   try {
     // Claude Code with --output-format json outputs a single JSON object on stdout
-    const parsed = JSON.parse(output.trim()) as ClaudeResponse;
+    const parsed = JSON.parse(output.trim()) as AgentResponse;
 
     // Validate it has the expected shape
     if (parsed && typeof parsed.result === 'string' && typeof parsed.session_id === 'string') {
@@ -39,7 +39,7 @@ export function extractClaudeResponse(output: string): ClaudeResponse | null {
       const line = lines[i].trim();
       if (line.startsWith('{')) {
         try {
-          const parsed = JSON.parse(line) as ClaudeResponse;
+          const parsed = JSON.parse(line) as AgentResponse;
           if (parsed && typeof parsed.result === 'string' && typeof parsed.session_id === 'string') {
             return parsed;
           }

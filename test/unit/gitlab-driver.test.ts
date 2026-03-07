@@ -18,7 +18,7 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'in-repo', orphan_branch_name: 'lazy-data', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'gitlab',
@@ -49,6 +49,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     branched_from_sha: null,
     close_reason: null,
     model: null,
+    agent_id: 'claude-code',
     metadata: { gitlab_remote_ref_id: '42', gitlab_remote_ref_url: 'https://gitlab.com/o/r/-/merge_requests/42' },
     ...overrides,
   };

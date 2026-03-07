@@ -199,7 +199,7 @@ in markdown with mermaid diagrams. It does NOT modify code files.
 Options:
   --goal <goal>      Documentation goal (what to document)
   --prompt <text>    Additional instructions for the documentation agent
-  --model <model>    Set model for this task (sonnet, opus, haiku)
+  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
   --code <code>      Human-readable code (e.g. "doc-storage", "doc-architecture")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

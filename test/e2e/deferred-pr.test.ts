@@ -38,6 +38,7 @@ describe('deferred PR creation', () => {
       branched_from_sha: null,
       close_reason: null,
       model: null,
+      agent_id: 'claude-code',
       metadata: null,
     };
 

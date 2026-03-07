@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { writeFile, readFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 
 describe('LAZY_CONFIG environment variable', () => {
@@ -70,13 +70,15 @@ describe('LAZY_CONFIG environment variable', () => {
     expect(showResult.stdout).toContain('Custom config task');
   });
 
-  test('falls back to lazy.toml if custom config does not exist', async () => {
+  test('fails hard when LAZY_CONFIG points to non-existent file', async () => {
     // Try to use a non-existent config file
-    // Should fall back to lazy.toml (or defaults if lazy.toml also doesn't exist)
+    // Should fail with an actionable error message, not fall back silently
     const result = await ctx.lazy(['list'], {
       env: { LAZY_CONFIG: 'nonexistent.toml' },
     });
-    expectSuccess(result);
+    expectFailure(result);
+    expectError(result, 'LAZY_CONFIG is set to \'nonexistent.toml\' but the file does not exist');
+    expectError(result, 'Unset it with LAZY_CONFIG= or fix the path');
   });
 
   test('works with relative path in LAZY_CONFIG', async () => {

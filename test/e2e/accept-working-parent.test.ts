@@ -1,10 +1,10 @@
 /**
- * Tests for accept refusing when parent task is in 'working' state.
+ * Tests for accept refusing when parent task has an active worktree.
  *
  * INVARIANT: Accepting a child task merges into the parent's branch.
- * If the parent is actively being worked on (status = 'working'), merging
- * into its worktree mid-turn would corrupt the agent's state. Accept must
- * refuse unless --force is passed.
+ * If the parent has an active worktree (working, interrupted, pairing, or
+ * merging status), merging into it would corrupt the agent's state or
+ * conflict with ongoing work. Accept must refuse.
  */
 
 import { describe, test, beforeEach, afterEach } from 'bun:test';
@@ -93,51 +93,6 @@ describe('accept with working parent', () => {
     const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
     expectFailure(acceptResult);
     expectError(acceptResult, 'currently working');
-    expectError(acceptResult, '--force');
-  });
-
-  // INVARIANT: --force bypasses the working-parent check when the user
-  // explicitly decides to merge despite the risk.
-  test('--force bypasses working parent check', async () => {
-    // 1. Create and start a parent task
-    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
-
-    // 2. Create a child task (branch from parent)
-    const branchResult = await ctx.lazyMocked(
-      ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(branchResult);
-    const childId = extractVariantTaskId(branchResult.stdout);
-
-    // 3. Add a commit to the child worktree
-    const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
-    writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
-    ctx.git('-C', childWorktree, 'add', 'child-work.txt');
-    ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
-
-    // 4. Remove parent worktree so the local driver's squash merge can
-    //    check out the parent branch. (The test is about the --force flag
-    //    bypassing the working-parent guard, not about worktree mechanics.)
-    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
-    ctx.git('worktree', 'remove', '--force', parentWorktree);
-
-    // 5. Set parent task status to 'working' (simulates active agent)
-    const parentJson = readTaskJson(ctx.root, parentId);
-    parentJson.status = 'working';
-    writeTaskJson(ctx.root, parentId, parentJson);
-
-    // 6. Accept with --force should succeed despite working parent
-    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM', '--force']);
-    expectSuccess(acceptResult);
-    expectOutput(acceptResult, 'Merged into parent task');
   });
 
   test('accept succeeds when parent is blocked (not working)', async () => {

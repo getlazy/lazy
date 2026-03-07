@@ -1,16 +1,22 @@
 /**
  * Work phase.
  *
- * Wraps the existing Claude Code launch/capture logic. Runs Claude Code
- * with the task prompt and captures the JSON response.
+ * Wraps the agent launch/capture logic. Runs the agent with the task
+ * prompt and captures the JSON response.
  *
  * This is the supervisor's private implementation detail for running the
- * coding agent. Swapping agents requires changes only here.
+ * coding agent. The agent abstraction (src/agent/) handles CLI arg building,
+ * response parsing, and error detection. Swapping agents requires only
+ * changing the agent_id in config.
  */
 
 import type { RetryError } from '../protocol/types';
 import { hasCommand } from '../protocol/io';
 import { log, logError } from './log';
+import type { Agent } from '../agent/interface';
+import { execWithWatchdog, WatchdogTimeoutError } from './watchdog';
+
+export { WatchdogTimeoutError };
 
 export interface WorkResult {
   result: string;
@@ -48,64 +54,60 @@ export interface RetryState {
 }
 
 /** Check whether an error message indicates the prompt/session is too large. */
-export function isPromptTooLongError(errorMessage: string): boolean {
-  return errorMessage.includes('Prompt is too long');
+function isPromptTooLongError(agent: Agent, errorMessage: string): boolean {
+  return agent.isPromptTooLongError(errorMessage);
 }
 
 /**
  * Check whether an error message indicates the session ID is not found.
- * This happens when resuming a session that doesn't exist in the local Claude
- * config — e.g. when switching from Docker mode (sandboxed .claude/) to
- * host-process mode (real ~/.claude/), or after a clean install.
+ * This happens when resuming a session that doesn't exist in the local agent
+ * config — e.g. when switching from Docker mode (sandboxed config) to
+ * host-process mode (real config), or after a clean install.
  * Retrying with the same session ID will always fail; we must start fresh.
  */
-export function isSessionNotFoundError(errorMessage: string): boolean {
-  return errorMessage.includes('No conversation found with session ID');
+function isSessionNotFoundError(agent: Agent, errorMessage: string): boolean {
+  return agent.isSessionNotFoundError(errorMessage);
 }
 
 /**
- * Execute Claude Code once and return the result or throw on error.
+ * Execute the agent once and return the result or throw on error.
+ * When watchdogTimeoutMs > 0, monitors output and kills hung processes.
  */
-async function executeClaudeCode(
+async function executeAgent(
+  agent: Agent,
   worktreePath: string,
   prompt: string,
   systemPrompt?: string,
   modelId?: string,
   claudeSessionId?: string,
+  watchdogTimeoutMs?: number,
 ): Promise<WorkResult> {
-  const claudeArgs = ['claude', '-p', prompt, '--output-format', 'json', '--dangerously-skip-permissions'];
-
-  if (systemPrompt) {
-    claudeArgs.push('--append-system-prompt', systemPrompt);
-  }
-
-  if (claudeSessionId) {
-    claudeArgs.push('--resume', claudeSessionId);
-  }
-
-  if (modelId) {
-    claudeArgs.push('--model', modelId);
-  }
-
-  const launchTime = Date.now();
-
-  const proc = Bun.spawn(claudeArgs, {
-    cwd: worktreePath,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    env: process.env as Record<string, string>,
+  const claudeArgs = agent.buildExecArgs({
+    prompt,
+    systemPrompt,
+    modelId,
+    sessionId: claudeSessionId,
+    dangerouslySkipPermissions: true,
   });
 
-  const outputPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
+  const launchTime = Date.now();
+  const effectiveTimeout = watchdogTimeoutMs ?? 0;
 
-  const [output, stderr, exitCode] = await Promise.all([
-    outputPromise,
-    stderrPromise,
-    proc.exited,
-  ]);
+  const { stdout: output, stderr, exitCode, killedByWatchdog } = await execWithWatchdog(
+    claudeArgs,
+    {
+      cwd: worktreePath,
+      env: process.env as Record<string, string>,
+      timeoutMs: effectiveTimeout,
+    },
+  );
 
   const runtime = Date.now() - launchTime;
+
+  // Watchdog kill is a specific non-retriable error
+  if (killedByWatchdog) {
+    throw new WatchdogTimeoutError(effectiveTimeout, runtime);
+  }
 
   if (exitCode !== 0) {
     // Try to extract error from stdout JSON (Claude Code puts errors in stdout sometimes)
@@ -142,18 +144,23 @@ async function executeClaudeCode(
     });
   }
 
-  let parsed: WorkResult;
+  // Delegate parsing and validation to the agent.
+  // Wrap in try-catch so parse/validation errors become CrashErrors with
+  // proper metadata. Without this, a throw from parseResponse would propagate
+  // as a plain Error and the retry loop in runWork would retry it with backoff
+  // — but parse failures (exitCode 0, garbled output) are not transient and
+  // retrying won't help.
   try {
-    parsed = JSON.parse(output) as WorkResult;
-  } catch (err) {
-    throw new Error(`Failed to parse Claude Code JSON output: ${err instanceof Error ? err.message : err}`);
+    return agent.parseResponse(output, { workingDir: worktreePath }) as WorkResult;
+  } catch (parseErr) {
+    throw new CrashError({
+      message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+      exitCode: 0,
+      stderr: '',
+      stdoutError: output.substring(0, 500),
+      durationMs: Date.now() - launchTime,
+    });
   }
-
-  if (!parsed.result || !parsed.session_id) {
-    throw new Error('Claude Code response missing required fields (result, session_id)');
-  }
-
-  return parsed;
 }
 
 /**
@@ -220,17 +227,20 @@ async function sleepWithCommandCheck(protocolDir: string, delayMs: number): Prom
  * Run the work phase: execute Claude Code with the given prompt.
  * Automatically retries on failure with exponential backoff.
  *
+ * @param agent The agent to use for execution
  * @param worktreePath Working directory
- * @param prompt Full prompt to send to Claude Code
- * @param systemPrompt Optional static system prompt (passed as --append-system-prompt)
+ * @param prompt Full prompt to send to the agent
+ * @param systemPrompt Optional static system prompt
  * @param modelId Optional model override
  * @param claudeSessionId Optional session ID to resume
  * @param protocolDir Protocol directory for checking new commands
  * @param onRetryStateChange Callback when retry state changes
- * @param _executeOverride Optional override for executeClaudeCode (for testing)
- * @returns Parsed Claude Code JSON response
+ * @param _executeOverride Optional override for executeAgent (for testing)
+ * @param watchdogTimeoutMs Output watchdog timeout in ms (0 = disabled)
+ * @returns Parsed agent JSON response
  */
 export async function runWork(
+  agent: Agent,
   worktreePath: string,
   prompt: string,
   systemPrompt?: string,
@@ -239,8 +249,12 @@ export async function runWork(
   protocolDir?: string,
   onRetryStateChange?: (state: RetryState | null) => void,
   _executeOverride?: (worktreePath: string, prompt: string, systemPrompt?: string, modelId?: string, claudeSessionId?: string) => Promise<WorkResult>,
+  watchdogTimeoutMs?: number,
 ): Promise<WorkResult> {
-  const execute = _executeOverride ?? executeClaudeCode;
+  const execute = _executeOverride
+    ? _executeOverride
+    : (wt: string, p: string, sp?: string, mid?: string, sid?: string) =>
+        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs);
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {
@@ -251,7 +265,7 @@ export async function runWork(
 
   while (true) {
     const isRetry = retryState.count > 0;
-    log(`[work] ${isRetry ? `Retry ${retryState.count}: ` : ''}Running Claude Code${currentSessionId ? ' (resume)' : ''}...`);
+    log(`[work] ${isRetry ? `Retry ${retryState.count}: ` : ''}Running ${agent.id}${currentSessionId ? ' (resume)' : ''}...`);
 
     const launchTime = Date.now();
 
@@ -265,7 +279,7 @@ export async function runWork(
           onRetryStateChange(null);
         }
       } else {
-        log('[work] Claude Code completed. Parsing response...');
+        log(`[work] ${agent.id} completed. Parsing response...`);
       }
 
       log(`[work] Response captured. Session: ${result.session_id.substring(0, 8)}...`);
@@ -275,12 +289,19 @@ export async function runWork(
       const runtime = Date.now() - launchTime;
       const errorMessage = err instanceof Error ? err.message : String(err);
 
-      logError(`[work] Claude Code failed after ${runtime}ms: ${errorMessage}`);
+      logError(`[work] ${agent.id} failed after ${runtime}ms: ${errorMessage}`);
+
+      // INVARIANT: Watchdog kills are never retried. The agent process was
+      // hung (no output for the configured timeout). Retrying would likely
+      // just hang again. Surface the error so the turn is marked as failed.
+      if (err instanceof WatchdogTimeoutError) {
+        throw err;
+      }
 
       // Handle 'Prompt is too long' as a non-retriable session error.
       // Clear the session so the next attempt starts fresh (turn history
       // injection provides sufficient context for sessionless starts).
-      if (isPromptTooLongError(errorMessage)) {
+      if (isPromptTooLongError(agent, errorMessage)) {
         if (currentSessionId) {
           // Was resuming a session — clear it and retry fresh immediately
           log('[work] Session too large, starting fresh session with turn history.');
@@ -310,7 +331,7 @@ export async function runWork(
       // Handle 'No conversation found with session ID' — the session doesn't exist
       // in the local Claude config. This is unrecoverable with the same session ID;
       // drop it and start fresh with the turn history prompt instead.
-      if (isSessionNotFoundError(errorMessage) && currentSessionId) {
+      if (isSessionNotFoundError(agent, errorMessage) && currentSessionId) {
         log('[work] Session not found, starting fresh session with turn history.');
         currentSessionId = undefined;
 

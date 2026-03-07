@@ -16,6 +16,7 @@ import type { StartCommand } from '../../protocol';
 import type { SandboxConfig } from '../../capture/claude';
 import type { ModelName, TaskType } from '../../types';
 import { VALID_TASK_TYPES } from '../../types';
+import { getAgent, listAgents } from '../../agent/registry';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
@@ -28,7 +29,6 @@ import goalContextStartText from '../../prompts/goal-context-start.md' with { ty
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
-const DEFAULT_AGENT = 'claude-code';
 
 /**
  * Build a situational awareness preamble for linked tasks.
@@ -141,6 +141,7 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'type', takesValue: true },
     { name: 'code', takesValue: true },
     { name: 'parent', takesValue: true },
+    { name: 'agent', takesValue: true },
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
@@ -185,6 +186,18 @@ export async function commandStart(args: string[]): Promise<void> {
       process.exit(1);
     }
     codeValue = codeFlag;
+  }
+
+  // Parse --agent flag
+  const agentFlag = parsed.flags.get('agent') as string | undefined;
+  let agentId: string | undefined;
+  if (agentFlag !== undefined) {
+    const validAgents = listAgents();
+    if (!validAgents.includes(agentFlag)) {
+      console.error(`Unknown agent '${agentFlag}'. Available agents: ${validAgents.join(', ')}`);
+      process.exit(1);
+    }
+    agentId = agentFlag;
   }
 
   // Determine if we're creating a new task or starting an existing one
@@ -359,8 +372,8 @@ export async function commandStart(args: string[]): Promise<void> {
         process.exit(1);
       }
 
-      // Create the task (with optional parent)
-      t = await storage.createTask(goal, parentTaskId, undefined, codeValue, taskType);
+      // Create the task (with optional parent and agent)
+      t = await storage.createTask(goal, parentTaskId, undefined, codeValue, taskType, agentId);
 
       // Set prompt
       await storage.updateTaskPrompt(t.id, prompt);
@@ -387,6 +400,13 @@ export async function commandStart(args: string[]): Promise<void> {
       runner.checkAvailability();
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+
+    // Validate that the runner supports the task's agent.
+    // Currently only claude-code supports Docker/Podman runners.
+    if (t.agent_id !== 'claude-code' && runner.type !== 'dangerously-host-process-without-any-isolation') {
+      console.error(`Agent "${t.agent_id}" only supports host-process runner. Set runner type to "dangerously-host-process-without-any-isolation" in lazy.toml.`);
       process.exit(1);
     }
 
@@ -664,7 +684,7 @@ export async function commandStart(args: string[]): Promise<void> {
         sess = existingSession;
       } else {
         // Create session record (no Claude session_id yet — reconciliation will capture it)
-        sess = await storage.createSession(t.id, DEFAULT_AGENT, branchName, startSha);
+        sess = await storage.createSession(t.id, t.agent_id, branchName, startSha);
       }
 
       // Record human turn immediately (crash-safe: turn is persisted before container runs)
@@ -747,6 +767,7 @@ export async function commandStart(args: string[]): Promise<void> {
         task_id: t.id,
         goal: t.goal,
         prompt: fullPrompt,
+        agent_id: t.agent_id,
         system_prompt: systemPrompt,
         model_id: modelId,
         parent_branch: parentBranch ?? undefined,
@@ -754,6 +775,10 @@ export async function commandStart(args: string[]): Promise<void> {
         sync_after_work: autoSyncAfterTurn,
         upstream_merge_context: upstreamMergeContext,
         turn_started_at: new Date().toISOString(),
+        // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
+        ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+          watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+        }),
       };
       writeCommand(protoDir, startCommand);
 
@@ -823,7 +848,7 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start [--goal <goal>] [--prompt <text>] [--parent <task_id>] [--model <model>] [--type <type>] [--code <code>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start [--goal <goal>] [--prompt <text>] [--parent <task_id>] [--model <model>] [--type <type>] [--code <code>] [--agent <agent_id>] [--follow] [--yes] [--force-local]
        lazy start <task_id> [--model <model>] [--follow] [--yes] [--force-local]
 
 Create and start a new task, or start an existing task (e.g., from 'lazy branch').
@@ -838,10 +863,11 @@ Options:
   --goal <goal>      Task goal (required for new tasks)
   --prompt <text>    Task prompt/specification (required for new tasks)
   --parent <task_id> Create as a child task of the specified parent (parent must have worktree)
-  --model <model>    Override model for this session (sonnet, opus, haiku)
+  --model <model>    Override model for this session (apprentice, journeyman, master, sonnet, opus, haiku)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Default: task
   --code <code>      Set a human-readable code for the task
+  --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompt when starting an existing task
   --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)

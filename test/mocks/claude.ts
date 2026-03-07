@@ -7,7 +7,7 @@
  * Must export every symbol that source files import from capture/claude.
  */
 
-import type { ModelName, ClaudeResponse, TokenUsage } from '../../src/types';
+import type { ModelName, AgentResponse, TokenUsage } from '../../src/types';
 
 export interface SandboxConfig {
   worktreePath: string;
@@ -16,11 +16,20 @@ export interface SandboxConfig {
 
 export function getModelId(modelName: ModelName): string {
   const modelMap: Record<ModelName, string> = {
+    // Universal monikers
+    'apprentice': 'claude-haiku-4-5-20251001',
+    'journeyman': 'claude-sonnet-4-5-20250929',
+    'master': 'claude-opus-4-6',
+    // Legacy Claude-specific aliases
     'sonnet': 'claude-sonnet-4-5-20250929',
     'opus': 'claude-opus-4-6',
-    'haiku': 'claude-3-7-haiku-20250219',
+    'haiku': 'claude-haiku-4-5-20251001',
   };
-  return modelMap[modelName];
+  const id = modelMap[modelName];
+  if (!id) {
+    throw new Error(`Unknown model: ${modelName}. Valid options: apprentice, journeyman, master, sonnet, opus, haiku`);
+  }
+  return id;
 }
 
 export function checkDocker(): void {
@@ -45,14 +54,20 @@ export function hasAuthEnv(): boolean {
 }
 
 export function getAuthEnv(): { key: string; value: string } {
+  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (oauthToken) {
+    return { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken };
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (apiKey) {
     return { key: 'ANTHROPIC_API_KEY', value: apiKey };
   }
-  throw new Error('No auth configured for test');
+  throw new Error(
+    'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
+  );
 }
 
-function getMockResponse(): ClaudeResponse {
+function getMockResponse(): AgentResponse {
   const envResponse = process.env.LAZY_MOCK_CLAUDE_RESPONSE;
   if (envResponse) {
     const parsed = JSON.parse(envResponse);
@@ -90,7 +105,7 @@ export async function runClaude(
   verbose: boolean = false,
   debug: boolean = false,
   model?: string,
-): Promise<ClaudeResponse> {
+): Promise<AgentResponse> {
   await maybeCommit(sandbox.worktreePath, 'start');
   return getMockResponse();
 }
@@ -102,7 +117,7 @@ export async function resumeClaude(
   verbose: boolean = false,
   debug: boolean = false,
   model?: string,
-): Promise<ClaudeResponse> {
+): Promise<AgentResponse> {
   await maybeCommit(sandbox.worktreePath, 'resume');
   return getMockResponse();
 }
@@ -261,7 +276,7 @@ export function calculateDockerfileHash(_lazyRoot: string): string {
 
 // --- Token usage extraction ---
 
-export function extractTokenUsage(response: ClaudeResponse): TokenUsage {
+export function extractTokenUsage(response: AgentResponse): TokenUsage {
   return {
     inputTokens: response.usage?.input_tokens ?? 0,
     outputTokens: response.usage?.output_tokens ?? 0,

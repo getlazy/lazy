@@ -226,10 +226,15 @@ async function resumeTask(
       task_id: task.id,
       goal: task.goal,
       prompt: fullPrompt,
+      agent_id: task.agent_id,
       system_prompt: systemPrompt,
       model_id: modelId,
-      claude_session_id: sess.claude_session_id ?? undefined,
+      agent_session_id: sess.agent_session_id ?? undefined,
       turn_started_at: new Date().toISOString(),
+      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
+      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+      }),
     };
     writeCommand(protoDir, unblockCommand);
 

@@ -82,7 +82,7 @@ describe('protocol I/O', () => {
       task_id: 'test-task-002',
       goal: 'Add feature',
       prompt: 'Add error handling',
-      claude_session_id: 'sess-123',
+      agent_session_id: 'sess-123',
       parent_branch: 'main',
     };
 
@@ -91,7 +91,7 @@ describe('protocol I/O', () => {
 
     expect(read).not.toBeNull();
     expect(read!.type).toBe('unblock');
-    expect((read as UnblockCommand).claude_session_id).toBe('sess-123');
+    expect((read as UnblockCommand).agent_session_id).toBe('sess-123');
     expect((read as UnblockCommand).parent_branch).toBe('main');
   });
 

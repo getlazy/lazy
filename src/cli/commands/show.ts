@@ -87,6 +87,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
   outputLines.push(`  ${theme.label('Goal:')}    ${task.goal}`);
   outputLines.push(`  ${theme.label('Status:')}  ${theme.status(task.status)}`);
   outputLines.push(`  ${theme.label('Model:')}   ${theme.model(task.model ?? '-')}`);
+  outputLines.push(`  ${theme.label('Agent:')}   ${task.agent_id}`);
   outputLines.push(`  ${theme.label('Type:')}    ${task.type ?? 'task'}`);
 
   outputLines.push(`  ${theme.label('Created:')} ${theme.timestamp(formatDate(task.created_at))}`);
@@ -412,6 +413,7 @@ export async function commandShow(args: string[]): Promise<void> {
           status: task.status,
           type: task.type ?? 'task',
           model: task.model,
+          agent_id: task.agent_id,
           prompt: task.prompt || null,
           created_at: task.created_at,
           completed_at: task.completed_at,

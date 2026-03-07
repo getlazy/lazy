@@ -231,8 +231,10 @@ async function reconcileIfNeeded(cmd: string): Promise<void> {
     } finally {
       await storage.close();
     }
-  } catch {
-    // Silently skip reconciliation on error — command will handle storage errors
+  } catch (err) {
+    // Log reconciliation error but don't crash — command will handle storage errors
+    // Use console.error since logger may not be initialized at this point
+    console.error(`Warning: Reconciliation failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -336,32 +338,42 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
   }
 }
 
-if (!command || command === '--help' || command === '-h') {
-  // Help
-  usage();
-} else if (command === '--version' || command === '-V') {
-  console.log(VERSION);
-} else if (legacyCommands[command]) {
-  // Legacy commands
-  console.error(legacyCommands[command]);
-  process.exit(1);
-} else if (commandMap[command]) {
-  // Known command — dispatch it
-  await dispatch(command, args.slice(1));
-  process.exit(0);
-} else {
-  // Unknown command — try fuzzy matching
-  const result = await handleFuzzyCommand(command, args, fuzzyMatchCommands);
-
-  if (result.action === 'execute') {
-    await dispatch(result.command, args.slice(1));
-    process.exit(0);
-  } else if (result.action === 'none') {
-    console.error(`Unknown command: ${command}`);
+try {
+  if (!command || command === '--help' || command === '-h') {
+    // Help
     usage();
+  } else if (command === '--version' || command === '-V') {
+    console.log(VERSION);
+  } else if (legacyCommands[command]) {
+    // Legacy commands
+    console.error(legacyCommands[command]);
     process.exit(1);
+  } else if (commandMap[command]) {
+    // Known command — dispatch it
+    await dispatch(command, args.slice(1));
+    process.exit(0);
   } else {
-    // 'skip' — fuzzy match already printed a message
-    process.exit(1);
+    // Unknown command — try fuzzy matching
+    const result = await handleFuzzyCommand(command, args, fuzzyMatchCommands);
+
+    if (result.action === 'execute') {
+      await dispatch(result.command, args.slice(1));
+      process.exit(0);
+    } else if (result.action === 'none') {
+      console.error(`Unknown command: ${command}`);
+      usage();
+      process.exit(1);
+    } else {
+      // 'skip' — fuzzy match already printed a message
+      process.exit(1);
+    }
   }
+} catch (err) {
+  // Catch config loading errors and other unhandled errors gracefully
+  if (err instanceof Error) {
+    console.error(`Error: ${err.message}`);
+  } else {
+    console.error(`Error: ${err}`);
+  }
+  process.exit(1);
 }

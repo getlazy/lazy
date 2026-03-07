@@ -32,7 +32,7 @@ describe('flag validation', () => {
 
     expectFailure(result);
     expectError(result, 'Invalid model: invalid-model');
-    expectError(result, 'Must be one of: sonnet, opus, haiku');
+    expectError(result, 'Must be one of: apprentice, journeyman, master, sonnet, opus, haiku');
   });
 
   test('start rejects unknown flag', async () => {
@@ -163,7 +163,7 @@ describe('flag validation', () => {
 
     expectFailure(result);
     expectError(result, 'Invalid model: invalid-model');
-    expectError(result, 'Must be one of: sonnet, opus, haiku');
+    expectError(result, 'Must be one of: apprentice, journeyman, master, sonnet, opus, haiku');
   });
 
   test('create accepts valid model values', async () => {
@@ -178,5 +178,21 @@ describe('flag validation', () => {
     const haikuResult = await ctx.lazy(['create', '--goal', 'Test haiku', '--model', 'haiku']);
     expectSuccess(haikuResult);
     expectOutput(haikuResult, 'haiku');
+  });
+
+  // INVARIANT: Universal monikers must be accepted as valid model names.
+  // These are agent-agnostic aliases that map to capability tiers.
+  test('create accepts universal moniker model values', async () => {
+    const apprenticeResult = await ctx.lazy(['create', '--goal', 'Test apprentice', '--model', 'apprentice']);
+    expectSuccess(apprenticeResult);
+    expectOutput(apprenticeResult, 'apprentice');
+
+    const journeymanResult = await ctx.lazy(['create', '--goal', 'Test journeyman', '--model', 'journeyman']);
+    expectSuccess(journeymanResult);
+    expectOutput(journeymanResult, 'journeyman');
+
+    const masterResult = await ctx.lazy(['create', '--goal', 'Test master', '--model', 'master']);
+    expectSuccess(masterResult);
+    expectOutput(masterResult, 'master');
   });
 });

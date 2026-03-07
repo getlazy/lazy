@@ -18,7 +18,7 @@ export interface WorkResult {
   exitCode: number;
 }
 
-export interface MockClaudeResponse {
+export interface MockAgentResponse {
   result: string;
   session_id: string;
   usage?: { input_tokens: number; output_tokens: number };
@@ -38,7 +38,7 @@ export interface TestContext {
   /** Run a `lazy` CLI command in this test context */
   lazy: (args: string[], options?: LazyOptions) => Promise<WorkResult>;
   /** Run a `lazy` CLI command with Claude/Docker mocked */
-  lazyMocked: (args: string[], mockResponse: MockClaudeResponse, options?: LazyOptions) => Promise<WorkResult>;
+  lazyMocked: (args: string[], mockResponse: MockAgentResponse, options?: LazyOptions) => Promise<WorkResult>;
   /** Run raw git commands in the test directory */
   git: (...args: string[]) => { stdout: string; stderr: string; exitCode: number };
   /** Clean up the temporary directory */
@@ -75,7 +75,7 @@ async function runLazy(cwd: string, args: string[], protocolBase: string, extraE
 async function runLazyMocked(
   cwd: string,
   args: string[],
-  mockResponse: MockClaudeResponse,
+  mockResponse: MockAgentResponse,
   protocolBase: string,
   extraEnv?: Record<string, string>,
   input?: string,

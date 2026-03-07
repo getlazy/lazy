@@ -12,6 +12,7 @@ import { randomUUID } from 'crypto';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { McpTool, McpToolHandler } from './types';
+import type { ModelName } from '../types';
 
 // Re-use storage and helpers from existing CLI infrastructure
 import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH } from '../cli/helpers';
@@ -374,7 +375,7 @@ export const createTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model to use for this task',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
       type: {
         type: 'string',
@@ -417,7 +418,7 @@ export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
       }
 
       if (model) {
-        await storage.updateTaskModel(task.id, model as 'sonnet' | 'opus' | 'haiku');
+        await storage.updateTaskModel(task.id, model as ModelName);
       }
 
       return {
@@ -1012,7 +1013,7 @@ export const startTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this run (optional)',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
     required: ['task_id'],
@@ -1061,7 +1062,7 @@ export const unblockTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this turn (optional)',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
     required: ['task_id', 'feedback'],
@@ -1241,7 +1242,7 @@ export const resumeTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this run (optional)',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
     required: ['task_id'],
@@ -1659,7 +1660,7 @@ export const editTool: McpTool = {
       model: {
         type: 'string',
         description: 'New model',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
       type: {
         type: 'string',
@@ -1795,7 +1796,7 @@ export const cloneTool: McpTool = {
       model: {
         type: 'string',
         description: 'Override model',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
     required: ['task_id'],
@@ -1959,7 +1960,7 @@ export const redoTool: McpTool = {
       model: {
         type: 'string',
         description: 'Override model for the new task',
-        enum: ['sonnet', 'opus', 'haiku'],
+        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
     required: ['task_id'],

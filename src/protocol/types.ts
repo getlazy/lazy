@@ -21,6 +21,7 @@ export interface StartCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
@@ -29,6 +30,7 @@ export interface StartCommand {
   remote_branch?: string;      // remote tracking ref to merge (e.g., "origin/lazy/abc12345") — sync-with-remote phase
   upstream_merge_context?: string; // pre-built context about upstream changes (commit log, task goals, diff stat)
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
+  watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
 }
 
 export interface UnblockCommand {
@@ -36,15 +38,17 @@ export interface UnblockCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
-  claude_session_id?: string;  // resume existing Claude session
+  agent_session_id?: string;  // resume existing agent session
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
   sync_before_work?: boolean;  // if true, sync upstream before work phase
   sync_after_work?: boolean;   // if true, sync upstream after work phase
   remote_branch?: string;      // remote tracking ref to merge (e.g., "origin/lazy/abc12345") — sync-with-remote phase
   upstream_merge_context?: string; // pre-built context about upstream changes (commit log, task goals, diff stat)
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
+  watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
 }
 
 export interface StopCommand {

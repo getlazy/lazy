@@ -500,7 +500,7 @@ remain, enters a follow mode that shows active tasks and polls for new blocked
 tasks every 3 seconds. Ctrl+C exits at any time.
 
 Options:
-  --model <model>   Override model for feedback turns (sonnet, opus, haiku)
+  --model <model>   Override model for feedback turns (apprentice, journeyman, master, sonnet, opus, haiku)
   --follow          Wait for agent after giving feedback
 
 Examples:

@@ -25,6 +25,15 @@ import { loadConfig } from '../config/loader';
 export function createRunner(lazyRoot: string, overrides?: Partial<DockerRunnerOptions>): Runner {
   const config = loadConfig(lazyRoot);
 
+  // Host-only agents cannot use container runners
+  const agentId = config.agent.agent_id;
+  if (agentId !== 'claude-code' && (config.runner.type === 'docker' || config.runner.type === 'podman')) {
+    throw new Error(
+      `The "${agentId}" agent only supports host-process runner. ` +
+      `Set runner = "dangerously-host-process-without-any-isolation" in lazy.toml or use a different agent.`
+    );
+  }
+
   // Merge config values with CLI overrides (overrides take precedence)
   const dockerOptions: DockerRunnerOptions = {
     dockerAgentRoot: overrides?.dockerAgentRoot ?? config.runner.docker_agent_root,

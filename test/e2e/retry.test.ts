@@ -25,6 +25,7 @@ import {
 import type { UnblockCommand, CompletedResponse, SupervisorStatus, StartCommand } from '../../src/protocol';
 import { runWork, CrashError, type RetryState } from '../../src/supervisor/work';
 import type { WorkResult } from '../../src/supervisor/work';
+import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 
 describe('supervisor retry', () => {
   let ctx: TestContext;
@@ -280,6 +281,7 @@ describe('runWork retry with command check', () => {
     expect(hasCommand(tempProtoDir)).toBe(false);
 
     const result = await runWork(
+      new ClaudeCodeAgent(),
       '/tmp/fake-worktree',
       'test prompt',
       undefined,
@@ -327,6 +329,7 @@ describe('runWork retry with command check', () => {
 
     await expect(
       runWork(
+        new ClaudeCodeAgent(),
         '/tmp/fake-worktree',
         'test prompt',
         undefined,

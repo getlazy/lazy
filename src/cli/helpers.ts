@@ -11,7 +11,8 @@ import { loadConfig } from '../config/loader';
 import { repoHasCommits } from '../git/operations';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
-import type { Task, TokenUsage } from '../types';
+import { VALID_MODEL_NAMES } from '../types';
+import type { ModelName, Task, TokenUsage } from '../types';
 
 /**
  * Maximum length for task codes (in characters).
@@ -443,17 +444,15 @@ export async function resolveTaskOrExit(storage: Storage, input: string): Promis
 /**
  * Validate a model name value.
  * Returns the validated model name or exits with an error.
- *
- * @param value - The model name to validate
- * @returns The validated model name ('sonnet', 'opus', or 'haiku')
+ * Accepts both universal monikers (apprentice/journeyman/master) and
+ * legacy Claude-specific aliases (sonnet/opus/haiku).
  */
-export function validateModel(value: string): 'sonnet' | 'opus' | 'haiku' {
-  const validModels = ['sonnet', 'opus', 'haiku'] as const;
-  if (!validModels.includes(value as any)) {
-    console.error(`Invalid model: ${value}. Must be one of: sonnet, opus, haiku`);
+export function validateModel(value: string): ModelName {
+  if (!(VALID_MODEL_NAMES as readonly string[]).includes(value)) {
+    console.error(`Invalid model: ${value}. Must be one of: ${VALID_MODEL_NAMES.join(', ')}`);
     process.exit(1);
   }
-  return value as 'sonnet' | 'opus' | 'haiku';
+  return value as ModelName;
 }
 
 /**

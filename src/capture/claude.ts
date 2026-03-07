@@ -2,7 +2,9 @@ import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
-import type { ClaudeResponse, ModelName, TokenUsage } from '../types';
+import type { AgentResponse, ModelName, TokenUsage } from '../types';
+import { ClaudeCodeAgent } from '../agent/claude-code';
+import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import { logger } from '../utils/logger';
@@ -34,21 +36,23 @@ const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
 // Timeout for Docker inspection commands (ms). Prevents process hangs if Docker daemon is unresponsive.
 const DOCKER_TIMEOUT_MS = 10_000;
 
-/**
- * Default Dockerfile uses the base toolchain — no duplication.
- */
-const DEFAULT_DOCKERFILE = getToolchainDockerfileContent('base');
+// Singleton agent instances for delegation. Functions in this file that were
+// previously hard-coded now delegate to the agent abstraction.
+const _agent = new ClaudeCodeAgent();
+const _packaging = new ClaudeCodePackaging();
 
 /**
- * Map friendly model names to Claude model IDs
+ * Default Dockerfile for lazy containers.
+ * Delegates to ClaudeCodePackaging.generateDockerfile().
+ */
+const DEFAULT_DOCKERFILE = _packaging.generateDockerfile();
+
+/**
+ * Map model names (universal monikers or legacy aliases) to Claude model IDs.
+ * Delegates to ClaudeCodeAgent.resolveModelId().
  */
 export function getModelId(modelName: ModelName): string {
-  const modelMap: Record<ModelName, string> = {
-    'sonnet': 'claude-sonnet-4-5-20250929',
-    'opus': 'claude-opus-4-6',
-    'haiku': 'claude-haiku-4-5-20251001',
-  };
-  return modelMap[modelName];
+  return _agent.resolveModelId(modelName);
 }
 
 export function checkDocker(binary: string = 'docker'): void {
@@ -465,25 +469,18 @@ function calculateSourceHash(lazyRoot: string): string {
 
 /**
  * Check whether an API auth token is available in the environment.
- * Returns true if CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is set.
- * Unlike getAuthEnv(), this never throws.
+ * Delegates to ClaudeCodeAgent.hasAuthEnv().
  */
 export function hasAuthEnv(): boolean {
-  return !!(process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY);
+  return _agent.hasAuthEnv();
 }
 
+/**
+ * Get auth environment variables.
+ * Delegates to ClaudeCodeAgent.getAuthEnv().
+ */
 export function getAuthEnv(): { key: string; value: string } {
-  const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (oauthToken) {
-    return { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken };
-  }
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey) {
-    return { key: 'ANTHROPIC_API_KEY', value: apiKey };
-  }
-  throw new Error(
-    'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
-  );
+  return _agent.getAuthEnv();
 }
 
 function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', options?: DockerRunOptions): string[] {
@@ -514,7 +511,7 @@ export async function runClaude(
   model?: string,
   binary: string = 'docker',
   dockerOptions?: DockerRunOptions,
-): Promise<ClaudeResponse> {
+): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
@@ -568,7 +565,7 @@ export async function runClaude(
   }
 
   logger.debug('Parsing Claude response...');
-  return JSON.parse(output) as ClaudeResponse;
+  return JSON.parse(output) as AgentResponse;
 }
 
 export async function resumeClaude(
@@ -579,7 +576,7 @@ export async function resumeClaude(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
-): Promise<ClaudeResponse> {
+): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
@@ -634,13 +631,13 @@ export async function resumeClaude(
   }
 
   logger.debug('Parsing Claude response...');
-  return JSON.parse(output) as ClaudeResponse;
+  return JSON.parse(output) as AgentResponse;
 }
 
 /**
- * Extract TokenUsage from a ClaudeResponse
+ * Extract TokenUsage from an AgentResponse
  */
-export function extractTokenUsage(response: ClaudeResponse): TokenUsage {
+export function extractTokenUsage(response: AgentResponse): TokenUsage {
   return {
     inputTokens: response.usage.input_tokens ?? 0,
     outputTokens: response.usage.output_tokens ?? 0,

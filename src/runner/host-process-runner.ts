@@ -13,12 +13,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdir
 import { join } from 'path';
 import { homedir } from 'os';
 import type { SandboxConfig } from '../capture/claude';
-import type { ClaudeResponse } from '../types';
+import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import { getAuthEnv } from '../capture/claude';
+import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { logger } from '../utils/logger';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
+
+// Agent packaging for availability checks and tool checks.
+const agentPackaging = new ClaudeCodePackaging();
 
 /** Directory inside worktrees where we store PID files and logs. */
 const RUN_STATE_DIR = '.lazy-run';
@@ -159,16 +163,17 @@ export class HostProcessRunner implements Runner {
   }
 
   checkAvailability(): void {
-    // Check that claude is on PATH
-    const result = Bun.spawnSync(['claude', '--version'], {
+    // Check that the agent binary is on PATH
+    const binaryName = agentPackaging.binaryName();
+    const result = Bun.spawnSync([binaryName, '--version'], {
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 10_000,
     });
     if (result.exitCode !== 0) {
       throw new Error(
-        'Claude Code CLI not found. Install it with: npm install -g @anthropic-ai/claude-code\n' +
-        'Host-process runner requires Claude Code to be installed on the host.'
+        `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
+        `Host-process runner requires ${binaryName} to be installed on the host.`
       );
     }
 
@@ -251,7 +256,7 @@ export class HostProcessRunner implements Runner {
     verbose?: boolean,
     debug?: boolean,
     model?: string,
-  ): Promise<ClaudeResponse> {
+  ): Promise<AgentResponse> {
     const auth = getAuthEnv();
 
     const claudeArgs = [
@@ -309,7 +314,7 @@ export class HostProcessRunner implements Runner {
     }
 
     logger.debug('Parsing Claude response...');
-    return JSON.parse(output) as ClaudeResponse;
+    return JSON.parse(output) as AgentResponse;
   }
 
   isRunning(runName: string): boolean {
@@ -457,9 +462,10 @@ export class HostProcessRunner implements Runner {
   }
 
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
+    const binaryName = agentPackaging.binaryName();
     return [
       { cmd: 'git', name: 'git', hint: 'Required tool not found: git' },
-      { cmd: 'claude', name: 'claude', hint: 'Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code' },
+      { cmd: binaryName, name: binaryName, hint: `${binaryName} CLI not found. Install with: npm install -g ${agentPackaging.npmPackage()}` },
       // No lazy-agent check — in host-process mode, the supervisor IS lazy itself.
     ];
   }
@@ -475,20 +481,8 @@ export class HostProcessRunner implements Runner {
   diagnose(): HealthCheck[] {
     const results: HealthCheck[] = [];
 
-    // Check that claude is on PATH
-    try {
-      const result = Bun.spawnSync(['claude', '--version'], {
-        stdout: 'pipe', stderr: 'pipe', timeout: 10_000,
-      });
-      if (result.exitCode === 0) {
-        const version = result.stdout.toString().trim();
-        results.push({ state: 'ok', what: `Claude Code CLI installed (${version})` });
-      } else {
-        results.push({ state: 'fail', what: 'Claude Code CLI installed', reason: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
-      }
-    } catch {
-      results.push({ state: 'fail', what: 'Claude Code CLI installed', reason: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code' });
-    }
+    // Delegate agent-specific checks to packaging
+    results.push(...agentPackaging.diagnose());
 
     results.push({ state: 'ok', what: 'Runner mode: host-process (no container isolation)' });
     return results;

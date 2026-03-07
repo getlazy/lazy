@@ -143,7 +143,7 @@ subtle bugs that resist traditional debugging approaches.
 Options:
   --goal <goal>      Bug or issue to fix (what's broken and symptoms)
   --prompt <text>    Additional context (reproduction steps, error messages, etc.)
-  --model <model>    Set model for this task (sonnet, opus, haiku)
+  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
   --code <code>      Human-readable code (e.g. "fix-token-hang", "fix-null-deref")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

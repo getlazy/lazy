@@ -139,7 +139,7 @@ Enforces: no behavior changes, one step per commit, tests pass after each step.
 Options:
   --goal <goal>      Refactoring goal (what to refactor and why)
   --prompt <text>    Additional instructions for the refactoring agent
-  --model <model>    Set model for this task (sonnet, opus, haiku)
+  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
   --code <code>      Human-readable code (e.g. "refactor-auth", "refactor-storage")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

@@ -163,7 +163,7 @@ export async function autoResumeTask(
     const modelId = getModelId(modelName);
 
     // Try to find Claude session ID
-    let claudeSessionId = session.claude_session_id;
+    let claudeSessionId = session.agent_session_id;
     if (!claudeSessionId) {
       claudeSessionId = findClaudeSessionId(sandboxPath);
       if (claudeSessionId) {
@@ -200,9 +200,14 @@ export async function autoResumeTask(
       task_id: task.id,
       goal: task.goal,
       prompt: fullPrompt,
+      agent_id: task.agent_id,
       model_id: modelId,
-      claude_session_id: claudeSessionId ?? undefined,
+      agent_session_id: claudeSessionId ?? undefined,
       turn_started_at: new Date().toISOString(),
+      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
+      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+      }),
     };
     writeCommand(protoDir, unblockCommand);
 

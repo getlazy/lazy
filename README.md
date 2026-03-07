@@ -2,14 +2,16 @@
 
 Lazy is three things:
 
-* A [proxy](#the-proxy) for AI-human collaboration: Lazy captures conversations, reviews, and decisions in a searchable data store, under your control.
-* A secure, locally hosted agent [orchestrator](#the-orchestrator): Lazy is at the same time a software development lead (aka builder) and a fleet of autonomous agents working on your behalf
-* An integrated [software development lifecycle](#the-task-manager) tool. Lazy treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction rather than an afterthought.
+* A [proxy](#the-proxy) for AI-human collaboration: Lazy captures conversations, reviews, and decisions in a searchable data store, under your control and giving your agents improved situational awareness.
+* A secure, locally hosted agent [orchestrator](#the-orchestrator): Lazy is both a software development lead (builder mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
+* An integrated [software development lifecycle](#the-task-manager) tool: Lazy treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction rather than an afterthought.
+
+Lazy is built around [Claude Code](https://claude.com/product/claude-code) and I *only* use lazy to build lazy.
 
 ## Core Concepts
 
-* Your time is precious, agent time is aplenty. This permeates all interactions with lazy including direct conversations.
-* Prompts and their context are valuable, code is a byproduct. Lazy keeps track of conversations, prompts, turns, comments, feedback.
+* Your time is precious, agent time is aplenty. This permeates all interactions with lazy including direct conversations. Watching agents write code and yanking them when they go astray is *micromanagement*.
+* Prompts and their context are valuable, code is a byproduct. Lazy automatically keeps track of all conversations, prompts, turns, comments, feedbacks.
 * Agents do the coding and (most of) reviewing, you focus on the product, the architecture and giving guidance to unblock the agents.
 * Primary interface is the conversation - let lazy's builder be your team lead - but you always have lazy's deterministic tools at your disposal.
 
@@ -22,14 +24,16 @@ Lazy is **alpha software** under active development. The core workflow is stable
 - Some (maybe even most) features are experimental
 - Error messages are improving but may be cryptic
 
-Lazy is definitely not in an awesome shape, it's test fail, it's inconsistent, etc. but it's very, very fun to use. At least for me!
+Lazy is definitely not in an awesome shape, its tests fail, it's inconsistent, etc. but it's very, very fun to use. At least for me!
 
 ### Contributing
 
 Lazy is being actively developed. You can contribute by:
 
+- Sending me feedback at [feedback@getlazy.dev](feedback@getlazy.dev)
 - Reporting [bugs or feature](https://github.com/getlazy/lazy/issues) requests
 - Submitting [**Prompt** Requests](https://github.com/getlazy/lazy/issues) for fixes or enhancements.
+- Testing experimental features - if you are interested, send me an email to [testing@getlazy.dev](testing@getlazy.dev)
 
 Lazy is built using lazy itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
 
@@ -60,7 +64,7 @@ I hope you get as much fun from this (or more!) as I have.
 
 ### Why Not Just Use X
 
-See above. Plus building lazy is fun and building lazy with lazy is *extra* fun.
+See above. Plus building building lazy is fun, building with lazy is fun and building lazy with lazy is *extra* fun.
 
 ## The Details
 

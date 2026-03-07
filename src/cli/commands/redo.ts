@@ -262,7 +262,7 @@ Arguments:
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (sonnet, opus, haiku)
+  --model <model>    Override model for the new task (apprentice, journeyman, master, sonnet, opus, haiku)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
   --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)

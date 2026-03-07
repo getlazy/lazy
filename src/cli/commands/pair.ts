@@ -308,7 +308,7 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     // Task must have a claude session ID to resume (or we'll start fresh)
-    const claudeSessionId = sess.claude_session_id;
+    const claudeSessionId = sess.agent_session_id;
     if (!claudeSessionId) {
       console.log('No existing Claude session to resume. Claude Code will start a fresh session.');
     }

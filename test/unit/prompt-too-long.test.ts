@@ -6,7 +6,10 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { runWork, isPromptTooLongError, CrashError, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { runWork, CrashError, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { ClaudeCodeAgent } from '../../src/agent/claude-code';
+
+const agent = new ClaudeCodeAgent();
 
 const MOCK_SUCCESS: WorkResult = {
   result: 'Task completed successfully',
@@ -26,17 +29,17 @@ function makeCrashError(message: string): CrashError {
 
 describe('isPromptTooLongError', () => {
   test('detects exact "Prompt is too long" message', () => {
-    expect(isPromptTooLongError('Prompt is too long')).toBe(true);
+    expect(agent.isPromptTooLongError('Prompt is too long')).toBe(true);
   });
 
   test('detects message containing "Prompt is too long"', () => {
-    expect(isPromptTooLongError('Error: Prompt is too long (max 200000 tokens)')).toBe(true);
+    expect(agent.isPromptTooLongError('Error: Prompt is too long (max 200000 tokens)')).toBe(true);
   });
 
   test('does not match unrelated errors', () => {
-    expect(isPromptTooLongError('Connection reset')).toBe(false);
-    expect(isPromptTooLongError('Rate limited')).toBe(false);
-    expect(isPromptTooLongError('prompt too long')).toBe(false); // case-sensitive
+    expect(agent.isPromptTooLongError('Connection reset')).toBe(false);
+    expect(agent.isPromptTooLongError('Rate limited')).toBe(false);
+    expect(agent.isPromptTooLongError('prompt too long')).toBe(false); // case-sensitive
   });
 });
 
@@ -66,6 +69,7 @@ describe('runWork prompt-too-long handling', () => {
 
     const retryStates: (RetryState | null)[] = [];
     const result = await runWork(
+      agent,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -107,6 +111,7 @@ describe('runWork prompt-too-long handling', () => {
 
     await expect(
       runWork(
+        agent,
         '/tmp/test',
         'Do the work',
         undefined,  // systemPrompt
@@ -146,6 +151,7 @@ describe('runWork prompt-too-long handling', () => {
 
     const retryStates: (RetryState | null)[] = [];
     const result = await runWork(
+      agent,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -180,6 +186,7 @@ describe('runWork prompt-too-long handling', () => {
 
     const retryStates: (RetryState | null)[] = [];
     await runWork(
+      agent,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -217,6 +224,7 @@ describe('runWork prompt-too-long handling', () => {
     };
 
     await runWork(
+      agent,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -249,6 +257,7 @@ describe('runWork prompt-too-long handling', () => {
     // When there's no session to clear, should fail immediately (no retry)
     await expect(
       runWork(
+        agent,
         '/tmp/test',
         'Do the work',
         undefined,  // systemPrompt

@@ -82,7 +82,7 @@ function createSessionManually(ctx: TestContext, shortId: string): void {
     outcome: null,
     git_branch: branchName,
     git_start_sha: startSha,
-    claude_session_id: null,
+    agent_session_id: null,
     last_interaction_at: Date.now(),
     total_duration_ms: 0,
     total_usage: null,

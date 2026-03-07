@@ -81,7 +81,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
       console.error(`Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
       process.exit(1);
     }
-    const canResume = !!sess.claude_session_id;
+    const canResume = !!sess.agent_session_id;
     if (!canResume) {
       console.log('Session has no Claude session ID. Will start a fresh Claude session.');
     }
@@ -480,7 +480,7 @@ Arguments:
 Options:
   -f <file>           Read feedback from a file
   --message <text>    Provide inline feedback
-  --model <model>     Override model for this turn (sonnet, opus, haiku)
+  --model <model>     Override model for this turn (apprentice, journeyman, master, sonnet, opus, haiku)
   --sync-with-upstream  Merge upstream changes and resolve conflicts (combinable with feedback)
   --follow            Wait for the agent to finish, streaming output in real time
 

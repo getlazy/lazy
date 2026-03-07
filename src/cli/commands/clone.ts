@@ -173,7 +173,7 @@ Options:
   --default-parent   Use default parent (null, root task) instead of inheriting from source
                      (conflicts with --parent)
   --code <code>      Set a custom code for the cloned task (default: auto-generated)
-  --model <model>    Override model for the cloned task (sonnet, opus, haiku)
+  --model <model>    Override model for the cloned task (apprentice, journeyman, master, sonnet, opus, haiku)
                      Default: inherit from source task
 
 What gets carried over:

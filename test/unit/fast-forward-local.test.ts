@@ -25,7 +25,7 @@ const githubConfig: ResolvedConfig = {
   },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'github',
