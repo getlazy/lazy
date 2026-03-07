@@ -29,3 +29,4 @@ src/version.ts
 dist/
 
 .DS_Store
+.lazy/

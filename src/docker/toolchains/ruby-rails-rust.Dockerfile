@@ -41,10 +41,11 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default \
     && chmod -R a+w /usr/local/cargo /usr/local/rustup
 
-# Install Claude Code agent
-RUN npm install -g @anthropic-ai/claude-code@latest
-
 RUN useradd -m -s /bin/bash user
 USER user
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /work

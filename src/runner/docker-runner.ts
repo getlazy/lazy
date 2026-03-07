@@ -351,16 +351,16 @@ export class DockerRunner implements Runner {
       '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
       // MCP binary for proxy tool access
       '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-      // Claude config dir (settings, conversations, credentials)
-      '-v', `${homedir()}/.claude:${homedir()}/.claude`,
+      // Claude config dir (settings, conversations, credentials) — mount to container's home
+      // so Claude Code finds them at $HOME/.claude and $HOME/.claude.json without needing
+      // to override HOME (which would cause warnings about missing .local/bin).
+      '-v', `${homedir()}/.claude:/home/user/.claude`,
       // Merged Claude config with MCP server entry (writable — Claude Code updates it on startup)
-      '-v', `${mergedConfigFile}:${homedir()}/.claude.json`,
+      '-v', `${mergedConfigFile}:/home/user/.claude.json`,
       // Auth
       '-e', `${auth.key}=${auth.value}`,
       // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
       '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
-      // HOME must match host so Claude Code finds ~/.claude/ and ~/.claude.json
-      '-e', `HOME=${homedir()}`,
       // Working directory
       '-w', lazyRoot,
       imageName,

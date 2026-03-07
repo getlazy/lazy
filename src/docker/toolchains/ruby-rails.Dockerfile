@@ -31,10 +31,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # Install Yarn (common in Rails projects)
 RUN npm install -g yarn
 
-# Install Claude Code agent
-RUN npm install -g @anthropic-ai/claude-code@latest
-
 RUN useradd -m -s /bin/bash user
 USER user
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /work

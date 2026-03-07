@@ -42,10 +42,9 @@ const _agent = new ClaudeCodeAgent();
 const _packaging = new ClaudeCodePackaging();
 
 /**
- * Default Dockerfile for lazy containers.
- * Delegates to ClaudeCodePackaging.generateDockerfile().
+ * Default Dockerfile uses the base toolchain — no duplication.
  */
-const DEFAULT_DOCKERFILE = _packaging.generateDockerfile();
+const DEFAULT_DOCKERFILE = getToolchainDockerfileContent('base');
 
 /**
  * Map model names (universal monikers or legacy aliases) to Claude model IDs.

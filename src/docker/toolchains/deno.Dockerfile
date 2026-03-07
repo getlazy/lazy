@@ -16,13 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Deno
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
-# Install Claude Code agent via Node.js
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code@latest \
-    && rm -rf /var/lib/apt/lists/*
-
 RUN useradd -m -s /bin/bash user
 USER user
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /work

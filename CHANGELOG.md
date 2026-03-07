@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.717] - 2026-03-07 - Native Installer & External Storage
+
+### Changed
+
+- **Native Claude Code installer** — All 16 toolchain Dockerfiles and the root Dockerfile now use Claude Code's native installer (`curl -fsSL
+https://claude.ai/install.sh | bash`) instead of npm/bun global install. Toolchains that only had Node.js for Claude Code (base, rust, go, cpp, python, deno, etc.) no
+longer install Node.js at all, resulting in smaller images and faster builds
+
+### Fixed
+
+- **Builder container HOME warning** — Builder containers no longer override `HOME` to the host path, eliminating the "installMethod is native, but directory does not
+exist" warning from Claude Code. Mounts `.claude` to the container user's home (`/home/user`) instead, matching how agent containers work
+
 ## [0.7.707] - 2026-03-07 - Agent Abstraction & Watchdog
 
 ### Fixed

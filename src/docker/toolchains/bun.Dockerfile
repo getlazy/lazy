@@ -12,14 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code agent
-# bun install -g puts packages in /root/.bun/ and symlinks binaries to /usr/local/bin/.
-# The symlinks point into /root/ which is 700 by default, so open /root for traversal.
-RUN bun install -g @anthropic-ai/claude-code@latest \
-    && chmod o+x /root \
-    && chmod -R o+rX /root/.bun
-
 RUN useradd -m -s /bin/bash user
 USER user
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /work

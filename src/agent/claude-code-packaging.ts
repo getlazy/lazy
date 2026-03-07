@@ -23,21 +23,20 @@ export class ClaudeCodePackaging implements AgentPackaging {
   }
 
   dockerInstallCommand(): string {
-    return 'RUN bun install -g @anthropic-ai/claude-code@latest && chmod o+x /root && chmod -R o+rX /root/.bun';
+    return 'RUN curl -fsSL https://claude.ai/install.sh | bash';
   }
 
   generateDockerfile(): string {
     return `FROM oven/bun:slim
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
-# bun install -g puts packages in /root/.bun/ and symlinks binaries to /usr/local/bin/.
-# The symlinks point into /root/ which is 700 by default, so the non-root user can't
-# follow them. Open /root for traversal so the "user" account can run claude.
-${this.dockerInstallCommand()}
+RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash user
 USER user
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+${this.dockerInstallCommand()}
+ENV PATH="/home/user/.local/bin:$PATH"
 
 WORKDIR /work
 `;
@@ -46,7 +45,7 @@ WORKDIR /work
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
     return [
       { cmd: 'git', name: 'git', hint: 'Container missing required tool: git. Install with: apt-get install -y git' },
-      { cmd: 'claude', name: 'claude', hint: 'Container missing required tool: claude. Install with: npm install -g @anthropic-ai/claude-code' },
+      { cmd: 'claude', name: 'claude', hint: 'Container missing required tool: claude. Install with: curl -fsSL https://claude.ai/install.sh | bash' },
       { cmd: 'lazy-agent', name: 'lazy-agent', hint: 'lazy-agent binary not found at /usr/local/bin/lazy-agent. This is likely a volume mount issue.' },
     ];
   }
@@ -68,7 +67,7 @@ WORKDIR /work
     return [{
       state: 'fail',
       what: 'Claude Code CLI installed',
-      reason: 'Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code',
+      reason: 'Claude Code CLI not found. Install: curl -fsSL https://claude.ai/install.sh | bash',
     }];
   }
 }

@@ -13,18 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code agent via Node.js
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code@latest \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create user before installing .NET tools so they go to /home/user/.dotnet/tools
+# Create user before installing tools so they go to /home/user/
 RUN useradd -m -s /bin/bash user
 USER user
 
 # Install .NET global tools as user (installs to /home/user/.dotnet/tools)
 RUN dotnet tool install --global dotnet-ef
-ENV PATH="$PATH:/home/user/.dotnet/tools"
+
+# Install Claude Code via native installer (installs to ~/.local/bin/claude)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="$PATH:/home/user/.dotnet/tools:/home/user/.local/bin"
 
 WORKDIR /work
