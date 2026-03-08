@@ -161,7 +161,7 @@ export interface Runner {
    * @param builderConfigPath  Path to the builder config JSON (empty string in host-process mode)
    * @param claudeExtraArgs    Additional args for Claude Code (e.g., --model)
    * @param debug              Enable debug logging
-   * @returns Exit code from the Claude Code session
+   * @returns Exit code and detected session ID (if available)
    */
   launchBuilderInteractive(
     lazyRoot: string,
@@ -169,5 +169,5 @@ export interface Runner {
     builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
-  ): Promise<number>;
+  ): Promise<{ exitCode: number; sessionId: string | null }>;
 }

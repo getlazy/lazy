@@ -13,11 +13,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdir
 import { join } from 'path';
 import { homedir } from 'os';
 import type { SandboxConfig } from '../capture/claude';
+import { spawn, spawnSync } from '../utils/spawn';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import { getAuthEnv } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { logger } from '../utils/logger';
+import { getLazyCommand } from '../utils/cli-path';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
 
@@ -71,27 +73,8 @@ function pidFileDir(): string {
   return join(homedir(), '.lazy', 'run');
 }
 
-/**
- * Get the command prefix to re-invoke the current lazy CLI.
- *
- * Re-derived at each call site (not cached) so that if the process was
- * started via `bun run ./src/index.ts` and later resumed via compiled
- * `lazy`, the correct command is always used.
- *
- * Handles these invocation patterns:
- *   - Compiled:         process.argv = ['/path/to/lazy', 'start', ...]
- *   - bun script:       process.argv = ['/path/to/bun', '/path/to/src/index.ts', 'start', ...]
- *   - bun run script:   process.argv = ['/path/to/bun', '/path/to/src/index.ts', 'start', ...]
- *     (bun strips the 'run' subcommand from argv)
- */
-function getLazyCliCommand(): string[] {
-  // Dev mode: argv[0] is bun, argv[1] is a TypeScript/JavaScript file
-  if (process.argv.length > 1 && /\.[tj]sx?$/.test(process.argv[1])) {
-    return [process.execPath, process.argv[1]];
-  }
-  // Compiled mode: just the binary
-  return [process.execPath];
-}
+// Re-export alias for backward compat with call sites in this file
+const getLazyCliCommand = getLazyCommand;
 
 /** Check if a process with the given PID is alive. */
 function isProcessAlive(pid: number): boolean {
@@ -165,7 +148,7 @@ export class HostProcessRunner implements Runner {
   checkAvailability(): void {
     // Check that the agent binary is on PATH
     const binaryName = agentPackaging.binaryName();
-    const result = Bun.spawnSync([binaryName, '--version'], {
+    const result = spawnSync([binaryName, '--version'], {
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 10_000,
@@ -225,7 +208,7 @@ export class HostProcessRunner implements Runner {
     const cleanEnv = { ...process.env } as Record<string, string>;
     delete cleanEnv.CLAUDECODE;
 
-    const proc = Bun.spawn(supervisorArgs, {
+    const proc = spawn(supervisorArgs, {
       cwd: sandbox.worktreePath,
       stdout: logFileHandle,
       stderr: logFileHandle,
@@ -279,7 +262,7 @@ export class HostProcessRunner implements Runner {
     const cleanEnv = { ...process.env } as Record<string, string>;
     delete cleanEnv.CLAUDECODE;
 
-    const proc = Bun.spawn(claudeArgs, {
+    const proc = spawn(claudeArgs, {
       cwd: sandbox.worktreePath,
       stdout: 'pipe',
       stderr: verbose || debug ? 'inherit' : 'pipe',
@@ -443,7 +426,7 @@ export class HostProcessRunner implements Runner {
     if (!pidData || !existsSync(pidData.logFile)) return null;
 
     try {
-      const proc = Bun.spawn(
+      const proc = spawn(
         ['tail', '-f', pidData.logFile],
         { stdout: 'pipe', stderr: 'pipe' },
       );
@@ -500,7 +483,7 @@ export class HostProcessRunner implements Runner {
     _builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
-  ): Promise<number> {
+  ): Promise<{ exitCode: number; sessionId: string | null }> {
     // Host-process mode: launch Claude Code directly (no supervisor, no MCP proxy).
     // MCP tools are not available in this mode — the builder relies on Claude Code's
     // built-in capabilities plus any tools the user has configured.
@@ -531,7 +514,7 @@ export class HostProcessRunner implements Runner {
     const claudeHome = homedir();
     const beforeTimes = getSessionFileTimes(claudeHome, lazyRoot, encodeProjectPath);
 
-    const proc = Bun.spawn(claudeArgs, {
+    const proc = spawn(claudeArgs, {
       cwd: lazyRoot,
       stdin: 'inherit',
       stdout: 'inherit',
@@ -541,12 +524,14 @@ export class HostProcessRunner implements Runner {
     const exitCode = await proc.exited;
 
     // Capture conversation from JSONL files
+    let detectedSessionId: string | null = null;
     try {
       const afterTimes = getSessionFileTimes(claudeHome, lazyRoot, encodeProjectPath);
       const sessionFile = findNewOrModifiedFile(beforeTimes, afterTimes);
 
       if (sessionFile) {
         const sessionId = sessionFile.replace(/\.jsonl$/, '');
+        detectedSessionId = sessionId;
         const available = await discoverAllProjectSessions(lazyRoot);
         const match = available.find(s => s.sessionId === sessionId);
 
@@ -560,7 +545,6 @@ export class HostProcessRunner implements Runner {
             const stored = toStoredConversation(conversation, summary, stats);
             await storage.saveConversation(stored);
             logger.debug(`Builder conversation captured: ${sessionId}`);
-            console.error(`\nBuilder session: ${sessionId}`);
           } finally {
             await storage.close();
           }
@@ -571,6 +555,6 @@ export class HostProcessRunner implements Runner {
       logger.warn(`Failed to capture builder conversation: ${msg}`);
     }
 
-    return exitCode;
+    return { exitCode, sessionId: detectedSessionId };
   }
 }

@@ -7,9 +7,10 @@ import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import {
   writeResponse,
   consumeResponse,
+  readCommand,
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
-import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
+import type { CompletedResponse, ErrorResponse, UnblockCommand } from '../../src/protocol';
 
 // ============================================================
 // Helpers
@@ -235,6 +236,80 @@ describe('auto-resume on reconciliation', () => {
       showResult.stdout.includes('working') ||
       showResult.stdout.includes('blocked');
     expect(hasValidStatus).toBe(true);
+  });
+
+  // INVARIANT: Every unblock merges upstream before giving feedback.
+  // Auto-resume must set parent_branch and sync_before_work on the UnblockCommand
+  // so the supervisor merges upstream before the agent resumes — but only when
+  // the worktree is clean. A dirty worktree means the agent crashed mid-turn
+  // and git merge would fail or create confusing state.
+  test('auto-resume sets parent_branch and sync_before_work on clean worktree', async () => {
+    // 1. Create and start a task
+    const taskId = await createTask(ctx, 'Upstream merge test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // 2. Reconcile to blocked
+    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // 3. Set to working and remove response (simulating container crash)
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    consumeResponse(getProtocolDir(fullTaskId));
+
+    // 4. Trigger reconciliation — auto-resume should kick in and write a
+    //    command.json with parent_branch and sync_before_work
+    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+
+    // 5. Read the command.json written by auto-resume
+    const protoDir = getProtocolDir(fullTaskId);
+    const command = readCommand(protoDir) as UnblockCommand;
+    expect(command).not.toBeNull();
+    expect(command.type).toBe('unblock');
+    expect(command.parent_branch).toBeTruthy();
+    expect(command.sync_before_work).toBe(true);
+    // Clean worktree should get the upstream-merged crash context
+    expect(command.prompt).toContain('Upstream has been merged into your branch');
+  });
+
+  // INVARIANT: Dirty worktree (uncommitted changes from crashed turn) must NOT
+  // trigger upstream merge — git merge on a dirty worktree will fail or create
+  // confusing state. The agent should handle the uncommitted changes first.
+  test('auto-resume skips upstream merge on dirty worktree', async () => {
+    // 1. Create and start a task
+    const taskId = await createTask(ctx, 'Dirty worktree test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // 2. Reconcile to blocked
+    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // 3. Set to working and remove response (simulating container crash)
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    consumeResponse(getProtocolDir(fullTaskId));
+
+    // 4. Create uncommitted changes in the worktree to simulate a crash mid-turn
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    writeFileSync(join(worktreePath, 'dirty-file.txt'), 'uncommitted work from crashed agent');
+
+    // 5. Trigger reconciliation — auto-resume should skip upstream merge
+    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+
+    // 6. Read the command.json written by auto-resume
+    const protoDir = getProtocolDir(fullTaskId);
+    const command = readCommand(protoDir) as UnblockCommand;
+    expect(command).not.toBeNull();
+    expect(command.type).toBe('unblock');
+    // Dirty worktree: no parent_branch, no sync
+    expect(command.parent_branch).toBeUndefined();
+    expect(command.sync_before_work).toBe(false);
+    // Dirty worktree should get the uncommitted-changes crash context
+    expect(command.prompt).toContain('uncommitted changes in your worktree');
   });
 
   test('consecutive_interruptions resets on successful turn completion', async () => {

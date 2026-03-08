@@ -1,10 +1,11 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef, resolveTaskOrExit } from '../helpers';
+import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef } from '../helpers';
 import type { Task, Session, Storage } from '../../storage';
 import { reconcileTasks } from '../../utils/reconcile';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { createRunner } from '../../runner';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
+import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
 
 export interface TaskWithSession {
   task: Task;
@@ -77,7 +78,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
  * Sort TaskWithSession nodes by last_interaction_at DESC (most recently active first).
  * Tasks with no session sort to the bottom. Stable sort: equal values fall back to created_at DESC.
  */
-function sortByLastActive(nodes: TaskWithSession[]): void {
+export function sortByLastActive(nodes: TaskWithSession[]): void {
   nodes.sort((a, b) => {
     const aTime = a.session?.last_interaction_at ?? null;
     const bTime = b.session?.last_interaction_at ?? null;
@@ -94,7 +95,7 @@ function formatTurnCount(turnCount: number): string {
 }
 
 /** Count tasks with crashed containers across a tree. */
-function countCrashed(nodes: TaskWithSession[]): number {
+export function countCrashed(nodes: TaskWithSession[]): number {
   let count = 0;
   for (const node of nodes) {
     if (node.crashed) count++;
@@ -104,7 +105,7 @@ function countCrashed(nodes: TaskWithSession[]): number {
 }
 
 /** Print a footnote if any tasks have crashed containers. */
-function printCrashedFootnote(crashedCount: number): void {
+export function printCrashedFootnote(crashedCount: number): void {
   if (crashedCount > 0) {
     console.log('');
     console.log(theme.warning(
@@ -184,27 +185,6 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   }
 }
 
-/**
- * Recursively collect all descendant task IDs for a given task.
- */
-function collectDescendants(taskId: string, allTasks: Task[]): Set<string> {
-  const descendants = new Set<string>();
-  descendants.add(taskId);
-
-  // Find all direct children
-  const children = allTasks.filter(t => t.parent_task_id === taskId);
-
-  // Recursively add descendants of each child
-  for (const child of children) {
-    const childDescendants = collectDescendants(child.id, allTasks);
-    for (const id of childDescendants) {
-      descendants.add(id);
-    }
-  }
-
-  return descendants;
-}
-
 export async function commandList(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
@@ -214,78 +194,74 @@ export async function commandList(args: string[]): Promise<void> {
     { name: 'ids-only', takesValue: false },
   ], 'list');
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
+  const idsOnly = parsed.flags.get('ids-only') === true;
+  const showAll = parsed.flags.get('all') === true;
+  const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
 
-  try {
-    const idsOnly = parsed.flags.get('ids-only') === true;
-    const showAll = parsed.flags.get('all') === true;
-    const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  const { tree } = await queryTaskList({
+    all: showAll,
+    taskFilter: parsed.positional[0] || undefined,
+  });
+  renderListOutput(tree, { idsOnly, showTree, showAll });
+}
 
-    // Get tasks - default to non-terminal (working + blocked + interrupted)
-    let tasks = showAll
-      ? await storage.listTasks()
-      : await storage.listTasksWithOptions({ nonTerminalOnly: true });
-
-    // If a task ID/code is provided, filter to show only that task and its descendants
-    if (parsed.positional.length > 0) {
-      const taskInput = parsed.positional[0];
-      const targetTask = await resolveTaskOrExit(storage, taskInput);
-
-      // Collect all descendant IDs (including the target task itself)
-      const allowedIds = collectDescendants(targetTask.id, tasks);
-
-      // Filter tasks to only include the target and its descendants
-      tasks = tasks.filter(t => allowedIds.has(t.id));
+/** Shared rendering for list command — used by both daemon and direct paths. */
+function renderListOutput(
+  tree: TaskWithSession[],
+  opts: { idsOnly: boolean; showTree: boolean; showAll: boolean },
+): void {
+  // Machine-readable output for shell completion
+  if (opts.idsOnly) {
+    const allNodes = flattenTree(tree);
+    for (const node of allNodes) {
+      console.log(displayId(node.task));
     }
-
-    // Machine-readable output for shell completion
-    if (idsOnly) {
-      for (const task of tasks) {
-        console.log(displayId(task));
-      }
-      return;
-    }
-
-    if (tasks.length === 0) {
-      console.log(showAll
-        ? 'No tasks. Create one with: lazy start --goal "..."'
-        : 'No active tasks. Use --all to see all tasks.');
-      return;
-    }
-
-    // Build tree (used for both display and crash detection)
-    const tree = await buildTaskTree(storage, tasks, root);
-    const crashedCount = countCrashed(tree);
-
-    if (showTree) {
-      console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
-      console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
-
-      for (const rootNode of tree) {
-        printTaskTree(rootNode);
-      }
-    } else {
-      // Flat list
-      const parentDisplayId = buildDisplayIdMap(tasks);
-      console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-      console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
-
-      for (const task of tasks) {
-        const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
-        const code = displayId(task);
-        const model = task.model ?? '-';
-        const taskType = task.type ?? 'task';
-        console.log(
-          `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
-        );
-      }
-    }
-
-    printCrashedFootnote(crashedCount);
-  } finally {
-    await storage.close();
+    return;
   }
+
+  if (tree.length === 0) {
+    console.log(opts.showAll
+      ? 'No tasks. Create one with: lazy start --goal "..."'
+      : 'No active tasks. Use --all to see all tasks.');
+    return;
+  }
+
+  if (opts.showTree) {
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
+
+    for (const rootNode of tree) {
+      printTaskTree(rootNode);
+    }
+  } else {
+    // Flat list
+    const tasks = flattenTree(tree).map(n => n.task);
+    const parentDisplayId = buildDisplayIdMap(tasks);
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+
+    for (const task of tasks) {
+      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const code = displayId(task);
+      const model = task.model ?? '-';
+      const taskType = task.type ?? 'task';
+      console.log(
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+      );
+    }
+  }
+
+  printCrashedFootnote(countCrashed(tree));
+}
+
+/** Flatten a TaskWithSession tree into a flat array, depth-first. */
+function flattenTree(nodes: TaskWithSession[]): TaskWithSession[] {
+  const result: TaskWithSession[] = [];
+  for (const node of nodes) {
+    result.push(node);
+    result.push(...flattenTree(node.children));
+  }
+  return result;
 }
 
 export async function commandActive(args: string[]): Promise<void> {
@@ -297,81 +273,84 @@ export async function commandActive(args: string[]): Promise<void> {
     { name: 'ids-only', takesValue: false },
   ], 'active');
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
+  const idsOnly = parsed.flags.get('ids-only') === true;
+  const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  const follow = parsed.flags.get('follow') === true;
 
-  try {
-    const idsOnly = parsed.flags.get('ids-only') === true;
-    const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
-    const follow = parsed.flags.get('follow') === true;
-    const pollIntervalMs = 3000;
-
-    // Machine-readable output for shell completion
-    if (idsOnly) {
-      const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
-      for (const task of tasks) {
-        console.log(displayId(task));
-      }
-      return;
-    }
-
-    const renderOnce = async (): Promise<boolean> => {
-      // Get active tasks (non-terminal tasks with sessions)
-      const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
-
-      if (tasks.length === 0) {
-        console.log('No active tasks.');
-        return true; // Stop polling
-      }
-
-      // Build tree for both display modes (includes crash detection)
-      const tree = await buildTaskTree(storage, tasks, root);
-
-      if (showTree) {
-        console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('COST'.padEnd(10))} ${theme.header('GOAL')}`);
-        console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(30)}`));
-
-        for (const rootNode of tree) {
-          printTaskTree(rootNode);
-        }
-      } else {
-        const parentDisplayId = buildDisplayIdMap(tasks);
-        console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-        console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
-
-        for (const task of tasks) {
-          const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
-          const code = displayId(task);
-          const model = task.model ?? '-';
-          const taskType = task.type ?? 'task';
-          console.log(
-            `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
-          );
-        }
-      }
-
-      printCrashedFootnote(countCrashed(tree));
-      return false;
-    };
-
-    if (follow) {
+  // --follow needs continuous reconciliation with open storage — can't use RPC
+  if (follow) {
+    const root = requireLazyRoot();
+    const storage = await requireStorage();
+    try {
+      const pollIntervalMs = 3000;
       let done = false;
       while (!done) {
         process.stdout.write('\x1B[2J\x1B[H');
-        // Reconcile on each poll iteration in follow mode
         await reconcileTasks(storage, root);
-        done = await renderOnce();
-        if (!done) {
+        const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
+        if (tasks.length === 0) {
+          console.log('No active tasks.');
+          done = true;
+        } else {
+          const tree = await buildTaskTree(storage, tasks, root);
+          renderActiveOutput(tree, { idsOnly, showTree });
           console.log(`\n(following — press Ctrl+C to stop, polling every ${pollIntervalMs / 1000}s)`);
           await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
         }
       }
-    } else {
-      await renderOnce();
+    } finally {
+      await storage.close();
     }
-  } finally {
-    await storage.close();
+    return;
   }
+
+  const { tree } = await queryActiveTasks();
+  renderActiveOutput(tree, { idsOnly, showTree });
+}
+
+/** Shared rendering for active command. */
+function renderActiveOutput(
+  tree: TaskWithSession[],
+  opts: { idsOnly: boolean; showTree: boolean },
+): void {
+  if (opts.idsOnly) {
+    const allNodes = flattenTree(tree);
+    for (const node of allNodes) {
+      console.log(displayId(node.task));
+    }
+    return;
+  }
+
+  if (tree.length === 0) {
+    console.log('No active tasks.');
+    return;
+  }
+
+  if (opts.showTree) {
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('COST'.padEnd(10))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(30)}`));
+
+    for (const rootNode of tree) {
+      printTaskTree(rootNode);
+    }
+  } else {
+    const tasks = flattenTree(tree).map(n => n.task);
+    const parentDisplayId = buildDisplayIdMap(tasks);
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+
+    for (const task of tasks) {
+      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const code = displayId(task);
+      const model = task.model ?? '-';
+      const taskType = task.type ?? 'task';
+      console.log(
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+      );
+    }
+  }
+
+  printCrashedFootnote(countCrashed(tree));
 }
 
 export async function commandBlocked(args: string[]): Promise<void> {
@@ -381,65 +360,45 @@ export async function commandBlocked(args: string[]): Promise<void> {
     { name: 'tree', takesValue: false },
   ], 'blocked');
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
+  const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
 
-  try {
-    const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  const { tree } = await queryBlockedTasks();
+  sortByLastActive(tree);
+  renderBlockedOutput(tree, showTree);
+}
 
-    // Get blocked tasks (blocked status only - waiting for user)
-    const tasks = await storage.listTasksWithOptions({ blockedOnly: true });
-
-    if (tasks.length === 0) {
-      console.log('No blocked tasks.');
-      return;
-    }
-
-    // Build tree for both display and crash detection
-    const tree = await buildTaskTree(storage, tasks, root);
-
-    // Sort roots by last_interaction_at DESC (most recently active first)
-    // Tasks with no session sort to the bottom
-    sortByLastActive(tree);
-
-    if (showTree) {
-      console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
-      console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
-
-      for (const rootNode of tree) {
-        printTaskTree(rootNode);
-      }
-    } else {
-      // Flat list - sort by session last_interaction_at
-      // (tree is already built and sorted above, extract flat task list)
-      const flatNodes: TaskWithSession[] = [];
-      const collectFlat = (nodes: TaskWithSession[]) => {
-        for (const node of nodes) {
-          flatNodes.push(node);
-          collectFlat(node.children);
-        }
-      };
-      collectFlat(tree);
-
-      const parentDisplayId = buildDisplayIdMap(flatNodes.map(n => n.task));
-      console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-      console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
-
-      for (const { task } of flatNodes) {
-        const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
-        const code = displayId(task);
-        const model = task.model ?? '-';
-        const taskType = task.type ?? 'task';
-        console.log(
-          `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
-        );
-      }
-    }
-
-    printCrashedFootnote(countCrashed(tree));
-  } finally {
-    await storage.close();
+/** Shared rendering for blocked command. */
+function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
+  if (tree.length === 0) {
+    console.log('No blocked tasks.');
+    return;
   }
+
+  if (showTree) {
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
+
+    for (const rootNode of tree) {
+      printTaskTree(rootNode);
+    }
+  } else {
+    const flatNodes = flattenTree(tree);
+    const parentDisplayId = buildDisplayIdMap(flatNodes.map(n => n.task));
+    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+
+    for (const { task } of flatNodes) {
+      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const code = displayId(task);
+      const model = task.model ?? '-';
+      const taskType = task.type ?? 'task';
+      console.log(
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+      );
+    }
+  }
+
+  printCrashedFootnote(countCrashed(tree));
 }
 
 export function listUsage(): void {

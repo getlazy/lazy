@@ -26,6 +26,7 @@ import { logger } from './logger';
 import { getDataDir } from '../cli/init';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
+import { runGit } from './git';
 
 /**
  * Grace period in milliseconds for newly-working tasks.
@@ -464,7 +465,7 @@ async function handleCompletedResponse(
   try {
     if (hasUncommittedChanges(worktreePath)) {
       const uncommittedDiff = getUncommittedDiff(worktreePath);
-      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout.toString();
+      const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
       await storage.createWorktreeSnapshot(session.id, agentTurnSeq, uncommittedDiff, gitStatus);
     }
   } catch {
@@ -552,8 +553,13 @@ async function handleErrorResponse(
     logs: response.stderr ?? null,
   });
 
-  // Auto-resume if called from reconciler (lazyRoot provided) and circuit breaker allows
-  if (lazyRoot) {
+  // Do NOT auto-resume if the error was during merge_and_fix — the task cannot
+  // make progress without a successful upstream merge. Resuming would start
+  // a new turn on a stale branch, diverging further from upstream.
+  if (response.phase === 'merge_and_fix') {
+    logger.warn(`Task ${taskShortId}: merge-and-fix failed, not auto-resuming (task needs human investigation)`);
+  } else if (lazyRoot) {
+    // Auto-resume if called from reconciler (lazyRoot provided) and circuit breaker allows
     await maybeAutoResume(storage, taskId, session.id, lazyRoot);
   }
   // Don't remove container — supervisor may still be alive for next turn

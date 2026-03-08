@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, copyFileSync, statSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { LAZY_COAUTHOR_TRAILER } from '../constants';
 import { logger } from '../utils/logger';
+import { runGit } from '../utils/git';
 
 export interface GitCommitInfo {
   sha: string;
@@ -13,7 +14,7 @@ export interface GitCommitInfo {
  * Returns false on a freshly `git init`-ed repo with no commits.
  */
 export function repoHasCommits(cwd?: string): boolean {
-  const result = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+  const result = runGit(['rev-parse', 'HEAD'], {
     cwd,
     stdout: 'ignore',
     stderr: 'ignore',
@@ -22,25 +23,25 @@ export function repoHasCommits(cwd?: string): boolean {
 }
 
 export function getCurrentSha(cwd?: string): string {
-  const result = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd });
+  const result = runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git rev-parse HEAD failed: ${result.stderr.toString()}`);
+    throw new Error(`git rev-parse HEAD failed: ${result.stderr}`);
   }
-  return result.stdout.toString().trim();
+  return result.stdout;
 }
 
 export function getCurrentBranch(cwd?: string): string {
-  const result = Bun.spawnSync(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
+  const result = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to get current branch: ${result.stderr.toString()}`);
+    throw new Error(`Failed to get current branch: ${result.stderr}`);
   }
-  return result.stdout.toString().trim();
+  return result.stdout;
 }
 
 export function createAndCheckoutBranch(name: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'checkout', '-b', name], { cwd });
+  const result = runGit(['checkout', '-b', name], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git checkout -b ${name} failed: ${result.stderr.toString()}`);
+    throw new Error(`git checkout -b ${name} failed: ${result.stderr}`);
   }
 }
 
@@ -49,11 +50,10 @@ export function createAndCheckoutBranch(name: string, cwd?: string): void {
  * Returns the worktree path if found, or null if the branch has no worktree.
  */
 export function findWorktreeForBranch(branch: string, cwd?: string): string | null {
-  const result = Bun.spawnSync(['git', 'worktree', 'list', '--porcelain'], { cwd });
+  const result = runGit(['worktree', 'list', '--porcelain'], { cwd });
   if (result.exitCode !== 0) return null;
 
-  const output = result.stdout.toString();
-  const lines = output.split('\n');
+  const lines = result.stdout.split('\n');
 
   let currentPath: string | null = null;
   for (const line of lines) {
@@ -74,33 +74,32 @@ export function findWorktreeForBranch(branch: string, cwd?: string): string | nu
 
 export function createWorktree(path: string, branch: string, cwd?: string): void {
   // Try creating with new branch first
-  const result = Bun.spawnSync(['git', 'worktree', 'add', path, '-b', branch], { cwd });
+  const result = runGit(['worktree', 'add', path, '-b', branch], { cwd });
   if (result.exitCode === 0) return;
 
   // Branch already exists — attach worktree to existing branch
-  const retry = Bun.spawnSync(['git', 'worktree', 'add', path, branch], { cwd });
+  const retry = runGit(['worktree', 'add', path, branch], { cwd });
   if (retry.exitCode === 0) return;
 
-  throw new Error(`git worktree add failed: ${retry.stderr.toString()}`);
+  throw new Error(`git worktree add failed: ${retry.stderr}`);
 }
 
 export function removeWorktree(path: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'worktree', 'remove', path, '--force'], { cwd });
+  const result = runGit(['worktree', 'remove', path, '--force'], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git worktree remove failed: ${result.stderr.toString()}`);
+    throw new Error(`git worktree remove failed: ${result.stderr}`);
   }
 }
 
 export function getNewCommits(sinceSha: string, cwd?: string): GitCommitInfo[] {
-  const result = Bun.spawnSync(['git', 'log', '--format=%H%n%s%n---END---', `${sinceSha}..HEAD`], { cwd });
+  const result = runGit(['log', '--format=%H%n%s%n---END---', `${sinceSha}..HEAD`], { cwd });
   if (result.exitCode !== 0) {
     return [];
   }
-  const output = result.stdout.toString().trim();
-  if (!output) return [];
+  if (!result.stdout) return [];
 
   const commits: GitCommitInfo[] = [];
-  const entries = output.split('---END---').filter((e) => e.trim());
+  const entries = result.stdout.split('---END---').filter((e) => e.trim());
   for (const entry of entries) {
     const lines = entry.trim().split('\n');
     if (lines.length >= 2) {
@@ -111,11 +110,11 @@ export function getNewCommits(sinceSha: string, cwd?: string): GitCommitInfo[] {
 }
 
 export function getCommitDiff(sha: string, cwd?: string): string {
-  const result = Bun.spawnSync(['git', 'show', '--no-color', '--format=', sha], { cwd });
+  const result = runGit(['show', '--no-color', '--format=', sha], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
-  return result.stdout.toString();
+  return result.stdout;
 }
 
 /**
@@ -123,13 +122,12 @@ export function getCommitDiff(sha: string, cwd?: string): string {
  * Returns an array of file paths (added, modified, or deleted).
  */
 export function getCommitChangedFiles(sha: string, cwd?: string): string[] {
-  const result = Bun.spawnSync(['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', sha], { cwd });
+  const result = runGit(['diff-tree', '--no-commit-id', '--name-only', '-r', sha], { cwd });
   if (result.exitCode !== 0) {
     return [];
   }
-  const output = result.stdout.toString().trim();
-  if (!output) return [];
-  return output.split('\n').filter(f => f.length > 0);
+  if (!result.stdout) return [];
+  return result.stdout.split('\n').filter(f => f.length > 0);
 }
 
 /**
@@ -137,24 +135,24 @@ export function getCommitChangedFiles(sha: string, cwd?: string): string[] {
  * Returns the file content as a string, or null if the file doesn't exist at that commit.
  */
 export function getFileAtCommit(sha: string, filepath: string, cwd?: string): string | null {
-  const result = Bun.spawnSync(['git', 'show', `${sha}:${filepath}`], { cwd });
+  const result = runGit(['show', `${sha}:${filepath}`], { cwd });
   if (result.exitCode !== 0) {
     return null;
   }
-  return result.stdout.toString();
+  return result.stdout;
 }
 
 export function createTag(name: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'tag', name], { cwd });
+  const result = runGit(['tag', name], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git tag ${name} failed: ${result.stderr.toString()}`);
+    throw new Error(`git tag ${name} failed: ${result.stderr}`);
   }
 }
 
 export function mergeBranch(branch: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'merge', branch, '--no-ff', '-m', `Merge ${branch}`], { cwd });
+  const result = runGit(['merge', branch, '--no-ff', '-m', `Merge ${branch}`], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git merge ${branch} failed: ${result.stderr.toString()}`);
+    throw new Error(`git merge ${branch} failed: ${result.stderr}`);
   }
 }
 
@@ -163,16 +161,15 @@ export function mergeBranch(branch: string, cwd?: string): void {
  * Used to build squash commit messages.
  */
 export function getBranchCommitMessages(sourceBranch: string, targetBranch: string, cwd?: string): string[] {
-  const result = Bun.spawnSync(
-    ['git', 'log', '--format=%s', `${targetBranch}..${sourceBranch}`],
+  const result = runGit(
+    ['log', '--format=%s', `${targetBranch}..${sourceBranch}`],
     { cwd }
   );
   if (result.exitCode !== 0) {
     return [];
   }
-  const output = result.stdout.toString().trim();
-  if (!output) return [];
-  return output.split('\n');
+  if (!result.stdout) return [];
+  return result.stdout.split('\n');
 }
 
 /**
@@ -180,9 +177,9 @@ export function getBranchCommitMessages(sourceBranch: string, targetBranch: stri
  * Stages all changes but does not auto-commit; the caller must commit separately.
  */
 export function squashMergeBranch(branch: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'merge', '--squash', branch], { cwd });
+  const result = runGit(['merge', '--squash', branch], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git merge --squash ${branch} failed: ${result.stderr.toString()}`);
+    throw new Error(`git merge --squash ${branch} failed: ${result.stderr}`);
   }
 }
 
@@ -198,30 +195,30 @@ export function squashMergeBranchIntoTarget(
 ): void {
   const originalBranch = getCurrentBranch(cwd);
 
-  const checkout = Bun.spawnSync(['git', 'checkout', targetBranch], { cwd });
+  const checkout = runGit(['checkout', targetBranch], { cwd });
   if (checkout.exitCode !== 0) {
-    throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr.toString()}`);
+    throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr}`);
   }
 
   try {
-    const merge = Bun.spawnSync(['git', 'merge', '--squash', sourceBranch], { cwd });
+    const merge = runGit(['merge', '--squash', sourceBranch], { cwd });
     if (merge.exitCode !== 0) {
-      throw new Error(`Squash merge failed: ${merge.stderr.toString()}`);
+      throw new Error(`Squash merge failed: ${merge.stderr}`);
     }
 
-    const commit = Bun.spawnSync(['git', 'commit', '-m', commitMessage], { cwd });
+    const commit = runGit(['commit', '-m', commitMessage], { cwd });
     if (commit.exitCode !== 0) {
-      throw new Error(`Commit after squash merge failed: ${commit.stderr.toString()}`);
+      throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
     }
   } finally {
-    Bun.spawnSync(['git', 'checkout', originalBranch], { cwd });
+    runGit(['checkout', originalBranch], { cwd });
   }
 }
 
 export function deleteBranch(branch: string, cwd?: string): void {
-  const result = Bun.spawnSync(['git', 'branch', '-D', branch], { cwd });
+  const result = runGit(['branch', '-D', branch], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git branch -D ${branch} failed: ${result.stderr.toString()}`);
+    throw new Error(`git branch -D ${branch} failed: ${result.stderr}`);
   }
 }
 
@@ -229,17 +226,17 @@ export function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: strin
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = Bun.spawnSync(['git', 'diff', '--no-color', '--stat', range], { cwd });
+  const result = runGit(['diff', '--no-color', '--stat', range], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
-  let output = result.stdout.toString();
+  let output = result.stdout;
 
   // If toRef is HEAD and there are uncommitted changes, include them
   if (toRef === 'HEAD' && hasUncommittedChanges(cwd)) {
-    const uncommittedStat = Bun.spawnSync(['git', 'diff', '--no-color', '--stat', 'HEAD'], { cwd });
-    if (uncommittedStat.exitCode === 0 && uncommittedStat.stdout.toString().trim()) {
-      output += '\n--- Uncommitted changes ---\n' + uncommittedStat.stdout.toString();
+    const uncommittedStat = runGit(['diff', '--no-color', '--stat', 'HEAD'], { cwd });
+    if (uncommittedStat.exitCode === 0 && uncommittedStat.stdout) {
+      output += '\n--- Uncommitted changes ---\n' + uncommittedStat.stdout;
     }
   }
 
@@ -250,17 +247,17 @@ export function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: strin
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = Bun.spawnSync(['git', 'diff', '--no-color', range], { cwd });
+  const result = runGit(['diff', '--no-color', range], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
-  let output = result.stdout.toString();
+  let output = result.stdout;
 
   // If toRef is HEAD and there are uncommitted changes, include them
   if (toRef === 'HEAD' && hasUncommittedChanges(cwd)) {
-    const uncommittedDiff = Bun.spawnSync(['git', 'diff', '--no-color', 'HEAD'], { cwd });
-    if (uncommittedDiff.exitCode === 0 && uncommittedDiff.stdout.toString().trim()) {
-      output += '\n\n--- Uncommitted changes ---\n' + uncommittedDiff.stdout.toString();
+    const uncommittedDiff = runGit(['diff', '--no-color', 'HEAD'], { cwd });
+    if (uncommittedDiff.exitCode === 0 && uncommittedDiff.stdout) {
+      output += '\n\n--- Uncommitted changes ---\n' + uncommittedDiff.stdout;
     }
   }
 
@@ -270,15 +267,14 @@ export function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: strin
 export function hasUncommittedChanges(cwd?: string): boolean {
   // Exclude .lazy-task-sandbox/ from dirty worktree checks — it contains lazy's own
   // runtime artifacts (agent sessions, protocol files) and should never affect dirty state.
-  const result = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
+  const result = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
   if (result.exitCode !== 0) {
     return false;
   }
-  const output = result.stdout.toString().trim();
-  if (!output) return false;
+  if (!result.stdout) return false;
 
   // Filter out lazy-specific control files that are not real uncommitted work
-  const lines = output.split('\n');
+  const lines = result.stdout.split('\n');
   const hasRealChanges = lines.some(line => {
     if (!line.trim()) return false; // Empty line
     // Lines start with 2-char status code (e.g., " M" for modified, "??" for untracked)
@@ -297,16 +293,16 @@ export function hasUncommittedChanges(cwd?: string): boolean {
 
 export function getUncommittedDiff(cwd?: string): string {
   // Get both staged and unstaged changes
-  const staged = Bun.spawnSync(['git', 'diff', '--no-color', '--cached'], { cwd });
-  const unstaged = Bun.spawnSync(['git', 'diff', '--no-color'], { cwd });
+  const staged = runGit(['diff', '--no-color', '--cached'], { cwd });
+  const unstaged = runGit(['diff', '--no-color'], { cwd });
 
   let diff = '';
-  if (staged.exitCode === 0 && staged.stdout.toString().trim()) {
-    diff += '--- STAGED CHANGES ---\n' + staged.stdout.toString();
+  if (staged.exitCode === 0 && staged.stdout) {
+    diff += '--- STAGED CHANGES ---\n' + staged.stdout;
   }
-  if (unstaged.exitCode === 0 && unstaged.stdout.toString().trim()) {
+  if (unstaged.exitCode === 0 && unstaged.stdout) {
     if (diff) diff += '\n\n';
-    diff += '--- UNSTAGED CHANGES ---\n' + unstaged.stdout.toString();
+    diff += '--- UNSTAGED CHANGES ---\n' + unstaged.stdout;
   }
 
   return diff;
@@ -315,9 +311,9 @@ export function getUncommittedDiff(cwd?: string): string {
 export function applyPatch(patch: string, cwd?: string): boolean {
   // Apply a git patch to the working directory
   // Use git apply which handles both staged and unstaged changes
-  const result = Bun.spawnSync(['git', 'apply'], {
+  const result = runGit(['apply'], {
     cwd,
-    stdin: new TextEncoder().encode(patch)
+    stdin: new TextEncoder().encode(patch),
   });
 
   return result.exitCode === 0;
@@ -329,9 +325,9 @@ export function applyPatch(patch: string, cwd?: string): boolean {
  */
 export function createWorktreeFromSha(path: string, branch: string, startSha: string, cwd?: string): void {
   // Create worktree with new branch starting from specified SHA
-  const result = Bun.spawnSync(['git', 'worktree', 'add', path, '-b', branch, startSha], { cwd });
+  const result = runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`git worktree add from SHA failed: ${result.stderr.toString()}`);
+    throw new Error(`git worktree add from SHA failed: ${result.stderr}`);
   }
 }
 
@@ -344,21 +340,21 @@ export function mergeBranchIntoTarget(sourceBranch: string, targetBranch: string
   const originalBranch = getCurrentBranch(cwd);
 
   // Checkout target branch
-  const checkout = Bun.spawnSync(['git', 'checkout', targetBranch], { cwd });
+  const checkout = runGit(['checkout', targetBranch], { cwd });
   if (checkout.exitCode !== 0) {
-    throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr.toString()}`);
+    throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr}`);
   }
 
   try {
     // Merge source branch
     const mergeMsg = message ?? `Merge ${sourceBranch} into ${targetBranch}`;
-    const merge = Bun.spawnSync(['git', 'merge', sourceBranch, '--no-ff', '-m', mergeMsg], { cwd });
+    const merge = runGit(['merge', sourceBranch, '--no-ff', '-m', mergeMsg], { cwd });
     if (merge.exitCode !== 0) {
-      throw new Error(`Merge failed: ${merge.stderr.toString()}`);
+      throw new Error(`Merge failed: ${merge.stderr}`);
     }
   } finally {
     // Return to original branch (best effort)
-    Bun.spawnSync(['git', 'checkout', originalBranch], { cwd });
+    runGit(['checkout', originalBranch], { cwd });
   }
 }
 
@@ -366,7 +362,7 @@ export function mergeBranchIntoTarget(sourceBranch: string, targetBranch: string
  * Check if a branch exists
  */
 export function branchExists(branch: string, cwd?: string): boolean {
-  const result = Bun.spawnSync(['git', 'rev-parse', '--verify', branch], { cwd });
+  const result = runGit(['rev-parse', '--verify', branch], { cwd });
   return result.exitCode === 0;
 }
 
@@ -393,11 +389,11 @@ export function recoverMissingWorktree(
   }
 
   // Prune stale worktree entries so git doesn't reject the add
-  Bun.spawnSync(['git', 'worktree', 'prune'], { cwd });
+  runGit(['worktree', 'prune'], { cwd });
 
-  const result = Bun.spawnSync(['git', 'worktree', 'add', worktreePath, branch], { cwd });
+  const result = runGit(['worktree', 'add', worktreePath, branch], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to recreate worktree: ${result.stderr.toString()}`);
+    throw new Error(`Failed to recreate worktree: ${result.stderr}`);
   }
 
   // Check if the recreated worktree has uncommitted changes
@@ -419,17 +415,15 @@ export function recoverMissingWorktree(
  */
 export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: string): boolean {
   // Fast path: check if this is a regular (non-squash) merge
-  const ancestorCheck = Bun.spawnSync(['git', 'merge-base', '--is-ancestor', branch, targetBranch], { cwd });
+  const ancestorCheck = runGit(['merge-base', '--is-ancestor', branch, targetBranch], { cwd });
   if (ancestorCheck.exitCode === 0) {
     // Branch is ancestor of target. But this is also true for freshly created branches
     // that have no new commits. Check that the branch actually has work on it by verifying
     // the branch tip is not the merge-base (i.e., they haven't diverged at all).
-    const mergeBase = Bun.spawnSync(['git', 'merge-base', branch, targetBranch], { cwd });
-    const branchTip = Bun.spawnSync(['git', 'rev-parse', branch], { cwd });
+    const mergeBase = runGit(['merge-base', branch, targetBranch], { cwd });
+    const branchTip = runGit(['rev-parse', branch], { cwd });
     if (mergeBase.exitCode === 0 && branchTip.exitCode === 0) {
-      const base = mergeBase.stdout.toString().trim();
-      const tip = branchTip.stdout.toString().trim();
-      if (base === tip) {
+      if (mergeBase.stdout === branchTip.stdout) {
         // Branch tip equals merge-base — no unique commits, freshly created branch
         return false;
       }
@@ -439,21 +433,20 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
 
   // Squash-merge detection: branch has unique commits but contents match target
   // First check the branch has diverged (has commits not on target)
-  const branchCommits = Bun.spawnSync(
-    ['git', 'rev-list', '--count', `${targetBranch}..${branch}`],
+  const branchCommits = runGit(
+    ['rev-list', '--count', `${targetBranch}..${branch}`],
     { cwd }
   );
   if (branchCommits.exitCode !== 0) return false;
-  const count = parseInt(branchCommits.stdout.toString().trim(), 10);
+  const count = parseInt(branchCommits.stdout, 10);
   if (count === 0) return false; // No unique commits — not merged, just empty
 
   // Guard: if ALL unique commits are empty (no file changes), this is not a squash merge.
   // This prevents false positives from --allow-empty initial commits created by `lazy start`.
-  const mergeBase = Bun.spawnSync(['git', 'merge-base', branch, targetBranch], { cwd });
+  const mergeBase = runGit(['merge-base', branch, targetBranch], { cwd });
   if (mergeBase.exitCode === 0) {
-    const base = mergeBase.stdout.toString().trim();
-    const filesChanged = Bun.spawnSync(['git', 'diff', '--name-only', base, branch], { cwd });
-    if (filesChanged.exitCode === 0 && filesChanged.stdout.toString().trim() === '') {
+    const filesChanged = runGit(['diff', '--name-only', mergeBase.stdout, branch], { cwd });
+    if (filesChanged.exitCode === 0 && filesChanged.stdout === '') {
       // Branch has commits but zero file changes — not a real merge, just empty commits
       return false;
     }
@@ -461,7 +454,7 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
 
   // Branch has unique commits with real file changes. Check if the tree contents are
   // identical to target (squash merged).
-  const diff = Bun.spawnSync(['git', 'diff', '--quiet', targetBranch, branch], { cwd });
+  const diff = runGit(['diff', '--quiet', targetBranch, branch], { cwd });
   return diff.exitCode === 0; // exit 0 = no diff = contents match
 }
 
@@ -471,12 +464,12 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
  * Searches the last `limit` commits (default 100).
  */
 export function findCommitByMessage(targetBranch: string, searchText: string, cwd?: string, limit: number = 100): boolean {
-  const result = Bun.spawnSync(
-    ['git', 'log', targetBranch, `--max-count=${limit}`, '--format=%s', '--grep', searchText],
+  const result = runGit(
+    ['log', targetBranch, `--max-count=${limit}`, '--format=%s', '--grep', searchText],
     { cwd }
   );
   if (result.exitCode !== 0) return false;
-  return result.stdout.toString().trim().length > 0;
+  return result.stdout.length > 0;
 }
 
 /**
@@ -491,8 +484,8 @@ export function hasUpstreamChanges(parentBranch: string, cwd?: string): boolean 
   }
 
   // Check if there are commits in parent that are not in current branch
-  const result = Bun.spawnSync(
-    ['git', 'rev-list', '--count', `${currentBranch}..${parentBranch}`],
+  const result = runGit(
+    ['rev-list', '--count', `${currentBranch}..${parentBranch}`],
     { cwd }
   );
 
@@ -500,7 +493,7 @@ export function hasUpstreamChanges(parentBranch: string, cwd?: string): boolean 
     return false;
   }
 
-  const count = parseInt(result.stdout.toString().trim(), 10);
+  const count = parseInt(result.stdout, 10);
   return count > 0;
 }
 
@@ -512,25 +505,25 @@ export function getCommitsBehindCount(sourceBranch: string, targetBranch: string
   if (!branchExists(targetBranch, cwd)) {
     return 0;
   }
-  const result = Bun.spawnSync(
-    ['git', 'rev-list', '--count', `${sourceBranch}..${targetBranch}`],
+  const result = runGit(
+    ['rev-list', '--count', `${sourceBranch}..${targetBranch}`],
     { cwd }
   );
   if (result.exitCode !== 0) {
     return 0;
   }
-  return parseInt(result.stdout.toString().trim(), 10) || 0;
+  return parseInt(result.stdout, 10) || 0;
 }
 
 /**
  * Get the merge base between two branches
  */
 export function getMergeBase(branch1: string, branch2: string, cwd?: string): string {
-  const result = Bun.spawnSync(['git', 'merge-base', branch1, branch2], { cwd });
+  const result = runGit(['merge-base', branch1, branch2], { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to find merge base: ${result.stderr.toString()}`);
+    throw new Error(`Failed to find merge base: ${result.stderr}`);
   }
-  return result.stdout.toString().trim();
+  return result.stdout;
 }
 
 /**
@@ -542,11 +535,10 @@ export function checkMergeConflicts(fromBranch: string, cwd?: string): boolean {
   const mergeBase = getMergeBase('HEAD', fromBranch, cwd);
 
   // Use git merge-tree to simulate the merge
-  const result = Bun.spawnSync(['git', 'merge-tree', mergeBase, 'HEAD', fromBranch], { cwd });
+  const result = runGit(['merge-tree', mergeBase, 'HEAD', fromBranch], { cwd });
 
   // merge-tree outputs conflict markers if there are conflicts
-  const output = result.stdout.toString();
-  return output.includes('<<<<<<<') || output.includes('>>>>>>>');
+  return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
 }
 
 /**
@@ -558,11 +550,10 @@ export function checkMergeConflictsIntoTarget(sourceBranch: string, targetBranch
   const mergeBase = getMergeBase(targetBranch, sourceBranch, cwd);
 
   // Use git merge-tree to simulate the merge
-  const result = Bun.spawnSync(['git', 'merge-tree', mergeBase, targetBranch, sourceBranch], { cwd });
+  const result = runGit(['merge-tree', mergeBase, targetBranch, sourceBranch], { cwd });
 
   // merge-tree outputs conflict markers if there are conflicts
-  const output = result.stdout.toString();
-  return output.includes('<<<<<<<') || output.includes('>>>>>>>');
+  return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
 }
 
 /**
@@ -617,8 +608,8 @@ export function copyUntrackedFilesIntoWorktree(
       if (!existsSync(sourcePath)) continue;
 
       // Skip if file is tracked by git
-      const checkTracked = Bun.spawnSync(
-        ['git', 'ls-files', '--error-unmatch', relativePath],
+      const checkTracked = runGit(
+        ['ls-files', '--error-unmatch', relativePath],
         { cwd: repoRoot, stdout: 'ignore', stderr: 'ignore' }
       );
       if (checkTracked.exitCode === 0) {
@@ -641,4 +632,3 @@ export function copyUntrackedFilesIntoWorktree(
     }
   }
 }
-

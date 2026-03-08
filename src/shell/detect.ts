@@ -9,6 +9,7 @@
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
+import { spawnSync } from '../utils/spawn';
 
 export type ShellName = 'bash' | 'zsh' | 'fish' | 'unknown';
 
@@ -41,7 +42,7 @@ function getShellVersion(shellPath: string, shellName: ShellName): string | unde
 
   try {
     // All three shells support --version
-    const result = Bun.spawnSync([shellPath, '--version'], {
+    const result = spawnSync([shellPath, '--version'], {
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 2_000,

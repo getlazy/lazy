@@ -71,30 +71,28 @@ describe('lazy init storage location', () => {
     await rm(testRoot, { recursive: true, force: true });
   });
 
-  test('non-interactive init defaults to in-repo storage', async () => {
+  test('non-interactive init defaults to external storage', async () => {
     const result = await runLazy(testRoot, ['init', '--skip-auth-check', '--non-interactive']);
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Initialized lazy');
-    expect(result.stdout).toContain('in-repo');
+    expect(result.stdout).toContain('external');
 
     // Verify .lazy directory was created
     expect(existsSync(join(testRoot, '.lazy'))).toBe(true);
-    expect(existsSync(join(testRoot, '.lazy', 'tasks'))).toBe(true);
 
     // Verify config file has correct backend
     const configContent = await readFile(join(testRoot, 'lazy.toml'), 'utf-8');
-    expect(configContent).toContain('backend = "in-repo"');
+    expect(configContent).toContain('backend = "external"');
   });
 
-  test('manual config for external storage is respected', async () => {
-    // Initialize with default in-repo first
+  test('manual config for external storage path is respected', async () => {
+    // Initialize with default external first
     await runLazy(testRoot, ['init', '--skip-auth-check', '--non-interactive']);
 
-    // Manually edit config to use external storage
+    // Manually edit config to set external storage path
     const configPath = join(testRoot, 'lazy.toml');
     let config = await readFile(configPath, 'utf-8');
-    config = config.replace('backend = "in-repo"', `backend = "external"`);
     config = config.replace('external_path = ""', `external_path = "${externalPath}"`);
     await writeFile(configPath, config);
 
@@ -122,6 +120,5 @@ describe('lazy init storage location', () => {
     expect(configContent).toContain('[storage]');
     expect(configContent).toContain('backend =');
     expect(configContent).toContain('external_path =');
-    expect(configContent).toContain('orphan_branch_name =');
   });
 });

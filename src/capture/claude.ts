@@ -8,6 +8,7 @@ import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import { logger } from '../utils/logger';
+import { spawn, spawnSync } from '../utils/spawn';
 import { isValidToolchain, getToolchainDockerfileContent } from '../docker/toolchains';
 import type { ToolchainName } from '../docker/toolchains';
 
@@ -57,7 +58,7 @@ export function getModelId(modelName: ModelName): string {
 export function checkDocker(binary: string = 'docker'): void {
   logger.debug(`Checking ${binary}...`);
 
-  const result = Bun.spawnSync([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
+  const result = spawnSync([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
   if (result.exitCode !== 0) {
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
     logger.error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
@@ -152,7 +153,7 @@ export function resolveImageName(lazyRoot: string): string {
 }
 
 function getImageDockerfileHash(imageName: string, binary: string = 'docker'): string | null {
-  const inspect = Bun.spawnSync(
+  const inspect = spawnSync(
     [binary, 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${DOCKERFILE_HASH_LABEL}"}}`],
     { stdout: 'pipe', stderr: 'ignore' }
   );
@@ -194,7 +195,7 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
     }
   }
 
-  const proc = Bun.spawn(
+  const proc = spawn(
     [binary, 'build', '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${currentHash}`, '-f', dockerfileName, '.'],
     { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe' }
   );
@@ -400,7 +401,7 @@ export async function ensureAgentBinary(): Promise<string> {
   // get the new binary. No window where the file is missing.
   const tmpPath = join(binDir, `.tmp-lazy-agent-${randomUUID()}`);
 
-  const proc = Bun.spawn(
+  const proc = spawn(
     ['bun', 'build', '--compile', `--target=${target}`, entryPoint, '--outfile', tmpPath],
     { cwd: sourceRoot, stdout: 'pipe', stderr: 'pipe' }
   );
@@ -535,7 +536,7 @@ export async function runClaude(
 
   logger.info('Running Claude Code...');
 
-  const proc = Bun.spawn(args, {
+  const proc = spawn(args, {
     stdout: 'pipe',
     stderr: verbose || debug ? 'inherit' : 'pipe',
   });
@@ -601,7 +602,7 @@ export async function resumeClaude(
     console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
-  const proc = Bun.spawn(args, {
+  const proc = spawn(args, {
     stdout: 'pipe',
     stderr: verbose || debug ? 'inherit' : 'pipe',
   });
@@ -714,7 +715,7 @@ export async function launchClaudeAsync(
 
   logger.info('Launching Claude Code (async)...');
 
-  const result = Bun.spawnSync(args, {
+  const result = spawnSync(args, {
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -766,7 +767,7 @@ export async function resumeClaudeAsync(
     console.log('[DEBUG] Running container command:', args.join(' '));
   }
 
-  const result = Bun.spawnSync(args, {
+  const result = spawnSync(args, {
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -786,7 +787,7 @@ export async function resumeClaudeAsync(
  */
 export function isContainerRunning(containerName: string, binary: string = 'docker'): boolean {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'ps', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -802,7 +803,7 @@ export function isContainerRunning(containerName: string, binary: string = 'dock
  */
 export function containerExists(containerName: string, binary: string = 'docker'): boolean {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'ps', '-a', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -818,7 +819,7 @@ export function containerExists(containerName: string, binary: string = 'docker'
  */
 export function getContainerExitCode(containerName: string, binary: string = 'docker'): number | null {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -839,7 +840,7 @@ export function getContainerExitCode(containerName: string, binary: string = 'do
  */
 export function getContainerOutput(containerName: string, binary: string = 'docker'): string | null {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'logs', containerName],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -856,7 +857,7 @@ export function getContainerOutput(containerName: string, binary: string = 'dock
  */
 export function getContainerLogs(containerName: string, tailLines: number = 50, binary: string = 'docker'): string | null {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'logs', '--tail', String(tailLines), containerName],
       { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -876,7 +877,7 @@ export function getContainerLogs(containerName: string, tailLines: number = 50, 
  */
 export function removeContainer(containerName: string, binary: string = 'docker'): void {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'rm', '-f', containerName],
       { stdout: 'ignore', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -901,7 +902,7 @@ export interface ContainerInfo {
  */
 export function getContainerInfo(containerName: string, binary: string = 'docker'): ContainerInfo | null {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
@@ -1020,7 +1021,7 @@ export async function launchSupervisorAsync(
 
   logger.info('Launching supervisor container...');
 
-  const result = Bun.spawnSync(args, {
+  const result = spawnSync(args, {
     stdout: 'pipe',
     stderr: 'pipe',
   });

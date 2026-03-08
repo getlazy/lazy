@@ -6,6 +6,7 @@
  */
 
 import type { AgentPackaging } from './interface';
+import { spawnSync } from '../utils/spawn';
 
 export class ClaudeCodePackaging implements AgentPackaging {
   readonly agentId = 'claude-code';
@@ -52,7 +53,7 @@ WORKDIR /work
 
   diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
     try {
-      const result = Bun.spawnSync(['claude', '--version'], {
+      const result = spawnSync(['claude', '--version'], {
         stdout: 'pipe',
         stderr: 'pipe',
         timeout: 10_000,

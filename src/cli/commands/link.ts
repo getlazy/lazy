@@ -15,6 +15,7 @@ import { createDriver } from '../../remote';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
+import { runGit } from '../../utils/git';
 
 export async function commandLink(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -92,20 +93,20 @@ export async function commandLink(args: string[]): Promise<void> {
     // Fetch the branch from remote so we can create a worktree
     const gitRemote = config.remote.git_remote;
     console.log(`Fetching branch ${result.branch}...`);
-    const fetchResult = Bun.spawnSync(
-      ['git', 'fetch', gitRemote, `${result.branch}:${result.branch}`],
-      { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+    const fetchResult = runGit(
+      ['fetch', gitRemote, `${result.branch}:${result.branch}`],
+      { cwd: root },
     );
     if (fetchResult.exitCode !== 0) {
       // Branch might already exist locally — try to update it
-      const pullResult = Bun.spawnSync(
-        ['git', 'fetch', gitRemote, result.branch],
-        { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+      const pullResult = runGit(
+        ['fetch', gitRemote, result.branch],
+        { cwd: root },
       );
       if (pullResult.exitCode !== 0) {
         console.error(`Failed to fetch branch '${result.branch}' from remote.`);
         console.error(`Make sure you have access to this repository and the branch exists.`);
-        console.error(pullResult.stderr.toString());
+        console.error(pullResult.stderr);
         process.exit(1);
       }
     }
@@ -150,9 +151,9 @@ export async function commandLink(args: string[]): Promise<void> {
     // Detect the parent branch (the branch this was forked from).
     // Try merge-base against main first, then fall back to HEAD.
     const mainBranch = getCurrentBranch(root);
-    const mergeBaseResult = Bun.spawnSync(
-      ['git', 'merge-base', mainBranch, result.branch],
-      { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+    const mergeBaseResult = runGit(
+      ['merge-base', mainBranch, result.branch],
+      { cwd: root },
     );
     if (mergeBaseResult.exitCode === 0) {
       await storage.updateTaskMetadata(task.id, 'parent_branch', mainBranch);
@@ -160,11 +161,11 @@ export async function commandLink(args: string[]): Promise<void> {
 
     // Create a session record so the task shows the correct branch
     const agentId = config.agent.agent_id;
-    const startSha = Bun.spawnSync(
-      ['git', 'rev-parse', result.branch],
-      { cwd: root, stdout: 'pipe', stderr: 'pipe' },
+    const startSha = runGit(
+      ['rev-parse', result.branch],
+      { cwd: root },
     );
-    const sha = startSha.exitCode === 0 ? startSha.stdout.toString().trim() : 'unknown';
+    const sha = startSha.exitCode === 0 ? startSha.stdout : 'unknown';
     await storage.createSession(task.id, agentId, result.branch, sha);
 
     // Print summary

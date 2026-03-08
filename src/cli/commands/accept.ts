@@ -4,6 +4,7 @@ import type { Task } from '../../types';
 import { isActiveStatus } from '../../types';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, validateCode, rejectIfPairing, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
 import { hasUncommittedChanges, getCurrentSha } from '../../git/operations';
+import { validateBranchInSyncWithRemote } from '../../utils/git';
 import { removeLock } from '../../utils/lock';
 import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
 import { protocolDir, removeProtocolDir } from '../../protocol';
@@ -374,6 +375,20 @@ export async function commandAccept(args: string[]): Promise<void> {
         console.log(`  ${theme.taskId(displayId(child))} [${theme.status(child.status)}] ${child.goal}`);
       }
       console.log('');
+    }
+
+    // Pre-flight: for root tasks with a remote driver, validate that local
+    // target branch is in sync with all remotes before attempting the merge.
+    // Once a remote merge happens we can't undo it — failing early prevents
+    // a half-accepted state where the remote merge succeeded but local
+    // fast-forward fails due to divergence.
+    if (!isChildTask && driver.needsSync) {
+      const syncCheck = validateBranchInSyncWithRemote(mergeTargetBranch, config.remote.git_remote, root);
+      if (!syncCheck.inSync) {
+        console.error(`Error: ${syncCheck.error}`);
+        console.error('Fix this before accepting to avoid a half-merged state.');
+        process.exit(1);
+      }
     }
 
     // Use the driver to perform the merge (conflict check + merge attempt)

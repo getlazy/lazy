@@ -51,6 +51,7 @@ import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
+import { spawnSync } from '../utils/spawn';
 
 export interface GhResult {
   stdout: string;
@@ -72,7 +73,7 @@ function runGh(args: string[], cwd?: string): GhResult {
   if (cwd) spawnOpts.cwd = cwd;
 
   try {
-    const result = Bun.spawnSync(['gh', ...args], spawnOpts);
+    const result = spawnSync(['gh', ...args], spawnOpts);
     return {
       stdout: result.stdout.toString().trim(),
       stderr: result.stderr.toString().trim(),
@@ -101,14 +102,10 @@ function parsePrNumberFromUrl(url: string): number | undefined {
  */
 export function detectGitHub(repoDir: string, remoteName: string = 'origin'): DriverDetection | null {
   try {
-    const result = Bun.spawnSync(['git', 'remote', 'get-url', remoteName], {
-      cwd: repoDir,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const result = defaultRunGit(['remote', 'get-url', remoteName], { cwd: repoDir });
 
     if (result.exitCode === 0) {
-      const url = result.stdout.toString().trim();
+      const url = result.stdout;
       if (url.includes('github.com')) {
         return {
           name: 'GitHub',

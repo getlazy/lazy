@@ -51,6 +51,8 @@ import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
 import { allTools } from '../mcp/tools';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
+import { spawnSync } from '../utils/spawn';
+import { runGit } from '../utils/git';
 
 export interface SupervisorConfig {
   /** Protocol directory path (shared via volume) */
@@ -78,7 +80,7 @@ function checkRequiredTools(runner: Runner): void {
   const checks = runner.supervisorToolChecks();
 
   for (const { cmd, name, hint } of checks) {
-    const result = Bun.spawnSync(['which', cmd], { stdout: 'ignore', stderr: 'ignore' });
+    const result = spawnSync(['which', cmd], { stdout: 'ignore', stderr: 'ignore' });
     if (result.exitCode !== 0) {
       logError(`[supervisor] ${hint}`);
       process.exit(1);
@@ -196,7 +198,7 @@ function recoverWorktreeState(worktreePath: string): void {
   // Check for unmerged files (conflict markers without MERGE_HEAD — shouldn't happen but be safe)
   if (hasUnmergedFiles(worktreePath)) {
     logWarn('[supervisor] Detected unmerged files in worktree. Resetting to clean state.');
-    Bun.spawnSync(['git', 'reset', '--hard', 'HEAD'], { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' });
+    runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
   }
 }
 
@@ -277,7 +279,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     }
 
     try {
-      const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, cmd.upstream_merge_context);
+      const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id);
       allMergeConflicts.push(...conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -391,7 +393,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       }
 
       try {
-        const postTurnConflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, cmd.upstream_merge_context);
+        const postTurnConflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id);
         allMergeConflicts.push(...postTurnConflicts);
         updatePhase(status, 'post_turn_sync_done', protocolDir);
       } catch (err) {
@@ -400,7 +402,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         logWarn(`[supervisor] Post-turn sync failed: ${errorMessage}. Skipping.`);
 
         // Abort any in-progress merge to leave the branch clean
-        Bun.spawnSync(['git', 'merge', '--abort'], { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' });
+        runGit(['merge', '--abort'], { cwd: worktreePath });
       }
     }
 
@@ -450,27 +452,27 @@ function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: stri
 }
 
 function getHeadSha(cwd: string): string {
-  const result = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
     return 'unknown';
   }
-  return result.stdout.toString().trim();
+  return result.stdout;
 }
 
 function getBranchSha(cwd: string, branch: string): string | null {
-  const result = Bun.spawnSync(['git', 'rev-parse', branch], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = runGit(['rev-parse', branch], { cwd });
   if (result.exitCode !== 0) {
-    logWarn(`[supervisor] Failed to get SHA for branch ${branch}: ${result.stderr.toString().trim()}`);
+    logWarn(`[supervisor] Failed to get SHA for branch ${branch}: ${result.stderr}`);
     return null;
   }
-  return result.stdout.toString().trim();
+  return result.stdout;
 }
 
 function tagHead(cwd: string, tagName: string): void {
   // Best-effort tagging — don't fail the turn if tagging fails
-  const result = Bun.spawnSync(['git', 'tag', '-f', tagName], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = runGit(['tag', '-f', tagName], { cwd });
   if (result.exitCode !== 0) {
-    logWarn(`[supervisor] Failed to create tag ${tagName}: ${result.stderr.toString().trim()}`);
+    logWarn(`[supervisor] Failed to create tag ${tagName}: ${result.stderr}`);
   } else {
     log(`[supervisor] Tagged HEAD as ${tagName}`);
   }

@@ -16,6 +16,7 @@ import { loadConfig } from '../../config/loader';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { getActor } from '../../constants';
+import { spawnSync } from '../../utils/spawn';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -359,7 +360,7 @@ export async function commandPair(args: string[]): Promise<void> {
       }
 
       // Launch Claude Code interactively in the worktree
-      const result = Bun.spawnSync(claudeArgs, {
+      const result = spawnSync(claudeArgs, {
         cwd: worktreePath,
         stdin: 'inherit',
         stdout: 'inherit',

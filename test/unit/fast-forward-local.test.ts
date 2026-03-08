@@ -18,8 +18,7 @@ const githubConfig: ResolvedConfig = {
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: {
-    backend: 'in-repo',
-    orphan_branch_name: 'lazy-data',
+    backend: 'external',
     external_path: '',
     postgres_ssl: false,
   },

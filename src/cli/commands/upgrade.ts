@@ -37,6 +37,8 @@ import type { SandboxConfig } from '../../capture/claude';
 import type { Task, ModelName } from '../../types';
 import type { Storage } from '../../storage';
 import { buildSystemPromptForResume, buildResumePrompt } from './resume';
+import { checkDaemonHealth, requestShutdown } from '../../daemon';
+import { spawnSync } from '../../utils/spawn';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 const DOCKER_TIMEOUT_MS = 10_000;
@@ -100,7 +102,7 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
 
   // Remove existing image to force rebuild
   try {
-    Bun.spawnSync(
+    spawnSync(
       [binary, 'rmi', '-f', imageName],
       { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -435,6 +437,18 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log(`\nResumed ${resumed}/${tasksToResume.length} task(s).`);
     } else {
       console.log('\nNo tasks to auto-resume.');
+    }
+
+    // Step 5: Restart daemon if it's running
+    const daemonStatus = await checkDaemonHealth();
+    if (daemonStatus.running) {
+      console.log('\nRestarting daemon with new version...');
+      const stopped = await requestShutdown();
+      if (stopped) {
+        console.log('  Daemon stopped — will restart automatically on next command.');
+      } else {
+        console.log('  Warning: Failed to stop daemon. You may need to restart it manually.');
+      }
     }
 
     console.log(theme.success('\nUpgrade complete.'));

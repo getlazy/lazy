@@ -21,7 +21,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   models: ['default'],
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
-  storage: ['backend', 'orphan_branch_name', 'external_path', 'postgres_ssl'],
+  storage: ['backend', 'external_path', 'postgres_ssl'],
   git: ['default_branch_prefix'],
   output: ['shortid_length'],
   agent: ['agent_id'],

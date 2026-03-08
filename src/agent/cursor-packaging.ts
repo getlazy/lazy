@@ -5,6 +5,7 @@
  */
 
 import type { AgentPackaging } from './interface';
+import { spawnSync } from '../utils/spawn';
 
 export class CursorPackaging implements AgentPackaging {
   readonly agentId = 'cursor';
@@ -44,7 +45,7 @@ export class CursorPackaging implements AgentPackaging {
 
   diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
     try {
-      const result = Bun.spawnSync(['agent', '--version'], {
+      const result = spawnSync(['agent', '--version'], {
         stdout: 'pipe',
         stderr: 'pipe',
         timeout: 10_000,

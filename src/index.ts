@@ -43,6 +43,7 @@ import {
   commandRefactor, refactorUsage,
   commandFix, fixUsage,
   commandRework, reworkUsage,
+  commandDaemon, daemonUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
 import { createStorage } from './storage';
@@ -112,6 +113,12 @@ Server:
 
 Builder:
   builder                Launch Claude Code with Lazy builder prompt
+
+Daemon:
+  daemon start           Start the lazy daemon
+  daemon stop            Stop the daemon gracefully
+  daemon restart         Restart the daemon
+  daemon status          Show daemon status
 
 Setup:
   init                   Initialize lazy in a git repository
@@ -199,6 +206,7 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'refactor': { run: commandRefactor, usage: refactorUsage },
   'fix':      { run: commandFix, usage: fixUsage },
   'rework':   { run: commandRework, usage: reworkUsage },
+  'daemon':   { run: commandDaemon, usage: daemonUsage },
 };
 
 // All valid command names for fuzzy matching (excludes aliases like ls/tasks/view
@@ -211,7 +219,7 @@ const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !
  */
 async function reconcileIfNeeded(cmd: string): Promise<void> {
   // Commands that don't need reconciliation
-  const skipReconciliation = ['init', 'server', 'builder', 'doctor', 'sync', 'completion', 'upgrade', 'system'];
+  const skipReconciliation = ['init', 'server', 'builder', 'doctor', 'sync', 'completion', 'upgrade', 'system', 'daemon'];
 
   if (skipReconciliation.includes(cmd)) {
     return;
@@ -336,6 +344,13 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
       }
     }
   }
+}
+
+// Auto-start daemon if not running (non-blocking, best-effort).
+// Skips for daemon command itself, init, completion, hidden commands, and test env.
+if (!isHelpOrVersion) {
+  const { ensureDaemon } = await import('./daemon/auto-start');
+  await ensureDaemon(command);
 }
 
 try {

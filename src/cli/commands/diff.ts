@@ -1,44 +1,10 @@
-import { join } from 'path';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, formatDate, parseLineRange, sliceLines, getWorktreePath, getBranchNameFromId } from '../helpers';
-import { getDiffStat, getDiffFull, getCurrentBranch } from '../../git/operations';
-import { getNewNotesSince } from './shared';
+import { requireLazyRoot, requireStorage, displayId, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines, getWorktreePath, getBranchNameFromId } from '../helpers';
+import { getCurrentBranch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
-import type { Comment } from '../../types';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
-
-import { getDataDir } from '../init';
-
-/**
- * Render comments as a virtual unified diff section.
- * Each comment appears as `+` lines, mimicking additions in a review diff.
- */
-function renderNotesDiff(comments: Comment[]): string {
-  if (comments.length === 0) return '';
-
-  const lines: string[] = [];
-  lines.push('diff --lazy a/comments b/comments');
-  lines.push('--- /dev/null');
-  lines.push('+++ b/comments');
-
-  // Build all comment lines
-  const commentLines: string[] = [];
-  for (const comment of comments) {
-    commentLines.push(`[${formatDate(comment.created_at)}]`);
-    const contentLines = comment.content.split('\n');
-    commentLines.push(...contentLines);
-    commentLines.push('');
-  }
-
-  // Emit a single hunk covering all comments
-  lines.push(`@@ -0,0 +1,${commentLines.length} @@`);
-  for (const line of commentLines) {
-    lines.push(`+${line}`);
-  }
-
-  return lines.join('\n');
-}
+import { queryDiff } from '../../daemon/rpc-fallback';
 
 export async function commandDiff(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -65,105 +31,39 @@ export async function commandDiff(args: string[]): Promise<void> {
     }
   }
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
-
-  try {
-    // Resolve task
-    const task = await resolveTaskOrExit(storage, taskId);
-
-    // Get session
-    const sess = await storage.getSessionByTaskId(task.id);
-    if (!sess) {
-      console.error(`Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
-      process.exit(1);
-    }
-
-    const worktreePath = getWorktreePath(root, task);
-    if (!existsSync(worktreePath)) {
-      console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
-      process.exit(1);
-    }
-
-    // Handle --turn flag: show diff for a specific turn
-    const turnValue = parsed.flags.get('turn') as string | undefined;
-    if (turnValue !== undefined) {
+  // --turn needs local git/worktree access — stays direct
+  const turnValue = parsed.flags.get('turn') as string | undefined;
+  if (turnValue !== undefined) {
+    const root = requireLazyRoot();
+    const storage = await requireStorage();
+    try {
+      const task = await resolveTaskOrExit(storage, taskId);
+      const sess = await storage.getSessionByTaskId(task.id);
+      if (!sess) {
+        console.error(`Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+        process.exit(1);
+      }
+      const worktreePath = getWorktreePath(root, task);
+      if (!existsSync(worktreePath)) {
+        console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
+        process.exit(1);
+      }
       await handleTurnDiff(storage, sess.id, turnValue, worktreePath, task.parent_task_id, root, lineRange);
-      return;
+    } finally {
+      await storage.close();
     }
-
-    // Use the captured upstream merge SHA if available (shows only agent's work).
-    // This is the SHA of the parent branch at the time it was last merged into this task.
-    // Fallback to three-dot diff against the parent branch for old tasks.
-    let fromRef: string;
-    let useTwoDotDiff = false;
-
-    if (sess.upstream_merge_sha) {
-      // Best case: we have the exact upstream SHA that was merged
-      fromRef = sess.upstream_merge_sha;
-      useTwoDotDiff = true;
-    } else {
-      // Fallback: use three-dot diff against parent branch (old behavior)
-      if (task.parent_task_id) {
-        fromRef = await getBranchNameFromId(task.parent_task_id, storage);
-      } else {
-        fromRef = getCurrentBranch(root);
-      }
-    }
-
-    // For default diff, find the last agent turn and show notes since then.
-    // If no agent turn, show all notes (they were all added before agent started).
-    let noteCutoff: number | null = null;
-    const turns = await storage.getSessionTurns(sess.id);
-    const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
-    if (lastAgentTurn) {
-      noteCutoff = lastAgentTurn.timestamp;
-    }
-    // noteCutoff = null means show all notes
-
-    // Fetch notes for the virtual diff section
-    const allNotes = await storage.getTaskComments(task.id);
-    const newNotes = noteCutoff
-      ? getNewNotesSince(allNotes, noteCutoff)
-      : allNotes;
-    const notesDiffSection = renderNotesDiff(newNotes);
-
-    const full = parsed.flags.get('full') === true;
-    let output = '';
-    if (full) {
-      const diff = getDiffFull(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
-      if (!diff && !notesDiffSection) {
-        output = 'No changes.';
-      } else {
-        const parts: string[] = [];
-        if (diff) parts.push(diff);
-        if (notesDiffSection) parts.push(notesDiffSection);
-        output = parts.join('\n\n');
-      }
-    } else {
-      const stat = getDiffStat(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
-      if (!stat && newNotes.length === 0) {
-        output = 'No changes.';
-      } else {
-        const parts: string[] = [];
-        if (stat) parts.push(stat);
-        if (newNotes.length > 0) {
-          parts.push(` comments | ${newNotes.length} comment(s) added`);
-        }
-        parts.push(`\nFor full diff: lazy diff ${displayId(task)} --full`);
-        output = parts.join('\n');
-      }
-    }
-
-    // Apply line slicing if specified
-    if (lineRange) {
-      output = sliceLines(output, lineRange);
-    }
-
-    console.log(output);
-  } finally {
-    await storage.close();
+    return;
   }
+
+  // Default diff — daemon-vs-direct handled by queryDiff
+  const full = parsed.flags.get('full') === true;
+  const { output: diffOutput } = await queryDiff({ taskId, full });
+
+  let output = diffOutput;
+  if (lineRange) {
+    output = sliceLines(output, lineRange);
+  }
+  console.log(output);
 }
 
 /**

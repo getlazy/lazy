@@ -20,6 +20,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync } from 'fs';
+import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { log, logError, setLogFile } from './log';
@@ -101,7 +102,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   log('[builder] Launching Claude Code interactively...');
 
   // Launch Claude Code with inherited stdin/stdout/stderr
-  const proc = Bun.spawn(claudeArgs, {
+  const proc = spawn(claudeArgs, {
     cwd: config.worktreePath,
     stdin: 'inherit',
     stdout: 'inherit',

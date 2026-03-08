@@ -88,6 +88,14 @@ Agents have `lazy_search` and `lazy_show` as MCP tools. Point them at relevant p
 instead of re-explaining it. If a similar task was done before, reference it by code — the
 agent can study it directly.
 
+**Don't research what the agent will research.** The rules above say not to *include*
+exhaustive detail in the prompt — but that means don't *gather* it either. If the task
+involves finding and changing call sites, don't grep for them yourself. If it involves
+understanding a pattern, don't read the files to explain it — point the agent at them.
+One quick check to confirm the task makes sense is fine. Exhaustively cataloging what
+needs changing is the agent's job, and doing it yourself just wastes time the engineer
+is waiting through.
+
 ## Situational awareness: check before you create
 
 Before creating a new task, always check what already exists:

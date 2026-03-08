@@ -165,7 +165,7 @@ describe('task codes', () => {
   test('no match produces helpful error', async () => {
     const result = await ctx.lazy(['show', 'nonexistent-code']);
     expectFailure(result);
-    expectError(result, "No task or conversation found matching 'nonexistent-code'");
+    expectError(result, "No task, conversation, or file found matching 'nonexistent-code'");
   });
 
   test('code works with edit command', async () => {
@@ -238,5 +238,40 @@ describe('task codes', () => {
 
     expectSuccess(result);
     expectOutput(result, 'Code:   42');
+  });
+
+  test('code with dots is accepted', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Release v0.5', '--code', 'release-v0.5']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Code:   release-v0.5');
+  });
+
+  test('code with multiple dots is accepted', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Version 1.2.3', '--code', 'v1.2.3']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Code:   v1.2.3');
+  });
+
+  test('code with dots and hyphens is accepted', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Hotfix version 2.1', '--code', 'hotfix-v2.1']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Code:   hotfix-v2.1');
+  });
+
+  test('code starting with dot is rejected', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', '.invalid']);
+
+    expectFailure(result);
+    expectError(result, 'Invalid code');
+  });
+
+  test('code ending with dot is rejected', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', 'invalid.']);
+
+    expectFailure(result);
+    expectError(result, 'Invalid code');
   });
 });

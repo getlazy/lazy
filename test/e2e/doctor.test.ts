@@ -161,7 +161,7 @@ describe('lazy doctor', () => {
     mkdirSync(join(extDir, 'tasks'));
 
     try {
-      // Remove the in-repo tasks dir so old check would have failed
+      // Remove any stale tasks dir so old check would have failed
       rmSync(join(ctx.root, '.lazy', 'tasks'), { recursive: true, force: true });
 
       // Configure external storage pointing to our temp dir

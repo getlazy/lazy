@@ -2,6 +2,7 @@ import { requireStorage, requireLazyRoot, displayId, parseFlags, resolveTaskOrEx
 import { followContainer } from './shared';
 import type { Task, TaskStatus } from '../../types';
 import type { Storage } from '../../storage';
+import { queryWait } from '../../daemon/rpc-fallback';
 
 const POLL_INTERVAL_MS = 1500;
 
@@ -33,6 +34,21 @@ export async function commandWait(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Single task, no --follow, no --next: use queryWait (daemon → direct fallback)
+  if (!isNext && !follow && parsed.positional.length === 1) {
+    const taskId = parsed.positional[0];
+    console.log(`Waiting for task ${taskId} to complete...`);
+
+    const result = await queryWait({ taskId });
+    if (result.timed_out) {
+      console.log(`Timed out waiting for task ${result.task_id.substring(0, 8)} (still ${result.status})`);
+      process.exit(1);
+    }
+    console.log(`Task ${result.task_id.substring(0, 8)} is now ${result.status}`);
+    process.exit(result.status === 'blocked' ? 0 : 1);
+  }
+
+  // --follow and multi-task modes need local storage access
   const storage = await requireStorage();
 
   try {
@@ -54,7 +70,7 @@ export async function commandWait(args: string[]): Promise<void> {
       }
     }
 
-    // Single task mode: supports --follow and legacy behavior
+    // Single task mode: supports --follow
     if (tasks.length === 1) {
       await waitSingleTask(storage, tasks[0], follow);
       return;

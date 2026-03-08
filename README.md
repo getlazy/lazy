@@ -1,41 +1,79 @@
-# Lazy
+# `lazy`
 
-Lazy is three things:
+`lazy` is:
 
-* A [proxy](#the-proxy) for AI-human collaboration: Lazy captures conversations, reviews, and decisions in a searchable data store, under your control and giving your agents improved situational awareness.
-* A secure, locally hosted agent [orchestrator](#the-orchestrator): Lazy is both a software development lead (builder mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
-* An integrated [software development lifecycle](#the-task-manager) tool: Lazy treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction rather than an afterthought.
+* A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (builder mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
+* A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
+* An [software development lifecycle](#the-task-manager) integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
 
-Lazy is built around [Claude Code](https://claude.com/product/claude-code) and I *only* use lazy to build lazy.
+`lazy` is thus [my](https://github.com/ierceg) attempt to raise the abstraction on three different fronts at the same time:
+
+* **Agents**: rather than working interactively with *coding* agents, `lazy` offers a way to work asynchronously with them *and* interactively with the intelligent orchestrator which is *also* aware of the prompts repository *and* task management features.
+* **Prompts**: rather than throwing them away, `lazy` captures them so that both humans and agents can reference them and learn from them.
+* **Source control**: rather than dealing with low-level pinnings of `git`, `lazy` wraps these mechanics into a task lifecycle management.
+
+## Quick Start
+
+```bash
+# Initialize lazy in your git repository. This will detect the remote repository
+# and other things like different runners (e.g. is there Docker)
+cd your-hello-lazy-project/
+lazy init
+
+# Launch the agent in interactive mode with an additional `lazy`'s system prompt
+# and tell it what tasks to create and start. Ask it "what can you do?"
+lazy builder
+
+# To review all the prompts that `lazy` uses run `lazy system prompts`
+# To view the content of individual prompts use `lazy view <prompt-code>`
+
+# Or create tasks directly
+lazy create --code add-auth --goal "Add user authentication" --prompt "Use JWT tokens, bcrypt for passwords"
+lazy start <task-id>
+
+# Review the agent's work in a full-screen TUI
+lazy review <task-id>
+
+# On a rare (and they truly *ought* to be rare) occasion you may need to pair directly
+# with the agent, use `lazy pair` to the agent's session but now with you in control
+lazy pair <task-id>
+
+# Accept and merge to main
+lazy accept <task-id>
+
+# Or reject if it's not right
+lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
+```
 
 ## Core Concepts
 
-* Your time is precious, agent time is aplenty. This permeates all interactions with lazy including direct conversations. Watching agents write code and yanking them when they go astray is *micromanagement*.
-* Prompts and their context are valuable, code is a byproduct. Lazy automatically keeps track of all conversations, prompts, turns, comments, feedbacks.
 * Agents do the coding and (most of) reviewing, you focus on the product, the architecture and giving guidance to unblock the agents.
+* Your time is precious, agent time is aplenty. This permeates all interactions with `lazy` including direct conversations. Watching agents write code and yanking them when they go astray is *micromanagement*.
+* Prompts and their context are valuable, code is a byproduct. `lazy` automatically keeps track of all conversations, prompts, turns, comments, feedbacks.
 * Primary interface is the conversation - let lazy's builder be your team lead - but you always have lazy's deterministic tools at your disposal.
+* Software development lifecycle is not an afterthought - it's front and center of `lazy` way of building software.
 
 ## Project Status
 
-Lazy is **alpha software** under active development. The core workflow is stable, but:
+`lazy` is **alpha software** under active development. The core workflow is stable, but:
 
 - I make no guarantees to its quality, correctness or safety
 - Breaking changes may occur in storage schema or CLI interface
 - Some (maybe even most) features are experimental
 - Error messages are improving but may be cryptic
 
-Lazy is definitely not in an awesome shape, its tests fail, it's inconsistent, etc. but it's very, very fun to use. At least for me!
+`lazy` is definitely not in an awesome shape, its tests fail, it's inconsistent, etc. but it's very, very fun to use. At least for me!
 
 ### Contributing
 
-Lazy is being actively developed. You can contribute by:
+`lazy` is being actively developed. You can contribute by:
 
 - Sending me feedback at [feedback@getlazy.dev](feedback@getlazy.dev)
 - Reporting [bugs or feature](https://github.com/getlazy/lazy/issues) requests
 - Submitting [**Prompt** Requests](https://github.com/getlazy/lazy/issues) for fixes or enhancements.
 - Testing experimental features - if you are interested, send me an email to [testing@getlazy.dev](testing@getlazy.dev)
 
-Lazy is built using lazy itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
+`lazy` is built using `lazy` itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
 
 ## Motivations
 
@@ -45,18 +83,18 @@ On one hand I felt that by throwing away prompts, we are not raising the abstrac
 
 On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do. I don't want to chat with agents and become a blocker. Instead, I want to give them actionable feedback, asynchronously, on my own good time, and let them do their thing in the meantime.
 
-### Why "lazy"
+### Why name it `lazy`
 
 Two reasons:
 
-1. It's a nod to the original lazy project, the Hackable Coding Assistant that I built with my friend [neboysa](https://github.com/neboysa) back in 2016 to 2017. You can find it at [github.com/getlazy/lazy-og](https://github.com/getlazy/lazy-og)
+1. It's a nod to the original `lazy` project, the Hackable Coding Assistant that I built with my friend [neboysa](https://github.com/neboysa) back in 2016 to 2017. You can find it at [github.com/getlazy/lazy-og](https://github.com/getlazy/lazy-og)
 2. This quote from [Robert A. Heinlein](https://en.wikipedia.org/wiki/Robert_A._Heinlein) (in spite of me being an early riser!):
 
 > Progress doesn't come from early risers—progress is made by lazy men looking for easier ways to do things.
 
 *Time Enough for Love (p. 54)*
 
-Lazy is my easier way of building software in the agentic age. I didn't like what I saw out there and I felt that it had to be built in a certain way, maybe idiosyncratic to me. To [paraphrase](https://en.wikipedia.org/wiki/Rifleman%27s_Creed):
+`lazy` is my easier way of building software in the agentic age. I didn't like what I saw out there and I felt that it had to be built in a certain way, maybe idiosyncratic to me. To [paraphrase](https://en.wikipedia.org/wiki/Rifleman%27s_Creed):
 
 > This is my way of building software. There are many like it, but this one is mine.
 
@@ -64,13 +102,13 @@ I hope you get as much fun from this (or more!) as I have.
 
 ### Why Not Just Use X
 
-See above. Plus building building lazy is fun, building with lazy is fun and building lazy with lazy is *extra* fun.
+See above. Plus building building `lazy` is fun, building with `lazy` is fun and building `lazy` with `lazy` is *extra* fun. Occasionally it is also *extra* frustrating but hey, what is programming if not a perpetual act of [frustration](https://x.com/CodeWisdom/status/1452004401774739464).
 
 ## The Details
 
 ### The proxy
 
-Lazy is a thin proxy that sits between you and AI coding agents, managing tasks as bounded units of work with full conversation history:
+`lazy` is a thin proxy that sits between you and AI coding agents, managing tasks as bounded units of work with full conversation history:
 
 - Captures conversations between you and the builder, the agentic team lead
 - Captures interactions (prompts, comments, feedback) in a searchable data store that agents themselves query during their work for improved situational awareness
@@ -82,11 +120,11 @@ Lazy is a thin proxy that sits between you and AI coding agents, managing tasks 
 - Use deterministic CLI tools for that task and work management including agent feedback
 - Or do both at the same time!
 
-All builder and agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and git branch.
+All builder and agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and `git` branch.
 
-The process isolation is necessary as lazy runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the builder agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
+The process isolation is necessary as `lazy` runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the builder agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
 
-The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run lazy on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running lazy on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
+The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run `lazy` on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running `lazy` on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
 
 ### The task manager
 
@@ -94,12 +132,12 @@ The current mechanism for this isolation is [Docker](https://docker.com). Docker
 - Assemble tasks into larger coherent wholes (features, releases) and hierarchies (tasks -> features -> releases -> main)
 - Sync with remote repos for PR creation, comment syncing, and remote collaboration (GitHub and GitLab support)
 
-The feel is one of task-aware git. For example, if an agent is working on a task and you accept its sub-task, lazy will refuse to merge until the parent task has finished running. Also, on every agent turn, the first thing that is done is syncing with upstream (parent's branch) and resolving conflicts. This can sometimes lead to suboptimal results but the sooner the conflicts are resolved the better it is. And in case the task is really falling behind its parent, then you can always run `lazy redo` to redo the task from scratch (from parent's current HEAD). This is in a way `rebase` powered by LLMs.
+The feel is one of task-aware `git`. For example, if an agent is working on a task and you accept its sub-task, `lazy` will refuse to merge until the parent task has finished running. Also, on every agent turn, the first thing that is done is syncing with upstream (parent's branch) and resolving conflicts. This can sometimes lead to suboptimal results but the sooner the conflicts are resolved the better it is. And in case the task is really falling behind its parent, then you can always run `lazy redo` to redo the task from scratch (from parent's current HEAD). This is in a way `rebase` powered by LLMs.
 
 ## Prerequisites
 
-- **Claude Code** - Lazy wraps Claude Code (install from [code.claude.com](https://code.claude.com/docs/en/setup)) (more agents coming!)
-- **Bun** — Lazy is built on Bun (install from [bun.sh](https://bun.sh))
+- **Claude Code** - `lazy` wraps Claude Code (install from [code.claude.com](https://code.claude.com/docs/en/setup)) (more agents coming!)
+- **Bun** — `lazy` is built on Bun (install from [bun.sh](https://bun.sh))
 - **Docker** — Agents run in isolated containers (install from [docker.com](https://docker.com))
 - **Git** — Required for version control and worktree management
 
@@ -144,7 +182,7 @@ lazy --version
 
 ### Authentication Setup
 
-Lazy wraps around Claude Code which requires that you setup its OAuth token as envvar. Lazy does not store or otherwise capture this information - it just passes it along so that Claude Code can read it.
+`lazy` wraps around Claude Code which requires that you setup its OAuth token as envvar. `lazy` does not store or otherwise capture this information - it just passes it along so that Claude Code can read it.
 
 ```bash
 # Option 1: Anthropic API key
@@ -165,38 +203,6 @@ For GitLab integration (optional):
 
 ```bash
 glab auth login
-```
-
-## Quick Start
-
-```bash
-# Initialize lazy in your git repository. This will detect the remote repository
-# and other things like different runners (e.g. is there Docker)
-cd your-hello-lazy-project/
-lazy init
-
-# Launch the agent in interactive mode with an additional Lazy's system prompt
-# and tell it what tasks to create and start.
-# To review all the prompts that Lazy uses run `lazy system prompts`
-# To view the content of individual prompts use `lazy view prompt-code`
-lazy builder
-
-# Or create tasks directly
-lazy create --code add-auth --goal "Add user authentication" --prompt "Use JWT tokens, bcrypt for passwords"
-lazy start <task-id>
-
-# Review the agent's work in a full-screen TUI
-lazy review <task-id>
-
-# On a rare (and they truly *ought* to be rare) occasion you may need to pair directly
-# with the agent, use `lazy pair` to the agent's session but now with you in control
-lazy pair <task-id>
-
-# Accept and merge to main
-lazy accept <task-id>
-
-# Or reject if it's not right
-lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 ```
 
 ## Real-World Configurations
@@ -227,17 +233,19 @@ type = "dangerously-host-process-without-any-isolation"
 
 The name says it all - you really **ought** to **never** run like that unless in an isolated environment.
 
-Regarding VM, there is one more thing that you will likely want to do which is to configure a different lazy.tom file to be used inside of VM. This is useful if you sometimes work in the VM and sometimes on the host or if there is a difference the way team mates work. To make use of that, override `LAZY_CONFIG` envvar inside of the VM to point to the alternative lazy.toml. For example, in this repo you will find `lazy.lima.toml` which uses this technique to pass the correct **VM** configuration which has the host runners unlike the host lima configuration which uses docker runners.
+Regarding VM, there is one more thing that you will likely want to do which is to configure a different `lazy.toml` file to be used inside of VM. This is useful if you sometimes work in the VM and sometimes on the host or if there is a difference the way team mates work. To make use of that, override `LAZY_CONFIG` envvar inside of the VM to point to the alternative lazy.toml. For example, in this repo you will find `lazy.lima.toml` which uses this technique to pass the correct **VM** configuration which has the host runners unlike the host lima configuration which uses docker runners.
 
 ### Centralized Store
 
-Starting with release v0.6, PostgreSQL can be used for centralized lazy store. This allows team coordination and collaboration which is difficult and prone to conflicts with same-repo storage configurations. That said, I wouldn't call support for it 1st class because lazy still lacks guarantees around say starting one task on one machine and finishing it on another. As a matter of fact, this should "just work", but it has not been thoroughly tested and depends very much on running `lazy sync` after each turn.
+Starting with release v0.6, PostgreSQL can be used for centralized `lazy` store. This allows team coordination and collaboration which is difficult and prone to conflicts with same-repo storage configurations. That said, I wouldn't call support for it 1st class because `lazy` still lacks guarantees around say starting one task on one machine and finishing it on another. As a matter of fact, this should "just work", but it has not been thoroughly tested and depends very much on running `lazy sync` after each turn.
+
+The only other alterantive at this time is storing `lazy` files directly on your computer, outside of the projcect's repository itself. You can then back them up in your usual manner or put them into another repisitory for safe-keeping.
 
 ## Details
 
 ### Builder
 
-An interactive session with Claude Code with the addition of lazy's own system prompt, guiding the conversation toward task creation, orchestration and reviewing. Work with builder to:
+An interactive session with Claude Code with the addition of `lazy`'s own system prompt, guiding the conversation toward task creation, orchestration and reviewing. Work with builder to:
 
 - Ideate, plan work, create new tasks.
 - Start tasks and keep track of their progress.
@@ -266,7 +274,7 @@ Use `lazy blocked` to see what's ready for review, and `lazy loop` to review eve
 
 ### Agents
 
-Agents work in isolation — each runs in its own Docker container with a dedicated git worktree. They can search past task history via MCP tools to understand prior decisions, but they don't coordinate with each other directly. The builder handles sequencing, conflict avoidance, and priority decisions.
+Agents work in isolation — each runs in its own Docker container with a dedicated `git` worktree. They can search past task history via MCP tools to understand prior decisions, but they don't coordinate with each other directly. The builder handles sequencing, conflict avoidance, and priority decisions.
 
 Agents are harnessed into a deterministic turn lifecycle. On every turn, the agents will:
 
@@ -314,14 +322,14 @@ A single message in the conversation—either from the human or the agent. Each 
 - Role (`human` or `agent`)
 - Content (the message text)
 - Token usage (input/output/cache tokens)
-- Git SHAs before/after the turn
+- `git` SHAs before/after the turn
 - Model used (sticky: next turn inherits if not overridden - feel free to increase it or lower it)
 
 Turns are the primary way to keep track of *why* the code was changed.
 
 ### Review
 
-Human feedback on a task though often written by lazy builder. Reviews capture:
+Human feedback on a task though often written by `lazy` builder. Reviews capture:
 
 - Verdict (`approve`, `reject`, `request_changes`)
 - Rationale (free-text explanation)
@@ -351,7 +359,7 @@ Run `lazy doctor` to validate your configuration.
 lazy pair <task-id>
 ```
 
-Launches an interactive Claude Code session in the task's worktree. You drive the conversation directly—asking Claude to make changes, running tests, editing code together. When you exit, lazy captures new commits and a summary as a turn. Useful for:
+Launches an interactive Claude Code session in the task's worktree. You drive the conversation directly—asking Claude to make changes, running tests, editing code together. When you exit, `lazy` captures new commits and a summary as a turn. Useful for:
 
 - Debugging issues the agent can't resolve
 - Showing the agent how to do something by example
@@ -390,7 +398,7 @@ lazy loop --help
 
 ### TUI Review
 
-Of course lazy has TUI as well. To review a task and all its descendants, run:
+**Of course** `lazy` has TUI as well - we have everything **and** the kitchen sink. To review a task and all its descendants, run:
 
 ```bash
 lazy review task-id
@@ -408,7 +416,7 @@ Just look at that design - feels like DOS days again!
 lazy sync
 ```
 
-Creates MRs or PRs for tasks, syncs comments as turn context, and updates status based on lazy task state. Two-way sync: comments on your remote repository appear in lazy, and lazy reviews appear in the remote repository. Merge is done by approving MRs/PRs and then synchronizing.
+Creates MRs or PRs for tasks, syncs comments as turn context, and updates status based on `lazy` task state. Two-way sync: comments on your remote repository appear in `lazy`, and `lazy` reviews appear in the remote repository. Merge is done by approving MRs/PRs and then synchronizing.
 
 For more details:
 
@@ -418,7 +426,7 @@ lazy sync --help
 
 ### Remote Integration and Merge Lifecycle
 
-Lazy integrates with GitHub and GitLab for PR/MR-based workflows. Configure the driver in `lazy.toml`:
+`lazy` integrates with GitHub and GitLab for PR/MR-based workflows. Configure the driver in `lazy.toml`:
 
 ```toml
 [remote]
@@ -433,7 +441,7 @@ Comment sync brings PR/MR review comments into the agent's context, so external 
 
 | Driver | Merge strategy | PR/MR | Comment sync | CI integration | CLI required |
 |--------|---------------|-------|--------------|----------------|--------------|
-| `local` | Squash merge (local git) | None | None | None | — |
+| `local` | Squash merge (local `git`) | None | None | None | — |
 | `github` | Squash merge (GitHub API) | Draft PR → ready | PR comments ↔ agent turns | GitHub Actions | `gh` |
 | `gitlab` | Squash merge (GitLab API) | MR on first turn | MR notes ↔ agent turns | GitLab CI | `glab` |
 
@@ -461,7 +469,7 @@ lazy search --help
 
 ### Upgrading
 
-When you build a new version of lazy, you have to replace the instances running in containers. To do so run:
+When you build a new version of `lazy`, you have to replace the instances running in containers as well as the deamon. To do so run:
 
 ```bash
 lazy upgrade
@@ -491,7 +499,7 @@ lazy wait task-1 task-2 task-n # First to finish will stop this
 
 ### Web Interface
 
-Lazy has read-only, highly experimental, not anywhere near mature, web interface. To see run:
+`lazy` has read-only, highly experimental, not anywhere near mature, web interface. To see run:
 
 ```bash
 lazy server
@@ -560,7 +568,7 @@ export ANTHROPIC_API_KEY="your-key-here"
 
 ### "Authentication required"
 
-Lazy requires one of these environment variables:
+`lazy` requires one of these environment variables:
 
 ```bash
 # Option 1: Anthropic API key
@@ -579,7 +587,7 @@ If a container crashes or is killed, the task may show as `working`. Use:
 lazy resume <task-id>
 ```
 
-Unless the container has been deleted, lazy will resume the agent's session.
+Unless the container has been deleted, `lazy` will resume the agent's session.
 
 Or check status and manually reconcile:
 

@@ -15,6 +15,7 @@ import { DockerRunner } from './docker-runner';
 import type { DockerRunnerOptions } from './docker-runner';
 import { getAuthEnv } from '../capture/claude';
 import { logger } from '../utils/logger';
+import { spawnSync } from '../utils/spawn';
 
 const PODMAN_TIMEOUT_MS = 10_000;
 
@@ -31,7 +32,7 @@ export class PodmanRunner extends DockerRunner {
   override checkAvailability(): void {
     logger.debug('Checking Podman...');
 
-    const result = Bun.spawnSync(['podman', 'info'], {
+    const result = spawnSync(['podman', 'info'], {
       stdout: 'ignore',
       stderr: 'ignore',
       timeout: PODMAN_TIMEOUT_MS,

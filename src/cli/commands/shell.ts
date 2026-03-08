@@ -3,6 +3,7 @@ import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
 
 import { getDataDir } from '../init';
+import { spawnSync } from '../../utils/spawn';
 
 export async function commandShell(args: string[]): Promise<void> {
   // Parse and validate flags (no flags supported, but validate against unknown flags)
@@ -40,7 +41,7 @@ export async function commandShell(args: string[]): Promise<void> {
     console.log(`  Type 'exit' to return.\n`);
 
     const shell = process.env.SHELL || '/bin/sh';
-    Bun.spawnSync([shell], {
+    spawnSync([shell], {
       cwd: worktreePath,
       stdin: 'inherit',
       stdout: 'inherit',

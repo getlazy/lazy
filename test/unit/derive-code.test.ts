@@ -17,7 +17,17 @@ describe('deriveCode', () => {
   test('replaces multiple non-alphanumeric chars with single hyphen', () => {
     expect(deriveCode('foo///bar')).toBe('foo-bar');
     expect(deriveCode('foo___bar')).toBe('foo-bar');
-    expect(deriveCode('foo...bar')).toBe('foo-bar');
+  });
+
+  test('collapses multiple dots to single dot', () => {
+    expect(deriveCode('foo...bar')).toBe('foo.bar');
+    expect(deriveCode('foo..bar')).toBe('foo.bar');
+  });
+
+  test('preserves single dots', () => {
+    expect(deriveCode('release/v1.0')).toBe('release-v1.0');
+    expect(deriveCode('v1.2.3')).toBe('v1.2.3');
+    expect(deriveCode('hotfix-v2.1')).toBe('hotfix-v2.1');
   });
 
   test('strips leading and trailing hyphens', () => {

@@ -18,9 +18,9 @@
 import { join } from 'path';
 import { homedir } from 'os';
 import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
-import { requireLazyRoot } from '../helpers';
+import { requireLazyRoot, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
-import { isTTY, promptLine } from '../editor';
+import { isTTY, promptLine, promptYesNo } from '../editor';
 import { createStorage, getProjectName } from '../../storage';
 import { theme } from '../theme';
 import { createRunner, type Runner } from '../../runner';
@@ -122,6 +122,20 @@ async function commandBuilderList(lazyRoot: string): Promise<void> {
   }
 }
 
+// --- Resume helpers ---
+
+/**
+ * Get the last builder session ID from the LAZY_LAST_SESSION_ID env var.
+ * This is the only source — no file scanning or marker files.
+ * The env var is inherently terminal-scoped, which prevents race conditions
+ * between concurrent builder sessions in different terminals.
+ */
+function getLastSessionId(): string | null {
+  const envId = process.env.LAZY_LAST_SESSION_ID;
+  if (envId && envId.trim()) return envId.trim();
+  return null;
+}
+
 // --- Main command ---
 
 export async function commandBuilder(args: string[]): Promise<void> {
@@ -134,22 +148,16 @@ export async function commandBuilder(args: string[]): Promise<void> {
     return;
   }
 
-  // Extract --autonomous and --yes flags, pass through everything else to Claude Code
-  let autonomous = false;
-  let yes = false;
-  const claudeExtraArgs: string[] = [];
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--autonomous') {
-      autonomous = true;
-    } else if (arg === '--yes') {
-      yes = true;
-    } else {
-      // Pass through all other args to Claude Code
-      claudeExtraArgs.push(arg);
-    }
-  }
+  // Parse and validate all flags — unknown flags exit with an error
+  const BUILDER_FLAGS: FlagDefinition[] = [
+    { name: 'autonomous', takesValue: false },
+    { name: 'yes', takesValue: false },
+    { name: 'resume', takesValue: true, optionalValue: true },
+  ];
+  const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
+  const autonomous = parsed.flags.get('autonomous') === true;
+  const yes = parsed.flags.get('yes') === true;
+  const resumeArg = parsed.flags.get('resume') ?? null;
 
   // Create the runner — determines Docker vs host-process mode
   const runner = createRunner(root);
@@ -200,43 +208,76 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   const systemPrompt = buildSystemPrompt(root, runner);
 
-  // Session disclosure
-  const agentName = config.agent.agent_id === 'claude-code' ? 'Claude Code' : config.agent.agent_id;
-  const firstRun = isFirstBuilderRun(root);
+  // Determine if we're resuming and which session ID to use.
+  // Resume source: LAZY_LAST_SESSION_ID env var (terminal-scoped) or explicit --resume <id>.
+  let resumeId: string | null = null;
+  const lastSessionId = getLastSessionId();
 
-  console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
-
-  // Warn about prompt injection risk when running on host without isolation
-  if (runner.type === 'dangerously-host-process-without-any-isolation') {
-    console.log('');
-    console.log('WARNING: Builder is running on the host without isolation.');
-    console.log('Agent output may contain prompt injection from untrusted sources.');
-    console.log('Configure [runner] type = "docker" in lazy.toml for safe-by-default execution.');
+  if (resumeArg === true) {
+    // Bare --resume: use LAZY_LAST_SESSION_ID env var
+    if (!lastSessionId) {
+      console.error('LAZY_LAST_SESSION_ID is not set.');
+      console.error('Use --resume <id> with an explicit session ID, or set the env var.');
+      console.error(`Find session IDs with: lazy builder list`);
+      process.exit(1);
+    }
+    resumeId = lastSessionId;
+    console.log(`Resuming session ${resumeId.substring(0, 8)}`);
+  } else if (typeof resumeArg === 'string') {
+    // Explicit session ID — pass directly to Claude (no storage scanning)
+    resumeId = resumeArg;
+    console.log(`Resuming session ${resumeId.substring(0, 8)}`);
+  } else if (lastSessionId && isTTY()) {
+    // No --resume flag but LAZY_LAST_SESSION_ID is set — offer to resume
+    const shortId = lastSessionId.substring(0, 8);
+    const shouldResume = await promptYesNo(`Resume previous builder session ${shortId}?`);
+    if (shouldResume) {
+      resumeId = lastSessionId;
+      console.log(`Resuming session ${shortId}`);
+    }
   }
 
-  if (isTTY()) {
-    if (firstRun) {
+  const isResuming = resumeId !== null;
+
+  // Session disclosure — skip on resume (user already saw it in the original session)
+  if (!isResuming) {
+    const agentName = config.agent.agent_id === 'claude-code' ? 'Claude Code' : config.agent.agent_id;
+    const firstRun = isFirstBuilderRun(root);
+
+    console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
+
+    // Warn about prompt injection risk when running on host without isolation
+    if (runner.type === 'dangerously-host-process-without-any-isolation') {
       console.log('');
-      console.log('This is your first time running lazy builder. We recommend reviewing the');
-      console.log('system prompt to understand what instructions the agent will receive.');
-      const response = await promptLine("Press 'v' to view system prompt, or Enter to continue");
-      if (response.toLowerCase() === 'v') {
+      console.log('WARNING: Builder is running on the host without isolation.');
+      console.log('Agent output may contain prompt injection from untrusted sources.');
+      console.log('Configure [runner] type = "docker" in lazy.toml for safe-by-default execution.');
+    }
+
+    if (isTTY()) {
+      if (firstRun) {
         console.log('');
-        console.log('--- System Prompt ---');
-        console.log(systemPrompt);
-        console.log('--- End System Prompt ---');
-        console.log('');
-        await promptLine('Press Enter to continue');
-      }
-    } else {
-      const response = await promptLine("(press 'v' to view system prompt, or Enter to continue)");
-      if (response.toLowerCase() === 'v') {
-        console.log('');
-        console.log('--- System Prompt ---');
-        console.log(systemPrompt);
-        console.log('--- End System Prompt ---');
-        console.log('');
-        await promptLine('Press Enter to continue');
+        console.log('This is your first time running lazy builder. We recommend reviewing the');
+        console.log('system prompt to understand what instructions the agent will receive.');
+        const response = await promptLine("Press 'v' to view system prompt, or Enter to continue");
+        if (response.toLowerCase() === 'v') {
+          console.log('');
+          console.log('--- System Prompt ---');
+          console.log(systemPrompt);
+          console.log('--- End System Prompt ---');
+          console.log('');
+          await promptLine('Press Enter to continue');
+        }
+      } else {
+        const response = await promptLine("(press 'v' to view system prompt, or Enter to continue)");
+        if (response.toLowerCase() === 'v') {
+          console.log('');
+          console.log('--- System Prompt ---');
+          console.log(systemPrompt);
+          console.log('--- End System Prompt ---');
+          console.log('');
+          await promptLine('Press Enter to continue');
+        }
       }
     }
   }
@@ -246,12 +287,15 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
 
-  // Add --dangerously-skip-permissions when in autonomous mode
-  const finalClaudeExtraArgs = autonomous
-    ? [...claudeExtraArgs, '--dangerously-skip-permissions']
-    : claudeExtraArgs;
+  // Add --dangerously-skip-permissions when in autonomous mode,
+  // and --resume <id> when resuming a session
+  const finalClaudeExtraArgs = [
+    ...(autonomous ? ['--dangerously-skip-permissions'] : []),
+    ...(resumeId ? ['--resume', resumeId] : []),
+  ];
 
   let exitCode: number;
+  let sessionId: string | null = null;
 
   if (runner.usesSandbox()) {
     // Container mode (Docker/Podman): start an HTTP server on localhost for tool calls.
@@ -261,7 +305,9 @@ export async function commandBuilder(args: string[]): Promise<void> {
     const { cleanup: cleanupServer } = startBuilderServer(builderConfig, configPath);
 
     try {
-      exitCode = await runner.launchBuilderInteractive(root, systemPrompt, configPath, finalClaudeExtraArgs);
+      const result = await runner.launchBuilderInteractive(root, systemPrompt, configPath, finalClaudeExtraArgs);
+      exitCode = result.exitCode;
+      sessionId = result.sessionId;
     } finally {
       cleanupServer();
       try {
@@ -275,14 +321,23 @@ export async function commandBuilder(args: string[]): Promise<void> {
   } else {
     // Host-process mode: launch Claude Code directly (no HTTP server needed).
     // The runner handles conversation capture internally.
-    exitCode = await runner.launchBuilderInteractive(root, systemPrompt, '', finalClaudeExtraArgs);
+    const result = await runner.launchBuilderInteractive(root, systemPrompt, '', finalClaudeExtraArgs);
+    exitCode = result.exitCode;
+    sessionId = result.sessionId;
+  }
+
+  // Print the session ID so the user can resume later
+  if (sessionId) {
+    console.log('');
+    console.log(`Session: ${sessionId}`);
+    console.log(`Resume:  lazy builder --resume ${sessionId}`);
   }
 
   process.exit(exitCode);
 }
 
 export function builderUsage(): void {
-  console.log(`Usage: lazy builder [list | claude-args...]
+  console.log(`Usage: lazy builder [list | --resume [id]]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
 
@@ -297,15 +352,24 @@ into lazy's store so they're searchable alongside task data.
 Subcommands:
   list, ls             List captured builder conversations
 
+Resume options:
+  --resume             Resume the session from LAZY_LAST_SESSION_ID
+  --resume <id>        Resume a specific session by Claude session ID
+
+When a builder session exits, the session ID is printed so you can resume it
+with --resume <id>. Set LAZY_LAST_SESSION_ID in your shell to enable bare
+--resume and the interactive resume prompt.
+
+The interactive system prompt warning is automatically skipped when resuming.
+
 Flags:
   --autonomous         Run without permission prompts (adds --dangerously-skip-permissions)
   --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
 
-Any other arguments are passed through to claude.
-
 Examples:
   lazy builder                    # Start new session
+  lazy builder --resume <uuid>    # Resume a specific session
+  lazy builder --resume           # Resume from LAZY_LAST_SESSION_ID
   lazy builder list               # List captured conversations
-  lazy builder --model opus       # Start with a specific model
   lazy builder --autonomous       # Run without permission prompts`);
 }

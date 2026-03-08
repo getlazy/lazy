@@ -11,6 +11,8 @@ import setupDockerfilePrompt from '../prompts/setup-dockerfile.md' with { type: 
 import { detectShell, getCompletionSetupCommand } from '../shell/detect';
 import { detectToolchain, isValidToolchain } from '../docker/toolchains';
 import { theme } from './theme';
+import { runGit } from '../utils/git';
+import { spawnSync } from '../utils/spawn';
 
 const LAZY_DIR = '.lazy';
 const LEGACY_DIR = '.workshop';
@@ -58,7 +60,7 @@ export function findGitRoot(startDir: string = process.cwd()): string | null {
  *
  * A repo is considered a lazy project if it has:
  * 1. lazy.toml config file, OR
- * 2. .lazy/ directory (in-repo storage), OR
+ * 2. .lazy/ directory (worktrees, logs, tmp), OR
  * 3. .workshop/ directory (legacy un-migrated repos)
  */
 export function findLazyRoot(startDir: string = process.cwd()): string | null {
@@ -162,7 +164,7 @@ async function checkDriverHealth(driverName: string): Promise<void> {
 }
 
 interface StorageChoice {
-  backend: 'in-repo' | 'external' | 'orphan-branch' | 'postgres';
+  backend: 'external' | 'postgres';
   path?: string;
 }
 
@@ -173,14 +175,10 @@ interface StorageChoice {
 function getProjectName(targetDir: string, remoteName: string = 'origin'): string {
   try {
     // Try to get remote URL
-    const result = Bun.spawnSync(['git', 'remote', 'get-url', remoteName], {
-      cwd: targetDir,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const result = runGit(['remote', 'get-url', remoteName], { cwd: targetDir });
 
     if (result.exitCode === 0) {
-      const url = result.stdout.toString().trim();
+      const url = result.stdout;
       // Extract repo name from various URL formats:
       // - git@github.com:user/repo.git
       // - https://github.com/user/repo.git
@@ -204,13 +202,9 @@ function getProjectName(targetDir: string, remoteName: string = 'origin'): strin
  */
 function listGitRemotes(repoDir: string): string[] {
   try {
-    const result = Bun.spawnSync(['git', 'remote'], {
-      cwd: repoDir,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const result = runGit(['remote'], { cwd: repoDir });
     if (result.exitCode !== 0) return [];
-    return result.stdout.toString().trim().split('\n').filter(Boolean);
+    return result.stdout.split('\n').filter(Boolean);
   } catch {
     return [];
   }
@@ -251,12 +245,8 @@ async function chooseGitRemote(repoDir: string): Promise<string> {
     const options = remotes.map(r => {
       // Show the URL alongside each remote name for context
       try {
-        const result = Bun.spawnSync(['git', 'remote', 'get-url', r], {
-          cwd: repoDir,
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const url = result.exitCode === 0 ? result.stdout.toString().trim() : '';
+        const result = runGit(['remote', 'get-url', r], { cwd: repoDir });
+        const url = result.exitCode === 0 ? result.stdout : '';
         return url ? `${r} (${url})` : r;
       } catch {
         return r;
@@ -276,20 +266,15 @@ async function chooseGitRemote(repoDir: string): Promise<string> {
  */
 async function promptStorageChoice(targetDir: string, gitRemote: string = 'origin'): Promise<StorageChoice> {
   const options = [
-    'PostgreSQL: Shared database for team collaboration\n     Best for teams. Requires PostgreSQL server (configure via LAZY_POSTGRES_URL or PG* env vars).',
     'External (recommended): Outside the repo in ~/.lazy/<project-name>\n     Keeps repo completely clean. Not tracked in git.',
-    'Orphan branch: Git orphan branch "lazy-state"\n     Keeps code branches clean. Tracked in git separately.',
-    'In-repo (not recommended): .lazy/ directory on the default branch\n     Simple but noisy. State files appear in your working tree and commits.',
+    'PostgreSQL: Shared database for team collaboration\n     Best for teams. Requires PostgreSQL server (configure via LAZY_POSTGRES_URL or PG* env vars).',
   ];
 
   console.log('');
   const choice = await promptChoice('Where would you like to store lazy state?', options);
 
   switch (choice) {
-    case 0:
-      return { backend: 'postgres' };
-
-    case 1: {
+    case 0: {
       const projectName = getProjectName(targetDir, gitRemote);
       const defaultPath = join(homedir(), '.lazy', projectName);
       console.log('');
@@ -297,15 +282,11 @@ async function promptStorageChoice(targetDir: string, gitRemote: string = 'origi
       return { backend: 'external', path };
     }
 
-    case 2:
-      return { backend: 'orphan-branch' };
-
-    case 3:
-      return { backend: 'in-repo' };
+    case 1:
+      return { backend: 'postgres' };
 
     default:
-      // promptChoice defaults to 0 on invalid input, so this shouldn't happen
-      return { backend: 'postgres' };
+      return { backend: 'external' };
   }
 }
 
@@ -318,7 +299,7 @@ function checkAuthSetup(): void {
   console.log('Checking authentication...');
 
   // Check for Claude Code CLI installation
-  const claudeCheck = Bun.spawnSync(['claude', '--version'], {
+  const claudeCheck = spawnSync(['claude', '--version'], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -395,7 +376,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   const gitRemote = await chooseGitRemote(targetDir);
 
   // Prompt for storage location if interactive
-  let storageChoice: StorageChoice = { backend: 'in-repo' };
+  let storageChoice: StorageChoice = { backend: 'external' };
   if (isTTY()) {
     storageChoice = await promptStorageChoice(targetDir, gitRemote);
   }
@@ -416,11 +397,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     storagePath = storageChoice.path || join(homedir(), '.lazy', getProjectName(targetDir, gitRemote));
     // Create external directory if it doesn't exist
     mkdirSync(storagePath, { recursive: true });
-  } else if (storageChoice.backend === 'postgres') {
-    // PostgreSQL storage doesn't use local paths
-    storagePath = lazyPath;
   } else {
-    // in-repo or orphan-branch
+    // PostgreSQL storage doesn't use local paths
     storagePath = lazyPath;
   }
 
@@ -518,12 +496,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     const database = process.env.PGDATABASE ?? 'lazy';
     const connLabel = url ? 'LAZY_POSTGRES_URL' : `${host}/${database}`;
     storageDesc = `postgres (${connLabel})`;
-  } else if (storageChoice.backend === 'external') {
-    storageDesc = `external (${storagePath})`;
-  } else if (storageChoice.backend === 'orphan-branch') {
-    storageDesc = 'orphan-branch (lazy-state)';
   } else {
-    storageDesc = `in-repo (${lazyPath})`;
+    storageDesc = `external (${storagePath})`;
   }
 
   console.log(`Initialized lazy in ${targetDir}`);

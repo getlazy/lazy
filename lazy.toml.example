@@ -22,12 +22,11 @@ auto_commit_instructions = true
 path = ".lazy"
 
 [storage]
-# Storage backend: "in-repo" (default), "external", "orphan-branch", or "postgres"
-backend = "in-repo"
+# Storage backend: "external" (default) or "postgres"
+backend = "external"
 # Path for external storage (only used when backend = "external")
+# Defaults to ~/.lazy/<project-name> if empty
 external_path = ""
-# Branch name for orphan-branch storage (only used when backend = "orphan-branch")
-orphan_branch_name = "lazy-state"
 # Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase)
 # Only used when backend = "postgres"
 # postgres_ssl = false

@@ -39,3 +39,4 @@ export { commandDocument, documentUsage } from './document';
 export { commandRefactor, refactorUsage } from './refactor';
 export { commandFix, fixUsage } from './fix';
 export { commandRework, reworkUsage } from './rework';
+export { commandDaemon, daemonUsage } from './daemon';

@@ -2,7 +2,9 @@
  * Shared git utilities for repository operations.
  */
 
+import { existsSync } from 'node:fs';
 import { logger } from './logger';
+import { spawnSync } from './spawn';
 
 export interface GitResult {
   stdout: string;
@@ -10,26 +12,52 @@ export interface GitResult {
   exitCode: number;
 }
 
+export interface RunGitOptions {
+  cwd?: string;
+  stdout?: 'pipe' | 'ignore';
+  stderr?: 'pipe' | 'ignore';
+  stdin?: Uint8Array;
+  timeout?: number;
+}
+
 /**
  * Execute a git command and return the result.
- * Default implementation uses Bun.spawnSync - can be overridden for testing.
+ * Default implementation uses spawnSync - can be overridden for testing.
  */
-export function runGit(args: string[], cwd?: string): GitResult {
-  const spawnOpts: { cwd?: string; stdout: 'pipe'; stderr: 'pipe' } = {
-    stdout: 'pipe',
-    stderr: 'pipe',
+export function runGit(args: string[], opts?: RunGitOptions | string): GitResult {
+  // Support legacy signature: runGit(args, cwd)
+  const options: RunGitOptions = typeof opts === 'string' ? { cwd: opts } : (opts ?? {});
+
+  const stdoutMode = options.stdout ?? 'pipe';
+  const stderrMode = options.stderr ?? 'pipe';
+
+  if (options.cwd && !existsSync(options.cwd)) {
+    logger.warn(`runGit: working directory '${options.cwd}' does not exist, args: ${args.join(' ')}`);
+    return {
+      stdout: '',
+      stderr: `git: working directory '${options.cwd}' does not exist`,
+      exitCode: 1,
+    };
+  }
+
+  const spawnOpts: Record<string, unknown> = {
+    stdout: stdoutMode,
+    stderr: stderrMode,
   };
-  if (cwd) spawnOpts.cwd = cwd;
+  if (options.cwd) spawnOpts.cwd = options.cwd;
+  if (options.stdin) spawnOpts.stdin = options.stdin;
+  if (options.timeout) spawnOpts.timeout = options.timeout;
 
   try {
-    const result = Bun.spawnSync(['git', ...args], spawnOpts);
+    const result = spawnSync(['git', ...args], spawnOpts);
     return {
-      stdout: result.stdout.toString().trim(),
-      stderr: result.stderr.toString().trim(),
+      stdout: stdoutMode === 'pipe' ? result.stdout.toString().trim() : '',
+      stderr: stderrMode === 'pipe' ? result.stderr.toString().trim() : '',
       exitCode: result.exitCode,
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    logger.warn(`runGit: git command failed with exception: ${message}, args: ${args.join(' ')}`);
     return {
       stdout: '',
       stderr: `git: command failed (${message})`,
@@ -247,4 +275,60 @@ export function fastForwardLocal(
   const warning = `Local ${targetBranch} has diverged from ${remoteRef}. Run \`git pull\` to reconcile.`;
   logger.warn(`fastForwardLocal: ${warning}`);
   return { success: false, warning };
+}
+
+/**
+ * Pre-flight check: validate that a local branch is in sync with the driver's
+ * configured remote before performing an irreversible remote merge.
+ *
+ * "In sync" means local is either equal to or behind (can fast-forward) the remote.
+ * Divergence (local has commits not in remote) is the failure case — it means
+ * fastForwardLocal will fail after the remote merge, leaving things half-merged.
+ *
+ * Only checks the single remote that the driver uses — not all git remotes.
+ * Users may have other remotes (heroku, personal forks) that are irrelevant.
+ */
+export function validateBranchInSyncWithRemote(
+  branch: string,
+  remote: string,
+  root: string,
+  git: (args: string[], cwd?: string) => GitResult = runGit,
+): { inSync: boolean; error?: string } {
+  // Fetch the branch from the driver's remote
+  const fetchResult = git(['fetch', remote, branch], root);
+  if (fetchResult.exitCode !== 0) {
+    // Can't fetch — network issue or branch doesn't exist on remote.
+    // Fail safe: if we can't verify sync, don't block the accept.
+    return { inSync: true };
+  }
+
+  const remoteRef = `${remote}/${branch}`;
+
+  // Get local and remote SHAs
+  const localShaResult = git(['rev-parse', branch], root);
+  const remoteShaResult = git(['rev-parse', remoteRef], root);
+
+  if (localShaResult.exitCode !== 0 || remoteShaResult.exitCode !== 0) {
+    // Can't resolve refs — can't verify, don't block
+    return { inSync: true };
+  }
+
+  const localSha = localShaResult.stdout.trim();
+  const remoteSha = remoteShaResult.stdout.trim();
+
+  if (localSha === remoteSha) {
+    return { inSync: true };
+  }
+
+  // Check if local is an ancestor of remote (local is behind — can fast-forward, OK)
+  const isAncestor = git(['merge-base', '--is-ancestor', localSha, remoteSha], root);
+  if (isAncestor.exitCode === 0) {
+    return { inSync: true };
+  }
+
+  // Local has diverged from this remote
+  return {
+    inSync: false,
+    error: `Local ${branch} has diverged from ${remoteRef}. Run \`git pull\` to reconcile before accepting.`,
+  };
 }

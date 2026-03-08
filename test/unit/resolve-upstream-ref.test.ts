@@ -20,7 +20,7 @@ const mockConfig: ResolvedConfig = {
   models: { default: 'sonnet' as const },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'in-repo', orphan_branch_name: 'lazy-data', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },

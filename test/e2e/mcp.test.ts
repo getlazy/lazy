@@ -677,6 +677,56 @@ describe('lazy-agent mcp', () => {
     expect(parsed.worktree.branch).toBe('main');
   });
 
+  // INVARIANT: Unknown parameters are rejected with a clear error message.
+  // Callers must not silently lose parameters due to typos (e.g. parent_task_id vs parent).
+  test('rejects unknown parameters with error and suggestions', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'Test task', parent_task_id: 'abc123' } } },
+    ]);
+
+    const createResponse = responses.find(r => r.id === 2);
+    expect(createResponse).toBeDefined();
+    expect(createResponse!.error).toBeDefined();
+    expect(createResponse!.error!.code).toBe(-32602);
+    expect(createResponse!.error!.message).toContain('parent_task_id');
+    expect(createResponse!.error!.message).toContain('parent');
+    // Should list valid parameters so the caller can self-correct
+    expect(createResponse!.error!.message).toContain('Valid parameters');
+    expect(createResponse!.error!.message).toContain('goal');
+  });
+
+  test('rejects completely unknown parameters without suggestion', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_status', arguments: { xyzzy: true } } },
+    ]);
+
+    const statusResponse = responses.find(r => r.id === 2);
+    expect(statusResponse).toBeDefined();
+    expect(statusResponse!.error).toBeDefined();
+    expect(statusResponse!.error!.code).toBe(-32602);
+    expect(statusResponse!.error!.message).toContain('xyzzy');
+  });
+
+  test('accepts valid parameters without error', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_search', arguments: { query: 'test', fuzzy: true } } },
+    ]);
+
+    const searchResponse = responses.find(r => r.id === 2);
+    expect(searchResponse).toBeDefined();
+    expect(searchResponse!.error).toBeUndefined();
+    expect(searchResponse!.result).toBeDefined();
+  });
+
   test('lazy_status shows zero changed files on clean worktree', async () => {
     const taskId = '00000000-0000-0000-0000-000000000001';
 

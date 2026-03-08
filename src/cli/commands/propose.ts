@@ -17,8 +17,7 @@ export interface Proposal {
 
 /**
  * Get the proposals directory for a task using the storage driver.
- * This ensures proposals follow the configured storage backend
- * (in-repo, external, or orphan-branch).
+ * This ensures proposals follow the configured storage backend.
  */
 function proposalsDirFromStorage(storage: Storage, taskId: string): string {
   return join(storage.getTaskDir(taskId), 'proposals');

@@ -1,37 +1,63 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, displayIdFor, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { logger } from '../../utils/logger';
 import type { ModelName } from '../../types';
+import type { Storage } from '../../storage/interface';
 import { theme } from '../theme';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
 
 /**
- * Generate a clone code from the old task's code.
+ * Escape special regex characters in a string.
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Generate a clone code from the old task's code, scanning existing tasks to avoid collisions.
  * Convention: append -clone-1, -clone-2, etc. Truncate base if needed to fit max code length limit.
  */
-function generateCloneCode(oldCode: string): string {
+async function generateCloneCode(oldCode: string, storage: Storage): Promise<string> {
   // Check if old code already has a -clone-N suffix
   const cloneMatch = oldCode.match(/^(.+)-clone-(\d+)$/);
   let base: string;
-  let n: number;
+
   if (cloneMatch) {
     base = cloneMatch[1];
-    n = parseInt(cloneMatch[2], 10) + 1;
   } else {
     base = oldCode;
-    n = 1;
   }
 
-  const suffix = `-clone-${n}`;
+  // Scan existing tasks to find the highest -clone-N suffix for this base
+  const allTasks = await storage.listTasks();
+  let maxN = 0;
+
+  const clonePattern = new RegExp(`^${escapeRegex(base)}-clone-(\\d+)$`);
+  for (const task of allTasks) {
+    if (task.code) {
+      const match = task.code.match(clonePattern);
+      if (match) {
+        const n = parseInt(match[1], 10);
+        if (n > maxN) {
+          maxN = n;
+        }
+      }
+    }
+  }
+
+  const nextN = maxN + 1;
+  const suffix = `-clone-${nextN}`;
+
   // Truncate base to fit within max code length limit
   const maxBase = MAX_TASK_CODE_LENGTH - suffix.length;
+  let finalBase = base;
   if (base.length > maxBase) {
-    base = base.substring(0, maxBase);
+    finalBase = base.substring(0, maxBase);
     // Remove trailing hyphen from truncation
-    base = base.replace(/-$/, '');
+    finalBase = finalBase.replace(/-$/, '');
   }
 
-  const code = base + suffix;
+  const code = finalBase + suffix;
   // Validate the generated code — if it's invalid, skip setting code
   if (validateCode(code) !== null) {
     return '';
@@ -113,7 +139,7 @@ export async function commandClone(args: string[]): Promise<void> {
     // Determine code: explicit > auto-generated > none
     let cloneCode: string | undefined = codeValue;
     if (!cloneCode && sourceTask.code) {
-      cloneCode = generateCloneCode(sourceTask.code);
+      cloneCode = await generateCloneCode(sourceTask.code, storage);
     }
 
     // Create cloned task

@@ -9,7 +9,7 @@ import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { createDriver } from '../../remote';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { openEditor, promptLine, removeRecoveryFile, promptYesNo, isTTY, readStdinIfPiped } from '../editor';
-import { followContainer, buildNotesContext, buildUpstreamMergeContext, buildSystemPrompt } from './shared';
+import { followContainer, buildNotesContext, buildSystemPrompt } from './shared';
 import { checkOrphanedChild, retargetOrphanedChild } from '../orphan';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
 import type { StartCommand } from '../../protocol';
@@ -27,6 +27,7 @@ import { formatMarkdown } from '../../utils/markdown';
 
 import goalContextStartText from '../../prompts/goal-context-start.md' with { type: 'text' };
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
+import { runGit } from '../../utils/git';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 
@@ -42,12 +43,12 @@ function buildLinkedTaskPreamble(worktreePath: string, branchName: string, paren
   lines.push('');
 
   // Commits ahead/behind
-  const countResult = Bun.spawnSync(
-    ['git', 'rev-list', '--left-right', '--count', `${parentBranch}...${branchName}`],
-    { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+  const countResult = runGit(
+    ['rev-list', '--left-right', '--count', `${parentBranch}...${branchName}`],
+    { cwd: worktreePath },
   );
   if (countResult.exitCode === 0) {
-    const parts = countResult.stdout.toString().trim().split(/\s+/);
+    const parts = countResult.stdout.split(/\s+/);
     const behind = parseInt(parts[0], 10) || 0;
     const ahead = parseInt(parts[1], 10) || 0;
     lines.push(`Branch status: ${ahead} commit(s) ahead, ${behind} commit(s) behind ${parentBranch}.`);
@@ -55,23 +56,23 @@ function buildLinkedTaskPreamble(worktreePath: string, branchName: string, paren
   }
 
   // Commit log since fork
-  const logResult = Bun.spawnSync(
-    ['git', 'log', '--no-color', '--oneline', `${parentBranch}..${branchName}`],
-    { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+  const logResult = runGit(
+    ['log', '--no-color', '--oneline', `${parentBranch}..${branchName}`],
+    { cwd: worktreePath },
   );
-  if (logResult.exitCode === 0 && logResult.stdout.toString().trim()) {
+  if (logResult.exitCode === 0 && logResult.stdout) {
     lines.push('Existing commits on this branch:');
-    lines.push(logResult.stdout.toString().trim());
+    lines.push(logResult.stdout);
     lines.push('');
   }
 
   // Working tree status
-  const statusResult = Bun.spawnSync(
-    ['git', 'status', '--short'],
-    { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+  const statusResult = runGit(
+    ['status', '--short'],
+    { cwd: worktreePath },
   );
   if (statusResult.exitCode === 0) {
-    const status = statusResult.stdout.toString().trim();
+    const status = statusResult.stdout;
     if (status) {
       lines.push('Working tree has uncommitted changes:');
       lines.push(status);
@@ -82,13 +83,13 @@ function buildLinkedTaskPreamble(worktreePath: string, branchName: string, paren
   }
 
   // Diff stat from parent branch
-  const diffStatResult = Bun.spawnSync(
-    ['git', 'diff', '--no-color', '--stat', `${parentBranch}...${branchName}`],
-    { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+  const diffStatResult = runGit(
+    ['diff', '--no-color', '--stat', `${parentBranch}...${branchName}`],
+    { cwd: worktreePath },
   );
-  if (diffStatResult.exitCode === 0 && diffStatResult.stdout.toString().trim()) {
+  if (diffStatResult.exitCode === 0 && diffStatResult.stdout) {
     lines.push(`Diff from ${parentBranch}:`);
-    lines.push(diffStatResult.stdout.toString().trim());
+    lines.push(diffStatResult.stdout);
     lines.push('');
   }
 
@@ -486,9 +487,9 @@ export async function commandStart(args: string[]): Promise<void> {
         const parentRef = await driver.resolveUpstreamRef(parentBranch, root);
 
         // Get the SHA of the resolved ref
-        const resolveResult = Bun.spawnSync(['git', 'rev-parse', parentRef], { cwd: root });
+        const resolveResult = runGit(['rev-parse', parentRef], { cwd: root });
         if (resolveResult.exitCode === 0) {
-          startSha = resolveResult.stdout.toString().trim();
+          startSha = resolveResult.stdout;
           logger.debug(`Resolved parent ${parentBranch} to ${parentRef} (${startSha.slice(0, 8)})`);
         } else {
           // Failed to resolve ref — this should not happen if resolveUpstreamRef succeeded
@@ -530,9 +531,9 @@ export async function commandStart(args: string[]): Promise<void> {
         const parentRef = await driver.resolveUpstreamRef(parentBranch, root);
 
         // Get the SHA of the resolved ref
-        const resolveResult = Bun.spawnSync(['git', 'rev-parse', parentRef], { cwd: root });
+        const resolveResult = runGit(['rev-parse', parentRef], { cwd: root });
         if (resolveResult.exitCode === 0) {
-          startSha = resolveResult.stdout.toString().trim();
+          startSha = resolveResult.stdout;
           logger.debug(`Resolved ${parentBranch} to ${parentRef} (${startSha.slice(0, 8)})`);
         } else {
           // Failed to resolve ref — this should not happen if resolveUpstreamRef succeeded
@@ -624,14 +625,14 @@ export async function commandStart(args: string[]): Promise<void> {
     if (!worktreeExisted && !isLinkedTask) {
       const taskCode = t.code ?? shortId(t.id);
       const commitMessage = `Initialize task ${taskCode}: ${t.goal}`;
-      const commitResult = Bun.spawnSync(
-        ['git', 'commit', '--allow-empty', '-m', commitMessage],
-        { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+      const commitResult = runGit(
+        ['commit', '--allow-empty', '-m', commitMessage],
+        { cwd: worktreePath },
       );
       if (commitResult.exitCode !== 0) {
         // Non-fatal: warn but continue. The task can still work without this commit,
         // though it may be subject to GitHub PR auto-close in edge cases.
-        logger.warn(`Failed to create initial empty commit: ${commitResult.stderr.toString()}`);
+        logger.warn(`Failed to create initial empty commit: ${commitResult.stderr}`);
       }
     }
 
@@ -753,14 +754,6 @@ export async function commandStart(args: string[]): Promise<void> {
 
       const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', config);
 
-      // Build upstream context for merge conflict resolution (best-effort).
-      // Done on host side where storage is available for task goal lookups.
-      let upstreamMergeContext: string | undefined;
-      if (parentBranch) {
-        const ctx = await buildUpstreamMergeContext(parentBranch, worktreePath, storage);
-        if (ctx) upstreamMergeContext = ctx;
-      }
-
       // Write the start command for the supervisor
       const startCommand: StartCommand = {
         type: 'start',
@@ -773,7 +766,6 @@ export async function commandStart(args: string[]): Promise<void> {
         parent_branch: parentBranch ?? undefined,
         sync_before_work: false,  // start creates branch from HEAD — already fresh
         sync_after_work: autoSyncAfterTurn,
-        upstream_merge_context: upstreamMergeContext,
         turn_started_at: new Date().toISOString(),
         // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
         ...(config.agent.watchdog_output_timeout_ms !== 0 && {

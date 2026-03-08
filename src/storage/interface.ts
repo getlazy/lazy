@@ -67,9 +67,7 @@ export interface Storage {
 
   /**
    * Get the base path where task data is stored.
-   * For in-repo storage: <repo>/.lazy/
    * For external storage: the configured external path
-   * For orphan-branch storage: the worktree path
    *
    * Use this instead of constructing paths with getDataDir() when
    * the data should follow the storage backend.

@@ -47,8 +47,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     path: '.lazy',
   },
   storage: {
-    backend: 'in-repo',
-    orphan_branch_name: 'lazy-state',
+    backend: 'external',
     external_path: '',
     postgres_ssl: false,
   },
@@ -187,6 +186,23 @@ export function loadConfig(lazyRoot: string): ResolvedConfig {
     );
   }
 
+  // Reject removed storage backends with clear migration guidance
+  const storageSection = raw.storage as Record<string, unknown> | undefined;
+  if (storageSection?.backend === 'in-repo') {
+    throw new Error(
+      'Storage backend "in-repo" is no longer supported. ' +
+      'Switch to backend = "external" and set external_path to a directory outside the repo ' +
+      '(e.g., external_path = "~/.lazy/my-project").',
+    );
+  }
+  if (storageSection?.backend === 'orphan-branch') {
+    throw new Error(
+      'Storage backend "orphan-branch" is no longer supported. ' +
+      'Switch to backend = "external" and set external_path to a directory outside the repo ' +
+      '(e.g., external_path = "~/.lazy/my-project").',
+    );
+  }
+
   // Backward compat: top-level `runner = "docker"` (string) → `runner.type = "docker"`
   if (typeof raw.runner === 'string') {
     console.warn(
@@ -237,8 +253,8 @@ export function hasExplicitModelConfig(lazyRoot: string): boolean {
  * Get a default lazy.toml template content
  */
 export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, storagePath?: string, toolchain?: string, gitRemote?: string): string {
-  const backend = storageBackend || 'in-repo';
-  const pathLine = backend === 'external' && storagePath ? `external_path = "${storagePath}"` : 'external_path = ""';
+  const backend = storageBackend || 'external';
+  const pathLine = storagePath ? `external_path = "${storagePath}"` : 'external_path = ""';
   const toolchainValue = toolchain || '';
   const remoteName = gitRemote || 'origin';
 
@@ -267,12 +283,11 @@ auto_commit_instructions = true
 path = ".lazy"
 
 [storage]
-# Storage backend: "in-repo" (default), "external", or "orphan-branch"
+# Storage backend: "external" (default) or "postgres"
 backend = "${backend}"
 # Path for external storage (only used when backend = "external")
+# Defaults to ~/.lazy/<project-name> if empty
 ${pathLine}
-# Branch name for orphan-branch storage (only used when backend = "orphan-branch")
-orphan_branch_name = "lazy-state"
 
 [git]
 # Default prefix for lazy branches (e.g., "lazy/abc123")

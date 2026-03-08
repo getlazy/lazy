@@ -9,8 +9,11 @@
  */
 
 import { randomUUID } from 'crypto';
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { spawn } from '../utils/spawn';
+import { runGit } from '../utils/git';
+import { logger } from '../utils/logger';
 import type { McpTool, McpToolHandler } from './types';
 import type { ModelName } from '../types';
 
@@ -19,6 +22,7 @@ import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH } from '
 import type { Proposal } from '../cli/commands/propose';
 import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
 import { reconcileTasks } from '../utils/reconcile';
+import { queryWait } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
 
 /**
@@ -367,8 +371,8 @@ export const createTool: McpTool = {
       },
       code: {
         type: 'string',
-        description: `Human-readable task code (kebab-case, 2-${MAX_TASK_CODE_LENGTH} chars, optional)`,
-        pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$',
+        description: `Human-readable task code (kebab-case with optional dots, 2-${MAX_TASK_CODE_LENGTH} chars, optional)`,
+        pattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$',
         minLength: 2,
         maxLength: MAX_TASK_CODE_LENGTH,
       },
@@ -518,8 +522,8 @@ export const proposeTool: McpTool = {
       },
       code: {
         type: 'string',
-        description: `Suggested task code (kebab-case identifier, 2-${MAX_TASK_CODE_LENGTH} chars, optional)`,
-        pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$',
+        description: `Suggested task code (kebab-case identifier with optional dots, 2-${MAX_TASK_CODE_LENGTH} chars, optional)`,
+        pattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$',
         minLength: 2,
         maxLength: MAX_TASK_CODE_LENGTH,
       },
@@ -615,32 +619,20 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
 
     // Stage files
     if (files && files.length > 0) {
-      const addResult = Bun.spawnSync(['git', 'add', ...files], {
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
+      const addResult = runGit(['add', ...files], { cwd });
       if (addResult.exitCode !== 0) {
-        throw new Error(`git add failed: ${addResult.stderr.toString().trim()}`);
+        throw new Error(`git add failed: ${addResult.stderr}`);
       }
     } else {
-      const addResult = Bun.spawnSync(['git', 'add', '-A'], {
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
+      const addResult = runGit(['add', '-A'], { cwd });
       if (addResult.exitCode !== 0) {
-        throw new Error(`git add failed: ${addResult.stderr.toString().trim()}`);
+        throw new Error(`git add failed: ${addResult.stderr}`);
       }
     }
 
     // Check if there's anything to commit
-    const statusResult = Bun.spawnSync(['git', 'diff', '--cached', '--stat'], {
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const diffStat = statusResult.stdout.toString().trim();
+    const statusResult = runGit(['diff', '--cached', '--stat'], { cwd });
+    const diffStat = statusResult.stdout;
     if (!diffStat) {
       return {
         committed: false,
@@ -649,22 +641,14 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     }
 
     // Commit
-    const commitResult = Bun.spawnSync(['git', 'commit', '-m', message], {
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const commitResult = runGit(['commit', '-m', message], { cwd });
     if (commitResult.exitCode !== 0) {
-      throw new Error(`git commit failed: ${commitResult.stderr.toString().trim()}`);
+      throw new Error(`git commit failed: ${commitResult.stderr}`);
     }
 
     // Get the commit SHA
-    const shaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
-      cwd,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const sha = shaResult.stdout.toString().trim();
+    const shaResult = runGit(['rev-parse', 'HEAD'], { cwd });
+    const sha = shaResult.stdout;
 
     // Count files changed from diffstat (last line is summary)
     const diffLines = diffStat.split('\n');
@@ -708,26 +692,15 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
     let recentCommits = '';
 
     try {
-      const branchResult = Bun.spawnSync(['git', 'branch', '--show-current'], {
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      branch = branchResult.exitCode === 0 ? branchResult.stdout.toString().trim() : '';
+      const branchResult = runGit(['branch', '--show-current'], { cwd });
+      branch = branchResult.exitCode === 0 ? branchResult.stdout : '';
 
-      const statusResult = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
-        cwd,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      porcelain = statusResult.exitCode === 0 ? statusResult.stdout.toString().trim() : '';
+      const statusResult = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
+      porcelain = statusResult.exitCode === 0 ? statusResult.stdout : '';
       changedFiles = porcelain ? porcelain.split('\n').length : 0;
 
-      const logResult = Bun.spawnSync(
-        ['git', 'log', '--oneline', '-5', '--no-color'],
-        { cwd, stdout: 'pipe', stderr: 'pipe' },
-      );
-      recentCommits = logResult.exitCode === 0 ? logResult.stdout.toString().trim() : '';
+      const logResult = runGit(['log', '--oneline', '-5', '--no-color'], { cwd });
+      recentCommits = logResult.exitCode === 0 ? logResult.stdout : '';
     } catch {
       // Git not available (e.g., minimal builder container) — skip git info
     }
@@ -978,7 +951,7 @@ async function runLazyCliCommand(
     cmd = [execPath, ...args];
   }
 
-  const proc = Bun.spawn(cmd, {
+  const proc = spawn(cmd, {
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -1477,52 +1450,75 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task ${taskIdInput} has no session (not started yet)`);
       }
 
-      // Find the task's worktree by convention
+      // Find the task's worktree by convention; fall back to main repo if worktree is gone
       const storagePath = storage.getStoragePath();
       const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
+      const worktreeExists = existsSync(worktreePath);
+      const diffCwd = worktreeExists ? worktreePath : lazyRoot;
+      if (!worktreeExists) {
+        logger.warn(`lazy_diff: worktree gone for task ${taskIdInput}, falling back to main repo`);
+      }
 
-      // Determine the merge base for diff
+      // Determine the diff range.
+      // Prefer three-dot diff against parent branch — this automatically finds the
+      // merge-base and shows only what the task itself changed, excluding upstream
+      // merges. Fall back to two-dot from upstream_merge_sha or git_start_sha when
+      // the parent branch ref is unavailable (e.g., deleted after accept).
       const parentBranch = task.parent_task_id
         ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
         : 'main';
 
-      // Use the upstream merge SHA if available, otherwise merge-base
-      let diffBase: string;
-      if (session.upstream_merge_sha) {
-        diffBase = session.upstream_merge_sha;
-      } else {
-        const mergeBaseResult = Bun.spawnSync(
-          ['git', 'merge-base', parentBranch, 'HEAD'],
-          { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+      let diffRange: string;
+      if (worktreeExists) {
+        const branchCheck = runGit(
+          ['rev-parse', '--verify', parentBranch],
+          { cwd: diffCwd },
         );
-        diffBase = mergeBaseResult.exitCode === 0
-          ? mergeBaseResult.stdout.toString().trim()
-          : session.git_start_sha;
+        if (branchCheck.exitCode === 0) {
+          // Parent branch exists — three-dot diff (most reliable)
+          diffRange = `${parentBranch}...HEAD`;
+        } else if (session.upstream_merge_sha) {
+          // Parent branch gone but we have the upstream SHA — two-dot diff
+          diffRange = `${session.upstream_merge_sha}..HEAD`;
+        } else {
+          // Last resort: two-dot from session start
+          diffRange = `${session.git_start_sha}..HEAD`;
+        }
+      } else {
+        // No worktree — use branch ref directly against parent in main repo
+        const branchRef = session.git_branch;
+        const branchCheck = runGit(
+          ['rev-parse', '--verify', branchRef],
+          { cwd: diffCwd },
+        );
+        if (branchCheck.exitCode !== 0) {
+          logger.warn(`lazy_diff: branch '${branchRef}' not found in main repo for task ${taskIdInput}`);
+          throw new Error(`Worktree is gone and branch '${branchRef}' not found in main repo`);
+        }
+        diffRange = `${parentBranch}...${branchRef}`;
       }
 
       const diffArgs = full
-        ? ['git', 'diff', diffBase, 'HEAD']
-        : ['git', 'diff', '--stat', diffBase, 'HEAD'];
+        ? ['diff', diffRange]
+        : ['diff', '--stat', diffRange];
 
       // Append file pathspecs after a -- separator
       if (files && files.length > 0) {
         diffArgs.push('--', ...files);
       }
 
-      const diffResult = Bun.spawnSync(diffArgs, {
-        cwd: worktreePath,
-        stdout: 'pipe',
-        stderr: 'pipe',
+      const diffResult = runGit(diffArgs, {
+        cwd: diffCwd,
       });
 
       if (diffResult.exitCode !== 0) {
-        throw new Error(`git diff failed: ${diffResult.stderr.toString().trim()}`);
+        throw new Error(`git diff failed: ${diffResult.stderr}`);
       }
 
-      let diffOutput = diffResult.stdout.toString();
+      let diffOutput = diffResult.stdout;
       const result: Record<string, unknown> = {
         task_id: shortId(task.id),
-        diff_base: diffBase.substring(0, 7),
+        diff_range: diffRange,
         full: !!full,
       };
 
@@ -1577,57 +1573,12 @@ export function createWaitHandler(_ctx: McpToolContext): McpToolHandler {
     const taskIdInput = args.task_id as string;
     const timeoutSecs = Math.min((args.timeout as number | undefined) ?? 600, 600);
 
-    // Resolve task ID once
-    let fullTaskId: string;
-    {
-      const storage = await requireStorage();
-      try {
-        const resolved = await storage.resolveTask(taskIdInput);
-        if (!resolved.task) {
-          throw new Error(`Task not found: ${taskIdInput}`);
-        }
-        fullTaskId = resolved.task.id;
-      } finally {
-        await storage.close();
-      }
-    }
-
-    const lazyRoot = requireLazyRoot();
-    const deadline = Date.now() + timeoutSecs * 1000;
-    const pollInterval = 3000;
-
-    while (Date.now() < deadline) {
-      // Open storage, reconcile, check status, close storage — release lock between polls
-      const storage = await requireStorage();
-      let status: string;
-      try {
-        // Reconcile on each poll to detect status changes
-        await reconcileTasks(storage, lazyRoot);
-
-        const task = await storage.getTask(fullTaskId);
-        if (!task) {
-          throw new Error(`Task disappeared: ${taskIdInput}`);
-        }
-        status = task.status;
-      } finally {
-        await storage.close();
-      }
-
-      if (status !== 'working') {
-        return {
-          task_id: shortId(fullTaskId),
-          status,
-          timed_out: false,
-        };
-      }
-
-      await Bun.sleep(pollInterval);
-    }
+    const result = await queryWait({ taskId: taskIdInput, timeout: timeoutSecs });
 
     return {
-      task_id: shortId(fullTaskId),
-      status: 'working',
-      timed_out: true,
+      task_id: shortId(result.task_id),
+      status: result.status,
+      timed_out: result.timed_out,
     };
   };
 }
@@ -1991,7 +1942,7 @@ export function createRedoHandler(_ctx: McpToolContext): McpToolHandler {
 
       // Generate a redo code using the old task's code (or fall back to task ID)
       const baseCode = oldTask.code ?? shortId(oldTask.id);
-      const redoCode = generateRedoCode(baseCode);
+      const redoCode = await generateRedoCode(baseCode, storage);
 
       // Get old prompt
       let prompt = promptOverride;

@@ -246,7 +246,7 @@ describe('lazy init', () => {
 
     // LAZY_FORCE_TTY makes isTTY() return true so interactive prompts run.
     // LAZY_PROMPT_DEFAULTS=accept makes all promptYesNo return true and
-    // promptChoice return the first option (in-repo storage).
+    // promptChoice return the first option (external storage).
     const result = await runLazy(
       tmpDir,
       ['init', '--skip-auth-check', '--skip-remote-check'],

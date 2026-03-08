@@ -4,7 +4,7 @@ import { rm } from 'fs/promises';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
 
 /** Replace the [runner] section's type value in a lazy.toml config string. */
 function setRunnerType(config: string, type: string): string {
@@ -52,7 +52,7 @@ describe('lazy builder', () => {
     const markerPath = join(markerDir, '.builder-launched');
     expect(existsSync(markerPath)).toBe(true);
 
-    // Verify it's NOT in the old in-repo location
+    // Verify it's NOT in the .lazy directory
     const oldMarkerPath = join(ctx.root, '.lazy', '.builder-launched');
     expect(existsSync(oldMarkerPath)).toBe(false);
   });
@@ -73,8 +73,104 @@ describe('lazy builder', () => {
     expectOutput(result, 'Conversations are captured');
   });
 
-  // INVARIANT: Every builder run starts a new session (no resume).
-  test('always starts new session without prompting', async () => {
+  test('--help shows resume options', async () => {
+    const result = await ctx.lazy(['builder', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, '--resume');
+    expectOutput(result, 'LAZY_LAST_SESSION_ID');
+    expectOutput(result, 'Resume a specific session');
+  });
+
+  // INVARIANT: --resume without LAZY_LAST_SESSION_ID errors clearly.
+  // No file scanning — env var is the only source for bare --resume.
+  test('--resume fails when LAZY_LAST_SESSION_ID is not set', async () => {
+    const result = await ctx.lazy(['builder', '--resume'], {
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+
+    expectError(result, 'LAZY_LAST_SESSION_ID is not set');
+  });
+
+  // INVARIANT: --resume (bare) reads from LAZY_LAST_SESSION_ID env var.
+  test('--resume reads session ID from env var', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+    const result = await ctx.lazy(['builder', '--resume'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        LAZY_LAST_SESSION_ID: sessionId,
+      },
+    });
+
+    expectOutput(result, 'Resuming session aaaaaaaa');
+  });
+
+  // INVARIANT: --resume <id> passes the ID directly to Claude.
+  test('--resume with explicit ID uses that ID', async () => {
+    const result = await ctx.lazy(['builder', '--resume', 'cafebabe-1234-5678-9abc-def012345678'], {
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+
+    expectOutput(result, 'Resuming session cafebabe');
+  });
+
+  // INVARIANT: Resume skips the interactive system prompt warning.
+  // Users have already seen the warning in the original session.
+  test('resume skips session disclosure message', async () => {
+    const result = await ctx.lazy(['builder', '--resume', 'abcdef01-2345-6789-abcd-ef0123456789'], {
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+
+    // Should show the resume message
+    expectOutput(result, 'Resuming session abcdef01');
+    // Should NOT show the new-session disclosure
+    expectOutputExcludes(result, 'Launching Claude Code in a new session');
+  });
+
+  // INVARIANT: When LAZY_LAST_SESSION_ID is set in TTY mode, offer to resume.
+  // promptYesNo with LAZY_PROMPT_DEFAULTS="accept" returns true.
+  test('offers resume prompt in TTY mode when env var is set', async () => {
+    const sessionId = 'faceb00c-cafe-babe-dead-beefcafebabe';
+
+    const result = await ctx.lazy(['builder'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: 'accept',
+        LAZY_LAST_SESSION_ID: sessionId,
+      },
+    });
+
+    // Should show the yes/no prompt with session ID
+    expectOutput(result, 'Resume previous builder session faceb00c');
+    // Accepted → resuming
+    expectOutput(result, 'Resuming session faceb00c');
+    // Resume should skip disclosure
+    expectOutputExcludes(result, 'Launching Claude Code in a new session');
+  });
+
+  // INVARIANT: Declining resume in TTY mode starts a new session with disclosure.
+  test('declining resume in TTY mode starts new session', async () => {
+    const sessionId = 'faceb00c-cafe-babe-dead-beefcafebabe';
+
+    const result = await ctx.lazy(['builder'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: 'decline',
+        LAZY_LAST_SESSION_ID: sessionId,
+      },
+    });
+
+    // Should show the yes/no prompt
+    expectOutput(result, 'Resume previous builder session faceb00c');
+    // Declined → new session with disclosure
+    expectOutput(result, 'Launching Claude Code in a new session');
+  });
+
+  // INVARIANT: Without env var or flag, no resume prompt — straight to new session.
+  test('no env var and no flag starts new session without prompting', async () => {
     const result = await ctx.lazy(['builder'], {
       env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
     });
@@ -161,5 +257,22 @@ describe('lazy builder', () => {
     expectSuccess(result);
     expectOutput(result, '--autonomous');
     expectOutput(result, 'Run without permission prompts');
+  });
+
+  // INVARIANT: builder rejects unknown flags with a non-zero exit code.
+  // Silently forwarding unknown flags to Claude Code masks mistakes — agents
+  // and humans need to know when lazy isn't doing what they think.
+  test('unknown flag causes non-zero exit with error message', async () => {
+    const result = await ctx.lazy(['builder', '--unblocked']);
+
+    expectFailure(result, 1);
+    expectError(result, 'Unknown flag: --unblocked');
+  });
+
+  test('unknown flag error message includes command hint', async () => {
+    const result = await ctx.lazy(['builder', '--bogus-flag']);
+
+    expectFailure(result, 1);
+    expectError(result, 'lazy builder --help');
   });
 });

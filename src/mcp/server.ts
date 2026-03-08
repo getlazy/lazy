@@ -179,8 +179,30 @@ export class McpServer {
       return;
     }
 
+    // Validate that args only contain known parameters
+    const args = params?.arguments ?? {};
+    const knownKeys = Object.keys(tool.definition.inputSchema.properties ?? {});
+    const providedKeys = Object.keys(args);
+    const unknownKeys = providedKeys.filter(k => !knownKeys.includes(k));
+
+    if (unknownKeys.length > 0) {
+      const suggestions = unknownKeys.map(uk => {
+        const closest = findClosestMatch(uk, knownKeys);
+        return closest ? `${uk} (did you mean: ${closest}?)` : uk;
+      });
+      this.sendResponse({
+        jsonrpc: JSONRPC_VERSION,
+        id: message.id!,
+        error: {
+          code: -32602,
+          message: `Unknown parameter(s): ${suggestions.join(', ')}. Valid parameters: ${knownKeys.join(', ')}`,
+        },
+      });
+      return;
+    }
+
     try {
-      const result = await tool.handler(params?.arguments ?? {});
+      const result = await tool.handler(args);
       this.sendResponse({
         jsonrpc: JSONRPC_VERSION,
         id: message.id!,
@@ -215,4 +237,44 @@ export class McpServer {
     const line = JSON.stringify(response) + '\n';
     process.stdout.write(line);
   }
+}
+
+/**
+ * Compute Levenshtein distance between two strings.
+ */
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+/**
+ * Find the closest match for a string among candidates.
+ * Returns null if no candidate is close enough (threshold: 60% similarity).
+ */
+function findClosestMatch(input: string, candidates: string[]): string | null {
+  if (candidates.length === 0) return null;
+  let best = '';
+  let bestDist = Infinity;
+  for (const c of candidates) {
+    const dist = levenshtein(input.toLowerCase(), c.toLowerCase());
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = c;
+    }
+  }
+  // Only suggest if the distance is reasonable (within 60% of the longer string)
+  const maxLen = Math.max(input.length, best.length);
+  if (bestDist <= maxLen * 0.6) return best;
+  return null;
 }

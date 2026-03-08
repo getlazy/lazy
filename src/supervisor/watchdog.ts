@@ -11,6 +11,7 @@
  */
 
 import { log } from './log';
+import { spawn } from '../utils/spawn';
 
 /** Grace period between SIGTERM and SIGKILL (ms). */
 const KILL_GRACE_MS = 5000;
@@ -66,7 +67,7 @@ export async function execWithWatchdog(
     log(`[watchdog] Enabled: output timeout ${timeoutMs}ms`);
   }
 
-  const proc = Bun.spawn(args, {
+  const proc = spawn(args, {
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',

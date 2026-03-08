@@ -17,7 +17,6 @@
  */
 
 export { FileStorage } from './file-storage';
-export { OrphanBranchStorage } from './orphan-branch-storage';
 export { PostgresStorage } from './postgres-storage';
 export type { Storage } from './interface';
 export type {
@@ -48,13 +47,13 @@ export type {
 } from './types';
 
 import { FileStorage } from './file-storage';
-import { OrphanBranchStorage } from './orphan-branch-storage';
 import { PostgresStorage } from './postgres-storage';
 import type { Storage } from './interface';
 import { loadConfig } from '../config/loader';
 import { join } from 'path';
 import { homedir } from 'os';
 import { basename } from 'path';
+import { runGit } from '../utils/git';
 
 /**
  * Extract project name from git remote URL or directory name.
@@ -63,14 +62,10 @@ import { basename } from 'path';
 export function getProjectName(lazyRoot: string, remoteName: string = 'origin'): string {
   try {
     // Try to get remote URL
-    const result = Bun.spawnSync(['git', 'remote', 'get-url', remoteName], {
-      cwd: lazyRoot,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const result = runGit(['remote', 'get-url', remoteName], { cwd: lazyRoot });
 
     if (result.exitCode === 0) {
-      const url = result.stdout.toString().trim();
+      const url = result.stdout;
       // Extract repo name from various URL formats
       const match = url.match(/\/([^/]+?)(\.git)?$/);
       if (match) {
@@ -86,18 +81,14 @@ export function getProjectName(lazyRoot: string, remoteName: string = 'origin'):
 
 /**
  * Storage backend types:
- * - 'in-repo': FileStorage with root at <repo>/.lazy/ (default, current behavior)
- * - 'orphan-branch': OrphanBranchStorage backed by a git orphan branch
- * - 'external': FileStorage with root at the configured external path
+ * - 'external': FileStorage with root at the configured external path (default)
  * - 'postgres': PostgresStorage backed by PostgreSQL database
  */
-export type StorageBackend = 'in-repo' | 'orphan-branch' | 'external' | 'postgres';
+export type StorageBackend = 'external' | 'postgres';
 
 export interface CreateStorageOptions {
-  /** Storage backend type (default: 'in-repo') */
+  /** Storage backend type (default: 'external') */
   backend?: StorageBackend;
-  /** Orphan branch name (only used with 'orphan-branch' backend, default: 'lazy-state') */
-  branchName?: string;
   /** External storage path (only used with 'external' backend) */
   externalPath?: string;
 }
@@ -109,14 +100,12 @@ export interface CreateStorageOptions {
 export async function createStorage(lazyRoot: string, options?: CreateStorageOptions): Promise<Storage> {
   // If options not provided, read from config
   let backend = options?.backend;
-  let branchName = options?.branchName;
   let externalPath = options?.externalPath;
 
   let gitRemote = 'origin';
   if (!backend) {
     const config = loadConfig(lazyRoot);
     backend = config.storage.backend;
-    branchName = config.storage.orphan_branch_name;
     externalPath = config.storage.external_path;
     gitRemote = config.remote.git_remote;
   }
@@ -124,13 +113,7 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
   let storage: Storage;
 
   switch (backend) {
-    case 'orphan-branch':
-      storage = new OrphanBranchStorage(lazyRoot, {
-        branchName: branchName || 'lazy-state',
-      });
-      break;
-
-    case 'external':
+    case 'external': {
       if (!externalPath || externalPath === '') {
         // Default external path
         const projectName = getProjectName(lazyRoot, gitRemote);
@@ -138,6 +121,7 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       }
       storage = new FileStorage(lazyRoot, { basePath: externalPath });
       break;
+    }
 
     case 'postgres': {
       // Credentials come from environment variables, never from lazy.toml.
@@ -155,10 +139,8 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       break;
     }
 
-    case 'in-repo':
     default:
-      storage = new FileStorage(lazyRoot);
-      break;
+      throw new Error(`Unknown storage backend: "${backend}". Valid backends are "external" and "postgres".`);
   }
 
   await storage.initialize();

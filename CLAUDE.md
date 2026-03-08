@@ -71,6 +71,21 @@ Each command that has a confirmation prompt should accept `--yes` to skip it.
 
 Agent system prompts (`src/prompts/`) are injected into agents working on the USER's codebase. They must not contain lazy-internal design decisions, invariants, or implementation details. Lazy-specific development guidelines live here in CLAUDE.md.
 
+### Never use Bun.spawn/Bun.spawnSync directly
+
+Always use `spawn()` and `spawnSync()` from `src/utils/spawn.ts` instead of calling `Bun.spawn` or `Bun.spawnSync` directly. The wrappers diagnose ENOENT errors — when a binary isn't found or a stdio redirection path doesn't exist, they produce clear error messages instead of the raw OS error (`"ENOENT: no such file or directory, posix_spawn ..."`).
+
+The only exception is `src/utils/spawn.ts` itself, which must call the underlying Bun APIs.
+
+```typescript
+// Good
+import { spawn, spawnSync } from '../utils/spawn';
+const result = spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe' });
+
+// Bad — raw ENOENT errors will confuse users
+const result = Bun.spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe' });
+```
+
 ## Core Principle: Act Like a Team Member
 
 **Rule of thumb:** "Would I as a reviewer do this?"

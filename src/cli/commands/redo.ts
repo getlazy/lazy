@@ -9,9 +9,12 @@ import { createDriver } from '../../remote';
 import { logger } from '../../utils/logger';
 import type { ModelName } from '../../types';
 import { getActor } from '../../constants';
+import type { Storage } from '../../storage/interface';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
+import { spawnSync } from '../../utils/spawn';
+import { runGit } from '../../utils/git';
 
 function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): void {
   if (existsSync(worktreePath)) {
@@ -19,8 +22,8 @@ function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: st
       removeWorktree(worktreePath, root);
     } catch {
       // Worktree may be corrupted. Fall back to manual removal + prune.
-      Bun.spawnSync(['rm', '-rf', worktreePath]);
-      Bun.spawnSync(['git', 'worktree', 'prune'], { cwd: root });
+      spawnSync(['rm', '-rf', worktreePath]);
+      runGit(['worktree', 'prune'], { cwd: root });
     }
   }
   try {
@@ -31,32 +34,57 @@ function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: st
 }
 
 /**
- * Generate a redo code from the old task's code.
+ * Escape special regex characters in a string.
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
  * Convention: append -redo-1, -redo-2, etc. Truncate base if needed to fit 80-char limit.
  */
-export function generateRedoCode(oldCode: string): string {
+export async function generateRedoCode(oldCode: string, storage: Storage): Promise<string> {
   // Check if old code already has a -redo-N suffix
   const redoMatch = oldCode.match(/^(.+)-redo-(\d+)$/);
   let base: string;
-  let n: number;
+
   if (redoMatch) {
     base = redoMatch[1];
-    n = parseInt(redoMatch[2], 10) + 1;
   } else {
     base = oldCode;
-    n = 1;
   }
 
-  const suffix = `-redo-${n}`;
+  // Scan existing tasks to find the highest -redo-N suffix for this base
+  const allTasks = await storage.listTasks();
+  let maxN = 0;
+
+  const redoPattern = new RegExp(`^${escapeRegex(base)}-redo-(\\d+)$`);
+  for (const task of allTasks) {
+    if (task.code) {
+      const match = task.code.match(redoPattern);
+      if (match) {
+        const n = parseInt(match[1], 10);
+        if (n > maxN) {
+          maxN = n;
+        }
+      }
+    }
+  }
+
+  const nextN = maxN + 1;
+  const suffix = `-redo-${nextN}`;
+
   // Truncate base to fit within max code length limit
   const maxBase = MAX_TASK_CODE_LENGTH - suffix.length;
+  let finalBase = base;
   if (base.length > maxBase) {
-    base = base.substring(0, maxBase);
+    finalBase = base.substring(0, maxBase);
     // Remove trailing hyphen from truncation
-    base = base.replace(/-$/, '');
+    finalBase = finalBase.replace(/-$/, '');
   }
 
-  const code = base + suffix;
+  const code = finalBase + suffix;
   // Validate the generated code — if it's invalid, skip setting code
   if (validateCode(code) !== null) {
     return '';
@@ -184,7 +212,7 @@ export async function commandRedo(args: string[]): Promise<void> {
 
     // Generate redo code from old task's code (convention: append -redo-N)
     if (oldTask.code) {
-      const redoCode = generateRedoCode(oldTask.code);
+      const redoCode = await generateRedoCode(oldTask.code, storage);
       if (redoCode) {
         try {
           await storage.updateTaskCode(newTask.id, redoCode);

@@ -11,6 +11,7 @@ import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RunnerType } from '../config/types';
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { spawn, spawnSync } from '../utils/spawn';
 import { join, basename } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger';
@@ -135,7 +136,7 @@ export class DockerRunner implements Runner {
 
   stopRun(runName: string): boolean {
     try {
-      const result = Bun.spawnSync(
+      const result = spawnSync(
         [this.binary, 'stop', runName],
         { stdout: 'ignore', stderr: 'pipe', timeout: 30_000 },
       );
@@ -151,7 +152,7 @@ export class DockerRunner implements Runner {
 
   discoverRunningRuns(): string[] {
     try {
-      const result = Bun.spawnSync(
+      const result = spawnSync(
         [this.binary, 'ps', '--filter', 'name=^lazy-', '--format', '{{.Names}}'],
         { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
@@ -174,7 +175,7 @@ export class DockerRunner implements Runner {
       }
       args.push(runName);
 
-      const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe' });
+      const proc = spawn(args, { stdout: 'pipe', stderr: 'pipe' });
       return {
         process: { kill: () => proc.kill() },
         stdout: proc.stdout as ReadableStream<Uint8Array>,
@@ -206,7 +207,7 @@ export class DockerRunner implements Runner {
 
     // Check binary installed
     try {
-      const result = Bun.spawnSync([this.binary, '--version'], {
+      const result = spawnSync([this.binary, '--version'], {
         stdout: 'pipe', stderr: 'ignore', timeout,
       });
       if (result.exitCode === 0) {
@@ -233,7 +234,7 @@ export class DockerRunner implements Runner {
 
     // Check daemon running
     try {
-      const result = Bun.spawnSync([this.binary, 'info'], {
+      const result = spawnSync([this.binary, 'info'], {
         stdout: 'ignore', stderr: 'ignore', timeout,
       });
       if (result.exitCode === 0) {
@@ -266,7 +267,7 @@ export class DockerRunner implements Runner {
     builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
-  ): Promise<number> {
+  ): Promise<{ exitCode: number; sessionId: string | null }> {
     const [imageName, agentBinaryPath] = await Promise.all([
       ensureImage(this.binary),
       ensureAgentBinary(),
@@ -384,7 +385,7 @@ export class DockerRunner implements Runner {
 
     logger.info('Launching builder container...');
 
-    const proc = Bun.spawn(dockerArgs, {
+    const proc = spawn(dockerArgs, {
       stdin: 'inherit',
       stdout: 'inherit',
       stderr: 'inherit',
@@ -401,6 +402,6 @@ export class DockerRunner implements Runner {
       }
     }
 
-    return exitCode;
+    return { exitCode, sessionId: null };
   }
 }

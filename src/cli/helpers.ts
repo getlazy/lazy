@@ -46,7 +46,6 @@ export async function requireStorage(): Promise<Storage> {
   const config = loadConfig(root);
   return createStorage(root, {
     backend: config.storage.backend as StorageBackend,
-    branchName: config.storage.orphan_branch_name,
     externalPath: config.storage.external_path || undefined,
   });
 }
@@ -187,17 +186,18 @@ export function buildDisplayIdMap(tasks: Task[]): (taskId: string) => string {
 
 /**
  * Derive a task code from a branch name or title string.
- * Rules: lowercase, replace `/` and non-alphanumeric with `-`, collapse runs of `-`, truncate to 80 chars.
+ * Rules: lowercase, replace `/` and non-alphanumeric (except dots) with `-`, collapse runs of `-` and `.`, truncate to 80 chars.
  * Returns null if the derived code would be invalid (too short, reserved, etc.).
  */
 export function deriveCode(input: string): string | null {
   const derived = input
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')  // replace non-alphanumeric runs with single `-`
-    .replace(/^-+/, '')            // strip leading hyphens
-    .replace(/-+$/, '')            // strip trailing hyphens
+    .replace(/[^a-z0-9.]+/g, '-')  // replace non-alphanumeric runs (except dots) with single `-`
+    .replace(/\.{2,}/g, '.')       // collapse multiple consecutive dots to single dot
+    .replace(/^[-.]+/, '')         // strip leading hyphens and dots
+    .replace(/[-.]+$/, '')         // strip trailing hyphens and dots
     .slice(0, MAX_TASK_CODE_LENGTH)  // truncate to max code length
-    .replace(/-+$/, '');           // strip any trailing hyphens created by truncation
+    .replace(/[-.]+$/, '');        // strip any trailing hyphens or dots created by truncation
 
   if (validateCode(derived) !== null) {
     return null;
@@ -207,7 +207,7 @@ export function deriveCode(input: string): string | null {
 
 /**
  * Validate a task code.
- * Rules: lowercase alphanumeric + hyphens, 2-80 chars, starts with a letter or digit.
+ * Rules: lowercase alphanumeric + hyphens + dots, 2-80 chars, starts and ends with a letter or digit.
  * Returns null if valid, or an error message string if invalid.
  */
 export function validateCode(code: string): string | null {
@@ -217,8 +217,8 @@ export function validateCode(code: string): string | null {
   if (code.length > MAX_TASK_CODE_LENGTH) {
     return `Task code must be ${MAX_TASK_CODE_LENGTH} characters or fewer (got ${code.length}). Shorten it.`;
   }
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(code)) {
-    return 'Code must be lowercase alphanumeric + hyphens, starting with a letter or digit';
+  if (!/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(code)) {
+    return 'Code must be lowercase alphanumeric + hyphens + dots, starting and ending with a letter or digit';
   }
   if (code.startsWith('lazy-')) {
     return "Codes starting with 'lazy-' are reserved for system entities";
@@ -317,6 +317,13 @@ export interface FlagDefinition {
   aliases?: string[];
   /** Whether this flag takes a value (false = boolean flag) */
   takesValue: boolean;
+  /**
+   * When true, the flag's value is optional. If the next argument looks like
+   * another flag (starts with '-') or is absent, the flag is set to `true`
+   * (bare usage). Otherwise the next argument is consumed as its value.
+   * Only meaningful when `takesValue` is true.
+   */
+  optionalValue?: boolean;
 }
 
 /**
@@ -375,13 +382,26 @@ export function parseFlags(
       }
 
       if (def.takesValue) {
-        // Flag requires a value
-        if (i + 1 >= args.length) {
-          console.error(`${arg} requires a value`);
-          process.exit(1);
+        if (def.optionalValue) {
+          // Optional value: consume next arg only if it doesn't look like a flag
+          const next = args[i + 1];
+          if (next && !next.startsWith('-')) {
+            flags.set(def.name, next);
+            i += 2;
+          } else {
+            // Bare usage — set to true (present without value)
+            flags.set(def.name, true);
+            i += 1;
+          }
+        } else {
+          // Flag requires a value
+          if (i + 1 >= args.length) {
+            console.error(`${arg} requires a value`);
+            process.exit(1);
+          }
+          flags.set(def.name, args[i + 1]);
+          i += 2;
         }
-        flags.set(def.name, args[i + 1]);
-        i += 2;
       } else {
         // Boolean flag
         flags.set(def.name, true);

@@ -2,18 +2,19 @@ import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolv
 import { openEditor, removeRecoveryFile, isTTY } from '../editor';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
+import { runGit } from '../../utils/git';
 
 /**
  * Find the merge commit SHA for an accepted task on the target branch.
  * Searches for commits matching "Accept task <shortId>" pattern.
  */
 function findMergeCommit(taskShortId: string, targetBranch: string, root: string): string | null {
-  const result = Bun.spawnSync(
-    ['git', 'log', targetBranch, '--grep', `Accept task ${taskShortId}`, '--format=%H', '-1'],
+  const result = runGit(
+    ['log', targetBranch, '--grep', `Accept task ${taskShortId}`, '--format=%H', '-1'],
     { cwd: root },
   );
   if (result.exitCode !== 0) return null;
-  const sha = result.stdout.toString().trim();
+  const sha = result.stdout;
   return sha || null;
 }
 

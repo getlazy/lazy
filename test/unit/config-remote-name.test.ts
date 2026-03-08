@@ -312,21 +312,21 @@ describe('configurable git_remote', () => {
     // INVARIANT: When git_remote is non-default, the config template
     // should include it as an uncommented setting so it's persisted.
     test('template comments out git_remote when it is origin (default)', () => {
-      const template = getDefaultConfigTemplate('in-repo', undefined, 'node', 'origin');
+      const template = getDefaultConfigTemplate('external', undefined, 'node', 'origin');
       expect(template).toContain('# git_remote = "origin"');
       // Should NOT have an uncommented git_remote line
       expect(template).not.toMatch(/^git_remote = /m);
     });
 
     test('template uncomments git_remote when it is not origin', () => {
-      const template = getDefaultConfigTemplate('in-repo', undefined, 'node', 'upstream');
+      const template = getDefaultConfigTemplate('external', undefined, 'node', 'upstream');
       expect(template).toContain('git_remote = "upstream"');
       // Should NOT have the commented-out default
       expect(template).not.toContain('# git_remote = "origin"');
     });
 
     test('template defaults to commented origin when gitRemote is omitted', () => {
-      const template = getDefaultConfigTemplate('in-repo', undefined, 'node');
+      const template = getDefaultConfigTemplate('external', undefined, 'node');
       expect(template).toContain('# git_remote = "origin"');
     });
   });

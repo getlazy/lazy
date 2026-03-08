@@ -20,7 +20,8 @@ import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
 import { getDataDir } from '../cli/init';
-import { taskRef, getWorktreePathForRef } from '../cli/helpers';
+import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
+import { getCurrentBranch, hasUncommittedChanges } from '../git/operations';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -195,14 +196,49 @@ export async function autoResumeTask(
     const protoDir = getProtocolDir(task.id);
     ensureProtocolDir(protoDir);
 
+    // INVARIANT: Every unblock merges upstream before giving feedback.
+    // Resolve the parent branch the same way the normal unblock path does
+    // (shared.ts lines 1078-1083) so the supervisor merges upstream before
+    // the agent resumes. Without this, auto-resumed tasks drift behind main.
+    //
+    // However, merging upstream is unsafe when the worktree has uncommitted
+    // changes from a crashed turn — git merge on a dirty worktree will fail
+    // or create confusing state. In that case, skip the merge and let the
+    // agent deal with the uncommitted changes first.
+    const worktreeDirty = hasUncommittedChanges(worktreePath);
+    let parentBranch: string | undefined;
+    let syncBeforeWork = false;
+
+    if (worktreeDirty) {
+      logger.debug(`Auto-resume ${taskShortId}: worktree is dirty, skipping upstream merge`);
+    } else {
+      try {
+        if (task.parent_task_id) {
+          parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
+        } else {
+          parentBranch = task.metadata?.remote_target_branch ?? getCurrentBranch(lazyRoot);
+        }
+        syncBeforeWork = true;
+      } catch (err) {
+        logger.debug(`Auto-resume ${taskShortId}: could not resolve parent branch: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Inject crash-state context so the agent knows what happened
+    const crashContext = worktreeDirty
+      ? 'You are being resumed after a crash. There are uncommitted changes in your worktree from your interrupted turn. Review them, decide what to keep, commit or discard, then continue your work.\n\n'
+      : 'You are being resumed after a crash. Upstream has been merged into your branch since your last turn. Don\'t assume your previous state is intact — verify before continuing.\n\n';
+
     const unblockCommand: UnblockCommand = {
       type: 'unblock',
       task_id: task.id,
       goal: task.goal,
-      prompt: fullPrompt,
+      prompt: crashContext + fullPrompt,
       agent_id: task.agent_id,
       model_id: modelId,
       agent_session_id: claudeSessionId ?? undefined,
+      parent_branch: parentBranch,
+      sync_before_work: syncBeforeWork,
       turn_started_at: new Date().toISOString(),
       // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
       ...(config.agent.watchdog_output_timeout_ms !== 0 && {

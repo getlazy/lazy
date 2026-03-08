@@ -27,8 +27,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       path: '/tmp/test/.lazy',
     },
     storage: {
-      backend: 'in-repo',
-      orphan_branch_name: 'lazy-data',
+      backend: 'external',
       external_path: '',
       postgres_ssl: false,
     },

@@ -6,6 +6,7 @@ import { checkOrphanedChild } from '../orphan';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
+import { runGit } from '../../utils/git';
 
 export async function commandStatus(args: string[]): Promise<void> {
   // Parse and validate flags (no flags supported, but validate against unknown flags)
@@ -85,7 +86,7 @@ export async function commandStatus(args: string[]): Promise<void> {
     console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
 
     if (hasUncommitted) {
-      const gitStatus = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout.toString();
+      const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
       const files = gitStatus.trim().split('\n').filter(l => l.trim());
       console.log(`  Modified files: ${files.length}`);
       for (const line of files.slice(0, 10)) {

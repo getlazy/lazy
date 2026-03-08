@@ -10,9 +10,11 @@ import { createStorage } from '../storage';
 import { findLazyRoot } from '../cli/init';
 import { getCommitDiff } from '../git/operations';
 import { logger } from '../utils/logger';
+import { getLazyCommand } from '../utils/cli-path';
 import { reconcileTasks } from '../utils/reconcile';
 import { loadConfig } from '../config/loader';
 import { createDriver } from '../remote';
+import { spawn } from '../utils/spawn';
 import {
   taskListHtml,
   taskDetailHtml,
@@ -647,22 +649,6 @@ function matchRoute(path: string, pattern: string): Record<string, string> | nul
 
 const MAX_PORT_ATTEMPTS = 100;
 
-/**
- * Determine the command to invoke the lazy CLI.
- *
- * When running via `bun run script.ts`, process.argv is [bun, script.ts, ...].
- * When running as a compiled binary, process.argv is [/path/to/lazy, ...].
- * Returns the base command array (without subcommand arguments).
- */
-function getLazyCommand(): string[] {
-  if (
-    process.argv.length >= 2 &&
-    (process.argv[1].endsWith('.ts') || process.argv[1].endsWith('.js'))
-  ) {
-    return [process.execPath, process.argv[1]];
-  }
-  return [process.execPath];
-}
 
 /**
  * Start a background sync loop that spawns `lazy sync` as a subprocess.
@@ -706,7 +692,7 @@ function startSyncLoop(
     syncing = true;
     try {
       const cmd = getLazyCommand();
-      const proc = Bun.spawn([...cmd, 'sync'], {
+      const proc = spawn([...cmd, 'sync'], {
         cwd: root,
         stdout: 'pipe',
         stderr: 'pipe',

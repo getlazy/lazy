@@ -27,6 +27,8 @@ import type { ResolvedConfig } from '../../config/types';
 import type { RepositoryDriver } from '../../remote';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../../shell/detect';
 import type { ShellInfo } from '../../shell/detect';
+import { spawnSync } from '../../utils/spawn';
+import { runGit } from '../../utils/git';
 
 // ── types ────────────────────────────────────────────────────────────────
 
@@ -47,13 +49,12 @@ const MIN_FREE_BYTES = 1_000_000_000;
 
 function checkGit(): CheckResult {
   try {
-    const result = Bun.spawnSync(['git', '--version'], {
-      stdout: 'pipe',
+    const result = runGit(['--version'], {
       stderr: 'ignore',
       timeout: 5_000,
     });
     if (result.exitCode === 0) {
-      const version = result.stdout.toString().trim().replace('git version ', '');
+      const version = result.stdout.replace('git version ', '');
       return { ok: true, label: `Git installed (v${version})` };
     }
   } catch { /* fall through */ }
@@ -189,15 +190,8 @@ function checkDataDir(root: string): CheckResult {
       displayPath = externalPath;
       break;
     }
-    case 'orphan-branch':
-      tasksDir = join(dataPath, '.state-worktree', 'tasks');
-      displayPath = `${dataDir}/.state-worktree`;
-      break;
-    case 'in-repo':
     default:
-      tasksDir = join(dataPath, 'tasks');
-      displayPath = `${dataDir}/`;
-      break;
+      throw new Error(`Unknown storage backend: "${config.storage.backend}". Valid backends are "external" and "postgres".`);
   }
 
   if (!existsSync(tasksDir)) {
@@ -209,7 +203,7 @@ function checkDataDir(root: string): CheckResult {
 
 function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'image', 'inspect', imageName, '--format', '{{.Id}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -241,7 +235,7 @@ function checkImageUpToDate(root: string, imageName: string, binary: string = 'd
   }
 
   try {
-    const inspect = Bun.spawnSync(
+    const inspect = spawnSync(
       [binary, 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -424,7 +418,7 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
 async function checkOrphanedContainers(root: string | null, binary: string = 'docker'): Promise<CheckResult> {
   try {
-    const result = Bun.spawnSync(
+    const result = spawnSync(
       [binary, 'ps', '-a', '--filter', 'name=^lazy-', '--format', '{{.Names}} {{.Status}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -680,11 +674,8 @@ async function checkRemoteDriver(config: ResolvedConfig): Promise<{ driver: Repo
 
 function checkSplitStorage(root: string): CheckResult {
   const config = loadConfig(root);
-  if (config.storage.backend === 'in-repo') {
-    return { ok: true, label: 'No split storage' };
-  }
 
-  // External or orphan-branch storage: check if .lazy/tasks/ also has task data
+  // External storage: check if .lazy/tasks/ also has stale task data
   const dataDir = getDataDir(root);
   const inRepoTasksDir = join(root, dataDir, 'tasks');
   if (!existsSync(inRepoTasksDir)) {
@@ -881,7 +872,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
         const code = c.taskCode;
         console.log(`  Resuming ${theme.taskId(code)}...`);
         try {
-          const proc = Bun.spawnSync(
+          const proc = spawnSync(
             [process.argv[0], process.argv[1], 'resume', code],
             {
               stdout: 'pipe',

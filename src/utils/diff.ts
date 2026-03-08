@@ -1,5 +1,6 @@
 import { createPatch } from 'diff';
 import type { Turn, Comment } from '../types';
+import { runGit } from './git';
 
 const COMMENT_PREFIX = '#';
 
@@ -230,16 +231,16 @@ export function getTurnDiff(
   // upstream changes merged into the task branch. Specific SHA-to-SHA cases
   // use two-dot because those are concrete commits on the same branch.
   const diffRange = isFallback ? `${fromSha}...${toSha}` : `${fromSha}..${toSha}`;
-  const result = Bun.spawnSync(
-    ['git', 'diff', '--no-color', diffRange, '--', '.', ':!.lazy*'],
-    { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
+  const result = runGit(
+    ['diff', '--no-color', diffRange, '--', '.', ':!.lazy*'],
+    { cwd: worktreePath },
   );
 
   if (result.exitCode !== 0) {
     return null;
   }
 
-  const fullDiff = result.stdout.toString();
+  const fullDiff = result.stdout;
   if (!fullDiff.trim()) {
     return { diff: '', filesChanged: 0, isFallback };
   }

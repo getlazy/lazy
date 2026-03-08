@@ -1,4 +1,5 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines } from '../helpers';
+import { requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines } from '../helpers';
+import { queryTaskShow, type ShowResult } from '../../daemon/rpc-fallback';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { theme } from '../theme';
 import { readPendingProposals, type Proposal } from './propose';
@@ -391,174 +392,50 @@ export async function commandShow(args: string[]): Promise<void> {
 
   const showFull = parsed.flags.get('full') === true;
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
+  // Try to resolve as a task (daemon → direct fallback)
+  const showResult = await queryTaskShow(taskId);
 
-  try {
-    // Try to resolve as a task first
-    const result = await storage.resolveTask(taskId);
+  if (showResult && !showResult.ambiguous) {
+    const data = showResult.data;
 
-    if (result.task) {
-      const task = result.task;
-      const data = await loadTaskShowData(storage, task, root);
-
-      // JSON output mode
-      if (jsonOutput) {
-        const { session: sess, turns, commits, comments, children, proposals, retryStatus } = data;
-
-        const jsonData: Record<string, unknown> = {
-          id: task.id,
-          code: task.code,
-          goal: task.goal,
-          status: task.status,
-          type: task.type ?? 'task',
-          model: task.model,
-          agent_id: task.agent_id,
-          prompt: task.prompt || null,
-          created_at: task.created_at,
-          completed_at: task.completed_at,
-          close_reason: task.close_reason,
-          parent_task_id: task.parent_task_id,
-          branched_from_sha: task.branched_from_sha,
-          metadata: task.metadata,
-          session: sess ? {
-            id: sess.id,
-            agent_id: sess.agent_id,
-            status: sess.outcome ?? (sess.ended_at ? 'ended' : task.status),
-            git_branch: sess.git_branch,
-            git_start_sha: sess.git_start_sha,
-            started_at: sess.started_at,
-            ended_at: sess.ended_at,
-            last_interaction_at: sess.last_interaction_at,
-            total_duration_ms: sess.total_duration_ms,
-            total_usage: sess.total_usage,
-            consecutive_interruptions: sess.consecutive_interruptions,
-            auto_resumed: sess.auto_resumed,
-          } : null,
-          turns: turns.map(t => ({
-            sequence: t.sequence,
-            role: t.role,
-            content: t.content,
-            timestamp: t.timestamp,
-            usage: t.usage,
-            model: t.model ?? null,
-          })),
-          commits: commits.map(c => ({
-            sha: c.sha,
-            message: c.message,
-            status: c.status,
-            timestamp: c.timestamp,
-          })),
-          comments: comments.map(c => ({
-            content: c.content,
-            created_at: c.created_at,
-          })),
-          children: children.map(c => ({
-            id: c.id,
-            code: c.code,
-            goal: c.goal,
-            status: c.status,
-          })),
-          proposals: proposals.map(p => ({
-            goal: p.goal,
-            code: p.code || null,
-            prompt: p.prompt || null,
-            status: p.status,
-            created_at: p.created_at,
-          })),
-        };
-
-        if (retryStatus) {
-          jsonData.retry_status = retryStatus;
-        }
-
-        console.log(JSON.stringify(jsonData));
-        return;
-      }
-
-      // Build and display text output
-      const outputLines = buildTaskShowLines(data, showFull);
-
-      // Join output and apply line slicing if specified
-      let output = outputLines.join('\n');
-      if (lineRange) {
-        output = sliceLines(output, lineRange);
-      }
-      console.log(output);
-
+    if (jsonOutput) {
+      const jsonData = buildShowJson(data);
+      console.log(JSON.stringify(jsonData));
       return;
     }
 
-    if (result.ambiguousMatches && result.ambiguousMatches.length > 0) {
-      // Build formatted options for each task
-      const options: string[] = [];
-      for (const t of result.ambiguousMatches) {
-        // Get the most recent session for this task to determine last interaction
-        const session = await storage.getSessionByTaskId(t.id);
-        const timestamp = session?.last_interaction_at ?? t.created_at;
-        const formattedDate = formatDate(timestamp);
+    const outputLines = buildTaskShowLines(data, showFull);
+    let output = outputLines.join('\n');
+    if (lineRange) {
+      output = sliceLines(output, lineRange);
+    }
+    console.log(output);
+    return;
+  }
 
-        // Pad status to align columns nicely (longest status is "interrupted" = 11 chars)
-        const paddedStatus = t.status.padEnd(12);
+  if (showResult?.ambiguous) {
+    // Build formatted options for each task
+    const options: string[] = [];
+    for (const t of showResult.matches) {
+      const paddedStatus = t.status.padEnd(12);
+      options.push(`${shortId(t.id)}  ${paddedStatus}  ${t.goal}`);
+    }
 
-        options.push(`${shortId(t.id)}  ${paddedStatus}  ${formattedDate}  ${t.goal}`);
-      }
+    // In TTY mode, offer interactive choice
+    if (isTTY()) {
+      const choice = await promptChoice(`Multiple tasks match code '${taskId}'. Choose one:`, options);
+      const selectedMatch = showResult.matches[choice];
 
-      // In TTY mode, offer interactive choice
-      if (isTTY()) {
-        const choice = await promptChoice(`Multiple tasks match code '${taskId}'. Choose one:`, options);
-        const selectedTask = result.ambiguousMatches[choice];
-
-        // Continue with the selected task by loading its data and displaying it
-        const data = await loadTaskShowData(storage, selectedTask);
-
+      // Re-query with the full ID to get the task data
+      const resolved = await queryTaskShow(selectedMatch.id);
+      if (resolved && !resolved.ambiguous) {
         if (jsonOutput) {
-          const jsonData: any = {
-            type: 'task',
-            id: selectedTask.id,
-            code: selectedTask.code,
-            goal: selectedTask.goal,
-            prompt: selectedTask.prompt,
-            status: selectedTask.status,
-            model: selectedTask.model,
-            created_at: selectedTask.created_at,
-            parent_task_id: selectedTask.parent_task_id,
-            session: data.session ? {
-              outcome: data.session.outcome,
-              git_branch: data.session.git_branch,
-              turn_count: data.turns.length,
-              commit_count: data.commits.length,
-              started_at: data.session.started_at,
-              turns: data.turns.map(t => ({
-                sequence: t.sequence,
-                role: t.role,
-                content: t.content,
-                timestamp: t.timestamp,
-              })),
-              commits: data.commits.map(c => ({
-                sha: c.sha,
-                message: c.message,
-                status: c.status,
-              })),
-            } : null,
-            comments: data.comments.map(c => ({
-              content: c.content,
-              created_at: c.created_at,
-            })),
-          };
-
-          if (data.retryStatus) {
-            jsonData.retry_status = data.retryStatus;
-          }
-
+          const jsonData = buildShowJson(resolved.data);
           console.log(JSON.stringify(jsonData));
           return;
         }
 
-        // Build and display text output
-        const outputLines = buildTaskShowLines(data, showFull);
-
-        // Join output and apply line slicing if specified
+        const outputLines = buildTaskShowLines(resolved.data, showFull);
         let output = outputLines.join('\n');
         if (lineRange) {
           output = sliceLines(output, lineRange);
@@ -566,16 +443,19 @@ export async function commandShow(args: string[]): Promise<void> {
         console.log(output);
         return;
       }
-
-      // In non-TTY mode, print error and exit
-      console.error(`Multiple tasks match code '${taskId}'. Use the ID to disambiguate:`);
-      for (const option of options) {
-        console.error(`  ${option}`);
-      }
-      process.exit(1);
     }
 
-    // Not a task — try conversation session ID
+    // In non-TTY mode, print error and exit
+    console.error(`Multiple tasks match code '${taskId}'. Use the ID to disambiguate:`);
+    for (const option of options) {
+      console.error(`  ${option}`);
+    }
+    process.exit(1);
+  }
+
+  // Not a task — try conversation session ID, then file path
+  const storage = await requireStorage();
+  try {
     const conversations = await storage.listConversations();
     const convMatch = conversations.find(
       c => c.sessionId === taskId || c.sessionId.startsWith(taskId)
@@ -608,42 +488,113 @@ export async function commandShow(args: string[]): Promise<void> {
       await showConversationTranscript(storage, taskId, lineRange);
       return;
     }
-
-    // Try as a file path
-    if (existsSync(taskId)) {
-      await storage.close();
-
-      // JSON output for files
-      if (jsonOutput) {
-        const content = readFileSync(taskId, 'utf-8');
-        console.log(JSON.stringify({
-          type: 'file',
-          path: taskId,
-          content,
-          size: content.length,
-          lines: content.split('\n').length,
-        }));
-        return;
-      }
-
-      // Line range output for files
-      if (lineRange) {
-        const content = readFileSync(taskId, 'utf-8');
-        const output = sliceLines(content, lineRange);
-        console.log(output);
-        return;
-      }
-
-      // Launch full-screen TUI viewer
-      await showFileViewer(taskId);
-      return;
-    }
-
-    console.error(`No task, conversation, or file found matching '${taskId}'`);
-    process.exit(1);
   } finally {
     await storage.close();
   }
+
+  // Try as a file path
+  if (existsSync(taskId)) {
+    // JSON output for files
+    if (jsonOutput) {
+      const content = readFileSync(taskId, 'utf-8');
+      console.log(JSON.stringify({
+        type: 'file',
+        path: taskId,
+        content,
+        size: content.length,
+        lines: content.split('\n').length,
+      }));
+      return;
+    }
+
+    // Line range output for files
+    if (lineRange) {
+      const content = readFileSync(taskId, 'utf-8');
+      const output = sliceLines(content, lineRange);
+      console.log(output);
+      return;
+    }
+
+    // Launch full-screen TUI viewer
+    await showFileViewer(taskId);
+    return;
+  }
+
+  console.error(`No task, conversation, or file found matching '${taskId}'`);
+  process.exit(1);
+}
+
+/** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
+function buildShowJson(data: TaskShowData): Record<string, unknown> {
+  const { task, session: sess, turns, commits, comments, children, proposals, retryStatus } = data;
+
+  const jsonData: Record<string, unknown> = {
+    id: task.id,
+    code: task.code,
+    goal: task.goal,
+    status: task.status,
+    type: task.type ?? 'task',
+    model: task.model,
+    agent_id: task.agent_id,
+    prompt: task.prompt || null,
+    created_at: task.created_at,
+    completed_at: task.completed_at,
+    close_reason: task.close_reason,
+    parent_task_id: task.parent_task_id,
+    branched_from_sha: task.branched_from_sha,
+    metadata: task.metadata,
+    session: sess ? {
+      id: sess.id,
+      agent_id: sess.agent_id,
+      status: sess.outcome ?? (sess.ended_at ? 'ended' : task.status),
+      git_branch: sess.git_branch,
+      git_start_sha: sess.git_start_sha,
+      started_at: sess.started_at,
+      ended_at: sess.ended_at,
+      last_interaction_at: sess.last_interaction_at,
+      total_duration_ms: sess.total_duration_ms,
+      total_usage: sess.total_usage,
+      consecutive_interruptions: sess.consecutive_interruptions,
+      auto_resumed: sess.auto_resumed,
+    } : null,
+    turns: turns.map(t => ({
+      sequence: t.sequence,
+      role: t.role,
+      content: t.content,
+      timestamp: t.timestamp,
+      usage: t.usage,
+      model: t.model ?? null,
+    })),
+    commits: commits.map(c => ({
+      sha: c.sha,
+      message: c.message,
+      status: c.status,
+      timestamp: c.timestamp,
+    })),
+    comments: comments.map(c => ({
+      content: c.content,
+      created_at: c.created_at,
+    })),
+    children: children.map(c => ({
+      id: c.id,
+      code: c.code,
+      goal: c.goal,
+      status: c.status,
+    })),
+    proposals: proposals.map(p => ({
+      goal: p.goal,
+      code: p.code || null,
+      prompt: p.prompt || null,
+      status: p.status,
+      created_at: p.created_at,
+    })),
+  };
+
+  if (retryStatus) {
+    jsonData.retry_status = retryStatus;
+  }
+
+  return jsonData;
 }
 
 export function showUsage(): void {

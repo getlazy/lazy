@@ -6,7 +6,7 @@
 
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getDiffStat, getMergeBase } from '../../git/operations';
+import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getDiffStat } from '../../git/operations';
 import { getModelId } from '../../capture/claude';
 import { createRunner } from '../../runner';
 import { hasResponse, readCommand, protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
@@ -35,6 +35,8 @@ import lazyToolInstructions from '../../prompts/tool-instructions.md' with { typ
 import systemInstructionsText from '../../prompts/system-instructions.md' with { type: 'text' };
 import mergeInstructionsTemplate from '../../prompts/merge-instructions.md' with { type: 'text' };
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
+import { spawnSync } from '../../utils/spawn';
+import { runGit } from '../../utils/git';
 
 const PROGRESS_POLL_MS = 1000;
 
@@ -151,103 +153,6 @@ comments. Treat them as review feedback to consider alongside your task goal.
 }
 
 /**
- * Build upstream merge context for the merge-conflict-resolution prompt.
- *
- * Runs on the host side where storage is available, so we can look up task
- * goals for lazy branch commits. The result is passed through command.json
- * to the supervisor, which appends it to the merge prompt when conflicts occur.
- *
- * Includes:
- * - Commit log since merge-base (with task goals for lazy branch merges)
- * - File-level diff stat
- *
- * Best-effort: returns empty string if git operations fail.
- */
-export async function buildUpstreamMergeContext(
-  parentBranch: string,
-  worktreePath: string,
-  storage: Storage | null,
-): Promise<string> {
-  try {
-    const mergeBase = getMergeBase('HEAD', parentBranch, worktreePath);
-
-    // Get commit log: short hash + subject
-    const logResult = Bun.spawnSync(
-      ['git', 'log', '--no-color', '--format=%h %s', `${mergeBase}..${parentBranch}`],
-      { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
-    );
-    const commitLog = logResult.exitCode === 0 ? logResult.stdout.toString().trim() : '';
-    if (!commitLog) return '';
-
-    // Enrich commit log with task goals for lazy branch merges
-    const enrichedLog = await enrichCommitLogWithTaskGoals(commitLog, storage);
-
-    // Get file-level diff stat (two-dot: actual changes from merge-base to parent)
-    const diffStatResult = Bun.spawnSync(
-      ['git', 'diff', '--no-color', '--stat', `${mergeBase}..${parentBranch}`],
-      { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' },
-    );
-    const diffStat = diffStatResult.exitCode === 0 ? diffStatResult.stdout.toString().trim() : '';
-
-    const lines: string[] = [
-      '',
-      '## Upstream changes being merged',
-      '',
-      `The following changes landed on ${parentBranch} since your branch diverged:`,
-      '',
-      '### Commits',
-      '```',
-      enrichedLog,
-      '```',
-    ];
-
-    if (diffStat) {
-      lines.push('', '### Files changed', '```', diffStat, '```');
-    }
-
-    lines.push('', 'Use this context to understand the intent of upstream changes when resolving conflicts.');
-
-    return lines.join('\n');
-  } catch {
-    // Best-effort: don't fail the merge if context building fails
-    return '';
-  }
-}
-
-/**
- * Enrich a commit log by looking up task goals for lazy branch merge commits.
- *
- * Parses commit subjects for patterns like "Merge lazy/XXXXXXXX" and looks up
- * the task goal from storage. Appends " (goal: ...)" to matching lines.
- */
-async function enrichCommitLogWithTaskGoals(commitLog: string, storage: Storage | null): Promise<string> {
-  if (!storage) return commitLog;
-
-  const lines = commitLog.split('\n');
-  const enriched: string[] = [];
-
-  for (const line of lines) {
-    // Match merge commits from lazy branches: "abc1234 Merge lazy/XXXXXXXX..."
-    const match = line.match(/lazy\/([0-9a-f]{8})/i);
-    if (match) {
-      const taskPrefix = match[1];
-      try {
-        const result = await storage.resolveTask(taskPrefix);
-        if (result.task) {
-          enriched.push(`${line}\n    Goal: ${result.task.goal}`);
-          continue;
-        }
-      } catch {
-        // Best-effort: skip if storage lookup fails
-      }
-    }
-    enriched.push(line);
-  }
-
-  return enriched.join('\n');
-}
-
-/**
  * Build the static system prompt for task agents.
  * This content is stable across turns and benefits from prompt caching.
  */
@@ -291,8 +196,8 @@ export function cleanupWorktree(worktreePath: string, root: string): void {
       // Worktree may be corrupted (e.g. .git is a dir instead of file).
       // Fall back to manual removal + prune.
       console.log('Worktree remove failed, cleaning up manually...');
-      Bun.spawnSync(['rm', '-rf', worktreePath]);
-      Bun.spawnSync(['git', 'worktree', 'prune'], { cwd: root });
+      spawnSync(['rm', '-rf', worktreePath]);
+      runGit(['worktree', 'prune'], { cwd: root });
     }
   }
 }
@@ -334,16 +239,14 @@ export async function cleanupTaskContainer(
  * Returns 0 if the git command fails (e.g. worktree is gone).
  */
 function getDirtyFileCount(worktreePath: string): number {
-  const result = Bun.spawnSync(['git', 'status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
+  const result = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
     cwd: worktreePath,
-    stdout: 'pipe',
     stderr: 'ignore',
     timeout: 5000,
   });
   if (result.exitCode !== 0) return 0;
-  const output = result.stdout.toString().trim();
-  if (!output) return 0;
-  return output.split('\n').length;
+  if (!result.stdout) return 0;
+  return result.stdout.split('\n').length;
 }
 
 /**
@@ -614,6 +517,8 @@ export async function syncTaskFromRemote(
               }
             }
           } catch (err) {
+            console.log(theme.warning(`⚠ Warning: Could not push to origin — local and remote branches have diverged.`));
+            console.log(`  The remote branch will be merged on next sync-with-upstream.`);
             logger.debug(`Failed to create remote ref during pre-review sync (non-fatal): ${err instanceof Error ? err.message : err}`);
           }
         }
@@ -1007,7 +912,9 @@ export async function runFeedbackFlow(
  *   5. post-sync (host) — push results
  *
  * Network failures are non-fatal: warns and continues with stale data.
- * Skipped when the task has no remote ref (no PR) or driver is local.
+ * Branch fetching runs for all non-local drivers (the branch may exist on the
+ * remote even without an MR/PR). PR comment fetching is skipped when the task
+ * has no remote ref (no MR/PR). Skipped entirely when driver is local.
  *
  * Returns the remote branch ref for the supervisor to merge (if ahead),
  * and the PR comments context for prompt injection.
@@ -1035,19 +942,16 @@ export async function runSyncWithRemote(
   try {
     const driver = createDriver(config);
 
-    // Skip if task has no remote ref (no PR)
-    if (!driver.hasRemoteRef(task)) {
-      return {};
-    }
-
     // Phase 1: Fetch remote branch (updates <remote>/<branch> ref, no merge)
+    // Always fetch regardless of MR/PR existence — the branch may have been
+    // pushed to the remote without creating an MR/PR yet.
     try {
       const hasNewCommits = await driver.fetchBranch(sess.git_branch, worktreePath);
       if (hasNewCommits) {
         // Tell the supervisor to merge <remote>/<branch> in its sync-with-remote phase
         const gitRemote = config.remote.git_remote;
         remoteBranch = `${gitRemote}/${sess.git_branch}`;
-        logger.info(`sync-with-remote: fetched remote branch, ${gitRemote}/${sess.git_branch} is ahead`);
+        console.log(theme.warning(`⚠ Remote branch is ahead — supervisor will merge before agent resumes.`));
       } else {
         logger.debug('sync-with-remote: remote branch is up-to-date');
       }
@@ -1056,22 +960,24 @@ export async function runSyncWithRemote(
       logger.warn(`sync-with-remote: failed to fetch remote branch (non-fatal): ${err instanceof Error ? err.message : err}`);
     }
 
-    // Phase 2: Fetch PR comments
-    try {
-      const turns = await storage.getSessionTurns(sess.id);
-      const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
-      const sinceTimestamp = new Date(lastAgentTurn?.timestamp ?? task.created_at).toISOString();
-      const remoteComments = await driver.syncComments(task, sinceTimestamp);
-      if (remoteComments.length > 0) {
-        logger.info(`sync-with-remote: ${remoteComments.length} new PR comment(s)`);
-        for (const c of remoteComments) {
-          logger.debug(`PR comment [${c.author}] at ${c.createdAt}: ${c.body.substring(0, 100)}${c.body.length > 100 ? '...' : ''}`);
+    // Phase 2: Fetch PR comments (only when MR/PR exists)
+    if (driver.hasRemoteRef(task)) {
+      try {
+        const turns = await storage.getSessionTurns(sess.id);
+        const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+        const sinceTimestamp = new Date(lastAgentTurn?.timestamp ?? task.created_at).toISOString();
+        const remoteComments = await driver.syncComments(task, sinceTimestamp);
+        if (remoteComments.length > 0) {
+          logger.info(`sync-with-remote: ${remoteComments.length} new PR comment(s)`);
+          for (const c of remoteComments) {
+            logger.debug(`PR comment [${c.author}] at ${c.createdAt}: ${c.body.substring(0, 100)}${c.body.length > 100 ? '...' : ''}`);
+          }
+          remoteCommentsCtx = buildRemoteCommentsContext(remoteComments);
         }
-        remoteCommentsCtx = buildRemoteCommentsContext(remoteComments);
+      } catch (err) {
+        // Non-fatal: warn and continue without comments
+        logger.warn(`sync-with-remote: failed to fetch PR comments (non-fatal): ${err instanceof Error ? err.message : err}`);
       }
-    } catch (err) {
-      // Non-fatal: warn and continue without comments
-      logger.warn(`sync-with-remote: failed to fetch PR comments (non-fatal): ${err instanceof Error ? err.message : err}`);
     }
   } catch (err) {
     logger.warn(`sync-with-remote: failed (non-fatal): ${err instanceof Error ? err.message : err}`);
@@ -1287,14 +1193,6 @@ export async function launchFeedbackTurn(
     // Write the unblock command for the supervisor
     const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', config);
 
-    // Build upstream context for merge conflict resolution (best-effort).
-    // Done on host side where storage is available for task goal lookups.
-    let upstreamMergeContext: string | undefined;
-    if (parentBranch) {
-      const ctx = await buildUpstreamMergeContext(parentBranch, worktreePath, storage);
-      if (ctx) upstreamMergeContext = ctx;
-    }
-
     const unblockCommand: UnblockCommand = {
       type: 'unblock',
       task_id: task.id,
@@ -1308,7 +1206,6 @@ export async function launchFeedbackTurn(
       sync_before_work: !!upstreamChanged,
       sync_after_work: autoSyncAfterTurn,
       remote_branch: syncResult.remoteBranch,
-      upstream_merge_context: upstreamMergeContext,
       turn_started_at: new Date().toISOString(),
       // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
       ...(config.agent.watchdog_output_timeout_ms !== 0 && {

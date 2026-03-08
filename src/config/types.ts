@@ -1,7 +1,7 @@
 import type { ModelName } from '../types';
 
 /** Storage backend types — duplicated here to avoid circular dependency with storage module */
-export type StorageBackendConfig = 'in-repo' | 'orphan-branch' | 'external' | 'postgres';
+export type StorageBackendConfig = 'external' | 'postgres';
 
 /** Runner types for task execution */
 export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
@@ -20,7 +20,6 @@ export interface LazyConfig {
   };
   storage?: {
     backend?: StorageBackendConfig;
-    orphan_branch_name?: string;
     external_path?: string;
     /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
     postgres_ssl?: boolean;
@@ -80,7 +79,6 @@ export interface ResolvedConfig {
   };
   storage: {
     backend: StorageBackendConfig;
-    orphan_branch_name: string;
     external_path: string;
     /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
     postgres_ssl: boolean;
