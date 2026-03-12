@@ -53,7 +53,6 @@ export interface LazyConfig {
   };
   runner?: RunnerType | {
     type?: RunnerType;
-    docker_agent_root?: boolean;
     docker_agent_no_network?: boolean;
   };
   documents?: {
@@ -62,6 +61,9 @@ export interface LazyConfig {
   features?: Record<string, boolean>;
   worktree?: {
     include?: string[];
+  };
+  permissions?: {
+    protected?: string[];
   };
 }
 
@@ -112,7 +114,6 @@ export interface ResolvedConfig {
   };
   runner: {
     type: RunnerType;
-    docker_agent_root: boolean;
     docker_agent_no_network: boolean;
   };
   documents: {
@@ -121,5 +122,8 @@ export interface ResolvedConfig {
   features: Record<string, boolean>;
   worktree: {
     include: string[];
+  };
+  permissions: {
+    protected: string[];
   };
 }

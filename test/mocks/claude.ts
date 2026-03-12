@@ -86,13 +86,29 @@ function getMockResponse(): AgentResponse {
 
 async function maybeCommit(worktreePath: string, label: string): Promise<void> {
   if (process.env.LAZY_MOCK_SHOULD_COMMIT === '1') {
-    const { writeFileSync } = await import('fs');
-    const { join } = await import('path');
+    const { writeFileSync, mkdirSync } = await import('fs');
+    const { join, dirname } = await import('path');
     const timestamp = Date.now();
 
-    const filename = `agent-output-${timestamp}.txt`;
-    writeFileSync(join(worktreePath, filename), `Mock agent output (${label})\n`);
-    Bun.spawnSync(['git', 'add', filename], { cwd: worktreePath });
+    // If LAZY_MOCK_FILES is set, create those specific files instead of the default
+    const mockFiles = process.env.LAZY_MOCK_FILES;
+    if (mockFiles) {
+      const files = JSON.parse(mockFiles) as Array<{ path: string; content: string; action?: 'create' | 'modify' | 'delete' }>;
+      for (const file of files) {
+        const fullPath = join(worktreePath, file.path);
+        if (file.action === 'delete') {
+          Bun.spawnSync(['git', 'rm', file.path], { cwd: worktreePath });
+        } else {
+          mkdirSync(dirname(fullPath), { recursive: true });
+          writeFileSync(fullPath, file.content);
+          Bun.spawnSync(['git', 'add', file.path], { cwd: worktreePath });
+        }
+      }
+    } else {
+      const filename = `agent-output-${timestamp}.txt`;
+      writeFileSync(join(worktreePath, filename), `Mock agent output (${label})\n`);
+      Bun.spawnSync(['git', 'add', filename], { cwd: worktreePath });
+    }
     Bun.spawnSync(['git', 'commit', '-m', `Mock agent commit (${label})`], { cwd: worktreePath });
   }
 }
@@ -200,13 +216,40 @@ export async function launchSupervisorAsync(
   };
   writeFileSync(join(protocolDir, 'status.json'), JSON.stringify(status, null, 2));
 
+  // Detect file permission violations (same logic as real supervisor).
+  // Read protected_patterns from command.json (written by the host before launching us).
+  let violations: Array<{ file: string; base_sha: string; status: string }> | undefined;
+  try {
+    const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
+    const commandPath = join(protocolDir, 'command.json');
+    if (existsFs(commandPath)) {
+      const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
+      const patterns = cmd.protected_patterns as string[] | undefined;
+      if (patterns && patterns.length > 0 && preTurnSha !== 'unknown' && postWorkSha && preTurnSha !== postWorkSha) {
+        const { detectViolations } = await import('../../src/supervisor/permissions');
+        const detected = detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
+        if (detected.length > 0) {
+          violations = detected;
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: skip violation detection if it fails in tests
+  }
+
   // Write a mock response to the protocol directory so reconciliation picks it up
   const mockResp = getMockResponse();
-  const response = {
+  let resultText = mockResp.result;
+  if (violations && violations.length > 0) {
+    const violationList = violations.map(v => `  - ${v.file}`).join('\n');
+    resultText = `**FILE PERMISSION VIOLATIONS**\n\nThe following protected files were modified or deleted:\n${violationList}\n\n${resultText}`;
+  }
+  const response: Record<string, unknown> = {
     status: 'completed',
-    result: mockResp.result,
+    result: resultText,
     session_id: mockResp.session_id,
     usage: mockResp.usage,
+    ...(violations ? { violations } : {}),
   };
   writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));
 }

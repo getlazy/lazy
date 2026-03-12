@@ -140,7 +140,15 @@ export interface Runner {
    */
   diagnose(): HealthCheck[];
 
-  // ----- Builder support -----
+  // ----- Prompt support -----
+
+  /**
+   * Get runner-specific instructions for agent system prompts.
+   * Returns a prompt fragment describing the agent's runtime environment.
+   * Docker/Podman: tells agent it runs as root and can install packages.
+   * Host-process: empty (agent runs in user's native environment).
+   */
+  getAgentInstructions(): string;
 
   /**
    * Get runner-specific instructions for the builder system prompt.

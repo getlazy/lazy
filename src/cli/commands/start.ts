@@ -11,7 +11,7 @@ import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { openEditor, promptLine, removeRecoveryFile, promptYesNo, isTTY, readStdinIfPiped } from '../editor';
 import { followContainer, buildNotesContext, buildSystemPrompt } from './shared';
 import { checkOrphanedChild, retargetOrphanedChild } from '../orphan';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
 import type { StartCommand } from '../../protocol';
 import type { SandboxConfig } from '../../capture/claude';
 import type { ModelName, TaskType } from '../../types';
@@ -146,7 +146,6 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
-    { name: 'docker-agent-root', takesValue: false },
     { name: 'docker-agent-no-network', takesValue: false },
   ], 'start');
 
@@ -159,7 +158,6 @@ export async function commandStart(args: string[]): Promise<void> {
   const follow = parsed.flags.get('follow') === true;
   const yes = parsed.flags.get('yes') === true;
   const forceLocal = parsed.flags.get('force-local') === true;
-  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
   const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
   // Determine model override
@@ -394,7 +392,6 @@ export async function commandStart(args: string[]): Promise<void> {
 
     // --- Pre-flight checks (before creating container/worktree) ---
     const dockerOptions: Partial<DockerRunnerOptions> = {};
-    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
     if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
     const runner = createRunner(root, dockerOptions);
     try {
@@ -674,7 +671,7 @@ export async function commandStart(args: string[]): Promise<void> {
       }
 
       // Build the prompts: static system prompt and dynamic user prompt
-      const systemPrompt = buildSystemPrompt();
+      const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
       const fullPrompt = buildPromptWithInstructions(turnPrompt, t.goal, true, root, notesCtx);
 
       // --- Persist state BEFORE launching container ---
@@ -752,7 +749,11 @@ export async function commandStart(args: string[]): Promise<void> {
         }
       }
 
-      const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', config);
+      // Reload config from the worktree — the branch may have settings (e.g., permissions)
+      // that aren't on the project root's lazy.toml yet. The early loadConfig(root) above
+      // was needed for pre-worktree operations (driver, session checks).
+      const branchConfig = loadConfig(root, { cwd: worktreePath });
+      const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', branchConfig);
 
       // Write the start command for the supervisor
       const startCommand: StartCommand = {
@@ -766,11 +767,7 @@ export async function commandStart(args: string[]): Promise<void> {
         parent_branch: parentBranch ?? undefined,
         sync_before_work: false,  // start creates branch from HEAD — already fresh
         sync_after_work: autoSyncAfterTurn,
-        turn_started_at: new Date().toISOString(),
-        // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
-        ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-          watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-        }),
+        ...commonCommandFields(branchConfig),
       };
       writeCommand(protoDir, startCommand);
 
@@ -862,7 +859,6 @@ Options:
   --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompt when starting an existing task
-  --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
   --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)
 

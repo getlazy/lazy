@@ -76,6 +76,7 @@ function statusBadge(status: string): string {
   const colors: Record<string, string> = {
     working: '#2563eb',
     blocked: '#d97706',
+    conflict: '#ea580c',
     interrupted: '#9333ea',
     complete: '#16a34a',
     abandoned: '#dc2626',

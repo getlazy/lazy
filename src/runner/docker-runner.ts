@@ -34,6 +34,7 @@ import {
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
+import dockerAgentInstructions from '../prompts/docker-agent-instructions.md' with { type: 'text' };
 import { writeToolPermissions } from '../mcp/config';
 
 // Agent packaging for tool checks. Instantiated once; stateless.
@@ -42,7 +43,6 @@ const agentPackaging = new ClaudeCodePackaging();
 const DOCKER_TIMEOUT_MS = 10_000;
 
 export interface DockerRunnerOptions {
-  dockerAgentRoot?: boolean;
   dockerAgentNoNetwork?: boolean;
 }
 
@@ -255,7 +255,11 @@ export class DockerRunner implements Runner {
     return results;
   }
 
-  // ----- Builder support -----
+  // ----- Prompt support -----
+
+  getAgentInstructions(): string {
+    return dockerAgentInstructions;
+  }
 
   getBuilderInstructions(): string {
     return dockerBuilderInstructions;

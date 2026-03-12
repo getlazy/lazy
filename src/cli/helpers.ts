@@ -303,8 +303,8 @@ export function formatTokenUsage(usage: TokenUsage | null): string {
 export interface ParsedFlags {
   /** Positional arguments (non-flag args) */
   positional: string[];
-  /** Flag values: map of flag name to value (or true for boolean flags) */
-  flags: Map<string, string | boolean>;
+  /** Flag values: map of flag name to value (or true for boolean flags, or string[] for accumulate flags) */
+  flags: Map<string, string | boolean | string[]>;
 }
 
 /**
@@ -324,6 +324,12 @@ export interface FlagDefinition {
    * Only meaningful when `takesValue` is true.
    */
   optionalValue?: boolean;
+  /**
+   * When true, repeated occurrences of this flag accumulate into a string[].
+   * e.g., --approve-file a.ts --approve-file b.ts → ['a.ts', 'b.ts']
+   * Only meaningful when `takesValue` is true.
+   */
+  accumulate?: boolean;
 }
 
 /**
@@ -353,7 +359,7 @@ export function parseFlags(
   commandName: string
 ): ParsedFlags {
   const positional: string[] = [];
-  const flags = new Map<string, string | boolean>();
+  const flags = new Map<string, string | boolean | string[]>();
 
   // Build lookup maps for fast validation
   const flagMap = new Map<string, FlagDefinition>();
@@ -393,6 +399,19 @@ export function parseFlags(
             flags.set(def.name, true);
             i += 1;
           }
+        } else if (def.accumulate) {
+          // Accumulate: repeated flags build a string[]
+          if (i + 1 >= args.length) {
+            console.error(`${arg} requires a value`);
+            process.exit(1);
+          }
+          const existing = flags.get(def.name);
+          if (Array.isArray(existing)) {
+            existing.push(args[i + 1]);
+          } else {
+            flags.set(def.name, [args[i + 1]]);
+          }
+          i += 2;
         } else {
           // Flag requires a value
           if (i + 1 >= args.length) {

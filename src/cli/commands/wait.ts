@@ -1,5 +1,6 @@
 import { requireStorage, requireLazyRoot, displayId, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
 import { followContainer } from './shared';
+import { isBlockedStatus } from '../../types';
 import type { Task, TaskStatus } from '../../types';
 import type { Storage } from '../../storage';
 import { queryWait } from '../../daemon/rpc-fallback';
@@ -45,7 +46,7 @@ export async function commandWait(args: string[]): Promise<void> {
       process.exit(1);
     }
     console.log(`Task ${result.task_id.substring(0, 8)} is now ${result.status}`);
-    process.exit(result.status === 'blocked' ? 0 : 1);
+    process.exit(isBlockedStatus(result.status as TaskStatus) ? 0 : 1);
   }
 
   // --follow and multi-task modes need local storage access
@@ -103,7 +104,7 @@ async function waitSingleTask(storage: Storage, task: Task, follow: boolean): Pr
   // If task is already not working, exit immediately
   if (task.status !== 'working') {
     console.log(`Task ${displayId(task)} is already ${task.status}`);
-    process.exit(task.status === 'blocked' ? 0 : 1);
+    process.exit(isBlockedStatus(task.status) ? 0 : 1);
   }
 
   // If --follow is specified, stream container logs and wait for exit
@@ -140,7 +141,7 @@ async function waitSingleTask(storage: Storage, task: Task, follow: boolean): Pr
   console.log(`Task ${displayId(task)} is now ${lastStatus}`);
 
   // Exit with code 0 if blocked (normal completion), 1 otherwise
-  process.exit(lastStatus === 'blocked' ? 0 : 1);
+  process.exit(isBlockedStatus(lastStatus) ? 0 : 1);
 }
 
 /**
@@ -154,7 +155,7 @@ async function waitMultipleTasks(storage: Storage, tasks: Task[]): Promise<void>
     if (task.status !== 'working') {
       console.log(`Task ${displayId(task)} is already ${task.status}`);
       // If any task is already done, exit immediately with its status
-      process.exit(task.status === 'blocked' ? 0 : 1);
+      process.exit(isBlockedStatus(task.status) ? 0 : 1);
     }
     workingTasks.push(task);
   }
@@ -180,7 +181,7 @@ async function waitMultipleTasks(storage: Storage, tasks: Task[]): Promise<void>
 
       if (updatedTask.status !== 'working') {
         console.log(`Task ${displayId(updatedTask)} is now ${updatedTask.status}`);
-        process.exit(updatedTask.status === 'blocked' ? 0 : 1);
+        process.exit(isBlockedStatus(updatedTask.status) ? 0 : 1);
       }
     }
   }

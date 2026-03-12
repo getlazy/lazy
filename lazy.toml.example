@@ -59,9 +59,6 @@ port = 26024
 # Docker mode runs agents in isolated containers. Host-process mode runs agents
 # directly on the host — use **only** in VMs or other already-isolated environments.
 type = "docker"
-# Run containers as root (passes --user root to docker run).
-# Lets agents install packages at runtime (apt-get install, etc.).
-# docker_agent_root = false
 # Disable network access inside containers (passes --network none to docker run).
 # docker_agent_no_network = false
 
@@ -103,3 +100,10 @@ dockerfile = ""
 # Untracked files to copy into new task worktrees (glob patterns)
 # Example: include = [".env", ".env.local", "config/local.yml"]
 # include = []
+
+[permissions]
+# Glob patterns for files agents are NOT allowed to delete or modify.
+# They are allowed to *add* into existing files *and* matching globs.
+# Violations are detected after each agent turn and flagged for review.
+# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
+protected = ["README.md", "test/**/*.ts"]

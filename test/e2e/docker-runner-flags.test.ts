@@ -44,13 +44,12 @@ type = "docker"
     expectOutput(result, 'Runner section test');
   });
 
-  test('[runner] section with docker_agent_root and docker_agent_no_network works', async () => {
+  test('[runner] section with docker_agent_no_network works', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(configPath, existingConfig + `
 [runner]
 type = "docker"
-docker_agent_root = true
 docker_agent_no_network = true
 `);
 
@@ -58,25 +57,6 @@ docker_agent_no_network = true
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
     expectOutput(result, 'Docker flags test');
-  });
-
-  test('doctor warns when docker_agent_root is enabled', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + `
-[runner]
-type = "docker"
-docker_agent_root = true
-`);
-
-    const result = await ctx.lazy(['doctor']);
-    expectOutput(result, 'docker_agent_root enabled');
-    expectOutput(result, 'elevated privileges');
-  });
-
-  test('doctor does not warn when docker_agent_root is disabled (default)', async () => {
-    const result = await ctx.lazy(['doctor']);
-    expectOutputExcludes(result, 'docker_agent_root enabled');
   });
 
   test('doctor shows docker_agent_no_network when enabled', async () => {
@@ -99,13 +79,11 @@ docker_agent_no_network = true
     writeFileSync(configPath, existingConfig + `
 [runner]
 type = "docker"
-docker_agent_root = false
 docker_agent_no_network = false
 `);
 
     const result = await ctx.lazy(['doctor']);
     expectOutputExcludes(result, "Unknown config option 'runner.type'");
-    expectOutputExcludes(result, "Unknown config option 'runner.docker_agent_root'");
     expectOutputExcludes(result, "Unknown config option 'runner.docker_agent_no_network'");
   });
 

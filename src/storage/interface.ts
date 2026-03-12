@@ -11,6 +11,7 @@ import type {
   Session,
   Turn,
   MergeConflict,
+  FileViolation,
   Commit,
   Review,
   ReviewVerdict,
@@ -44,6 +45,7 @@ export interface CreateTurnOptions {
   startShaWork?: string;
   endShaWork?: string;
   mergeConflicts?: MergeConflict[];
+  violations?: FileViolation[];
   model?: ModelName;
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
@@ -281,6 +283,12 @@ export interface Storage {
    * Get the number of turns for a task (without loading full turn content)
    */
   getTurnCountByTaskId(taskId: string): Promise<number>;
+
+  /**
+   * Update violation statuses on a specific turn.
+   * Used when a human approves or rejects file violations during unblock.
+   */
+  updateTurnViolations(taskId: string, turnId: string, violations: FileViolation[]): Promise<void>;
 
   // --- Commits ---
 

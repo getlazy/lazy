@@ -394,7 +394,7 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
       // For interrupted tasks: report if run still exists (not yet cleaned up)
       // For working/blocked tasks: run died but reconciler hasn't caught it yet
-      if (task.status === 'interrupted' || task.status === 'working' || task.status === 'blocked' || task.status === 'merging') {
+      if (task.status === 'interrupted' || task.status === 'working' || task.status === 'blocked' || task.status === 'conflict' || task.status === 'merging') {
         crashed.push({
           taskCode: displayId(task),
           taskId: task.id,

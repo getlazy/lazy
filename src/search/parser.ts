@@ -4,13 +4,16 @@
  * Grammar (AND binds tighter than OR):
  *   query     → or_expr EOF
  *   or_expr   → and_expr (OR and_expr)*
- *   and_expr  → term (AND term)*
+ *   and_expr  → term ((AND | implicit_AND) term)*
  *   term      → NOT? atom
  *   atom      → '(' or_expr ')' | field_expr | text_match
  *   field_expr→ FIELD ':' VALUE
  *   text_match→ QUOTED_STRING | BARE_WORD
  *
  * Tokens: AND, OR, NOT, LPAREN, RPAREN, FIELD_VALUE, QUOTED_STRING, BARE_WORD
+ *
+ * Note: Consecutive terms without an explicit operator are treated as implicit AND.
+ * For example, "task manager" parses as "task AND manager".
  */
 
 // ─── AST Types ───────────────────────────────────────────
@@ -255,11 +258,18 @@ export function parseQuery(input: string): QueryNode {
     return left;
   }
 
+  function isTermStart(tok: Token): boolean {
+    return tok.type === 'WORD' || tok.type === 'QUOTED' || tok.type === 'NOT' || tok.type === 'LPAREN';
+  }
+
   function parseAnd(): QueryNode {
     let left = parseTerm();
 
-    while (peek().type === 'AND') {
-      advance();
+    while (peek().type === 'AND' || isTermStart(peek())) {
+      if (peek().type === 'AND') {
+        advance(); // consume explicit AND
+      }
+      // Otherwise, implicit AND (consecutive terms with no operator)
       const right = parseTerm();
       left = { type: 'and', left, right };
     }

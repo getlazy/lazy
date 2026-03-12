@@ -24,6 +24,7 @@ import { getStartLockPath } from '../../src/daemon/paths';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 
 describe('lazy daemon', () => {
   describe('server module (unit-level)', () => {
@@ -523,5 +524,204 @@ describe('lazy daemon', () => {
       expect(status).toBe(404);
       expect(data.error).toContain('not found');
     });
+  });
+
+  describe('multi-project routing', () => {
+    let daemon: RunningDaemon;
+    let ctxA: TestContext;
+    let ctxB: TestContext;
+    let tmpDir: string;
+    let socketPath: string;
+    let token: string;
+
+    beforeEach(async () => {
+      ctxA = await setupTestLazy();
+      ctxB = await setupTestLazy();
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-multi-'));
+      socketPath = join(tmpDir, 'multi-test.sock');
+      token = 'multi-project-token';
+      daemon = startDaemonServer({ socketPath, token });
+    });
+
+    afterEach(async () => {
+      if (daemon) {
+        try { daemon.stop(); } catch { /* may already be stopped */ }
+      }
+      await ctxA.cleanup();
+      await ctxB.cleanup();
+      await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    function rpcForProject(project: string, command: string, params: Record<string, unknown> = {}): Promise<any> {
+      return fetch(`http://localhost/rpc/${command}`, {
+        method: 'POST',
+        unix: socketPath,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-Lazy-Project': project,
+        },
+        body: JSON.stringify(params),
+      } as any).then(async (response) => ({
+        status: response.status,
+        data: await response.json(),
+      }));
+    }
+
+    // INVARIANT: The daemon routes requests to the correct project based on
+    // X-Lazy-Project header, not its own process.cwd(). Without this,
+    // whichever project spawned the daemon "captures" all subsequent requests.
+    test('returns different tasks for different projects', async () => {
+      // Create distinct tasks in each project
+      const taskIdA = await createTask(ctxA, 'Task in project Alpha');
+      const taskIdB = await createTask(ctxB, 'Task in project Beta');
+
+      // Query project A
+      const resultA = await rpcForProject(ctxA.root, 'list', { all: true });
+      expect(resultA.status).toBe(200);
+      const goalsA = resultA.data.tree.map((n: any) => n.task.goal);
+      expect(goalsA).toContain('Task in project Alpha');
+      expect(goalsA).not.toContain('Task in project Beta');
+
+      // Query project B
+      const resultB = await rpcForProject(ctxB.root, 'list', { all: true });
+      expect(resultB.status).toBe(200);
+      const goalsB = resultB.data.tree.map((n: any) => n.task.goal);
+      expect(goalsB).toContain('Task in project Beta');
+      expect(goalsB).not.toContain('Task in project Alpha');
+    });
+
+    // INVARIANT: show returns the correct task from the correct project.
+    test('show returns correct task from correct project', async () => {
+      const taskIdA = await createTask(ctxA, 'Alpha show test');
+      const taskIdB = await createTask(ctxB, 'Beta show test');
+
+      const showA = await rpcForProject(ctxA.root, 'show', { taskId: taskIdA });
+      expect(showA.status).toBe(200);
+      expect(showA.data.task.goal).toBe('Alpha show test');
+
+      const showB = await rpcForProject(ctxB.root, 'show', { taskId: taskIdB });
+      expect(showB.status).toBe(200);
+      expect(showB.data.task.goal).toBe('Beta show test');
+    });
+
+    // INVARIANT: search scopes results to the requested project.
+    test('search scopes results to the requested project', async () => {
+      await createTask(ctxA, 'Unique alpha unicorn task');
+      await createTask(ctxB, 'Unique beta dragon task');
+
+      const searchA = await rpcForProject(ctxA.root, 'search', { query: 'unicorn' });
+      expect(searchA.status).toBe(200);
+      expect(searchA.data.results.length).toBeGreaterThan(0);
+
+      const searchB = await rpcForProject(ctxB.root, 'search', { query: 'unicorn' });
+      expect(searchB.status).toBe(200);
+      expect(searchB.data.results.length).toBe(0);
+    });
+
+    // INVARIANT: A task from project A is not found in project B.
+    test('show returns 404 for task ID from wrong project', async () => {
+      const taskIdA = await createTask(ctxA, 'Alpha only task');
+
+      // Task exists in project A
+      const showA = await rpcForProject(ctxA.root, 'show', { taskId: taskIdA });
+      expect(showA.status).toBe(200);
+
+      // Same task ID does not exist in project B
+      const showB = await rpcForProject(ctxB.root, 'show', { taskId: taskIdA });
+      expect(showB.status).toBe(404);
+    });
+  });
+
+  describe('reconcile loop', () => {
+    let daemon: RunningDaemon;
+    let ctx: TestContext;
+    let tmpDir: string;
+    let socketPath: string;
+    let token: string;
+
+    beforeEach(async () => {
+      // Set LAZY_TEST so the reconcile grace period is 0 (evaluated at call time)
+      process.env.LAZY_TEST = '1';
+      ctx = await setupTestLazy();
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-reconcile-'));
+      socketPath = join(tmpDir, 'reconcile-test.sock');
+      token = 'reconcile-test-token';
+      // Use a short reconcile interval for tests
+      daemon = startDaemonServer({ socketPath, token, reconcileIntervalSeconds: 1 });
+    });
+
+    afterEach(async () => {
+      if (daemon) {
+        try { daemon.stop(); } catch { /* may already be stopped */ }
+      }
+      await ctx.cleanup();
+      await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    async function rpc(command: string, params: Record<string, unknown> = {}): Promise<any> {
+      const response = await fetch(`http://localhost/rpc/${command}`, {
+        method: 'POST',
+        unix: socketPath,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-Lazy-Project': ctx.root,
+        },
+        body: JSON.stringify(params),
+      } as any);
+      return { status: response.status, data: await response.json() };
+    }
+
+    // INVARIANT: RPC requests register the project for background reconciliation.
+    // Without this, the daemon wouldn't know which projects to reconcile.
+    test('RPC request registers project in activeProjects', async () => {
+      expect(daemon.activeProjects.size).toBe(0);
+
+      await rpc('list');
+
+      expect(daemon.activeProjects.has(ctx.root)).toBe(true);
+    });
+
+    // INVARIANT: The daemon reconcile loop transitions working tasks with no
+    // running container to interrupted. Without this, crashed containers leave
+    // tasks stuck in 'working' forever.
+    test('reconcile loop moves working task with no container to interrupted', async () => {
+      // 1. Create a task and set it to 'working' with a session BEFORE registering
+      //    the project with the daemon, so the reconcile loop sees it on its first tick.
+      const shortTaskId = await createTask(ctx, 'Reconcile test task');
+
+      const storage = await openProjectStorage(ctx.root);
+      const allTasks = await storage.listTasks();
+      const task = allTasks.find(t => t.id.startsWith(shortTaskId));
+      expect(task).toBeDefined();
+
+      const gitResult = ctx.git('rev-parse', 'HEAD');
+      const startSha = gitResult.stdout.trim();
+
+      await storage.createSession(task!.id, 'test-agent', `lazy/fix.${shortTaskId}`, startSha);
+      await storage.updateTaskStatus(task!.id, 'working', 'system');
+      await storage.close();
+
+      // 2. Register the project via RPC. The reconcile loop will pick it up
+      //    on its next tick and see the working task with no container.
+      await rpc('list');
+      expect(daemon.activeProjects.has(ctx.root)).toBe(true);
+
+      // 3. Poll until the reconcile loop transitions the task to 'interrupted'.
+      //    With 1s interval, this typically takes 1-2 ticks.
+      //    WORKING_GRACE_PERIOD_MS is 0 in tests.
+      let finalStatus = 'working';
+      for (let i = 0; i < 8; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        const { status, data } = await rpc('show', { taskId: shortTaskId });
+        expect(status).toBe(200);
+        finalStatus = data.task.status;
+        if (finalStatus === 'interrupted') break;
+      }
+
+      // 4. Verify the task moved to 'interrupted'
+      expect(finalStatus).toBe('interrupted');
+    }, 15_000); // 15s timeout for this test
   });
 });

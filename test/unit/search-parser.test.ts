@@ -281,9 +281,93 @@ describe('parseQuery', () => {
     expect(() => parseQuery('(foo AND bar')).toThrow(QueryParseError);
   });
 
-  test('throws on unexpected token after expression', () => {
-    // Two terms without a boolean operator between them
-    expect(() => parseQuery('foo bar')).toThrow(QueryParseError);
+  test('parses implicit AND between bare words', () => {
+    const ast = parseQuery('task manager');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'text', value: 'task' });
+      expect(ast.right).toEqual({ type: 'text', value: 'manager' });
+    }
+  });
+
+  test('parses implicit AND with in:scope and text', () => {
+    const ast = parseQuery('in:turns merge conflict');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'in', scope: 'turns', value: 'merge' });
+      expect(ast.right).toEqual({ type: 'text', value: 'conflict' });
+    }
+  });
+
+  test('parses implicit AND between field expressions', () => {
+    const ast = parseQuery('goal:memory status:backlog');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'field', field: 'goal', value: 'memory' });
+      expect(ast.right).toEqual({ type: 'field', field: 'status', value: 'backlog' });
+    }
+  });
+
+  test('implicit AND binds tighter than explicit OR', () => {
+    const ast = parseQuery('fix bug OR add feature');
+    // Should parse as: (fix AND bug) OR (add AND feature)
+    expect(ast.type).toBe('or');
+    if (ast.type === 'or') {
+      expect(ast.left.type).toBe('and');
+      expect(ast.right.type).toBe('and');
+      if (ast.left.type === 'and') {
+        expect(ast.left.left).toEqual({ type: 'text', value: 'fix' });
+        expect(ast.left.right).toEqual({ type: 'text', value: 'bug' });
+      }
+      if (ast.right.type === 'and') {
+        expect(ast.right.left).toEqual({ type: 'text', value: 'add' });
+        expect(ast.right.right).toEqual({ type: 'text', value: 'feature' });
+      }
+    }
+  });
+
+  test('parses implicit AND with three terms', () => {
+    const ast = parseQuery('foo bar baz');
+    // Should parse as: (foo AND bar) AND baz (left-associative)
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left.type).toBe('and');
+      expect(ast.right).toEqual({ type: 'text', value: 'baz' });
+      if (ast.left.type === 'and') {
+        expect(ast.left.left).toEqual({ type: 'text', value: 'foo' });
+        expect(ast.left.right).toEqual({ type: 'text', value: 'bar' });
+      }
+    }
+  });
+
+  test('parses implicit AND with quoted strings', () => {
+    const ast = parseQuery('"hello world" "goodbye moon"');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'text', value: 'hello world' });
+      expect(ast.right).toEqual({ type: 'text', value: 'goodbye moon' });
+    }
+  });
+
+  test('parses implicit AND with NOT', () => {
+    const ast = parseQuery('foo NOT bar');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'text', value: 'foo' });
+      expect(ast.right.type).toBe('not');
+      if (ast.right.type === 'not') {
+        expect(ast.right.operand).toEqual({ type: 'text', value: 'bar' });
+      }
+    }
+  });
+
+  test('parses implicit AND with parentheses', () => {
+    const ast = parseQuery('foo (bar OR baz)');
+    expect(ast.type).toBe('and');
+    if (ast.type === 'and') {
+      expect(ast.left).toEqual({ type: 'text', value: 'foo' });
+      expect(ast.right.type).toBe('or');
+    }
   });
 
   test('throws on empty status', () => {

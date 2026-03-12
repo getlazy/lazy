@@ -60,7 +60,7 @@ interface SortConfig {
 function parseSortParam(sort: string | null, filter: string): SortConfig {
   // Default: blocked filter sorts by last_active DESC, others by created DESC
   if (!sort) {
-    return filter === 'blocked'
+    return (filter === 'blocked' || filter === 'conflict')
       ? { field: 'last_active', direction: 'desc' }
       : { field: 'created', direction: 'desc' };
   }
@@ -360,7 +360,7 @@ async function handleDashboard(storage: Storage): Promise<Response> {
 
   // Blocked tasks needing attention
   const blockedTasks = allWithSessions
-    .filter(({ task }) => task.status === 'blocked' || task.status === 'pairing')
+    .filter(({ task }) => task.status === 'blocked' || task.status === 'conflict' || task.status === 'pairing')
     .sort((a, b) => {
       const aTime = a.session?.last_interaction_at ?? a.task.created_at;
       const bTime = b.session?.last_interaction_at ?? b.task.created_at;

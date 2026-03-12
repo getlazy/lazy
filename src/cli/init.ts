@@ -375,9 +375,9 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // Detect the git remote to use before storage/config setup
   const gitRemote = await chooseGitRemote(targetDir);
 
-  // Prompt for storage location if interactive
+  // Prompt for storage location if interactive (and not --non-interactive)
   let storageChoice: StorageChoice = { backend: 'external' };
-  if (isTTY()) {
+  if (isTTY() && !options.nonInteractive) {
     storageChoice = await promptStorageChoice(targetDir, gitRemote);
   }
 
@@ -440,7 +440,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
       console.log(`\nDetected ${detected.name} remote`);
 
       let shouldConfigure = true;
-      if (isTTY()) {
+      if (isTTY() && !options.nonInteractive) {
         shouldConfigure = await promptYesNo(`Configure ${detected.name} integration?`, true);
       }
 
@@ -522,7 +522,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   }
 
   // Offer to create first task if README.md exists
-  if (isTTY() && existsSync(join(targetDir, 'README.md'))) {
+  if (isTTY() && !options.nonInteractive && existsSync(join(targetDir, 'README.md'))) {
     console.log('');
     const createFirstTask = await promptYesNo(
       'Would you like to create your first task? We\'ll analyze your README.md and propose improvements.\n' +
@@ -556,7 +556,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   }
 
   // Offer to create Dockerfile.lazy task if Dockerfile exists
-  if (isTTY() && existsSync(join(targetDir, 'Dockerfile'))) {
+  if (isTTY() && !options.nonInteractive && existsSync(join(targetDir, 'Dockerfile'))) {
     console.log('');
     console.log('Found a Dockerfile in your project. Lazy can create a Dockerfile.lazy based on it');
     console.log('that adds Claude Code to your existing environment — so agents work with your');

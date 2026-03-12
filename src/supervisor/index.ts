@@ -53,6 +53,7 @@ import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
 import { spawnSync } from '../utils/spawn';
 import { runGit } from '../utils/git';
+import { detectViolations } from './permissions';
 
 export interface SupervisorConfig {
   /** Protocol directory path (shared via volume) */
@@ -381,6 +382,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postWorkSha.substring(0, 8)}`;
     tagHead(worktreePath, tagName);
 
+    // Phase 3b: Check for file permission violations
+    const protectedPatterns = cmd.protected_patterns ?? [];
+    const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
+    const violations = detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns);
+    if (violations.length > 0) {
+      log(`[supervisor] Detected ${violations.length} file permission violation(s)`);
+    }
+
     // Phase 4: Post-turn sync-with-upstream (if requested and parent_branch is specified)
     if (cmd.parent_branch && cmd.sync_after_work) {
       updatePhase(status, 'post_turn_sync', protocolDir);
@@ -409,12 +418,20 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // Write response
     updatePhase(status, 'writing_response', protocolDir);
 
+    // Build result text, prepending violations if any
+    let resultText = result.result;
+    if (violations.length > 0) {
+      const violationList = violations.map(v => `  - ${v.file}`).join('\n');
+      resultText = `**FILE PERMISSION VIOLATIONS**\n\nThe following protected files were modified or deleted:\n${violationList}\n\n${resultText}`;
+    }
+
     const response: CompletedResponse = {
       status: 'completed',
-      result: result.result,
+      result: resultText,
       session_id: result.session_id,
       usage: result.usage,
       ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
+      ...(violations.length > 0 ? { violations } : {}),
     };
     writeResponse(protocolDir, response);
 

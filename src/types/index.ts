@@ -1,22 +1,8 @@
-export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'merging' | 'complete' | 'abandoned' | 'closed' | 'backlog';
+export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'merging' | 'conflict' | 'zombie' | 'complete' | 'abandoned' | 'closed' | 'backlog';
 
-/** Task statuses that represent a finished task. Once a task reaches one of these statuses, its core fields are frozen. */
-export const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['complete', 'abandoned', 'closed']);
-
-/** Returns true if the given status is a terminal (finished) state. */
-export function isTerminalStatus(status: TaskStatus): boolean {
-  return TERMINAL_STATUSES.has(status);
-}
-
-/** Task has an active worktree that should not be merged into */
-export function isActiveStatus(status: TaskStatus): boolean {
-  return status === 'working' || status === 'interrupted' || status === 'pairing' || status === 'merging';
-}
-
-/** Task is waiting for human or agent action */
-export function isBlockedStatus(status: TaskStatus): boolean {
-  return status === 'blocked';
-}
+// Status classification functions live in src/task-state-machine.ts (single source of truth).
+// Re-exported here for backward compatibility — consumers can import from either location.
+export { TERMINAL_STATUSES, isTerminalStatus, isActiveStatus, isBlockedStatus } from '../task-state-machine';
 
 export type TaskType = 'task' | 'fix' | 'spike' | 'refactor' | 'test' | 'audit' | 'migrate' | 'document' | 'tidy' | 'rework' | 'feature' | 'release';
 
@@ -107,6 +93,15 @@ export interface MergeConflict {
   merge_source: string;
 }
 
+export interface FileViolation {
+  /** Relative path to the violated file */
+  file: string;
+  /** SHA to revert to if rejected */
+  base_sha: string;
+  /** Review status */
+  status: 'pending' | 'approved' | 'rejected';
+}
+
 export interface Turn {
   id: string;
   session_id: string;
@@ -131,6 +126,8 @@ export interface Turn {
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
   actor?: Actor;
+  /** File permission violations detected in this turn */
+  violations?: FileViolation[];
 }
 
 export interface Commit {

@@ -20,9 +20,9 @@
 cd your-hello-lazy-project/
 lazy init
 
-# Launch the agent in interactive mode with an additional `lazy`'s system prompt
-# and tell it what tasks to create and start. Ask it "what can you do?"
-lazy builder
+# Launch the agent in interactive mode with an additional lazy's system prompt
+# and tell it what tasks to create and start.
+lazy builder # Ask it "what can you do?"
 
 # To review all the prompts that `lazy` uses run `lazy system prompts`
 # To view the content of individual prompts use `lazy view <prompt-code>`
@@ -45,12 +45,20 @@ lazy accept <task-id>
 lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 ```
 
+## Core components
+
+When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a linux build of `lazy` with a different CLI commands that run inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
+
+When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware so there is a single daemon for the system, not a deamon per project. Daemon runs task reconiciliation in the background and it is slowly becoming the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check deamon state through `lazy daemon` commands.
+
+Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon.
+
 ## Core Concepts
 
 * Agents do the coding and (most of) reviewing, you focus on the product, the architecture and giving guidance to unblock the agents.
 * Your time is precious, agent time is aplenty. This permeates all interactions with `lazy` including direct conversations. Watching agents write code and yanking them when they go astray is *micromanagement*.
 * Prompts and their context are valuable, code is a byproduct. `lazy` automatically keeps track of all conversations, prompts, turns, comments, feedbacks.
-* Primary interface is the conversation - let lazy's builder be your team lead - but you always have lazy's deterministic tools at your disposal.
+* Primary interface is the conversation - let `lazy`'s builder be your team lead - but you always have `lazy`'s deterministic tools at your disposal.
 * Software development lifecycle is not an afterthought - it's front and center of `lazy` way of building software.
 
 ## Project Status
@@ -75,15 +83,15 @@ lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 
 `lazy` is built using `lazy` itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
 
-## Motivations
+## FAQ
 
-### Why build this
+### Why build `lazy`?
 
 On one hand I felt that by throwing away prompts, we are not raising the abstraction of software development. I feel that that is akin to writing in a higher level language, compiling that to machine or p-code, then committing *that* code and deleting the original source code. It's not *exactly* the same of course but it is... akin.
 
 On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do. I don't want to chat with agents and become a blocker. Instead, I want to give them actionable feedback, asynchronously, on my own good time, and let them do their thing in the meantime.
 
-### Why name it `lazy`
+### Why name it `lazy`?
 
 Two reasons:
 
@@ -100,9 +108,30 @@ Two reasons:
 
 I hope you get as much fun from this (or more!) as I have.
 
-### Why Not Just Use X
+### Why Not Just Use <X>?
 
 See above. Plus building building `lazy` is fun, building with `lazy` is fun and building `lazy` with `lazy` is *extra* fun. Occasionally it is also *extra* frustrating but hey, what is programming if not a perpetual act of [frustration](https://x.com/CodeWisdom/status/1452004401774739464).
+
+### At what is `lazy` particularly good at compared to native Claude Code?
+
+From the point of view of the quality of one-shot code or similar - nothing whatsoever. From the point of view of experience of software development, where Claude Code aptly leverages subagents to launch work in the background, `lazy` uses its task system to do the same. `lazy` plans the work and fires off tasks and then gives *you* the control to do something else while the task or tasks are running. The difference, to me, is similar to the difference between real-time strategy games, where your reflexes dominate the outcome (how many times *today* have you slammed ESC to stop Claude Code going off the rails?), to turn-based strategy games, where you asynchronously plan and make your moves and then let the opponent take its turn. To me, it is liberating to review after the agent's turn, instead of watching reams of text fly by, hoping to gain some semblance of control.
+
+Beside that, `lazy` does a lot of little "quality of life" things that are otherwise annoying with agents:
+
+* Before agent's turn `lazy` inject goals of the task into the prompt, in order to avoid goal drift and stabilize the agent's output.
+* Before agent's turn `lazy` automatically merges task's branch with origin branch and parent task's branch (e.g. main) so that the differences are never too large. Conflicts are resolved by the agents with a specially crafted prompt.
+* After agent's turn `lazy` checks agent's work for file permission violations in order to make potential reward hacking (e.g. deleting tests it doesn't "like") obvious and rejectable by default.
+* `lazy` has specific verbs and specialized prompts for different types of tasks, similar to skills but that go well beyond that. For example, there is a built-in `redo` command which acts like smart rebase redoing the work already done, from scratch, on top of latest HEAD, repeating the exact same goal and prompt.
+
+### At what is `lazy` particularly bad at?
+
+Right now, it's really annoying when I am preparing a new release and I am doing integration tests. These rarely expose major issues but rather a number of smaller issues for which I often fire off tasks to fix *but* I readily admit that sometimes the overhead is too large and instead I use the "escape hatch" and fire up Claude Code. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. On the roadmap is `agent = "human"` that will allow me to just "pair" on the main while fixing these issues and not lose those prompts either (although honestly, if any of them are *that* important, they should have been a task rather than *ad hoc* fixing)
+
+Another thing that is annoying are bootstrapping failures: `lazy` failing so hard that I cannot fix it using `lazy`. But that is very rare these days and besides, it's only annoying to me.
+
+### Why use Docker?
+
+I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastropic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonmously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding builder layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
 
 ## The Details
 
@@ -366,6 +395,29 @@ Launches an interactive Claude Code session in the task's worktree. You drive th
 - Taking over when the agent is stuck
 
 This is rarely needed as you usually want to unblock with review and move on. But when it's needed, it's a great escape hatch.
+
+### Minimization of Little Differences
+
+On every turn, before the agent has a chance to act on the prompt, `lazy` does two things:
+
+* It tries to merge the origin branch into the local task's branch and
+* It tries to merge the parent's origin branch into the task's branch
+
+In both cases, if there are conflicts, it invokes the agent with a specific prompt of resolving the conflicts and giving the origin's state advantage over own's state (under the assumptions that those changes have been freshly accepted whereas agent is still working on the current task). This allows you to minimize the divergence between two sources of changes: task's origin branch where *other* actors may have pushed their changes since agent's last turn and parent's origin branch where other tasks may have been accepted since agent's last turn.
+
+### File Permission
+
+After every agent's turn, `lazy` will check if the agent has tried to change or delete files from the areas that are prohibited for it to touch. For me, there are two areas that I don't want agents just screwing around: this `README.md` and the tests. I got tired of agents, not only `lazy` agents but in general, "fixing" the issues by deleting or unnecessarily modifying tests. So now `lazy` is enforcing the rules, not through begging and cajoling in prompts but with a deterministic process.
+
+That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy` builder agent. Then it is up to the reviewer, whatever it may be, to *explicitly* accept chagnes to files. What is not accepted is assumed rejected and on the next turn, before it tries to merge anything or give the agent control, `lazy` will revert the rejected files to their pre-last-turn state and let the agent know about the changes.
+
+### Head of Line Blocking
+
+As [Herb Sutter](https://herbsutter.com/) memorably put it in his 2009 [Sharing Is the Root of All Contention](https://www.state-machine.com/doc/Sutter2009a.pdf):
+
+> Sharing requires waiting and overhead, and is a natural enemy of scalability
+
+Amen. He was (mostly) talking about runtime concurrency of a software system but concurrency in the process of a software engineer team has the same shape: different agents share the same resource, repository, and they must contend with each other to update the release branch in order to release their changes. `lazy` tries to deal with this by allowing working trains, where feature branches are branched off other feature branches that are still in flight, and so on, so that the changes can propagate with minimal differences throughout the code base. This is all happening without you paying attention to it, because the system moves forward together on every turn. And if you prefer *not* to do it that way, you simply branch of new features off the default branch and the upstream will be merged into the feature when you give the feature's main task another turn.
 
 ### Shell
 

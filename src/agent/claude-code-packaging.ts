@@ -30,14 +30,21 @@ export class ClaudeCodePackaging implements AgentPackaging {
   generateDockerfile(): string {
     return `FROM oven/bun:slim
 
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -m -s /bin/bash user
-USER user
+RUN apt-get update && apt-get install -y git curl sudo && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code via native installer (installs to ~/.local/bin/claude)
 ${this.dockerInstallCommand()}
-ENV PATH="/home/user/.local/bin:$PATH"
+# Make Claude available system-wide (for non-root builder sessions)
+RUN cp /root/.local/bin/claude /usr/local/bin/claude
+# Remove native install artifacts so Claude Code doesn't detect a stale native install
+RUN rm -rf /root/.local/bin/claude
+
+# Non-root user with sudo — passes Claude Code's root check while allowing tool installs
+RUN useradd -m -s /bin/bash user \\
+    && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+USER user
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 WORKDIR /work
 `;

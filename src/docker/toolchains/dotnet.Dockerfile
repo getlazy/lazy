@@ -11,17 +11,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     ca-certificates \
     less \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Create user before installing tools so they go to /home/user/
-RUN useradd -m -s /bin/bash user
-USER user
-
-# Install .NET global tools as user (installs to /home/user/.dotnet/tools)
+# Install .NET global tools (installs to /root/.dotnet/tools)
 RUN dotnet tool install --global dotnet-ef
 
 # Install Claude Code via native installer (installs to ~/.local/bin/claude)
 RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="$PATH:/home/user/.dotnet/tools:/home/user/.local/bin"
+ENV PATH="$PATH:/root/.dotnet/tools"
+
+# Make Claude available system-wide (for non-root builder sessions)
+RUN cp /root/.local/bin/claude /usr/local/bin/claude
+# Remove native install artifacts so Claude Code doesn't detect a stale native install
+RUN rm -rf /root/.local/bin/claude
+# Non-root user with sudo — passes Claude Code's root check while allowing tool installs
+RUN useradd -m -s /bin/bash user \
+    && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+USER user
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 WORKDIR /work

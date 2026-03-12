@@ -19,6 +19,27 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import type { Command, Response, SupervisorStatus } from './types';
+import type { ResolvedConfig } from '../config/types';
+
+/**
+ * Common policy fields for every start/unblock command.
+ *
+ * Centralizes fields that must be on every command — callers spread
+ * the result into their command object so nobody forgets them.
+ */
+export function commonCommandFields(config: ResolvedConfig): {
+  turn_started_at: string;
+  watchdog_output_timeout_ms?: number;
+  protected_patterns: string[];
+} {
+  return {
+    turn_started_at: new Date().toISOString(),
+    ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+      watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+    }),
+    protected_patterns: config.permissions.protected,
+  };
+}
 
 /**
  * Get the base directory for protocol files.

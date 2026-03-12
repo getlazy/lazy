@@ -64,11 +64,13 @@ export function stripAnsi(s: string): string {
 const STATUS_COLORS: Record<string, (s: string) => string> = {
   working: blue,
   blocked: yellow,
+  conflict: red,
   pairing: magenta,
   merging: cyan,
   complete: green,
   completed: green,
   accepted: green,
+  zombie: red,
   interrupted: red,
   abandoned: red,
   rejected: red,

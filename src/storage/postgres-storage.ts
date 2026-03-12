@@ -28,8 +28,10 @@ import type {
   StatusChange,
   ModelName,
   Actor,
+  FileViolation,
 } from './types';
 import { isTerminalStatus, DEFAULT_TASK_TYPE, type TaskType } from '../types';
+import { assertValidTransition } from '../task-state-machine';
 
 export interface PostgresStorageOptions {
   /** PostgreSQL connection URL (from LAZY_POSTGRES_URL env var) */
@@ -213,12 +215,21 @@ export class PostgresStorage implements Storage {
           start_sha_work TEXT,
           end_sha_work TEXT,
           merge_conflicts JSONB,
+          violations JSONB,
           usage JSONB,
           timestamp BIGINT NOT NULL
         )
       `;
 
       await sql`CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns(session_id)`;
+
+      // Migration: add violations column if missing (for existing databases)
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS violations JSONB;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
 
       // Commits table
       await sql`
@@ -407,7 +418,7 @@ export class PostgresStorage implements Storage {
       SELECT * FROM tasks
       WHERE 1=1
       ${options.rootsOnly ? this.sql`AND parent_task_id IS NULL` : this.sql``}
-      ${options.blockedOnly ? this.sql`AND status = 'blocked'` : this.sql``}
+      ${options.blockedOnly ? this.sql`AND status IN ('blocked', 'conflict')` : this.sql``}
       ${options.backlogOnly ? this.sql`AND status = 'backlog'` : this.sql``}
       ${options.workingOnly ? this.sql`AND status = 'working'` : this.sql``}
       ${options.interruptedOnly ? this.sql`AND status = 'interrupted'` : this.sql``}
@@ -420,6 +431,15 @@ export class PostgresStorage implements Storage {
   }
 
   async updateTaskStatus(taskId: string, status: TaskStatus, actor?: Actor): Promise<void> {
+    // Read current status to validate transition
+    const [task] = await this.sql<{ status: TaskStatus }[]>`
+      SELECT status FROM tasks WHERE id = ${taskId}
+    `;
+    if (!task) return;
+    if (task.status === status) return; // idempotent
+
+    assertValidTransition(task.status, status, actor);
+
     const now = Date.now();
     const completedAt = isTerminalStatus(status) ? now : null;
 
@@ -457,6 +477,11 @@ export class PostgresStorage implements Storage {
   }
 
   async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {
+    const [task] = await this.sql<{ status: TaskStatus }[]>`
+      SELECT status FROM tasks WHERE id = ${taskId}
+    `;
+    if (task) assertValidTransition(task.status, 'closed');
+
     const now = Date.now();
 
     await this.sql`
@@ -469,9 +494,21 @@ export class PostgresStorage implements Storage {
   }
 
   async reopenTask(taskId: string, actor?: Actor): Promise<void> {
+    const [task] = await this.sql<{ status: TaskStatus }[]>`
+      SELECT status FROM tasks WHERE id = ${taskId}
+    `;
+    if (!task) return;
+
+    // Determine target: 'blocked' if task had sessions, 'backlog' otherwise
+    const [sessionRow] = await this.sql<{ id: string }[]>`
+      SELECT id FROM sessions WHERE task_id = ${taskId} LIMIT 1
+    `;
+    const newStatus: TaskStatus = sessionRow ? 'blocked' : 'backlog';
+    assertValidTransition(task.status, newStatus);
+
     const now = Date.now();
-    await this.sql`UPDATE tasks SET status = 'blocked', completed_at = NULL WHERE id = ${taskId}`;
-    await this.recordStatusChange(taskId, 'blocked', now, actor);
+    await this.sql`UPDATE tasks SET status = ${newStatus}, completed_at = NULL WHERE id = ${taskId}`;
+    await this.recordStatusChange(taskId, newStatus, now, actor);
   }
 
   async updateTaskMetadata(taskId: string, key: string, value: string): Promise<void> {
@@ -678,13 +715,14 @@ export class PostgresStorage implements Storage {
       INSERT INTO turns (
         id, session_id, sequence, role, content, model, prompt,
         start_sha, end_sha, start_sha_work, end_sha_work,
-        merge_conflicts, usage, timestamp
+        merge_conflicts, violations, usage, timestamp
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${options.content},
         ${options.model ?? null}, ${options.prompt ?? null}, ${options.startSha ?? null}, ${options.endSha ?? null},
         ${options.startShaWork ?? null}, ${options.endShaWork ?? null},
         ${options.mergeConflicts ? JSON.stringify(options.mergeConflicts) : null},
+        ${options.violations ? JSON.stringify(options.violations) : null},
         ${options.usage ? JSON.stringify(options.usage) : null}, ${now}
       )
     `;
@@ -702,6 +740,7 @@ export class PostgresStorage implements Storage {
       start_sha_work: options.startShaWork ?? null,
       end_sha_work: options.endShaWork ?? null,
       merge_conflicts: options.mergeConflicts,
+      violations: options.violations,
       usage: options.usage ?? null,
       timestamp: now,
     };
@@ -725,6 +764,13 @@ export class PostgresStorage implements Storage {
       WHERE sessions.task_id = ${taskId}
     `;
     return result?.count ?? 0;
+  }
+
+  async updateTurnViolations(_taskId: string, turnId: string, violations: FileViolation[]): Promise<void> {
+    await this.sql`
+      UPDATE turns SET violations = ${JSON.stringify(violations)}
+      WHERE id = ${turnId}
+    `;
   }
 
   async createCommit(sessionId: string, sha: string, message: string): Promise<Commit> {

@@ -35,9 +35,10 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
   docker: ['dockerfile', 'toolchain'],
-  runner: ['type', 'docker_agent_root', 'docker_agent_no_network'],
+  runner: ['type', 'docker_agent_no_network'],
   documents: ['path'],
   worktree: ['include'],
+  permissions: ['protected'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
 

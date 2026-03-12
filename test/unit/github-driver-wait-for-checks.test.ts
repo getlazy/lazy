@@ -32,10 +32,11 @@ describe('GitHubDriver waitForChecks', () => {
       gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     },
     docker: { dockerfile: '', toolchain: '' },
-    runner: { type: 'docker' as const, docker_agent_root: false, docker_agent_no_network: false },
+    runner: { type: 'docker' as const, docker_agent_no_network: false },
     documents: { path: '' },
     features: {},
     worktree: { include: [] },
+    permissions: { protected: [] },
   };
 
   const mockTask: Task = {

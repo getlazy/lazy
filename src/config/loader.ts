@@ -8,13 +8,16 @@ const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 let _configOverrideWarned = false;
 
 /**
- * Find the nearest lazy.toml by walking up from cwd, stopping at lazyRoot.
+ * Find the nearest lazy.toml by walking up from startDir, stopping at lazyRoot.
  * Returns the directory containing the config, or lazyRoot if none found closer.
  * This lets worktrees carry their own config without being shadowed by the repo root.
+ *
+ * @param startDir - Directory to start searching from. Defaults to process.cwd().
+ *   The daemon passes projectRoot here because its own cwd is meaningless.
  */
-function findConfigDir(lazyRoot: string): string {
+function findConfigDir(lazyRoot: string, startDir?: string): string {
   const root = resolve(lazyRoot);
-  let dir = resolve(process.cwd());
+  let dir = resolve(startDir ?? process.cwd());
 
   while (true) {
     if (existsSync(join(dir, CONFIG_FILENAME))) {
@@ -79,7 +82,6 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   runner: {
     type: 'docker',
-    docker_agent_root: false,
     docker_agent_no_network: false,
   },
   documents: {
@@ -88,6 +90,9 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   features: {},
   worktree: {
     include: [],
+  },
+  permissions: {
+    protected: [],
   },
 };
 
@@ -146,17 +151,21 @@ export function loadRawConfig(lazyRoot: string): Record<string, unknown> | null 
 }
 
 /**
- * Load and parse lazy.toml configuration file
+ * Load and parse lazy.toml configuration file.
+ *
+ * @param options.cwd - Override the starting directory for config file search.
+ *   Normally starts from process.cwd(). The daemon passes the project root
+ *   because its own cwd may belong to a different project.
  */
-export function loadConfig(lazyRoot: string): ResolvedConfig {
-  const configDir = findConfigDir(lazyRoot);
+export function loadConfig(lazyRoot: string, options?: { cwd?: string }): ResolvedConfig {
+  const configDir = findConfigDir(lazyRoot, options?.cwd);
   const configPath = join(configDir, CONFIG_FILENAME);
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
   if (process.env.LAZY_CONFIG && !existsSync(configPath)) {
     throw new Error(
       `LAZY_CONFIG is set to '${process.env.LAZY_CONFIG}' but the file does not exist.\n` +
-      `Searched from ${process.cwd()} up to ${lazyRoot}.\n` +
+      `Searched from ${options?.cwd ?? process.cwd()} up to ${lazyRoot}.\n` +
       `Unset it with LAZY_CONFIG= or fix the path.`,
     );
   }
@@ -217,6 +226,13 @@ export function loadConfig(lazyRoot: string): ResolvedConfig {
   // After backward-compat normalization above, runner is always object form.
   // Cast to satisfy DeepPartial<ResolvedConfig> which expects { type: RunnerType }.
   const config = deepMerge(DEFAULT_CONFIG, parsed as DeepPartial<ResolvedConfig>);
+
+  // Merge user-specified protected patterns with built-in defaults (additive)
+  if (parsed.permissions?.protected) {
+    const userPatterns = parsed.permissions.protected;
+    const builtinPatterns = DEFAULT_CONFIG.permissions.protected;
+    config.permissions.protected = [...new Set([...builtinPatterns, ...userPatterns])];
+  }
 
   // Validate agent_id against registry
   const validAgents = listAgents();
@@ -312,9 +328,6 @@ port = 26024
 # Docker/Podman modes run agents in isolated containers. Host-process mode runs agents
 # directly on the host — use only in VMs or other already-isolated environments.
 type = "docker"
-# Run containers as root (passes --user root to docker run).
-# Lets agents install packages at runtime (apt-get install, etc.).
-# docker_agent_root = false
 # Disable network access inside containers (passes --network none to docker run).
 # docker_agent_no_network = false
 
@@ -350,5 +363,11 @@ dockerfile = ""
 # Untracked files to copy into new task worktrees (glob patterns)
 # Example: include = [".env", ".env.local", "config/local.yml"]
 # include = []
+
+# [permissions]
+# Glob patterns for files agents should not modify or delete.
+# Agents can still ADD new files matching these patterns — only modifications
+# and deletions are flagged as violations for human review.
+# protected = ["test/**", "tests/**", "spec/**", "*_test.*", "*.test.*", "*.spec.*"]
 `;
 }

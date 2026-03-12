@@ -46,6 +46,38 @@ function extractVariantTaskId(output: string): string {
   return match[1];
 }
 
+/** Helper: create parent + child tasks, add a commit to child, set parent status */
+async function setupParentChild(ctx: TestContext, parentStatus?: string) {
+  const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
+  const parentStartResult = await ctx.lazyMocked(
+    ['start', parentId, '--yes'],
+    MOCK_CLAUDE_SUCCESS,
+    { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+  );
+  expectSuccess(parentStartResult);
+
+  const branchResult = await ctx.lazyMocked(
+    ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
+    MOCK_CLAUDE_SUCCESS,
+    { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+  );
+  expectSuccess(branchResult);
+  const childId = extractVariantTaskId(branchResult.stdout);
+
+  const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
+  writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
+  ctx.git('-C', childWorktree, 'add', 'child-work.txt');
+  ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
+
+  if (parentStatus) {
+    const parentJson = readTaskJson(ctx.root, parentId);
+    parentJson.status = parentStatus;
+    writeTaskJson(ctx.root, parentId, parentJson);
+  }
+
+  return { parentId, childId };
+}
+
 describe('accept with working parent', () => {
   let ctx: TestContext;
 
@@ -60,39 +92,35 @@ describe('accept with working parent', () => {
   // INVARIANT: Accepting a child task when the parent is working would merge
   // into the agent's active worktree, corrupting its state. Must refuse.
   test('refuses accept when parent task is working', async () => {
-    // 1. Create and start a parent task
-    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    const { childId } = await setupParentChild(ctx, 'working');
 
-    // 2. Create a child task (branch from parent)
-    const branchResult = await ctx.lazyMocked(
-      ['branch', parentId, '--goal', 'Child task', '--prompt', 'Do child work', '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(branchResult);
-    const childId = extractVariantTaskId(branchResult.stdout);
-
-    // 3. Add a commit to the child worktree so accept has something to merge
-    const childWorktree = join(ctx.root, '.lazy', 'worktrees', childId);
-    writeFileSync(join(childWorktree, 'child-work.txt'), 'child content\n');
-    ctx.git('-C', childWorktree, 'add', 'child-work.txt');
-    ctx.git('-C', childWorktree, 'commit', '-m', 'Child work commit');
-
-    // 4. Set parent task status to 'working' (simulates an active agent turn)
-    const parentJson = readTaskJson(ctx.root, parentId);
-    parentJson.status = 'working';
-    writeTaskJson(ctx.root, parentId, parentJson);
-
-    // 5. Accept should refuse
     const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
     expectFailure(acceptResult);
     expectError(acceptResult, 'currently working');
+    expectError(acceptResult, 'surprise the agent or human');
+    expectError(acceptResult, 'Wait for the parent task to become blocked');
+  });
+
+  // INVARIANT: Accepting a child task when the parent is pairing would surprise
+  // the human interactively working in the worktree. Must refuse.
+  test('refuses accept when parent task is pairing', async () => {
+    const { childId } = await setupParentChild(ctx, 'pairing');
+
+    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
+    expectFailure(acceptResult);
+    expectError(acceptResult, 'currently pairing');
+    expectError(acceptResult, 'surprise the agent or human');
+  });
+
+  // INVARIANT: Accepting when parent is interrupted shows a different hint:
+  // the user can unblock the parent to resume it.
+  test('refuses accept when parent is interrupted and suggests unblock', async () => {
+    const { parentId, childId } = await setupParentChild(ctx, 'interrupted');
+
+    const acceptResult = await ctx.lazy(['accept', childId, '--reason', 'LGTM']);
+    expectFailure(acceptResult);
+    expectError(acceptResult, 'currently interrupted');
+    expectError(acceptResult, 'lazy resume');
   });
 
   test('accept succeeds when parent is blocked (not working)', async () => {

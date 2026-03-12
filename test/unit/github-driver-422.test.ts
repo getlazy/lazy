@@ -57,12 +57,13 @@ describe('GitHubDriver 422 self-approval handling', () => {
       dockerfile: '',
       toolchain: '',
     },
-    runner: { type: 'docker' as const, docker_agent_root: false, docker_agent_no_network: false },
+    runner: { type: 'docker' as const, docker_agent_no_network: false },
     documents: {
       path: '',
     },
     features: {},
     worktree: { include: [] },
+    permissions: { protected: [] },
   };
 
   // Minimal task with a PR number

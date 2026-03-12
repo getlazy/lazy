@@ -307,6 +307,51 @@ describeWithPg('PostgresStorage', () => {
     expect(typeof count).toBe('number');
   });
 
+  // INVARIANT: updateTurnViolations must persist violation status transitions
+  // (pending → approved/rejected) as JSONB. The round-trip must preserve the
+  // full FileViolation structure including the updated status field.
+  test('updateTurnViolations persists violation statuses as JSONB', async () => {
+    const task = await storage.createTask('Test task');
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/test', 'abc');
+
+    const violations = [
+      { file: 'test.spec.ts', base_sha: 'abc123', status: 'pending' as const },
+      { file: 'other.spec.ts', base_sha: 'def456', status: 'pending' as const },
+    ];
+
+    const turn = await storage.createTurn({
+      sessionId: session.id,
+      sequence: 0,
+      role: 'agent',
+      content: 'Modified files',
+      violations,
+    });
+
+    // Verify initial violations are stored
+    const turnsBefore = await storage.getSessionTurns(session.id);
+    expect(turnsBefore[0].violations).toHaveLength(2);
+    expect(turnsBefore[0].violations![0].status).toBe('pending');
+
+    // Update: approve one, reject the other
+    const updatedViolations = [
+      { ...violations[0], status: 'approved' as const },
+      { ...violations[1], status: 'rejected' as const },
+    ];
+    await storage.updateTurnViolations(task.id, turn.id, updatedViolations);
+
+    // Verify round-trip preserves full structure
+    const turnsAfter = await storage.getSessionTurns(session.id);
+    expect(turnsAfter[0].violations).toHaveLength(2);
+    const v0 = turnsAfter[0].violations![0];
+    const v1 = turnsAfter[0].violations![1];
+    expect(v0.file).toBe('test.spec.ts');
+    expect(v0.status).toBe('approved');
+    expect(v0.base_sha).toBe('abc123');
+    expect(v1.file).toBe('other.spec.ts');
+    expect(v1.status).toBe('rejected');
+    expect(v1.base_sha).toBe('def456');
+  });
+
   // ── Commits ───────────────────────────────────────────────────────
 
   test('create and retrieve commits', async () => {

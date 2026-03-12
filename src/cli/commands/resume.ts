@@ -8,7 +8,7 @@ import { loadConfig } from '../../config/loader';
 import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { followContainer } from './shared';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
 import type { UnblockCommand } from '../../protocol';
 import type { SandboxConfig } from '../../capture/claude';
 import type { ModelName } from '../../types';
@@ -72,8 +72,12 @@ function findClaudeSessionId(sandboxPath: string): string | null {
  * Build the static system prompt for task resume (after interruption).
  * Uses resume-specific system instructions which may differ from normal operations.
  */
-export function buildSystemPromptForResume(): string {
-  return lazyToolInstructions + '\n' + systemInstructionsResumeText;
+export function buildSystemPromptForResume(runnerInstructions?: string): string {
+  let prompt = lazyToolInstructions + '\n' + systemInstructionsResumeText;
+  if (runnerInstructions) {
+    prompt += '\n' + runnerInstructions;
+  }
+  return prompt;
 }
 
 /**
@@ -91,7 +95,6 @@ export async function commandResume(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'follow', takesValue: false },
     { name: 'model', takesValue: true },
-    { name: 'docker-agent-root', takesValue: false },
     { name: 'docker-agent-no-network', takesValue: false },
   ], 'resume');
 
@@ -103,7 +106,6 @@ export async function commandResume(args: string[]): Promise<void> {
 
   // Parse flags
   const follow = parsed.flags.get('follow') === true;
-  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
   const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -122,7 +124,7 @@ export async function commandResume(args: string[]): Promise<void> {
     // Verify task is in interrupted state
     if (task.status !== 'interrupted') {
       console.error(`Task ${displayId(task)} is not interrupted (status: ${task.status}).`);
-      if (task.status === 'blocked') {
+      if (task.status === 'blocked' || task.status === 'conflict') {
         console.error(`Use 'lazy unblock ${displayId(task)}' to continue.`);
       } else if (task.status === 'working') {
         console.error(`Task is still working. Use 'lazy blocked' to check when it finishes.`);
@@ -151,7 +153,6 @@ export async function commandResume(args: string[]): Promise<void> {
 
     // Pre-flight checks
     const dockerOptions: Partial<DockerRunnerOptions> = {};
-    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
     if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
     const runner = createRunner(root, dockerOptions);
     try {
@@ -197,7 +198,9 @@ export async function commandResume(args: string[]): Promise<void> {
     const containerName = runner.runNameForTask(tRef);
 
     try {
-      const config = loadConfig(root);
+      // Load config from the worktree — the branch may have settings (e.g., permissions)
+      // that aren't on the project root's lazy.toml yet.
+      const config = loadConfig(root, { cwd: worktreePath });
 
       // Ensure sandbox exists
       const sandboxPath = join(worktreePath, SANDBOX_DIR);
@@ -250,7 +253,7 @@ export async function commandResume(args: string[]): Promise<void> {
       }
 
       // Build the prompts: static system prompt and dynamic user prompt
-      const systemPrompt = buildSystemPromptForResume();
+      const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions());
       const fullPrompt = buildResumePrompt(task.goal, root);
 
       // --- Persist state BEFORE launching container ---
@@ -285,11 +288,7 @@ export async function commandResume(args: string[]): Promise<void> {
         system_prompt: systemPrompt,
         model_id: modelId,
         agent_session_id: claudeSessionId ?? undefined,
-        turn_started_at: new Date().toISOString(),
-        // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
-        ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-          watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-        }),
+        ...commonCommandFields(config),
       };
       writeCommand(protoDir, unblockCommand);
 
@@ -365,7 +364,6 @@ Arguments:
 Options:
   --model <model>    Override model for this session (apprentice, journeyman, master, sonnet, opus, haiku)
   --follow           Wait for the agent to finish, streaming output in real time
-  --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
   --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
 
 Examples:

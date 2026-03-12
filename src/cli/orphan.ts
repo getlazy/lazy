@@ -126,3 +126,39 @@ export async function getActiveChildren(
   const children = await storage.getChildTasks(parentTaskId);
   return children.filter(c => !isTerminalStatus(c.status));
 }
+
+/**
+ * Re-parent non-terminal children of an accepted task to the accepted task's parent.
+ *
+ * When a parent is accepted, its branch is merged and deleted. Any unfinished
+ * children would become orphans. This function proactively re-parents them to
+ * the grandparent (or makes them top-level if the accepted task had no parent).
+ *
+ * Only updates parent_task_id — does NOT touch worktrees. The next
+ * sync-with-upstream on each child will handle merging the new parent branch.
+ *
+ * Returns the list of re-parented children (for logging).
+ */
+export async function reparentChildren(
+  acceptedTask: Task,
+  storage: Storage,
+): Promise<Task[]> {
+  const activeChildren = await getActiveChildren(acceptedTask.id, storage);
+  if (activeChildren.length === 0) return [];
+
+  const newParentId = acceptedTask.parent_task_id ?? null;
+
+  for (const child of activeChildren) {
+    await storage.updateTaskParent(child.id, newParentId);
+
+    const acceptedRef = acceptedTask.code ?? acceptedTask.id.substring(0, 8);
+    const newParentRef = newParentId ? newParentId.substring(0, 8) : 'top-level';
+    await storage.createComment(
+      child.id,
+      `[Re-parented] Parent task ${acceptedRef} was accepted. Re-parented to ${newParentRef}.`,
+      getActor(),
+    );
+  }
+
+  return activeChildren;
+}

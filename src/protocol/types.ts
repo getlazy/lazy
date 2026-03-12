@@ -10,7 +10,7 @@
  *   supervisor writes status.json at phase boundaries (checkpoint/heartbeat)
  */
 
-import type { TokenUsage, MergeConflict } from '../types';
+import type { TokenUsage, MergeConflict, FileViolation } from '../types';
 
 // --- Command (host → supervisor) ---
 
@@ -31,6 +31,7 @@ export interface StartCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
+  protected_patterns?: string[];      // glob patterns for file permission violation detection
 }
 
 export interface UnblockCommand {
@@ -49,6 +50,7 @@ export interface UnblockCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
+  protected_patterns?: string[];      // glob patterns for file permission violation detection
 }
 
 export interface StopCommand {
@@ -75,6 +77,8 @@ export interface CompletedResponse {
   };
   /** Merge conflicts captured before agent resolution (if any merges had conflicts) */
   merge_conflicts?: MergeConflict[];
+  /** File permission violations detected after agent work */
+  violations?: FileViolation[];
 }
 
 export interface ErrorResponse {

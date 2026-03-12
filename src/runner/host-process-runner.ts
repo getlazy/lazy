@@ -471,7 +471,11 @@ export class HostProcessRunner implements Runner {
     return results;
   }
 
-  // ----- Builder support -----
+  // ----- Prompt support -----
+
+  getAgentInstructions(): string {
+    return '';
+  }
 
   getBuilderInstructions(): string {
     return hostProcessBuilderInstructions;

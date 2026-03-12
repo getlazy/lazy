@@ -200,11 +200,13 @@ export function render(state: LayoutState): string {
 const STATUS_ANSI: Record<string, string> = {
   working: ansi.fg.blue,
   blocked: ansi.fg.yellow,
+  conflict: ansi.fg.red,
   pairing: ansi.fg.magenta,
   merging: ansi.fg.cyan,
   complete: ansi.fg.green,
   completed: ansi.fg.green,
   accepted: ansi.fg.green,
+  zombie: ansi.fg.red,
   interrupted: ansi.fg.red,
   abandoned: ansi.fg.red,
   rejected: ansi.fg.red,

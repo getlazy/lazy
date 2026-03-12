@@ -1037,6 +1037,11 @@ export const unblockTool: McpTool = {
         description: 'Model override for this turn (optional)',
         enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
+      approved_files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'List of violated files to approve (default: all rejected/reverted). Only relevant for tasks in conflict status with file permission violations.',
+      },
     },
     required: ['task_id', 'feedback'],
   },
@@ -1047,10 +1052,16 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const feedback = args.feedback as string;
     const model = args.model as string | undefined;
+    const approvedFiles = args.approved_files as string[] | undefined;
 
     const cliArgs = ['unblock', taskId];
     if (model) {
       cliArgs.push('--model', model);
+    }
+    if (approvedFiles && approvedFiles.length > 0) {
+      for (const f of approvedFiles) {
+        cliArgs.push('--approve-file', f);
+      }
     }
 
     // Pipe feedback via stdin
@@ -1073,7 +1084,8 @@ export const acceptTool: McpTool = {
   name: 'lazy_accept',
   description:
     'Accept a task\'s work and merge it into the parent branch. The task ' +
-    'must be in blocked status with at least one commit.',
+    'must be in blocked or conflict status with at least one commit. ' +
+    'For conflict tasks, all violated files must be approved via approved_files.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1086,6 +1098,11 @@ export const acceptTool: McpTool = {
         type: 'string',
         description: 'Reason for accepting (optional)',
       },
+      approved_files: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'List of violated files to approve (required for conflict tasks, must cover all pending violations)',
+      },
     },
     required: ['task_id'],
   },
@@ -1095,10 +1112,16 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
     const reason = args.reason as string | undefined;
+    const approvedFiles = args.approved_files as string[] | undefined;
 
     const cliArgs = ['accept', taskId, '--yes'];
     if (reason) {
       cliArgs.push('--reason', reason);
+    }
+    if (approvedFiles && approvedFiles.length > 0) {
+      for (const f of approvedFiles) {
+        cliArgs.push('--approve-file', f);
+      }
     }
 
     const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);

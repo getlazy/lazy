@@ -251,9 +251,9 @@ lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 
 ### Reviewing and feedback
 
-- `lazy_unblock(task_id="<id>", feedback="Fix error handling")` — Give feedback to a blocked task
+- `lazy_unblock(task_id="<id>", feedback="Fix error handling")` — Give feedback to a blocked task. For conflict tasks, use `approved_files=["file"]` to selectively approve violated files (default: all rejected and reverted)
 - `lazy_diff(task_id="<id>")` — See changes made by a task (use `full=true` for full diff, `files=["path"]` to filter, `max_lines=N` to truncate)
-- `lazy_accept(task_id="<id>", reason="Why accepting")` — Merge task's work into parent branch
+- `lazy_accept(task_id="<id>", reason="Why accepting")` — Merge task's work into parent branch. For conflict tasks, pass `approved_files=["file1", "file2"]` to approve all violated files (all must be listed — partial approval is rejected)
 - `lazy_reject(task_id="<id>", reason="Why")` — Discard task's work
 
 ### Resuming work
@@ -393,6 +393,14 @@ approving review. Examples:
 lazy_accept(task_id="<id>", reason="Clean implementation, tests pass, matches spec")
 lazy_accept(task_id="<id>", reason="LGTM — minor style nits but not blocking")
 ```
+
+**Accepting conflict tasks.** When a task is in `conflict` status (file permission violations),
+you must approve all violated files to accept it. Use `approved_files` to list every file:
+```
+lazy_accept(task_id="<id>", reason="Test changes are intentional", approved_files=["test/unit/foo.test.ts", "test/e2e/bar.test.ts"])
+```
+All pending violations must be covered — partial approval is rejected. If some files should
+not be approved, unblock with feedback instead and let the agent fix them.
 
 Be specific in feedback. "This is wrong" doesn't help. "The merge logic in accept.ts has a
 bug — extract it into a shared helper in shared.ts" does.

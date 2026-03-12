@@ -27,7 +27,7 @@ import { promptYesNo } from '../editor';
 import { theme } from '../theme';
 import { logger } from '../../utils/logger';
 import { reconcileTasks } from '../../utils/reconcile';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
 import { getDataDir } from '../init';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { checkPairingLock } from '../../utils/pairing-lock';
@@ -183,7 +183,9 @@ async function resumeTask(
   const containerName = runner.runNameForTask(tRef);
 
   try {
-    const config = loadConfig(root);
+    // Load config from the worktree — the branch may have settings (e.g., permissions)
+    // that aren't on the project root's lazy.toml yet.
+    const config = loadConfig(root, { cwd: worktreePath });
 
     // Ensure sandbox exists
     const sandboxPath = join(worktreePath, SANDBOX_DIR);
@@ -203,7 +205,7 @@ async function resumeTask(
     const modelId = getModelId(modelName);
 
     // Build the prompts: static system prompt and dynamic user prompt
-    const systemPrompt = buildSystemPromptForResume();
+    const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions());
     const fullPrompt = buildResumePrompt(task.goal, root);
 
     // Record synthetic human turn
@@ -232,11 +234,7 @@ async function resumeTask(
       system_prompt: systemPrompt,
       model_id: modelId,
       agent_session_id: sess.agent_session_id ?? undefined,
-      turn_started_at: new Date().toISOString(),
-      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
-      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-      }),
+      ...commonCommandFields(config),
     };
     writeCommand(protoDir, unblockCommand);
 

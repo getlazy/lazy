@@ -27,6 +27,7 @@ function isInteractiveMode(args: string[]): boolean {
   if (args.includes('--sync-with-upstream')) return false;
   if (args.includes('--merge-and-fix')) return false;  // hidden alias
   if (args.includes('--message')) return false;
+  if (args.includes('--approve-file')) return false;
   if (args.indexOf('-f') !== -1) return false;
   return true;
 }
@@ -40,8 +41,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'sync-with-upstream', takesValue: false },
     { name: 'merge-and-fix', takesValue: false },  // hidden alias for --sync-with-upstream
     { name: 'follow', takesValue: false },
-    { name: 'docker-agent-root', takesValue: false },
     { name: 'docker-agent-no-network', takesValue: false },
+    { name: 'approve-file', takesValue: true, accumulate: true },
   ], 'unblock');
 
   const taskId = parsed.positional[0];
@@ -53,9 +54,9 @@ export async function commandUnblock(args: string[]): Promise<void> {
   // Parse flags
   const syncWithUpstream = parsed.flags.get('sync-with-upstream') === true || parsed.flags.get('merge-and-fix') === true;
   const follow = parsed.flags.get('follow') === true;
-  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
   const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
   const messageValue = parsed.flags.get('message') as string | undefined;
+  const approvedFiles = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
 
   // --sync-with-upstream is combinable with feedback flags (--message, -f, piped stdin).
   // When combined, the feedback is delivered normally and additional merge-conflict
@@ -120,7 +121,6 @@ export async function commandUnblock(args: string[]): Promise<void> {
     // CRITICAL: These must happen before the human types feedback,
     // so we never lose their input to a pre-flight failure.
     const dockerOptions: Partial<DockerRunnerOptions> = {};
-    if (dockerAgentRoot) dockerOptions.dockerAgentRoot = true;
     if (dockerAgentNoNetwork) dockerOptions.dockerAgentNoNetwork = true;
     const runner = createRunner(root, dockerOptions);
     try {
@@ -391,7 +391,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
     const taskShortId = shortId(task.id);
     const tRef = taskRef(task);
     const worktreePath = getWorktreePathForRef(root, tRef);
-    await launchFeedbackTurn(task, sess, message, syncWithUpstream, root, storage, worktreePath, taskShortId, follow, modelOverride, feedbackRecoveryPath, notesInEditor);
+    await launchFeedbackTurn(task, sess, message, syncWithUpstream, root, storage, worktreePath, taskShortId, follow, modelOverride, feedbackRecoveryPath, notesInEditor, approvedFiles);
   } finally {
     await storage.close();
   }
@@ -456,7 +456,7 @@ async function reviewProposals(
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | --message <text>] [--model <model>] [--sync-with-upstream] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | --message <text>] [--model <model>] [--sync-with-upstream] [--approve-file <file>...] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -482,6 +482,7 @@ Options:
   --message <text>    Provide inline feedback
   --model <model>     Override model for this turn (apprentice, journeyman, master, sonnet, opus, haiku)
   --sync-with-upstream  Merge upstream changes and resolve conflicts (combinable with feedback)
+  --approve-file <file>   Approve a violated file (repeatable, default: all rejected)
   --follow            Wait for the agent to finish, streaming output in real time
 
 Feedback input priority: --message flag > -f file > piped stdin > $EDITOR (interactive)
@@ -511,5 +512,6 @@ Examples:
   lazy unblock abc123 --sync-with-upstream              # Fix merge conflicts
   lazy unblock abc123 --sync-with-upstream --message "Also fix the bug"  # Merge + feedback
   lazy unblock abc123 --message "Fix it" --follow       # Wait for completion
-  echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback`);
+  echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback
+  lazy unblock abc123 --approve-file a.ts --approve-file b.ts --message "OK" # Approve specific violated files`);
 }

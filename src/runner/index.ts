@@ -20,7 +20,7 @@ import { loadConfig } from '../config/loader';
 
 /**
  * Create a Runner based on the configured runner type.
- * Accepts optional overrides for docker_agent_root and docker_agent_no_network (from CLI flags).
+ * Accepts optional overrides for docker_agent_no_network (from CLI flags).
  */
 export function createRunner(lazyRoot: string, overrides?: Partial<DockerRunnerOptions>): Runner {
   const config = loadConfig(lazyRoot);
@@ -36,7 +36,6 @@ export function createRunner(lazyRoot: string, overrides?: Partial<DockerRunnerO
 
   // Merge config values with CLI overrides (overrides take precedence)
   const dockerOptions: DockerRunnerOptions = {
-    dockerAgentRoot: overrides?.dockerAgentRoot ?? config.runner.docker_agent_root,
     dockerAgentNoNetwork: overrides?.dockerAgentNoNetwork ?? config.runner.docker_agent_no_network,
   };
 

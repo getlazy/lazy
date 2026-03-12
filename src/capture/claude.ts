@@ -28,7 +28,6 @@ export interface SandboxConfig {
 }
 
 export interface DockerRunOptions {
-  dockerAgentRoot?: boolean;
   dockerAgentNoNetwork?: boolean;
 }
 
@@ -489,7 +488,6 @@ function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBina
 
   return [
     binary, 'run', '--rm', '--init',
-    ...(options?.dockerAgentRoot ? ['--user', 'root'] : []),
     ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '-v', `${repoRoot}:${repoRoot}`,
     '-w', sandbox.worktreePath,
@@ -664,7 +662,6 @@ function buildDockerArgsAsync(
 
   return [
     binary, 'run', '-d', '--init',
-    ...(options?.dockerAgentRoot ? ['--user', 'root'] : []),
     ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,
@@ -1000,7 +997,6 @@ export async function launchSupervisorAsync(
 
   const args = [
     binary, 'run', '-d', '--init',
-    ...(dockerOptions?.dockerAgentRoot ? ['--user', 'root'] : []),
     ...(dockerOptions?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
     '-v', `${repoRoot}:${repoRoot}`,

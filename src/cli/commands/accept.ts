@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { existsSync } from 'fs';
 import type { Task } from '../../types';
-import { isActiveStatus } from '../../types';
+import { isActiveStatus, isBlockedStatus } from '../../types';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, validateCode, rejectIfPairing, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
 import { hasUncommittedChanges, getCurrentSha } from '../../git/operations';
 import { validateBranchInSyncWithRemote } from '../../utils/git';
@@ -12,11 +12,29 @@ import { isTTY, promptYesNo, promptLine, readStdinIfPiped } from '../editor';
 import { commandUnblock } from './unblock';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
-import { getActiveChildren } from '../orphan';
+import { getActiveChildren, reparentChildren } from '../orphan';
+import type { Storage } from '../../storage/interface';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
+
+/**
+ * Re-parent non-terminal children of the accepted task and log the result.
+ */
+async function reparentAndLog(task: Task, storage: Storage): Promise<void> {
+  const reparented = await reparentChildren(task, storage);
+  if (reparented.length > 0) {
+    const newParentDesc = task.parent_task_id
+      ? task.parent_task_id.substring(0, 8)
+      : 'top-level';
+    const plural = reparented.length === 1 ? 'child' : 'children';
+    console.log(`Re-parented ${reparented.length} unfinished ${plural} of ${displayId(task)} to ${newParentDesc}.`);
+    for (const child of reparented) {
+      console.log(`  ${displayId(child)} [${child.status}] ${child.goal}`);
+    }
+  }
+}
 
 /**
  * Fire off sync-with-upstream (merge upstream + resolve conflicts) without blocking.
@@ -38,6 +56,7 @@ export async function commandAccept(args: string[]): Promise<void> {
     { name: 'yes', takesValue: false },
     { name: 'reason', takesValue: true },
     { name: 'wait', takesValue: false },
+    { name: 'approve-file', takesValue: true, accumulate: true },
   ], 'accept');
 
   const taskId = parsed.positional[0];
@@ -49,6 +68,7 @@ export async function commandAccept(args: string[]): Promise<void> {
   const yes = parsed.flags.get('yes') === true;
   const wait = parsed.flags.get('wait') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
+  const approvedFiles = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
 
   const root = requireLazyRoot();
   const config = loadConfig(root);
@@ -97,6 +117,62 @@ export async function commandAccept(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // Only blocked tasks can be accepted (must review before accepting)
+    if (!isBlockedStatus(task.status) && task.status !== 'merging') {
+      if (task.status === 'interrupted') {
+        console.error(`Task ${displayId(task)} is interrupted. Resume it first: lazy resume ${displayId(task)}`);
+      } else if (task.status === 'working') {
+        console.error(`Task ${displayId(task)} is still working. Wait for it to finish.`);
+      } else {
+        console.error(`Task ${displayId(task)} is in state '${task.status}' and cannot be accepted.`);
+      }
+      process.exit(1);
+    }
+
+    // INVARIANT: Tasks with unresolved file permission violations cannot be accepted
+    // unless ALL pending violations are covered by --approve-file flags.
+    // This prevents protected file changes from being merged without explicit human review.
+    const turns = await storage.getSessionTurns(sess.id);
+    const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+    if (lastAgentTurn?.violations?.some(v => v.status === 'pending')) {
+      const pendingFiles = lastAgentTurn.violations
+        .filter(v => v.status === 'pending')
+        .map(v => v.file);
+
+      if (approvedFiles.length === 0) {
+        // No --approve-file flags → refuse
+        console.error(`Task ${displayId(task)} has unresolved file permission violations:`);
+        for (const f of pendingFiles) {
+          console.error(`  - ${f}`);
+        }
+        console.error(`\nResolve violations by accepting with --approve-file to approve all files,`);
+        console.error(`or unblock without --approve-file to reject all (revert to original).`);
+        console.error(`Example: ${theme.command('lazy accept ' + displayId(task) + ' --approve-file file1 --approve-file file2 --yes')}`);
+        process.exit(1);
+      }
+
+      // Check that --approve-file covers ALL pending violations
+      const approvedSet = new Set(approvedFiles);
+      const missingFiles = pendingFiles.filter(f => !approvedSet.has(f));
+
+      if (missingFiles.length > 0) {
+        console.error(`Missing approval for ${missingFiles.length} violated file(s):`);
+        for (const f of missingFiles) {
+          console.error(`  - ${f}`);
+        }
+        console.error(`\nAll violated files must be approved to accept. Add the missing --approve-file flags.`);
+        process.exit(1);
+      }
+
+      // All pending violations covered — mark them as approved
+      const updatedViolations: import('../../types').FileViolation[] = lastAgentTurn.violations.map(v => ({
+        ...v,
+        status: v.status === 'pending' ? 'approved' as const : v.status,
+      }));
+      await storage.updateTurnViolations(task.id, lastAgentTurn.id, updatedViolations);
+      console.log(`Approved ${pendingFiles.length} protected file change(s): ${pendingFiles.join(', ')}`);
+    }
+
     // Check for pairing lock — refuse if someone is pairing on this task
     rejectIfPairing(root, taskRef(task), displayId(task));
 
@@ -127,6 +203,9 @@ export async function commandAccept(args: string[]): Promise<void> {
         // End session and mark complete
         await storage.endSession(sess.id, 'accepted');
         await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+        // Re-parent unfinished children to the grandparent
+        await reparentAndLog(task, storage);
 
         // Clean up resources
         await cleanupTaskContainer(storage, sess, taskRef(task), root);
@@ -210,6 +289,9 @@ export async function commandAccept(args: string[]): Promise<void> {
 
             await storage.endSession(sess.id, 'accepted');
             await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+            // Re-parent unfinished children to the grandparent
+            await reparentAndLog(task, storage);
 
             await cleanupTaskContainer(storage, sess, taskRef(task), root);
             removeLock(worktreePath);
@@ -344,11 +426,20 @@ export async function commandAccept(args: string[]): Promise<void> {
         process.exit(1);
       }
 
-      // Refuse to merge into a parent that has an active agent — merging into
-      // the agent's working tree mid-turn would corrupt its state.
+      // Refuse to merge into a parent that has an active worktree.
+      // - working: agent is mid-turn, a squash merge commit would corrupt its state
+      // - pairing: human is interactively working, a surprise commit would appear
+      // - interrupted: agent will resume and find unexpected changes
+      // - merging: PR/MR is in flight, local state is uncertain
+      // The only safe time to merge is when the parent is blocked.
       if (isActiveStatus(parentTask.status)) {
-        console.error(`Error: Parent task ${displayId(parentTask)} is currently ${parentTask.status}. Accepting would merge into its active worktree.`);
-        console.error(`Wait for the parent task to finish or become blocked.`);
+        console.error(`Error: Parent task ${displayId(parentTask)} is currently ${parentTask.status}.`);
+        console.error('Merging into an active worktree would surprise the agent or human working there.');
+        if (parentTask.status === 'interrupted') {
+          console.error(`Either wait for the parent to resume, or resume it manually: ${theme.command('lazy resume ' + displayId(parentTask))}`);
+        } else {
+          console.error('Wait for the parent task to become blocked, then retry accept.');
+        }
         process.exit(1);
       }
 
@@ -586,10 +677,14 @@ export async function commandAccept(args: string[]): Promise<void> {
       console.error(`Warning: ${reviewWarning}`);
     }
 
-    // Mark task complete BEFORE cleanup — cleanup can throw and must not
-    // prevent the status update (which would leave the task as "blocked"
-    // with an accepted session, causing it to appear in active/blocked lists).
+    // Transition through merging → complete. Even for local merges, we go
+    // through the merging state so the transition table stays consistent:
+    // blocked → merging → complete (never blocked → complete directly).
+    await storage.updateTaskStatus(task.id, 'merging', getActor());
     await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+    // Re-parent unfinished children to the grandparent
+    await reparentAndLog(task, storage);
 
     // Stop and remove the task's Docker container
     await cleanupTaskContainer(storage, sess, taskRef(task), root);
@@ -698,7 +793,7 @@ export async function commandAccept(args: string[]): Promise<void> {
 }
 
 export function acceptUsage(): void {
-  console.log(`Usage: lazy accept <task_id> [--reason "..."] [--yes] [--wait]
+  console.log(`Usage: lazy accept <task_id> [--reason "..."] [--yes] [--wait] [--approve-file <file>...]
 
 Accept a task's work and merge it into the appropriate branch.
 
@@ -709,10 +804,12 @@ Arguments:
   <task_id>    ID of the task to accept
 
 Options:
-  --reason "..."  Provide accept reason inline (default: "LGTM")
-  --yes           Skip interactive prompts (non-interactive mode)
-  --wait          If merge fails due to pending CI checks, poll until checks
-                  complete, then retry the merge. Timeout: 10 minutes.
+  --reason "..."        Provide accept reason inline (default: "LGTM")
+  --yes                 Skip interactive prompts (non-interactive mode)
+  --wait                If merge fails due to pending CI checks, poll until checks
+                        complete, then retry the merge. Timeout: 10 minutes.
+  --approve-file <file> Approve a violated file (repeatable). Required when accepting
+                        a conflict task — all violated files must be listed.
 
 Reason input priority: --reason flag > piped stdin > interactive prompt > "LGTM"
 
@@ -744,5 +841,6 @@ Examples:
   echo "Looks good" | lazy accept abc12345      # Piped stdin as reason
   lazy accept abc12345 --yes                    # Accept without prompts (uses "LGTM")
   lazy accept abc12345 --reason "Ship it" --yes # Accept with reason, no prompts
-  lazy accept abc12345 --wait                   # Wait for CI checks before merging`);
+  lazy accept abc12345 --wait                   # Wait for CI checks before merging
+  lazy accept abc12345 --approve-file a.ts --approve-file b.ts --yes  # Accept conflict task, approving violated files`);
 }

@@ -15,7 +15,7 @@ import { getAuthEnv, getModelId } from '../capture/claude';
 import type { SandboxConfig } from '../capture/claude';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../protocol';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
@@ -137,7 +137,9 @@ export async function autoResumeTask(
   const containerName = runner.runNameForTask(tRef);
 
   try {
-    const config = loadConfig(lazyRoot);
+    // Load config from the worktree — the branch may have settings (e.g., permissions)
+    // that aren't on the project root's lazy.toml yet.
+    const config = loadConfig(lazyRoot, { cwd: worktreePath });
 
     // Ensure sandbox exists
     const sandboxPath = join(worktreePath, SANDBOX_DIR);
@@ -239,11 +241,7 @@ export async function autoResumeTask(
       agent_session_id: claudeSessionId ?? undefined,
       parent_branch: parentBranch,
       sync_before_work: syncBeforeWork,
-      turn_started_at: new Date().toISOString(),
-      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
-      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-      }),
+      ...commonCommandFields(config),
     };
     writeCommand(protoDir, unblockCommand);
 

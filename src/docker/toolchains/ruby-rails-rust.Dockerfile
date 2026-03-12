@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     zlib1g-dev \
     redis-tools \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (for asset pipeline / esbuild / webpacker)
@@ -34,18 +35,23 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g yarn
 
 # Install Rust via rustup to shared locations accessible by all users.
-# chmod ensures the non-root user can run rustup/cargo and install crates.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default \
-    && chmod -R a+w /usr/local/cargo /usr/local/rustup
-
-RUN useradd -m -s /bin/bash user
-USER user
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default
 
 # Install Claude Code via native installer (installs to ~/.local/bin/claude)
 RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/user/.local/bin:$PATH"
+
+# Make Claude available system-wide (for non-root builder sessions)
+RUN cp /root/.local/bin/claude /usr/local/bin/claude
+# Remove native install artifacts so Claude Code doesn't detect a stale native install
+RUN rm -rf /root/.local/bin/claude
+# Non-root user with sudo — passes Claude Code's root check while allowing tool installs
+RUN useradd -m -s /bin/bash user \
+    && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+USER user
+RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 WORKDIR /work

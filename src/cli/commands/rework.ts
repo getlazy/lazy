@@ -123,7 +123,7 @@ export async function commandRework(args: string[]): Promise<void> {
       console.error(`Task ${displayId(originalTask)} is ${originalTask.status}, not complete (accepted).`);
       if (originalTask.status === 'abandoned' || originalTask.status === 'closed') {
         console.error(`Use \`lazy reopen ${displayId(originalTask)}\` to reopen rejected/closed tasks.`);
-      } else if (originalTask.status === 'blocked') {
+      } else if (originalTask.status === 'blocked' || originalTask.status === 'conflict') {
         console.error(`Use \`lazy unblock ${displayId(originalTask)}\` to continue blocked tasks.`);
       } else {
         console.error(`Use \`lazy create\` to create a new task instead.`);

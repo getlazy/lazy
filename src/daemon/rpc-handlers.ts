@@ -28,8 +28,10 @@ export class RpcError extends Error {
   }
 }
 
-async function openProjectStorage(projectRoot: string): Promise<Storage> {
-  const config = loadConfig(projectRoot);
+export async function openProjectStorage(projectRoot: string): Promise<Storage> {
+  // Pass projectRoot as cwd so config resolution starts from the correct
+  // project directory, not the daemon's own cwd (which may be a different project).
+  const config = loadConfig(projectRoot, { cwd: projectRoot });
   return createStorage(projectRoot, {
     backend: config.storage.backend as StorageBackend,
     externalPath: config.storage.external_path || undefined,

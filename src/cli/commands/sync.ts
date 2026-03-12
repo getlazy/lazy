@@ -26,6 +26,7 @@ import { isTerminalStatus } from '../../types';
 import { removeLock } from '../../utils/lock';
 import { protocolDir, removeProtocolDir } from '../../protocol';
 import { getActor } from '../../constants';
+import { reparentChildren } from '../orphan';
 
 /**
  * SyncLogger abstracts how sync progress is reported.
@@ -93,8 +94,8 @@ async function detectExternalChanges(storage: ReturnType<typeof requireStorage> 
 
   for (const task of allTasks) {
     if (!driver.hasRemoteRef(task)) continue;
-    // Check both blocked and merging tasks for external state changes
-    if (task.status !== 'blocked' && task.status !== 'merging') continue;
+    // Check blocked, conflict, and merging tasks for external state changes
+    if (task.status !== 'blocked' && task.status !== 'conflict' && task.status !== 'merging') continue;
 
     try {
       const prState = await driver.getPRState(task);
@@ -122,6 +123,16 @@ async function detectExternalChanges(storage: ReturnType<typeof requireStorage> 
           await storage.endSession(session.id, 'accepted');
         }
         await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+        // Re-parent unfinished children to the grandparent
+        const reparented = await reparentChildren(task, storage);
+        if (reparented.length > 0) {
+          const newParentDesc = task.parent_task_id
+            ? task.parent_task_id.substring(0, 8)
+            : 'top-level';
+          const plural = reparented.length === 1 ? 'child' : 'children';
+          log.detail(`  Re-parented ${reparented.length} unfinished ${plural} of ${displayId(task)} to ${newParentDesc}`);
+        }
 
         // Clean up worktree, container, and protocol dir for completed merging tasks
         if (root && session) {
@@ -185,7 +196,7 @@ async function exportTasks(storage: ReturnType<typeof requireStorage> extends Pr
 
   for (const task of allTasks) {
     // Only export tasks that have sessions (i.e., work has been done)
-    if (task.status !== 'blocked') continue;
+    if (task.status !== 'blocked' && task.status !== 'conflict') continue;
 
     const session = await storage.getSessionByTaskId(task.id);
     if (!session?.git_branch) continue;
@@ -249,7 +260,7 @@ async function postTurnSummaries(storage: ReturnType<typeof requireStorage> exte
 
   for (const task of allTasks) {
     if (!driver.hasRemoteRef(task)) continue;
-    if (task.status !== 'blocked') continue;
+    if (task.status !== 'blocked' && task.status !== 'conflict') continue;
 
     try {
       const session = await storage.getSessionByTaskId(task.id);
@@ -315,7 +326,7 @@ async function postTaskNotes(storage: ReturnType<typeof requireStorage> extends 
 
   for (const task of allTasks) {
     if (!driver.hasRemoteRef(task)) continue;
-    if (task.status !== 'blocked') continue;
+    if (task.status !== 'blocked' && task.status !== 'conflict') continue;
 
     try {
       const comments = await storage.getTaskComments(task.id);
@@ -417,7 +428,7 @@ async function fetchRemoteComments(storage: ReturnType<typeof requireStorage> ex
 
   for (const task of allTasks) {
     if (!driver.hasRemoteRef(task)) continue;
-    if (task.status !== 'blocked') continue;
+    if (task.status !== 'blocked' && task.status !== 'conflict') continue;
 
     try {
       // Capture comment count before sync to detect new comments

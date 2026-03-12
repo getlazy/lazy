@@ -9,8 +9,8 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { Terminal, getTerminalSize, type KeyPress } from './terminal';
 import { render, renderTreeOverlay, renderHelpOverlay, flattenNavItems, formatMarkdown, colorDiff, wrapLines, statusColor, type NavItem, type LayoutState, type TreeOverlayNode, type SubtaskFilterMode } from './renderer';
-import { getDiffStat, getDiffFull, getCurrentBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit } from '../../git/operations';
-import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchNameFromId } from '../helpers';
+import { getDiffStat, getDiffFull, getCurrentBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists } from '../../git/operations';
+import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchName, getBranchNameFromId } from '../helpers';
 import type { TaskTreeNode } from '../../storage/types';
 import { readPendingProposals, updateProposalStatus } from '../commands/propose';
 import { getNewNotesSince } from '../commands/shared';
@@ -88,7 +88,9 @@ export async function loadReviewData(
     ? getNewNotesSince(comments, lastAgentTurn.timestamp)
     : comments;
 
-  // Load diff
+  // Load diff — prefer worktree (has uncommitted changes), fall back to
+  // branch-based diff from the main repo when the worktree is gone (e.g.
+  // accepted subtasks whose worktrees have been cleaned up).
   let diffStat = '';
   let diffFull = '';
   if (existsSync(worktreePath)) {
@@ -98,6 +100,17 @@ export async function loadReviewData(
     try {
       diffFull = getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
     } catch { /* branch may not exist */ }
+  } else {
+    // Worktree gone — try diffing the task branch from the main repo root
+    const taskBranch = getBranchName(task);
+    if (branchExists(taskBranch, root)) {
+      try {
+        diffStat = getDiffStat(targetBranch, taskBranch, root) || '';
+      } catch { /* branch comparison may fail */ }
+      try {
+        diffFull = getDiffFull(targetBranch, taskBranch, root) || '';
+      } catch { /* branch comparison may fail */ }
+    }
   }
 
   // Precompute per-turn data for ALL turns (human and agent)
@@ -109,13 +122,16 @@ export async function loadReviewData(
     const turnCommits = commitsByTurn.get(turn.sequence) ?? [];
 
     // Turn diff = combined diff of its commits. No commits = no diff.
+    // Use worktree if available, otherwise fall back to main repo root
+    // (commit SHAs are repo-wide so getCommitDiff works from any cwd).
     let turnDiffFull = '';
     let turnDiffFiles: string[] = [];
-    if (turnCommits.length > 0 && existsSync(worktreePath)) {
+    const diffCwd = existsSync(worktreePath) ? worktreePath : root;
+    if (turnCommits.length > 0) {
       const diffs: string[] = [];
       for (const c of turnCommits) {
         try {
-          const d = getCommitDiff(c.sha, worktreePath);
+          const d = getCommitDiff(c.sha, diffCwd);
           if (d) diffs.push(d);
         } catch { /* commit may not be accessible */ }
       }
@@ -162,11 +178,33 @@ async function loadReviewDataForSubtask(
     return loadReviewData(storage, task, sess, root);
   }
 
-  // Minimal data for tasks without sessions
+  // Minimal data for tasks without sessions — still try to get branch diff
   const childTasks = await storage.getChildTasks(task.id);
   const parentTask = task.parent_task_id
     ? await storage.getTask(task.parent_task_id)
     : null;
+
+  // Determine target branch for diff
+  let targetBranch = '';
+  if (task.parent_task_id) {
+    targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+  } else {
+    targetBranch = getCurrentBranch(root);
+  }
+
+  // Try to get branch diff even without a session
+  let diffStat = '';
+  let diffFull = '';
+  const worktreePath = getWorktreePath(root, task);
+  const taskBranch = getBranchName(task);
+  if (existsSync(worktreePath)) {
+    try { diffStat = getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+    try { diffFull = getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+  } else if (branchExists(taskBranch, root)) {
+    try { diffStat = getDiffStat(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+    try { diffFull = getDiffFull(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+  }
+
   return {
     task,
     session: null,
@@ -175,10 +213,10 @@ async function loadReviewDataForSubtask(
     comments: await storage.getTaskComments(task.id),
     unseenComments: [],
     proposals: [],
-    diffStat: '',
-    diffFull: '',
-    worktreePath: '',
-    targetBranch: '',
+    diffStat,
+    diffFull,
+    worktreePath,
+    targetBranch,
     lastAgentTurn: null,
     turnInfoMap: new Map(),
     taskTree: null,
@@ -1106,7 +1144,7 @@ function filterSubtaskEntries(entries: SubtaskEntry[], mode: SubtaskFilterMode):
     case 'all':
       return entries;
     case 'active':
-      return entries.filter(e => e.status === 'working' || e.status === 'blocked');
+      return entries.filter(e => e.status === 'working' || e.status === 'blocked' || e.status === 'conflict');
     case 'backlog':
       return entries.filter(e => e.status === 'backlog');
   }

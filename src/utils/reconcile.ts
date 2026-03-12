@@ -27,6 +27,7 @@ import { getDataDir } from '../cli/init';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { runGit } from './git';
+import { reparentChildren } from '../cli/orphan';
 
 /**
  * Grace period in milliseconds for newly-working tasks.
@@ -37,7 +38,10 @@ import { runGit } from './git';
  *
  * In test mode, we set this to 0 to allow tests to run quickly without waiting.
  */
-const WORKING_GRACE_PERIOD_MS = process.env.LAZY_TEST === '1' ? 0 : 30000; // 30 seconds (0 in tests)
+// Evaluated at call time (not module load) so that LAZY_TEST=1 set after import takes effect.
+function getWorkingGracePeriodMs(): number {
+  return process.env.LAZY_TEST === '1' ? 0 : 30000; // 30 seconds (0 in tests)
+}
 
 /**
  * Acquire a global reconciliation lock. Returns true if acquired, false if another process holds it.
@@ -212,7 +216,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     const now = Date.now();
     const timeSinceTransition = now - lastInteractionTime;
 
-    if (timeSinceTransition >= 0 && timeSinceTransition < WORKING_GRACE_PERIOD_MS) {
+    if (timeSinceTransition >= 0 && timeSinceTransition < getWorkingGracePeriodMs()) {
       logger.debug(`Task ${taskShortId}: within grace period (${Math.round(timeSinceTransition / 1000)}s), skipping reconciliation`);
       return;
     }
@@ -434,6 +438,7 @@ async function handleCompletedResponse(
       startShaWork: turnStartShaWork,
       endShaWork: turnEndShaWork,
       mergeConflicts: response.merge_conflicts,
+      violations: response.violations,
     });
   }
 
@@ -472,8 +477,9 @@ async function handleCompletedResponse(
     logger.debug(`Task ${taskShortId}: could not capture uncommitted changes`);
   }
 
-  // Transition to blocked
-  await storage.updateTaskStatus(taskId, 'blocked', 'system');
+  // Transition to blocked (or conflict if there are file permission violations)
+  const nextStatus = (response.violations && response.violations.length > 0) ? 'conflict' : 'blocked';
+  await storage.updateTaskStatus(taskId, nextStatus, 'system');
 
   // Reset consecutive interruptions counter — a successful turn means the agent is healthy
   await storage.resetConsecutiveInterruptions(session.id);
@@ -723,7 +729,19 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
       logger.warn(`Task ${taskShortId}: branch ${session.git_branch} already merged into ${mergeTarget}, fixing zombie state (${turns.length} turns, ${turns.filter(t => t.role === 'agent').length} agent)`);
 
       await storage.endSession(session.id, 'accepted');
+      await storage.updateTaskStatus(task.id, 'zombie', 'system');
       await storage.updateTaskStatus(task.id, 'complete', 'system');
+
+      // Re-parent unfinished children to the grandparent
+      const reparented = await reparentChildren(task, storage);
+      if (reparented.length > 0) {
+        const taskShortId = shortIdHelper(task.id);
+        const newParentDesc = task.parent_task_id
+          ? task.parent_task_id.substring(0, 8)
+          : 'top-level';
+        const plural = reparented.length === 1 ? 'child' : 'children';
+        logger.info(`Re-parented ${reparented.length} unfinished ${plural} of ${taskShortId} to ${newParentDesc}`);
+      }
     } catch (err) {
       logger.debug(`Failed to check merged branch for task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
     }

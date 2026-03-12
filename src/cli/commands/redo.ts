@@ -98,7 +98,6 @@ export async function commandRedo(args: string[]): Promise<void> {
     { name: 'model', takesValue: true },
     { name: 'no-start', takesValue: false },
     { name: 'yes', takesValue: false },
-    { name: 'docker-agent-root', takesValue: false },
     { name: 'docker-agent-no-network', takesValue: false },
   ], 'redo');
 
@@ -111,7 +110,6 @@ export async function commandRedo(args: string[]): Promise<void> {
   const promptOverride = parsed.flags.get('prompt') as string | undefined;
   const noStart = parsed.flags.get('no-start') === true;
   const yes = parsed.flags.get('yes') === true;
-  const dockerAgentRoot = parsed.flags.get('docker-agent-root') === true;
   const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
   let modelOverride: ModelName | undefined;
@@ -264,9 +262,6 @@ export async function commandRedo(args: string[]): Promise<void> {
     if (modelOverride) {
       startArgs.push('--model', modelOverride);
     }
-    if (dockerAgentRoot) {
-      startArgs.push('--docker-agent-root');
-    }
     if (dockerAgentNoNetwork) {
       startArgs.push('--docker-agent-no-network');
     }
@@ -293,7 +288,6 @@ Options:
   --model <model>    Override model for the new task (apprentice, journeyman, master, sonnet, opus, haiku)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
-  --docker-agent-root      Run container as root (overrides lazy.toml runner.docker_agent_root)
   --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
 
 What gets carried over:

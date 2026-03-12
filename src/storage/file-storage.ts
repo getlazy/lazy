@@ -26,6 +26,7 @@ import type {
   Session,
   Turn,
   MergeConflict,
+  FileViolation,
   Commit,
   Review,
   ReviewVerdict,
@@ -52,7 +53,8 @@ import type {
   ModelName,
   Actor,
 } from './types';
-import { isTerminalStatus } from '../types';
+import { isTerminalStatus, isBlockedStatus } from '../types';
+import { assertValidTransition } from '../task-state-machine';
 import { StorageLock } from '../utils/storage-lock';
 
 const STORAGE_VERSION = 1;
@@ -663,7 +665,7 @@ export class FileStorage implements Storage {
       if (options.rootsOnly && task.parent_task_id !== null) {
         return false;
       }
-      if (options.blockedOnly && task.status !== 'blocked') {
+      if (options.blockedOnly && !isBlockedStatus(task.status)) {
         return false;
       }
       if (options.backlogOnly && task.status !== 'backlog') {
@@ -681,7 +683,7 @@ export class FileStorage implements Storage {
       if (options.mergingOnly && task.status !== 'merging') {
         return false;
       }
-      if (options.nonTerminalOnly && !['working', 'blocked', 'pairing', 'interrupted', 'merging', 'backlog'].includes(task.status)) {
+      if (options.nonTerminalOnly && isTerminalStatus(task.status)) {
         return false;
       }
       return true;
@@ -696,13 +698,13 @@ export class FileStorage implements Storage {
       const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
       if (!task) return;
 
-      // Idempotent check: if already in target status, this is a no-op
-      this.assertNotTerminal(task, `change status to '${status}'`, status);
-
-      // If we reach here and status is already the target, skip the update
+      // Idempotent: same state → same state is a no-op
       if (task.status === status) {
         return;
       }
+
+      // Enforce valid transitions via the state machine
+      assertValidTransition(task.status, status, actor);
 
       const now = Date.now();
       task.status = status;
@@ -817,7 +819,7 @@ export class FileStorage implements Storage {
       const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
       if (!task) return;
 
-      this.assertNotTerminal(task, 'close');
+      assertValidTransition(task.status, 'closed');
 
       const now = Date.now();
       task.status = 'closed';
@@ -841,6 +843,9 @@ export class FileStorage implements Storage {
       // If task has no session (never started), reopen to 'backlog'.
       const session = await this.getSessionByTaskId(fullId);
       const newStatus = session ? 'blocked' : 'backlog';
+
+      // Enforce valid transition via the state machine
+      assertValidTransition(task.status, newStatus);
       const now = Date.now();
       task.status = newStatus;
       task.completed_at = null;
@@ -1220,6 +1225,7 @@ export class FileStorage implements Storage {
         startShaWork,
         endShaWork,
         mergeConflicts,
+        violations,
         model,
         prompt,
         actor,
@@ -1254,6 +1260,7 @@ export class FileStorage implements Storage {
         end_sha_work: endShaWork ?? null,
         end_sha: endSha ?? null,
         ...(mergeConflicts && mergeConflicts.length > 0 ? { merge_conflicts: mergeConflicts } : {}),
+        ...(violations && violations.length > 0 ? { violations } : {}),
         ...(model ? { model } : {}),
         ...(prompt ? { prompt } : {}),
         ...(actor ? { actor } : {}),
@@ -1322,6 +1329,22 @@ export class FileStorage implements Storage {
   async getTurnCountByTaskId(taskId: string): Promise<number> {
     const turnsFile = await this.readJson<TurnsFile>(join(this.taskDir(taskId), 'turns.json'));
     return turnsFile?.turns?.length ?? 0;
+  }
+
+  async updateTurnViolations(taskId: string, turnId: string, violations: FileViolation[]): Promise<void> {
+    return this.lock.withLock(async () => {
+      const turnsFile = await this.readJson<TurnsFile>(join(this.taskDir(taskId), 'turns.json'));
+      if (turnsFile?.turns) {
+        const turn = turnsFile.turns.find(t => t.id === turnId);
+        if (turn) {
+          turn.violations = violations;
+          await this.atomicWriteTask(taskId, { 'turns.json': turnsFile });
+          return;
+        }
+      }
+
+      throw new Error(`Turn not found: ${turnId}`);
+    });
   }
 
   // --- Commits ---

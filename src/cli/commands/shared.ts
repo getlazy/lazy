@@ -9,7 +9,7 @@ import { existsSync } from 'fs';
 import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getDiffStat } from '../../git/operations';
 import { getModelId } from '../../capture/claude';
 import { createRunner } from '../../runner';
-import { hasResponse, readCommand, protocolDir as getProtocolDir, writeCommand, ensureProtocolDir } from '../../protocol';
+import { hasResponse, readCommand, protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
 import type { StartCommand, UnblockCommand } from '../../protocol';
 import { reconcileTasks } from '../../utils/reconcile';
 import { loadConfig } from '../../config/loader';
@@ -20,7 +20,7 @@ import { logger } from '../../utils/logger';
 import type { Storage } from '../../storage';
 import { requireStorage, shortId, displayId, taskRef, getBranchNameFromId } from '../helpers';
 import { isTerminalStatus } from '../../types';
-import type { Task, Turn, Comment, ModelName } from '../../types';
+import type { Task, Turn, Comment, ModelName, FileViolation } from '../../types';
 import { createDriver, type RemoteComment } from '../../remote';
 import type { SandboxConfig } from '../../capture/claude';
 
@@ -28,6 +28,7 @@ import { commandAccept } from './accept';
 import { theme, dim } from '../theme';
 import { getActor } from '../../constants';
 import { isFeatureEnabled } from '../../utils/features';
+import { reparentChildren } from '../orphan';
 import { readPendingProposals, updateProposalStatus, type Proposal } from './propose';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
 
@@ -156,8 +157,12 @@ comments. Treat them as review feedback to consider alongside your task goal.
  * Build the static system prompt for task agents.
  * This content is stable across turns and benefits from prompt caching.
  */
-export function buildSystemPrompt(): string {
-  return lazyToolInstructions + '\n' + systemInstructionsText;
+export function buildSystemPrompt(runnerInstructions?: string): string {
+  let prompt = lazyToolInstructions + '\n' + systemInstructionsText;
+  if (runnerInstructions) {
+    prompt += '\n' + runnerInstructions;
+  }
+  return prompt;
 }
 
 /**
@@ -597,6 +602,15 @@ export async function syncTaskFromRemote(
             await storage.endSession(sess.id, 'accepted');
           }
           await storage.updateTaskStatus(task.id, 'complete', getActor());
+          // Re-parent unfinished children to the grandparent
+          const reparented = await reparentChildren(task, storage);
+          if (reparented.length > 0) {
+            const newParentDesc = task.parent_task_id
+              ? task.parent_task_id.substring(0, 8)
+              : 'top-level';
+            const plural = reparented.length === 1 ? 'child' : 'children';
+            console.log(`Re-parented ${reparented.length} unfinished ${plural} of ${displayId(task)} to ${newParentDesc}.`);
+          }
         }
       } else if (prState === 'CLOSED') {
         console.log(`Remote ref was closed externally — marking task ${displayId(task)} closed`);
@@ -1008,6 +1022,7 @@ export async function launchFeedbackTurn(
   modelOverride?: ModelName,
   feedbackRecoveryPath?: string | null,
   notesInEditor?: boolean,
+  approvedFiles?: string[],
 ): Promise<void> {
   const sandbox: SandboxConfig = {
     worktreePath,
@@ -1052,7 +1067,67 @@ export async function launchFeedbackTurn(
       }
     }
 
-    const config = loadConfig(root);
+    // --- Revert rejected file violations (conflict tasks) ---
+    // When unblocking a task with violations, revert files that are NOT approved.
+    // Default (no --approve-file) = ALL violations rejected = all files reverted.
+    let violationRevertInfo: string | undefined;
+    if (task.status === 'conflict') {
+      const existingTurns = await storage.getSessionTurns(sess.id);
+      const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
+
+      if (latestAgentTurn?.violations?.length) {
+        const violations = latestAgentTurn.violations;
+        const approvedSet = new Set(approvedFiles ?? []);
+
+        const updatedViolations: FileViolation[] = violations.map(v => ({
+          ...v,
+          status: approvedSet.has(v.file) ? 'approved' as const : 'rejected' as const,
+        }));
+
+        const rejectedFiles = updatedViolations.filter(v => v.status === 'rejected');
+        const approvedViolations = updatedViolations.filter(v => v.status === 'approved');
+
+        // Revert rejected files to their base SHA
+        if (rejectedFiles.length > 0) {
+          for (const v of rejectedFiles) {
+            const result = runGit(['checkout', v.base_sha, '--', v.file], { cwd: worktreePath });
+            if (result.exitCode !== 0) {
+              throw new Error(`Failed to revert protected file ${v.file} to ${v.base_sha}: ${result.stderr}`);
+            }
+          }
+
+          const revertedPaths = rejectedFiles.map(v => v.file);
+          runGit(['add', ...revertedPaths], { cwd: worktreePath });
+          runGit(['commit', '-m', 'Revert protected file changes (rejected by reviewer)'], { cwd: worktreePath });
+          console.log(`Reverted ${revertedPaths.length} protected file(s): ${revertedPaths.join(', ')}`);
+        }
+
+        if (approvedViolations.length > 0) {
+          console.log(`Approved ${approvedViolations.length} protected file change(s): ${approvedViolations.map(v => v.file).join(', ')}`);
+        }
+
+        // Update violation statuses on the turn
+        await storage.updateTurnViolations(task.id, latestAgentTurn.id, updatedViolations);
+
+        // Build context for the agent prompt
+        const revertedList = rejectedFiles.map(v => v.file);
+        const approvedList = approvedViolations.map(v => v.file);
+        const parts: string[] = [];
+        if (revertedList.length > 0) {
+          parts.push(`The following protected files were REVERTED (do NOT modify them again):\n${revertedList.map(f => `  - ${f}`).join('\n')}`);
+        }
+        if (approvedList.length > 0) {
+          parts.push(`The following protected file changes were APPROVED by the reviewer:\n${approvedList.map(f => `  - ${f}`).join('\n')}`);
+        }
+        if (parts.length > 0) {
+          violationRevertInfo = parts.join('\n\n');
+        }
+      }
+    }
+
+    // Load config from the worktree — the branch may have settings (e.g., permissions)
+    // that aren't on the project root's lazy.toml yet.
+    const config = loadConfig(root, { cwd: worktreePath });
 
     // Determine model to use: CLI flag > previous turn's model (sticky) > task.model > config default
     let stickyModel: ModelName | undefined;
@@ -1154,10 +1229,15 @@ export async function launchFeedbackTurn(
     const syncResult = await runSyncWithRemote(task, sess, root, storage, worktreePath);
     const remoteCommentsCtx = syncResult.remoteCommentsCtx;
 
+    // Prepend violation revert info so the agent knows what was reverted/approved
+    if (violationRevertInfo) {
+      message = `## Protected File Resolution\n\n${violationRevertInfo}\n\n---\n\n${message}`;
+    }
+
     // Build the prompts: static system prompt and dynamic user prompt.
     // (Merge instructions handled by supervisor's merge phase, so we pass null for parentBranch
     // — the supervisor gets merge info via the command)
-    const systemPrompt = buildSystemPrompt();
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
     const fullMessage = buildPromptWithInstructions(message.trim(), task.goal, null, root, turnHistory, notesCtx, remoteCommentsCtx);
 
     // --- Persist state BEFORE launching container ---
@@ -1179,8 +1259,8 @@ export async function launchFeedbackTurn(
       removeRecoveryFile(feedbackRecoveryPath);
     }
 
-    // Transition to working (from blocked or interrupted)
-    if (task.status === 'blocked' || task.status === 'interrupted') {
+    // Transition to working (from blocked, conflict, or interrupted)
+    if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'interrupted') {
       await storage.updateTaskStatus(task.id, 'working', getActor());
     }
 
@@ -1206,11 +1286,7 @@ export async function launchFeedbackTurn(
       sync_before_work: !!upstreamChanged,
       sync_after_work: autoSyncAfterTurn,
       remote_branch: syncResult.remoteBranch,
-      turn_started_at: new Date().toISOString(),
-      // Pass watchdog config if user explicitly set a non-zero value. 0 = omit, use agent default.
-      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-      }),
+      ...commonCommandFields(config),
     };
     writeCommand(protoDir, unblockCommand);
 

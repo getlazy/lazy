@@ -2,6 +2,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync, readFileSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
+import { isBlockedStatus } from '../../types';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { getCurrentSha, getNewCommits, getDiffStat } from '../../git/operations';
@@ -275,8 +276,8 @@ export async function commandPair(args: string[]): Promise<void> {
       return;
     }
 
-    // Task must be in 'blocked' state to pair (only valid entry point)
-    if (task.status !== 'blocked') {
+    // Task must be blocked, conflict, or interrupted to pair
+    if (!isBlockedStatus(task.status) && task.status !== 'interrupted') {
       if (task.status === 'working') {
         console.error(`Task ${displayId(task)} is currently working under the supervisor.`);
         console.error(`Wait for it to finish, or check status with: lazy status ${displayId(task)}`);
@@ -284,7 +285,7 @@ export async function commandPair(args: string[]): Promise<void> {
         console.error(`Task ${displayId(task)} is already in a pairing session.`);
         console.error(`End the current pairing session first, or clear the lock with: lazy pair ${displayId(task)} --unlock`);
       } else {
-        console.error(`Task ${displayId(task)} is in state '${task.status}', not 'blocked'. Can only pair with blocked tasks.`);
+        console.error(`Task ${displayId(task)} is in state '${task.status}'. Can only pair with blocked, conflict, or interrupted tasks.`);
       }
       process.exit(1);
     }
