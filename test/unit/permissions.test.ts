@@ -143,6 +143,73 @@ describe('detectViolations', () => {
     expect(violations[0].file).toBe('foo.test.ts');
   });
 
+  // INVARIANT: Files created by the task itself are not violations when modified later.
+  // The permission system protects pre-existing files, not agent-created ones.
+  test('allows modification of file created by earlier commits in same task', () => {
+    // Record the branch point (before the task creates any files)
+    const branchPointSha = getSha(repoDir);
+
+    // Task creates a new file matching protected pattern (simulates turn 1)
+    mkdirSync(join(repoDir, 'test'), { recursive: true });
+    writeFileSync(join(repoDir, 'test', 'new-feature.test.ts'), 'test("v1", () => {});\n');
+    git(repoDir, 'add', '.');
+    git(repoDir, 'commit', '-m', 'Turn 1: create test file');
+
+    // Later turn modifies the same file (simulates turn 5 after feedback)
+    const startSha = getSha(repoDir);
+    writeFileSync(join(repoDir, 'test', 'new-feature.test.ts'), 'test("v2 - rewritten after feedback", () => {});\n');
+    git(repoDir, 'add', '.');
+    git(repoDir, 'commit', '-m', 'Turn 5: modify test after feedback');
+    const endSha = getSha(repoDir);
+
+    // Without branchPointSha, this would be flagged as a violation
+    const violationsWithout = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    expect(violationsWithout.length).toBe(1);
+
+    // With branchPointSha, the file is recognized as task-created and exempt
+    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    expect(violations).toEqual([]);
+  });
+
+  // INVARIANT: Files created by the task itself can be deleted without violation.
+  test('allows deletion of file created by earlier commits in same task', () => {
+    const branchPointSha = getSha(repoDir);
+
+    mkdirSync(join(repoDir, 'test'), { recursive: true });
+    writeFileSync(join(repoDir, 'test', 'temp.test.ts'), 'test("temp", () => {});\n');
+    git(repoDir, 'add', '.');
+    git(repoDir, 'commit', '-m', 'Create temp test');
+
+    const startSha = getSha(repoDir);
+    git(repoDir, 'rm', 'test/temp.test.ts');
+    git(repoDir, 'commit', '-m', 'Delete temp test');
+    const endSha = getSha(repoDir);
+
+    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    expect(violations).toEqual([]);
+  });
+
+  // INVARIANT: Pre-existing files are still protected even when branchPointSha is provided.
+  test('still detects modification of pre-existing file with branchPointSha', () => {
+    mkdirSync(join(repoDir, 'test'), { recursive: true });
+    writeFileSync(join(repoDir, 'test', 'existing.test.ts'), 'test("original", () => {});\n');
+    git(repoDir, 'add', '.');
+    git(repoDir, 'commit', '-m', 'Add pre-existing test');
+
+    // Branch point is after the file exists — so it's a pre-existing file
+    const branchPointSha = getSha(repoDir);
+    const startSha = getSha(repoDir);
+
+    writeFileSync(join(repoDir, 'test', 'existing.test.ts'), 'test("gutted", () => {});\n');
+    git(repoDir, 'add', '.');
+    git(repoDir, 'commit', '-m', 'Modify existing test');
+    const endSha = getSha(repoDir);
+
+    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    expect(violations.length).toBe(1);
+    expect(violations[0].file).toBe('test/existing.test.ts');
+  });
+
   // INVARIANT: Non-protected files are never flagged.
   test('ignores changes to non-protected files', () => {
     const startSha = getSha(repoDir);

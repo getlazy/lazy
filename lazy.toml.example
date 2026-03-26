@@ -107,3 +107,12 @@ dockerfile = ""
 # Violations are detected after each agent turn and flagged for review.
 # Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
 protected = ["README.md", "test/**/*.ts"]
+
+[checks]
+# Command to run after each agent turn. Output is captured and attached to
+# the turn for reviewers to see. Does NOT block the agent or trigger retries.
+# post_turn = "bun test --bail"
+post_turn = "echo all-good >&2"
+# Timeout in seconds for the post_turn command (default: 300 = 5 minutes).
+# If the command exceeds this, it is killed and recorded as exit code -2.
+post_turn_timeout = 300

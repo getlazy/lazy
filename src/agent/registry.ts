@@ -11,16 +11,20 @@ import { ClaudeCodeAgent } from './claude-code';
 import { ClaudeCodePackaging } from './claude-code-packaging';
 import { CursorAgent } from './cursor';
 import { CursorPackaging } from './cursor-packaging';
+import { QaAgent } from './qa-agent';
+import { QaAgentPackaging } from './qa-agent-packaging';
 import type { Agent, AgentPackaging } from './interface';
 
 const agents: Record<string, () => Agent> = {
   'claude-code': () => new ClaudeCodeAgent(),
   'cursor': () => new CursorAgent(),
+  'qa-agent': () => new QaAgent(),
 };
 
 const packaging: Record<string, () => AgentPackaging> = {
   'claude-code': () => new ClaudeCodePackaging(),
   'cursor': () => new CursorPackaging(),
+  'qa-agent': () => new QaAgentPackaging(),
 };
 
 export function getAgent(agentId: string): Agent {

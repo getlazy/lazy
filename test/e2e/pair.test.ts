@@ -48,7 +48,11 @@ function setTaskMetadata(root: string, shortId: string, key: string, value: stri
  */
 function placePairingLock(root: string, shortId: string): void {
   const worktreePath = join(root, '.lazy', 'worktrees', shortId);
-  const lockPath = join(worktreePath, '.lazy-pairing');
+  const lockDir = join(worktreePath, '.lazy');
+  if (!existsSync(lockDir)) {
+    mkdirSync(lockDir, { recursive: true });
+  }
+  const lockPath = join(lockDir, 'pairing-lock');
   writeFileSync(lockPath, JSON.stringify({
     pid: process.pid, // Test runner PID — alive while subprocess runs
     started_at: new Date().toISOString(),
@@ -144,7 +148,7 @@ describe('lazy pair', () => {
     placePairingLock(ctx.root, taskId);
 
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
-    const lockPath = join(worktreePath, '.lazy-pairing');
+    const lockPath = join(worktreePath, '.lazy', 'pairing-lock');
 
     // Verify lock file exists
     expect(existsSync(lockPath)).toBe(true);

@@ -489,7 +489,12 @@ function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBina
   return [
     binary, 'run', '--rm', '--init',
     ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
-    '-v', `${repoRoot}:${repoRoot}`,
+    // Mount repo read-only so agent can read source but not modify the main tree.
+    // The worktree and .git dir are mounted read-write on top (more specific mount wins).
+    '-v', `${repoRoot}:${repoRoot}:ro`,
+    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
+    // Git worktrees need write access to <repoRoot>/.git for commits, refs, etc.
+    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
@@ -664,7 +669,11 @@ function buildDockerArgsAsync(
     binary, 'run', '-d', '--init',
     ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
-    '-v', `${repoRoot}:${repoRoot}`,
+    // Mount repo read-only so agent can read source but not modify the main tree.
+    // The worktree and .git dir are mounted read-write on top (more specific mount wins).
+    '-v', `${repoRoot}:${repoRoot}:ro`,
+    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
+    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
@@ -999,7 +1008,10 @@ export async function launchSupervisorAsync(
     binary, 'run', '-d', '--init',
     ...(dockerOptions?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
-    '-v', `${repoRoot}:${repoRoot}`,
+    // Mount repo read-only; worktree, .git, and protocol dir are mounted read-write on top.
+    '-v', `${repoRoot}:${repoRoot}:ro`,
+    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
+    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
     '-v', `${protocolDir}:${protocolDir}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,

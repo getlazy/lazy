@@ -133,4 +133,45 @@ describe('lazy close', () => {
     expectSuccess(result);
     expectOutput(result, 'closed');
   });
+
+  test('fails when worktree has uncommitted changes', async () => {
+    const taskId = await createTask(ctx, 'Task with uncommitted changes', 'Some work');
+
+    // Start the task to create a session and worktree
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' }
+    });
+
+    // Create uncommitted changes in the worktree
+    const { writeFile } = await import('fs/promises');
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    await writeFile(join(worktreePath, 'test-file.txt'), 'uncommitted content\n');
+
+    // Try to close without --accept-dirty-worktree
+    const result = await ctx.lazy(['close', taskId, '--reason', 'Not needed', '--yes']);
+
+    expectFailure(result);
+    expectError(result, 'Task has uncommitted changes!');
+    expectError(result, 'Commit or stash your changes before closing');
+  });
+
+  test('succeeds with --accept-dirty-worktree when worktree has uncommitted changes', async () => {
+    const taskId = await createTask(ctx, 'Task with uncommitted changes', 'Some work');
+
+    // Start the task to create a session and worktree
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' }
+    });
+
+    // Create uncommitted changes in the worktree
+    const { writeFile } = await import('fs/promises');
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    await writeFile(join(worktreePath, 'test-file.txt'), 'uncommitted content\n');
+
+    // Close with --accept-dirty-worktree
+    const result = await ctx.lazy(['close', taskId, '--accept-dirty-worktree', '--reason', 'Discard all work', '--yes']);
+
+    expectSuccess(result);
+    expectOutput(result, 'closed');
+  });
 });

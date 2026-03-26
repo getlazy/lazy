@@ -128,6 +128,10 @@ export interface Turn {
   actor?: Actor;
   /** File permission violations detected in this turn */
   violations?: FileViolation[];
+  /** Exit code of the post-turn check command (undefined if no check configured) */
+  check_exit_code?: number;
+  /** Captured output from the post-turn check command */
+  check_output?: string;
 }
 
 export interface Commit {
@@ -157,6 +161,9 @@ export interface TaskPromptVersion {
   session_id: string | null;
 }
 
+/** Where a comment originated. Used to prevent echo (re-exporting imported comments). */
+export type CommentSource = 'local' | 'remote';
+
 export interface Comment {
   id: string;
   task_id: string;
@@ -164,6 +171,8 @@ export interface Comment {
   created_at: number;
   /** Who left this comment: human (CLI) or builder (MCP). */
   actor?: Actor;
+  /** Where this comment originated: 'local' (created in lazy) or 'remote' (synced from PR/MR). */
+  source?: CommentSource;
 }
 
 /** @deprecated Use Comment instead */

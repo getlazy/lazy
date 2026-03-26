@@ -1,6 +1,7 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync, readdirSync, rmSync, existsSync } from 'fs';
+import { join, basename } from 'path';
+import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -28,6 +29,7 @@ describe('lazy sync', () => {
     expectSuccess(result);
     expectOutput(result, 'Sync lazy tasks with your remote repository');
     expectOutput(result, 'Fetches PR comments from remote');
+    expectOutput(result, 'Checks CI status and comments on tasks with failures');
     expectOutput(result, 'Human review feedback');
     expectOutput(result, 'Notes added via lazy comment');
   });
@@ -46,6 +48,7 @@ describe('lazy sync', () => {
     expect(output.includes('Exporting task branches')).toBe(true);
     // Should show import and export sections
     expect(output.includes('Fetching PR comments')).toBe(true);
+    expect(output.includes('Checking CI status')).toBe(true);
     expect(output.includes('Posting task artifacts to PRs')).toBe(true);
   });
 
@@ -66,7 +69,8 @@ describe('lazy sync', () => {
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // Manually set task status back to 'working' (simulates an agent actively running)
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
+    // External storage puts tasks in ~/.lazy/<project-name>/tasks/
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
     const entries = readdirSync(tasksDir);
     const fullId = entries.find(e => e.startsWith(taskId));
     if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
@@ -74,6 +78,14 @@ describe('lazy sync', () => {
     const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
     taskData.status = 'working';
     writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2) + '\n');
+
+    // Remove the protocol response.json so reconciliation doesn't transition
+    // the task out of 'working' when sync runs
+    const protoTaskDir = join(ctx.protocolBase, fullId);
+    const responsePath = join(protoTaskDir, 'response.json');
+    if (existsSync(responsePath)) {
+      rmSync(responsePath);
+    }
 
     // Configure github driver and run sync
     const configPath = join(ctx.root, 'lazy.toml');

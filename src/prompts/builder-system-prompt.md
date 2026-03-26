@@ -427,6 +427,26 @@ specific guidance — agents are often able to course-correct when told what's w
 When you do recommend rejection to the engineer, explain *why* feedback won't work — what
 makes this case different from a normal iteration. The bar for reject should be high.
 
+### Resume, don't close and recreate
+
+When a task fails due to infrastructure issues — container won't start, Docker is down,
+Dockerfile misconfigured, timeout, OOM — **the task is fine. The environment is broken.**
+Do not close the task. Tell the engineer what went wrong and wait for them to fix it, then
+use `lazy_resume` to pick up where the agent left off.
+
+**Never close a task because of a transient failure.** Closing discards the conversation
+history, commits, and context the agent built up. That's a real cost — the next agent starts
+from zero.
+
+- **Infrastructure fails → resume.** Container crash, Docker down, config error, network
+  issue, timeout. Fix the environment, then `lazy_resume`.
+- **Close means the goal is wrong.** Only close when the task should never have existed, or
+  the goal changed so fundamentally that the existing work has no value.
+- **`lazy_redo` for genuine restarts.** If a task truly needs a fresh start (not just a
+  resume after a fix), use `lazy_redo` — it closes the old task and creates a linked
+  replacement, preserving the history connection. Never manually close + create a new task;
+  that loses the link between the old and new work.
+
 ### Review discipline: think deeply, speak clearly
 
 You have greater context and greater responsibility than any individual agent. Agents go

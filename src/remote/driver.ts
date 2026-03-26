@@ -138,6 +138,16 @@ export type ChecksStatusResult =
   | { status: 'failed'; failed: Array<{ name: string; url?: string }> }
   | { status: 'pending' };
 
+/** A single failed CI job with enough detail to be actionable. */
+export interface CIJobFailure {
+  /** The job/check name (e.g., "lint", "test-unit"). */
+  name: string;
+  /** URL to the CI run page. */
+  url?: string;
+  /** Truncated log output from the failed job. */
+  log?: string;
+}
+
 /** Options for waitForChecks. */
 export interface WaitForChecksOptions {
   /** Maximum time to wait in milliseconds. Default: 600000 (10 minutes). */
@@ -380,6 +390,30 @@ export interface RepositoryDriver {
 
   /** Get the canonical metadata key for storing the last posted note timestamp. */
   postedNoteAtKey(): string;
+
+  /**
+   * Get the stored CI failure signature from task metadata.
+   * Used to deduplicate CI failure comments — if the signature matches
+   * the current failure set, no new comment is posted.
+   * Returns undefined if no CI failures have been synced.
+   */
+  getLastCIFailureSynced(task: Task): string | undefined;
+
+  /** Get the canonical metadata key for storing the CI failure signature. */
+  ciFailureSyncedKey(): string;
+
+  /**
+   * Fetch detailed information about failed CI jobs for a task's PR/MR.
+   * Returns an array of failed jobs with name, URL, and truncated log output.
+   *
+   * Agents run in containers with no browser access — they cannot follow links
+   * to CI pages. The log output is essential for the agent to diagnose and fix
+   * failures without human intervention.
+   *
+   * Returns an empty array if no CI failures exist, or if the task has no remote ref.
+   * LocalDriver: always returns [] (no remote CI).
+   */
+  getFailedCIJobs(task: Task): Promise<CIJobFailure[]>;
 
   /**
    * Get the remote reference URL (PR/MR URL) from task metadata.

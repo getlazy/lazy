@@ -51,6 +51,9 @@ function buildMockDriver(mockResult: ImportResult): RepositoryDriver {
     isImportedComment: () => false,
     getRemoteRefUrl: () => null,
     getRemoteRefState: () => null,
+    getLastCIFailureSynced: () => undefined,
+    ciFailureSyncedKey: () => 'ci_failure_synced',
+    getFailedCIJobs: async () => [],
   } as RepositoryDriver;
 }
 

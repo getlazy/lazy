@@ -51,9 +51,11 @@ import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
 import { allTools } from '../mcp/tools';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
-import { spawnSync } from '../utils/spawn';
+import { spawn, spawnSync } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { detectViolations } from './permissions';
+import { runPermissionPushback } from './pushback';
+import { truncateLog } from '../utils/log-truncate';
 
 export interface SupervisorConfig {
   /** Protocol directory path (shared via volume) */
@@ -213,12 +215,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
   const cmd = command as StartCommand | UnblockCommand;
   const isResume = command.type === 'unblock' && !!(command as UnblockCommand).agent_session_id;
+  log(`[supervisor] Command fields: protected_patterns=${JSON.stringify(cmd.protected_patterns)}, post_turn_check=${JSON.stringify(cmd.post_turn_check)}, parent_branch=${cmd.parent_branch}, agent_id=${cmd.agent_id}`);
 
   // Pre-turn worktree health check: ensure no leftover merge state
   recoverWorktreeState(worktreePath);
 
   // Record pre-turn SHA for deterministic turn diff
   const preTurnSha = getHeadSha(worktreePath);
+  log(`[supervisor] Pre-turn SHA: ${preTurnSha.substring(0, 8)}`);
 
   // Initialize status
   const status: SupervisorStatus = {
@@ -373,21 +377,116 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     );
 
     updatePhase(status, 'work_done', protocolDir);
+    log(`[supervisor] Agent result: session_id=${result.session_id?.substring(0, 8)}, result_length=${result.result.length}`);
 
     // Record agent's work endpoint (before any post-turn sync)
     const postWorkSha = getHeadSha(worktreePath);
+    log(`[supervisor] Post-work SHA: ${postWorkSha.substring(0, 8)}`);
     status.post_work_sha = postWorkSha;
     writeStatus(protocolDir, status);
 
     const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postWorkSha.substring(0, 8)}`;
     tagHead(worktreePath, tagName);
+    log(`[supervisor] Tagged HEAD: ${tagName}`);
 
-    // Phase 3b: Check for file permission violations
+    // Phase 3b: Check for file permission violations and push back if needed
     const protectedPatterns = cmd.protected_patterns ?? [];
     const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
-    const violations = detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns);
+
+    // Compute branch point SHA: the merge-base with the parent branch.
+    // Files created after this point were created by the task itself and are
+    // exempt from permission violations (they're not pre-existing files).
+    let branchPointSha: string | undefined;
+    if (cmd.parent_branch && protectedPatterns.length > 0) {
+      const mergeBaseResult = runGit(
+        ['merge-base', cmd.parent_branch, 'HEAD'],
+        { cwd: worktreePath },
+      );
+      if (mergeBaseResult.exitCode === 0 && mergeBaseResult.stdout.trim()) {
+        branchPointSha = mergeBaseResult.stdout.trim();
+        log(`[supervisor] Branch point SHA (merge-base with ${cmd.parent_branch}): ${branchPointSha.substring(0, 8)}`);
+      } else {
+        log(`[supervisor] Could not compute merge-base with ${cmd.parent_branch} — all protected-pattern changes will be checked`);
+      }
+    }
+
+    log(`[supervisor] Checking permissions: ${protectedPatterns.length} pattern(s) [${protectedPatterns.join(', ')}], diff ${startShaWork.substring(0, 8)}..${postWorkSha.substring(0, 8)}`);
+    log(`[supervisor] status.post_merge_sha=${status.post_merge_sha?.substring(0, 8)}, status.pre_turn_sha=${status.pre_turn_sha?.substring(0, 8)}, preTurnSha=${preTurnSha.substring(0, 8)}`);
+    let violations = detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns, branchPointSha);
+    log(`[supervisor] Violations detected: ${violations.length}`);
+
+    // Push-back: give the agent one chance to self-correct before blocking
+    let pushbackResponse: string | undefined;
     if (violations.length > 0) {
-      log(`[supervisor] Detected ${violations.length} file permission violation(s)`);
+      log(`[supervisor] Detected ${violations.length} file permission violation(s). Pushing back...`);
+      updatePhase(status, 'permission_pushback', protocolDir);
+
+      const pushbackResult = await runPermissionPushback(
+        agent,
+        worktreePath,
+        result.session_id,
+        violations,
+        cmd.model_id,
+      );
+      pushbackResponse = pushbackResult.response;
+
+      // Re-check violations on the new HEAD (agent may have reverted some files)
+      const postPushbackSha = getHeadSha(worktreePath);
+      violations = detectViolations(worktreePath, startShaWork, postPushbackSha, protectedPatterns, branchPointSha);
+      log(`[supervisor] After push-back: ${violations.length} violation(s) remaining`);
+      updatePhase(status, 'permission_pushback_done', protocolDir);
+
+      // Update the post-work SHA and tag to reflect the push-back
+      if (postPushbackSha !== postWorkSha) {
+        status.post_work_sha = postPushbackSha;
+        writeStatus(protocolDir, status);
+
+        const pushbackTagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postPushbackSha.substring(0, 8)}`;
+        tagHead(worktreePath, pushbackTagName);
+      }
+    }
+
+    // Phase 3c: Post-turn check (run configurable command and capture output)
+    let checkExitCode: number | undefined;
+    let checkOutput: string | undefined;
+    log(`[supervisor] Post-turn check: ${cmd.post_turn_check ? `"${cmd.post_turn_check}"` : 'not configured'}`);
+    if (cmd.post_turn_check) {
+      const timeoutSecs = cmd.post_turn_timeout ?? 300;
+      log(`[supervisor] Running post-turn check (timeout: ${timeoutSecs}s)`);
+      updatePhase(status, 'post_turn_check', protocolDir);
+      try {
+        const proc = spawn(['sh', '-c', cmd.post_turn_check], {
+          cwd: worktreePath,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+
+        // Race the process against the timeout
+        const timeoutMs = timeoutSecs * 1000;
+        const timeout = new Promise<'timeout'>(resolve =>
+          setTimeout(() => resolve('timeout'), timeoutMs),
+        );
+        const exited = proc.exited.then(() => 'exited' as const);
+        const winner = await Promise.race([exited, timeout]);
+
+        if (winner === 'timeout') {
+          proc.kill();
+          checkExitCode = -2;
+          checkOutput = `Post-turn check timed out after ${timeoutSecs}s`;
+          logWarn(`[supervisor] Post-turn check timed out after ${timeoutSecs}s`);
+        } else {
+          checkExitCode = proc.exitCode ?? undefined;
+          const stderr = await new Response(proc.stderr).text();
+          checkOutput = truncateLog(stderr);
+          log(`[supervisor] Post-turn check exited with code ${checkExitCode}`);
+        }
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        logWarn(`[supervisor] Post-turn check failed to execute: ${errorMessage}`);
+        checkExitCode = -1;
+        checkOutput = errorMessage;
+      }
+      updatePhase(status, 'post_turn_check_done', protocolDir);
     }
 
     // Phase 4: Post-turn sync-with-upstream (if requested and parent_branch is specified)
@@ -417,12 +516,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
     // Write response
     updatePhase(status, 'writing_response', protocolDir);
+    log(`[supervisor] Writing response: violations=${violations.length}, check_exit_code=${checkExitCode}, merge_conflicts=${allMergeConflicts.length}`);
 
-    // Build result text, prepending violations if any
+    // Violations are stored in response.violations (structured field) and
+    // rendered by the display layer — do NOT prepend them into resultText.
+    // The pushback response IS appended so reviewers can see the agent's justification.
     let resultText = result.result;
-    if (violations.length > 0) {
-      const violationList = violations.map(v => `  - ${v.file}`).join('\n');
-      resultText = `**FILE PERMISSION VIOLATIONS**\n\nThe following protected files were modified or deleted:\n${violationList}\n\n${resultText}`;
+    if (pushbackResponse) {
+      resultText += '\n\n---\n\n## Permission Violation Review\n\n' + pushbackResponse;
     }
 
     const response: CompletedResponse = {
@@ -431,8 +532,11 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       session_id: result.session_id,
       usage: result.usage,
       ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
-      ...(violations.length > 0 ? { violations } : {}),
+      ...(violations.length > 0 ? { violations, pushed_back: true } : {}),
+      ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
+      ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
     };
+    log(`[supervisor] Response written: status=${response.status}, pushed_back=${response.pushed_back}`);
     writeResponse(protocolDir, response);
 
   } catch (err) {

@@ -109,9 +109,8 @@ describe('file permission violations', () => {
     expect(agentTurn!.violations![0].file).toBe('test.spec.ts');
     expect(agentTurn!.violations![0].status).toBe('pending');
 
-    // Verify the violation text is in the agent's turn content
-    expect(agentTurn!.content).toContain('FILE PERMISSION VIOLATIONS');
-    expect(agentTurn!.content).toContain('test.spec.ts');
+    // Violation text is NOT in the turn content — violations live in the structured field
+    expect(agentTurn!.content).not.toContain('## Permission Violations');
 
     // INVARIANT: Tasks with violations transition to 'conflict', not 'blocked'.
     // This makes permission violations visible at a glance in task listings.
@@ -149,8 +148,8 @@ describe('file permission violations', () => {
     expect(agentTurn).toBeDefined();
     expect(agentTurn!.violations).toBeUndefined();
 
-    // Verify the turn content does NOT contain violation text
-    expect(agentTurn!.content).not.toContain('FILE PERMISSION VIOLATIONS');
+    // No violations → no violation text anywhere
+    expect(agentTurn!.content).not.toContain('## Permission Violations');
 
     // No violations means task should be in 'blocked', not 'conflict'
     const status = readTaskStatus(ctx.root, taskId);
@@ -470,9 +469,151 @@ describe('file permission violations', () => {
     expect(agentTurn!.violations!.length).toBe(1);
     expect(agentTurn!.violations![0].file).toBe('docs/api.md');
 
-    // Verify the violation text is in the agent's turn content
-    expect(agentTurn!.content).toContain('FILE PERMISSION VIOLATIONS');
-    expect(agentTurn!.content).toContain('docs/api.md');
+    // Violation text is NOT in the turn content — violations live in the structured field
+    expect(agentTurn!.content).not.toContain('## Permission Violations');
+  });
+
+  // INVARIANT: Push-back fires when violations are detected, giving the agent one chance
+  // to self-correct. If the agent reverts the file, no violations remain in the output.
+  test('push-back allows agent to revert violation and clear it', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns');
+
+    writeFileSync(join(ctx.root, 'test.spec.ts'), 'describe("existing tests", () => {});\n');
+    ctx.git('add', 'test.spec.ts');
+    ctx.git('commit', '-m', 'Add existing test file');
+
+    const taskId = await createTask(ctx, 'Fix something', 'Fix the bug');
+
+    // Mock agent modifies the protected file
+    const mockFiles = JSON.stringify([
+      { path: 'test.spec.ts', content: 'describe("modified tests", () => { /* changed */ });\n' },
+    ]);
+
+    // Mock push-back: agent reverts the file
+    const pushbackReverts = JSON.stringify(['test.spec.ts']);
+
+    const result = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {
+        env: {
+          LAZY_MOCK_SHOULD_COMMIT: '1',
+          LAZY_MOCK_FILES: mockFiles,
+          LAZY_MOCK_PUSHBACK_REVERTS: pushbackReverts,
+          LAZY_MOCK_PUSHBACK_RESPONSE: 'I reverted the test file change as it was unnecessary.',
+        },
+      },
+    );
+    expectSuccess(result);
+
+    // Verify NO violations remain on the agent turn (agent reverted)
+    const turns = readTurns(ctx.root, taskId);
+    const agentTurn = turns.find(t => t.role === 'agent');
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn!.violations).toBeUndefined();
+
+    // Pushback response IS in the turn content — reviewers need to see the agent's justification
+    expect(agentTurn!.content).toContain('## Permission Violation Review');
+    expect(agentTurn!.content).toContain('I reverted the test file change as it was unnecessary.');
+
+    // No violations means task goes to 'blocked', not 'conflict'
+    const status = readTaskStatus(ctx.root, taskId);
+    expect(status).toBe('blocked');
+  });
+
+  // INVARIANT: When push-back fires and the agent keeps the file, violations persist
+  // and the task enters 'conflict' status with the agent's justification.
+  test('push-back with agent keeping changes preserves violations with justification', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns');
+
+    writeFileSync(join(ctx.root, 'test.spec.ts'), 'describe("existing tests", () => {});\n');
+    ctx.git('add', 'test.spec.ts');
+    ctx.git('commit', '-m', 'Add existing test file');
+
+    const taskId = await createTask(ctx, 'Fix something', 'Fix the bug');
+
+    const mockFiles = JSON.stringify([
+      { path: 'test.spec.ts', content: 'describe("modified tests", () => { /* changed */ });\n' },
+    ]);
+
+    // Mock push-back: agent keeps the file, provides justification
+    const result = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {
+        env: {
+          LAZY_MOCK_SHOULD_COMMIT: '1',
+          LAZY_MOCK_FILES: mockFiles,
+          // No LAZY_MOCK_PUSHBACK_REVERTS → agent keeps all changes
+          LAZY_MOCK_PUSHBACK_RESPONSE: 'The test file change is essential for the bug fix.',
+        },
+      },
+    );
+    expectSuccess(result);
+
+    // Verify violations persist
+    const turns = readTurns(ctx.root, taskId);
+    const agentTurn = turns.find(t => t.role === 'agent');
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn!.violations).toBeDefined();
+    expect(agentTurn!.violations!.length).toBe(1);
+    expect(agentTurn!.violations![0].file).toBe('test.spec.ts');
+
+    // Pushback response IS in the turn content — reviewers need to see the agent's justification
+    expect(agentTurn!.content).toContain('## Permission Violation Review');
+    expect(agentTurn!.content).toContain('The test file change is essential for the bug fix.');
+
+    // Violations remain → task goes to 'conflict'
+    const status = readTaskStatus(ctx.root, taskId);
+    expect(status).toBe('conflict');
+  });
+
+  // INVARIANT: Push-back only happens once per turn (no infinite loop).
+  // Even after push-back, the result is final and the turn completes.
+  test('push-back happens only once — no re-push-back after agent response', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns');
+
+    writeFileSync(join(ctx.root, 'test.spec.ts'), 'describe("existing tests", () => {});\n');
+    ctx.git('add', 'test.spec.ts');
+    ctx.git('commit', '-m', 'Add existing test file');
+
+    const taskId = await createTask(ctx, 'Fix something', 'Fix the bug');
+
+    const mockFiles = JSON.stringify([
+      { path: 'test.spec.ts', content: 'describe("modified tests", () => { /* changed */ });\n' },
+    ]);
+
+    // Agent doesn't revert — violations remain after push-back
+    const result = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
+    );
+    expectSuccess(result);
+
+    // The turn completed (response was written) — push-back happened exactly once
+    // We verify this by checking the response has pushed_back=true and violations
+    const turns = readTurns(ctx.root, taskId);
+    const agentTurn = turns.find(t => t.role === 'agent');
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn!.violations).toBeDefined();
+    expect(agentTurn!.violations!.length).toBe(1);
+
+    // Task completed the turn and moved to conflict (not stuck in a loop)
+    const status = readTaskStatus(ctx.root, taskId);
+    expect(status).toBe('conflict');
   });
 
   // INVARIANT: Violations are detected on unblock turns, not just start turns.
@@ -533,9 +674,8 @@ describe('file permission violations', () => {
     expect(secondAgentTurn!.violations![0].file).toBe('test.spec.ts');
     expect(secondAgentTurn!.violations![0].status).toBe('pending');
 
-    // Verify the violation text is in the second turn content
-    expect(secondAgentTurn!.content).toContain('FILE PERMISSION VIOLATIONS');
-    expect(secondAgentTurn!.content).toContain('test.spec.ts');
+    // Violation text is NOT in the turn content — violations live in the structured field
+    expect(secondAgentTurn!.content).not.toContain('## Permission Violations');
 
     // INVARIANT: Task transitions to 'conflict' after unblock with violations
     status = readTaskStatus(ctx.root, taskId);

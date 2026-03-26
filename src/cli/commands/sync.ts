@@ -122,6 +122,11 @@ async function detectExternalChanges(storage: ReturnType<typeof requireStorage> 
         if (session && !session.ended_at) {
           await storage.endSession(session.id, 'accepted');
         }
+        // Transition through merging → complete to satisfy state machine.
+        // blocked/conflict can't transition directly to complete — must go through merging.
+        if (task.status === 'blocked' || task.status === 'conflict') {
+          await storage.updateTaskStatus(task.id, 'merging', getActor());
+        }
         await storage.updateTaskStatus(task.id, 'complete', getActor());
 
         // Re-parent unfinished children to the grandparent
@@ -345,8 +350,10 @@ async function postTaskNotes(storage: ReturnType<typeof requireStorage> extends 
       const taskShortId = shortId(task.id);
 
       for (const comment of unpostedComments) {
-        // Skip comments that were synced FROM the remote (avoid echo)
-        if (driver.isImportedComment(comment.content)) continue;
+        // Skip comments that were synced FROM the remote (avoid echo).
+        // Primary check: structured source field. Fallback: content-based regex
+        // for backward compatibility with comments created before the source field existed.
+        if (comment.source === 'remote' || driver.isImportedComment(comment.content)) continue;
 
         const body = formatNoteComment(comment.content, comment.id, taskShortId);
         await driver.postTurnSummary(task, body);
@@ -415,6 +422,86 @@ export function formatNoteComment(noteContent: string, noteId: string, taskShort
   }
 
   return `### Note\n\n${content}\n\n---\n*Posted by [lazy](https://getlazy.dev/) for task \`${taskShortId}\`*`;
+}
+
+/**
+ * Compute a deterministic signature from a set of CI failures.
+ * Used to deduplicate CI failure comments — same signature means same failures.
+ */
+export function ciFailureSignature(failed: Array<{ name: string; url?: string }>): string {
+  return failed
+    .map(f => f.url ? `${f.name}|${f.url}` : f.name)
+    .sort()
+    .join('\n');
+}
+
+/**
+ * Format a CI failure comment for a single job.
+ * Includes the job name, URL, and truncated log output in a collapsible section.
+ */
+function formatCIFailureComment(job: import('../../remote/driver').CIJobFailure): string {
+  let comment = `CI failure: **${job.name}**`;
+  if (job.url) {
+    comment += `\nURL: ${job.url}`;
+  }
+  if (job.log) {
+    comment += `\n\n<details><summary>Log output (last 200 lines)</summary>\n\n\`\`\`\n${job.log}\n\`\`\`\n\n</details>`;
+  }
+  return comment;
+}
+
+/**
+ * Import direction: fetch CI check results from remote for all active tasks.
+ * Only creates comments for failures — successful runs are ignored.
+ * Creates one comment per failed job with log output so the agent can
+ * diagnose and fix failures without browser access.
+ *
+ * Deduplicates using a stored failure signature to avoid re-commenting
+ * on the same set of failures across multiple sync runs.
+ */
+async function fetchCIFailures(storage: ReturnType<typeof requireStorage> extends Promise<infer T> ? T : never, driver: RepositoryDriver, log: SyncLogger): Promise<{ commented: number; errors: string[] }> {
+  const result = { commented: 0, errors: [] as string[] };
+
+  const allTasks = await storage.listTasks();
+
+  for (const task of allTasks) {
+    if (!driver.hasRemoteRef(task)) continue;
+    if (task.status !== 'blocked' && task.status !== 'conflict') continue;
+
+    try {
+      const failedJobs = await driver.getFailedCIJobs(task);
+
+      if (failedJobs.length === 0) {
+        // No failures — clear the stored signature so re-failures get reported
+        const lastSynced = driver.getLastCIFailureSynced(task);
+        if (lastSynced) {
+          await storage.updateTaskMetadata(task.id, driver.ciFailureSyncedKey(), '');
+        }
+        continue;
+      }
+
+      // Build a signature from the current failure set for dedup
+      const signature = ciFailureSignature(failedJobs);
+      const lastSynced = driver.getLastCIFailureSynced(task);
+
+      if (lastSynced === signature) {
+        // Same failures as last time — don't re-comment
+        continue;
+      }
+
+      // New or changed failures — create one comment per failed job
+      for (const job of failedJobs) {
+        await storage.createComment(task.id, formatCIFailureComment(job), getActor(), 'remote');
+      }
+
+      await storage.updateTaskMetadata(task.id, driver.ciFailureSyncedKey(), signature);
+      result.commented += failedJobs.length;
+    } catch (err) {
+      result.errors.push(`Failed to check CI for task ${displayId(task)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -520,6 +607,20 @@ export async function runSync(root: string, storage: Awaited<ReturnType<typeof r
     log.error(`  Error: ${error}`);
   }
 
+  // Import direction: fetch CI failure results from remote
+  log.phase('\nChecking CI status...');
+  const ciResult = await fetchCIFailures(storage, driver, log);
+
+  if (ciResult.commented > 0) {
+    log.detail(`  ${ciResult.commented} CI failure comment(s) added`);
+  } else {
+    log.detail('  No new CI failures');
+  }
+
+  for (const error of ciResult.errors) {
+    log.error(`  Error: ${error}`);
+  }
+
   // Export direction: lazy → remote
   log.phase('\nExporting task branches...');
   const exportResult = await exportTasks(storage, root, driver, log);
@@ -591,6 +692,7 @@ Sync lazy tasks with your remote repository.
 
 What sync does:
   - Fetches PR comments from remote for all active tasks
+  - Checks CI status and comments on tasks with failures
   - Pushes unpushed task branches to origin
   - Creates PRs for branches with commits (skips zero-commit branches)
   - Posts all task artifacts as PR comments:

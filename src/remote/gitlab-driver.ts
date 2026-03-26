@@ -44,6 +44,7 @@ import type {
   DriverConfigOptions,
   ImportOptions,
   ImportResult,
+  CIJobFailure,
 } from './driver';
 import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
@@ -51,6 +52,7 @@ import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
+import { truncateLog } from '../utils/log-truncate';
 
 export interface GlResult {
   stdout: string;
@@ -443,6 +445,14 @@ export class GitLabDriver implements RepositoryDriver {
     const status = latest.status;
 
     if (status === 'failed' || status === 'canceled') {
+      // Fetch job-level failures for more actionable details
+      const failedJobs = this.getPipelineFailedJobs(latest.id);
+      if (failedJobs.length > 0) {
+        return {
+          status: 'failed',
+          failed: failedJobs.map(j => ({ name: j.name, url: j.web_url })),
+        };
+      }
       return {
         status: 'failed',
         failed: [{ name: `Pipeline #${latest.id}`, url: latest.web_url }],
@@ -529,6 +539,71 @@ export class GitLabDriver implements RepositoryDriver {
       logger.debug(`getMRPipelines: failed to parse response for MR !${mrIid}`);
       return [];
     }
+  }
+
+  /**
+   * Get failed jobs for a specific pipeline.
+   * Returns an array of jobs with name, status, and web_url.
+   */
+  private getPipelineFailedJobs(pipelineId: number): Array<{ id: number; name: string; status: string; web_url?: string }> {
+    const result = this.gl([
+      'api', `projects/:id/pipelines/${pipelineId}/jobs`,
+    ]);
+
+    if (result.exitCode !== 0) {
+      logger.debug(`getPipelineFailedJobs: glab api failed for pipeline #${pipelineId}: ${result.stderr}`);
+      return [];
+    }
+
+    try {
+      const jobs: Array<{ id: number; name: string; status: string; web_url?: string }> = JSON.parse(result.stdout.trim());
+      return jobs.filter(j => j.status === 'failed');
+    } catch {
+      logger.debug(`getPipelineFailedJobs: failed to parse response for pipeline #${pipelineId}`);
+      return [];
+    }
+  }
+
+  async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
+    const mrIid = this.mrNumber(task);
+    if (!mrIid) return [];
+
+    const pipelines = this.getMRPipelines(mrIid);
+    if (pipelines.length === 0) return [];
+
+    const latest = pipelines[0];
+    if (latest.status !== 'failed' && latest.status !== 'canceled') return [];
+
+    const failedJobs = this.getPipelineFailedJobs(latest.id);
+    if (failedJobs.length === 0) {
+      // Fall back to pipeline-level info if no job details available
+      return [{ name: `Pipeline #${latest.id}`, url: latest.web_url }];
+    }
+
+    const results: CIJobFailure[] = [];
+
+    for (const job of failedJobs) {
+      const failure: CIJobFailure = {
+        name: job.name,
+        url: job.web_url,
+      };
+
+      // Fetch job trace (log output)
+      try {
+        const traceResult = this.gl([
+          'api', `projects/:id/jobs/${job.id}/trace`,
+        ]);
+        if (traceResult.exitCode === 0 && traceResult.stdout) {
+          failure.log = truncateLog(traceResult.stdout, 200);
+        }
+      } catch {
+        logger.debug(`getFailedCIJobs: failed to fetch trace for job ${job.name}`);
+      }
+
+      results.push(failure);
+    }
+
+    return results;
   }
 
   async postAcceptReview(task: Task, reason: string): Promise<string | null> {
@@ -1017,6 +1092,14 @@ export class GitLabDriver implements RepositoryDriver {
 
   postedNoteAtKey(): string {
     return 'gitlab_remote_last_posted_note_at';
+  }
+
+  getLastCIFailureSynced(task: Task): string | undefined {
+    return task.metadata?.gitlab_ci_failure_synced;
+  }
+
+  ciFailureSyncedKey(): string {
+    return 'gitlab_ci_failure_synced';
   }
 
   formatImportedComment(comment: RemoteComment, task: Task): string {

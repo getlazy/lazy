@@ -8,6 +8,7 @@ import { protocolDir, removeProtocolDir } from '../../protocol';
 import { removeLock } from '../../utils/lock';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
+import { createRunner } from '../../runner';
 import { logger } from '../../utils/logger';
 import { isTerminalStatus } from '../../types';
 
@@ -56,6 +57,7 @@ export async function commandClose(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'yes', aliases: ['y'], takesValue: false },
     { name: 'reason', takesValue: true },
+    { name: 'accept-dirty-worktree', takesValue: false },
   ], 'close');
 
   const taskId = parsed.positional[0];
@@ -66,6 +68,7 @@ export async function commandClose(args: string[]): Promise<void> {
 
   const skipEditor = parsed.flags.get('yes') === true;
   const argReason = parsed.flags.get('reason') as string | undefined;
+  const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
 
   const root = requireLazyRoot();
   const storage = await requireStorage();
@@ -92,12 +95,13 @@ export async function commandClose(args: string[]): Promise<void> {
     // CRITICAL: Check for uncommitted changes in worktree FIRST
     // This is the hardest gate — losing uncommitted work is the worst outcome.
     // Must happen before ANY destructive or remote operations.
-    if (existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
+    if (!acceptDirtyWorktree && existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
       console.error('Error: Task has uncommitted changes!');
       console.error('Commit or stash your changes before closing.');
       console.error('Options:');
       console.error(`  1. Unblock and ask agent to commit: lazy unblock ${displayId(task)} --message "Please commit your changes"`);
       console.error(`  2. Manually commit in shell: lazy shell ${displayId(task)}`);
+      console.error(`  3. Accept dirty worktree: lazy close ${displayId(task)} --accept-dirty-worktree`);
       process.exit(1);
     }
 
@@ -131,6 +135,18 @@ export async function commandClose(args: string[]): Promise<void> {
 
     // Get session if it exists
     const sess = await storage.getSessionByTaskId(task.id);
+
+    // If task is working, stop the runner and transition to interrupted first.
+    // working → closed is not a valid transition, but working → interrupted is,
+    // and interrupted → closed is valid via closeTask.
+    if (task.status === 'working') {
+      if (sess) {
+        const runner = createRunner(root);
+        const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
+        runner.stopRun(runName);
+      }
+      await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+    }
 
     // Close the task (persists reason to DB)
     await storage.closeTask(task.id, reason, getActor());
@@ -180,7 +196,7 @@ export async function commandClose(args: string[]): Promise<void> {
 }
 
 export function closeUsage(): void {
-  console.log(`Usage: lazy close <task_id> [--reason "reason text"] [--yes]
+  console.log(`Usage: lazy close <task_id> [--reason "reason text"] [--yes] [--accept-dirty-worktree]
 
 Close a task without doing work on it.
 
@@ -188,10 +204,11 @@ Arguments:
   <task_id>    ID of the task to close
 
 Options:
-  --reason     Reason for closing the task (required)
-               If not provided, $EDITOR will be opened to enter the reason
-  --yes, -y    Skip editor prompt (non-interactive mode)
-               Requires --reason or piped stdin
+  --reason                Reason for closing the task (required)
+                          If not provided, $EDITOR will be opened to enter the reason
+  --yes, -y               Skip editor prompt (non-interactive mode)
+                          Requires --reason or piped stdin
+  --accept-dirty-worktree Allow closing even if worktree has uncommitted changes
 
 Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 
@@ -207,11 +224,14 @@ Notes:
   - Task history is preserved
   - Use 'lazy reopen <task_id>' to restore the task later
   - Use this when a task is superseded, no longer relevant, or decided against
+  - By default, uncommitted changes prevent closing (safety check)
+  - Use --accept-dirty-worktree to bypass this check when certain
 
 Examples:
   lazy close abc12345 --reason "Superseded by task def67890" --yes
   lazy close abc1 --yes --reason "No longer needed after refactor"
   lazy close abc1 --reason "No longer needed"  # Interactive (no --yes)
+  lazy close abc1 --accept-dirty-worktree --reason "Discard all work" --yes
   lazy close abc1     # Opens editor to enter reason (requires TTY)
   echo "No longer needed" | lazy close abc1 --yes  # Piped stdin as reason`);
 }

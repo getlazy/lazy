@@ -32,6 +32,8 @@ export interface StartCommand {
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
+  post_turn_check?: string;           // command to run after agent work (output captured for review)
+  post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
 }
 
 export interface UnblockCommand {
@@ -51,6 +53,8 @@ export interface UnblockCommand {
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
+  post_turn_check?: string;           // command to run after agent work (output captured for review)
+  post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
 }
 
 export interface StopCommand {
@@ -79,6 +83,12 @@ export interface CompletedResponse {
   merge_conflicts?: MergeConflict[];
   /** File permission violations detected after agent work */
   violations?: FileViolation[];
+  /** Whether the agent was given a push-back chance for violations */
+  pushed_back?: boolean;
+  /** Exit code of the post-turn check command (undefined if no check, -1 if exec failed, -2 if timed out) */
+  check_exit_code?: number;
+  /** Captured stderr output from the post-turn check command (truncated to last 200 lines) */
+  check_output?: string;
 }
 
 export interface ErrorResponse {
@@ -108,6 +118,10 @@ export type SupervisorPhase =
   | 'merge_and_fix_done'
   | 'work'
   | 'work_done'
+  | 'permission_pushback'
+  | 'permission_pushback_done'
+  | 'post_turn_check'
+  | 'post_turn_check_done'
   | 'post_turn_sync'
   | 'post_turn_sync_done'
   | 'retrying'

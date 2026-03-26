@@ -1,6 +1,55 @@
 # Changelog
 
-## [0.9.751] - 2026-03-11
+## [0.10.788] - 2026-03-17 - Minor fixes
+
+### Fixed
+
+- **`lazy sync` invalid status transition** — syncing externally-merged blocked/conflict tasks tried `blocked → complete` which violates the state machine. Now transitions through `merging` first
+- **Builder close-and-recreate loop** — builder prompt now discourages closing and recreating tasks on transient failures (e.g., Docker misconfiguration). Added guidance to prefer `lazy_resume` over `lazy_close` + `lazy_create` when infrastructure issues are resolved
+- **Duplicate task code resolution** — `resolveTask` failed with "Task not found" when multiple tasks shared the same code. Now disambiguates by preferring non-terminal tasks over terminal ones, and most recently updated when all are terminal
+- **`lazy_active` MCP tool mismatch** — MCP tool only returned `working` tasks while CLI `lazy active` showed all non-terminal tasks with sessions. MCP now uses `{ withSessionsOnly: true, nonTerminalOnly: true }` to match CLI behavior
+- **GitHub PR creation diagnostics** — added `--repo` flag to all `gh` CLI calls for explicit repository targeting, debug logging of exact `gh` command arguments, and guards against empty `targetBranch` values (the `??` operator doesn't catch empty strings `""`)
+- **False conflict on files created by the task itself** — agent-created files matching protected patterns were flagged as permission violations when modified in later turns. Now uses merge-base to distinguish pre-existing files from task-created ones
+- **`lazy_create` MCP guard missed blocked tasks** — parentless-task guard only checked `working` tasks, missing `blocked` ones. Also escalates to stern confirmation when active tasks have children, naming the parent tasks explicitly
+
+## [0.10.763] - 2026-03-13 - Confirmation protocol and soft push-bach on file violations
+
+### Added
+
+- **Confirmation protocol for destructive MCP operations** — MCP tools that are destructive or hard to reverse now require a two-step confirmation: first call returns contextual guidance and a confirmation code, second call with the code executes the operation. Applies to `lazy_reject` (always stern), `lazy_accept` (scales with diff size), `lazy_close` (scales with work invested), `lazy_redo` (scales with history), and conditionally to `lazy_reopen` and `lazy_create`
+- **Confirmation level scaling** — confirmation intensity scales with operational risk: `lazy_accept` requires stern confirmation for diffs >2000 lines or >30 files, standard for >500 lines or >10 files, light otherwise. `lazy_close` is stern if task has commits (work abandoned), standard normally, light if task is empty. Similar scaling for other operations based on context and risk
+- **Confirmation guidance templates** — each confirmation level provides tailored guidance (e.g., `lazy_reject` warns about work being discarded and suggests `lazy_unblock` feedback as an alternative). Guidance is generated from template files in `src/prompts/confirmations/`
+- **MCP confirmation codes** — confirmation codes are short-lived (`<verb-prefix>-<4-hex>`), scoped to (operation, task_id), single-use, and valid for 5 minutes. Code format makes codes non-interchangeable between operations
+- **Updated MCP tool signatures** — `lazy_reject`, `lazy_accept`, `lazy_close`, `lazy_redo`, and `lazy_reopen` now accept an optional `confirmation_code` parameter (string) to complete two-step confirmations. Calling without the code returns guidance; calling with it executes
+- **Permission violation self-correction (soft push-back)** — when an agent makes a file permission violation, supervisor now gives the agent one chance to self-correct before marking the task as `conflict`. On the first violation, the supervisor injects the violation context into the agent's next prompt without blocking, allowing the agent to fix it. Only after a second violation does the task move to `conflict` status
+- **Confirmation handling in builders** — builder agents now understand the confirmation protocol and handle `confirm_required` responses by extracting guidance and codes, deciding whether to proceed, and calling with confirmation code if needed
+- **Post-turn check command** — `[checks] post_turn` configuration option allows running a custom command (e.g., `bun test --bail`) after each agent turn. Output is captured and attached to the turn data for reviewers to see. No push-back or gating — purely instrumentation for data collection. Configure with timeout support via `post_turn_timeout_ms`
+- **File permission violations in review TUI** — the `lazy unblock` review editor now prominently displays file permission violations from the latest agent turn, showing which files were flagged and their status (pending, approved, rejected)
+- **CI failure fetching from GitHub/GitLab** — `lazy sync` now fetches CI check results from the remote driver and adds failures as comments on corresponding tasks. Includes job name, failure reason/logs, and links to the CI run. Works for both GitHub (check runs/status checks API) and GitLab (pipeline/job API)
+- **Accept dirty worktree flag** — `lazy reject --accept-dirty-worktree` and `lazy close --accept-dirty-worktree` allow these commands to proceed even when the task worktree has uncommitted changes, since these commands discard the work anyway
+- **Pairing lock file visible as untracked** — moved pairing lock from `<worktree>/.lazy-pairing` to `<worktree>/.lazy-task-sandbox/pairing-lock` so it's covered by `.gitignore`
+
+### Fixed
+
+- **Docker containers could write outside worktree** — agent containers mounted the repo root read-write, allowing agents to modify files outside their worktree. Repo root is now mounted `:ro` with the worktree and `.git` directory mounted read-write on top
+- **Reject/close of working tasks threw error but silently succeeded** — rejecting or closing a task in `working` status failed on the state transition (`working → abandoned` is invalid) but the task was silently fixed by self-healing. Now properly stops the runner and transitions through `interrupted` first
+- **Zombie sweep and self-healing touched working tasks** — both mechanisms now skip tasks in `working` status to avoid interfering with active agent runs
+- **GitHub code scanning alerts** — resolved false positives in code scanning
+- **Missing worktree directory handling** — gracefully handle cases where worktree directory is missing for completed tasks instead of crashing
+- **Empty squash merge not detected** — `lazy accept` with squash merge could produce an empty commit when the target branch already contained the changes. Now detects this and shows an actionable error
+- **PR comments being echoed back** — fixed issue where imported comments were re-exported to PR, causing duplication
+- **lazy_start MCP tool missing parameters** — fixed MCP tool to properly accept goal, code, prompt, and type parameters for create-and-start operations
+- **grep -P usage in release.sh** — fixed macOS compatibility in the release script
+- **TOML config generation commented out section headers** — `lazy init` generated `lazy.toml` with commented-out section headers (e.g., `# [checks]`), causing keys like `post_turn` to silently land under the wrong TOML section. Section headers are now always emitted uncommented; only individual keys within sections are commented out
+
+### Changed
+
+- **Toolchain build scripts** — extracted toolchain builds into standalone script for better modularity and reusability
+- **Activity monitor shows permission and check phases** — added `permission_pushback`, `permission_pushback_done`, `post_turn_check`, and `post_turn_check_done` phases to the activity monitor display
+- **Debug logging in supervisor and permission checks** — added structured logging for command fields, SHAs, violation detection, and post-turn check execution to aid debugging
+- **Duplicate task codes accepted** — `lazy create` now rejects task codes that collide with active (non-terminal) tasks, preventing confusing ambiguity
+
+## [0.9.751] - 2026-03-11 - File permissions and violation detection
 
 ### Added
 
@@ -26,13 +75,13 @@
 - **Parent branch protection** — parent branches are now guarded against remote push operations while child tasks are active, preventing accidental upstream modifications
 - **Implicit AND in search queries** — multi-word queries like `task manager` or `in:turns merge conflict` now work without explicit `AND` operators, matching standard Lucene behavior
 
-## [0.8.736] - 2026-03-08
+## [0.8.736] - 2026-03-08 - Daemon and multi-agent support
 
 ### Added
 
+- **Daemon infrastructure** — `lazy daemon start|stop|restart|status` commands with unix socket server, PID file management, bearer token auth, and auto-start mechanism. Daemon automatically starts when running CLI commands unless `LAZY_NO_DAEMON=1` is set
 - **Agent selection in MCP tools and CLI** — `lazy_create`, `lazy_start`, `lazy_unblock`, and `lazy_edit` MCP tools now accept an `agent` parameter. CLI `lazy edit --agent` and `lazy unblock --agent` allow switching agents per-task. Builder prompt documents agent selection guidance
 - **Builder `--resume` support** — `lazy builder --resume` restores previous builder conversation, preserving context across sessions
-- **Daemon infrastructure** — `lazy daemon start|stop|restart|status` commands with unix socket server, PID file management, bearer token auth, and auto-start mechanism. Daemon automatically starts when running CLI commands unless `LAZY_NO_DAEMON=1` is set
 - **CLI pass-through mode** — read-only commands (`list`, `show`, `search`, `blocked`, `active`, `diff`) route through daemon for improved performance with transparent fallback to direct execution when daemon is unavailable
 - **Dots in task codes** — task codes can now contain dots (e.g., `fix-accept.v2`) for better versioning and naming flexibility
 - **Auto-restart daemon on upgrade** — `lazy upgrade` automatically restarts the daemon after successful upgrade to ensure latest version is running

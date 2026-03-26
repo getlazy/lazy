@@ -3,6 +3,7 @@ import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, formatDate, taskRef, getWorktreePath } from '../helpers';
 import { getCurrentSha, hasUncommittedChanges } from '../../git/operations';
 import { checkOrphanedChild } from '../orphan';
+import { isTerminalStatus } from '../../types';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
@@ -58,18 +59,27 @@ export async function commandStatus(args: string[]): Promise<void> {
     console.log(`  ${theme.label('Baseline:')} ${theme.commitSha(sess.git_start_sha.substring(0, 8))}`);
 
     // Check worktree existence
-    if (!existsSync(worktreePath)) {
-      console.error('\n  ERROR: Worktree directory does not exist!');
-      console.error('  The session cannot be resumed without the worktree.');
-      return;
+    const worktreeExists = existsSync(worktreePath);
+    if (!worktreeExists) {
+      // For terminal tasks (complete, abandoned, closed), missing worktree is expected
+      if (isTerminalStatus(task.status)) {
+        console.log(`\n  ${theme.label('Note:')} Worktree directory has been cleaned up (task is ${task.status})`);
+      } else {
+        // For active/blocked tasks, missing worktree is an error
+        console.error('\n  ERROR: Worktree directory does not exist!');
+        console.error('  The session cannot be resumed without the worktree.');
+        return;
+      }
     }
 
-    // Get current HEAD
-    try {
-      const currentSha = getCurrentSha(worktreePath);
-      console.log(`  ${theme.label('HEAD:')}     ${theme.commitSha(currentSha.substring(0, 8))}`);
-    } catch {
-      console.error('\n  ERROR: Failed to read HEAD from worktree!');
+    // Get current HEAD (only if worktree exists)
+    if (worktreeExists) {
+      try {
+        const currentSha = getCurrentSha(worktreePath);
+        console.log(`  ${theme.label('HEAD:')}     ${theme.commitSha(currentSha.substring(0, 8))}`);
+      } catch {
+        console.error('\n  ERROR: Failed to read HEAD from worktree!');
+      }
     }
 
     // Check for commits
@@ -81,28 +91,30 @@ export async function commandStatus(args: string[]): Promise<void> {
       }
     }
 
-    // Check for uncommitted changes
-    const hasUncommitted = hasUncommittedChanges(worktreePath);
-    console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
+    // Check for uncommitted changes (only if worktree exists)
+    if (worktreeExists) {
+      const hasUncommitted = hasUncommittedChanges(worktreePath);
+      console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
 
-    if (hasUncommitted) {
-      const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
-      const files = gitStatus.trim().split('\n').filter(l => l.trim());
-      console.log(`  Modified files: ${files.length}`);
-      for (const line of files.slice(0, 10)) {
-        console.log(`    ${line}`);
-      }
-      if (files.length > 10) {
-        console.log(`    ... and ${files.length - 10} more`);
-      }
+      if (hasUncommitted) {
+        const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
+        const files = gitStatus.trim().split('\n').filter(l => l.trim());
+        console.log(`  Modified files: ${files.length}`);
+        for (const line of files.slice(0, 10)) {
+          console.log(`    ${line}`);
+        }
+        if (files.length > 10) {
+          console.log(`    ... and ${files.length - 10} more`);
+        }
 
-      // Check for saved snapshot
-      const snapshot = await storage.getLatestWorktreeSnapshot(sess.id);
-      if (snapshot) {
-        console.log(`\n  Latest backup snapshot:`);
-        console.log(`    Turn: ${snapshot.turn_sequence}`);
-        console.log(`    Time: ${formatDate(snapshot.timestamp)}`);
-        console.log(`    (Uncommitted changes have been backed up)`);
+        // Check for saved snapshot
+        const snapshot = await storage.getLatestWorktreeSnapshot(sess.id);
+        if (snapshot) {
+          console.log(`\n  Latest backup snapshot:`);
+          console.log(`    Turn: ${snapshot.turn_sequence}`);
+          console.log(`    Time: ${formatDate(snapshot.timestamp)}`);
+          console.log(`    (Uncommitted changes have been backed up)`);
+        }
       }
     }
 

@@ -8,7 +8,7 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve, join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { createTask } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { writeFileSync } from 'fs';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -741,5 +741,55 @@ describe('lazy-agent mcp', () => {
 
     expect(parsed.worktree.changed_files).toBe(0);
     expect(parsed.worktree.uncommitted_changes).toBeNull();
+  });
+
+  // -----------------------------------------------------------------------
+  // lazy_active tests - verifies it returns ALL non-terminal tasks with sessions
+  // -----------------------------------------------------------------------
+
+  test('lazy_active returns tasks in blocked status with sessions', async () => {
+    // Create task 1: start it to get working status with session
+    const t1ShortId = await createTask(ctx, 'Working task', 'Test prompt for task 1');
+    const t1Start = await ctx.lazyMocked(['start', t1ShortId], MOCK_CLAUDE_SUCCESS);
+    expect(t1Start.exitCode).toBe(0);
+
+    // Create task 2: start it then wait to get blocked status with session
+    const t2ShortId = await createTask(ctx, 'Blocked task', 'Test prompt for task 2');
+    const t2Start = await ctx.lazyMocked(['start', t2ShortId], MOCK_CLAUDE_SUCCESS);
+    expect(t2Start.exitCode).toBe(0);
+
+    // Wait transitions the task to blocked
+    const t2Wait = await ctx.lazy(['wait', t2ShortId]);
+    expect(t2Wait.exitCode).toBe(0);
+
+    // Create task 3: backlog status with NO session (should NOT be returned)
+    const t3ShortId = await createTask(ctx, 'Backlog task without session');
+
+    // Call lazy_active via MCP (using any task ID as context)
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_active', arguments: {} } },
+    ]);
+
+    const activeResponse = responses.find(r => r.id === 2);
+    expect(activeResponse).toBeDefined();
+    expect(activeResponse!.result).toBeDefined();
+
+    const result = activeResponse!.result as { content: Array<{ type: string; text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+
+    // Should return 2 tasks (working + blocked, both have sessions)
+    expect(parsed.count).toBe(2);
+    expect(parsed.tasks).toHaveLength(2);
+
+    // Extract returned task IDs
+    const returnedIds = parsed.tasks.map((t: { id: string }) => t.id);
+
+    // Should include both working and blocked tasks
+    expect(returnedIds).toContain(t1ShortId); // working with session
+    expect(returnedIds).toContain(t2ShortId); // blocked with session
+
+    // Should NOT include backlog task without session
+    expect(returnedIds).not.toContain(t3ShortId);
   });
 });

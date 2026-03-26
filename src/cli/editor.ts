@@ -82,7 +82,9 @@ export async function openEditor(initialContent: string = '', recoveryTag?: stri
     // Write initial content to temp file
     writeFileSync(tmpFile, initialContent);
 
-    // Open editor
+    // shell:true is intentional — $EDITOR may contain arguments (e.g. "code --wait").
+    // This is not a command injection risk: EDITOR is set by the user in their own
+    // shell environment; anyone who controls it already has shell access.
     const result = spawnSync(editor, [tmpFile], {
       stdio: 'inherit',
       shell: true,

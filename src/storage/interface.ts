@@ -29,6 +29,7 @@ import type {
   StatusChange,
   ModelName,
   Actor,
+  CommentSource,
 } from './types';
 
 /**
@@ -50,6 +51,10 @@ export interface CreateTurnOptions {
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
   actor?: Actor;
+  /** Exit code of the post-turn check command */
+  checkExitCode?: number;
+  /** Captured output from the post-turn check command */
+  checkOutput?: string;
 }
 
 export interface Storage {
@@ -361,9 +366,10 @@ export interface Storage {
   // --- Comments ---
 
   /**
-   * Create a comment on a task
+   * Create a comment on a task.
+   * @param source - 'remote' for comments synced from PR/MR, 'local' (default) for locally-created.
    */
-  createComment(taskId: string, content: string, actor?: Actor): Promise<Comment>;
+  createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment>;
 
   /**
    * Get all comments for a task

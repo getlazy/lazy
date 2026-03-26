@@ -70,6 +70,7 @@ export type {
   DeprecatedConfigOption,
   ImportOptions,
   ImportResult,
+  CIJobFailure,
 } from './driver';
 export { LocalDriver } from './local-driver';
 export { GitHubDriver, detectGitHub } from './github-driver';

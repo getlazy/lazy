@@ -64,6 +64,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     features: {},
     worktree: { include: [] },
     permissions: { protected: [] },
+    checks: { post_turn: '', post_turn_timeout: 300 },
   };
 
   // Minimal task with a PR number

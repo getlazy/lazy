@@ -206,6 +206,12 @@ export function squashMergeBranchIntoTarget(
       throw new Error(`Squash merge failed: ${merge.stderr}`);
     }
 
+    // Check if the squash merge produced any staged changes
+    const diffIndex = runGit(['diff', '--cached', '--quiet'], { cwd });
+    if (diffIndex.exitCode === 0) {
+      throw new Error(`Nothing to merge: ${sourceBranch} has no changes relative to ${targetBranch}. Use 'lazy close' or 'lazy reject' instead.`);
+    }
+
     const commit = runGit(['commit', '-m', commitMessage], { cwd });
     if (commit.exitCode !== 0) {
       throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
@@ -277,13 +283,6 @@ export function hasUncommittedChanges(cwd?: string): boolean {
   const lines = result.stdout.split('\n');
   const hasRealChanges = lines.some(line => {
     if (!line.trim()) return false; // Empty line
-    // Lines start with 2-char status code (e.g., " M" for modified, "??" for untracked)
-    // followed by the filename.
-    const filename = line.slice(3); // Skip 2-char status code + 1 space
-    // Ignore .lazy-pairing (pairing lock file) — it's a control file, not work
-    if (filename === '.lazy-pairing') {
-      return false;
-    }
     // All other changes are real
     return true;
   });

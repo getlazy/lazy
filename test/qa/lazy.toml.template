@@ -1,0 +1,37 @@
+# lazy.toml template for v0.11 QA testing with the qa-agent.
+#
+# Copy this to your test project as lazy.toml.
+# Set the QA_SCENARIO_FILE env var to point to your scenario JSON file.
+#
+# Usage:
+#   cp test/qa/lazy.toml.template /tmp/test-project/lazy.toml
+#   export QA_SCENARIO_FILE=/path/to/v011-daemon.scenarios.json
+
+[agent]
+agent_id = "qa-agent"
+# The qa-agent reads its scenario file from the QA_SCENARIO_FILE env var.
+# The test driver sets this automatically during setup.
+
+[runner]
+# qa-agent runs directly on the host — no Docker needed.
+type = "dangerously-host-process-without-any-isolation"
+
+[models]
+# Model selection is irrelevant for qa-agent (it uses canned responses),
+# but we set a default to avoid validation errors.
+default = "journeyman"
+
+[daemon]
+# Enable daemon features for v0.11 testing.
+# These settings control the reconcile loop and auto-react behavior.
+auto_react = true
+auto_react_ci = true
+auto_react_comments = true
+
+[daemon.reconcile]
+# Fast reconcile interval for testing (default is 5s in production).
+interval_ms = 2000
+
+[session]
+verbose = false
+debug = false

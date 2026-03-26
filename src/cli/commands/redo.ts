@@ -15,6 +15,7 @@ import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { spawnSync } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
+import { escapeRegex } from '../../utils/regex';
 
 function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): void {
   if (existsSync(worktreePath)) {
@@ -31,13 +32,6 @@ function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: st
   } catch {
     // Branch may already be gone
   }
-}
-
-/**
- * Escape special regex characters in a string.
- */
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

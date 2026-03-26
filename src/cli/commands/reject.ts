@@ -8,6 +8,7 @@ import { protocolDir, removeProtocolDir } from '../../protocol';
 import { promptYesNo, openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
+import { createRunner } from '../../runner';
 import { logger } from '../../utils/logger';
 
 import { getDataDir } from '../init';
@@ -19,6 +20,7 @@ export async function commandReject(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'yes', aliases: ['y'], takesValue: false },
     { name: 'reason', takesValue: true },
+    { name: 'accept-dirty-worktree', takesValue: false },
   ], 'reject');
 
   const taskId = parsed.positional[0];
@@ -29,6 +31,7 @@ export async function commandReject(args: string[]): Promise<void> {
 
   const skipConfirmation = parsed.flags.get('yes') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
+  const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
 
   const root = requireLazyRoot();
   const storage = await requireStorage();
@@ -43,12 +46,13 @@ export async function commandReject(args: string[]): Promise<void> {
     // CRITICAL: Check for uncommitted changes in worktree FIRST
     // This is the hardest gate — losing uncommitted work is the worst outcome.
     // Must happen before ANY destructive or remote operations.
-    if (existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
+    if (!acceptDirtyWorktree && existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
       console.error('Error: Task has uncommitted changes!');
       console.error('Commit or stash your changes before rejecting.');
       console.error('Options:');
       console.error(`  1. Unblock and ask agent to commit: lazy unblock ${displayId(task)} --message "Please commit your changes"`);
       console.error(`  2. Manually commit in shell: lazy shell ${displayId(task)}`);
+      console.error(`  3. Accept dirty worktree: lazy reject ${displayId(task)} --accept-dirty-worktree`);
       process.exit(1);
     }
 
@@ -135,14 +139,23 @@ export async function commandReject(args: string[]): Promise<void> {
       }
     }
 
+    // If task is working, stop the runner and transition to interrupted first.
+    // working → abandoned is not a valid transition, but working → interrupted is.
+    if (task.status === 'working') {
+      const runner = createRunner(root);
+      const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
+      runner.stopRun(runName);
+      await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+    }
+
+    // Mark task as abandoned (now valid: interrupted/blocked → abandoned)
+    await storage.updateTaskStatus(task.id, 'abandoned', getActor());
+
     // End session with rejected outcome
     await storage.endSession(sess.id, 'rejected');
 
-    // Stop and remove the task's Docker container
+    // Remove the task's container
     await cleanupTaskContainer(storage, sess, taskRef(task), root);
-
-    // Mark task as abandoned
-    await storage.updateTaskStatus(task.id, 'abandoned', getActor());
 
     // Store rejection reason as a comment (with prefix for easy identification)
     await storage.createComment(task.id, `[Rejected] ${reason.trim()}`, getActor());
@@ -189,7 +202,7 @@ export async function commandReject(args: string[]): Promise<void> {
 }
 
 export function rejectUsage(): void {
-  console.log(`Usage: lazy reject <task_id> [--reason "..."] [--yes]
+  console.log(`Usage: lazy reject <task_id> [--reason "..."] [--yes] [--accept-dirty-worktree]
 
 Reject a task's work and discard the changes.
 
@@ -197,8 +210,9 @@ Arguments:
   <task_id>    ID of the task to reject
 
 Options:
-  --reason "..."   Provide rejection reason inline instead of opening editor
-  --yes, -y        Skip confirmation prompt
+  --reason "..."          Provide rejection reason inline instead of opening editor
+  --yes, -y               Skip confirmation prompt
+  --accept-dirty-worktree Allow rejecting even if worktree has uncommitted changes
 
 Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 
@@ -214,10 +228,13 @@ Notes:
   - Task is marked as 'abandoned'
   - Use 'lazy reopen <task_id>' to restore the task later
   - If this is a child task, you can unblock the parent
+  - By default, uncommitted changes prevent rejection (safety check)
+  - Use --accept-dirty-worktree to bypass this check when certain
 
 Examples:
   lazy reject abc12345 --reason "Incorrect approach, needs redesign" --yes
   lazy reject def4 --yes --reason "Superseded by task xyz"
   lazy reject abc1 --reason "Bad approach"    # Will prompt for confirmation (requires TTY)
+  lazy reject abc1 --accept-dirty-worktree --reason "Discard all work" --yes
   echo "Bad approach" | lazy reject abc1 --yes  # Piped stdin as reason`);
 }

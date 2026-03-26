@@ -40,6 +40,7 @@ const githubConfig: ResolvedConfig = {
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
+  checks: { post_turn: '', post_turn_timeout: 300 },
 };
 
 const gitlabConfig: ResolvedConfig = {

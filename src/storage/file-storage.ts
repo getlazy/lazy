@@ -52,6 +52,7 @@ import type {
   StatusChangelogFile,
   ModelName,
   Actor,
+  CommentSource,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { assertValidTransition } from '../task-state-machine';
@@ -400,23 +401,45 @@ export class FileStorage implements Storage {
       }
 
       // Try code lookup: scan all tasks for matching code
-      const codeMatches: string[] = [];
+      const codeTasks: Task[] = [];
       for (const dir of cleanDirs) {
-        const task = await this.readJson<Record<string, unknown>>(join(this.tasksPath, dir, 'task.json'));
+        const task = await this.readTask(join(this.tasksPath, dir, 'task.json'));
         if (task && task.code === input) {
-          codeMatches.push(dir);
+          codeTasks.push(task);
         }
       }
 
-      if (codeMatches.length === 1) {
-        return { id: codeMatches[0] };
+      if (codeTasks.length === 0) {
+        return { id: null }; // No match
       }
 
-      if (codeMatches.length > 1) {
-        return { id: null, ambiguousIds: codeMatches };
+      if (codeTasks.length === 1) {
+        return { id: codeTasks[0].id };
       }
 
-      return { id: null }; // No match
+      // Multiple matches: apply disambiguation logic
+      // 1. Prefer non-terminal tasks over terminal tasks
+      const nonTerminal = codeTasks.filter(t => !isTerminalStatus(t.status));
+      const terminal = codeTasks.filter(t => isTerminalStatus(t.status));
+
+      if (nonTerminal.length === 1) {
+        // Single non-terminal task - use it even if there are terminal tasks
+        return { id: nonTerminal[0].id };
+      }
+
+      if (nonTerminal.length > 1) {
+        // Multiple non-terminal tasks - genuinely ambiguous, error
+        return { id: null, ambiguousIds: nonTerminal.map(t => t.id) };
+      }
+
+      // All matches are terminal (closed, abandoned, complete)
+      if (terminal.length === 1) {
+        return { id: terminal[0].id };
+      }
+
+      // Multiple terminal tasks - prefer most recent (all inactive, so not genuinely ambiguous)
+      const sorted = terminal.sort((a, b) => b.created_at - a.created_at);
+      return { id: sorted[0].id };
     } catch {
       return { id: null };
     }
@@ -539,6 +562,15 @@ export class FileStorage implements Storage {
 
   async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task> {
     return this.lock.withLock(async () => {
+      // Reject duplicate codes against non-terminal tasks
+      if (code) {
+        const existing = await this.listTasks();
+        const conflict = existing.find(t => t.code === code && !isTerminalStatus(t.status));
+        if (conflict) {
+          throw new Error(`A task with code '${code}' already exists (${conflict.id.slice(0, 8)}, status: ${conflict.status}). Choose a different code or close/reject the existing task first.`);
+        }
+      }
+
       const id = randomUUID();
       const now = Date.now();
 
@@ -640,8 +672,9 @@ export class FileStorage implements Storage {
     // Self-healing: fix tasks with ended sessions but non-terminal status.
     // This can happen if accept/reject updates the session but crashes before
     // updating the task status. We detect and repair this inconsistency.
+    // Never auto-heal working tasks — the agent is actively running.
     for (const task of tasks) {
-      if (!isTerminalStatus(task.status)) {
+      if (!isTerminalStatus(task.status) && task.status !== 'working') {
         const session = await this.getSessionByTaskId(task.id);
         if (session?.ended_at && session.outcome) {
           const newStatus = session.outcome === 'accepted' ? 'complete' : 'abandoned';
@@ -1229,6 +1262,8 @@ export class FileStorage implements Storage {
         model,
         prompt,
         actor,
+        checkExitCode,
+        checkOutput,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1264,6 +1299,8 @@ export class FileStorage implements Storage {
         ...(model ? { model } : {}),
         ...(prompt ? { prompt } : {}),
         ...(actor ? { actor } : {}),
+        ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
+        ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
       };
 
       turns.push(turn);
@@ -1671,7 +1708,7 @@ export class FileStorage implements Storage {
     return [];
   }
 
-  async createComment(taskId: string, content: string, actor?: Actor): Promise<Comment> {
+  async createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
       if (!fullId) {
@@ -1692,6 +1729,7 @@ export class FileStorage implements Storage {
         content,
         created_at: Date.now(),
         ...(actor ? { actor } : {}),
+        ...(source ? { source } : {}),
       };
 
       comments.push(comment);

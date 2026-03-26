@@ -439,6 +439,8 @@ async function handleCompletedResponse(
       endShaWork: turnEndShaWork,
       mergeConflicts: response.merge_conflicts,
       violations: response.violations,
+      ...(response.check_exit_code !== undefined ? { checkExitCode: response.check_exit_code } : {}),
+      ...(response.check_output !== undefined ? { checkOutput: response.check_output } : {}),
     });
   }
 
@@ -679,6 +681,11 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
 
   for (const task of allTasks) {
     if (TERMINAL_STATUSES.has(task.status)) continue;
+
+    // Never auto-accept a working task — the agent is actively running.
+    // A working task's branch may appear "merged" if it was just created
+    // from the target and the agent hasn't committed yet.
+    if (task.status === 'working') continue;
 
     try {
       const session = await storage.getSessionByTaskId(task.id);

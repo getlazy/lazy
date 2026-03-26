@@ -4,6 +4,9 @@
  * After each agent turn, checks whether the agent modified or deleted content
  * in protected files. Pure additions (new files, or only added lines) are
  * allowed — they don't violate permissions.
+ *
+ * Files created by the task itself (not present at the branch point) are also
+ * exempt — the permission system protects pre-existing files, not agent-created ones.
  */
 
 import type { FileViolation } from '../types';
@@ -72,37 +75,62 @@ function isPureAddition(
 }
 
 /**
+ * Check if a file existed at a given SHA (the task's branch point).
+ * Returns true if the file was present, false if it was not (i.e., it was
+ * created by the task itself after branching).
+ */
+function fileExistsAtSha(worktreePath: string, sha: string, filePath: string): boolean {
+  const result = runGit(
+    ['cat-file', '-e', `${sha}:${filePath}`],
+    { cwd: worktreePath },
+  );
+  return result.exitCode === 0;
+}
+
+/**
  * Detect file permission violations between two SHAs.
  *
  * Returns violations for protected files that were modified or had content deleted.
  * Pure additions (new files or only added lines) are allowed.
+ *
+ * When branchPointSha is provided, files that did not exist at the branch point
+ * (i.e., files created by the task itself) are exempt from violation checks.
  */
 export function detectViolations(
   worktreePath: string,
   startSha: string,
   endSha: string,
   protectedPatterns: string[],
+  branchPointSha?: string,
 ): FileViolation[] {
+  log(`[permissions] detectViolations called: patterns=${JSON.stringify(protectedPatterns)}, startSha=${startSha.substring(0, 8)}, endSha=${endSha.substring(0, 8)}, branchPointSha=${branchPointSha?.substring(0, 8) ?? 'none'}`);
+
   if (protectedPatterns.length === 0) {
+    log('[permissions] No protected patterns — skipping');
     return [];
   }
 
   if (startSha === endSha) {
+    log('[permissions] startSha === endSha — no changes to check');
     return [];
   }
 
   // Get list of changed files with their status
+  log(`[permissions] Running: git diff --name-status ${startSha.substring(0, 8)} ${endSha.substring(0, 8)}`);
   const result = runGit(
     ['diff', '--name-status', startSha, endSha],
     { cwd: worktreePath },
   );
 
   if (result.exitCode !== 0) {
-    log(`[permissions] Failed to get diff: ${result.stderr}`);
+    log(`[permissions] Failed to get diff (exit ${result.exitCode}): ${result.stderr}`);
     return [];
   }
 
+  log(`[permissions] git diff output: "${result.stdout.trim()}"`);
+
   if (!result.stdout.trim()) {
+    log('[permissions] No changed files');
     return [];
   }
 
@@ -121,7 +149,17 @@ export function detectViolations(
     if (!filePath) continue;
 
     // Check if the file matches a protected pattern
-    if (!matchesProtectedPattern(filePath, protectedPatterns)) {
+    const matched = matchesProtectedPattern(filePath, protectedPatterns);
+    log(`[permissions] File: ${filePath} (status=${status}) matched=${matched}`);
+    if (!matched) {
+      continue;
+    }
+
+    // If a branch point SHA is provided, check whether the file existed before the
+    // task started. Files created by the task itself are exempt from violations —
+    // the permission system protects pre-existing files, not agent-created ones.
+    if (branchPointSha && !fileExistsAtSha(worktreePath, branchPointSha, filePath)) {
+      log(`[permissions] Skipping ${filePath}: file did not exist at branch point ${branchPointSha.substring(0, 8)} (created by this task)`);
       continue;
     }
 

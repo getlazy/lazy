@@ -183,6 +183,18 @@ export class LocalDriver implements RepositoryDriver {
     return 'remote_last_posted_note_at';
   }
 
+  getLastCIFailureSynced(_task: Task): string | undefined {
+    return undefined;
+  }
+
+  ciFailureSyncedKey(): string {
+    return 'remote_ci_failure_synced';
+  }
+
+  async getFailedCIJobs(_task: Task): Promise<import('./driver').CIJobFailure[]> {
+    return [];
+  }
+
   formatImportedComment(_comment: RemoteComment, _task: Task): string {
     return '';
   }

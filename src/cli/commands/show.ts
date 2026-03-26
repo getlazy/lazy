@@ -183,9 +183,14 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
           : '';
         const modelSuffix = turn.model && turn.model !== task.model ? ` | ${turn.model}` : '';
+        const checkSuffix = turn.check_exit_code !== undefined
+          ? (turn.check_exit_code === 0
+            ? ` | ${theme.status('check: OK')}`
+            : ` | ${theme.error(`check: FAILED (exit ${turn.check_exit_code})`)}`)
+          : '';
         const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(turn.role);
         if (showFull) {
-          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix} ---`);
+          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix} ---`);
           if (isErrorTurn) {
             for (const line of turn.content.split('\n')) {
               outputLines.push(`    ${theme.error(line)}`);
@@ -199,12 +204,19 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
               outputLines.push(turn.content);
             }
           }
+          // Show check output in full view
+          if (turn.check_output) {
+            outputLines.push(`\n    ${theme.label('--- Post-turn check output ---')}`);
+            for (const line of turn.check_output.split('\n')) {
+              outputLines.push(`    ${line}`);
+            }
+          }
         } else {
           const preview = turn.content.substring(0, 80).replace(/\n/g, ' ');
           if (isErrorTurn) {
-            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
           } else {
-            outputLines.push(`    #${turn.sequence} [${theme.turnRole(turn.role)}]${usageSuffix}${modelSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${theme.turnRole(turn.role)}]${usageSuffix}${modelSuffix}${checkSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
           }
         }
       }
@@ -561,9 +573,12 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       sequence: t.sequence,
       role: t.role,
       content: t.content,
+      prompt: t.prompt ?? null,
       timestamp: t.timestamp,
       usage: t.usage,
       model: t.model ?? null,
+      ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
+      ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
     })),
     commits: commits.map(c => ({
       sha: c.sha,

@@ -3,15 +3,9 @@ import { logger } from '../../utils/logger';
 import type { ModelName } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { theme } from '../theme';
+import { escapeRegex } from '../../utils/regex';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
-
-/**
- * Escape special regex characters in a string.
- */
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 /**
  * Generate a clone code from the old task's code, scanning existing tasks to avoid collisions.

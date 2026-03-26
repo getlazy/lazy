@@ -31,6 +31,8 @@ export function commonCommandFields(config: ResolvedConfig): {
   turn_started_at: string;
   watchdog_output_timeout_ms?: number;
   protected_patterns: string[];
+  post_turn_check?: string;
+  post_turn_timeout?: number;
 } {
   return {
     turn_started_at: new Date().toISOString(),
@@ -38,6 +40,10 @@ export function commonCommandFields(config: ResolvedConfig): {
       watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
     }),
     protected_patterns: config.permissions.protected,
+    ...(config.checks.post_turn !== '' && {
+      post_turn_check: config.checks.post_turn,
+      post_turn_timeout: config.checks.post_turn_timeout,
+    }),
   };
 }
 

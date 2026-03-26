@@ -32,6 +32,7 @@ const mockConfig: ResolvedConfig = {
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
+  checks: { post_turn: '', post_turn_timeout: 300 },
 };
 
 function makeTask(overrides?: Partial<Task>): Task {
@@ -399,5 +400,61 @@ describe('GitHubDriver merge', () => {
     if (result.status === 'failed') {
       expect(result.isConflict).toBeFalsy();
     }
+  });
+
+  // INVARIANT: When creating a replacement PR with multiple GitHub remotes,
+  // the driver MUST pass --repo to gh pr create to avoid ambiguity.
+  // Without this, gh might pick the wrong repository, causing "Head sha can't be blank" errors.
+  test('passes --repo flag when creating replacement PR', async () => {
+    const ghCalls: string[][] = [];
+    const gitCalls: string[][] = [];
+
+    const deps: DriverDeps = {
+      runGh: (args) => {
+        ghCalls.push([...args]);
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+          return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
+        }
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
+          return ok(JSON.stringify({ number: 99 }));
+        }
+        if (args[0] === 'pr' && args[1] === 'create') {
+          return ok('https://github.com/o/r/pull/99');
+        }
+        if (args[0] === 'pr' && args[1] === 'merge') {
+          return ok();
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: (args: string[]) => {
+        gitCalls.push([...args]);
+        if (args[0] === 'push') return ok();
+        if (args[0] === 'merge-base') return fail('not ancestor');
+        if (args[0] === 'remote' && args[1] === 'get-url') {
+          return ok('git@github.com:owner/repo.git');
+        }
+        return fail('unexpected git call');
+      },
+    };
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask({ metadata: {} }), // No PR metadata, forces creation
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('merged');
+
+    // Find the gh pr create call
+    const createCall = ghCalls.find(c => c[0] === 'pr' && c[1] === 'create');
+    expect(createCall).toBeDefined();
+
+    // Verify --repo flag is present
+    const repoIndex = createCall!.indexOf('--repo');
+    expect(repoIndex).toBeGreaterThan(-1);
+    expect(createCall![repoIndex + 1]).toBe('owner/repo');
   });
 });

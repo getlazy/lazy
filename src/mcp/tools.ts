@@ -24,6 +24,23 @@ import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryPars
 import { reconcileTasks } from '../utils/reconcile';
 import { queryWait } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
+import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
+import {
+  rejectConfirmationLevel,
+  closeConfirmationLevel,
+  acceptConfirmationLevel,
+  redoConfirmationLevel,
+  reopenConfirmationLevel,
+  createConfirmationLevel,
+  gatherRejectContext,
+  gatherCloseContext,
+  gatherAcceptContext,
+  gatherRedoContext,
+  gatherReopenContext,
+  gatherCreateParentWarningContext,
+  gatherCreateParentWarningSternContext,
+  type DiffStat,
+} from './confirmation-context';
 
 /**
  * Context passed to MCP tool handlers at registration time.
@@ -290,6 +307,8 @@ export function createShowHandler(_ctx: McpToolContext): McpToolHandler {
             role: latest.role,
             content: latest.content,
             timestamp: new Date(latest.timestamp).toISOString(),
+            ...(latest.check_exit_code !== undefined ? { check_exit_code: latest.check_exit_code } : {}),
+            ...(latest.check_output !== undefined ? { check_output: latest.check_output } : {}),
           };
         }
       } else {
@@ -311,6 +330,8 @@ export function createShowHandler(_ctx: McpToolContext): McpToolHandler {
           role: t.role,
           content: t.content,
           timestamp: new Date(t.timestamp).toISOString(),
+          ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
+          ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
         }));
       }
 
@@ -389,6 +410,10 @@ export const createTool: McpTool = {
         type: 'string',
         description: 'Parent task ID to create this as a child/variant task',
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. Only needed when creating under main while an active task exists.',
+      },
     },
     required: ['goal'],
   },
@@ -402,6 +427,7 @@ export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
     const model = args.model as string | undefined;
     const type = args.type as string | undefined;
     const parent = args.parent as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
 
     const storage = await requireStorage();
     try {
@@ -413,6 +439,60 @@ export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
           throw new Error(`Parent task not found: ${parent}`);
         }
         parentTaskId = resolved.task.id;
+      }
+
+      // Check for parent warning: creating under main while active tasks exist.
+      // Active = non-terminal and non-backlog (working, blocked, interrupted, pairing, merging, conflict).
+      const effectiveParent = parent ?? 'main';
+
+      const nonTerminalTasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
+      // Filter out backlog — those aren't "active" in the sense that matters here
+      const activeTasks = nonTerminalTasks.filter((t) => t.status !== 'backlog');
+
+      // For each active task, check if it has children (indicating parent-child hierarchy)
+      const activeTasksWithChildCounts: Array<{ task: typeof activeTasks[0]; childCount: number }> = [];
+      for (const task of activeTasks) {
+        const children = await storage.getChildTasks(task.id);
+        activeTasksWithChildCounts.push({ task, childCount: children.length });
+      }
+
+      const level = createConfirmationLevel(
+        effectiveParent === 'main' ? 'main' : undefined,
+        activeTasksWithChildCounts,
+      );
+
+      // For create, we use a fixed synthetic task ID since no task exists yet.
+      // The confirmation is scoped to (operation='create', taskId='_create_').
+      const CREATE_CONFIRMATION_TASK_ID = '_create_';
+
+      if (level !== 'none' && !confirmationCode) {
+        // Step 1: return guidance about parent warning
+        const confirmCode = generateCode('cr');
+        storePending({ code: confirmCode, operation: 'create', taskId: CREATE_CONFIRMATION_TASK_ID, createdAt: Date.now() });
+
+        let guidance: string;
+        if (level === 'stern') {
+          // Find the active task with the most children for the warning message
+          const withChildren = activeTasksWithChildCounts
+            .filter((t) => t.childCount > 0)
+            .sort((a, b) => b.childCount - a.childCount);
+          const topParent = withChildren[0]!;
+          const context = gatherCreateParentWarningSternContext(topParent.task, topParent.childCount, confirmCode);
+          guidance = renderGuidance('create-parent-warning-stern', context);
+        } else {
+          // Light: active tasks exist but none have children
+          const context = gatherCreateParentWarningContext(activeTasks[0]!, confirmCode);
+          guidance = renderGuidance('create-parent-warning', context);
+        }
+
+        throw new Error(guidance);
+      }
+
+      if (level !== 'none' && confirmationCode) {
+        // Step 2: validate confirmation code
+        if (!validateCode(confirmationCode, 'create', CREATE_CONFIRMATION_TASK_ID)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_create without a code to get a new one.');
+        }
       }
 
       const task = await storage.createTask(goal, parentTaskId, undefined, code, type);
@@ -968,20 +1048,120 @@ async function runLazyCliCommand(
   return { stdout, stderr, exitCode };
 }
 
+/** Parse git diff --shortstat output into structured numbers. */
+function parseShortstat(stdout: string): { filesChanged: number; linesAdded: number; linesRemoved: number } {
+  const filesMatch = stdout.match(/(\d+) file/);
+  const addMatch = stdout.match(/(\d+) insertion/);
+  const delMatch = stdout.match(/(\d+) deletion/);
+  return {
+    filesChanged: filesMatch ? parseInt(filesMatch[1], 10) : 0,
+    linesAdded: addMatch ? parseInt(addMatch[1], 10) : 0,
+    linesRemoved: delMatch ? parseInt(delMatch[1], 10) : 0,
+  };
+}
+
+/**
+ * Compute the git diff cwd and range for a task relative to its parent branch.
+ */
+function computeDiffCwdAndRange(
+  session: { git_branch: string; git_start_sha: string },
+  parentBranch: string,
+  storagePath: string,
+  lazyRoot: string,
+): { cwd: string; diffRange: string } {
+  const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
+  const cwd = existsSync(worktreePath) ? worktreePath : lazyRoot;
+
+  // Use the task's branch name explicitly instead of HEAD. When cwd falls
+  // back to lazyRoot, HEAD is whatever branch the main repo is on (e.g. main),
+  // not the task branch — giving an empty diff for tasks with real changes.
+  const branchCheck = runGit(['rev-parse', '--verify', parentBranch], { cwd });
+  const diffRange = branchCheck.exitCode === 0
+    ? `${parentBranch}...${session.git_branch}`
+    : `${session.git_start_sha}..${session.git_branch}`;
+
+  return { cwd, diffRange };
+}
+
+interface StorageForDiff {
+  getSessionByTaskId(taskId: string): Promise<{ git_branch: string } | null>;
+  getStoragePath(): string;
+}
+
+/**
+ * Get total lines changed for a task by running git diff --shortstat.
+ * Returns 0 if the diff can't be computed (e.g., worktree gone).
+ */
+async function getDiffLinesChanged(
+  task: { id: string; parent_task_id: string | null },
+  session: { git_branch: string; git_start_sha: string },
+  storage: StorageForDiff,
+): Promise<number> {
+  const stat = await getDiffStat(task, session, storage);
+  if (!stat) return 0;
+  return stat.linesAdded + stat.linesRemoved;
+}
+
+/**
+ * Get diff stat (files changed, lines added, lines removed) for a task.
+ * Returns null if the diff can't be computed (git error, worktree gone, etc.).
+ */
+async function getDiffStat(
+  task: { id: string; parent_task_id: string | null },
+  session: { git_branch: string; git_start_sha: string },
+  storage: StorageForDiff,
+): Promise<DiffStat | null> {
+  try {
+    const lazyRoot = requireLazyRoot();
+    const parentBranch = task.parent_task_id
+      ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
+      : 'main';
+
+    const { cwd, diffRange } = computeDiffCwdAndRange(session, parentBranch, storage.getStoragePath(), lazyRoot);
+
+    const result = runGit(['diff', '--shortstat', diffRange], { cwd });
+    if (result.exitCode !== 0) return null;
+
+    return parseShortstat(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
 // --- lazy_start ---
 
 export const startTool: McpTool = {
   name: 'lazy_start',
   description:
-    'Start working on a task. Creates a worktree, git branch, and launches ' +
-    'a supervisor to run the agent. The task must be in backlog or blocked status.',
+    'Start working on a task. Can either start an existing task by ID, or create ' +
+    'a new task and start it in one step by providing goal and prompt. Creates a ' +
+    'worktree, git branch, and launches a supervisor to run the agent.',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: {
         type: 'string',
-        description: 'Task ID (short hex prefix or task code)',
+        description: 'Task ID (short hex prefix or task code) - required when starting an existing task',
         minLength: 1,
+      },
+      goal: {
+        type: 'string',
+        description: 'Task goal - required when creating a new task inline',
+        minLength: 1,
+      },
+      prompt: {
+        type: 'string',
+        description: 'Task prompt/specification - required when creating a new task inline',
+        minLength: 1,
+      },
+      code: {
+        type: 'string',
+        description: 'Human-readable code for the task (optional)',
+      },
+      type: {
+        type: 'string',
+        description: 'Task type (optional, defaults to "task")',
+        enum: ['task', 'fix', 'spike', 'refactor', 'test', 'audit', 'migrate', 'document', 'tidy', 'rework', 'feature', 'release'],
       },
       model: {
         type: 'string',
@@ -989,19 +1169,58 @@ export const startTool: McpTool = {
         enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
-    required: ['task_id'],
+    required: [],
   },
 };
 
 export function createStartHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
-    const taskId = args.task_id as string;
+    const taskId = args.task_id as string | undefined;
+    const goal = args.goal as string | undefined;
+    const prompt = args.prompt as string | undefined;
+    const code = args.code as string | undefined;
+    const type = args.type as string | undefined;
     const model = args.model as string | undefined;
 
-    const cliArgs = ['start', taskId, '--yes'];
+    // Validate: either task_id OR goal must be provided
+    if (!taskId && !goal) {
+      throw new Error('Either task_id (to start existing task) or goal (to create and start new task) must be provided');
+    }
+
+    // Validate: if goal is provided, prompt is also required
+    if (goal && !prompt) {
+      throw new Error('prompt is required when creating a new task with goal');
+    }
+
+    // Validate: if taskId is provided, goal/prompt/code/type should not be
+    if (taskId && (goal || prompt || code || type)) {
+      throw new Error('Cannot provide goal/prompt/code/type when starting an existing task by task_id');
+    }
+
+    const cliArgs = ['start'];
+
+    if (goal) {
+      // Create-and-start flow
+      cliArgs.push('--goal', goal);
+      cliArgs.push('--prompt', prompt!);
+      if (code) {
+        cliArgs.push('--code', code);
+      }
+      if (type) {
+        cliArgs.push('--type', type);
+      }
+    } else {
+      // Start existing task flow
+      cliArgs.push(taskId!);
+    }
+
+    // Model applies to both flows
     if (model) {
       cliArgs.push('--model', model);
     }
+
+    // Always use --yes to skip confirmation prompts
+    cliArgs.push('--yes');
 
     const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
     if (result.exitCode !== 0) {
@@ -1098,6 +1317,10 @@ export const acceptTool: McpTool = {
         type: 'string',
         description: 'Reason for accepting (optional)',
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing (unless the diff is tiny).',
+      },
       approved_files: {
         type: 'array',
         items: { type: 'string' },
@@ -1108,28 +1331,98 @@ export const acceptTool: McpTool = {
   },
 };
 
+async function executeAccept(
+  taskId: string,
+  reason: string | undefined,
+  approvedFiles: string[] | undefined,
+  worktreePath: string,
+): Promise<{ output: string }> {
+  const cliArgs = ['accept', taskId, '--yes'];
+  if (reason) {
+    cliArgs.push('--reason', reason);
+  }
+  if (approvedFiles && approvedFiles.length > 0) {
+    for (const f of approvedFiles) {
+      cliArgs.push('--approve-file', f);
+    }
+  }
+
+  const result = await runLazyCliCommand(cliArgs, worktreePath);
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to accept task: ${(result.stderr || result.stdout).trim()}`);
+  }
+
+  return { output: result.stdout.trim() };
+}
+
 export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
     const reason = args.reason as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
     const approvedFiles = args.approved_files as string[] | undefined;
 
-    const cliArgs = ['accept', taskId, '--yes'];
-    if (reason) {
-      cliArgs.push('--reason', reason);
-    }
-    if (approvedFiles && approvedFiles.length > 0) {
-      for (const f of approvedFiles) {
-        cliArgs.push('--approve-file', f);
+    const storage = await requireStorage();
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
       }
-    }
+      const task = resolved.task;
 
-    const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to accept task: ${(result.stderr || result.stdout).trim()}`);
-    }
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'accept', task.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_accept without a code to get a new one.');
+        }
 
-    return { output: result.stdout.trim() };
+        return await executeAccept(taskId, reason, approvedFiles, ctx.worktreePath);
+      }
+
+      // Step 1: evaluate confirmation level based on diff size
+      const session = await storage.getSessionByTaskId(task.id);
+      let diffStat: DiffStat | null = null;
+      let commitCount = 0;
+      if (session) {
+        diffStat = await getDiffStat(task, session, storage);
+        const commits = await storage.getSessionCommits(session.id);
+        commitCount = commits.length;
+      }
+
+      // If diff stat couldn't be computed (git error, worktree gone, etc.),
+      // treat as unknown risk and require stern confirmation. Defaults must be safe.
+      const level = diffStat ? acceptConfirmationLevel(diffStat) : 'stern';
+
+      // If level is none (tiny diff with successful stat), execute directly
+      if (level === 'none') {
+        return await executeAccept(taskId, reason, approvedFiles, ctx.worktreePath);
+      }
+
+      const parentBranch = task.parent_task_id
+        ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
+        : 'main';
+
+      const code = generateCode('ac');
+      storePending({ code, operation: 'accept', taskId: task.id, createdAt: Date.now() });
+
+      const resolvedDiffStat = diffStat ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0 };
+      const context = gatherAcceptContext(task, resolvedDiffStat, commitCount, parentBranch, code);
+
+      // When diff stats are unavailable, override the zeroed values so the
+      // guidance message doesn't misleadingly say "0 files, 0 additions".
+      if (!diffStat) {
+        (context as Record<string, unknown>).files_changed = 'unknown';
+        (context as Record<string, unknown>).lines_added = 'unknown';
+        (context as Record<string, unknown>).lines_removed = 'unknown';
+      }
+
+      const templateName = `accept-${level}` as const;
+      const guidance = renderGuidance(templateName, context);
+
+      throw new Error(guidance);
+    } finally {
+      await storage.close();
+    }
   };
 }
 
@@ -1152,6 +1445,14 @@ export const rejectTool: McpTool = {
         type: 'string',
         description: 'Reason for rejecting (feedback for the agent)',
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
+      },
+      accept_dirty_worktree: {
+        type: 'boolean',
+        description: 'Allow rejecting even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
+      },
     },
     required: ['task_id'],
   },
@@ -1161,18 +1462,64 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
     const reason = args.reason as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
+    const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
 
-    const cliArgs = ['reject', taskId, '--yes'];
-    if (reason) {
-      cliArgs.push('--reason', reason);
+    // Resolve task to get full ID for confirmation scoping
+    const storage = await requireStorage();
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'reject', task.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_reject without a code to get a new one.');
+        }
+
+        const cliArgs = ['reject', taskId, '--yes'];
+        if (reason) {
+          cliArgs.push('--reason', reason);
+        }
+        if (acceptDirtyWorktree) {
+          cliArgs.push('--accept-dirty-worktree');
+        }
+
+        const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
+        if (result.exitCode !== 0) {
+          throw new Error(`Failed to reject task: ${(result.stderr || result.stdout).trim()}`);
+        }
+
+        return { output: result.stdout.trim() };
+      }
+
+      // Step 1: evaluate confirmation level and return guidance
+      const level = rejectConfirmationLevel(); // always stern
+
+      // Gather context for template
+      const session = await storage.getSessionByTaskId(task.id);
+      let commitCount = 0;
+      let linesChanged = 0;
+      if (session) {
+        const commits = await storage.getSessionCommits(session.id);
+        commitCount = commits.length;
+        // Approximate lines changed from diff stat
+        linesChanged = await getDiffLinesChanged(task, session, storage);
+      }
+
+      const code = generateCode('rj');
+      storePending({ code, operation: 'reject', taskId: task.id, createdAt: Date.now() });
+
+      const context = gatherRejectContext(task, commitCount, linesChanged, code);
+      const guidance = renderGuidance('reject', context);
+
+      throw new Error(guidance);
+    } finally {
+      await storage.close();
     }
-
-    const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to reject task: ${(result.stderr || result.stdout).trim()}`);
-    }
-
-    return { output: result.stdout.trim() };
   };
 }
 
@@ -1196,6 +1543,14 @@ export const closeTool: McpTool = {
         description: 'Reason for closing (required)',
         minLength: 1,
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
+      },
+      accept_dirty_worktree: {
+        type: 'boolean',
+        description: 'Allow closing even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
+      },
     },
     required: ['task_id', 'reason'],
   },
@@ -1205,18 +1560,62 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
     const reason = args.reason as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
+    const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
 
-    const cliArgs = ['close', taskId, '--yes'];
-    if (reason) {
-      cliArgs.push('--reason', reason);
+    const storage = await requireStorage();
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'close', task.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_close without a code to get a new one.');
+        }
+
+        const cliArgs = ['close', taskId, '--yes'];
+        if (reason) {
+          cliArgs.push('--reason', reason);
+        }
+        if (acceptDirtyWorktree) {
+          cliArgs.push('--accept-dirty-worktree');
+        }
+
+        const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
+        if (result.exitCode !== 0) {
+          throw new Error(`Failed to close task: ${(result.stderr || result.stdout).trim()}`);
+        }
+
+        return { output: result.stdout.trim() };
+      }
+
+      // Step 1: evaluate confirmation level
+      const session = await storage.getSessionByTaskId(task.id);
+      let commitCount = 0;
+      let linesChanged = 0;
+      if (session) {
+        const commits = await storage.getSessionCommits(session.id);
+        commitCount = commits.length;
+        linesChanged = await getDiffLinesChanged(task, session, storage);
+      }
+
+      const level = closeConfirmationLevel(task, commitCount);
+
+      const code = generateCode('cl');
+      storePending({ code, operation: 'close', taskId: task.id, createdAt: Date.now() });
+
+      const context = gatherCloseContext(task, commitCount, linesChanged, code);
+      const templateName = `close-${level}` as const;
+      const guidance = renderGuidance(templateName, context);
+
+      throw new Error(guidance);
+    } finally {
+      await storage.close();
     }
-
-    const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to close task: ${(result.stderr || result.stdout).trim()}`);
-    }
-
-    return { output: result.stdout.trim() };
   };
 }
 
@@ -1380,8 +1779,8 @@ export function createBlockedHandler(_ctx: McpToolContext): McpToolHandler {
 export const activeTool: McpTool = {
   name: 'lazy_active',
   description:
-    'List tasks with running sessions (status: working). These are tasks ' +
-    'currently being worked on by agents.',
+    'List all non-terminal tasks (working, blocked, interrupted, conflict, etc.) ' +
+    'with active sessions. These are tasks currently being worked on or awaiting input.',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -1396,7 +1795,7 @@ export function createActiveHandler(_ctx: McpToolContext): McpToolHandler {
       const lazyRoot = requireLazyRoot();
       await reconcileTasks(storage, lazyRoot);
 
-      const tasks = await storage.listTasksWithOptions({ workingOnly: true });
+      const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
 
       return {
         count: tasks.length,
@@ -1851,6 +2250,10 @@ export const reopenTool: McpTool = {
         type: 'string',
         description: 'Reason for reopening (required for completed tasks)',
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
+      },
     },
     required: ['task_id'],
   },
@@ -1860,6 +2263,7 @@ export function createReopenHandler(_ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const reason = args.reason as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
 
     const storage = await requireStorage();
     try {
@@ -1874,35 +2278,60 @@ export function createReopenHandler(_ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task is in ${task.status} status — can only reopen terminal tasks`);
       }
 
-      if (task.status === 'complete' && !reason) {
-        throw new Error('A reason is required to reopen a completed task');
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'reopen', task.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_reopen without a code to get a new one.');
+        }
+
+        if (task.status === 'complete' && !reason) {
+          throw new Error('A reason is required to reopen a completed task');
+        }
+
+        if (reason) {
+          await storage.createComment(task.id, `[Reopened] ${reason}`, 'builder');
+        }
+
+        await storage.reopenTask(task.id, 'builder');
+
+        const session = await storage.getSessionByTaskId(task.id);
+        const newStatus = session ? 'blocked' : 'backlog';
+        await storage.updateTaskStatus(task.id, newStatus, 'builder');
+
+        if (session) {
+          await storage.resetSession(session.id);
+        }
+
+        return {
+          task_id: shortId(task.id),
+          previous_status: task.status,
+          new_status: newStatus,
+          message: session
+            ? 'Task reopened. Call lazy_start to set up the worktree and resume.'
+            : 'Task reopened in backlog. Call lazy_start to begin work.',
+        };
       }
 
-      // Record reason as a comment if provided
-      if (reason) {
-        await storage.createComment(task.id, `[Reopened] ${reason}`, 'builder');
+      // Step 1: evaluate confirmation level
+      const level = reopenConfirmationLevel(task);
+
+      // Reopen is always at least light, so always require confirmation
+      const code = generateCode('ro');
+      storePending({ code, operation: 'reopen', taskId: task.id, createdAt: Date.now() });
+
+      const context = gatherReopenContext(task, code);
+      // Light level uses no specific template — use a simple inline guidance
+      // Standard level (reopening completed task) uses reopen-standard template
+      const templateName = level === 'standard' ? 'reopen-standard' : null;
+
+      let guidance: string;
+      if (templateName) {
+        guidance = renderGuidance(templateName, context);
+      } else {
+        guidance = `Reopening task \`${context.task_code}\`. To proceed, call \`lazy_reopen\` again with confirmation_code: "${code}"`;
       }
 
-      await storage.reopenTask(task.id, 'builder');
-
-      // Determine new status: blocked if task had a session, backlog otherwise
-      const session = await storage.getSessionByTaskId(task.id);
-      const newStatus = session ? 'blocked' : 'backlog';
-      await storage.updateTaskStatus(task.id, newStatus, 'builder');
-
-      // Reset session if one exists
-      if (session) {
-        await storage.resetSession(session.id);
-      }
-
-      return {
-        task_id: shortId(task.id),
-        previous_status: task.status,
-        new_status: newStatus,
-        message: session
-          ? 'Task reopened. Call lazy_start to set up the worktree and resume.'
-          : 'Task reopened in backlog. Call lazy_start to begin work.',
-      };
+      throw new Error(guidance);
     } finally {
       await storage.close();
     }
@@ -1936,6 +2365,10 @@ export const redoTool: McpTool = {
         description: 'Override model for the new task',
         enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
+      },
     },
     required: ['task_id'],
   },
@@ -1946,6 +2379,7 @@ export function createRedoHandler(_ctx: McpToolContext): McpToolHandler {
     const taskIdInput = args.task_id as string;
     const promptOverride = args.prompt as string | undefined;
     const model = args.model as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
 
     const storage = await requireStorage();
     try {
@@ -1963,51 +2397,77 @@ export function createRedoHandler(_ctx: McpToolContext): McpToolHandler {
         throw new Error('Cannot redo a closed task');
       }
 
-      // Generate a redo code using the old task's code (or fall back to task ID)
-      const baseCode = oldTask.code ?? shortId(oldTask.id);
-      const redoCode = await generateRedoCode(baseCode, storage);
-
-      // Get old prompt
-      let prompt = promptOverride;
-      if (!prompt) {
-        const promptHistory = await storage.getPromptHistory(oldTask.id);
-        if (promptHistory.length > 0) {
-          prompt = promptHistory[promptHistory.length - 1].content;
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'redo', oldTask.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_redo without a code to get a new one.');
         }
+
+        // Generate a redo code using the old task's code (or fall back to task ID)
+        const baseCode = oldTask.code ?? shortId(oldTask.id);
+        const redoCode = await generateRedoCode(baseCode, storage);
+
+        // Get old prompt
+        let prompt = promptOverride;
+        if (!prompt) {
+          const promptHistory = await storage.getPromptHistory(oldTask.id);
+          if (promptHistory.length > 0) {
+            prompt = promptHistory[promptHistory.length - 1].content;
+          }
+        }
+
+        // Create new task
+        const newTask = await storage.createTask(
+          oldTask.goal,
+          oldTask.parent_task_id ?? undefined,
+          undefined,
+          redoCode || undefined,
+        );
+
+        if (prompt) {
+          await storage.updateTaskPrompt(newTask.id, prompt);
+        }
+
+        const taskModel = model ?? oldTask.model;
+        if (taskModel) {
+          await storage.updateTaskModel(newTask.id, taskModel);
+        }
+
+        // Link new task to old via metadata
+        await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
+
+        // Close the old task
+        await storage.closeTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, 'builder');
+        await storage.updateTaskStatus(oldTask.id, 'closed', 'builder');
+
+        return {
+          old_task_id: shortId(oldTask.id),
+          new_task_id: shortId(newTask.id),
+          new_task_code: newTask.code ?? null,
+          goal: newTask.goal,
+          status: newTask.status,
+          message: 'New task created. Call lazy_start to begin work.',
+        };
       }
 
-      // Create new task
-      const newTask = await storage.createTask(
-        oldTask.goal,
-        oldTask.parent_task_id ?? undefined,
-        undefined,
-        redoCode || undefined,
-      );
-
-      if (prompt) {
-        await storage.updateTaskPrompt(newTask.id, prompt);
+      // Step 1: evaluate confirmation level based on commit count
+      const session = await storage.getSessionByTaskId(oldTask.id);
+      let commitCount = 0;
+      if (session) {
+        const commits = await storage.getSessionCommits(session.id);
+        commitCount = commits.length;
       }
 
-      const taskModel = model ?? oldTask.model;
-      if (taskModel) {
-        await storage.updateTaskModel(newTask.id, taskModel);
-      }
+      const level = redoConfirmationLevel(commitCount);
 
-      // Link new task to old via metadata
-      await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
+      const code = generateCode('rd');
+      storePending({ code, operation: 'redo', taskId: oldTask.id, createdAt: Date.now() });
 
-      // Close the old task
-      await storage.closeTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, 'builder');
-      await storage.updateTaskStatus(oldTask.id, 'closed', 'builder');
+      const context = gatherRedoContext(oldTask, commitCount, code);
+      const templateName = level === 'stern' ? 'redo-stern' : 'redo-standard';
+      const guidance = renderGuidance(templateName, context);
 
-      return {
-        old_task_id: shortId(oldTask.id),
-        new_task_id: shortId(newTask.id),
-        new_task_code: newTask.code ?? null,
-        goal: newTask.goal,
-        status: newTask.status,
-        message: 'New task created. Call lazy_start to begin work.',
-      };
+      throw new Error(guidance);
     } finally {
       await storage.close();
     }

@@ -123,9 +123,13 @@ function applyTomlOverrides(configPath: string, overrides: Record<string, string
     const section = key.substring(0, dotIdx);
     const field = key.substring(dotIdx + 1);
 
+    // Escape regex metacharacters in section/field names to prevent injection
+    const escSection = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     // Replace the field value in the section
     const pattern = new RegExp(
-      `^(\\[${section}\\]\\s*\\n(?:.*\\n)*?${field}\\s*=\\s*)"[^"]*"`,
+      `^(\\[${escSection}\\]\\s*\\n(?:.*\\n)*?${escField}\\s*=\\s*)"[^"]*"`,
       'm',
     );
     content = content.replace(pattern, `$1"${value}"`);

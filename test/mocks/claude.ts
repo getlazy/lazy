@@ -229,7 +229,35 @@ export async function launchSupervisorAsync(
         const { detectViolations } = await import('../../src/supervisor/permissions');
         const detected = detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
         if (detected.length > 0) {
-          violations = detected;
+          // Simulate push-back: give the agent one chance to self-correct.
+          // LAZY_MOCK_PUSHBACK_REVERTS: JSON array of file paths the agent "reverts" during push-back.
+
+          const pushbackReverts = process.env.LAZY_MOCK_PUSHBACK_REVERTS;
+          if (pushbackReverts) {
+            const revertFiles = JSON.parse(pushbackReverts) as string[];
+            for (const filePath of revertFiles) {
+              // Revert file to its state at preTurnSha
+              Bun.spawnSync(['git', 'checkout', preTurnSha, '--', filePath], { cwd: sandbox.worktreePath });
+            }
+            if (revertFiles.length > 0) {
+              Bun.spawnSync(['git', 'commit', '-m', 'Push-back: revert unnecessary file changes'], { cwd: sandbox.worktreePath });
+            }
+          }
+
+          // Re-detect violations after push-back (agent may have reverted some files)
+          const postPushbackShaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+            cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+          });
+          const postPushbackSha = postPushbackShaResult.exitCode === 0
+            ? postPushbackShaResult.stdout.toString().trim()
+            : postWorkSha;
+
+          // Update post_work_sha in status
+          status.post_work_sha = postPushbackSha;
+          writeFileSync(join(protocolDir, 'status.json'), JSON.stringify(status, null, 2));
+
+          const remaining = detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
+          violations = remaining.length > 0 ? remaining : undefined;
         }
       }
     }
@@ -237,19 +265,50 @@ export async function launchSupervisorAsync(
     // Non-fatal: skip violation detection if it fails in tests
   }
 
-  // Write a mock response to the protocol directory so reconciliation picks it up
-  const mockResp = getMockResponse();
-  let resultText = mockResp.result;
-  if (violations && violations.length > 0) {
-    const violationList = violations.map(v => `  - ${v.file}`).join('\n');
-    resultText = `**FILE PERMISSION VIOLATIONS**\n\nThe following protected files were modified or deleted:\n${violationList}\n\n${resultText}`;
+  // Post-turn check: if the command has post_turn_check, run it and capture result
+  let checkExitCode: number | undefined;
+  let checkOutput: string | undefined;
+  try {
+    const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
+    const { truncateLog } = await import('../../src/utils/log-truncate');
+    const commandPath = join(protocolDir, 'command.json');
+    if (existsFs(commandPath)) {
+      const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
+      const postTurnCheck = cmd.post_turn_check as string | undefined;
+      if (postTurnCheck) {
+        const checkResult = Bun.spawnSync(['sh', '-c', postTurnCheck], {
+          cwd: sandbox.worktreePath,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        checkExitCode = checkResult.exitCode;
+        const stderr = checkResult.stderr?.toString() ?? '';
+        checkOutput = truncateLog(stderr);
+      }
+    }
+  } catch {
+    // Non-fatal: skip check execution if it fails in tests
   }
+
+  // Write a mock response to the protocol directory so reconciliation picks it up.
+  // Violations are stored in the structured field — NOT prepended to resultText.
+  // The pushback response IS appended so reviewers can see the agent's justification.
+  const mockResp = getMockResponse();
+
+  let resultText = mockResp.result;
+  const pushbackResponse = process.env.LAZY_MOCK_PUSHBACK_RESPONSE;
+  if (pushbackResponse) {
+    resultText += '\n\n---\n\n## Permission Violation Review\n\n' + pushbackResponse;
+  }
+
   const response: Record<string, unknown> = {
     status: 'completed',
     result: resultText,
     session_id: mockResp.session_id,
     usage: mockResp.usage,
-    ...(violations ? { violations } : {}),
+    ...(violations ? { violations, pushed_back: true } : {}),
+    ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
+    ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
   };
   writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));
 }

@@ -65,6 +65,12 @@ export interface LazyConfig {
   permissions?: {
     protected?: string[];
   };
+  checks?: {
+    /** Command to run after each agent turn. Output is captured and attached to the turn. */
+    post_turn?: string;
+    /** Timeout in seconds for post_turn check command (default: 300). */
+    post_turn_timeout?: number;
+  };
 }
 
 export interface ResolvedConfig {
@@ -125,5 +131,11 @@ export interface ResolvedConfig {
   };
   permissions: {
     protected: string[];
+  };
+  checks: {
+    /** Command to run after each agent turn. Output is captured and attached to the turn. */
+    post_turn: string;
+    /** Timeout in seconds for post_turn check command (default: 300). */
+    post_turn_timeout: number;
   };
 }

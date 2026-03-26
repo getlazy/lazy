@@ -94,6 +94,10 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   permissions: {
     protected: [],
   },
+  checks: {
+    post_turn: '',
+    post_turn_timeout: 300,
+  },
 };
 
 /**
@@ -364,10 +368,17 @@ dockerfile = ""
 # Example: include = [".env", ".env.local", "config/local.yml"]
 # include = []
 
-# [permissions]
+[permissions]
 # Glob patterns for files agents should not modify or delete.
 # Agents can still ADD new files matching these patterns — only modifications
 # and deletions are flagged as violations for human review.
 # protected = ["test/**", "tests/**", "spec/**", "*_test.*", "*.test.*", "*.spec.*"]
+
+[checks]
+# Command to run after each agent turn. Output is captured and attached to
+# the turn for reviewers to see. Does NOT block the agent or trigger retries.
+# post_turn = "bun test --bail"
+# Timeout in seconds for the post_turn command (default: 300 = 5 minutes).
+# post_turn_timeout = 300
 `;
 }

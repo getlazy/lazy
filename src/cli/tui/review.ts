@@ -507,6 +507,17 @@ function buildTurnChildren(turn: Turn, data: ReviewData, keyPrefix: string = '')
     });
   }
 
+  // Post-turn check results
+  if (turn.check_exit_code !== undefined) {
+    const passed = turn.check_exit_code === 0;
+    children.push({
+      key: `${keyPrefix}turn-check:${seq}`,
+      label: 'Check',
+      icon: passed ? '✓' : '✗',
+      badge: passed ? 'OK' : `exit ${turn.check_exit_code}`,
+    });
+  }
+
   // Diff for this turn
   const turnDiffFiles = info?.diffFiles ?? [];
   if (turnDiffFiles.length > 0) {
@@ -623,6 +634,12 @@ function getContentForItem(key: string, dataMap: Map<string, ReviewData>, mainDa
     return getTurnCommitsOverview(mainData, seq);
   }
 
+  // Per-turn check results
+  if (key.startsWith('turn-check:')) {
+    const seq = parseInt(key.substring(11), 10);
+    return getTurnCheckContent(mainData, seq);
+  }
+
   // Per-turn diff overview (must check before turn-diff-file since both start with turn-diff)
   if (key.startsWith('turn-diff-file:')) {
     const rest = key.substring(15);
@@ -684,6 +701,33 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
   const lines: string[] = [];
   lines.push(roleColor + ansi.bold + `── Turn #${turn.sequence} [${roleLabel}] ──` + ansi.reset);
   lines.push('');
+
+  // Show violations prominently for agent turns (before the agent's response)
+  if (turn.role === 'agent' && turn.violations && turn.violations.length > 0) {
+    const fileCount = turn.violations.length;
+    const fileLabel = fileCount === 1 ? 'file' : 'files';
+    lines.push(ansi.fg.yellow + ansi.bold + `⚠ PERMISSION VIOLATIONS (${fileCount} ${fileLabel})` + ansi.reset);
+
+    for (const v of turn.violations) {
+      const statusColor =
+        v.status === 'approved' ? ansi.fg.green :
+        v.status === 'rejected' ? ansi.fg.red :
+        ansi.fg.yellow;
+      const statusLabel = statusColor + `[${v.status}]` + ansi.reset;
+      lines.push(`  - ${v.file} ${statusLabel}`);
+    }
+    lines.push('');
+  }
+
+  // Show post-turn check failure prominently
+  if (turn.check_exit_code !== undefined && turn.check_exit_code !== 0) {
+    const msg = turn.check_exit_code === -2 ? 'POST-TURN CHECK TIMED OUT'
+      : turn.check_exit_code === -1 ? 'POST-TURN CHECK FAILED TO EXECUTE'
+      : `POST-TURN CHECK FAILED (exit ${turn.check_exit_code})`;
+    lines.push(ansi.fg.red + ansi.bold + `✗ ${msg}` + ansi.reset);
+    lines.push('');
+  }
+
   if (turn.role === 'agent') {
     lines.push(...formatMarkdown(turn.content));
   } else {
@@ -709,6 +753,34 @@ function getTurnPromptContent(data: ReviewData, seq: number): string[] {
   lines.push(ansi.bold + ansi.fg.yellow + '── Full prompt sent to agent ──' + ansi.reset);
   lines.push('');
   lines.push(...turn.prompt.split('\n'));
+  return lines;
+}
+
+function getTurnCheckContent(data: ReviewData, seq: number): string[] {
+  const turn = data.turns.find(t => t.sequence === seq);
+  if (!turn) return ['Turn not found.'];
+  if (turn.check_exit_code === undefined) return [ansi.dim + 'No post-turn check was run.' + ansi.reset];
+
+  const lines: string[] = [];
+  const passed = turn.check_exit_code === 0;
+
+  if (passed) {
+    lines.push(ansi.fg.green + ansi.bold + '✓ Post-turn check passed' + ansi.reset);
+  } else if (turn.check_exit_code === -2) {
+    lines.push(ansi.fg.red + ansi.bold + '✗ Post-turn check timed out' + ansi.reset);
+  } else if (turn.check_exit_code === -1) {
+    lines.push(ansi.fg.red + ansi.bold + '✗ Post-turn check failed to execute' + ansi.reset);
+  } else {
+    lines.push(ansi.fg.red + ansi.bold + `✗ Post-turn check failed (exit ${turn.check_exit_code})` + ansi.reset);
+  }
+
+  if (turn.check_output) {
+    lines.push('');
+    lines.push(ansi.bold + '── Output ──' + ansi.reset);
+    lines.push('');
+    lines.push(...turn.check_output.split('\n'));
+  }
+
   return lines;
 }
 

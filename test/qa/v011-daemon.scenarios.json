@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "QA scenario file for v0.11 daemon features. Each scenario has an id, description, and ordered steps. Each step has a 'match' regex that the qa-agent uses to identify which step to execute based on the prompt it receives. The qa-agent walks through steps in order within each scenario.",
+
+  "version": "0.11",
+  "scenarios": {
+    "happy-path": {
+      "id": "happy-path",
+      "description": "Scenario A: Happy path — task lifecycle with CI. Agent creates a TypeScript project, receives feedback, makes improvements.",
+      "steps": [
+        {
+          "id": "happy-path-start",
+          "match": "You are starting to work on a new task.*Implement a simple TypeScript utility",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/index.ts",
+              "content": "/**\n * A simple string utility module.\n */\n\n/**\n * Reverses a string.\n */\nexport function reverse(s: string): string {\n  return s.split('').reverse().join('');\n}\n\n/**\n * Capitalizes the first letter of a string.\n */\nexport function capitalize(s: string): string {\n  if (s.length === 0) return s;\n  return s[0].toUpperCase() + s.slice(1);\n}\n\n/**\n * Truncates a string to a given length, adding '...' if truncated.\n */\nexport function truncate(s: string, maxLength: number): string {\n  if (s.length <= maxLength) return s;\n  return s.slice(0, maxLength - 3) + '...';\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/index.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { reverse, capitalize, truncate } from '../src/index';\n\ndescribe('string utilities', () => {\n  test('reverse', () => {\n    expect(reverse('hello')).toBe('olleh');\n    expect(reverse('')).toBe('');\n  });\n\n  test('capitalize', () => {\n    expect(capitalize('hello')).toBe('Hello');\n    expect(capitalize('')).toBe('');\n  });\n\n  test('truncate', () => {\n    expect(truncate('hello world', 8)).toBe('hello...');\n    expect(truncate('hi', 10)).toBe('hi');\n  });\n});\n"
+            },
+            {
+              "type": "write_file",
+              "path": ".github/workflows/test.yml",
+              "content": "name: Test\non:\n  push:\n    branches: ['**']\n  pull_request:\n    branches: ['**']\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: oven-sh/setup-bun@v1\n      - run: bun install\n      - run: bun test\n"
+            },
+            {
+              "type": "write_file",
+              "path": "package.json",
+              "content": "{\n  \"name\": \"string-utils\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"main\": \"src/index.ts\"\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "tsconfig.json",
+              "content": "{\n  \"compilerOptions\": {\n    \"target\": \"ES2022\",\n    \"module\": \"ES2022\",\n    \"moduleResolution\": \"bundler\",\n    \"strict\": true,\n    \"esModuleInterop\": true,\n    \"outDir\": \"dist\",\n    \"rootDir\": \".\"\n  },\n  \"include\": [\"src/**/*.ts\", \"test/**/*.ts\"]\n}\n"
+            }
+          ],
+          "commit_message": "Add string utility module with tests and CI workflow",
+          "response": "I've created a simple TypeScript string utility module with three functions:\n\n1. `reverse(s)` - reverses a string\n2. `capitalize(s)` - capitalizes the first letter\n3. `truncate(s, maxLength)` - truncates with ellipsis\n\nI also added:\n- Unit tests in `test/index.test.ts` covering all functions\n- GitHub Actions CI workflow that runs `bun test` on every push\n- `package.json` and `tsconfig.json` for project configuration\n\nAll tests pass locally. The CI workflow will run on push."
+        },
+        {
+          "id": "happy-path-feedback",
+          "match": "You are continuing to work on a task.*Implement a simple TypeScript utility",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/index.ts",
+              "content": "/**\n * A simple string utility module.\n */\n\n/**\n * Reverses a string.\n */\nexport function reverse(s: string): string {\n  return s.split('').reverse().join('');\n}\n\n/**\n * Capitalizes the first letter of a string.\n */\nexport function capitalize(s: string): string {\n  if (s.length === 0) return s;\n  return s[0].toUpperCase() + s.slice(1);\n}\n\n/**\n * Truncates a string to a given length, adding '...' if truncated.\n * @throws {Error} if maxLength is less than 4 (can't fit '...' + 1 char)\n */\nexport function truncate(s: string, maxLength: number): string {\n  if (maxLength < 4) {\n    throw new Error('maxLength must be at least 4');\n  }\n  if (s.length <= maxLength) return s;\n  return s.slice(0, maxLength - 3) + '...';\n}\n\n/**\n * Checks if a string is a palindrome (case-insensitive).\n */\nexport function isPalindrome(s: string): boolean {\n  const normalized = s.toLowerCase().replace(/[^a-z0-9]/g, '');\n  return normalized === reverse(normalized);\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/index.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { reverse, capitalize, truncate, isPalindrome } from '../src/index';\n\ndescribe('string utilities', () => {\n  test('reverse', () => {\n    expect(reverse('hello')).toBe('olleh');\n    expect(reverse('')).toBe('');\n  });\n\n  test('capitalize', () => {\n    expect(capitalize('hello')).toBe('Hello');\n    expect(capitalize('')).toBe('');\n  });\n\n  test('truncate', () => {\n    expect(truncate('hello world', 8)).toBe('hello...');\n    expect(truncate('hi', 10)).toBe('hi');\n  });\n\n  test('truncate throws on small maxLength', () => {\n    expect(() => truncate('hello', 3)).toThrow('maxLength must be at least 4');\n  });\n\n  test('isPalindrome', () => {\n    expect(isPalindrome('racecar')).toBe(true);\n    expect(isPalindrome('A man a plan a canal Panama')).toBe(true);\n    expect(isPalindrome('hello')).toBe(false);\n  });\n});\n"
+            }
+          ],
+          "commit_message": "Add error handling to truncate and add isPalindrome function",
+          "response": "Based on the feedback, I've made these improvements:\n\n1. **Error handling for `truncate`**: Now throws an `Error` if `maxLength < 4`, since we need at least one character plus the ellipsis.\n2. **New `isPalindrome` function**: Case-insensitive palindrome check that ignores non-alphanumeric characters.\n3. **Updated tests**: Added test for the truncate error case and comprehensive palindrome tests.\n\nAll tests pass."
+        }
+      ]
+    },
+
+    "ci-failure": {
+      "id": "ci-failure",
+      "description": "Scenario B: CI failure -> auto-react -> fix. Agent creates code with a deliberately failing test, then fixes it after receiving a CI failure signal.",
+      "steps": [
+        {
+          "id": "ci-failure-start",
+          "match": "You are starting to work on a new task.*Create a project with tests",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/math.ts",
+              "content": "/**\n * Math utility functions.\n */\n\n/**\n * Adds two numbers.\n */\nexport function add(a: number, b: number): number {\n  return a + b;\n}\n\n/**\n * Multiplies two numbers.\n */\nexport function multiply(a: number, b: number): number {\n  return a * b;\n}\n\n/**\n * Computes the factorial of n.\n * NOTE: This implementation has a bug — it returns n instead of 1 for n=0.\n */\nexport function factorial(n: number): number {\n  if (n < 0) throw new Error('n must be non-negative');\n  if (n === 0) return n;  // BUG: should return 1\n  return n * factorial(n - 1);\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/math.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { add, multiply, factorial } from '../src/math';\n\ndescribe('math utilities', () => {\n  test('add', () => {\n    expect(add(2, 3)).toBe(5);\n    expect(add(-1, 1)).toBe(0);\n  });\n\n  test('multiply', () => {\n    expect(multiply(3, 4)).toBe(12);\n    expect(multiply(0, 5)).toBe(0);\n  });\n\n  test('factorial', () => {\n    expect(factorial(0)).toBe(1);\n    expect(factorial(1)).toBe(1);\n    expect(factorial(5)).toBe(120);\n  });\n\n  test('factorial throws on negative', () => {\n    expect(() => factorial(-1)).toThrow('n must be non-negative');\n  });\n});\n"
+            },
+            {
+              "type": "write_file",
+              "path": ".github/workflows/test.yml",
+              "content": "name: Test\non:\n  push:\n    branches: ['**']\n  pull_request:\n    branches: ['**']\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: oven-sh/setup-bun@v1\n      - run: bun install\n      - run: bun test\n"
+            },
+            {
+              "type": "write_file",
+              "path": "package.json",
+              "content": "{\n  \"name\": \"math-utils\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"main\": \"src/math.ts\"\n}\n"
+            }
+          ],
+          "commit_message": "Add math utility module with tests and CI workflow",
+          "response": "I've created a math utility module with:\n\n- `add(a, b)` - addition\n- `multiply(a, b)` - multiplication  \n- `factorial(n)` - factorial computation\n\nAlso added unit tests and a GitHub Actions CI workflow.\n\nAll functions are implemented and tested."
+        },
+        {
+          "id": "ci-failure-fix",
+          "match": "(SIGNAL: CI_FAILURE|CI run.*(fail|error)|workflow run.*fail|GitHub Actions.*fail|check run.*fail)",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/math.ts",
+              "content": "/**\n * Math utility functions.\n */\n\n/**\n * Adds two numbers.\n */\nexport function add(a: number, b: number): number {\n  return a + b;\n}\n\n/**\n * Multiplies two numbers.\n */\nexport function multiply(a: number, b: number): number {\n  return a * b;\n}\n\n/**\n * Computes the factorial of n.\n */\nexport function factorial(n: number): number {\n  if (n < 0) throw new Error('n must be non-negative');\n  if (n === 0) return 1;\n  return n * factorial(n - 1);\n}\n"
+            }
+          ],
+          "commit_message": "Fix factorial base case: return 1 for n=0",
+          "response": "I found and fixed the CI failure. The issue was in `factorial()` — the base case for `n === 0` was returning `n` (which is 0) instead of `1`.\n\nThe fix:\n```typescript\n// Before (bug):\nif (n === 0) return n;  // returns 0\n\n// After (fix):\nif (n === 0) return 1;  // correct: 0! = 1\n```\n\nThis caused `factorial(0)` to return 0 instead of 1, and `factorial(1)` to return 0 as well (since 1 * factorial(0) = 1 * 0 = 0). All tests should now pass."
+        }
+      ]
+    },
+
+    "pr-comment": {
+      "id": "pr-comment",
+      "description": "Scenario C: PR comment -> auto-react -> respond. Agent creates working code, then responds to a PR comment requesting input validation.",
+      "steps": [
+        {
+          "id": "pr-comment-start",
+          "match": "You are starting to work on a new task.*Create a basic module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/validator.ts",
+              "content": "/**\n * Email and URL validation utilities.\n */\n\n/**\n * Validates an email address (basic check).\n */\nexport function isValidEmail(email: string): boolean {\n  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email);\n}\n\n/**\n * Validates a URL.\n */\nexport function isValidUrl(url: string): boolean {\n  try {\n    new URL(url);\n    return true;\n  } catch {\n    return false;\n  }\n}\n\n/**\n * Sanitizes a string by removing HTML tags.\n */\nexport function sanitize(input: string): string {\n  return input.replace(/<[^>]*>/g, '');\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/validator.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { isValidEmail, isValidUrl, sanitize } from '../src/validator';\n\ndescribe('validator', () => {\n  test('isValidEmail', () => {\n    expect(isValidEmail('user@example.com')).toBe(true);\n    expect(isValidEmail('not-an-email')).toBe(false);\n    expect(isValidEmail('')).toBe(false);\n  });\n\n  test('isValidUrl', () => {\n    expect(isValidUrl('https://example.com')).toBe(true);\n    expect(isValidUrl('not-a-url')).toBe(false);\n  });\n\n  test('sanitize', () => {\n    expect(sanitize('<b>bold</b>')).toBe('bold');\n    expect(sanitize('no tags')).toBe('no tags');\n  });\n});\n"
+            },
+            {
+              "type": "write_file",
+              "path": "package.json",
+              "content": "{\n  \"name\": \"validator-utils\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"main\": \"src/validator.ts\"\n}\n"
+            }
+          ],
+          "commit_message": "Add email, URL, and HTML validation utilities with tests",
+          "response": "I've created a validation module with three utilities:\n\n1. `isValidEmail(email)` - basic email format validation\n2. `isValidUrl(url)` - URL validation using the URL constructor\n3. `sanitize(input)` - strips HTML tags from strings\n\nUnit tests cover all functions. All tests pass."
+        },
+        {
+          "id": "pr-comment-respond",
+          "match": "(SIGNAL: PR_COMMENT|PR comment.*add input validation|Please add input validation|new review comment)",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/validator.ts",
+              "content": "/**\n * Email and URL validation utilities.\n */\n\n/**\n * Validates an email address (basic check).\n * @throws {TypeError} if input is not a string\n */\nexport function isValidEmail(email: string): boolean {\n  if (typeof email !== 'string') {\n    throw new TypeError('email must be a string');\n  }\n  if (email.length === 0 || email.length > 254) return false;\n  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email);\n}\n\n/**\n * Validates a URL.\n * @throws {TypeError} if input is not a string\n */\nexport function isValidUrl(url: string): boolean {\n  if (typeof url !== 'string') {\n    throw new TypeError('url must be a string');\n  }\n  if (url.length === 0) return false;\n  try {\n    new URL(url);\n    return true;\n  } catch {\n    return false;\n  }\n}\n\n/**\n * Sanitizes a string by removing HTML tags.\n * @throws {TypeError} if input is not a string\n */\nexport function sanitize(input: string): string {\n  if (typeof input !== 'string') {\n    throw new TypeError('input must be a string');\n  }\n  return input.replace(/<[^>]*>/g, '');\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/validator.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { isValidEmail, isValidUrl, sanitize } from '../src/validator';\n\ndescribe('validator', () => {\n  test('isValidEmail', () => {\n    expect(isValidEmail('user@example.com')).toBe(true);\n    expect(isValidEmail('not-an-email')).toBe(false);\n    expect(isValidEmail('')).toBe(false);\n  });\n\n  test('isValidEmail rejects non-string', () => {\n    expect(() => isValidEmail(42 as any)).toThrow('email must be a string');\n    expect(() => isValidEmail(null as any)).toThrow('email must be a string');\n  });\n\n  test('isValidEmail rejects overlong input', () => {\n    expect(isValidEmail('a'.repeat(255) + '@example.com')).toBe(false);\n  });\n\n  test('isValidUrl', () => {\n    expect(isValidUrl('https://example.com')).toBe(true);\n    expect(isValidUrl('not-a-url')).toBe(false);\n    expect(isValidUrl('')).toBe(false);\n  });\n\n  test('isValidUrl rejects non-string', () => {\n    expect(() => isValidUrl(123 as any)).toThrow('url must be a string');\n  });\n\n  test('sanitize', () => {\n    expect(sanitize('<b>bold</b>')).toBe('bold');\n    expect(sanitize('no tags')).toBe('no tags');\n  });\n\n  test('sanitize rejects non-string', () => {\n    expect(() => sanitize(undefined as any)).toThrow('input must be a string');\n  });\n});\n"
+            }
+          ],
+          "commit_message": "Add input validation and type checks to all validator functions",
+          "response": "I've addressed the PR comment about input validation. Changes made:\n\n1. **Type checking**: All functions now throw `TypeError` if the input is not a string. This catches misuse at runtime when TypeScript types are bypassed.\n\n2. **Length validation**: `isValidEmail` now rejects emails longer than 254 characters (RFC 5321 limit) and empty strings early.\n\n3. **Empty string handling**: `isValidUrl` now returns `false` for empty strings before attempting `new URL()`.\n\n4. **Updated tests**: Added tests for non-string inputs and edge cases.\n\nAll tests pass."
+        }
+      ]
+    },
+
+    "upstream-parent": {
+      "id": "upstream-parent",
+      "description": "Scenario D helper: Parent task that creates shared types. Used by upstream-change scenario to produce content on the parent branch.",
+      "steps": [
+        {
+          "id": "upstream-parent-start",
+          "match": "You are starting to work on a new task.*Create a shared types module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/types.ts",
+              "content": "/**\n * Shared type definitions used across the project.\n */\n\nexport interface FormatOptions {\n  locale?: string;\n  precision?: number;\n}\n\nexport interface ValidationResult {\n  valid: boolean;\n  errors: string[];\n}\n\nexport type Currency = 'USD' | 'EUR' | 'GBP' | 'JPY';\n\nexport interface MoneyAmount {\n  value: number;\n  currency: Currency;\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/types.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport type { FormatOptions, ValidationResult, Currency, MoneyAmount } from '../src/types';\n\ndescribe('shared types', () => {\n  test('FormatOptions is usable', () => {\n    const opts: FormatOptions = { locale: 'en-US', precision: 2 };\n    expect(opts.locale).toBe('en-US');\n  });\n\n  test('ValidationResult is usable', () => {\n    const result: ValidationResult = { valid: true, errors: [] };\n    expect(result.valid).toBe(true);\n  });\n\n  test('MoneyAmount is usable', () => {\n    const amount: MoneyAmount = { value: 42.50, currency: 'USD' };\n    expect(amount.value).toBe(42.50);\n    expect(amount.currency).toBe('USD');\n  });\n});\n"
+            },
+            {
+              "type": "write_file",
+              "path": "package.json",
+              "content": "{\n  \"name\": \"shared-types\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"main\": \"src/types.ts\"\n}\n"
+            }
+          ],
+          "commit_message": "Add shared type definitions for the project",
+          "response": "I've created the shared types module with:\n\n1. `FormatOptions` - configuration for formatting functions (locale, precision)\n2. `ValidationResult` - standard validation return type (valid flag + error list)\n3. `Currency` - union type for supported currencies\n4. `MoneyAmount` - value + currency pair\n\nThese types provide a common vocabulary for the project's modules. Tests verify that all types are usable."
+        }
+      ]
+    },
+
+    "upstream-change": {
+      "id": "upstream-change",
+      "description": "Scenario D: Upstream change -> auto-deliver -> merge. Child task receives signal that parent branch has new commits and merges them.",
+      "steps": [
+        {
+          "id": "upstream-start",
+          "match": "You are starting to work on a new task.*Create a child feature",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/formatter.ts",
+              "content": "/**\n * String formatting utilities for display.\n */\n\n/**\n * Formats a number as a currency string.\n */\nexport function formatCurrency(amount: number, currency: string = 'USD'): string {\n  return new Intl.NumberFormat('en-US', {\n    style: 'currency',\n    currency,\n  }).format(amount);\n}\n\n/**\n * Formats a date as a human-readable string.\n */\nexport function formatDate(date: Date): string {\n  return new Intl.DateTimeFormat('en-US', {\n    year: 'numeric',\n    month: 'long',\n    day: 'numeric',\n  }).format(date);\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/formatter.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { formatCurrency, formatDate } from '../src/formatter';\n\ndescribe('formatter', () => {\n  test('formatCurrency defaults to USD', () => {\n    expect(formatCurrency(1234.56)).toBe('$1,234.56');\n  });\n\n  test('formatCurrency with EUR', () => {\n    const result = formatCurrency(1234.56, 'EUR');\n    expect(result).toContain('1,234.56');\n  });\n\n  test('formatDate', () => {\n    const date = new Date('2025-01-15');\n    const result = formatDate(date);\n    expect(result).toContain('January');\n    expect(result).toContain('2025');\n  });\n});\n"
+            }
+          ],
+          "commit_message": "Add currency and date formatting utilities with tests",
+          "response": "I've created formatting utilities for the child feature:\n\n1. `formatCurrency(amount, currency)` - formats numbers as currency strings using `Intl.NumberFormat`\n2. `formatDate(date)` - formats dates in a human-readable format using `Intl.DateTimeFormat`\n\nUnit tests cover both functions. All tests pass."
+        },
+        {
+          "id": "upstream-merge",
+          "match": "(SIGNAL: UPSTREAM_CHANGE|upstream branch.*change|parent branch.*new commits|parent branch.*updated|merge upstream.*before proceeding)",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/formatter.ts",
+              "content": "/**\n * String formatting utilities for display.\n * Updated after upstream merge to use shared types.\n */\n\n/**\n * Formats a number as a currency string.\n */\nexport function formatCurrency(amount: number, currency: string = 'USD'): string {\n  return new Intl.NumberFormat('en-US', {\n    style: 'currency',\n    currency,\n  }).format(amount);\n}\n\n/**\n * Formats a date as a human-readable string.\n */\nexport function formatDate(date: Date): string {\n  return new Intl.DateTimeFormat('en-US', {\n    year: 'numeric',\n    month: 'long',\n    day: 'numeric',\n  }).format(date);\n}\n\n/**\n * Formats a percentage with specified decimal places.\n */\nexport function formatPercent(value: number, decimals: number = 1): string {\n  return `${(value * 100).toFixed(decimals)}%`;\n}\n"
+            },
+            {
+              "type": "write_file",
+              "path": "test/formatter.test.ts",
+              "content": "import { describe, test, expect } from 'bun:test';\nimport { formatCurrency, formatDate, formatPercent } from '../src/formatter';\n\ndescribe('formatter', () => {\n  test('formatCurrency defaults to USD', () => {\n    expect(formatCurrency(1234.56)).toBe('$1,234.56');\n  });\n\n  test('formatCurrency with EUR', () => {\n    const result = formatCurrency(1234.56, 'EUR');\n    expect(result).toContain('1,234.56');\n  });\n\n  test('formatDate', () => {\n    const date = new Date('2025-01-15');\n    const result = formatDate(date);\n    expect(result).toContain('January');\n    expect(result).toContain('2025');\n  });\n\n  test('formatPercent', () => {\n    expect(formatPercent(0.1234)).toBe('12.3%');\n    expect(formatPercent(0.1234, 2)).toBe('12.34%');\n    expect(formatPercent(1)).toBe('100.0%');\n  });\n});\n"
+            }
+          ],
+          "commit_message": "Merge upstream changes and add formatPercent function",
+          "response": "I received a signal that the parent branch has new commits. I've merged the upstream changes and continued development:\n\n1. **Merged upstream**: No conflicts detected, merge was clean.\n2. **Added `formatPercent`**: New function that formats a decimal value as a percentage string with configurable decimal places.\n3. **Updated tests**: Added tests for the new function.\n\nAll tests pass after the merge."
+        }
+      ]
+    }
+  },
+
+  "_design_notes": {
+    "match_patterns": "Each step's 'match' field is a regex tested against the full prompt the supervisor sends to the agent. The qa-agent tries steps in order within a scenario, using the first unmatched step whose regex matches. For signal-based steps (CI failure, PR comment, upstream change), the match patterns are broad enough to match both the v0.11 signal prefix format (SIGNAL: <TYPE>) and natural language descriptions that might appear in feedback.",
+    "actions": "Each action creates/modifies a file in the worktree. The qa-agent executes these actions, then runs `git add -A && git commit -m '<commit_message>'` before returning the response.",
+    "scenario_selection": "The qa-agent selects the active scenario based on the QA_SCENARIO environment variable or by matching the task goal against scenario descriptions. Within a scenario, steps are consumed in order — once a step matches, it won't match again.",
+    "signal_format": "v0.11 auto-deliver prepends signal summaries to prompts. The exact format is TBD but will include a prefix like 'SIGNAL: CI_FAILURE' or 'SIGNAL: PR_COMMENT' followed by details. The match patterns here are designed to work with both the structured signal format and plain-text feedback."
+  }
+}

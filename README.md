@@ -2,7 +2,7 @@
 
 `lazy` is:
 
-* A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (builder mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
+* A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (`builder` mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
 * A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
 * An [software development lifecycle](#the-task-manager) integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
 
@@ -58,7 +58,7 @@ Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the
 * Agents do the coding and (most of) reviewing, you focus on the product, the architecture and giving guidance to unblock the agents.
 * Your time is precious, agent time is aplenty. This permeates all interactions with `lazy` including direct conversations. Watching agents write code and yanking them when they go astray is *micromanagement*.
 * Prompts and their context are valuable, code is a byproduct. `lazy` automatically keeps track of all conversations, prompts, turns, comments, feedbacks.
-* Primary interface is the conversation - let `lazy`'s builder be your team lead - but you always have `lazy`'s deterministic tools at your disposal.
+* Primary interface is the conversation - let `lazy`'s `builder` be your team lead - but you always have `lazy`'s deterministic tools at your disposal.
 * Software development lifecycle is not an afterthought - it's front and center of `lazy` way of building software.
 
 ## Project Status
@@ -131,7 +131,7 @@ Another thing that is annoying are bootstrapping failures: `lazy` failing so har
 
 ### Why use Docker?
 
-I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastropic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonmously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding builder layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
+I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastropic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonmously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding `builder` layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
 
 ## The Details
 
@@ -145,13 +145,15 @@ I want to make the default onboarding path both safe and easy and I think docker
 
 ### The orchestrator
 
-- Interact with the builder agent directly through conversations and let it interact with agents through turn by turn feedback *OR*
+AKA "the `builder`".
+
+- Interact with the `builder` agent directly through conversations and let it interact with agents through turn by turn feedback *OR*
 - Use deterministic CLI tools for that task and work management including agent feedback
 - Or do both at the same time!
 
-All builder and agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and `git` branch.
+All `builder` and autonomous agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and `git` branch.
 
-The process isolation is necessary as `lazy` runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the builder agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
+The process isolation is necessary as `lazy` runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the `builder` agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
 
 The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run `lazy` on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running `lazy` on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
 
@@ -272,9 +274,9 @@ The only other alterantive at this time is storing `lazy` files directly on your
 
 ## Details
 
-### Builder
+### `lazy builer`
 
-An interactive session with Claude Code with the addition of `lazy`'s own system prompt, guiding the conversation toward task creation, orchestration and reviewing. Work with builder to:
+An interactive session with Claude Code with the addition of `lazy`'s own system prompt, guiding the conversation toward task creation, orchestration and reviewing. Work with `builder` to:
 
 - Ideate, plan work, create new tasks.
 - Start tasks and keep track of their progress.
@@ -282,28 +284,28 @@ An interactive session with Claude Code with the addition of `lazy`'s own system
 - Schedule task acceptance trains.
 - Decide on priorities and directions.
 
-In builder mode, the assistant is strongly encouraged to *not* do anything itself but rather to create tasks and coordinate work of agents working on those tasks. It is actually *so* discouraged that I mount the repo as read-only into builder's container.
+In `builder` mode, the assistant is strongly encouraged to *not* do anything itself but rather to create tasks and coordinate work of agents working on those tasks. It is actually *so* discouraged that I mount the repo as read-only into `builder`'s container.
 
-The user <-> builder <-> agent relationship follows a clear division of labor:
+The user <-> `builder` <-> agent relationship follows a clear division of labor:
 
 - The **user** sets direction and make decisions, plan larger work ("release so and so will have features this and that")
-- The **builder** helps scope work and manage tasks with goals and prompts, and preliminary or full feedback to the agents
+- The **`builder`** helps scope work and manage tasks with goals and prompts, and preliminary or full feedback to the agents
 - The **agents** write code
 
-Again, the builder never touches code directly — it creates tasks with goals and prompts, starts agents, and reviews their output. Think of it as working with a tech lead who delegates to a team of engineers.
+Again, the `builder` never touches code directly — it creates tasks with goals and prompts, starts agents, and reviews their output. Think of it as working with a tech lead who delegates to a team of engineers.
 
 The typical workflow:
 
-- You tell the builder what you want and you chat about it a bit
-- Builder offers to create certain tasks, and then starts them thus launching agents
-- Agents work in autonomously and in parallel until they finish or need guidance, and builder and you review the results.
+- You tell the `builder` what you want and you chat about it a bit
+- `builder` offers to create certain tasks, and then starts them thus launching agents
+- Agents work in autonomously and in parallel until they finish or need guidance, and `builder` and you review the results.
 - You either accept or provide feedback at which point agents continue their work.
 
-Use `lazy blocked` to see what's ready for review, and `lazy loop` to review everything in sequence. Or ask the builder to wait for the tasks and let you know what it thinks of the work.
+Use `lazy blocked` to see what's ready for review, and `lazy loop` to review everything in sequence. Or ask the `builder` to wait for the tasks and let you know what it thinks of the work.
 
 ### Agents
 
-Agents work in isolation — each runs in its own Docker container with a dedicated `git` worktree. They can search past task history via MCP tools to understand prior decisions, but they don't coordinate with each other directly. The builder handles sequencing, conflict avoidance, and priority decisions.
+Agents work in isolation — each runs in its own Docker container with a dedicated `git` worktree. They can search past task history via MCP tools to understand prior decisions, but they don't coordinate with each other directly. The `builder` handles sequencing, conflict avoidance, and priority decisions.
 
 Agents are harnessed into a deterministic turn lifecycle. On every turn, the agents will:
 
@@ -342,7 +344,7 @@ blocked    ──→ working ──→ blocked ──→ ... ──→ complete
 (feedback)     (agent)     (review)            (merged)
 ```
 
-And of course - you can do [review](#review) or you can work with [builder](#builder) on it.
+And of course - you can do [review](#review) or you can work with [`builder`](#builder) on it.
 
 ### Turn
 
@@ -358,7 +360,7 @@ Turns are the primary way to keep track of *why* the code was changed.
 
 ### Review
 
-Human feedback on a task though often written by `lazy` builder. Reviews capture:
+Human feedback on a task though often written by `lazy builder`. Reviews capture:
 
 - Verdict (`approve`, `reject`, `request_changes`)
 - Rationale (free-text explanation)
@@ -396,6 +398,30 @@ Launches an interactive Claude Code session in the task's worktree. You drive th
 
 This is rarely needed as you usually want to unblock with review and move on. But when it's needed, it's a great escape hatch.
 
+### Confirmation Protocol
+
+Agents can be wild in their actions and autonomous agents only more so which is why `lazy` adds additional friction when `builder` is taking system level actions. `lazy`'s `builder` works on the project level and its errors can propagate through both the software being built (e.g. insufficiently careful reviews) and to the *process* of the software building through `lazy` itself (e.g. rejecting long running tasks on its own where another turn would do the trick). Hence `lazy` has a built-in confirmation "tell me twice" protocol that escalates the feedback to the `builder` itself forcing it (or at least *sternly* suggesting) to take additional actions before continuing with the operation. For example, when accepting a large task, `lazy` will demand that `builder` performs a review first and only if it's still confident, accept the task This push back gives the `builder` a 2nd chance to "reflect" on the action rather than you having to carefully and synchronously curate what actions are allowed at what time.
+
+A broader point to be made here is that humans and agents require different UI because they make different mistakes. For example, there is no push back on CLI commands because those are meant for humans and humans don't just shoot from the hip and say reject tasks instead of giving feedback. But agents do so MCP is tighter UI than CLI. Another example is `lazy start` which allows humans to immediately create and launch tasks but `lazy_start` MCP tool does not allow that because agents have a tendency to create a task and then try to fix its parent and similar things that cannot be done once the task has started. Hence "tight MCP, lax CLI" is a good rule of thumb.
+
+#### Details
+
+There are four levels of "tell me twice":
+
+* `none`: `lazy` does not requires confirmation
+* `light`: `builder` is reminded of the effect of the changes but nothing else
+* `standard`: `builder` is told what it needs to do before accepting the diff
+* `stern`: `builder` is told, in sterner terms, to perform the review and "reflect" before accepting the diff
+
+Conditions for triggering these levels depend on the action being performed. For `accept` which is *the* riskiest operation, because after all, it affects the system under development, confirmations are triggered under the following conditions:
+
+| Condition (evaluated in order) | Level |
+|-------------------------------|-------|
+| Total lines ≤ 20 **and** files changed ≤ 2 | `none` |
+| Total lines > 500 **or** files changed > 10 | `stern` |
+| Total lines > 100 **or** files changed > 5 | `standard` |
+| Otherwise | `light` |
+
 ### Minimization of Little Differences
 
 On every turn, before the agent has a chance to act on the prompt, `lazy` does two things:
@@ -409,7 +435,7 @@ In both cases, if there are conflicts, it invokes the agent with a specific prom
 
 After every agent's turn, `lazy` will check if the agent has tried to change or delete files from the areas that are prohibited for it to touch. For me, there are two areas that I don't want agents just screwing around: this `README.md` and the tests. I got tired of agents, not only `lazy` agents but in general, "fixing" the issues by deleting or unnecessarily modifying tests. So now `lazy` is enforcing the rules, not through begging and cajoling in prompts but with a deterministic process.
 
-That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy` builder agent. Then it is up to the reviewer, whatever it may be, to *explicitly* accept chagnes to files. What is not accepted is assumed rejected and on the next turn, before it tries to merge anything or give the agent control, `lazy` will revert the rejected files to their pre-last-turn state and let the agent know about the changes.
+That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy builder` agent. Then it is up to the reviewer, whatever it may be, to *explicitly* accept chagnes to files. What is not accepted is assumed rejected and on the next turn, before it tries to merge anything or give the agent control, `lazy` will revert the rejected files to their pre-last-turn state and let the agent know about the changes.
 
 ### Head of Line Blocking
 

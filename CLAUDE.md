@@ -124,6 +124,58 @@ Never leave conflicts unresolved for the human to fix.
 - Add comments only where logic isn't self-evident
 - Test your changes when possible
 
+### Error handling: never swallow, always surface
+
+Errors exist to communicate what went wrong. Swallowing them — even in "non-critical" paths
+— creates debugging nightmares where the symptom is far from the cause. Every `catch` block
+must either handle the error meaningfully or propagate it with context.
+
+Rules:
+
+1. **No empty `catch {}` blocks.** Every catch must do something: re-throw, log, wrap with
+    context, or convert to a user-facing message. `catch {}` and `catch { /* ignore */ }` are
+    never acceptable. If you genuinely need to suppress an error, add a comment explaining
+    exactly why this specific error is safe to ignore and what you verified to confirm that.
+
+2. **Add context when re-throwing.** A raw re-throw (`throw err`) loses the "where" and "why."
+    Wrap with context: `throw new Error(`failed to parse ${configPath}: ${err.message}`)`. The
+    person debugging this at 2am shouldn't have to reconstruct the call stack mentally.
+
+3. **Don't catch-and-log-and-continue when the operation failed.** If a function's purpose is
+    to read config and it can't read config, that's not a warning — it's an error. Logging and
+    returning a default silently violates the caller's expectations. Throw, and let the caller
+    decide what to do.
+
+4. **Distinguish between "not found" and "found but broken."** A missing config file is a
+    normal condition (fall through to defaults). A config file that exists but fails to parse
+    is a bug in the user's config — they need to know immediately, not get a mysterious
+    downstream failure.
+
+5. **Errors are for humans, not for code.** Error messages should tell the user what happened,
+    what the system was trying to do, and what they can do to fix it. Include the actual values
+    that caused the failure (file paths, config keys, expected vs actual types).
+
+```typescript
+// Bad — silent swallow, user gets mysterious "not configured" error
+try {
+  const config = parseToml(readFileSync(configPath, 'utf-8'));
+  return config.agent?.qa?.scenario_file;
+} catch {
+  // fall through
+}
+
+// Good — distinguishes missing file from broken file
+if (!existsSync(configPath)) {
+  // No config file — fall through to other resolution methods
+} else {
+  try {
+    const config = parseToml(readFileSync(configPath, 'utf-8'));
+    return config.agent?.qa?.scenario_file;
+  } catch (err) {
+    throw new Error(`Failed to parse ${configPath}: ${err.message}`);
+  }
+}
+
 ### Principle of least surprise
 
 Lazy's behavior must be predictable. Users build mental models of how tools work, and

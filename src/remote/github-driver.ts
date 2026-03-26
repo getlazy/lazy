@@ -45,6 +45,7 @@ import type {
   DriverConfigOptions,
   ImportOptions,
   ImportResult,
+  CIJobFailure,
 } from './driver';
 import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
@@ -52,6 +53,7 @@ import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
+import { truncateLog } from '../utils/log-truncate';
 
 export interface GhResult {
   stdout: string;
@@ -94,6 +96,28 @@ function runGh(args: string[], cwd?: string): GhResult {
 function parsePrNumberFromUrl(url: string): number | undefined {
   const match = url.match(/\/pull\/(\d+)/);
   return match ? parseInt(match[1], 10) : undefined;
+}
+
+/**
+ * Parse a GitHub remote URL and extract the repository identifier (owner/repo).
+ * Supports both SSH and HTTPS formats.
+ * Returns null if the URL is not a valid GitHub URL.
+ *
+ * Examples:
+ *   git@github.com:getlazy/lazy-dev.git -> getlazy/lazy-dev
+ *   https://github.com/getlazy/lazy-dev.git -> getlazy/lazy-dev
+ *   https://github.com/getlazy/lazy-dev -> getlazy/lazy-dev
+ */
+function parseGitHubRepoIdentifier(url: string): string | null {
+  // SSH format: git@github.com:owner/repo.git or git@github.com:owner/repo
+  const sshMatch = url.match(/git@github\.com:([^/]+\/[^/]+?)(\.git)?$/);
+  if (sshMatch) return sshMatch[1];
+
+  // HTTPS format: https://github.com/owner/repo.git or https://github.com/owner/repo
+  const httpsMatch = url.match(/https:\/\/github\.com\/([^/]+\/[^/]+?)(\.git)?$/);
+  if (httpsMatch) return httpsMatch[1];
+
+  return null;
 }
 
 /**
@@ -244,18 +268,48 @@ export class GitHubDriver implements RepositoryDriver {
     const branchName = getBranchName(task);
     const targetBranch = this.targetBranch(task);
 
+    // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
+    if (!targetBranch || targetBranch.trim() === '') {
+      logger.error(`markReadyForReview: targetBranch is empty. Task metadata: ${JSON.stringify({
+        remote_target_branch: task.metadata?.remote_target_branch,
+        github_pr_target_branch: task.metadata?.github_pr_target_branch,
+      })}`);
+      logger.warn('Failed to create PR: target branch is empty');
+      return {};
+    }
+
+    logger.debug(`markReadyForReview: branchName=${branchName}, targetBranch=${targetBranch}`);
+
     // Note: Branch is already pushed by exportTasks() before calling markReadyForReview().
     // We do not push again here to avoid duplicate push operations.
 
     const body = this.buildPRBody(task);
 
-    const createResult = this.gh([
+    // Get the repository identifier to explicitly specify --repo for gh CLI.
+    // This ensures the PR is created in the correct repository when multiple
+    // GitHub remotes exist (e.g., origin → GitLab, github-obsolete → GitHub).
+    const repoIdentifier = this.getRepoIdentifier();
+    if (!repoIdentifier) {
+      logger.warn(`Failed to determine GitHub repository from remote ${this.remoteName} — PR creation may fail`);
+    }
+
+    const createArgs = [
       'pr', 'create',
       '--head', branchName,
       '--base', targetBranch,
       '--title', task.goal,
       '--body', body,
-    ]);
+    ];
+
+    // Add --repo flag if we successfully parsed the repository identifier
+    if (repoIdentifier) {
+      createArgs.push('--repo', repoIdentifier);
+    }
+
+    // Log the exact command for debugging PR creation failures
+    logger.debug(`markReadyForReview: executing: gh ${createArgs.join(' ')}`);
+
+    const createResult = this.gh(createArgs);
 
     if (createResult.exitCode !== 0) {
       logger.warn(`Failed to create PR (non-fatal): ${createResult.stderr}`);
@@ -315,14 +369,37 @@ export class GitHubDriver implements RepositoryDriver {
       const reason = existing ? `stale (state: ${existing.state})` : 'not found';
       logger.info(`Existing PR is ${reason}, creating replacement PR...`);
 
+      // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
+      if (!targetBranch || targetBranch.trim() === '') {
+        logger.error(`merge: targetBranch is empty. Task metadata: ${JSON.stringify({
+          remote_target_branch: task.metadata?.remote_target_branch,
+          github_pr_target_branch: task.metadata?.github_pr_target_branch,
+        })}`);
+        return {
+          status: 'failed',
+          error: 'Target branch is empty',
+        };
+      }
+
+      logger.debug(`merge: sourceBranch=${sourceBranch}, targetBranch=${targetBranch}`);
+
       const body = this.buildPRBody(task);
-      const createResult = this.gh([
+      const createArgs = [
         'pr', 'create',
         '--head', sourceBranch,
         '--base', targetBranch,
         '--title', task.goal,
         '--body', body,
-      ]);
+      ];
+      const repoIdentifier = this.getRepoIdentifier();
+      if (repoIdentifier) {
+        createArgs.push('--repo', repoIdentifier);
+      }
+
+      // Log the exact command for debugging PR creation failures
+      logger.debug(`merge: executing: gh ${createArgs.join(' ')}`);
+
+      const createResult = this.gh(createArgs);
 
       if (createResult.exitCode !== 0) {
         // If PR creation fails, the branch may already be fully merged into
@@ -526,6 +603,48 @@ export class GitHubDriver implements RepositoryDriver {
       logger.debug(`getPRChecks: failed to parse response for PR #${prNumber}`);
       return [];
     }
+  }
+
+  async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
+    const prNumber = this.prNumber(task);
+    if (!prNumber) return [];
+
+    const checks = this.getPRChecks(prNumber);
+    const failed = checks.filter(c => c.bucket === 'fail');
+    if (failed.length === 0) return [];
+
+    const results: CIJobFailure[] = [];
+
+    for (const check of failed) {
+      const failure: CIJobFailure = {
+        name: check.name,
+        url: check.detailUrl,
+      };
+
+      // Try to fetch logs for GitHub Actions jobs.
+      // detailUrl format: https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
+      if (check.detailUrl) {
+        const jobMatch = check.detailUrl.match(/\/actions\/runs\/\d+\/job\/(\d+)/);
+        if (jobMatch) {
+          const jobId = jobMatch[1];
+          try {
+            const logResult = this.gh([
+              'api',
+              `repos/{owner}/{repo}/actions/jobs/${jobId}/logs`,
+            ]);
+            if (logResult.exitCode === 0 && logResult.stdout) {
+              failure.log = truncateLog(logResult.stdout, 200);
+            }
+          } catch {
+            logger.debug(`getFailedCIJobs: failed to fetch logs for job ${jobId}`);
+          }
+        }
+      }
+
+      results.push(failure);
+    }
+
+    return results;
   }
 
   async postAcceptReview(task: Task, reason: string): Promise<string | null> {
@@ -962,7 +1081,42 @@ export class GitHubDriver implements RepositoryDriver {
    * remote_target_branch is driver-agnostic, github_pr_target_branch is legacy.
    */
   private targetBranch(task: Task): string {
-    return task.metadata?.remote_target_branch ?? task.metadata?.github_pr_target_branch ?? 'main';
+    const remote = task.metadata?.remote_target_branch;
+    const github = task.metadata?.github_pr_target_branch;
+
+    // The ?? operator doesn't catch empty strings, so we need to check explicitly
+    if (remote !== null && remote !== undefined) {
+      if (remote.trim() === '') {
+        logger.warn(`targetBranch: remote_target_branch is empty string for task ${task.id}`);
+        return github || 'main';
+      }
+      return remote;
+    }
+
+    if (github !== null && github !== undefined) {
+      if (github.trim() === '') {
+        logger.warn(`targetBranch: github_pr_target_branch is empty string for task ${task.id}`);
+        return 'main';
+      }
+      return github;
+    }
+
+    return 'main';
+  }
+
+  /**
+   * Get the GitHub repository identifier (owner/repo) from the configured git remote.
+   * Returns null if the remote doesn't exist or isn't a valid GitHub URL.
+   * This is used to explicitly specify --repo for gh CLI commands to avoid ambiguity
+   * when multiple GitHub remotes exist.
+   */
+  private getRepoIdentifier(): string | null {
+    const remoteUrl = this.git(['remote', 'get-url', this.remoteName]);
+    if (remoteUrl.exitCode !== 0) {
+      logger.debug(`getRepoIdentifier: failed to get URL for remote ${this.remoteName}: ${remoteUrl.stderr}`);
+      return null;
+    }
+    return parseGitHubRepoIdentifier(remoteUrl.stdout);
   }
 
   /**
@@ -1016,7 +1170,12 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   private findExistingPR(branch: string): { url: string; number: number; state: string } | null {
-    const result = this.gh(['pr', 'view', branch, '--json', 'url,number,state']);
+    const args = ['pr', 'view', branch, '--json', 'url,number,state'];
+    const repoIdentifier = this.getRepoIdentifier();
+    if (repoIdentifier) {
+      args.push('--repo', repoIdentifier);
+    }
+    const result = this.gh(args);
     if (result.exitCode !== 0) return null;
 
     try {
@@ -1080,7 +1239,12 @@ export class GitHubDriver implements RepositoryDriver {
 
   private getPRNumber(branch: string, prUrl: string): number | undefined {
     // Try gh pr view first
-    const viewResult = this.gh(['pr', 'view', branch, '--json', 'number']);
+    const args = ['pr', 'view', branch, '--json', 'number'];
+    const repoIdentifier = this.getRepoIdentifier();
+    if (repoIdentifier) {
+      args.push('--repo', repoIdentifier);
+    }
+    const viewResult = this.gh(args);
     if (viewResult.exitCode === 0) {
       try {
         return JSON.parse(viewResult.stdout).number;
@@ -1275,6 +1439,14 @@ export class GitHubDriver implements RepositoryDriver {
 
   postedNoteAtKey(): string {
     return 'github_remote_last_posted_note_at';
+  }
+
+  getLastCIFailureSynced(task: Task): string | undefined {
+    return task.metadata?.github_ci_failure_synced;
+  }
+
+  ciFailureSyncedKey(): string {
+    return 'github_ci_failure_synced';
   }
 
   formatImportedComment(comment: RemoteComment, task: Task): string {

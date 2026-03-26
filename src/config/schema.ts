@@ -39,6 +39,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   documents: ['path'],
   worktree: ['include'],
   permissions: ['protected'],
+  checks: ['post_turn', 'post_turn_timeout'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
 

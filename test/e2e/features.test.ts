@@ -16,9 +16,12 @@ describe('feature flags', () => {
   });
 
   describe('lazy init', () => {
-    test('generated lazy.toml contains commented-out features section', () => {
+    test('generated lazy.toml contains features section with commented-out keys', () => {
       const toml = readFileSync(join(ctx.root, 'lazy.toml'), 'utf-8');
-      expect(toml).toContain('# [features]');
+      // Section headers must never be commented out — only keys within them.
+      // A commented-out section header is a footgun: users uncomment a key
+      // but forget the header, and the key silently lands in the wrong section.
+      expect(toml).toContain('[features]');
       expect(toml).toContain('LAZY_VANILLA=1');
       expect(toml).toContain('# all = true');
     });

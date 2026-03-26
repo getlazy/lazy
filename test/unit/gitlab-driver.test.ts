@@ -34,6 +34,7 @@ const mockConfig: ResolvedConfig = {
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
+  checks: { post_turn: '', post_turn_timeout: 300 },
 };
 
 function makeTask(overrides?: Partial<Task>): Task {

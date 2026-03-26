@@ -127,10 +127,10 @@ export async function commandLink(args: string[]): Promise<void> {
       await storage.updateTaskMetadata(task.id, key, value);
     }
 
-    // Import comments
+    // Import comments (marked as 'remote' to prevent re-exporting to PR)
     if (result.comments && result.comments.length > 0) {
       for (const comment of result.comments) {
-        await storage.createComment(task.id, comment, getActor());
+        await storage.createComment(task.id, comment, getActor(), 'remote');
       }
     }
 

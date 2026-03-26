@@ -37,6 +37,7 @@ describe('GitHubDriver waitForChecks', () => {
     features: {},
     worktree: { include: [] },
     permissions: { protected: [] },
+    checks: { post_turn: '', post_turn_timeout: 300 },
   };
 
   const mockTask: Task = {

@@ -14,6 +14,9 @@ let syncCommentsCalls: { sinceTimestamp: string }[] = [];
 let mockFetchBranchResult = false;
 let mockHasRemoteRef = false;
 
+// Import real exports so the mock doesn't lose their shape for other test files
+import { DEFAULT_CONFIG as REAL_DEFAULT_CONFIG, getDefaultConfigTemplate as REAL_getDefaultConfigTemplate } from '../../src/config/loader';
+
 // Mock the config loader to return a github driver config
 // Uses absolute paths to .ts files, matching the pattern in preload-mocks.ts
 mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
@@ -23,12 +26,13 @@ mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
       git_remote: 'origin',
     },
   }),
-  DEFAULT_CONFIG: {},
-  getDefaultConfigTemplate: () => '',
+  DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
+  getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
 }));
 
 // Mock the remote module to return a controllable driver
 mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+  detectRemote: () => null,
   createDriver: () => ({
     hasRemoteRef: () => mockHasRemoteRef,
     fetchBranch: async (branch: string, worktreePath: string) => {

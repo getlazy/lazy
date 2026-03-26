@@ -349,6 +349,10 @@ function formatPhase(phase: string): string | null {
     case 'merge_and_fix_done': return 'Upstream sync complete';
     case 'work': return 'Agent working...';
     case 'work_done': return 'Agent finished';
+    case 'permission_pushback': return 'Permission violation detected, pushing back...';
+    case 'permission_pushback_done': return 'Permission pushback complete';
+    case 'post_turn_check': return 'Running post-turn check...';
+    case 'post_turn_check_done': return 'Post-turn check complete';
     case 'post_turn_sync': return 'Post-turn sync...';
     case 'post_turn_sync_done': return 'Post-turn sync complete';
     case 'writing_response': return null; // internal detail

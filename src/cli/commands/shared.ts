@@ -567,7 +567,7 @@ export async function syncTaskFromRemote(
         if (existingCommentIds.has(comment.id)) continue;
 
         const noteContent = driver.formatImportedComment(comment, task);
-        await storage.createComment(task.id, noteContent, getActor());
+        await storage.createComment(task.id, noteContent, getActor(), 'remote');
         newCount++;
       }
 

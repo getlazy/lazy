@@ -29,6 +29,7 @@ import type {
   ModelName,
   Actor,
   FileViolation,
+  CommentSource,
 } from './types';
 import { isTerminalStatus, DEFAULT_TASK_TYPE, type TaskType } from '../types';
 import { assertValidTransition } from '../task-state-machine';
@@ -217,7 +218,9 @@ export class PostgresStorage implements Storage {
           merge_conflicts JSONB,
           violations JSONB,
           usage JSONB,
-          timestamp BIGINT NOT NULL
+          timestamp BIGINT NOT NULL,
+          check_exit_code INTEGER,
+          check_output TEXT
         )
       `;
 
@@ -227,6 +230,20 @@ export class PostgresStorage implements Storage {
       await sql`
         DO $$ BEGIN
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS violations JSONB;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+
+      // Migration: add check columns if missing (for existing databases)
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS check_exit_code INTEGER;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS check_output TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
       `;
@@ -266,11 +283,20 @@ export class PostgresStorage implements Storage {
           task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
           content TEXT NOT NULL,
           created_at BIGINT NOT NULL,
-          actor TEXT
+          actor TEXT,
+          source TEXT
         )
       `;
 
       await sql`CREATE INDEX IF NOT EXISTS idx_comments_task_id ON comments(task_id)`;
+
+      // Migration: add source column if missing (for existing databases)
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE comments ADD COLUMN IF NOT EXISTS source TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
 
       // Prompt history table
       await sql`
@@ -349,6 +375,19 @@ export class PostgresStorage implements Storage {
     type?: string,
     agentId?: string
   ): Promise<Task> {
+    // Reject duplicate codes against non-terminal tasks
+    if (code) {
+      const conflicts = await this.sql`
+        SELECT id, status FROM tasks
+        WHERE code = ${code} AND status NOT IN ('complete', 'abandoned', 'closed')
+        LIMIT 1
+      `;
+      if (conflicts.length > 0) {
+        const c = conflicts[0];
+        throw new Error(`A task with code '${code}' already exists (${(c.id as string).slice(0, 8)}, status: ${c.status}). Choose a different code or close/reject the existing task first.`);
+      }
+    }
+
     const id = randomUUID();
     const now = Date.now();
     const taskType = (type ?? DEFAULT_TASK_TYPE) as TaskType;
@@ -397,8 +436,35 @@ export class PostgresStorage implements Storage {
 
     if (input.match(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/)) {
       const codeMatches = await this.sql<Task[]>`SELECT * FROM tasks WHERE code = ${input}`;
-      if (codeMatches.length === 1) return { task: codeMatches[0] };
-      if (codeMatches.length > 1) return { task: null, ambiguousMatches: codeMatches };
+      if (codeMatches.length === 0) {
+        // Fall through to prefix matching
+      } else if (codeMatches.length === 1) {
+        return { task: codeMatches[0] };
+      } else {
+        // Multiple matches: apply disambiguation logic
+        // 1. Prefer non-terminal tasks over terminal tasks
+        const nonTerminal = codeMatches.filter(t => !isTerminalStatus(t.status));
+        const terminal = codeMatches.filter(t => isTerminalStatus(t.status));
+
+        if (nonTerminal.length === 1) {
+          // Single non-terminal task - use it even if there are terminal tasks
+          return { task: nonTerminal[0] };
+        }
+
+        if (nonTerminal.length > 1) {
+          // Multiple non-terminal tasks - genuinely ambiguous, error
+          return { task: null, ambiguousMatches: nonTerminal };
+        }
+
+        // All matches are terminal (closed, abandoned, complete)
+        if (terminal.length === 1) {
+          return { task: terminal[0] };
+        }
+
+        // Multiple terminal tasks - prefer most recent (all inactive, so not genuinely ambiguous)
+        const sorted = terminal.sort((a, b) => b.created_at - a.created_at);
+        return { task: sorted[0] };
+      }
     }
 
     const prefixMatches = await this.sql<Task[]>`SELECT * FROM tasks WHERE id LIKE ${input + '%'}`;
@@ -715,7 +781,8 @@ export class PostgresStorage implements Storage {
       INSERT INTO turns (
         id, session_id, sequence, role, content, model, prompt,
         start_sha, end_sha, start_sha_work, end_sha_work,
-        merge_conflicts, violations, usage, timestamp
+        merge_conflicts, violations, usage, timestamp,
+        check_exit_code, check_output
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${options.content},
@@ -723,7 +790,8 @@ export class PostgresStorage implements Storage {
         ${options.startShaWork ?? null}, ${options.endShaWork ?? null},
         ${options.mergeConflicts ? JSON.stringify(options.mergeConflicts) : null},
         ${options.violations ? JSON.stringify(options.violations) : null},
-        ${options.usage ? JSON.stringify(options.usage) : null}, ${now}
+        ${options.usage ? JSON.stringify(options.usage) : null}, ${now},
+        ${options.checkExitCode ?? null}, ${options.checkOutput ?? null}
       )
     `;
 
@@ -743,6 +811,8 @@ export class PostgresStorage implements Storage {
       violations: options.violations,
       usage: options.usage ?? null,
       timestamp: now,
+      ...(options.checkExitCode !== undefined ? { check_exit_code: options.checkExitCode } : {}),
+      ...(options.checkOutput !== undefined ? { check_output: options.checkOutput } : {}),
     };
   }
 
@@ -886,16 +956,16 @@ export class PostgresStorage implements Storage {
     return { task, session, children: childNodes, depth };
   }
 
-  async createComment(taskId: string, content: string, actor?: Actor): Promise<Comment> {
+  async createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment> {
     const id = randomUUID();
     const now = Date.now();
 
     await this.sql`
-      INSERT INTO comments (id, task_id, content, created_at, actor)
-      VALUES (${id}, ${taskId}, ${content}, ${now}, ${actor ?? null})
+      INSERT INTO comments (id, task_id, content, created_at, actor, source)
+      VALUES (${id}, ${taskId}, ${content}, ${now}, ${actor ?? null}, ${source ?? null})
     `;
 
-    return { id, task_id: taskId, content, created_at: now, actor };
+    return { id, task_id: taskId, content, created_at: now, actor, source };
   }
 
   async getTaskComments(taskId: string): Promise<Comment[]> {

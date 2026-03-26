@@ -2,8 +2,8 @@
  * Pairing lock utilities for `lazy pair`.
  *
  * When a human pairs on a task (interactive Claude Code session in the worktree),
- * a pairing lock file is placed alongside the regular worktree lock:
- *   <datadir>/worktrees/<task-short-id>/.lazy-pairing
+ * a pairing lock file is placed inside the worktree's .lazy directory:
+ *   <worktree>/.lazy-task-sandbox/pairing-lock
  *
  * While this lock exists, automated commands (start, unblock, accept, reject,
  * resume) and the reconciler must refuse to operate on the task.
@@ -12,7 +12,7 @@
  * stale lock detection when the process has exited.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 export interface PairingLockInfo {
@@ -21,13 +21,14 @@ export interface PairingLockInfo {
   user: string;
 }
 
-const PAIRING_LOCK_FILENAME = '.lazy-pairing';
+const PAIRING_LOCK_FILENAME = 'pairing-lock';
 
 /**
  * Get the pairing lock file path for a worktree directory.
+ * Lives inside .lazy-task-sandbox/ so it doesn't appear as an untracked git file.
  */
 export function getPairingLockPath(worktreePath: string): string {
-  return join(worktreePath, PAIRING_LOCK_FILENAME);
+  return join(worktreePath, '.lazy-task-sandbox', PAIRING_LOCK_FILENAME);
 }
 
 /**
@@ -92,6 +93,10 @@ export function acquirePairingLock(worktreePath: string): void {
   };
 
   const lockPath = getPairingLockPath(worktreePath);
+  const lockDir = join(worktreePath, '.lazy');
+  if (!existsSync(lockDir)) {
+    mkdirSync(lockDir, { recursive: true });
+  }
   writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf-8');
 }
 
