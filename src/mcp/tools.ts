@@ -711,7 +711,7 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     }
 
     // Check if there's anything to commit
-    const statusResult = runGit(['diff', '--cached', '--stat'], { cwd });
+    const statusResult = runGit(['diff', '--no-color', '--cached', '--stat'], { cwd });
     const diffStat = statusResult.stdout;
     if (!diffStat) {
       return {
@@ -1119,7 +1119,7 @@ async function getDiffStat(
 
     const { cwd, diffRange } = computeDiffCwdAndRange(session, parentBranch, storage.getStoragePath(), lazyRoot);
 
-    const result = runGit(['diff', '--shortstat', diffRange], { cwd });
+    const result = runGit(['diff', '--no-color', '--shortstat', diffRange], { cwd });
     if (result.exitCode !== 0) return null;
 
     return parseShortstat(result.stdout);
@@ -1133,35 +1133,15 @@ async function getDiffStat(
 export const startTool: McpTool = {
   name: 'lazy_start',
   description:
-    'Start working on a task. Can either start an existing task by ID, or create ' +
-    'a new task and start it in one step by providing goal and prompt. Creates a ' +
-    'worktree, git branch, and launches a supervisor to run the agent.',
+    'Start working on an existing task. Creates a worktree, git branch, and ' +
+    'launches a supervisor to run the agent. To create a new task, use lazy_create first.',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: {
         type: 'string',
-        description: 'Task ID (short hex prefix or task code) - required when starting an existing task',
+        description: 'Task ID (short hex prefix or task code)',
         minLength: 1,
-      },
-      goal: {
-        type: 'string',
-        description: 'Task goal - required when creating a new task inline',
-        minLength: 1,
-      },
-      prompt: {
-        type: 'string',
-        description: 'Task prompt/specification - required when creating a new task inline',
-        minLength: 1,
-      },
-      code: {
-        type: 'string',
-        description: 'Human-readable code for the task (optional)',
-      },
-      type: {
-        type: 'string',
-        description: 'Task type (optional, defaults to "task")',
-        enum: ['task', 'fix', 'spike', 'refactor', 'test', 'audit', 'migrate', 'document', 'tidy', 'rework', 'feature', 'release'],
       },
       model: {
         type: 'string',
@@ -1169,52 +1149,17 @@ export const startTool: McpTool = {
         enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
       },
     },
-    required: [],
+    required: ['task_id'],
   },
 };
 
 export function createStartHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
-    const taskId = args.task_id as string | undefined;
-    const goal = args.goal as string | undefined;
-    const prompt = args.prompt as string | undefined;
-    const code = args.code as string | undefined;
-    const type = args.type as string | undefined;
+    const taskId = args.task_id as string;
     const model = args.model as string | undefined;
 
-    // Validate: either task_id OR goal must be provided
-    if (!taskId && !goal) {
-      throw new Error('Either task_id (to start existing task) or goal (to create and start new task) must be provided');
-    }
+    const cliArgs = ['start', taskId];
 
-    // Validate: if goal is provided, prompt is also required
-    if (goal && !prompt) {
-      throw new Error('prompt is required when creating a new task with goal');
-    }
-
-    // Validate: if taskId is provided, goal/prompt/code/type should not be
-    if (taskId && (goal || prompt || code || type)) {
-      throw new Error('Cannot provide goal/prompt/code/type when starting an existing task by task_id');
-    }
-
-    const cliArgs = ['start'];
-
-    if (goal) {
-      // Create-and-start flow
-      cliArgs.push('--goal', goal);
-      cliArgs.push('--prompt', prompt!);
-      if (code) {
-        cliArgs.push('--code', code);
-      }
-      if (type) {
-        cliArgs.push('--type', type);
-      }
-    } else {
-      // Start existing task flow
-      cliArgs.push(taskId!);
-    }
-
-    // Model applies to both flows
     if (model) {
       cliArgs.push('--model', model);
     }
@@ -1273,7 +1218,57 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
     const model = args.model as string | undefined;
     const approvedFiles = args.approved_files as string[] | undefined;
 
-    const cliArgs = ['unblock', taskId];
+    // --- Guard: validate approved_files parameter ---
+    // The approved_files parameter is only meaningful when there are actual
+    // file permission violations. Require explicit intent for both approve and revert.
+    const storage = await requireStorage();
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+
+      // Get violations if task is in conflict status
+      let violations: Array<{ file: string; status: string }> = [];
+      if (task.status === 'conflict') {
+        const sess = await storage.getSessionByTaskId(task.id);
+        if (sess) {
+          const turns = await storage.getSessionTurns(sess.id);
+          const latestAgentTurn = turns.filter(t => t.role === 'agent').pop();
+          violations = latestAgentTurn?.violations?.filter(v => v.status === 'pending') ?? [];
+        }
+      }
+
+      const hasViolations = violations.length > 0;
+
+      // Error: approved_files passed when there are no violations
+      if (!hasViolations && approvedFiles !== undefined) {
+        throw new Error(
+          `Task ${taskId} has no file permission violations. ` +
+          `The "approved_files" parameter is only meaningful for conflict tasks. ` +
+          `Do not pass it when there are no violations.`
+        );
+      }
+
+      // Error: conflict task but approved_files not passed
+      if (hasViolations && approvedFiles === undefined) {
+        const fileList = violations.map(v => `  - ${v.file}`).join('\n');
+        throw new Error(
+          `Task ${taskId} has ${violations.length} file permission violation(s):\n${fileList}\n\n` +
+          `To unblock, pass the "approved_files" parameter:\n` +
+          `  - To approve all: approved_files: ${JSON.stringify(violations.map(v => v.file))}\n` +
+          `  - To approve specific files: approved_files: ["file1.ts", "file2.ts"]\n` +
+          `  - To revert all (explicit): approved_files: []\n\n` +
+          `Note: approved_files: [] means revert all files. ` +
+          `Omitting the parameter entirely is an error (no implicit default).`
+        );
+      }
+    } finally {
+      await storage.close();
+    }
+
+    const cliArgs = ['unblock', taskId, '--yes'];
     if (model) {
       cliArgs.push('--model', model);
     }
@@ -1921,8 +1916,8 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
       }
 
       const diffArgs = full
-        ? ['diff', diffRange]
-        : ['diff', '--stat', diffRange];
+        ? ['diff', '--no-color', diffRange]
+        : ['diff', '--no-color', '--stat', diffRange];
 
       // Append file pathspecs after a -- separator
       if (files && files.length > 0) {

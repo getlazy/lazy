@@ -12,7 +12,7 @@
 
 import type { Task } from '../types';
 import { isTerminalStatus } from '../types';
-import { branchExists } from '../git/operations';
+import { branchExists, getTaskTargetBranch } from '../git/operations';
 import type { Storage } from '../storage/interface';
 import { getBranchNameFromId } from './helpers';
 import { getActor } from '../constants';
@@ -59,7 +59,7 @@ export async function checkOrphanedChild(
     parentBranchName = await getBranchNameFromId(task.parent_task_id, storage);
   } catch {
     // Can't determine parent's branch name — treat as orphaned
-    return { isOrphaned: true, parentTask, retargetBranch: parentTask.metadata?.remote_target_branch ?? 'main' };
+    return { isOrphaned: true, parentTask, retargetBranch: getTaskTargetBranch(parentTask, root) ?? 'main' };
   }
 
   if (branchExists(parentBranchName, root)) {
@@ -69,7 +69,7 @@ export async function checkOrphanedChild(
 
   // Parent is terminal and branch is gone. Determine the retarget branch.
   // Use the parent's target branch (what the parent was merging into), defaulting to main.
-  let retargetBranch = parentTask.metadata?.remote_target_branch ?? 'main';
+  let retargetBranch = getTaskTargetBranch(parentTask, root) ?? 'main';
 
   // If the retarget branch also doesn't exist (chained accepts), fall back to main
   if (!branchExists(retargetBranch, root)) {

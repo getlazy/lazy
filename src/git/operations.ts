@@ -3,6 +3,7 @@ import { join, dirname } from 'path';
 import { LAZY_COAUTHOR_TRAILER } from '../constants';
 import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
+import type { Task } from '../types';
 
 export interface GitCommitInfo {
   sha: string;
@@ -36,6 +37,62 @@ export function getCurrentBranch(cwd?: string): string {
     throw new Error(`Failed to get current branch: ${result.stderr}`);
   }
   return result.stdout;
+}
+
+/**
+ * Get the remote's default branch name (e.g., "main" or "master").
+ * Returns the branch name, falling back to "main" if it cannot be determined.
+ *
+ * This resolves the branch via `git symbolic-ref refs/remotes/<remote>/HEAD`,
+ * which returns the remote's default branch regardless of what's checked out locally.
+ */
+export function getRemoteDefaultBranch(cwd?: string, remoteName: string = 'origin'): string {
+  // Try to resolve the remote's default branch via symbolic-ref
+  const result = runGit(['symbolic-ref', `refs/remotes/${remoteName}/HEAD`], { cwd });
+  if (result.exitCode === 0) {
+    // Returns something like "refs/remotes/origin/main" — extract the branch name
+    const ref = result.stdout.trim();
+    const prefix = `refs/remotes/${remoteName}/`;
+    if (ref.startsWith(prefix)) {
+      return ref.slice(prefix.length);
+    }
+  }
+
+  // Fallback to "main" if remote default cannot be determined
+  logger.warn(`Could not resolve remote default branch for ${remoteName} — falling back to "main". Run "git remote set-head ${remoteName} --auto" to configure.`);
+  return 'main';
+}
+
+/**
+ * Resolve the literal "HEAD" (returned by getCurrentBranch in detached HEAD state)
+ * to the remote's default branch name. Returns the branch unchanged if it's not "HEAD".
+ *
+ * This is needed because `git rev-parse --abbrev-ref HEAD` returns the literal string
+ * "HEAD" when the repo is in detached HEAD state (e.g., when the main branch is checked
+ * out in a worktree). Passing "HEAD" as a base ref to GitHub's PR API causes failures
+ * like "Base ref must be a branch".
+ */
+export function resolveDetachedHead(branch: string, cwd?: string, remoteName: string = 'origin'): string {
+  if (branch !== 'HEAD') return branch;
+
+  const resolved = getRemoteDefaultBranch(cwd, remoteName);
+  logger.warn(`Detached HEAD detected — resolved to remote default branch '${resolved}'`);
+  return resolved;
+}
+
+/**
+ * Get the target branch for a task, resolving "HEAD" if present.
+ *
+ * Reads `remote_target_branch` from task metadata and applies `resolveDetachedHead`
+ * if the value is "HEAD" (defense against legacy metadata with literal "HEAD" stored).
+ *
+ * Returns undefined if the task has no `remote_target_branch` metadata, allowing
+ * callers to provide their own fallback (e.g., getCurrentBranch or 'main').
+ */
+export function getTaskTargetBranch(task: Task, cwd: string, remoteName: string = 'origin'): string | undefined {
+  const targetBranch = task.metadata?.remote_target_branch;
+  if (!targetBranch) return undefined;
+  return resolveDetachedHead(targetBranch, cwd, remoteName);
 }
 
 export function createAndCheckoutBranch(name: string, cwd?: string): void {

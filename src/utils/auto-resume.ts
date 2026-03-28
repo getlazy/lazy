@@ -21,7 +21,7 @@ import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
 import { getDataDir } from '../cli/init';
 import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
-import { getCurrentBranch, hasUncommittedChanges } from '../git/operations';
+import { getCurrentBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -218,7 +218,7 @@ export async function autoResumeTask(
         if (task.parent_task_id) {
           parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
         } else {
-          parentBranch = task.metadata?.remote_target_branch ?? getCurrentBranch(lazyRoot);
+          parentBranch = getTaskTargetBranch(task, lazyRoot) ?? getCurrentBranch(lazyRoot);
         }
         syncBeforeWork = true;
       } catch (err) {

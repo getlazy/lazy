@@ -9,7 +9,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { Terminal, getTerminalSize, type KeyPress } from './terminal';
 import { render, renderTreeOverlay, renderHelpOverlay, flattenNavItems, formatMarkdown, colorDiff, wrapLines, statusColor, type NavItem, type LayoutState, type TreeOverlayNode, type SubtaskFilterMode } from './renderer';
-import { getDiffStat, getDiffFull, getCurrentBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists } from '../../git/operations';
+import { getDiffStat, getDiffFull, getCurrentBranch, getRemoteDefaultBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists } from '../../git/operations';
 import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchName, getBranchNameFromId } from '../helpers';
 import type { TaskTreeNode } from '../../storage/types';
 import { readPendingProposals, updateProposalStatus } from '../commands/propose';
@@ -71,7 +71,7 @@ export async function loadReviewData(
   if (task.parent_task_id) {
     targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
   } else {
-    targetBranch = getCurrentBranch(root);
+    targetBranch = getRemoteDefaultBranch(root);
   }
 
   // Load all data in parallel (skip session-specific data if no session)
@@ -189,7 +189,7 @@ async function loadReviewDataForSubtask(
   if (task.parent_task_id) {
     targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
   } else {
-    targetBranch = getCurrentBranch(root);
+    targetBranch = getRemoteDefaultBranch(root);
   }
 
   // Try to get branch diff even without a session

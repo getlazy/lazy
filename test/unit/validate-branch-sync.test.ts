@@ -68,15 +68,18 @@ describe('validateBranchInSyncWithRemote', () => {
   });
 
   // INVARIANT: If the remote can't be fetched (network issue, branch doesn't exist),
-  // don't block the accept — fail safe.
-  test('returns inSync when fetch fails (fail safe)', () => {
+  // fail hard — no silent fallback. Proceeding without verification risks a
+  // half-accepted state where the remote merge succeeds but local diverges.
+  test('returns not inSync when fetch fails (fail hard)', () => {
     const git = (args: string[]): GitResult => {
       if (args[0] === 'fetch') return fail('Could not resolve host');
       return fail('unexpected: ' + args.join(' '));
     };
 
     const result = validateBranchInSyncWithRemote('main', 'origin', '/tmp/test', git);
-    expect(result.inSync).toBe(true);
+    expect(result.inSync).toBe(false);
+    expect(result.error).toContain('Failed to fetch');
+    expect(result.error).toContain('Could not resolve host');
   });
 
   // INVARIANT: Works with non-main target branches (e.g., release branches).
@@ -110,8 +113,9 @@ describe('validateBranchInSyncWithRemote', () => {
     expect(result.error).toContain('upstream/main');
   });
 
-  // INVARIANT: If rev-parse fails for either ref, don't block — can't verify.
-  test('returns inSync when rev-parse fails (fail safe)', () => {
+  // INVARIANT: If rev-parse fails for either ref, fail hard — can't verify
+  // means can't proceed safely.
+  test('returns not inSync when rev-parse fails (fail hard)', () => {
     const git = (args: string[]): GitResult => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'rev-parse') return fail('unknown revision');
@@ -119,6 +123,7 @@ describe('validateBranchInSyncWithRemote', () => {
     };
 
     const result = validateBranchInSyncWithRemote('main', 'origin', '/tmp/test', git);
-    expect(result.inSync).toBe(true);
+    expect(result.inSync).toBe(false);
+    expect(result.error).toContain('Failed to resolve refs');
   });
 });

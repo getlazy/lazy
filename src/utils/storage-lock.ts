@@ -14,7 +14,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { getDataDir } from '../cli/init';
 
 const LOCK_FILENAME = '.storage-lock';
@@ -134,6 +134,14 @@ export class StorageLock {
    * Returns true if acquired, false if held by another live process.
    */
   private tryAcquire(): boolean {
+    // Precondition: lock directory must exist
+    const lockDir = dirname(this.lockPath);
+    if (!existsSync(lockDir)) {
+      throw new Error(
+        `Storage lock directory does not exist: ${lockDir}. Has 'lazy init' been run?`
+      );
+    }
+
     try {
       if (existsSync(this.lockPath)) {
         const content = readFileSync(this.lockPath, 'utf-8');

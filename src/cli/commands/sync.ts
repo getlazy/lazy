@@ -559,7 +559,7 @@ export async function runSync(root: string, storage: Awaited<ReturnType<typeof r
       allTasksForBranches
         .filter(t => !isTerminalStatus(t.status))
         .map(t => t.metadata?.remote_target_branch ?? t.metadata?.github_pr_target_branch)
-        .filter((b): b is string => typeof b === 'string')
+        .filter((b): b is string => typeof b === 'string' && b !== 'HEAD')
     ),
   ];
 

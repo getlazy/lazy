@@ -78,6 +78,12 @@ describe('GitHubDriver merge', () => {
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
         return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
       }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([])); // No checks
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: '' }));
+      }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
         return ok(JSON.stringify({ body: 'PR body' }));
       }
@@ -111,6 +117,12 @@ describe('GitHubDriver merge', () => {
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
         return ok(JSON.stringify({ number: 99 }));
+      }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([]));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: '' }));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
         return ok(JSON.stringify({ body: 'PR body' }));
@@ -154,6 +166,13 @@ describe('GitHubDriver merge', () => {
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
         return ok(JSON.stringify({ number: 99 }));
+      }
+      // Pre-merge checks pass
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([]));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: '' }));
       }
       // gh pr view --json mergeable (conflict detection after merge failure)
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
@@ -239,6 +258,12 @@ describe('GitHubDriver merge', () => {
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
         return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
       }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([]));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: '' }));
+      }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
         return ok(JSON.stringify({ body: 'PR body' }));
       }
@@ -303,24 +328,15 @@ describe('GitHubDriver merge', () => {
 
   // INVARIANT: When checks are running, merge() returns 'pending' instead of 'failed'.
   // This tells the accept command to set the task to 'merging' status and exit cleanly.
+  // Now caught by pre-merge CI check rather than post-merge-failure detection.
   test('returns pending when required checks are pending', async () => {
     const deps = makeDeps((args) => {
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
         return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
       }
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
-      }
-      // gh pr view --json mergeable (not conflicting — fall through to checks)
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
-        return ok(JSON.stringify({ mergeable: 'MERGEABLE' }));
-      }
-      // gh pr checks --json (pending checks detected)
+      // Pre-merge CI check: pending checks detected
       if (args[0] === 'pr' && args[1] === 'checks') {
         return ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }]));
-      }
-      if (args[0] === 'pr' && args[1] === 'merge') {
-        return fail('merge requirements were not met');
       }
       return fail('unexpected');
     });
@@ -338,6 +354,201 @@ describe('GitHubDriver merge', () => {
     if (result.status === 'pending') {
       expect(result.reason).toContain('check');
     }
+  });
+
+  // INVARIANT: merge() must check CI status before attempting merge.
+  // This prevents admin users from accidentally bypassing branch protection
+  // when GitHub allows admin merge bypass by default.
+  test('refuses to merge when CI checks are failing', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps = makeDeps((args) => {
+      ghCalls.push([...args]);
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+      }
+      // Pre-merge CI check: return failed checks
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([
+          { name: 'ci/build', state: 'FAILURE', bucket: 'fail', detailUrl: 'https://example.com/1' },
+        ]));
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') {
+        throw new Error('merge should not be called when checks are failing');
+      }
+      return fail('unexpected gh call');
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask(),
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('failed');
+    if (result.status === 'failed') {
+      expect(result.error).toContain('CI checks failed');
+      expect(result.error).toContain('ci/build');
+    }
+    // Verify merge was never called
+    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
+  });
+
+  // INVARIANT: merge() must check CI status before attempting merge.
+  // Pending checks should return 'pending' so the task enters 'merging' state.
+  test('returns pending when CI checks are still running (pre-merge)', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps = makeDeps((args) => {
+      ghCalls.push([...args]);
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([
+          { name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null },
+        ]));
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') {
+        throw new Error('merge should not be called when checks are pending');
+      }
+      return fail('unexpected gh call');
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask(),
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('pending');
+    if (result.status === 'pending') {
+      expect(result.reason).toContain('CI checks pending');
+    }
+    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
+  });
+
+  // INVARIANT: merge() must check review status before attempting merge.
+  // Required reviews must be approved before merging.
+  test('refuses to merge when required reviews are not approved', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps = makeDeps((args) => {
+      ghCalls.push([...args]);
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+      }
+      // CI checks pass
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
+        ]));
+      }
+      // Review decision: not approved
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: 'REVIEW_REQUIRED' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') {
+        throw new Error('merge should not be called when reviews are missing');
+      }
+      return fail('unexpected gh call');
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask(),
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('pending');
+    if (result.status === 'pending') {
+      expect(result.reason).toContain('Required reviews not approved');
+    }
+    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
+  });
+
+  // INVARIANT: merge() proceeds when checks pass and reviews are approved.
+  test('merges when CI passes and reviews are approved', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps = makeDeps((args) => {
+      ghCalls.push([...args]);
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
+        ]));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: 'APPROVED' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
+        return ok(JSON.stringify({ body: 'PR body' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') {
+        return ok();
+      }
+      return fail('unexpected gh call');
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask(),
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('merged');
+    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeDefined();
+  });
+
+  // merge() proceeds when no reviews are required (empty reviewDecision).
+  test('merges when no reviews are required', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps = makeDeps((args) => {
+      ghCalls.push([...args]);
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
+        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return ok(JSON.stringify([])); // No checks configured
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+        return ok(JSON.stringify({ reviewDecision: '' })); // No reviews required
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
+        return ok(JSON.stringify({ body: 'PR body' }));
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') {
+        return ok();
+      }
+      return fail('unexpected gh call');
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.merge({
+      sourceBranch: 'lazy/test1234',
+      targetBranch: 'main',
+      task: makeTask(),
+      taskShortId: 'test1234',
+      root: '/tmp/test',
+    });
+
+    expect(result.status).toBe('merged');
   });
 
   // When the PR is already MERGED on the remote and the branch is also merged
@@ -420,6 +631,12 @@ describe('GitHubDriver merge', () => {
         }
         if (args[0] === 'pr' && args[1] === 'create') {
           return ok('https://github.com/o/r/pull/99');
+        }
+        if (args[0] === 'pr' && args[1] === 'checks') {
+          return ok(JSON.stringify([]));
+        }
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
+          return ok(JSON.stringify({ reviewDecision: '' }));
         }
         if (args[0] === 'pr' && args[1] === 'merge') {
           return ok();

@@ -663,6 +663,10 @@ describe('GitLabDriver', () => {
 
       const deps = makeDeps((args) => {
         glCalls.push([...args]);
+        // Pre-merge pipeline check: no pipelines
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view' && args.includes('json')) {
           // After merge command has been called, getPRState should see 'merged'
           const mergeAlreadyCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
@@ -694,12 +698,15 @@ describe('GitLabDriver', () => {
 
       const deps = makeDeps((args) => {
         glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view' && args.includes('json') && !args.includes('number')) {
           // First call: findExistingMR returns closed
           if (!glCalls.some(c => c[0] === 'mr' && c[1] === 'create')) {
             return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'closed' }));
           }
-          // After create: getMRNumber call
+          // After create: getMRNumber, approval check, and body fetch calls
           return ok(JSON.stringify({ iid: 99 }));
         }
         if (args[0] === 'mr' && args[1] === 'create') {
@@ -749,6 +756,9 @@ describe('GitLabDriver', () => {
 
     test('detects conflicts', async () => {
       const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view') {
           return ok(JSON.stringify({
             web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
@@ -783,6 +793,9 @@ describe('GitLabDriver', () => {
 
       const deps = makeDeps((args) => {
         glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view' && args.includes('json')) {
           const mergeWasCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
           if (mergeWasCalled) {
@@ -793,7 +806,7 @@ describe('GitLabDriver', () => {
           if (!glCalls.some(c => c[0] === 'mr' && c[1] === 'create')) {
             return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'closed' }));
           }
-          // After create: getMRNumber call
+          // After create: getMRNumber, approval check, body fetch calls
           return ok(JSON.stringify({ iid: 99 }));
         }
         if (args[0] === 'mr' && args[1] === 'create') {
@@ -829,6 +842,9 @@ describe('GitLabDriver', () => {
 
       const deps = makeDeps((args) => {
         glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view' && args.includes('json') && !args.includes('number')) {
           if (!glCalls.some(c => c[0] === 'mr' && c[1] === 'create')) {
             return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'closed' }));
@@ -866,6 +882,9 @@ describe('GitLabDriver', () => {
     // be undefined on failure — there's nothing new to persist.
     test('does not return metadata on conflict when no replacement MR was created', async () => {
       const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view') {
           return ok(JSON.stringify({
             web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
@@ -894,20 +913,18 @@ describe('GitLabDriver', () => {
       }
     });
 
-    // INVARIANT: When the pipeline is running and glab mr merge fails with
-    // a pipeline-related error, merge() returns 'pending' instead of 'failed'.
-    // This tells the accept command to set the task to 'merging' status.
+    // INVARIANT: When the pipeline is running, merge() returns 'pending' instead of 'failed'.
+    // Now caught by pre-merge pipeline check rather than post-merge-failure detection.
     test('returns pending when pipeline must succeed', async () => {
       const deps = makeDeps((args) => {
+        // Pre-merge pipeline check: pipeline is running
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'running', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
         if (args[0] === 'mr' && args[1] === 'view') {
           return ok(JSON.stringify({
             web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
-            head_pipeline: { status: 'running' },
-            detailed_merge_status: 'ci_still_running',
           }));
-        }
-        if (args[0] === 'mr' && args[1] === 'merge') {
-          return fail('Pipeline must succeed before merging');
         }
         return fail('unexpected');
       });
@@ -932,6 +949,9 @@ describe('GitLabDriver', () => {
     // set to 'merging' to wait for the pipeline to finish and auto-merge to complete.
     test('returns pending when auto-merge is set (MR still open after merge command)', async () => {
       const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
         if (args[0] === 'mr' && args[1] === 'view') {
           // MR is still open even after the merge command succeeded (auto-merge was set)
           return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
@@ -987,6 +1007,112 @@ describe('GitLabDriver', () => {
       expect(result.status).toBe('merged');
       // Should not have called any glab commands
       expect(glCalls.length).toBe(0);
+    });
+
+    // INVARIANT: merge() must check pipeline status before attempting merge.
+    // This prevents maintainers from accidentally bypassing merge checks.
+    test('refuses to merge when pipeline has failed (pre-merge)', async () => {
+      const glCalls: string[][] = [];
+
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'failed', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          throw new Error('merge should not be called when pipeline has failed');
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const result = await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      expect(result.status).toBe('failed');
+      if (result.status === 'failed') {
+        expect(result.error).toContain('Pipeline failed');
+      }
+      expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeUndefined();
+    });
+
+    // INVARIANT: merge() must check approval status before attempting merge.
+    // Required approvals must be met before merging.
+    test('refuses to merge when required approvals are not met', async () => {
+      const glCalls: string[][] = [];
+
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({
+            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
+            detailed_merge_status: 'not_approved',
+          }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          throw new Error('merge should not be called when approvals are missing');
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const result = await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      expect(result.status).toBe('pending');
+      if (result.status === 'pending') {
+        expect(result.reason).toContain('Required approvals not met');
+      }
+      expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeUndefined();
+    });
+
+    // merge() proceeds when pipeline passes and no approval issues.
+    test('merges when pipeline passes and approvals are met', async () => {
+      const glCalls: string[][] = [];
+
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          const mergeAlreadyCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          const state = mergeAlreadyCalled ? 'merged' : 'opened';
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          return ok();
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const result = await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      expect(result.status).toBe('merged');
+      expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeDefined();
     });
   });
 

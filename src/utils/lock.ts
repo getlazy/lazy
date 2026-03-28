@@ -82,6 +82,10 @@ export function readLock(worktreePath: string): LockInfo | null {
  * The worktree directory must already exist.
  */
 export function acquireLock(worktreePath: string, command: string): void {
+  if (!existsSync(worktreePath)) {
+    throw new Error(`Cannot acquire lock: worktree directory does not exist: ${worktreePath}`);
+  }
+
   const lock: LockInfo = {
     pid: process.pid,
     started_at: new Date().toISOString(),

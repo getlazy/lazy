@@ -12,6 +12,12 @@
 * **Prompts**: rather than throwing them away, `lazy` captures them so that both humans and agents can reference them and learn from them.
 * **Source control**: rather than dealing with low-level pinnings of `git`, `lazy` wraps these mechanics into a task lifecycle management.
 
+## What are the main benefits
+
+* Prolonged autonomous horizon for agents (hours not tens of minutes)
+* Autonomous, concurrent, asynchronous (turn based) work across multiple tasks
+* Increased agent situational awarness (agents can search over all past tasks and prompts)
+
 ## Quick Start
 
 ```bash
@@ -91,6 +97,8 @@ On one hand I felt that by throwing away prompts, we are not raising the abstrac
 
 On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do. I don't want to chat with agents and become a blocker. Instead, I want to give them actionable feedback, asynchronously, on my own good time, and let them do their thing in the meantime.
 
+For the record, I see a lot of people building and running their own orchestration layer and I think it's great. I expected this and I'm certainly not part of the 1st wave but more of "fine, I'll do it myself" wave. I expect this trend to continue leading to fragmentation the like of which we have not see since Linux distro ecosystem bloom.
+
 ### Why name it `lazy`?
 
 Two reasons:
@@ -125,7 +133,7 @@ Beside that, `lazy` does a lot of little "quality of life" things that are other
 
 ### At what is `lazy` particularly bad at?
 
-Right now, it's really annoying when I am preparing a new release and I am doing integration tests. These rarely expose major issues but rather a number of smaller issues for which I often fire off tasks to fix *but* I readily admit that sometimes the overhead is too large and instead I use the "escape hatch" and fire up Claude Code. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. On the roadmap is `agent = "human"` that will allow me to just "pair" on the main while fixing these issues and not lose those prompts either (although honestly, if any of them are *that* important, they should have been a task rather than *ad hoc* fixing)
+Right now, it's really annoying when I am preparing a new release and I am doing integration tests. These rarely expose major issues but rather a number of smaller issues for which I often fire off tasks to fix *but* I readily admit that sometimes the overhead is too large. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. To help that use case, `lazy pair` command can be invoked without the task ID which essentially puts you into a session that will be captured but where you can work in the traditional "micro-management" style.
 
 Another thing that is annoying are bootstrapping failures: `lazy` failing so hard that I cannot fix it using `lazy`. But that is very rare these days and besides, it's only annoying to me.
 
@@ -397,6 +405,10 @@ Launches an interactive Claude Code session in the task's worktree. You drive th
 - Taking over when the agent is stuck
 
 This is rarely needed as you usually want to unblock with review and move on. But when it's needed, it's a great escape hatch.
+
+#### Taskless pairing
+
+As I mentioned before, when you are working on a set of very, very small tasks, the turn based "lazy-ness" is... not great. At those times you are doing a lot of back and forth and you don't want to just delegate: you want to be hands-on. For those moments, `lazy pair` can be invoked without any task ID and it will start a new conversation that will be captured, just like any other `lazy` conversation, but without any task to anchor on.
 
 ### Confirmation Protocol
 

@@ -131,6 +131,7 @@ if [[ -n "${LAZY_BRANCH:-}" ]]; then
 fi
 
 bun install
+bun run build
 ok "Lazy built successfully"
 
 # ---------------------------------------------------------------------------

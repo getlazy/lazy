@@ -19,7 +19,7 @@ import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { dirname } from 'path';
 import { getSocketPath } from './paths';
 import { writePid, generateToken, cleanupStaleFiles } from './lifecycle';
-import { handleRpc, RpcError, openProjectStorage } from './rpc-handlers';
+import { handleRpc, RpcError, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
 import { reconcileTasks } from '../utils/reconcile';
 import { logger } from '../utils/logger';
 
@@ -133,7 +133,8 @@ export function startDaemonServer(options: DaemonServerOptions = {}): RunningDae
         try {
           const params = await req.json().catch(() => ({})) as Record<string, unknown>;
           const result = await handleRpc(command, projectRoot, params);
-          return Response.json(result);
+          // Void methods return undefined — normalize to null for JSON serialization
+          return Response.json(result ?? null);
         } catch (err) {
           if (err instanceof RpcError) {
             return Response.json({ error: err.message }, { status: err.status });
@@ -152,6 +153,8 @@ export function startDaemonServer(options: DaemonServerOptions = {}): RunningDae
     stopped = true;
     // Stop background reconcile loop
     stopReconcileLoop();
+    // Close all long-lived Storage instances
+    closeAllStorage().catch(() => {});
     // Cancel any pending shutdown timer (prevents process.exit in tests)
     if (shutdownTimer) {
       clearTimeout(shutdownTimer);
@@ -198,18 +201,13 @@ function startDaemonReconcileLoop(activeProjects: Set<string>, intervalSeconds: 
     try {
       for (const projectRoot of activeProjects) {
         if (stopped) break;
-        let storage;
         try {
-          storage = await openProjectStorage(projectRoot);
+          const storage = await getOrCreateStorage(projectRoot);
           await reconcileTasks(storage, projectRoot);
           logger.debug(`Daemon reconcile completed for ${projectRoot}`);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           logger.debug(`Daemon reconcile error for ${projectRoot}: ${msg}`);
-        } finally {
-          if (storage) {
-            await storage.close();
-          }
         }
       }
     } finally {

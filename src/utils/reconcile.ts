@@ -19,7 +19,7 @@ import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus } from '../protocol';
 import type { CompletedResponse, ErrorResponse } from '../protocol';
-import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, branchExists, isBranchMergedInto, findCommitByMessage } from '../git/operations';
+import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, branchExists, isBranchMergedInto, findCommitByMessage, getTaskTargetBranch } from '../git/operations';
 import { checkLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
@@ -714,7 +714,7 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
         // If parent's branch doesn't exist, we can't check — skip
         if (!branchExists(mergeTarget, lazyRoot)) continue;
       } else {
-        mergeTarget = task.metadata?.remote_target_branch ?? 'main';
+        mergeTarget = getTaskTargetBranch(task, lazyRoot) ?? 'main';
       }
 
       let isMerged = false;

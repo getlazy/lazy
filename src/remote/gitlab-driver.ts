@@ -53,6 +53,7 @@ import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
+import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 
 export interface GlResult {
   stdout: string;
@@ -64,6 +65,8 @@ export interface GlResult {
 export interface GitLabDriverDeps {
   runGl: (args: string[], cwd?: string) => GlResult;
   runGit: (args: string[], cwd?: string) => GitResult;
+  /** Override retry options for testing (e.g., { maxAttempts: 1 } to disable retries). */
+  retryOptions?: RetryOptions;
 }
 
 function runGl(args: string[], cwd?: string): GlResult {
@@ -134,32 +137,49 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   private driverContext?: DriverContext;
+  private retryOpts?: RetryOptions;
 
   constructor(config: ResolvedConfig, deps?: GitLabDriverDeps, context?: DriverContext) {
     this.config = config;
     this.gl = deps?.runGl ?? runGl;
     this.git = deps?.runGit ?? defaultRunGit;
+    // When deps are injected (test mode), default to no-retry to avoid test
+    // timeouts from backoff delays. Tests that want to verify retry behavior
+    // can explicitly set retryOptions with appropriate timeouts.
+    this.retryOpts = deps?.retryOptions ?? (deps ? { maxAttempts: 1 } : undefined);
     this.driverContext = context;
   }
 
   async pushBranch(branch: string): Promise<void> {
-    logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-    const result = this.git(['push', '-u', this.remoteName, branch]);
-    if (result.exitCode !== 0) {
-      if (result.stderr.includes('Everything up-to-date')) {
-        logger.debug('Branch already up-to-date on remote');
-        return;
-      }
-      throw new Error(`Failed to push branch ${branch}: ${result.stderr}`);
-    }
-    logger.debug(`Pushed branch ${branch} to ${this.remoteName}`);
+    await withRemoteRetry(
+      async () => {
+        logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
+        const result = this.git(['push', '-u', this.remoteName, branch]);
+        if (result.exitCode !== 0) {
+          if (result.stderr.includes('Everything up-to-date')) {
+            logger.debug('Branch already up-to-date on remote');
+            return;
+          }
+          throw new Error(`Failed to push branch ${branch}: ${result.stderr}`);
+        }
+        logger.debug(`Pushed branch ${branch} to ${this.remoteName}`);
+      },
+      `push ${branch} to ${this.remoteName}`,
+      this.retryOpts,
+    );
   }
 
   async fetchBranch(branch: string, worktreePath: string): Promise<boolean> {
-    const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
-    if (fetchResult.exitCode !== 0) {
-      throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
-    }
+    await withRemoteRetry(
+      async () => {
+        const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
+        if (fetchResult.exitCode !== 0) {
+          throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
+        }
+      },
+      `fetch ${branch} from ${this.remoteName}`,
+      this.retryOpts,
+    );
 
     const remoteRef = `${this.remoteName}/${branch}`;
     const revListResult = this.git(
@@ -183,10 +203,16 @@ export class GitLabDriver implements RepositoryDriver {
 
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
     const remoteRef = `${this.remoteName}/${parentBranch}`;
-    const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
-    if (fetchResult.exitCode !== 0) {
-      throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
-    }
+    await withRemoteRetry(
+      async () => {
+        const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
+        if (fetchResult.exitCode !== 0) {
+          throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
+        }
+      },
+      `fetch upstream ref ${parentBranch} from ${this.remoteName}`,
+      this.retryOpts,
+    );
     logger.debug(`resolveUpstreamRef: fetched ${remoteRef}`);
     return remoteRef;
   }
@@ -345,8 +371,56 @@ export class GitLabDriver implements RepositoryDriver {
       logger.info(`Created replacement MR: ${mrUrl ?? 'unknown URL'}`);
     }
 
-    // Step 3: Squash merge via glab mr merge
+    // Step 3: Pre-merge checks — verify pipeline and approvals BEFORE attempting merge.
+    // GitLab may allow maintainers to bypass merge checks by default.
+    // By checking here, we avoid accidentally merging when CI is failing or
+    // required approvals are missing.
     const mergeTarget = mrIid ?? sourceBranch;
+
+    if (mrIid) {
+      // 3a: Check pipeline status
+      const pipelines = this.getMRPipelines(mrIid);
+      if (pipelines.length > 0) {
+        const latest = pipelines[0];
+        const pipelineStatus = latest.status;
+
+        if (pipelineStatus === 'failed' || pipelineStatus === 'canceled') {
+          return {
+            status: 'failed',
+            error: `Pipeline ${pipelineStatus}`,
+            metadata: updatedMetadata,
+          };
+        }
+
+        if (pipelineStatus === 'running' || pipelineStatus === 'pending') {
+          return {
+            status: 'pending',
+            reason: `Pipeline ${pipelineStatus}`,
+            metadata: updatedMetadata,
+          };
+        }
+      }
+
+      // 3b: Check detailed merge status for approval requirements
+      const viewResult = this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
+      if (viewResult.exitCode === 0) {
+        try {
+          const data = JSON.parse(viewResult.stdout);
+          const detailedStatus = data.detailed_merge_status;
+          if (detailedStatus === 'not_approved') {
+            return {
+              status: 'pending',
+              reason: 'Required approvals not met',
+              metadata: updatedMetadata,
+            };
+          }
+        } catch {
+          logger.debug('Failed to parse MR view for approval status, proceeding with merge attempt');
+        }
+      }
+    }
+
+    // Step 4: Squash merge via glab mr merge
     const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
 
     // Fetch current MR description to preserve in commit message
@@ -1029,6 +1103,13 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   private fastForwardBranch(root: string, branch: string): void {
+    // Skip git special refs that aren't real branches — "HEAD" always passes
+    // rev-parse --verify, and `git fetch origin HEAD:HEAD` creates a phantom local branch.
+    if (branch === 'HEAD') {
+      logger.debug(`Skipping special ref "${branch}"`);
+      return;
+    }
+
     logger.info(`Updating ${branch} branch...`);
     const checkResult = this.git(['rev-parse', '--verify', branch], root);
     if (checkResult.exitCode !== 0) {
@@ -1128,7 +1209,29 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   private targetBranch(task: Task): string {
-    return task.metadata?.remote_target_branch ?? 'main';
+    const branch = task.metadata?.remote_target_branch;
+    if (branch && branch !== 'HEAD') return branch;
+    if (branch === 'HEAD') {
+      logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
+      return this.resolveDefaultBranch() ?? 'main';
+    }
+    return 'main';
+  }
+
+  /**
+   * Resolve the remote's default branch name via git symbolic-ref.
+   * Returns null if resolution fails.
+   */
+  private resolveDefaultBranch(): string | null {
+    const result = this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
+    if (result.exitCode === 0) {
+      const ref = result.stdout.trim();
+      const prefix = `refs/remotes/${this.remoteName}/`;
+      if (ref.startsWith(prefix)) {
+        return ref.slice(prefix.length);
+      }
+    }
+    return null;
   }
 
   /**

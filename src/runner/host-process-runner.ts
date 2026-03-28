@@ -9,7 +9,7 @@
  * the host system. Only use in environments that are already sandboxed.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { SandboxConfig } from '../capture/claude';
@@ -20,6 +20,7 @@ import { getAuthEnv } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { logger } from '../utils/logger';
 import { getLazyCommand } from '../utils/cli-path';
+import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
 
@@ -84,56 +85,6 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
-}
-
-/** Get mtime of all JSONL session files for a project (for conversation capture). */
-function getSessionFileTimes(
-  claudeHome: string,
-  lazyRoot: string,
-  encodeProjectPath: (p: string) => string,
-): Map<string, number> {
-  const encodedPath = encodeProjectPath(lazyRoot);
-  const projectDir = join(claudeHome, '.claude', 'projects', encodedPath);
-  const times = new Map<string, number>();
-
-  try {
-    const entries = readdirSync(projectDir);
-    for (const entry of entries) {
-      if (entry.endsWith('.jsonl')) {
-        try {
-          const mtime = statSync(join(projectDir, entry)).mtimeMs;
-          times.set(entry, mtime);
-        } catch {
-          // Skip inaccessible files
-        }
-      }
-    }
-  } catch {
-    // Project directory doesn't exist yet
-  }
-
-  return times;
-}
-
-/** Find the newest JSONL file that was created or modified between two snapshots. */
-function findNewOrModifiedFile(
-  before: Map<string, number>,
-  after: Map<string, number>,
-): string | null {
-  let newestFile: string | null = null;
-  let newestMtime = 0;
-
-  for (const [file, mtime] of after) {
-    const beforeMtime = before.get(file);
-    if (beforeMtime === undefined || mtime !== beforeMtime) {
-      if (mtime > newestMtime) {
-        newestMtime = mtime;
-        newestFile = file;
-      }
-    }
-  }
-
-  return newestFile;
 }
 
 export class HostProcessRunner implements Runner {
@@ -506,17 +457,7 @@ export class HostProcessRunner implements Runner {
     logger.info('Launching Claude Code...');
 
     // Snapshot JSONL file times before launch for conversation capture
-    const {
-      encodeProjectPath,
-      discoverAllProjectSessions,
-      parseConversation,
-      extractSummary,
-      conversationStats,
-    } = await import('../import/claude-code-logs');
-    const { toStoredConversation } = await import('../import/conversation-storage');
-
-    const claudeHome = homedir();
-    const beforeTimes = getSessionFileTimes(claudeHome, lazyRoot, encodeProjectPath);
+    const beforeSnapshot = snapshotSessionFiles(lazyRoot);
 
     const proc = spawn(claudeArgs, {
       cwd: lazyRoot,
@@ -528,36 +469,7 @@ export class HostProcessRunner implements Runner {
     const exitCode = await proc.exited;
 
     // Capture conversation from JSONL files
-    let detectedSessionId: string | null = null;
-    try {
-      const afterTimes = getSessionFileTimes(claudeHome, lazyRoot, encodeProjectPath);
-      const sessionFile = findNewOrModifiedFile(beforeTimes, afterTimes);
-
-      if (sessionFile) {
-        const sessionId = sessionFile.replace(/\.jsonl$/, '');
-        detectedSessionId = sessionId;
-        const available = await discoverAllProjectSessions(lazyRoot);
-        const match = available.find(s => s.sessionId === sessionId);
-
-        if (match) {
-          const { createStorage } = await import('../storage');
-          const storage = await createStorage(lazyRoot);
-          try {
-            const conversation = await parseConversation(match.projectPath, match.sessionId);
-            const summary = extractSummary(conversation);
-            const stats = conversationStats(conversation);
-            const stored = toStoredConversation(conversation, summary, stats);
-            await storage.saveConversation(stored);
-            logger.debug(`Builder conversation captured: ${sessionId}`);
-          } finally {
-            await storage.close();
-          }
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(`Failed to capture builder conversation: ${msg}`);
-    }
+    const detectedSessionId = await captureConversation(lazyRoot, beforeSnapshot, 'Builder');
 
     return { exitCode, sessionId: detectedSessionId };
   }

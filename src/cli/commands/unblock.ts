@@ -2,7 +2,8 @@ import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, resolveTaskOrExit, rejectIfPairing, taskRef, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
 import { createRunner, type DockerRunnerOptions } from '../../runner';
-import { getCommitsBehindCount, getCurrentBranch } from '../../git/operations';
+import { getCommitsBehindCount, getCurrentBranch, getRemoteDefaultBranch } from '../../git/operations';
+import { runGit } from '../../utils/git';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
 import { showTaskContext, runFeedbackFlow, getEditorFeedback, launchFeedbackTurn, syncTaskFromRemote, getNewNotesSince } from './shared';
 import { commandAccept } from './accept';
@@ -20,7 +21,7 @@ import { getActor } from '../../constants';
 
 /**
  * Determine whether unblock should run in interactive mode.
- * Interactive = TTY + no imperative flags (--message, -f, --sync-with-upstream, no piped stdin).
+ * Interactive = TTY + no imperative flags (--message, -f, --sync-with-upstream, --yes, no piped stdin).
  */
 function isInteractiveMode(args: string[]): boolean {
   if (!process.stdin.isTTY) return false;
@@ -28,6 +29,7 @@ function isInteractiveMode(args: string[]): boolean {
   if (args.includes('--merge-and-fix')) return false;  // hidden alias
   if (args.includes('--message')) return false;
   if (args.includes('--approve-file')) return false;
+  if (args.includes('--yes')) return false;
   if (args.indexOf('-f') !== -1) return false;
   return true;
 }
@@ -43,6 +45,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'docker-agent-no-network', takesValue: false },
     { name: 'approve-file', takesValue: true, accumulate: true },
+    { name: 'no-approve-files', takesValue: false },
+    { name: 'yes', takesValue: false },
   ], 'unblock');
 
   const taskId = parsed.positional[0];
@@ -57,6 +61,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
   const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
   const messageValue = parsed.flags.get('message') as string | undefined;
   const approvedFiles = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
+  const noApproveFiles = parsed.flags.get('no-approve-files') === true;
+  const skipConfirmation = parsed.flags.get('yes') === true;
 
   // --sync-with-upstream is combinable with feedback flags (--message, -f, piped stdin).
   // When combined, the feedback is delivered normally and additional merge-conflict
@@ -116,6 +122,47 @@ export async function commandUnblock(args: string[]): Promise<void> {
 
     // Check for pairing lock — refuse if someone is pairing on this task
     rejectIfPairing(root, taskRef(task), displayId(task));
+
+    // --- Guard: conflict task flags validation ---
+    // File approval flags (--approve-file, --no-approve-files) are only meaningful
+    // when there are actual file permission violations. Check for misuse.
+    const existingTurns = await storage.getSessionTurns(sess.id);
+    const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
+    const violations = latestAgentTurn?.violations?.filter(v => v.status === 'pending') ?? [];
+    const hasViolations = task.status === 'conflict' && violations.length > 0;
+
+    // Error: contradictory flags
+    if (approvedFiles.length > 0 && noApproveFiles) {
+      console.error(`Error: Cannot use both --approve-file and --no-approve-files together.`);
+      console.error(`Choose one: either approve specific files or explicitly revert all.`);
+      process.exit(1);
+    }
+
+    // Error: flags used when there are no violations
+    if (!hasViolations && (approvedFiles.length > 0 || noApproveFiles)) {
+      console.error(`Error: Task ${displayId(task)} has no file permission violations.`);
+      console.error(`The --approve-file and --no-approve-files flags are only meaningful for conflict tasks.`);
+      process.exit(1);
+    }
+
+    // Guard: conflict tasks in non-interactive mode require explicit intent
+    if (hasViolations && !isInteractiveMode(args)) {
+      // Non-interactive mode (--yes, --message, -f, piped stdin, or no TTY)
+      // Must explicitly approve files OR explicitly revert all
+      if (approvedFiles.length === 0 && !noApproveFiles) {
+        console.error(`Error: Task ${displayId(task)} has ${violations.length} file permission violation(s).`);
+        console.error(`\nViolated files:`);
+        for (const v of violations) {
+          console.error(`  - ${v.file}`);
+        }
+        console.error(`\nTo unblock, you must explicitly choose to approve or revert:`);
+        console.error(`  • Approve all: ${theme.command(`lazy unblock ${displayId(task)} --approve-file ${violations.map(v => v.file).join(' --approve-file ')} --message "..." --yes`)}`);
+        console.error(`  • Approve specific: ${theme.command(`lazy unblock ${displayId(task)} --approve-file <file1> --approve-file <file2> --message "..." --yes`)}`);
+        console.error(`  • Revert all (destructive): ${theme.command(`lazy unblock ${displayId(task)} --no-approve-files --message "..." --yes`)}`);
+        console.error(`\nNote: Both approve and revert are potentially destructive. Neither is the default.`);
+        process.exit(1);
+      }
+    }
 
     // Pre-flight checks before doing expensive work
     // CRITICAL: These must happen before the human types feedback,
@@ -194,6 +241,73 @@ export async function commandUnblock(args: string[]): Promise<void> {
           displayId(task),
         );
 
+        // --- Interactive mode: handle conflict tasks ---
+        // When task is in conflict status (file permission violations), prompt user
+        // to choose whether to approve or revert. Neither is "safe" — both require active choice.
+        if (task.status === 'conflict' && approvedFiles.length === 0 && !noApproveFiles) {
+          const existingTurns = await storage.getSessionTurns(sess.id);
+          const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
+          const violations = latestAgentTurn?.violations?.filter(v => v.status === 'pending') ?? [];
+
+          if (violations.length > 0) {
+            console.log(`\n${theme.warning('⚠ File Permission Violations')}`);
+            console.log(`The agent modified ${violations.length} protected file(s):\n`);
+
+            // Show each violated file with diff stat (lines added/removed)
+            for (const v of violations) {
+              // Get diff stat for this specific file
+              const diffResult = runGit(
+                ['diff', '--numstat', v.base_sha, 'HEAD', '--', v.file],
+                { cwd: worktreePath }
+              );
+
+              let statStr = '';
+              if (diffResult.exitCode === 0 && diffResult.stdout.trim()) {
+                const parts = diffResult.stdout.trim().split(/\s+/);
+                if (parts.length >= 2) {
+                  const added = parts[0];
+                  const removed = parts[1];
+                  statStr = ` (+${added} -${removed})`;
+                }
+              }
+
+              console.log(`  - ${v.file}${statStr}`);
+            }
+            console.log('');
+
+            // Present three choices with NO default
+            const choice = await promptChoice(
+              'What would you like to do with these violations?',
+              [
+                `Approve all ${violations.length} file(s) - keep agent's changes`,
+                `Reject all ${violations.length} file(s) - revert to original`,
+                'Stop - abort unblock (can retry with --approve-file flags)',
+              ]
+            );
+
+            if (choice === 0) {
+              // Approve all violations
+              approvedFiles.length = 0;
+              approvedFiles.push(...violations.map(v => v.file));
+              console.log(`\nApproved ${violations.length} file(s). Proceeding...\n`);
+            } else if (choice === 1) {
+              // Reject all violations - explicitly set empty approved list (revert all)
+              // The noApproveFiles flag signals to launchFeedbackTurn to revert
+              // We'll pass an empty approvedFiles array which means "revert all"
+              approvedFiles.length = 0;
+              console.log(`\nRejecting ${violations.length} file(s). All will be reverted. Proceeding...\n`);
+            } else {
+              // Stop - abort
+              console.log(`\nUnblock aborted. To approve specific files, use:`);
+              console.log(`  ${theme.command(`lazy unblock ${displayId(task)} --approve-file <file1> --approve-file <file2>`)}`);
+              console.log(`\nOr to explicitly revert all:`);
+              console.log(`  ${theme.command(`lazy unblock ${displayId(task)} --no-approve-files --message "Try different approach"`)}`);
+              console.log('');
+              process.exit(0);
+            }
+          }
+        }
+
         // Check for pending proposals
         const pendingProposals = readPendingProposals(storage, task.id);
 
@@ -204,7 +318,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
         try {
           const mainBranch = task.parent_task_id
             ? await getBranchNameFromId(task.parent_task_id, storage)
-            : getCurrentBranch(root);
+            : getRemoteDefaultBranch(root);
           commitsBehind = getCommitsBehindCount(sess.git_branch, mainBranch, root);
           isStale = commitsBehind >= STALE_THRESHOLD;
         } catch {
@@ -456,7 +570,7 @@ async function reviewProposals(
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | --message <text>] [--model <model>] [--sync-with-upstream] [--approve-file <file>...] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | --message <text>] [--model <model>] [--sync-with-upstream] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -482,7 +596,9 @@ Options:
   --message <text>    Provide inline feedback
   --model <model>     Override model for this turn (apprentice, journeyman, master, sonnet, opus, haiku)
   --sync-with-upstream  Merge upstream changes and resolve conflicts (combinable with feedback)
-  --approve-file <file>   Approve a violated file (repeatable, default: all rejected)
+  --approve-file <file>   Approve a violated file (repeatable, for conflict tasks)
+  --no-approve-files  Explicitly revert all violated files (for conflict tasks)
+  --yes               Skip interactive prompts (non-interactive mode)
   --follow            Wait for the agent to finish, streaming output in real time
 
 Feedback input priority: --message flag > -f file > piped stdin > $EDITOR (interactive)
@@ -491,8 +607,14 @@ Interactive mode (no flags, TTY):
   Shows task summary, recent commits, diff summary, then presents choices:
   give feedback, accept, reject, or merge upstream.
 
+  For conflict tasks: shows violated files with diff stats, then presents three
+  choices (no default): approve all, reject all, or stop. You must actively choose.
+
 Imperative mode (any flag or piped stdin):
   Sends feedback directly without interactive preamble.
+
+  For conflict tasks: MUST use --approve-file or --no-approve-files explicitly.
+  Neither approve nor revert is the default — both require explicit intent.
 
 Sync with Upstream:
   Use --sync-with-upstream when 'lazy accept' detects conflicts. This tells the
@@ -504,6 +626,27 @@ Sync with Upstream:
   has new commits. --sync-with-upstream adds a merge-conflict warning to the
   agent's context and is useful when you know there will be conflicts.
 
+File Permission Violations (conflict status):
+  When the agent modifies protected files, the task enters 'conflict' status.
+  Unblocking requires explicit approval or rejection — neither is the default:
+
+  Interactive mode:
+    - Lists violated files with diff stats (+lines -lines)
+    - Presents three choices with NO default:
+      1) Approve all - keep agent's changes
+      2) Reject all - revert to original
+      3) Stop - abort and retry with --approve-file flags
+
+  Non-interactive mode:
+    - --approve-file <file> ... : approve specific files (repeatable)
+    - --no-approve-files : explicitly revert all (destructive)
+    - Omitting both flags with a conflict task is an error
+
+  Misuse errors:
+    - Using --approve-file and --no-approve-files together: error
+    - Using these flags when task has no violations: error
+    - --yes does NOT bypass the conflict guard
+
 Examples:
   lazy unblock abc123                                   # Interactive review
   lazy unblock abc123 --message "Add error handling"    # Direct feedback
@@ -512,6 +655,11 @@ Examples:
   lazy unblock abc123 --sync-with-upstream              # Fix merge conflicts
   lazy unblock abc123 --sync-with-upstream --message "Also fix the bug"  # Merge + feedback
   lazy unblock abc123 --message "Fix it" --follow       # Wait for completion
+  lazy unblock abc123 --message "Fix it" --yes          # Non-interactive
   echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback
-  lazy unblock abc123 --approve-file a.ts --approve-file b.ts --message "OK" # Approve specific violated files`);
+
+  # Conflict task examples (file permission violations):
+  lazy unblock abc123 --approve-file a.ts --approve-file b.ts --message "OK" --yes  # Approve specific files
+  lazy unblock abc123 --approve-file src/config.ts --approve-file src/db.ts --yes   # Approve multiple files
+  lazy unblock abc123 --no-approve-files --message "Try different approach" --yes   # Explicitly revert all`);
 }

@@ -54,6 +54,7 @@ import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
+import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 
 export interface GhResult {
   stdout: string;
@@ -65,6 +66,8 @@ export interface GhResult {
 export interface DriverDeps {
   runGh: (args: string[], cwd?: string) => GhResult;
   runGit: (args: string[], cwd?: string) => GitResult;
+  /** Override retry options for testing (e.g., { maxAttempts: 1 } to disable retries). */
+  retryOptions?: RetryOptions;
 }
 
 function runGh(args: string[], cwd?: string): GhResult {
@@ -157,33 +160,50 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   private driverContext?: DriverContext;
+  private retryOpts?: RetryOptions;
 
   constructor(config: ResolvedConfig, deps?: DriverDeps, context?: DriverContext) {
     this.config = config;
     this.gh = deps?.runGh ?? runGh;
     this.git = deps?.runGit ?? defaultRunGit;
     this.driverContext = context;
+    // When deps are injected (test mode), default to no-retry to avoid test
+    // timeouts from backoff delays. Tests that want to verify retry behavior
+    // can explicitly set retryOptions with appropriate timeouts.
+    this.retryOpts = deps?.retryOptions ?? (deps ? { maxAttempts: 1 } : undefined);
   }
 
   async pushBranch(branch: string): Promise<void> {
-    logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-    const result = this.git(['push', '-u', this.remoteName, branch]);
-    if (result.exitCode !== 0) {
-      if (result.stderr.includes('Everything up-to-date')) {
-        logger.debug('Branch already up-to-date on remote');
-        return;
-      }
-      throw new Error(`Failed to push branch ${branch}: ${result.stderr}`);
-    }
-    logger.debug(`Pushed branch ${branch} to ${this.remoteName}`);
+    await withRemoteRetry(
+      async () => {
+        logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
+        const result = this.git(['push', '-u', this.remoteName, branch]);
+        if (result.exitCode !== 0) {
+          if (result.stderr.includes('Everything up-to-date')) {
+            logger.debug('Branch already up-to-date on remote');
+            return;
+          }
+          throw new Error(`Failed to push branch ${branch}: ${result.stderr}`);
+        }
+        logger.debug(`Pushed branch ${branch} to ${this.remoteName}`);
+      },
+      `push ${branch} to ${this.remoteName}`,
+      this.retryOpts,
+    );
   }
 
   async fetchBranch(branch: string, worktreePath: string): Promise<boolean> {
     // Fetch the latest state of the branch from remote (updates <remote>/<branch> ref)
-    const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
-    if (fetchResult.exitCode !== 0) {
-      throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
-    }
+    await withRemoteRetry(
+      async () => {
+        const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
+        if (fetchResult.exitCode !== 0) {
+          throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
+        }
+      },
+      `fetch ${branch} from ${this.remoteName}`,
+      this.retryOpts,
+    );
 
     // Check if <remote>/<branch> is ahead of local HEAD
     const remoteRef = `${this.remoteName}/${branch}`;
@@ -209,10 +229,16 @@ export class GitHubDriver implements RepositoryDriver {
 
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
     const remoteRef = `${this.remoteName}/${parentBranch}`;
-    const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
-    if (fetchResult.exitCode !== 0) {
-      throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
-    }
+    await withRemoteRetry(
+      async () => {
+        const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
+        if (fetchResult.exitCode !== 0) {
+          throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
+        }
+      },
+      `fetch upstream ref ${parentBranch} from ${this.remoteName}`,
+      this.retryOpts,
+    );
     logger.debug(`resolveUpstreamRef: fetched ${remoteRef}`);
     return remoteRef;
   }
@@ -431,9 +457,59 @@ export class GitHubDriver implements RepositoryDriver {
       logger.info(`Created replacement PR: ${prUrl}`);
     }
 
-    // Step 3: Squash merge via gh pr merge
-    // Fetch the PR body and append Lazy co-author trailer
+    // Step 3: Pre-merge checks — verify CI and reviews BEFORE attempting merge.
+    // GitHub allows repo admins to bypass branch protection by default.
+    // By checking here, we avoid accidentally merging when CI is failing or
+    // required reviews are missing, even if the user has admin privileges.
     const mergeTarget = prNumber ?? sourceBranch;
+
+    if (prNumber) {
+      // 3a: Check CI status
+      const checks = this.getPRChecks(prNumber);
+      const pending = checks.filter(c => c.bucket === 'pending');
+      const failed = checks.filter(c => c.bucket === 'fail');
+
+      if (failed.length > 0) {
+        const names = failed.map(c => c.name).join(', ');
+        return {
+          status: 'failed',
+          error: `CI checks failed: ${names}`,
+          metadata: updatedMetadata,
+        };
+      }
+
+      if (pending.length > 0) {
+        const names = pending.map(c => c.name).join(', ');
+        return {
+          status: 'pending',
+          reason: `CI checks pending: ${names}`,
+          metadata: updatedMetadata,
+        };
+      }
+
+      // 3b: Check review status
+      const reviewResult = this.gh(['pr', 'view', prNumber, '--json', 'reviewDecision'], root);
+      if (reviewResult.exitCode === 0) {
+        try {
+          const data = JSON.parse(reviewResult.stdout);
+          const decision = data.reviewDecision;
+          // reviewDecision is empty string when no reviews are required,
+          // 'APPROVED' when approved, 'CHANGES_REQUESTED' or 'REVIEW_REQUIRED' otherwise.
+          if (decision && decision !== 'APPROVED') {
+            return {
+              status: 'pending',
+              reason: `Required reviews not approved (status: ${decision})`,
+              metadata: updatedMetadata,
+            };
+          }
+        } catch {
+          logger.debug('Failed to parse reviewDecision, proceeding with merge attempt');
+        }
+      }
+    }
+
+    // Step 4: Squash merge via gh pr merge
+    // Fetch the PR body and append Lazy co-author trailer
     const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
 
     // Fetch current PR body to preserve it in the squash commit
@@ -1090,6 +1166,13 @@ export class GitHubDriver implements RepositoryDriver {
         logger.warn(`targetBranch: remote_target_branch is empty string for task ${task.id}`);
         return github || 'main';
       }
+      // Defense-in-depth: "HEAD" is not a valid branch name for GitHub PRs.
+      // This can happen if the root repo was in detached HEAD state when the
+      // task was started (getCurrentBranch returns literal "HEAD" in that case).
+      if (remote === 'HEAD') {
+        logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
+        return this.resolveDefaultBranch() ?? (github || 'main');
+      }
       return remote;
     }
 
@@ -1098,10 +1181,30 @@ export class GitHubDriver implements RepositoryDriver {
         logger.warn(`targetBranch: github_pr_target_branch is empty string for task ${task.id}`);
         return 'main';
       }
+      if (github === 'HEAD') {
+        logger.warn(`targetBranch: github_pr_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
+        return this.resolveDefaultBranch() ?? 'main';
+      }
       return github;
     }
 
     return 'main';
+  }
+
+  /**
+   * Resolve the remote's default branch name via git symbolic-ref.
+   * Returns null if resolution fails.
+   */
+  private resolveDefaultBranch(): string | null {
+    const result = this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
+    if (result.exitCode === 0) {
+      const ref = result.stdout.trim();
+      const prefix = `refs/remotes/${this.remoteName}/`;
+      if (ref.startsWith(prefix)) {
+        return ref.slice(prefix.length);
+      }
+    }
+    return null;
   }
 
   /**
@@ -1372,6 +1475,13 @@ export class GitHubDriver implements RepositoryDriver {
    * the branch is currently checked out.
    */
   private fastForwardBranch(root: string, branch: string): void {
+    // Skip git special refs that aren't real branches — "HEAD" always passes
+    // rev-parse --verify, and `git fetch origin HEAD:HEAD` creates a phantom local branch.
+    if (branch === 'HEAD') {
+      logger.debug(`Skipping special ref "${branch}"`);
+      return;
+    }
+
     logger.info(`Updating ${branch} branch...`);
     const checkResult = this.git(['rev-parse', '--verify', branch], root);
     if (checkResult.exitCode !== 0) {

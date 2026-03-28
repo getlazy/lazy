@@ -113,10 +113,45 @@ describe('lazy pair', () => {
     await ctx.cleanup();
   });
 
-  test('shows usage when no task ID provided', async () => {
+  // INVARIANT: When on main (non-task branch) with no argument, pair launches
+  // branchless mode — Claude Code in the current directory with conversation capture.
+  test('launches branchless pairing on non-task branch', async () => {
+    // On main branch (default in test repos), `lazy pair` should attempt
+    // to launch Claude Code without task context. It will fail because
+    // the `claude` binary doesn't exist, but should NOT show usage.
     const result = await ctx.lazy(['pair']);
+    expectOutputExcludes(result, 'Usage: lazy pair');
+    expectOutput(result, 'Launching Claude Code');
+    expectOutput(result, 'no task context');
+  });
+
+  // INVARIANT: When on a lazy/* branch with no argument, pair detects the task.
+  test('detects task from lazy/* branch', async () => {
+    const taskId = await createTask(ctx, 'Branch detection task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    // Switch to the task branch in the main repo (not worktree)
+    const branchName = `lazy/${taskId}`;
+    ctx.git('checkout', branchName);
+
+    // Running `lazy pair` without arguments should detect the task.
+    // It will fail at the auth check (no API token), proving it resolved the task.
+    const result = await ctx.lazy(['pair'], {
+      env: {
+        CLAUDE_CODE_OAUTH_TOKEN: '',
+        ANTHROPIC_API_KEY: '',
+      },
+    });
+
     expectFailure(result);
-    expectOutput(result, 'Usage: lazy pair');
+    expectError(result, 'No API token found');
+  });
+
+  test('--unlock fails without task on non-task branch', async () => {
+    const result = await ctx.lazy(['pair', '--unlock']);
+    expectFailure(result);
+    expectError(result, '--unlock requires a task argument');
   });
 
   test('fails when task has no session', async () => {

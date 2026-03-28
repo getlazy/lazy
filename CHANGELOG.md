@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.827] - 2026-03-28 - Storage proxy, branch protection, and reliability hardening
+
+### Added
+
+- **`lazy pair` without a task argument** — running `lazy pair` on a task branch auto-detects the task from the current git branch name. On non-task branches (e.g., `main`), it launches Claude Code in the current directory with no task context. Conversations are still captured and searchable via `lazy search`
+- **GitHub/GitLab branch protection checks before merge** — `lazy accept` now verifies CI checks have passed and required reviews are approved before attempting to merge a PR. Previously, repo admins could inadvertently bypass branch protection rules because GitHub allows admin merge by default
+- **Conflict task unblock safety** — `lazy unblock` on a `conflict` task now warns when no `--approved-files` flag is provided, instead of silently reverting all violated files. CLI prompts for confirmation; MCP returns an error listing the violated files so the caller can make an explicit choice
+
+### Fixed
+
+- **RemoteStorage proxy for daemon-as-single-writer** — CLI commands now proxy all storage calls through the daemon via unix socket RPC instead of competing for file locks directly. Eliminates lock contention that caused ~7.5s timeouts when the daemon's reconcile loop and CLI commands fought over `.storage-lock`. Falls back to direct storage when the daemon isn't running
+- **`lazy start` used wrong base branch in worktree setups** — `start` determined the parent branch from the main repo's current checkout, which is arbitrary when `main` lives in a worktree. Now resolves the base branch from the remote's default branch, which is always correct regardless of local checkout state
+- **Accept/merge silently swallowed remote failures** — `tryFastForwardInWorktree` returned `success: true` with a warning when merges actually failed, causing branch divergence that surfaced later as confusing push rejections. Remote operations now fail hard after 3 retries with progressive backoff, and parent branch commits are pushed before remote merges to prevent divergence
+- **Phantom "HEAD" branch created by `lazy sync`** — sync and fast-forward operations could create or target a literal "HEAD" branch instead of resolving it to the actual default branch. Added HEAD guards in both GitHub and GitLab drivers, and HEAD resolution in GitLab's `targetBranch()`
+- **`lazy_accept` passed "HEAD" as base ref for GitHub PRs** — the accept flow resolved the target branch to the literal string "HEAD" instead of the actual branch name (e.g., `main`), causing PR creation to fail with "Base ref must be a branch"
+- **Lock file failures with missing parent directory** — both storage-lock and worktree-lock silently failed when the parent directory didn't exist, causing mysterious "can't get lock" errors after 50 retries. Now throws a clear error message identifying the missing directory
+- **`lazy_diff` returned ANSI color codes in JSON** — git diff output included terminal escape codes that wasted LLM tokens and bloated JSON responses. Now passes `--no-color` to all git diff invocations in MCP tool responses
+- **`lazy pair` failed with host-process runner** — session bridging assumed a Docker sandbox directory existed. With the host-process runner, Claude Code writes session files directly to `~/.claude/projects/`, so no bridging is needed. Now detects this case and skips bridging
+
+### Changed
+
+- **Removed inline task creation from `lazy start`** — the `--goal`, `--prompt`, and `--code` flags were removed from `lazy start`. Use `lazy create` followed by `lazy start` instead. This simplifies the start command and avoids duplicating creation logic
+
 ## [0.10.788] - 2026-03-17 - Minor fixes
 
 ### Fixed

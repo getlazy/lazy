@@ -186,4 +186,101 @@ describe('GitHubDriver markReadyForReview', () => {
     expect(repoIndex).toBeGreaterThan(-1);
     expect(createCall![repoIndex + 1]).toBe('acme/product');
   });
+
+  // INVARIANT: "HEAD" is not a valid base ref for GitHub PRs.
+  // When remote_target_branch is "HEAD" (from detached HEAD at start time),
+  // the driver must resolve it to the actual default branch name.
+  test('resolves literal "HEAD" in remote_target_branch to default branch', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps: DriverDeps = {
+      runGh: (args) => {
+        ghCalls.push([...args]);
+        if (args[0] === 'pr' && args[1] === 'create') {
+          return ok('https://github.com/owner/repo/pull/789');
+        }
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
+          return ok(JSON.stringify({ number: 789 }));
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: (args: string[]) => {
+        if (args[0] === 'remote' && args[1] === 'get-url') {
+          return ok('git@github.com:owner/repo.git');
+        }
+        // symbolic-ref for resolveDefaultBranch
+        if (args[0] === 'symbolic-ref' && args[1] === 'refs/remotes/origin/HEAD') {
+          return ok('refs/remotes/origin/main');
+        }
+        return fail('unexpected git call');
+      },
+    };
+
+    const task = makeTask({
+      metadata: {
+        remote_target_branch: 'HEAD',
+      },
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.markReadyForReview(task);
+
+    expect(result.metadata).toBeDefined();
+
+    // Find the gh pr create call and verify --base is NOT "HEAD"
+    const createCall = ghCalls.find(c => c[0] === 'pr' && c[1] === 'create');
+    expect(createCall).toBeDefined();
+
+    const baseIndex = createCall!.indexOf('--base');
+    expect(baseIndex).toBeGreaterThan(-1);
+    // Should be "main" (resolved from symbolic-ref), NOT "HEAD"
+    expect(createCall![baseIndex + 1]).toBe('main');
+  });
+
+  // INVARIANT: When "HEAD" can't be resolved, fall back to "main".
+  test('falls back to "main" when "HEAD" resolution fails', async () => {
+    const ghCalls: string[][] = [];
+
+    const deps: DriverDeps = {
+      runGh: (args) => {
+        ghCalls.push([...args]);
+        if (args[0] === 'pr' && args[1] === 'create') {
+          return ok('https://github.com/owner/repo/pull/790');
+        }
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
+          return ok(JSON.stringify({ number: 790 }));
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: (args: string[]) => {
+        if (args[0] === 'remote' && args[1] === 'get-url') {
+          return ok('git@github.com:owner/repo.git');
+        }
+        // symbolic-ref fails (no origin/HEAD configured)
+        if (args[0] === 'symbolic-ref') {
+          return fail('ref refs/remotes/origin/HEAD is not a symbolic ref');
+        }
+        return fail('unexpected git call');
+      },
+    };
+
+    const task = makeTask({
+      metadata: {
+        remote_target_branch: 'HEAD',
+      },
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const result = await driver.markReadyForReview(task);
+
+    expect(result.metadata).toBeDefined();
+
+    const createCall = ghCalls.find(c => c[0] === 'pr' && c[1] === 'create');
+    expect(createCall).toBeDefined();
+
+    const baseIndex = createCall!.indexOf('--base');
+    expect(baseIndex).toBeGreaterThan(-1);
+    // Should fall back to "main", NOT "HEAD"
+    expect(createCall![baseIndex + 1]).toBe('main');
+  });
 });

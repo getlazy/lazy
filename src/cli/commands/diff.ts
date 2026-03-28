@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, displayId, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines, getWorktreePath, getBranchNameFromId } from '../helpers';
-import { getCurrentBranch } from '../../git/operations';
+import { getCurrentBranch, getRemoteDefaultBranch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
@@ -109,7 +109,7 @@ async function handleTurnDiff(
   if (parentTaskId) {
     fallbackFromRef = await getBranchNameFromId(parentTaskId, storage);
   } else {
-    fallbackFromRef = getCurrentBranch(root);
+    fallbackFromRef = getRemoteDefaultBranch(root);
   }
 
   // Resolve the base ref through the driver to get origin/<branch> when using

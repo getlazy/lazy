@@ -13,6 +13,8 @@ import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
 import { VALID_MODEL_NAMES } from '../types';
 import type { ModelName, Task, TokenUsage } from '../types';
+import { DaemonClient } from '../daemon/client';
+import { RemoteStorage } from '../storage/remote-storage';
 
 /**
  * Maximum length for task codes (in characters).
@@ -38,11 +40,46 @@ export function requireLazyRoot(): string {
 }
 
 /**
+ * Try to create a RemoteStorage that proxies through the daemon.
+ * Returns null if the daemon is unavailable or in test/daemon mode.
+ */
+async function tryRemoteStorage(root: string): Promise<Storage | null> {
+  // Skip daemon in test mode, when explicitly disabled, or when we ARE the daemon
+  if (process.env.LAZY_NO_DAEMON === '1') return null;
+  if (process.env.LAZY_TEST === '1') return null;
+  if (process.env.LAZY_IS_DAEMON === '1') return null;
+
+  const client = DaemonClient.create();
+  if (!client) return null;
+
+  try {
+    // Fetch the storage path from the daemon so getStoragePath()/getTaskDir() work.
+    const info = await client.rpc('storage', root, {
+      method: 'getStoragePath',
+      args: {},
+    }) as string;
+
+    return new RemoteStorage(client, root, info);
+  } catch {
+    // Daemon unavailable — fall back to direct storage
+    return null;
+  }
+}
+
+/**
  * Create and initialize storage, or exit with an error.
- * Reads the storage backend from lazy.toml configuration.
+ * When a daemon is running, returns a RemoteStorage proxy that routes
+ * all calls through the daemon (eliminating lock contention).
+ * Falls back to direct storage when the daemon isn't available.
  */
 export async function requireStorage(): Promise<Storage> {
   const root = requireLazyRoot();
+
+  // Try daemon first — CLI commands become lock-free
+  const remote = await tryRemoteStorage(root);
+  if (remote) return remote;
+
+  // Fallback: direct storage (acquires .storage-lock)
   const config = loadConfig(root);
   return createStorage(root, {
     backend: config.storage.backend as StorageBackend,

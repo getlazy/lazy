@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import type { Task } from '../../types';
 import { isActiveStatus, isBlockedStatus } from '../../types';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, validateCode, rejectIfPairing, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
-import { hasUncommittedChanges, getCurrentSha } from '../../git/operations';
+import { hasUncommittedChanges, getCurrentSha, resolveDetachedHead } from '../../git/operations';
 import { validateBranchInSyncWithRemote } from '../../utils/git';
 import { removeLock } from '../../utils/lock';
 import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
@@ -187,7 +187,8 @@ export async function commandAccept(args: string[]): Promise<void> {
         console.log('Merge completed! Finishing up...');
 
         // Determine merge target for fast-forward
-        const mergeTargetBranch = task.metadata?.remote_target_branch ?? 'main';
+        // resolveDetachedHead guards against "HEAD" stored in metadata by old code
+        const mergeTargetBranch = resolveDetachedHead(task.metadata?.remote_target_branch ?? 'main', root, config.remote.git_remote);
 
         const ffResult = await driver.fastForwardLocal(mergeTargetBranch, root);
         if (!ffResult.success) {
@@ -258,7 +259,7 @@ export async function commandAccept(args: string[]): Promise<void> {
         if (checksResult.passed) {
           console.log(theme.success('All checks passed! Retrying merge...\n'));
 
-          const mergeTargetBranch = task.metadata?.remote_target_branch ?? 'main';
+          const mergeTargetBranch = resolveDetachedHead(task.metadata?.remote_target_branch ?? 'main', root, config.remote.git_remote);
           const retryResult = await driver.merge({
             sourceBranch: sess.git_branch,
             targetBranch: mergeTargetBranch,
@@ -446,7 +447,8 @@ export async function commandAccept(args: string[]): Promise<void> {
       mergeTargetBranch = await getBranchNameFromId(task.parent_task_id, storage);
     } else {
       // Root task: merge into the branch it was created from
-      mergeTargetBranch = task.metadata?.remote_target_branch ?? 'main';
+      // resolveDetachedHead guards against "HEAD" stored in metadata by old code
+      mergeTargetBranch = resolveDetachedHead(task.metadata?.remote_target_branch ?? 'main', root, config.remote.git_remote);
     }
 
     // Log merge intent
@@ -478,6 +480,21 @@ export async function commandAccept(args: string[]): Promise<void> {
       if (!syncCheck.inSync) {
         console.error(`Error: ${syncCheck.error}`);
         console.error('Fix this before accepting to avoid a half-merged state.');
+        process.exit(1);
+      }
+    }
+
+    // INVARIANT: Push parent branch's local commits to remote before remote merge.
+    // If the parent has local-only commits, the remote merge will create a state
+    // where the remote parent has the merge commit but not the local-only commits,
+    // causing the local branch to diverge from remote.
+    if (driver.needsSync) {
+      try {
+        await driver.pushBranch(mergeTargetBranch);
+      } catch (err) {
+        console.error(`Error: Failed to push ${mergeTargetBranch} to remote: ${err instanceof Error ? err.message : err}`);
+        console.error('The parent branch has local commits that must be pushed before merging.');
+        console.error(`Fix: run \`git push\` for ${mergeTargetBranch}, then retry accept.`);
         process.exit(1);
       }
     }

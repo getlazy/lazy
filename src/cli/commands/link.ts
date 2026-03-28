@@ -9,7 +9,7 @@
 import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateCode, deriveCode, resolveTaskOrExit, taskRef } from '../helpers';
-import { createWorktree, findWorktreeForBranch, getCurrentBranch, copyUntrackedFilesIntoWorktree } from '../../git/operations';
+import { createWorktree, findWorktreeForBranch, getCurrentBranch, getRemoteDefaultBranch, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
 import { getDataDir } from '../init';
@@ -149,14 +149,14 @@ export async function commandLink(args: string[]): Promise<void> {
     }
 
     // Detect the parent branch (the branch this was forked from).
-    // Try merge-base against main first, then fall back to HEAD.
-    const mainBranch = getCurrentBranch(root);
+    // Use the remote's default branch (e.g., main) to check merge-base.
+    const defaultBranch = getRemoteDefaultBranch(root, config.remote.git_remote);
     const mergeBaseResult = runGit(
-      ['merge-base', mainBranch, result.branch],
+      ['merge-base', defaultBranch, result.branch],
       { cwd: root },
     );
     if (mergeBaseResult.exitCode === 0) {
-      await storage.updateTaskMetadata(task.id, 'parent_branch', mainBranch);
+      await storage.updateTaskMetadata(task.id, 'parent_branch', defaultBranch);
     }
 
     // Create a session record so the task shows the correct branch

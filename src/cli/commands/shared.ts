@@ -6,7 +6,7 @@
 
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getDiffStat } from '../../git/operations';
+import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getRemoteDefaultBranch, getDiffStat, getTaskTargetBranch } from '../../git/operations';
 import { getModelId } from '../../capture/claude';
 import { createRunner } from '../../runner';
 import { hasResponse, readCommand, protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
@@ -669,9 +669,9 @@ export async function showTaskContext(
   if (parentTaskId) {
     targetBranch = await getBranchNameFromId(parentTaskId, storage);
   } else {
-    // Use the branch this task was created from, falling back to current branch
+    // Use the branch this task was created from, falling back to remote default branch
     const taskData = await storage.getTask(taskId);
-    targetBranch = taskData?.metadata?.remote_target_branch ?? getCurrentBranch(root);
+    targetBranch = (taskData && getTaskTargetBranch(taskData, root)) ?? getRemoteDefaultBranch(root);
   }
 
   try {
@@ -769,9 +769,9 @@ export async function getEditorFeedback(
         if (parentTaskId) {
           fallbackFromRef = await getBranchNameFromId(parentTaskId, storage);
         } else {
-          // Use the branch this task was created from, falling back to current branch
+          // Use the branch this task was created from, falling back to remote default branch
           const taskData = await storage.getTask(taskId);
-          fallbackFromRef = taskData?.metadata?.remote_target_branch ?? getCurrentBranch(root);
+          fallbackFromRef = (taskData && getTaskTargetBranch(taskData, root)) ?? getRemoteDefaultBranch(root);
         }
       }
 
@@ -1154,8 +1154,8 @@ export async function launchFeedbackTurn(
     if (task.parent_task_id) {
       parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
     } else {
-      // Use the branch this task was created from, falling back to current branch
-      parentBranch = task.metadata?.remote_target_branch ?? getCurrentBranch(root);
+      // Use the branch this task was created from, falling back to remote default branch
+      parentBranch = getTaskTargetBranch(task, root) ?? getRemoteDefaultBranch(root);
     }
 
     // Resolve upstream ref through the driver so the supervisor merges

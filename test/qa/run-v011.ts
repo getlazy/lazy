@@ -719,7 +719,7 @@ async function setup(overrides: Partial<DriverConfig>): Promise<DriverConfig> {
 
   // Initialize lazy
   logStep('Running lazy init');
-  const initResult = await execLazy(config, ['init', '--yes']);
+  const initResult = await execLazy(config, ['init', '--non-interactive']);
   if (initResult.exitCode !== 0) {
     throw new Error(`lazy init failed: ${initResult.stderr || initResult.stdout}`);
   }

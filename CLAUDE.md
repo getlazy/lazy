@@ -86,6 +86,18 @@ const result = spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe
 const result = Bun.spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe' });
 ```
 
+### Fail hard on remote failures — no silent fallbacks
+
+Remote operations (push, fetch, MR/PR creation) must retry up to 3 attempts with progressive backoff (2s, 4s). If all retries fail, the operation FAILS — no silent fallback to local-only behavior. Use `withRemoteRetry()` from `src/utils/retry.ts` to wrap remote operations in drivers.
+
+`success: true` with a warning when the operation actually failed is NEVER acceptable. If a fast-forward fails, that's a failure. If a push fails, that's a failure. If a fetch fails, that's a failure. The caller decides how to handle the failure — not the utility function.
+
+Before performing a remote merge (accept), the parent branch's local commits MUST be pushed to the remote first. If the parent has local-only commits and the remote merge succeeds without them, the remote parent will have the merge commit but not the local commits, causing divergence.
+
+### PRs only for protected branches
+
+PRs/MRs should only be created when merging into a branch with protection rules. Subtask→parent merges should be local git operations, not remote MRs. "Protected" means branches where non-admin users cannot force push or merge without review. This avoids creating unnecessary PRs for intermediate branches that are part of the task hierarchy.
+
 ## Core Principle: Act Like a Team Member
 
 **Rule of thumb:** "Would I as a reviewer do this?"

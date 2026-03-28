@@ -1,21 +1,20 @@
 import { join } from 'path';
 import { existsSync, mkdirSync, copyFileSync, writeFileSync, statSync, rmSync } from 'fs';
 import { homedir } from 'os';
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, rejectIfPairing, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
-import { getCurrentSha, getCurrentBranch, createWorktree, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../../git/operations';
+import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, resolveTaskOrExit, rejectIfPairing, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
+import { getCurrentSha, getCurrentBranch, getRemoteDefaultBranch, resolveDetachedHead, createWorktree, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { getAuthEnv, getModelId } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { createRunner, type DockerRunnerOptions } from '../../runner';
 import { createDriver } from '../../remote';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
-import { openEditor, promptLine, removeRecoveryFile, promptYesNo, isTTY, readStdinIfPiped } from '../editor';
+import { promptYesNo, isTTY } from '../editor';
 import { followContainer, buildNotesContext, buildSystemPrompt } from './shared';
 import { checkOrphanedChild, retargetOrphanedChild } from '../orphan';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
 import type { StartCommand } from '../../protocol';
 import type { SandboxConfig } from '../../capture/claude';
-import type { ModelName, TaskType } from '../../types';
-import { VALID_TASK_TYPES } from '../../types';
+import type { ModelName } from '../../types';
 import { getAgent, listAgents } from '../../agent/registry';
 
 import { getDataDir } from '../init';
@@ -136,12 +135,7 @@ function setupSandbox(worktreePath: string): SandboxConfig {
 export async function commandStart(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
-    { name: 'goal', takesValue: true },
-    { name: 'prompt', takesValue: true },
     { name: 'model', takesValue: true },
-    { name: 'type', takesValue: true },
-    { name: 'code', takesValue: true },
-    { name: 'parent', takesValue: true },
     { name: 'agent', takesValue: true },
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
@@ -149,12 +143,7 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'docker-agent-no-network', takesValue: false },
   ], 'start');
 
-  const goalFlag = parsed.flags.get('goal') as string | undefined;
-  const promptFlag = parsed.flags.get('prompt') as string | undefined;
   const modelValue = parsed.flags.get('model') as string | undefined;
-  const typeValue = parsed.flags.get('type') as string | undefined;
-  const codeFlag = parsed.flags.get('code') as string | undefined;
-  const parentFlag = parsed.flags.get('parent') as string | undefined;
   const follow = parsed.flags.get('follow') === true;
   const yes = parsed.flags.get('yes') === true;
   const forceLocal = parsed.flags.get('force-local') === true;
@@ -164,27 +153,6 @@ export async function commandStart(args: string[]): Promise<void> {
   let modelOverride: ModelName | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
-  }
-
-  // Validate type if provided
-  let taskType: TaskType | undefined;
-  if (typeValue !== undefined) {
-    if (!VALID_TASK_TYPES.includes(typeValue as TaskType)) {
-      console.error(`Invalid type '${typeValue}'. Must be one of: ${VALID_TASK_TYPES.join(', ')}`);
-      process.exit(1);
-    }
-    taskType = typeValue as TaskType;
-  }
-
-  // Validate code if provided
-  let codeValue: string | undefined;
-  if (codeFlag !== undefined) {
-    const codeError = validateCode(codeFlag);
-    if (codeError) {
-      console.error(`Invalid code: ${codeError}`);
-      process.exit(1);
-    }
-    codeValue = codeFlag;
   }
 
   // Parse --agent flag
@@ -199,195 +167,119 @@ export async function commandStart(args: string[]): Promise<void> {
     agentId = agentFlag;
   }
 
-  // Determine if we're creating a new task or starting an existing one
-  // If --goal is provided, we're creating a new task
-  // Otherwise, the first positional arg is a task ID
-  let taskId: string | undefined;
-  if (!goalFlag) {
-    // No --goal: use first positional arg as task ID
-    taskId = parsed.positional[0];
-  }
-
-  // Validate --parent flag: can only be used with inline task creation (--goal)
-  if (parentFlag && taskId) {
-    console.error('Error: --parent flag can only be used with --goal (inline task creation), not with an existing task ID');
+  // Require task ID as the first positional argument
+  const taskId = parsed.positional[0];
+  if (!taskId) {
+    console.error('Error: Task ID is required.');
+    console.error('To create a new task, use: lazy create --goal "..." --prompt "..."');
+    console.error('Then start it with: lazy start <task_id>');
     process.exit(1);
   }
 
   const root = requireLazyRoot();
   const storage = await requireStorage();
 
-  // Validate and resolve parent task if --parent is provided
-  let parentTaskId: string | undefined;
-  if (parentFlag) {
-    const parentTask = await storage.getTask(parentFlag);
-    if (!parentTask) {
-      console.error(`Parent task not found: ${parentFlag}`);
-      await storage.close();
-      process.exit(1);
-    }
-
-    // Verify parent is not in a terminal state
-    if (parentTask.status === 'abandoned' || parentTask.status === 'closed' || parentTask.status === 'complete') {
-      console.error(`Cannot create child of ${parentTask.status} task ${displayId(parentTask)}`);
-      await storage.close();
-      process.exit(1);
-    }
-
-    // Verify parent worktree exists
-    const parentWorktreePath = getWorktreePath(root, parentTask);
-    if (!existsSync(parentWorktreePath)) {
-      console.error(`Cannot create child task: parent task has no worktree.`);
-      console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
-      await storage.close();
-      process.exit(1);
-    }
-
-    parentTaskId = parentTask.id;
-  }
-
   try {
-    let t;
+    // Starting an existing task
+    let t = await resolveTaskOrExit(storage, taskId);
+    if (!t.prompt) {
+      console.error(`Task ${displayId(t)} has no prompt. Set one with: lazy edit ${displayId(t)}`);
+      process.exit(1);
+    }
 
-    if (taskId) {
-      // Starting an existing task (e.g., from `lazy branch`)
-      t = await resolveTaskOrExit(storage, taskId);
-      if (!t.prompt) {
-        console.error(`Task ${displayId(t)} has no prompt. Set one with: lazy edit ${displayId(t)}`);
+    // Pre-flight check for child tasks: verify parent worktree exists
+    // This check runs before the Docker/runner check to give a clear error message
+    if (t.parent_task_id) {
+      const parentTask = await storage.getTask(t.parent_task_id);
+      if (!parentTask) {
+        console.error(`Parent task not found: ${t.parent_task_id}`);
         process.exit(1);
       }
 
-      // Pre-flight check for child tasks: verify parent worktree exists
-      // This check runs before the Docker/runner check to give a clear error message
-      if (t.parent_task_id) {
-        const parentTask = await storage.getTask(t.parent_task_id);
-        if (!parentTask) {
-          console.error(`Parent task not found: ${t.parent_task_id}`);
+      const parentWorktreePath = getWorktreePath(root, parentTask);
+      if (!existsSync(parentWorktreePath)) {
+        console.error(`Cannot start child task: parent task has no worktree.`);
+        console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
+        process.exit(1);
+      }
+    }
+
+    // Check for orphaned child (parent accepted, branch gone) and retarget
+    if (t.parent_task_id) {
+      const orphanStatus = await checkOrphanedChild(t, storage, root);
+      if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
+        console.log(theme.warning(`\nParent task was accepted and its branch deleted.`));
+        console.log(`This task needs to be retargeted to ${theme.taskId(orphanStatus.retargetBranch)} before starting.\n`);
+
+        let shouldRetarget: boolean;
+        if (isTTY() && !yes) {
+          shouldRetarget = await promptYesNo(`Retarget to ${orphanStatus.retargetBranch}?`, true);
+        } else {
+          // Non-TTY or --yes: retarget automatically (the alternative is a broken task)
+          shouldRetarget = true;
+          if (!isTTY()) {
+            console.log(`Automatically retargeting to ${orphanStatus.retargetBranch} (non-interactive mode).`);
+          }
+        }
+
+        if (!shouldRetarget) {
+          console.error('Cannot start without retargeting. The parent branch no longer exists.');
           process.exit(1);
         }
 
-        const parentWorktreePath = getWorktreePath(root, parentTask);
-        if (!existsSync(parentWorktreePath)) {
-          console.error(`Cannot start child task: parent task has no worktree.`);
-          console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
-          process.exit(1);
-        }
+        await retargetOrphanedChild(t, storage, orphanStatus.retargetBranch);
+        console.log(theme.success(`Retargeted to ${orphanStatus.retargetBranch}.\n`));
+
+        // Refresh task reference — parent_task_id is now null
+        t = (await storage.getTask(t.id))!;
       }
+    }
 
-      // Check for orphaned child (parent accepted, branch gone) and retarget
-      if (t.parent_task_id) {
-        const orphanStatus = await checkOrphanedChild(t, storage, root);
-        if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
-          console.log(theme.warning(`\nParent task was accepted and its branch deleted.`));
-          console.log(`This task needs to be retargeted to ${theme.taskId(orphanStatus.retargetBranch)} before starting.\n`);
+    // Warn if task has no parent and there are active tasks on other branches
+    if (!t.parent_task_id) {
+      const allTasks = await storage.listTasks();
+      const activeTasks = allTasks.filter(task => {
+        const status = task.status;
+        return status === 'working' || status === 'interrupted' || status === 'pairing' || status === 'merging';
+      });
 
-          let shouldRetarget: boolean;
-          if (isTTY() && !yes) {
-            shouldRetarget = await promptYesNo(`Retarget to ${orphanStatus.retargetBranch}?`, true);
-          } else {
-            // Non-TTY or --yes: retarget automatically (the alternative is a broken task)
-            shouldRetarget = true;
-            if (!isTTY()) {
-              console.log(`Automatically retargeting to ${orphanStatus.retargetBranch} (non-interactive mode).`);
-            }
-          }
-
-          if (!shouldRetarget) {
-            console.error('Cannot start without retargeting. The parent branch no longer exists.');
-            process.exit(1);
-          }
-
-          await retargetOrphanedChild(t, storage, orphanStatus.retargetBranch);
-          console.log(theme.success(`Retargeted to ${orphanStatus.retargetBranch}.\n`));
-
-          // Refresh task reference — parent_task_id is now null
-          t = (await storage.getTask(t.id))!;
+      if (activeTasks.length > 0 && !yes) {
+        const defaultBranch = getRemoteDefaultBranch(root);
+        console.log(theme.warning(`\nTask '${displayId(t)}' has no parent and will branch from ${defaultBranch}.`));
+        console.log(`There are ${activeTasks.length} active task(s) on other branches:`);
+        for (const activeTask of activeTasks.slice(0, 5)) {
+          console.log(`  - ${displayId(activeTask)}: ${activeTask.goal}`);
         }
-      }
-
-      // Show task details and ask for confirmation unless --yes was provided
-      // When no TTY is available, auto-proceed — starting an existing task is
-      // non-destructive and all required info (goal, prompt) is already present.
-      if (!yes && isTTY()) {
-        console.log(`\nTask: ${displayId(t)}`);
-        console.log(`Goal: ${t.goal}`);
-        console.log(`\nPrompt:`);
-        console.log(formatMarkdown(t.prompt).join('\n'));
+        if (activeTasks.length > 5) {
+          console.log(`  ... and ${activeTasks.length - 5} more`);
+        }
         console.log('');
 
-        const confirmed = await promptYesNo('Start this task?', false);
-        if (!confirmed) {
-          console.log(`Task not started. Edit the prompt with: lazy edit ${displayId(t)}`);
-          process.exit(0);
-        }
-      }
-    } else {
-      // Creating a new task inline
-      let goal: string;
-      let prompt: string | null = null;
-      let startPromptRecoveryPath: string | null = null;
-
-      if (goalFlag) {
-        goal = goalFlag;
-        if (promptFlag !== undefined) {
-          prompt = promptFlag;
-        } else {
-          // Try piped stdin as prompt
-          const stdinContent = await readStdinIfPiped();
-          if (stdinContent !== null) {
-            prompt = stdinContent;
+        if (isTTY()) {
+          const confirmed = await promptYesNo('Continue?', true);
+          if (!confirmed) {
+            console.log('Task not started. To make this a child task, use: lazy create --parent <parent_task_id>');
+            process.exit(0);
           }
         }
-      } else {
-        // Interactive mode
-        if (!process.stdin.isTTY) {
-          console.error('Interactive mode requires a TTY. Use --goal and --prompt flags instead.');
-          process.exit(1);
-        }
-
-        const goalInput = await promptLine('Task goal');
-        if (!goalInput.trim()) {
-          console.error('Goal cannot be empty');
-          process.exit(1);
-        }
-        goal = goalInput;
-
-        // Open editor for prompt
-        console.log('\nOpening editor for prompt (close without saving to skip)...');
-        const editResult = await openEditor('', `start-prompt`);
-        if (editResult !== null && editResult.content.trim()) {
-          prompt = editResult.content.trim();
-          startPromptRecoveryPath = editResult.recoveryPath;
-        } else if (editResult !== null && editResult.recoveryPath) {
-          // Empty prompt — clean up recovery file
-          removeRecoveryFile(editResult.recoveryPath);
-        }
       }
+    }
 
-      if (!prompt) {
-        // Prompt is required to start work
-        if (startPromptRecoveryPath) removeRecoveryFile(startPromptRecoveryPath);
-        console.error('Prompt is required. Provide it with --prompt or via the editor.');
-        process.exit(1);
+    // Show task details and ask for confirmation unless --yes was provided
+    // When no TTY is available, auto-proceed — starting an existing task is
+    // non-destructive and all required info (goal, prompt) is already present.
+    if (!yes && isTTY()) {
+      console.log(`\nTask: ${displayId(t)}`);
+      console.log(`Goal: ${t.goal}`);
+      console.log(`\nPrompt:`);
+      console.log(formatMarkdown(t.prompt).join('\n'));
+      console.log('');
+
+      const confirmed = await promptYesNo('Start this task?', false);
+      if (!confirmed) {
+        console.log(`Task not started. Edit the prompt with: lazy edit ${displayId(t)}`);
+        process.exit(0);
       }
-
-      // Create the task (with optional parent and agent)
-      t = await storage.createTask(goal, parentTaskId, undefined, codeValue, taskType, agentId);
-
-      // Set prompt
-      await storage.updateTaskPrompt(t.id, prompt);
-      // Prompt is now durably persisted — clean up recovery file
-      if (startPromptRecoveryPath) removeRecoveryFile(startPromptRecoveryPath);
-      t.prompt = prompt;
-
-      // Set model if provided
-      if (modelOverride) {
-        await storage.updateTaskModel(t.id, modelOverride);
-        t.model = modelOverride;
-      }
-
-      console.log(`Created task ${theme.taskId(displayId(t))}`);
-      console.log(`  ${theme.label('Goal:')} ${t.goal}`);
     }
 
     // --- Pre-flight checks (before creating container/worktree) ---
@@ -406,20 +298,6 @@ export async function commandStart(args: string[]): Promise<void> {
     if (t.agent_id !== 'claude-code' && runner.type !== 'dangerously-host-process-without-any-isolation') {
       console.error(`Agent "${t.agent_id}" only supports host-process runner. Set runner type to "dangerously-host-process-without-any-isolation" in lazy.toml.`);
       process.exit(1);
-    }
-
-    // For new tasks (not starting an existing one), verify we can get a git SHA
-    // before creating any task state. This prevents orphaned tasks when the repo
-    // has no commits.
-    let preflightSha: string | undefined;
-    if (!taskId) {
-      try {
-        preflightSha = getCurrentSha(root);
-      } catch {
-        console.error('Cannot determine git HEAD. The repository must have at least one commit.');
-        console.error('Run: git commit --allow-empty -m "Initial commit"');
-        process.exit(1);
-      }
     }
 
     // Load config and create driver early — we need it for resolveUpstreamRef
@@ -469,7 +347,7 @@ export async function commandStart(args: string[]): Promise<void> {
 
     if (isLinkedTask && existingSession) {
       startSha = existingSession.git_start_sha;
-      parentBranch = t.metadata?.parent_branch ?? getCurrentBranch(root);
+      parentBranch = t.metadata?.parent_branch ?? getRemoteDefaultBranch(root, config.remote.git_remote);
     } else if (t.parent_task_id) {
       // Child task: branch from parent's branch HEAD (fetched from remote).
       // Parent worktree existence already verified in pre-flight check above.
@@ -517,9 +395,11 @@ export async function commandStart(args: string[]): Promise<void> {
       await storage.updateTaskBranchedFromSha(t.id, startSha);
       t.branched_from_sha = startSha;
     } else {
-      // Non-child, non-linked task: branch from parent branch (usually main).
-      // Use the driver to fetch the latest state before branching.
-      parentBranch = getCurrentBranch(root);
+      // Non-child, non-linked task: branch from the remote's default branch.
+      // This ensures we always branch from the correct base (e.g., main) regardless
+      // of what branch is currently checked out in the main repo (which may be
+      // arbitrary when worktrees are in use).
+      parentBranch = getRemoteDefaultBranch(root, config.remote.git_remote);
 
       try {
         // Fetch the parent branch and get its up-to-date ref.
@@ -538,7 +418,7 @@ export async function commandStart(args: string[]): Promise<void> {
           console.error('This is unexpected. The remote ref may have been deleted immediately after fetch.');
           if (forceLocal) {
             logger.warn('--force-local specified, using local HEAD');
-            startSha = preflightSha ?? getCurrentSha(root);
+            startSha = getCurrentSha(root);
           } else {
             console.error(`Run 'git fetch' to verify remote state, or use --force-local to start from local HEAD anyway.`);
             process.exit(1);
@@ -550,7 +430,7 @@ export async function commandStart(args: string[]): Promise<void> {
         console.error('Cannot start task — the remote branch may have moved forward since your last fetch.');
         if (forceLocal) {
           logger.warn('--force-local specified, using local HEAD (may be stale)');
-          startSha = preflightSha ?? getCurrentSha(root);
+          startSha = getCurrentSha(root);
         } else {
           console.error(`Run 'git fetch' to update your local state, or use --force-local to start from local HEAD anyway.`);
           process.exit(1);
@@ -665,7 +545,7 @@ export async function commandStart(args: string[]): Promise<void> {
       // describes the existing branch state (commits, diff, status).
       let turnPrompt = t.prompt;
       if (isLinkedTask) {
-        const linkedParentBranch = t.metadata?.parent_branch ?? getCurrentBranch(root);
+        const linkedParentBranch = t.metadata?.parent_branch ?? getRemoteDefaultBranch(root, config.remote.git_remote);
         const preamble = buildLinkedTaskPreamble(worktreePath, branchName, linkedParentBranch);
         turnPrompt = preamble + '\n---\n\n' + t.prompt;
       }
@@ -706,7 +586,7 @@ export async function commandStart(args: string[]): Promise<void> {
         // record the branch this task was forked from. The GitHub driver may
         // overwrite this via publishResult.metadata — that's fine.
         // Note: parentBranch was already determined when creating the worktree.
-        const mergeTarget = parentBranch ?? getCurrentBranch(root);
+        const mergeTarget = parentBranch ?? getRemoteDefaultBranch(root, config.remote.git_remote);
         await storage.updateTaskMetadata(t.id, 'remote_target_branch', mergeTarget);
 
         // createDriver() is NOT wrapped — invalid config is a hard failure.
@@ -837,33 +717,26 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start [--goal <goal>] [--prompt <text>] [--parent <task_id>] [--model <model>] [--type <type>] [--code <code>] [--agent <agent_id>] [--follow] [--yes] [--force-local]
-       lazy start <task_id> [--model <model>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--follow] [--yes] [--force-local]
 
-Create and start a new task, or start an existing task (e.g., from 'lazy branch').
-
-Creates a worktree, launches a supervisor container, and writes a start command.
+Start an existing task. Creates a worktree, launches a supervisor container, and writes a start command.
 The supervisor manages the agent lifecycle (sync-with-upstream, work phases).
+
+To create a new task, use 'lazy create' first, then start it with this command.
 
 Use 'lazy blocked' to check when the agent finishes and needs your input.
 Use 'lazy status <task_id>' to check the current state.
 
+Arguments:
+  <task_id>          ID of the task to start (short hex prefix or task code)
+
 Options:
-  --goal <goal>      Task goal (required for new tasks)
-  --prompt <text>    Task prompt/specification (required for new tasks)
-  --parent <task_id> Create as a child task of the specified parent (parent must have worktree)
   --model <model>    Override model for this session (apprentice, journeyman, master, sonnet, opus, haiku)
-  --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
-                     Default: task
-  --code <code>      Set a human-readable code for the task
-  --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
+  --agent <agent_id> Agent to use for this task (default: from task or lazy.toml)
   --follow           Wait for the agent to finish, streaming output in real time
-  --yes              Skip confirmation prompt when starting an existing task
+  --yes              Skip confirmation prompts
   --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)
-
-Arguments:
-  <task_id>          ID of an existing task to start (e.g., from 'lazy branch')
 
 Model Selection:
   Models are selected in this priority order:
@@ -881,16 +754,10 @@ Notes:
   - The human turn is recorded before the container launches, so it's
     crash-safe — if the process dies, the turn is preserved
 
-Prompt input priority: --prompt flag > piped stdin > $EDITOR (interactive)
-
 Examples:
-  lazy start --goal "Add auth" --prompt "Implement OAuth2 login"
-  lazy start --goal "Refactor" --prompt "..." --model opus
-  lazy start --goal "Try Redis" --prompt "..." --parent abc123  # Child task
-  lazy start                                # Interactive mode
-  lazy start abc12345                       # Start existing task (shows prompt for review)
+  lazy create --goal "Add auth" --prompt "Implement OAuth2 login"
+  lazy start abc12345                       # Start the created task
   lazy start abc12345 --yes                 # Start without confirmation
   lazy start abc1 --model haiku             # Start with model override
-  lazy start --goal "Fix bug" --prompt "..." --follow  # Wait for completion
-  echo "Detailed prompt" | lazy start --goal "Fix bug"  # Piped stdin as prompt`);
+  lazy start abc1 --follow                  # Wait for completion`);
 }

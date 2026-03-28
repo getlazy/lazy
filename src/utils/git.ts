@@ -124,9 +124,11 @@ export function tryFastForwardInWorktree(
   // First fetch in the worktree to ensure we have the latest remote ref
   const fetchResult = git(['fetch', remoteName, targetBranch], worktreePath);
   if (fetchResult.exitCode !== 0) {
-    const warning = `Branch ${targetBranch} is checked out in worktree at ${worktreePath}, but fetch failed. The remote merge succeeded — you may want to run \`git -C ${worktreePath} pull\` manually.`;
+    // INVARIANT: Fetch failure is a real failure — no silent fallback to success.
+    // The caller must handle this (retry, inform user, etc.).
+    const warning = `Branch ${targetBranch} is checked out in worktree at ${worktreePath}, but fetch failed: ${fetchResult.stderr.trim() || 'unknown error'}. Run \`git -C ${worktreePath} fetch && git -C ${worktreePath} pull\` to update manually.`;
     logger.warn(`fastForwardLocal: ${warning}`);
-    return { success: true, warning };
+    return { success: false, warning };
   }
 
   const mergeResult = git(['merge', '--ff-only', remoteRef], worktreePath);
@@ -142,10 +144,11 @@ export function tryFastForwardInWorktree(
     return { success: true };
   }
 
-  // Merge failed — warn but return success (remote merge succeeded, local staleness is non-blocking)
-  const warning = `Branch ${targetBranch} is checked out in worktree at ${worktreePath} and could not be fast-forwarded. The remote merge succeeded — you may want to run \`git -C ${worktreePath} pull\` manually.`;
+  // INVARIANT: A failed merge is a failure — never return success:true with a warning
+  // to paper over it. The caller decides how to handle (retry, inform user, etc.).
+  const warning = `Branch ${targetBranch} is checked out in worktree at ${worktreePath} and could not be fast-forwarded: ${mergeResult.stderr.trim() || 'unknown error'}. Run \`git -C ${worktreePath} pull\` to update manually.`;
   logger.warn(`fastForwardLocal: ${warning}`);
-  return { success: true, warning };
+  return { success: false, warning };
 }
 
 /**
@@ -297,9 +300,13 @@ export function validateBranchInSyncWithRemote(
   // Fetch the branch from the driver's remote
   const fetchResult = git(['fetch', remote, branch], root);
   if (fetchResult.exitCode !== 0) {
-    // Can't fetch — network issue or branch doesn't exist on remote.
-    // Fail safe: if we can't verify sync, don't block the accept.
-    return { inSync: true };
+    // INVARIANT: Fetch failure is a real failure — no silent fallback.
+    // If we can't verify sync, we must not proceed with an irreversible
+    // remote merge that could leave local and remote diverged.
+    return {
+      inSync: false,
+      error: `Failed to fetch ${branch} from ${remote}: ${fetchResult.stderr.trim() || 'unknown error'}. Check your network connection and retry.`,
+    };
   }
 
   const remoteRef = `${remote}/${branch}`;
@@ -309,8 +316,11 @@ export function validateBranchInSyncWithRemote(
   const remoteShaResult = git(['rev-parse', remoteRef], root);
 
   if (localShaResult.exitCode !== 0 || remoteShaResult.exitCode !== 0) {
-    // Can't resolve refs — can't verify, don't block
-    return { inSync: true };
+    // Can't resolve refs — fail rather than silently proceeding
+    return {
+      inSync: false,
+      error: `Failed to resolve refs for ${branch} or ${remoteRef}. Ensure both branches exist.`,
+    };
   }
 
   const localSha = localShaResult.stdout.trim();

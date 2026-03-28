@@ -1,11 +1,10 @@
 import { join } from 'path';
 import { homedir } from 'os';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync, readFileSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
+import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
 import { isBlockedStatus } from '../../types';
-import { getDataDir } from '../init';
 import { theme } from '../theme';
-import { getCurrentSha, getNewCommits, getDiffStat } from '../../git/operations';
+import { getCurrentBranch, getCurrentSha, getNewCommits, getDiffStat } from '../../git/operations';
 import {
   acquirePairingLock,
   removePairingLock,
@@ -16,8 +15,9 @@ import { runClaude, hasAuthEnv } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
+import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { getActor } from '../../constants';
-import { spawnSync } from '../../utils/spawn';
+import { spawnSync, spawn } from '../../utils/spawn';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -121,7 +121,15 @@ function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeRes
 
   const noop: BridgeResult = { accessible: false, cleanup: () => {} };
 
+  // If there's no sandbox dir, check if the session is already accessible
+  // at the host location (host-process runner writes directly to ~/.claude/).
   if (!existsSync(sandboxProjectDir)) {
+    if (sessionId) {
+      const hostSessionFile = join(hostProjectDir, `${sessionId}.jsonl`);
+      if (existsSync(hostSessionFile)) {
+        return { accessible: true, cleanup: () => {} };
+      }
+    }
     return noop;
   }
 
@@ -215,6 +223,56 @@ function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeRes
   return { accessible, cleanup };
 }
 
+/**
+ * Try to detect a task from the current git branch.
+ * Returns the task ref (code or short ID) if the branch matches the
+ * configured branch prefix pattern (e.g. `lazy/<ref>`), or null if
+ * on a non-task branch.
+ */
+function detectTaskRefFromBranch(branchPrefix: string): string | null {
+  try {
+    const branch = getCurrentBranch();
+    const prefix = `${branchPrefix}/`;
+    if (branch.startsWith(prefix)) {
+      return branch.slice(prefix.length);
+    }
+  } catch {
+    // Not in a git repo or other error — treat as no task
+  }
+  return null;
+}
+
+/**
+ * Launch Claude Code in the current directory with no task context.
+ * Captures the conversation into lazy's storage after exit.
+ */
+async function pairBranchless(root: string): Promise<void> {
+  console.log(`\nLaunching Claude Code in ${process.cwd()}...`);
+  console.log(`(no task context — conversation will be captured for search)\n`);
+
+  const beforeSnapshot = snapshotSessionFiles(root);
+
+  // Launch Claude Code interactively in the current directory
+  const proc = spawn(['claude'], {
+    cwd: process.cwd(),
+    stdin: 'inherit',
+    stdout: 'inherit',
+    stderr: 'inherit',
+  });
+
+  const exitCode = await proc.exited;
+
+  // Capture conversation from JSONL files
+  const sessionId = await captureConversation(root, beforeSnapshot, 'Pairing');
+  if (sessionId) {
+    console.log(`\nConversation captured (session ${sessionId.substring(0, 8)}...)`);
+  }
+
+  if (exitCode !== 0) {
+    process.exit(exitCode);
+  }
+}
+
 export async function commandPair(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
@@ -222,16 +280,31 @@ export async function commandPair(args: string[]): Promise<void> {
     { name: 'no-summary', takesValue: false },
   ], 'pair');
 
-  const taskId = parsed.positional[0];
-  if (!taskId) {
-    pairUsage();
-    process.exit(1);
-  }
-
+  let taskId = parsed.positional[0];
   const unlock = parsed.flags.get('unlock') === true;
   const noSummary = parsed.flags.get('no-summary') === true;
 
   const root = requireLazyRoot();
+
+  // If no task argument, try to detect from current branch
+  if (!taskId) {
+    const config = loadConfig(root);
+    const detectedRef = detectTaskRefFromBranch(config.git.default_branch_prefix);
+
+    if (detectedRef) {
+      // On a lazy/* branch — use the ref as the task identifier
+      taskId = detectedRef;
+    } else if (unlock) {
+      // --unlock without a task and not on a task branch
+      console.error('Error: --unlock requires a task argument or a lazy/* branch.');
+      process.exit(1);
+    } else {
+      // On main or non-task branch — launch branchless pairing
+      await pairBranchless(root);
+      return;
+    }
+  }
+
   const storage = await requireStorage();
 
   try {
@@ -533,43 +606,34 @@ Keep the summary concise and factual.`;
 }
 
 export function pairUsage(): void {
-  console.log(`Usage: lazy pair <task_id> [--unlock] [--no-summary]
+  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary]
 
-Open an interactive Claude Code session in a task's worktree.
+Open an interactive Claude Code session, context-aware.
 
-This is the human equivalent of the agent working — same worktree, same
-conversation history, but human-driven. Use this for pair programming with
-Claude when a task is stuck or needs human expertise.
+Three modes:
+  1. lazy pair <task>           Pair on a specific task's worktree
+  2. lazy pair                  On a lazy/* branch: detect the task, pair on it
+  3. lazy pair                  On main or non-task branch: launch Claude Code
+                                in the current directory (no task context)
 
-While pairing, the task is locked — other commands (start, unblock, accept,
-reject, resume) will refuse to operate on this task until pairing ends.
+In task mode (1 & 2), the task is locked during pairing — other commands
+(start, unblock, accept, reject, resume) will refuse to operate until
+pairing ends.
+
+In branchless mode (3), Claude Code launches in the current directory with
+no task context. The conversation is captured into lazy's storage so it's
+searchable via lazy search.
 
 Arguments:
-  <task_id>    ID of the task to pair on
+  [task_id]    ID of the task to pair on (optional — detected from branch)
 
 Options:
   --unlock       Force-remove a stale pairing lock (e.g., after a crash)
   --no-summary   Skip AI summarization of the pairing session
 
-Requirements:
-  - Task must have a session (has been started)
-  - Task must not be actively working under the supervisor
-  - Worktree must exist
-  - No existing pairing lock on the task
-  - API token available (unless --no-summary is used)
-
-What happens:
-  1. Pairing lock is acquired (prevents other commands from interfering)
-  2. Claude Code launches in the worktree, resuming the existing conversation
-  3. You work interactively with Claude
-  4. On exit: new commits are captured, a turn is recorded, lock is released
-
-Edge cases:
-  - If you force-quit during pairing, the lock becomes stale.
-    Clear it with: lazy pair <task_id> --unlock
-  - If the task has no Claude session ID, a fresh session starts.
-
 Examples:
-  lazy pair abc123                   # Start pairing on task
-  lazy pair abc123 --unlock          # Clear a stale pairing lock`);
+  lazy pair abc123                   # Pair on a specific task
+  lazy pair abc123 --unlock          # Clear a stale pairing lock
+  lazy pair                          # Detect task from branch, or launch branchless
+  lazy pair --no-summary             # Pair without AI summary`);
 }

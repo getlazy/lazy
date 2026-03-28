@@ -18,6 +18,7 @@
 
 export { FileStorage } from './file-storage';
 export { PostgresStorage } from './postgres-storage';
+export { RemoteStorage } from './remote-storage';
 export type { Storage } from './interface';
 export type {
   Task,
