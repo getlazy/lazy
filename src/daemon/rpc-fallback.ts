@@ -1,14 +1,14 @@
 /**
- * RPC fallback layer — encapsulates daemon-vs-direct execution.
+ * RPC dispatch layer — routes CLI queries through the daemon.
  *
- * CLI commands call these functions to get structured data.
- * Each function tries the daemon RPC first, then falls back to
- * calling the handler directly (same code the daemon runs).
- * The caller never knows which path ran.
+ * In v0.11+, the daemon is required. CLI commands call these functions
+ * to get structured data via daemon RPC. The only exception is test mode
+ * (LAZY_TEST=1) and daemon-self mode (LAZY_IS_DAEMON=1), where tryRpc()
+ * returns null and we fall back to calling handlers directly.
  *
  * This module is intentionally thin — all command logic lives in
  * rpc-handlers.ts. This file only handles:
- * 1. tryRpc → if null → call handler with project root
+ * 1. tryRpc → if null (test/daemon-self) → call handler with project root
  * 2. Deserialization (e.g., Map reconstruction from JSON)
  * 3. Error translation (RpcError → return types the CLI expects)
  */
@@ -22,6 +22,15 @@ import {
   handleSearch,
   handleDiff,
   handleWait,
+  handleStartTask,
+  handleUnblockTask,
+  handleAcceptTaskPreflight,
+  handleAcceptTask,
+  handleRejectTask,
+  handleCloseTask,
+  handleSyncTask,
+  handleResumeTask,
+  handleGetDaemonMcpConfig,
   RpcError,
 } from './rpc-handlers';
 import { requireLazyRoot } from '../cli/helpers';
@@ -45,6 +54,7 @@ export async function queryTaskList(params: {
   });
   if (rpc) return rpc;
 
+  // Test/daemon-self mode: execute directly
   const root = requireLazyRoot();
   try {
     return await handleList(root, params) as ListResult;
@@ -201,4 +211,283 @@ export async function queryWait(params: {
     }
     throw err;
   }
+}
+
+// --- Start Task ---
+
+export interface StartTaskRpcResult {
+  sessionId: string;
+  containerName: string;
+  worktreePath: string;
+  branchName: string;
+  parentBranch: string | null;
+  parentDisplayId: string | null;
+  runnerType: string;
+  warnings: string[];
+}
+
+export async function queryStartTask(params: {
+  taskId: string;
+  modelOverride?: string;
+  agentId?: string;
+  forceLocal?: boolean;
+
+  retargetOrphan?: boolean;
+}): Promise<StartTaskRpcResult> {
+  const rpc = await tryRpc<StartTaskRpcResult>('startTask', {
+    taskId: params.taskId,
+    modelOverride: params.modelOverride,
+    agentId: params.agentId,
+    forceLocal: params.forceLocal,
+    retargetOrphan: params.retargetOrphan,
+  });
+  if (rpc) return rpc;
+
+  // Test/daemon-self mode: execute directly
+  const root = requireLazyRoot();
+  return await handleStartTask(root, params) as StartTaskRpcResult;
+}
+
+// --- Get Daemon MCP Config ---
+
+export interface DaemonMcpConfigResult {
+  configPath: string;
+}
+
+export async function queryDaemonMcpConfig(params: {
+  name?: string;
+}): Promise<DaemonMcpConfigResult> {
+  const rpc = await tryRpc<DaemonMcpConfigResult>('getDaemonMcpConfig', {
+    name: params.name,
+  });
+  if (rpc) return rpc;
+
+  // Test/daemon-self mode: execute directly
+  const root = requireLazyRoot();
+  return await handleGetDaemonMcpConfig(root, params) as DaemonMcpConfigResult;
+}
+
+// --- Unblock Task ---
+
+export interface UnblockTaskRpcResult {
+  sessionId: string;
+  containerName: string;
+  worktreePath: string;
+  branchName: string;
+  turnNumber: number;
+  runnerType: string;
+  runnerLabel: string;
+  runnerDisplayName: string;
+  warnings: string[];
+}
+
+export async function queryUnblockTask(params: {
+  taskId: string;
+  message: string;
+  modelOverride?: string;
+  approvedFiles?: string[];
+  retargetOrphan?: boolean;
+  notesInEditor?: boolean;
+}): Promise<UnblockTaskRpcResult> {
+  const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
+    taskId: params.taskId,
+    message: params.message,
+    modelOverride: params.modelOverride,
+    approvedFiles: params.approvedFiles,
+    retargetOrphan: params.retargetOrphan,
+    notesInEditor: params.notesInEditor,
+  });
+  if (rpc) return rpc;
+
+  // Test/daemon-self mode: execute directly
+  const root = requireLazyRoot();
+  return await handleUnblockTask(root, params) as UnblockTaskRpcResult;
+}
+
+// --- Accept Task Preflight ---
+
+export interface AcceptTaskPreflightRpcResult {
+  taskId: string;
+  fullTaskId: string;
+  displayId: string;
+  worktreePath: string;
+  branchName: string;
+  sessionId: string;
+  parentTaskId: string | null;
+  mergeTargetBranch: string;
+  isChildTask: boolean;
+  parentDisplayId: string | null;
+  taskStatus: string;
+  commitCount: number;
+  metadata: Record<string, string>;
+  warnings: string[];
+}
+
+export async function queryAcceptTaskPreflight(params: {
+  taskId: string;
+  approvedFiles?: string[];
+  acceptDirtyWorktree?: boolean;
+}): Promise<AcceptTaskPreflightRpcResult> {
+  const rpc = await tryRpc<AcceptTaskPreflightRpcResult>('acceptTaskPreflight', {
+    taskId: params.taskId,
+    approvedFiles: params.approvedFiles,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleAcceptTaskPreflight(root, params) as AcceptTaskPreflightRpcResult;
+}
+
+// --- Accept Task (Full) ---
+
+export interface AcceptTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  status: 'merged' | 'pending';
+  reason?: string;
+  prUrl?: string;
+  warnings: string[];
+}
+
+export async function queryAcceptTask(params: {
+  taskId: string;
+  reason?: string;
+  approvedFiles?: string[];
+  acceptDirtyWorktree?: boolean;
+}): Promise<AcceptTaskRpcResult> {
+  const rpc = await tryRpc<AcceptTaskRpcResult>('acceptTask', {
+    taskId: params.taskId,
+    reason: params.reason,
+    approvedFiles: params.approvedFiles,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleAcceptTask(root, params) as AcceptTaskRpcResult;
+}
+
+// --- Reject Task ---
+
+export interface RejectTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  branchName: string | null;
+  parentTaskId: string | null;
+  warnings: string[];
+}
+
+export async function queryRejectTask(params: {
+  taskId: string;
+  reason: string;
+  acceptDirtyWorktree?: boolean;
+}): Promise<RejectTaskRpcResult> {
+  const rpc = await tryRpc<RejectTaskRpcResult>('rejectTask', {
+    taskId: params.taskId,
+    reason: params.reason,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleRejectTask(root, params) as RejectTaskRpcResult;
+}
+
+// --- Close Task ---
+
+export interface CloseTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  branchName: string | null;
+  parentTaskId: string | null;
+  warnings: string[];
+}
+
+export async function queryCloseTask(params: {
+  taskId: string;
+  reason: string;
+  acceptDirtyWorktree?: boolean;
+}): Promise<CloseTaskRpcResult> {
+  const rpc = await tryRpc<CloseTaskRpcResult>('closeTask', {
+    taskId: params.taskId,
+    reason: params.reason,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleCloseTask(root, params) as CloseTaskRpcResult;
+}
+
+// --- Submit Task ---
+
+export interface SubmitTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  prUrl: string | null;
+  warnings: string[];
+}
+
+export async function querySubmitTask(params: {
+  taskId: string;
+}): Promise<SubmitTaskRpcResult> {
+  const rpc = await tryRpc<SubmitTaskRpcResult>('submitTask', {
+    taskId: params.taskId,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  const { handleSubmitTask } = await import('./rpc-handlers');
+  return await handleSubmitTask(root, params) as SubmitTaskRpcResult;
+}
+
+// --- Resume Task ---
+
+export interface ResumeTaskRpcResult {
+  sessionId: string;
+  containerName: string;
+  worktreePath: string;
+  branchName: string;
+  runnerType: string;
+  runnerLabel: string;
+  runnerDisplayName: string;
+  warnings: string[];
+}
+
+export async function queryResumeTask(params: {
+  taskId: string;
+  modelOverride?: string;
+
+}): Promise<ResumeTaskRpcResult> {
+  const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
+    taskId: params.taskId,
+    modelOverride: params.modelOverride,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleResumeTask(root, params) as ResumeTaskRpcResult;
+}
+
+// --- Sync Task ---
+
+export interface SyncTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync';
+  message: string;
+  warnings: string[];
+}
+
+export async function querySyncTask(params: {
+  taskId: string;
+}): Promise<SyncTaskRpcResult> {
+  const rpc = await tryRpc<SyncTaskRpcResult>('syncTask', {
+    taskId: params.taskId,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleSyncTask(root, params) as SyncTaskRpcResult;
 }

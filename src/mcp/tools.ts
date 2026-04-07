@@ -9,19 +9,20 @@
  */
 
 import { randomUUID } from 'crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
+import { pathExists, ensureDir, writeFile } from '../utils/fs';
 import type { McpTool, McpToolHandler } from './types';
-import type { ModelName } from '../types';
+
 
 // Re-use storage and helpers from existing CLI infrastructure
 import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH } from '../cli/helpers';
+import type { Storage } from '../storage';
 import type { Proposal } from '../cli/commands/propose';
 import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
-import { reconcileTasks } from '../utils/reconcile';
+
 import { queryWait } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
@@ -42,6 +43,25 @@ import {
   type DiffStat,
 } from './confirmation-context';
 
+// Import daemon lifecycle functions for direct invocation (no subprocess spawning)
+import { launchTask, type StartTaskParams } from '../daemon/task-launcher';
+import {
+  launchUnblockTask,
+  rejectTask,
+  closeTask,
+  acceptTaskPreflight,
+  acceptTask,
+  syncTask,
+  submitTask,
+  type UnblockTaskParams,
+  type RejectTaskParams,
+  type CloseTaskParams,
+  type AcceptTaskPreflightParams,
+  type AcceptTaskParams,
+  type SyncTaskParams,
+  type SubmitTaskParams,
+} from '../daemon/task-lifecycle';
+
 /**
  * Context passed to MCP tool handlers at registration time.
  * Provides the task ID and worktree path that the agent is operating on.
@@ -55,6 +75,27 @@ export interface McpToolContext {
   taskId: string;
   /** Worktree path for git operations (repo root for builder context) */
   worktreePath: string;
+  /**
+   * Optional storage instance. When running inside the daemon process,
+   * this is the daemon's long-lived storage singleton. When undefined,
+   * handlers fall back to requireStorage().
+   */
+  storage?: import('../storage').Storage;
+}
+
+/**
+ * Get storage from context or fall back to requireStorage().
+ *
+ * When MCP handlers run inside the daemon process, ctx.storage is the daemon's
+ * long-lived singleton. When handlers run in host-process-runner mode (local
+ * execution), ctx.storage is undefined and we fall back to requireStorage()
+ * which creates a RemoteStorage proxy to the daemon.
+ */
+async function getStorage(ctx: McpToolContext): Promise<Storage> {
+  if (ctx.storage) {
+    return ctx.storage;
+  }
+  return requireStorage();
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +140,7 @@ export const searchTool: McpTool = {
   },
 };
 
-export function createSearchHandler(_ctx: McpToolContext): McpToolHandler {
+export function createSearchHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const query = args.query as string;
     const fuzzy = args.fuzzy as boolean | undefined;
@@ -108,7 +149,7 @@ export function createSearchHandler(_ctx: McpToolContext): McpToolHandler {
     const offset = (args.offset as number | undefined) ?? 0;
     const limit = (args.limit as number | undefined) ?? 20;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       if (fuzzy) {
         // Fuzzy search: load all content and use fuse.js
@@ -243,7 +284,7 @@ export const showTool: McpTool = {
   },
 };
 
-export function createShowHandler(_ctx: McpToolContext): McpToolHandler {
+export function createShowHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const sections = args.sections as string[] | undefined;
@@ -252,11 +293,8 @@ export function createShowHandler(_ctx: McpToolContext): McpToolHandler {
 
     const sectionsSet = new Set(sections ?? []);
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -399,8 +437,8 @@ export const createTool: McpTool = {
       },
       model: {
         type: 'string',
-        description: 'Model to use for this task',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+        description: 'Model ID to use for this task (e.g., claude-sonnet-4-5-20250929, claude-opus-4-6)',
+
       },
       type: {
         type: 'string',
@@ -419,7 +457,7 @@ export const createTool: McpTool = {
   },
 };
 
-export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
+export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const goal = args.goal as string;
     const prompt = args.prompt as string | undefined;
@@ -429,7 +467,7 @@ export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
     const parent = args.parent as string | undefined;
     const confirmationCode = args.confirmation_code as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       // Resolve parent task if specified
       let parentTaskId: string | undefined;
@@ -502,7 +540,7 @@ export function createCreateHandler(_ctx: McpToolContext): McpToolHandler {
       }
 
       if (model) {
-        await storage.updateTaskModel(task.id, model as ModelName);
+        await storage.updateTaskModel(task.id, model);
       }
 
       return {
@@ -552,7 +590,7 @@ export function createCommentHandler(ctx: McpToolContext): McpToolHandler {
     const message = args.message as string;
     const taskIdInput = args.task_id as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       let taskId: string;
       if (taskIdInput) {
@@ -626,11 +664,11 @@ export function createProposeHandler(ctx: McpToolContext): McpToolHandler {
     const code = args.code as string | undefined;
     const prompt = args.prompt as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       // Create proposals directory using storage driver path
       const dir = join(storage.getTaskDir(ctx.taskId), 'proposals');
-      mkdirSync(dir, { recursive: true });
+      await ensureDir(dir);
 
       const proposal: Proposal = {
         id: randomUUID(),
@@ -643,7 +681,7 @@ export function createProposeHandler(ctx: McpToolContext): McpToolHandler {
       };
 
       const filePath = join(dir, `${proposal.id}.json`);
-      writeFileSync(filePath, JSON.stringify(proposal, null, 2) + '\n');
+      await writeFile(filePath, JSON.stringify(proposal, null, 2) + '\n', 'utf-8');
 
       return {
         proposal_id: shortId(proposal.id),
@@ -699,19 +737,19 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
 
     // Stage files
     if (files && files.length > 0) {
-      const addResult = runGit(['add', ...files], { cwd });
+      const addResult = await runGit(['add', ...files], { cwd });
       if (addResult.exitCode !== 0) {
         throw new Error(`git add failed: ${addResult.stderr}`);
       }
     } else {
-      const addResult = runGit(['add', '-A'], { cwd });
+      const addResult = await runGit(['add', '-A'], { cwd });
       if (addResult.exitCode !== 0) {
         throw new Error(`git add failed: ${addResult.stderr}`);
       }
     }
 
     // Check if there's anything to commit
-    const statusResult = runGit(['diff', '--no-color', '--cached', '--stat'], { cwd });
+    const statusResult = await runGit(['diff', '--no-color', '--cached', '--stat'], { cwd });
     const diffStat = statusResult.stdout;
     if (!diffStat) {
       return {
@@ -721,13 +759,13 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     }
 
     // Commit
-    const commitResult = runGit(['commit', '-m', message], { cwd });
+    const commitResult = await runGit(['commit', '-m', message], { cwd });
     if (commitResult.exitCode !== 0) {
       throw new Error(`git commit failed: ${commitResult.stderr}`);
     }
 
     // Get the commit SHA
-    const shaResult = runGit(['rev-parse', 'HEAD'], { cwd });
+    const shaResult = await runGit(['rev-parse', 'HEAD'], { cwd });
     const sha = shaResult.stdout;
 
     // Count files changed from diffstat (last line is summary)
@@ -772,25 +810,22 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
     let recentCommits = '';
 
     try {
-      const branchResult = runGit(['branch', '--show-current'], { cwd });
+      const branchResult = await runGit(['branch', '--show-current'], { cwd });
       branch = branchResult.exitCode === 0 ? branchResult.stdout : '';
 
-      const statusResult = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
+      const statusResult = await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
       porcelain = statusResult.exitCode === 0 ? statusResult.stdout : '';
       changedFiles = porcelain ? porcelain.split('\n').length : 0;
 
-      const logResult = runGit(['log', '--oneline', '-5', '--no-color'], { cwd });
+      const logResult = await runGit(['log', '--oneline', '-5', '--no-color'], { cwd });
       recentCommits = logResult.exitCode === 0 ? logResult.stdout : '';
     } catch {
       // Git not available (e.g., minimal builder container) — skip git info
     }
 
     // Task info from storage
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       const task = ctx.taskId ? await storage.getTask(ctx.taskId) : null;
       const session = task ? await storage.getSessionByTaskId(task.id) : null;
@@ -845,9 +880,9 @@ export const conversationsTool: McpTool = {
   },
 };
 
-export function createConversationsHandler(_ctx: McpToolContext): McpToolHandler {
+export function createConversationsHandler(ctx: McpToolContext): McpToolHandler {
   return async (_args) => {
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const conversations = await storage.listConversations();
 
@@ -892,12 +927,12 @@ export const conversationSearchTool: McpTool = {
   },
 };
 
-export function createConversationSearchHandler(_ctx: McpToolContext): McpToolHandler {
+export function createConversationSearchHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const query = args.query as string;
     const regex = new RegExp(query, 'i');
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const conversations = await storage.listConversations();
       const hits: Array<{
@@ -965,11 +1000,11 @@ export const conversationReadTool: McpTool = {
   },
 };
 
-export function createConversationReadHandler(_ctx: McpToolContext): McpToolHandler {
+export function createConversationReadHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const sessionId = args.session_id as string;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const conversation = await storage.loadConversation(sessionId);
       if (!conversation) {
@@ -996,57 +1031,15 @@ export function createConversationReadHandler(_ctx: McpToolContext): McpToolHand
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_reject, lazy_close
+// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_reject, lazy_close, lazy_submit
 //
-// These invoke the lazy CLI as a subprocess so all the complex orchestration
-// logic (worktree creation, supervisor launch, merge, etc.) is reused.
+// IMPORTANT: These handlers call daemon lifecycle functions DIRECTLY — never
+// spawn lazy CLI as a subprocess. Spawning lazy from within the daemon causes
+// deadlocks (child RPCs back to parent) and storage lock contention.
 //
-// On the host: handlers execute locally via runLazyCliCommand.
-// In the container: these handlers are never called — the proxy MCP server
-// forwards tool calls to the host HTTP server which runs these handlers.
+// The daemon has direct access to storage, runners, and all task lifecycle
+// functions. Use them directly instead of forking processes.
 // ---------------------------------------------------------------------------
-
-/**
- * Run a lazy CLI command and return the result.
- *
- * These handlers only run on the host side. In production, process.execPath
- * IS the compiled lazy binary. In dev mode, it's bun and we need to prepend
- * 'run' + the entry point.
- */
-async function runLazyCliCommand(
-  args: string[],
-  cwd: string,
-  stdin?: string,
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const execPath = process.execPath;
-  const execName = execPath.split('/').pop() ?? '';
-
-  let cmd: string[];
-  // HACK: In dev mode, process.execPath is bun, not the compiled lazy binary.
-  // Detect this and prepend the entry point. Remove when we stop using bun run.
-  if (execName === 'bun' || execName === 'bun.exe') {
-    const entryPoint = join(import.meta.dir, '..', '..', 'src', 'index.ts');
-    cmd = [execPath, 'run', entryPoint, ...args];
-  } else {
-    cmd = [execPath, ...args];
-  }
-
-  const proc = spawn(cmd, {
-    cwd,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    stdin: stdin ? new Blob([stdin]) : undefined,
-    env: { ...process.env, LAZY_ACTOR: 'builder' },
-  });
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-
-  return { stdout, stderr, exitCode };
-}
 
 /** Parse git diff --shortstat output into structured numbers. */
 function parseShortstat(stdout: string): { filesChanged: number; linesAdded: number; linesRemoved: number } {
@@ -1063,19 +1056,19 @@ function parseShortstat(stdout: string): { filesChanged: number; linesAdded: num
 /**
  * Compute the git diff cwd and range for a task relative to its parent branch.
  */
-function computeDiffCwdAndRange(
+async function computeDiffCwdAndRange(
   session: { git_branch: string; git_start_sha: string },
   parentBranch: string,
   storagePath: string,
   lazyRoot: string,
-): { cwd: string; diffRange: string } {
+): Promise<{ cwd: string; diffRange: string }> {
   const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
-  const cwd = existsSync(worktreePath) ? worktreePath : lazyRoot;
+  const cwd = (await pathExists(worktreePath)) ? worktreePath : lazyRoot;
 
   // Use the task's branch name explicitly instead of HEAD. When cwd falls
   // back to lazyRoot, HEAD is whatever branch the main repo is on (e.g. main),
   // not the task branch — giving an empty diff for tasks with real changes.
-  const branchCheck = runGit(['rev-parse', '--verify', parentBranch], { cwd });
+  const branchCheck = await runGit(['rev-parse', '--verify', parentBranch], { cwd });
   const diffRange = branchCheck.exitCode === 0
     ? `${parentBranch}...${session.git_branch}`
     : `${session.git_start_sha}..${session.git_branch}`;
@@ -1117,9 +1110,9 @@ async function getDiffStat(
       ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
       : 'main';
 
-    const { cwd, diffRange } = computeDiffCwdAndRange(session, parentBranch, storage.getStoragePath(), lazyRoot);
+    const { cwd, diffRange } = await computeDiffCwdAndRange(session, parentBranch, storage.getStoragePath(), lazyRoot);
 
-    const result = runGit(['diff', '--no-color', '--shortstat', diffRange], { cwd });
+    const result = await runGit(['diff', '--no-color', '--shortstat', diffRange], { cwd });
     if (result.exitCode !== 0) return null;
 
     return parseShortstat(result.stdout);
@@ -1146,7 +1139,7 @@ export const startTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this run (optional)',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
     },
     required: ['task_id'],
@@ -1158,21 +1151,22 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const model = args.model as string | undefined;
 
-    const cliArgs = ['start', taskId];
+    const root = requireLazyRoot();
+    const params: StartTaskParams = {
+      taskId,
+      modelOverride: model,
+      retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
+    };
 
-    if (model) {
-      cliArgs.push('--model', model);
-    }
+    const result = await launchTask(root, params);
 
-    // Always use --yes to skip confirmation prompts
-    cliArgs.push('--yes');
-
-    const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to start task: ${(result.stderr || result.stdout).trim()}`);
-    }
-
-    return { output: result.stdout.trim() };
+    return {
+      output: `Started task ${result.sessionId} on branch ${result.branchName}`,
+      sessionId: result.sessionId,
+      containerName: result.containerName,
+      worktreePath: result.worktreePath,
+      branchName: result.branchName,
+    };
   };
 }
 
@@ -1199,7 +1193,7 @@ export const unblockTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this turn (optional)',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
       approved_files: {
         type: 'array',
@@ -1221,7 +1215,7 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
     // --- Guard: validate approved_files parameter ---
     // The approved_files parameter is only meaningful when there are actual
     // file permission violations. Require explicit intent for both approve and revert.
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -1268,27 +1262,24 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const cliArgs = ['unblock', taskId, '--yes'];
-    if (model) {
-      cliArgs.push('--model', model);
-    }
-    if (approvedFiles && approvedFiles.length > 0) {
-      for (const f of approvedFiles) {
-        cliArgs.push('--approve-file', f);
-      }
-    }
+    const root = requireLazyRoot();
+    const params: UnblockTaskParams = {
+      taskId,
+      message: feedback,
+      modelOverride: model,
+      approvedFiles,
+      retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
+      notesInEditor: false,
+    };
 
-    // Pipe feedback via stdin
-    const result = await runLazyCliCommand(
-      cliArgs,
-      ctx.worktreePath,
-      feedback,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to unblock task: ${(result.stderr || result.stdout).trim()}`);
-    }
+    const result = await launchUnblockTask(root, params);
 
-    return { output: result.stdout.trim() };
+    return {
+      output: `Unblocked task ${result.sessionId} on branch ${result.branchName}`,
+      sessionId: result.sessionId,
+      containerName: result.containerName,
+      turnNumber: result.turnNumber,
+    };
   };
 }
 
@@ -1330,24 +1321,26 @@ async function executeAccept(
   taskId: string,
   reason: string | undefined,
   approvedFiles: string[] | undefined,
-  worktreePath: string,
-): Promise<{ output: string }> {
-  const cliArgs = ['accept', taskId, '--yes'];
-  if (reason) {
-    cliArgs.push('--reason', reason);
-  }
-  if (approvedFiles && approvedFiles.length > 0) {
-    for (const f of approvedFiles) {
-      cliArgs.push('--approve-file', f);
-    }
-  }
+): Promise<{ output: string; status: string; prUrl?: string }> {
+  const root = requireLazyRoot();
+  const params: AcceptTaskParams = {
+    taskId,
+    reason,
+    approvedFiles,
+    acceptDirtyWorktree: false,
+  };
 
-  const result = await runLazyCliCommand(cliArgs, worktreePath);
-  if (result.exitCode !== 0) {
-    throw new Error(`Failed to accept task: ${(result.stderr || result.stdout).trim()}`);
-  }
+  const result = await acceptTask(root, params);
 
-  return { output: result.stdout.trim() };
+  const statusMsg = result.status === 'merged'
+    ? `Task ${result.displayId} accepted and merged`
+    : `Task ${result.displayId} approved — merge pending: ${result.reason}`;
+
+  return {
+    output: statusMsg,
+    status: result.status,
+    prUrl: result.prUrl,
+  };
 }
 
 export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
@@ -1357,7 +1350,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
     const confirmationCode = args.confirmation_code as string | undefined;
     const approvedFiles = args.approved_files as string[] | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -1371,7 +1364,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_accept without a code to get a new one.');
         }
 
-        return await executeAccept(taskId, reason, approvedFiles, ctx.worktreePath);
+        return await executeAccept(taskId, reason, approvedFiles);
       }
 
       // Step 1: evaluate confirmation level based on diff size
@@ -1390,7 +1383,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
 
       // If level is none (tiny diff with successful stat), execute directly
       if (level === 'none') {
-        return await executeAccept(taskId, reason, approvedFiles, ctx.worktreePath);
+        return await executeAccept(taskId, reason, approvedFiles);
       }
 
       const parentBranch = task.parent_task_id
@@ -1461,7 +1454,7 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
     const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
 
     // Resolve task to get full ID for confirmation scoping
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -1475,20 +1468,21 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_reject without a code to get a new one.');
         }
 
-        const cliArgs = ['reject', taskId, '--yes'];
-        if (reason) {
-          cliArgs.push('--reason', reason);
-        }
-        if (acceptDirtyWorktree) {
-          cliArgs.push('--accept-dirty-worktree');
-        }
+        const root = requireLazyRoot();
+        const params: RejectTaskParams = {
+          taskId,
+          reason: reason || '',
+          acceptDirtyWorktree,
+        };
 
-        const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-        if (result.exitCode !== 0) {
-          throw new Error(`Failed to reject task: ${(result.stderr || result.stdout).trim()}`);
-        }
+        const result = await rejectTask(root, params);
 
-        return { output: result.stdout.trim() };
+        return {
+          output: `Rejected task ${result.displayId} (${result.branchName})`,
+          taskId: result.taskId,
+          displayId: result.displayId,
+          branchName: result.branchName,
+        };
       }
 
       // Step 1: evaluate confirmation level and return guidance
@@ -1558,7 +1552,7 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
     const confirmationCode = args.confirmation_code as string | undefined;
     const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -1572,20 +1566,21 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_close without a code to get a new one.');
         }
 
-        const cliArgs = ['close', taskId, '--yes'];
-        if (reason) {
-          cliArgs.push('--reason', reason);
-        }
-        if (acceptDirtyWorktree) {
-          cliArgs.push('--accept-dirty-worktree');
-        }
+        const root = requireLazyRoot();
+        const params: CloseTaskParams = {
+          taskId,
+          reason: reason || '',
+          acceptDirtyWorktree,
+        };
 
-        const result = await runLazyCliCommand(cliArgs, ctx.worktreePath);
-        if (result.exitCode !== 0) {
-          throw new Error(`Failed to close task: ${(result.stderr || result.stdout).trim()}`);
-        }
+        const result = await closeTask(root, params);
 
-        return { output: result.stdout.trim() };
+        return {
+          output: `Closed task ${result.displayId} (${result.branchName})`,
+          taskId: result.taskId,
+          displayId: result.displayId,
+          branchName: result.branchName,
+        };
       }
 
       // Step 1: evaluate confirmation level
@@ -1614,6 +1609,47 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
   };
 }
 
+// --- lazy_submit ---
+
+export const submitTool: McpTool = {
+  name: 'lazy_submit',
+  description:
+    'Submit a task for human review by creating a pull request. The task must be ' +
+    'in blocked or conflict status with at least one commit. Transitions the task ' +
+    'to submitted status. Only submitted tasks receive PR comment auto-react.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+    },
+    required: ['task_id'],
+  },
+};
+
+export function createSubmitHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+
+    const root = requireLazyRoot();
+    const params: SubmitTaskParams = {
+      taskId,
+    };
+
+    const result = await submitTask(root, params);
+
+    return {
+      output: `Submitted task ${result.displayId}`,
+      taskId: result.taskId,
+      displayId: result.displayId,
+      prUrl: result.prUrl,
+    };
+  };
+}
+
 // --- lazy_resume ---
 
 export const resumeTool: McpTool = {
@@ -1632,7 +1668,7 @@ export const resumeTool: McpTool = {
       model: {
         type: 'string',
         description: 'Model override for this run (optional)',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
     },
     required: ['task_id'],
@@ -1644,20 +1680,25 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const model = args.model as string | undefined;
 
-    const cliArgs = ['resume', taskId];
-    if (model) {
-      cliArgs.push('--model', model);
-    }
+    // Resume is like unblock but for interrupted tasks, without a feedback message.
+    // Use unblock with a standard resume message.
+    const root = requireLazyRoot();
+    const params: UnblockTaskParams = {
+      taskId,
+      message: '[Resumed after interruption]',
+      modelOverride: model,
+      retargetOrphan: true,
+      notesInEditor: false,
+    };
 
-    const result = await runLazyCliCommand(
-      cliArgs,
-      ctx.worktreePath,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to resume task: ${(result.stderr || result.stdout).trim()}`);
-    }
+    const result = await launchUnblockTask(root, params);
 
-    return { output: result.stdout.trim() };
+    return {
+      output: `Resumed task ${result.sessionId} on branch ${result.branchName}`,
+      sessionId: result.sessionId,
+      containerName: result.containerName,
+      turnNumber: result.turnNumber,
+    };
   };
 }
 
@@ -1686,16 +1727,13 @@ export const listTool: McpTool = {
   },
 };
 
-export function createListHandler(_ctx: McpToolContext): McpToolHandler {
+export function createListHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const showAll = args.all as boolean | undefined;
     const taskIdInput = args.task_id as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       let tasks;
       if (taskIdInput) {
@@ -1742,13 +1780,10 @@ export const blockedTool: McpTool = {
   },
 };
 
-export function createBlockedHandler(_ctx: McpToolContext): McpToolHandler {
+export function createBlockedHandler(ctx: McpToolContext): McpToolHandler {
   return async (_args) => {
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       const tasks = await storage.listTasksWithOptions({ blockedOnly: true });
 
@@ -1782,13 +1817,10 @@ export const activeTool: McpTool = {
   },
 };
 
-export function createActiveHandler(_ctx: McpToolContext): McpToolHandler {
+export function createActiveHandler(ctx: McpToolContext): McpToolHandler {
   return async (_args) => {
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
 
@@ -1843,18 +1875,15 @@ export const diffTool: McpTool = {
   },
 };
 
-export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
+export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const full = args.full as boolean | undefined;
     const files = args.files as string[] | undefined;
     const maxLines = args.max_lines as number | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
-      // Reconcile tasks before reading state to ensure current status
-      const lazyRoot = requireLazyRoot();
-      await reconcileTasks(storage, lazyRoot);
 
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -1868,9 +1897,10 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
       }
 
       // Find the task's worktree by convention; fall back to main repo if worktree is gone
+      const lazyRoot = requireLazyRoot();
       const storagePath = storage.getStoragePath();
       const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
-      const worktreeExists = existsSync(worktreePath);
+      const worktreeExists = await pathExists(worktreePath);
       const diffCwd = worktreeExists ? worktreePath : lazyRoot;
       if (!worktreeExists) {
         logger.warn(`lazy_diff: worktree gone for task ${taskIdInput}, falling back to main repo`);
@@ -1887,7 +1917,7 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
 
       let diffRange: string;
       if (worktreeExists) {
-        const branchCheck = runGit(
+        const branchCheck = await runGit(
           ['rev-parse', '--verify', parentBranch],
           { cwd: diffCwd },
         );
@@ -1904,7 +1934,7 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
       } else {
         // No worktree — use branch ref directly against parent in main repo
         const branchRef = session.git_branch;
-        const branchCheck = runGit(
+        const branchCheck = await runGit(
           ['rev-parse', '--verify', branchRef],
           { cwd: diffCwd },
         );
@@ -1924,7 +1954,7 @@ export function createDiffHandler(_ctx: McpToolContext): McpToolHandler {
         diffArgs.push('--', ...files);
       }
 
-      const diffResult = runGit(diffArgs, {
+      const diffResult = await runGit(diffArgs, {
         cwd: diffCwd,
       });
 
@@ -1985,7 +2015,7 @@ export const waitTool: McpTool = {
   },
 };
 
-export function createWaitHandler(_ctx: McpToolContext): McpToolHandler {
+export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const timeoutSecs = Math.min((args.timeout as number | undefined) ?? 600, 600);
@@ -2028,7 +2058,7 @@ export const editTool: McpTool = {
       model: {
         type: 'string',
         description: 'New model',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
       type: {
         type: 'string',
@@ -2047,7 +2077,7 @@ export const editTool: McpTool = {
   },
 };
 
-export function createEditHandler(_ctx: McpToolContext): McpToolHandler {
+export function createEditHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const goal = args.goal as string | undefined;
@@ -2057,7 +2087,7 @@ export function createEditHandler(_ctx: McpToolContext): McpToolHandler {
     const code = args.code as string | undefined;
     const parent = args.parent as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -2164,14 +2194,14 @@ export const cloneTool: McpTool = {
       model: {
         type: 'string',
         description: 'Override model',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
     },
     required: ['task_id'],
   },
 };
 
-export function createCloneHandler(_ctx: McpToolContext): McpToolHandler {
+export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const goalOverride = args.goal as string | undefined;
@@ -2179,7 +2209,7 @@ export function createCloneHandler(_ctx: McpToolContext): McpToolHandler {
     const code = args.code as string | undefined;
     const model = args.model as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -2254,13 +2284,13 @@ export const reopenTool: McpTool = {
   },
 };
 
-export function createReopenHandler(_ctx: McpToolContext): McpToolHandler {
+export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const reason = args.reason as string | undefined;
     const confirmationCode = args.confirmation_code as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -2358,7 +2388,7 @@ export const redoTool: McpTool = {
       model: {
         type: 'string',
         description: 'Override model for the new task',
-        enum: ['apprentice', 'journeyman', 'master', 'sonnet', 'opus', 'haiku'],
+
       },
       confirmation_code: {
         type: 'string',
@@ -2369,14 +2399,14 @@ export const redoTool: McpTool = {
   },
 };
 
-export function createRedoHandler(_ctx: McpToolContext): McpToolHandler {
+export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string;
     const promptOverride = args.prompt as string | undefined;
     const model = args.model as string | undefined;
     const confirmationCode = args.confirmation_code as string | undefined;
 
-    const storage = await requireStorage();
+    const storage = await getStorage(ctx);
     try {
       const resolved = await storage.resolveTask(taskIdInput);
       if (!resolved.task) {
@@ -2470,6 +2500,49 @@ export function createRedoHandler(_ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_sync
+// ---------------------------------------------------------------------------
+
+export const syncTool: McpTool = {
+  name: 'lazy_sync',
+  description:
+    'Sync a task\'s worktree with its upstream (parent) branch. Merges ' +
+    'upstream changes without running an agent work phase. Task must be ' +
+    'blocked, conflict, or interrupted (not working).',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+    },
+    required: ['task_id'],
+  },
+};
+
+export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+
+    const root = requireLazyRoot();
+    const params: SyncTaskParams = {
+      taskId,
+    };
+
+    const result = await syncTask(root, params);
+
+    return {
+      output: result.message,
+      taskId: result.taskId,
+      displayId: result.displayId,
+      status: result.status,
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Registration helper
 // ---------------------------------------------------------------------------
 
@@ -2492,6 +2565,7 @@ export const allTools: McpTool[] = [
   acceptTool,
   rejectTool,
   closeTool,
+  submitTool,
   resumeTool,
   listTool,
   blockedTool,
@@ -2502,6 +2576,7 @@ export const allTools: McpTool[] = [
   cloneTool,
   reopenTool,
   redoTool,
+  syncTool,
 ];
 
 /**
@@ -2524,6 +2599,7 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_accept', createAcceptHandler(ctx));
   handlers.set('lazy_reject', createRejectHandler(ctx));
   handlers.set('lazy_close', createCloseHandler(ctx));
+  handlers.set('lazy_submit', createSubmitHandler(ctx));
   handlers.set('lazy_resume', createResumeHandler(ctx));
   handlers.set('lazy_list', createListHandler(ctx));
   handlers.set('lazy_blocked', createBlockedHandler(ctx));
@@ -2534,5 +2610,6 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_clone', createCloneHandler(ctx));
   handlers.set('lazy_reopen', createReopenHandler(ctx));
   handlers.set('lazy_redo', createRedoHandler(ctx));
+  handlers.set('lazy_sync', createSyncHandler(ctx));
   return handlers;
 }

@@ -1,20 +1,11 @@
-import { join } from 'path';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
-import { hasUncommittedChanges } from '../../git/operations';
+import { requireLazyRoot, requireStorage, displayId, displayIdFor, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
-import { cleanupWorktree, cleanupTaskContainer } from './shared';
-import { protocolDir, removeProtocolDir } from '../../protocol';
-import { removeLock } from '../../utils/lock';
-import { loadConfig } from '../../config/loader';
-import { createDriver } from '../../remote';
-import { createRunner } from '../../runner';
-import { logger } from '../../utils/logger';
+import { hasUncommittedChanges } from '../../git/operations';
 import { isTerminalStatus } from '../../types';
+import { queryCloseTask } from '../../daemon/rpc-fallback';
 
-import { getDataDir } from '../init';
 import { theme } from '../theme';
-import { getActor } from '../../constants';
 
 async function promptForReason(taskShortId: string, goal?: string): Promise<{ reason: string; recoveryPath: string | null }> {
   const headerLines = [
@@ -43,7 +34,6 @@ async function promptForReason(taskShortId: string, goal?: string): Promise<{ re
   const reason = lines.join('\n').trim();
 
   if (!reason) {
-    // No reason provided — clean up recovery file (nothing to preserve)
     if (recoveryPath) removeRecoveryFile(recoveryPath);
     console.error('Error: no reason provided');
     process.exit(1);
@@ -70,128 +60,111 @@ export async function commandClose(args: string[]): Promise<void> {
   const argReason = parsed.flags.get('reason') as string | undefined;
   const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
+  // --- Lightweight pre-flight checks BEFORE collecting reason ---
+  // INVARIANT: Pre-flight checks before editor — the user should never type
+  // feedback only to have it discarded by a validation failure.
+  // The daemon RPC does authoritative validation afterward.
+  let goal: string | undefined;
+  {
+    const root = requireLazyRoot();
+    const storage = await requireStorage();
+    try {
+      const task = await resolveTaskOrExit(storage, taskId);
+      goal = task.goal;
 
-  try {
-    // Resolve task
-    const task = await resolveTaskOrExit(storage, taskId);
-
-    // Check if task is already ended
-    if (isTerminalStatus(task.status)) {
-      console.error(`Task ${displayId(task)} is already ${task.status}.`);
-      process.exit(1);
-    }
-
-    // Refuse if task is in pairing state — task is locked
-    if (task.status === 'pairing') {
-      console.error(`Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
-      process.exit(1);
-    }
-
-    // Get worktree path
-    const worktreePath = getWorktreePath(root, task);
-
-    // CRITICAL: Check for uncommitted changes in worktree FIRST
-    // This is the hardest gate — losing uncommitted work is the worst outcome.
-    // Must happen before ANY destructive or remote operations.
-    if (!acceptDirtyWorktree && existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
-      console.error('Error: Task has uncommitted changes!');
-      console.error('Commit or stash your changes before closing.');
-      console.error('Options:');
-      console.error(`  1. Unblock and ask agent to commit: lazy unblock ${displayId(task)} --message "Please commit your changes"`);
-      console.error(`  2. Manually commit in shell: lazy shell ${displayId(task)}`);
-      console.error(`  3. Accept dirty worktree: lazy close ${displayId(task)} --accept-dirty-worktree`);
-      process.exit(1);
-    }
-
-    // Get or prompt for reason
-    let reason: string;
-    let closeRecoveryPath: string | null = null;
-    if (argReason !== undefined) {
-      reason = argReason;
-    } else {
-      // Try piped stdin before falling back to $EDITOR
-      const stdinContent = await readStdinIfPiped();
-      if (stdinContent !== null) {
-        reason = stdinContent;
-      } else if (skipEditor) {
-        // Non-interactive mode: reason is required
-        console.error('Error: --reason is required when using --yes flag');
+      // Terminal status check
+      if (isTerminalStatus(task.status)) {
+        console.error(`Task ${displayId(task)} is already ${task.status}.`);
         process.exit(1);
-      } else {
-        // Require TTY before opening editor
-        try {
-          requireTTY('This command requires an interactive terminal. Use --reason to provide a reason non-interactively, or pipe via stdin.');
-        } catch (err) {
-          console.error(err instanceof Error ? err.message : err);
-          process.exit(1);
-        }
-        const result = await promptForReason(displayId(task), task.goal);
-        reason = result.reason;
-        closeRecoveryPath = result.recoveryPath;
       }
-    }
 
-    // Get session if it exists
-    const sess = await storage.getSessionByTaskId(task.id);
-
-    // If task is working, stop the runner and transition to interrupted first.
-    // working → closed is not a valid transition, but working → interrupted is,
-    // and interrupted → closed is valid via closeTask.
-    if (task.status === 'working') {
-      if (sess) {
-        const runner = createRunner(root);
-        const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-        runner.stopRun(runName);
+      // Pairing check
+      if (task.status === 'pairing') {
+        console.error(`Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
+        process.exit(1);
       }
-      await storage.updateTaskStatus(task.id, 'interrupted', getActor());
-    }
 
-    // Close the task (persists reason to DB)
-    await storage.closeTask(task.id, reason, getActor());
+      // Uncommitted changes check
+      const worktreePath = getWorktreePath(root, task);
+      if (!acceptDirtyWorktree && existsSync(worktreePath) && await hasUncommittedChanges(worktreePath)) {
+        console.error('Error: Task has uncommitted changes!');
+        console.error('Commit or stash your changes before closing.');
+        console.error('Options:');
+        console.error(`  1. Unblock and ask agent to commit: lazy unblock ${displayId(task)} --message "Please commit your changes"`);
+        console.error(`  2. Manually commit in shell: lazy shell ${displayId(task)}`);
+        console.error(`  3. Accept dirty worktree: lazy close ${displayId(task)} --accept-dirty-worktree`);
+        process.exit(1);
+      }
+    } finally {
+      await storage.close();
+    }
+  }
+
+  // Get reason BEFORE RPC call — collect all interactive input first
+  let reason: string;
+  let closeRecoveryPath: string | null = null;
+  if (argReason !== undefined) {
+    reason = argReason;
+  } else {
+    const stdinContent = await readStdinIfPiped();
+    if (stdinContent !== null) {
+      reason = stdinContent;
+    } else if (skipEditor) {
+      console.error('Error: --reason is required when using --yes flag');
+      process.exit(1);
+    } else {
+      try {
+        requireTTY('This command requires an interactive terminal. Use --reason to provide a reason non-interactively, or pipe via stdin.');
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+
+      const result = await promptForReason(taskId, goal);
+      reason = result.reason;
+      closeRecoveryPath = result.recoveryPath;
+    }
+  }
+
+  // --- Delegate to daemon RPC ---
+  try {
+    const result = await queryCloseTask({
+      taskId,
+      reason,
+      acceptDirtyWorktree,
+    });
 
     // Reason is now durably persisted — clean up recovery file
     if (closeRecoveryPath) removeRecoveryFile(closeRecoveryPath);
 
-    // Clean up container, remote resources, and worktree if session exists
-    if (sess) {
-      await cleanupTaskContainer(storage, sess, taskRef(task), root);
-
-      // Clean up remote resources (e.g., close PR on GitHub)
-      try {
-        const config = loadConfig(root);
-        const driver = createDriver(config);
-        await driver.cleanup(sess.git_branch);
-      } catch (err) {
-        logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
-      }
-
-      // Remove lock before cleaning up worktree
-      removeLock(worktreePath);
-
-      // Remove worktree but preserve branch for potential reopen
-      cleanupWorktree(worktreePath, root);
+    // Print warnings
+    for (const w of result.warnings) {
+      console.log(w);
     }
 
-    // Clean up protocol directory (outside the if block since protocol dir exists regardless of session)
-    removeProtocolDir(protocolDir(task.id));
-
-    console.log(`\nTask ${theme.taskId(displayId(task))} closed.`);
+    console.log(`\nTask ${theme.taskId(result.displayId)} closed.`);
     console.log(`${theme.label('Reason:')} ${reason}`);
-    if (sess) {
+    if (result.branchName) {
       console.log('  Worktree removed.');
-      console.log(`  Branch preserved: ${sess.git_branch}`);
+      console.log(`  Branch preserved: ${result.branchName}`);
     }
     console.log('  Task history preserved.');
-    console.log(`\nTo recover: ${theme.command('lazy reopen ' + displayId(task))}`);
+    console.log(`\nTo recover: ${theme.command('lazy reopen ' + result.displayId)}`);
 
-    if (task.parent_task_id) {
-      console.log(`\nUnblock parent task: ${theme.command('lazy unblock ' + await displayIdFor(storage, task.parent_task_id))}`);
+    if (result.parentTaskId) {
+      const storage = await requireStorage();
+      try {
+        console.log(`\nUnblock parent task: ${theme.command('lazy unblock ' + await displayIdFor(storage, result.parentTaskId))}`);
+      } finally {
+        await storage.close();
+      }
     }
-
-  } finally {
-    await storage.close();
+  } catch (err) {
+    if (closeRecoveryPath) {
+      console.error(`Close reason saved to recovery file: ${closeRecoveryPath}`);
+    }
+    console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
   }
 }
 

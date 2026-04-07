@@ -27,7 +27,6 @@ import type {
   SearchResult,
   StoredConversation,
   StatusChange,
-  ModelName,
   Actor,
   CommentSource,
 } from './types';
@@ -47,7 +46,7 @@ export interface CreateTurnOptions {
   endShaWork?: string;
   mergeConflicts?: MergeConflict[];
   violations?: FileViolation[];
-  model?: ModelName;
+  model?: string;
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
   actor?: Actor;
@@ -55,6 +54,8 @@ export interface CreateTurnOptions {
   checkExitCode?: number;
   /** Captured output from the post-turn check command */
   checkOutput?: string;
+  /** Whether this turn was auto-triggered (CI failure, comment, upstream sync, crash) vs human-triggered */
+  autoTriggered?: boolean;
 }
 
 export interface Storage {
@@ -101,7 +102,13 @@ export interface Storage {
 
   /**
    * Resolve a task identifier (hex ID, UUID, or code) to a task.
-   * Returns the task and any resolution errors (e.g., ambiguous code).
+   *
+   * For code-based lookups with multiple matches:
+   * - If one non-terminal task and any terminal tasks exist → returns the non-terminal task
+   * - If multiple non-terminal tasks exist → returns ambiguousMatches (genuinely ambiguous)
+   * - If only terminal tasks exist → returns the most recently created task
+   *
+   * Returns the task and any resolution errors (e.g., ambiguous hex prefix, multiple active tasks).
    */
   resolveTask(input: string): Promise<{ task: Task | null; ambiguousMatches?: Task[] }>;
 
@@ -149,6 +156,16 @@ export interface Storage {
    * Update task type
    */
   updateTaskType(taskId: string, type: string): Promise<void>;
+
+  /**
+   * Reset the pending_sync counter to 0 (called when sync launches).
+   */
+  resetTaskPendingSync(taskId: string): Promise<void>;
+
+  /**
+   * Increment the pending_sync counter by 1 (called when a new sync signal arrives).
+   */
+  incrementTaskPendingSync(taskId: string): Promise<void>;
 
   /**
    * Close a task with a reason

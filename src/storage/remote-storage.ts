@@ -31,7 +31,7 @@ import type {
   StoredConversation,
   StatusChange,
 } from './types';
-import type { Actor, CommentSource, FileViolation, ModelName } from '../types';
+import type { Actor, CommentSource, FileViolation } from '../types';
 
 export class RemoteStorage implements Storage {
   constructor(
@@ -121,6 +121,14 @@ export class RemoteStorage implements Storage {
 
   async updateTaskType(taskId: string, type: string): Promise<void> {
     await this.call('updateTaskType', { taskId, type });
+  }
+
+  async resetTaskPendingSync(taskId: string): Promise<void> {
+    await this.call('resetTaskPendingSync', { taskId });
+  }
+
+  async incrementTaskPendingSync(taskId: string): Promise<void> {
+    await this.call('incrementTaskPendingSync', { taskId });
   }
 
   async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {

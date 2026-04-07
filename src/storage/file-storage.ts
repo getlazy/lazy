@@ -50,13 +50,13 @@ import type {
   CommentsFile,
   StatusChange,
   StatusChangelogFile,
-  ModelName,
   Actor,
   CommentSource,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { assertValidTransition } from '../task-state-machine';
 import { StorageLock } from '../utils/storage-lock';
+import { TaskMutex } from '../utils/task-mutex';
 
 const STORAGE_VERSION = 1;
 
@@ -69,6 +69,7 @@ export class FileStorage implements Storage {
   private readonly basePath: string;
   private readonly tasksPath: string;
   private readonly lock: StorageLock;
+  private readonly taskMutex = new TaskMutex();
 
   constructor(lazyRoot: string, options?: FileStorageOptions) {
     this.basePath = options?.basePath ?? join(lazyRoot, getDataDir(lazyRoot));
@@ -197,6 +198,15 @@ export class FileStorage implements Storage {
       needsWrite = true;
     }
 
+    // Migrate pending_sync: boolean→number (false→0, true→1, undefined→0)
+    if (raw.pending_sync === undefined || raw.pending_sync === false) {
+      raw.pending_sync = 0;
+      needsWrite = true;
+    } else if (raw.pending_sync === true) {
+      raw.pending_sync = 1;
+      needsWrite = true;
+    }
+
     // Handle legacy 'draft' -> 'interrupted' migration
     // Draft tasks no longer exist; they're like a session that was started
     // but the container immediately crashed (no agent work done)
@@ -322,46 +332,53 @@ export class FileStorage implements Storage {
    * Creates a temp directory, writes all files, then atomically renames.
    */
   private async atomicWriteTask(taskId: string, files: Record<string, unknown>): Promise<void> {
-    const taskDir = this.taskDir(taskId);
-    const tmpDir = `${taskDir}.tmp.${Date.now()}`;
+    // Serialize concurrent async operations on the same task directory.
+    // The StorageLock (file-based) handles inter-process exclusion but is
+    // re-entrant within the same process, so two concurrent async operations
+    // (e.g. RPC handler + reconcile loop) can interleave at await points and
+    // corrupt each other's temp→real rename sequence.
+    return this.taskMutex.withLock(taskId, async () => {
+      const taskDir = this.taskDir(taskId);
+      const tmpDir = `${taskDir}.tmp.${Date.now()}`;
 
-    try {
-      // Create temp directory
-      await mkdir(tmpDir, { recursive: true });
+      try {
+        // Create temp directory
+        await mkdir(tmpDir, { recursive: true });
 
-      // If updating, copy existing files first
-      if (await this.exists(taskDir)) {
-        const entries = await readdir(taskDir, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.name.endsWith('.tmp') || entry.name.endsWith('.backup')) continue;
-          if (entry.isFile()) {
-            const content = await readFile(join(taskDir, entry.name), 'utf-8');
-            await writeFile(join(tmpDir, entry.name), content, 'utf-8');
-          } else if (entry.isDirectory()) {
-            await cp(join(taskDir, entry.name), join(tmpDir, entry.name), { recursive: true });
+        // If updating, copy existing files first
+        if (await this.exists(taskDir)) {
+          const entries = await readdir(taskDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.name.includes('.tmp') || entry.name.includes('.backup')) continue;
+            if (entry.isFile()) {
+              const content = await readFile(join(taskDir, entry.name), 'utf-8');
+              await writeFile(join(tmpDir, entry.name), content, 'utf-8');
+            } else if (entry.isDirectory()) {
+              await cp(join(taskDir, entry.name), join(tmpDir, entry.name), { recursive: true });
+            }
           }
         }
-      }
 
-      // Write new/updated files
-      for (const [filename, data] of Object.entries(files)) {
-        await this.writeJson(join(tmpDir, filename), data);
-      }
+        // Write new/updated files
+        for (const [filename, data] of Object.entries(files)) {
+          await this.writeJson(join(tmpDir, filename), data);
+        }
 
-      // Atomic swap
-      if (await this.exists(taskDir)) {
-        const backupDir = `${taskDir}.backup.${Date.now()}`;
-        await rename(taskDir, backupDir);
-        await rename(tmpDir, taskDir);
-        await rm(backupDir, { recursive: true, force: true });
-      } else {
-        await rename(tmpDir, taskDir);
+        // Atomic swap
+        if (await this.exists(taskDir)) {
+          const backupDir = `${taskDir}.backup.${Date.now()}`;
+          await rename(taskDir, backupDir);
+          await rename(tmpDir, taskDir);
+          await rm(backupDir, { recursive: true, force: true });
+        } else {
+          await rename(tmpDir, taskDir);
+        }
+      } catch (err) {
+        // Cleanup temp on failure
+        await rm(tmpDir, { recursive: true, force: true });
+        throw err;
       }
-    } catch (err) {
-      // Cleanup temp on failure
-      await rm(tmpDir, { recursive: true, force: true });
-      throw err;
-    }
+    });
   }
 
   /**
@@ -506,8 +523,14 @@ export class FileStorage implements Storage {
   // --- Lifecycle ---
 
   async initialize(): Promise<void> {
+    // Ensure basePath exists BEFORE acquiring the lock.
+    // The storage lock checks that its directory exists, so we must create
+    // the basePath first. This is safe without a lock because mkdir with
+    // { recursive: true } is idempotent — concurrent calls won't conflict.
+    await mkdir(this.basePath, { recursive: true });
+
     return this.lock.withLock(async () => {
-      // Create directories
+      // Create subdirectories
       await mkdir(this.tasksPath, { recursive: true });
 
       // Write/check version
@@ -589,6 +612,7 @@ export class FileStorage implements Storage {
         model: null,
         agent_id: agentId ?? 'claude-code',
         metadata: null,
+        pending_sync: 0,
       };
 
       await this.atomicWriteTask(id, {
@@ -839,6 +863,34 @@ export class FileStorage implements Storage {
       this.assertNotTerminal(task, 'update type');
 
       task.type = type as Task['type'];
+
+      await this.atomicWriteTask(fullId, { 'task.json': task });
+    });
+  }
+
+  async resetTaskPendingSync(taskId: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) return;
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) return;
+
+      task.pending_sync = 0;
+
+      await this.atomicWriteTask(fullId, { 'task.json': task });
+    });
+  }
+
+  async incrementTaskPendingSync(taskId: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) return;
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) return;
+
+      task.pending_sync = (task.pending_sync ?? 0) + 1;
 
       await this.atomicWriteTask(fullId, { 'task.json': task });
     });
@@ -1264,6 +1316,7 @@ export class FileStorage implements Storage {
         actor,
         checkExitCode,
         checkOutput,
+        autoTriggered,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1301,6 +1354,7 @@ export class FileStorage implements Storage {
         ...(actor ? { actor } : {}),
         ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
         ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
+        ...(autoTriggered ? { auto_triggered: true } : {}),
       };
 
       turns.push(turn);

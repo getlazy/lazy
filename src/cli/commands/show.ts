@@ -10,6 +10,7 @@ import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
 import type { Task, Session, Turn, Commit, Comment } from '../../types';
 import type { Storage } from '../../storage/interface';
+import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
 import { existsSync, readFileSync } from 'fs';
 
@@ -29,6 +30,7 @@ export interface TaskShowData {
   parent: Task | null;
   retryStatus: { retryCount: number; errors: { count: number; message: string; firstSeen: string; lastSeen: string }[] } | null;
   orphanStatus: OrphanCheckResult | null;
+  autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
 }
 
 /**
@@ -68,7 +70,18 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     orphanStatus = await checkOrphanedChild(task, storage, root);
   }
 
-  return { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus };
+  // Load auto-react status
+  let autoReactStatus: TaskShowData['autoReactStatus'] = null;
+  try {
+    autoReactStatus = await getAutoReactSummary(storage, task.id);
+    // Only include if there's meaningful data (any count > 0, paused, or auto-turns)
+    const hasData = autoReactStatus.paused || Object.values(autoReactStatus.counts).some(c => c > 0) || autoReactStatus.consecutiveAutoTurns > 0;
+    if (!hasData) autoReactStatus = null;
+  } catch {
+    // Non-critical
+  }
+
+  return { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus };
 }
 
 /**
@@ -76,7 +89,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * Used by both the show command (for display) and the search command (for line number computation).
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean): string[] {
-  const { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus } = data;
+  const { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus } = data;
   const outputLines: string[] = [];
 
   // Task info
@@ -174,9 +187,37 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
       }
     }
 
+    // Auto-react budget status (if any auto-reacts have occurred or limits reached)
+    if (autoReactStatus) {
+      if (autoReactStatus.paused) {
+        outputLines.push(`\n  ${theme.error('Auto-react paused:')} ${autoReactStatus.reason ?? 'limit reached'}`);
+      } else {
+        outputLines.push(`\n  ${theme.label('Auto-react counts:')}`);
+      }
+      const triggerLabels: Record<string, string> = {
+        ci_failure: 'CI failures',
+        upstream_sync: 'Upstream syncs',
+        comment: 'Comments',
+        crash: 'Crashes',
+      };
+      for (const [trigger, count] of Object.entries(autoReactStatus.counts)) {
+        if (count > 0) {
+          outputLines.push(`    ${theme.label(triggerLabels[trigger] + ':')} ${count}`);
+        }
+      }
+      if (autoReactStatus.consecutiveAutoTurns > 0) {
+        outputLines.push(`    ${theme.label('Consecutive auto-turns (current burst):')} ${autoReactStatus.consecutiveAutoTurns}`);
+      }
+    }
+
     // Turns
     if (turns.length > 0) {
-      outputLines.push(`\n  ${theme.label('Turns:')} ${theme.count(String(turns.length))}`);
+      const autoTriggeredCount = turns.filter(t => t.auto_triggered).length;
+      const humanTriggeredCount = turns.length - autoTriggeredCount;
+      const turnSummary = autoTriggeredCount > 0
+        ? `${theme.count(String(turns.length))} total (${humanTriggeredCount} human, ${autoTriggeredCount} auto)`
+        : theme.count(String(turns.length));
+      outputLines.push(`\n  ${theme.label('Turns:')} ${turnSummary}`);
       for (const turn of turns) {
         const isErrorTurn = turn.role === 'agent' && turn.content.startsWith('[Agent crashed]');
         const usageSuffix = turn.usage
@@ -188,9 +229,10 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
             ? ` | ${theme.status('check: OK')}`
             : ` | ${theme.error(`check: FAILED (exit ${turn.check_exit_code})`)}`)
           : '';
+        const autoSuffix = turn.auto_triggered ? ` | ${theme.warning('auto')}` : '';
         const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(turn.role);
         if (showFull) {
-          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix} ---`);
+          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ---`);
           if (isErrorTurn) {
             for (const line of turn.content.split('\n')) {
               outputLines.push(`    ${theme.error(line)}`);
@@ -214,9 +256,9 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
         } else {
           const preview = turn.content.substring(0, 80).replace(/\n/g, ' ');
           if (isErrorTurn) {
-            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
           } else {
-            outputLines.push(`    #${turn.sequence} [${theme.turnRole(turn.role)}]${usageSuffix}${modelSuffix}${checkSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${theme.turnRole(turn.role)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
           }
         }
       }
@@ -404,7 +446,7 @@ export async function commandShow(args: string[]): Promise<void> {
 
   const showFull = parsed.flags.get('full') === true;
 
-  // Try to resolve as a task (daemon → direct fallback)
+  // Resolve as a task via daemon RPC
   const showResult = await queryTaskShow(taskId);
 
   if (showResult && !showResult.ambiguous) {
@@ -538,7 +580,7 @@ export async function commandShow(args: string[]): Promise<void> {
 
 /** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
 function buildShowJson(data: TaskShowData): Record<string, unknown> {
-  const { task, session: sess, turns, commits, comments, children, proposals, retryStatus } = data;
+  const { task, session: sess, turns, commits, comments, children, proposals, retryStatus, autoReactStatus } = data;
 
   const jsonData: Record<string, unknown> = {
     id: task.id,
@@ -577,6 +619,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       timestamp: t.timestamp,
       usage: t.usage,
       model: t.model ?? null,
+      auto_triggered: t.auto_triggered ?? false,
       ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
       ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
     })),
@@ -607,6 +650,10 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
 
   if (retryStatus) {
     jsonData.retry_status = retryStatus;
+  }
+
+  if (autoReactStatus) {
+    jsonData.auto_react_status = autoReactStatus;
   }
 
   return jsonData;

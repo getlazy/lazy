@@ -1,6 +1,6 @@
 import { requireStorage, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
-import type { ModelName } from '../../types';
+
 
 import fixConstraints from '../../prompts/fix-constraints.md' with { type: 'text' };
 
@@ -17,7 +17,7 @@ export async function commandFix(args: string[]): Promise<void> {
 
   let goal: string;
   let prompt: string | null = null;
-  let model: ModelName | null = null;
+  let model: string | null = null;
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
@@ -143,7 +143,7 @@ subtle bugs that resist traditional debugging approaches.
 Options:
   --goal <goal>      Bug or issue to fix (what's broken and symptoms)
   --prompt <text>    Additional context (reproduction steps, error messages, etc.)
-  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --code <code>      Human-readable code (e.g. "fix-token-hang", "fix-null-deref")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

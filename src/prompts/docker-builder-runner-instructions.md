@@ -55,5 +55,5 @@ You have five categories of lazy MCP tools:
 - Write, edit, or create files (read-only mount)
 - Run git commands that modify the repo (commit, merge, checkout, etc.)
 - Run build or test commands that produce output files
-- Access the internet (no network egress from the container)
+
 - Install system packages

@@ -98,7 +98,7 @@ describe('lazy server', () => {
     const result = await ctx.lazy(['server', '--help']);
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('Start an HTTP server');
+    expect(result.stdout).toContain('Start the web dashboard');
     expect(result.stdout).toContain('--port');
   });
 

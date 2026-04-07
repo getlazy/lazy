@@ -131,18 +131,48 @@ if [[ -n "${LAZY_BRANCH:-}" ]]; then
 fi
 
 bun install
+# Ensure the lazy-agent placeholder exists — it's gitignored but required
+# by the Bun file import in src/capture/claude.ts for dev-mode runs.
+bun run ensure:agent-placeholder
 bun run build
 ok "Lazy built successfully"
 
 # ---------------------------------------------------------------------------
-# 4. Run the test driver
+# 4. Pre-flight checks
+# ---------------------------------------------------------------------------
+
+log "Running pre-flight checks..."
+
+# Verify scenario file exists
+QA_SCENARIO="${SCRIPT_DIR}/v011-daemon.scenarios.json"
+if [[ ! -f "$QA_SCENARIO" ]]; then
+  error "Scenario file not found: ${QA_SCENARIO}"
+  exit 1
+fi
+ok "Scenario file found"
+
+# Verify lazy runs (catches missing deps, broken builds).
+# Try installed binary first, fall back to source tree.
+if command -v lazy &>/dev/null && lazy --version &>/dev/null; then
+  LAZY_CMD="lazy"
+  ok "lazy binary works (installed)"
+elif bun run "${LAZY_ROOT}/src/index.ts" --version &>/dev/null; then
+  LAZY_CMD="bun run ${LAZY_ROOT}/src/index.ts"
+  ok "lazy binary works (source tree)"
+else
+  error "lazy binary does not work. Check build output above."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Run the test driver
 # ---------------------------------------------------------------------------
 
 log "Running v0.11 QA test driver..."
 echo ""
 
-export QA_SCENARIO_FILE="${SCRIPT_DIR}/v011-daemon.scenarios.json"
-export LAZY_BIN="bun run ${LAZY_ROOT}/src/index.ts"
+export QA_SCENARIO_FILE="$QA_SCENARIO"
+export LAZY_BIN="${LAZY_CMD}"
 
 # Pass through GitHub repo if set
 if [[ -n "${QA_GITHUB_REPO:-}" ]]; then

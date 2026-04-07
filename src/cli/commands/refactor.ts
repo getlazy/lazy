@@ -1,6 +1,6 @@
 import { requireStorage, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
-import type { ModelName } from '../../types';
+
 
 import refactorConstraints from '../../prompts/refactor-constraints.md' with { type: 'text' };
 
@@ -17,7 +17,7 @@ export async function commandRefactor(args: string[]): Promise<void> {
 
   let goal: string;
   let prompt: string | null = null;
-  let model: ModelName | null = null;
+  let model: string | null = null;
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
@@ -139,7 +139,7 @@ Enforces: no behavior changes, one step per commit, tests pass after each step.
 Options:
   --goal <goal>      Refactoring goal (what to refactor and why)
   --prompt <text>    Additional instructions for the refactoring agent
-  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --code <code>      Human-readable code (e.g. "refactor-auth", "refactor-storage")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

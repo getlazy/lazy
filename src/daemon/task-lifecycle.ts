@@ -1,0 +1,1917 @@
+/**
+ * Daemon-side lifecycle orchestration for unblock, accept, reject, close.
+ *
+ * Owns pre-flight validation and state transitions for lifecycle operations,
+ * mirroring how task-launcher.ts owns start orchestration.
+ *
+ * The daemon enforces invariants (status checks, lock checks, orphan detection)
+ * so that any client (CLI, MCP tool, future API) gets consistent behavior.
+ *
+ * This module must NOT:
+ * - Call process.exit()
+ * - Do interactive prompts (no TTY in daemon)
+ * - Import CLI rendering/theme modules
+ * - Call storage.close() — the daemon owns the Storage lifecycle
+ * - NEVER spawn lazy CLI as a subprocess (use internal functions instead)
+ *
+ * CRITICAL: The daemon has direct access to storage, runners, and all task
+ * lifecycle functions. Never use getLazyCommand() or spawn lazy CLI from
+ * daemon code — it causes deadlocks and storage lock contention.
+ */
+
+import { join } from 'path';
+import { stat } from 'fs/promises';
+import { loadConfig } from '../config/loader';
+import { pathExists } from '../utils/fs';
+import { createRunner } from '../runner';
+import { createDriver } from '../remote';
+import { getOrCreateStorage, RpcError } from './rpc-handlers';
+import { getAgent } from '../agent/registry';
+import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, recoverMissingWorktreeWithFetch } from '../git/operations';
+import { checkLock, acquireLock, removeLock } from '../utils/lock';
+import { checkPairingLock } from '../utils/pairing-lock';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir } from '../protocol';
+import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
+import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
+import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren } from '../cli/orphan';
+import { resetAutoReactCounters } from './auto-react-budget';
+import { isFeatureEnabled } from '../utils/features';
+import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
+import { logger } from '../utils/logger';
+import { getActor } from '../constants';
+import { writeDaemonMcpConfig, SANDBOX_DIR } from './task-launcher';
+import { hasDaemonContext } from './context';
+import { runGit } from '../utils/git';
+import { validateBranchInSyncWithRemote } from '../utils/git';
+import { mkdir, copyFile, writeFile, rm, readdir, readFile } from 'fs/promises';
+import { getHome } from '../utils/home';
+import { dirExists } from '../utils/fs';
+
+import type { StartCommand, UnblockCommand, SyncCommand } from '../protocol';
+import type { FileViolation, Task } from '../types';
+import type { Storage } from '../storage';
+import type { SandboxConfig } from '../capture/claude';
+
+import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
+import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
+import resumeContextText from '../prompts/resume-context.md' with { type: 'text' };
+import goalContextResumeText from '../prompts/goal-context-resume.md' with { type: 'text' };
+
+// =====================================================================
+// Shared pre-flight helpers
+// =====================================================================
+
+/**
+ * Check pairing lock on a task's worktree and throw RpcError if locked.
+ * Daemon-side equivalent of CLI's rejectIfPairing (which calls process.exit).
+ */
+function checkPairingLockOrThrow(root: string, tRef: string, displayTaskId: string): void {
+  const worktreePath = getWorktreePathForRef(root, tRef);
+  const pairingLock = checkPairingLock(worktreePath);
+  if (pairingLock) {
+    throw new RpcError(409, `Task ${displayTaskId} is locked for pairing (PID ${pairingLock.pid}, started ${pairingLock.started_at}). Exit the pairing session first.`);
+  }
+}
+
+/**
+ * Check for uncommitted changes in a task's worktree and throw if found.
+ */
+async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskId: string, commandName: string): Promise<void> {
+  if (await pathExists(worktreePath) && await hasUncommittedChanges(worktreePath)) {
+    throw new RpcError(409, `Task ${displayTaskId} has uncommitted changes. Commit or stash changes before running ${commandName}.`);
+  }
+}
+
+// =====================================================================
+// Unblock Task
+// =====================================================================
+
+export interface UnblockTaskParams {
+  taskId: string;
+  message: string;
+  modelOverride?: string;
+  approvedFiles?: string[];
+  /** CLI already confirmed orphan retargeting */
+  retargetOrphan?: boolean;
+  /** Whether notes were already shown in editor (skip re-injection) */
+  notesInEditor?: boolean;
+}
+
+export interface UnblockTaskResult {
+  sessionId: string;
+  containerName: string;
+  worktreePath: string;
+  branchName: string;
+  turnNumber: number;
+  runnerType: string;
+  runnerLabel: string;
+  runnerDisplayName: string;
+  warnings: string[];
+}
+
+
+export async function launchUnblockTask(
+  projectRoot: string,
+  params: UnblockTaskParams,
+): Promise<UnblockTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const result = await storage.resolveTask(params.taskId);
+  if (!result.task) {
+    if (result.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'. Matches: ${result.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  let task = result.task;
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session has ended. Create a variant with: lazy branch ${displayId(task)}`);
+  }
+
+  // --- Status validation ---
+  if (task.status === 'working') {
+    throw new RpcError(409, `Task ${displayId(task)} is still working. Wait for it to finish.`);
+  }
+  if (task.status === 'pairing') {
+    throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
+  }
+
+  // Merging → blocked escape hatch
+  if (task.status === 'merging') {
+    await storage.updateTaskStatus(task.id, 'blocked', getActor());
+    await storage.createComment(task.id, 'Task unblocked from merging state (manual escape hatch).', getActor());
+    task = (await storage.getTask(task.id))!;
+    warnings.push('Task was in merging state. Moved back to blocked.');
+  }
+
+  // --- Pairing lock check ---
+  checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
+
+  // --- Runner pre-flight ---
+  const runner = await createRunner(projectRoot);
+  // Set agent on runner so auth uses the correct agent (not hardcoded ClaudeCodeAgent)
+  if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
+    (runner as any).setAgent(getAgent(task.agent_id));
+  }
+  runner.checkAvailability();
+
+  // --- Orphan detection/retargeting ---
+  if (task.parent_task_id) {
+    const orphanStatus = await checkOrphanedChild(task, storage, projectRoot);
+    if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
+      if (params.retargetOrphan) {
+        await retargetOrphanedChild(task, storage, orphanStatus.retargetBranch);
+        task = (await storage.getTask(task.id))!;
+        warnings.push(`Retargeted to ${orphanStatus.retargetBranch}.`);
+      } else {
+        throw new RpcError(409, `Parent task was accepted and its branch deleted. Task needs retargeting to ${orphanStatus.retargetBranch}. Pass retargetOrphan=true to confirm.`);
+      }
+    }
+  }
+
+  // --- Reset auto-react counters (human is taking over) ---
+  try {
+    await resetAutoReactCounters(storage, task.id);
+  } catch {
+    // Counter reset is best-effort — task unblock must proceed even if budget tracking fails
+  }
+
+  // --- Launch feedback turn ---
+  const tRef = taskRef(task);
+  const worktreePath = getWorktreePathForRef(projectRoot, tRef);
+
+  if (!await pathExists(worktreePath)) {
+    // Worktree is gone — try to recover from local or remote branch
+    const branchName = sess.git_branch;
+    const unblockConfig = await loadConfig(projectRoot);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, branchName, unblockConfig.remote.git_remote, projectRoot,
+      );
+      if (!recovery.recovered) {
+        throw new RpcError(400,
+          `Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+      }
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError(400,
+        `Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Check for concurrent session lock
+  const existingLock = await checkLock(worktreePath);
+  if (existingLock) {
+    throw new RpcError(409, `Task ${shortId(task.id)} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
+  }
+
+  // Acquire lock
+  await acquireLock(worktreePath, 'lazy unblock');
+
+  const canResume = !!sess.agent_session_id;
+  const containerName = runner.runNameForTask(tRef);
+
+  const sandbox: SandboxConfig = {
+    worktreePath,
+    sandboxPath: join(worktreePath, SANDBOX_DIR),
+  };
+
+  try {
+    // Restore snapshot if exists
+    const snapshot = await storage.getLatestWorktreeSnapshot(sess.id);
+    if (snapshot && !await hasUncommittedChanges(worktreePath)) {
+      let patch = snapshot.uncommitted_diff;
+      patch = patch.replace(/^--- STAGED CHANGES ---\n/gm, '');
+      patch = patch.replace(/^--- UNSTAGED CHANGES ---\n/gm, '');
+
+      if (await applyPatch(patch, worktreePath)) {
+        warnings.push('Restored uncommitted changes from backup.');
+      } else {
+        warnings.push('Could not restore uncommitted changes from backup. Continuing without them.');
+      }
+    }
+
+    // --- Revert rejected file violations (conflict tasks) ---
+    let violationRevertInfo: string | undefined;
+    let message = params.message;
+
+    if (task.status === 'conflict') {
+      const existingTurns = await storage.getSessionTurns(sess.id);
+      const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
+
+      if (latestAgentTurn?.violations?.length) {
+        const violations = latestAgentTurn.violations;
+        const approvedSet = new Set(params.approvedFiles ?? []);
+
+        const updatedViolations: FileViolation[] = violations.map(v => ({
+          ...v,
+          status: approvedSet.has(v.file) ? 'approved' as const : 'rejected' as const,
+        }));
+
+        const rejectedFiles = updatedViolations.filter(v => v.status === 'rejected');
+        const approvedViolations = updatedViolations.filter(v => v.status === 'approved');
+
+        if (rejectedFiles.length > 0) {
+          for (const v of rejectedFiles) {
+            const gitResult = await runGit(['checkout', v.base_sha, '--', v.file], { cwd: worktreePath });
+            if (gitResult.exitCode !== 0) {
+              throw new RpcError(500, `Failed to revert protected file ${v.file} to ${v.base_sha}: ${gitResult.stderr}`);
+            }
+          }
+
+          const revertedPaths = rejectedFiles.map(v => v.file);
+          await runGit(['add', ...revertedPaths], { cwd: worktreePath });
+          await runGit(['commit', '-m', 'Revert protected file changes (rejected by reviewer)'], { cwd: worktreePath });
+          warnings.push(`Reverted ${revertedPaths.length} protected file(s): ${revertedPaths.join(', ')}`);
+        }
+
+        if (approvedViolations.length > 0) {
+          warnings.push(`Approved ${approvedViolations.length} protected file change(s): ${approvedViolations.map(v => v.file).join(', ')}`);
+        }
+
+        await storage.updateTurnViolations(task.id, latestAgentTurn.id, updatedViolations);
+
+        // Build context for the agent prompt
+        const revertedList = rejectedFiles.map(v => v.file);
+        const approvedList = approvedViolations.map(v => v.file);
+        const parts: string[] = [];
+        if (revertedList.length > 0) {
+          parts.push(`The following protected files were REVERTED (do NOT modify them again):\n${revertedList.map(f => `  - ${f}`).join('\n')}`);
+        }
+        if (approvedList.length > 0) {
+          parts.push(`The following protected file changes were APPROVED by the reviewer:\n${approvedList.map(f => `  - ${f}`).join('\n')}`);
+        }
+        if (parts.length > 0) {
+          violationRevertInfo = parts.join('\n\n');
+        }
+      }
+    }
+
+    // Load config from the worktree
+    const config = await loadConfig(projectRoot, { cwd: worktreePath });
+
+    // Determine model: CLI flag > previous turn's model (sticky) > task.model > config default
+    let stickyModel: string | undefined;
+    if (!params.modelOverride) {
+      const existingTurns = await storage.getSessionTurns(sess.id);
+      for (let i = existingTurns.length - 1; i >= 0; i--) {
+        if (existingTurns[i].model) {
+          stickyModel = existingTurns[i].model;
+          break;
+        }
+      }
+    }
+    // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
+    // model names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
+      ? config.ollama.model
+      : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
+    const modelId = modelName;
+
+    if (!task.model) {
+      await storage.updateTaskModel(task.id, modelName);
+      task.model = modelName;
+    }
+
+    // Determine parent branch
+    let parentBranch: string | null = null;
+    if (task.parent_task_id) {
+      parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
+    } else {
+      parentBranch = task.metadata?.remote_target_branch ?? await getCurrentBranch(projectRoot);
+    }
+
+    // Parent branch is still passed to the supervisor for context (protected
+    // patterns, post-turn sync, etc.) but unblock no longer triggers merge.
+    // Use `lazy sync <task>` for upstream merge as a separate operation.
+
+    // Build turn history for fresh sessions (no Claude session to resume)
+    let turnHistory: string | undefined;
+    if (!canResume) {
+      const turns = await storage.getSessionTurns(sess.id);
+      if (turns.length > 0) {
+        turnHistory = buildTurnHistoryContext(turns);
+      }
+    }
+
+    // Fetch notes
+    let notesCtx: string | undefined;
+    if (!params.notesInEditor) {
+      const allNotes = await storage.getTaskComments(task.id);
+      if (allNotes.length > 0) {
+        const turns = await storage.getSessionTurns(sess.id);
+        const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+        const newNotes = lastAgentTurn
+          ? getNewNotesSince(allNotes, lastAgentTurn.timestamp)
+          : allNotes;
+        if (newNotes.length > 0) {
+          notesCtx = buildNotesContext(newNotes);
+        }
+      }
+    }
+
+    // Sync with remote
+    const syncResult = await runSyncWithRemote(task, sess, projectRoot, storage, worktreePath);
+    const remoteCommentsCtx = syncResult.remoteCommentsCtx;
+
+    // Prepend violation revert info
+    if (violationRevertInfo) {
+      message = `## Protected File Resolution\n\n${violationRevertInfo}\n\n---\n\n${message}`;
+    }
+
+    // Build prompts
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
+    const fullMessage = buildPromptWithInstructions(message.trim(), task.goal, null, projectRoot, turnHistory, notesCtx, remoteCommentsCtx);
+
+    // --- Persist state BEFORE launching container ---
+    const nextSeq = await storage.getNextTurnSequence(sess.id);
+    await storage.createTurn({
+      sessionId: sess.id,
+      sequence: nextSeq,
+      role: 'human',
+      content: message.trim(),
+      model: modelName,
+      prompt: fullMessage,
+      actor: getActor(),
+    });
+
+    // Transition to working
+    if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted' || task.status === 'interrupted') {
+      await storage.updateTaskStatus(task.id, 'working', getActor());
+    }
+
+    // --- Write command and launch/reuse supervisor ---
+    const protoDir = getProtocolDir(task.id);
+    ensureProtocolDir(protoDir);
+
+    const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', config);
+
+    const unblockCommand: UnblockCommand = {
+      type: 'unblock',
+      task_id: task.id,
+      goal: task.goal,
+      prompt: fullMessage,
+      agent_id: task.agent_id,
+      system_prompt: systemPrompt,
+      model_id: modelId,
+      agent_session_id: canResume ? sess.agent_session_id! : undefined,
+      parent_branch: parentBranch ?? undefined,
+      sync_before_work: false,
+      sync_after_work: autoSyncAfterTurn,
+      remote_branch: syncResult.remoteBranch,
+      ...commonCommandFields(config),
+    };
+    writeCommand(protoDir, unblockCommand);
+
+    // --- Generate daemon MCP config ---
+    // The daemon knows its own webPort — no health check, no fallback.
+    let daemonConfigPath: string | null = null;
+    if (runner.usesSandbox()) {
+      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
+    }
+
+    // Launch or reuse supervisor
+    if (runner.isRunning(containerName)) {
+      // Supervisor already running — it will pick up the new command
+    } else {
+      runner.removeRun(containerName);
+
+      try {
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+      } catch (err) {
+        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Store container name
+    await storage.updateSessionContainerName(sess.id, containerName);
+    await storage.updateSessionInteraction(sess.id, 0);
+
+    const turnNumber = Math.floor(nextSeq / 2) + 1;
+
+    return {
+      sessionId: sess.id,
+      containerName,
+      worktreePath,
+      branchName: sess.git_branch,
+      turnNumber,
+      runnerType: runner.type,
+      runnerLabel: runner.runLabel,
+      runnerDisplayName: runner.runDisplayName(containerName),
+      warnings,
+    };
+  } finally {
+    removeLock(worktreePath);
+  }
+}
+
+// =====================================================================
+// Reject Task
+// =====================================================================
+
+export interface RejectTaskParams {
+  taskId: string;
+  reason: string;
+  acceptDirtyWorktree?: boolean;
+}
+
+export interface RejectTaskResult {
+  taskId: string;
+  displayId: string;
+  branchName: string | null;
+  parentTaskId: string | null;
+  warnings: string[];
+}
+
+export async function rejectTask(
+  projectRoot: string,
+  params: RejectTaskParams,
+): Promise<RejectTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const resolveResult = await storage.resolveTask(params.taskId);
+  if (!resolveResult.task) {
+    if (resolveResult.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolveResult.task;
+
+  // --- Worktree uncommitted changes check ---
+  const worktreePath = getWorktreePath(projectRoot, task);
+  if (!params.acceptDirtyWorktree) {
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'reject');
+  }
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session.`);
+  }
+  if (sess.outcome === 'rejected') {
+    return { taskId: task.id, displayId: displayId(task), branchName: sess.git_branch, parentTaskId: task.parent_task_id, warnings: ['Task was already rejected.'] };
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
+  }
+
+  // --- Status validation ---
+  if (task.status === 'pairing') {
+    throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
+  }
+
+  // --- Pairing lock check ---
+  checkPairingLockOrThrow(projectRoot, shortId(task.id), displayId(task));
+
+  // --- State transitions ---
+
+  // If working, stop runner and transition to interrupted first
+  if (task.status === 'working') {
+    const runner = await createRunner(projectRoot);
+    const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
+    runner.stopRun(runName);
+    await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+  }
+
+  // Mark as abandoned
+  await storage.updateTaskStatus(task.id, 'abandoned', getActor());
+
+  // End session
+  await storage.endSession(sess.id, 'rejected');
+
+  // Clean up container
+  await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
+
+  // Store rejection reason as comment
+  await storage.createComment(task.id, `[Rejected] ${params.reason.trim()}`, getActor());
+
+  // Post reject review and close PR
+  try {
+    const config = await loadConfig(projectRoot);
+    const driver = createDriver(config);
+    const reviewWarning = await driver.postRejectReview(task, params.reason.trim());
+    if (reviewWarning) {
+      warnings.push(`Review warning: ${reviewWarning}`);
+    }
+    await driver.cleanup(sess.git_branch);
+  } catch (err) {
+    logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Clean up lock and worktree (preserve branch)
+  await removeLock(worktreePath);
+  await cleanupWorktree(worktreePath, projectRoot);
+
+  // Clean up protocol dir
+  removeProtocolDir(getProtocolDir(task.id));
+
+  return {
+    taskId: task.id,
+    displayId: displayId(task),
+    branchName: sess.git_branch,
+    parentTaskId: task.parent_task_id,
+    warnings,
+  };
+}
+
+// =====================================================================
+// Close Task
+// =====================================================================
+
+export interface CloseTaskParams {
+  taskId: string;
+  reason: string;
+  acceptDirtyWorktree?: boolean;
+}
+
+export interface CloseTaskResult {
+  taskId: string;
+  displayId: string;
+  branchName: string | null;
+  parentTaskId: string | null;
+  warnings: string[];
+}
+
+export async function closeTask(
+  projectRoot: string,
+  params: CloseTaskParams,
+): Promise<CloseTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const resolveResult = await storage.resolveTask(params.taskId);
+  if (!resolveResult.task) {
+    if (resolveResult.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolveResult.task;
+
+  // --- Status check ---
+  if (isTerminalStatus(task.status)) {
+    throw new RpcError(409, `Task ${displayId(task)} is already ${task.status}.`);
+  }
+  if (task.status === 'pairing') {
+    throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
+  }
+
+  // --- Worktree uncommitted changes check ---
+  const worktreePath = getWorktreePath(projectRoot, task);
+  if (!params.acceptDirtyWorktree) {
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'close');
+  }
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+
+  // --- State transitions ---
+
+  // If working, stop runner and transition to interrupted first
+  if (task.status === 'working') {
+    if (sess) {
+      const runner = await createRunner(projectRoot);
+      const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
+      runner.stopRun(runName);
+    }
+    await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+  }
+
+  // Close task (persists reason)
+  await storage.closeTask(task.id, params.reason, getActor());
+
+  // Clean up container, remote resources, and worktree
+  if (sess) {
+    await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
+
+    try {
+      const config = await loadConfig(projectRoot);
+      const driver = createDriver(config);
+      await driver.cleanup(sess.git_branch);
+    } catch (err) {
+      logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    }
+
+    await removeLock(worktreePath);
+    await cleanupWorktree(worktreePath, projectRoot);
+  }
+
+  // Clean up protocol dir
+  removeProtocolDir(getProtocolDir(task.id));
+
+  return {
+    taskId: task.id,
+    displayId: displayId(task),
+    branchName: sess?.git_branch ?? null,
+    parentTaskId: task.parent_task_id,
+    warnings,
+  };
+}
+
+// =====================================================================
+// Accept Task — pre-flight validation only
+// =====================================================================
+
+/**
+ * Accept task pre-flight validation.
+ *
+ * Accept is the most complex lifecycle operation because it involves
+ * remote driver merges, conflict detection, CI check polling, and
+ * continuation task creation — all of which have heavy CLI interaction.
+ *
+ * Rather than moving the ENTIRE accept flow into daemon, we move just
+ * the pre-flight validation and early state checks. The merge orchestration
+ * stays CLI-side because it's deeply intertwined with interactive prompts
+ * (sync-with-upstream confirmation, PR creation, wait-for-CI polling).
+ */
+
+export interface AcceptTaskPreflightParams {
+  taskId: string;
+  approvedFiles?: string[];
+  acceptDirtyWorktree?: boolean;
+}
+
+export interface AcceptTaskPreflightResult {
+  taskId: string;
+  fullTaskId: string;
+  displayId: string;
+  worktreePath: string;
+  branchName: string;
+  sessionId: string;
+  parentTaskId: string | null;
+  mergeTargetBranch: string;
+  isChildTask: boolean;
+  parentDisplayId: string | null;
+  taskStatus: string;
+  commitCount: number;
+  /** Task metadata (includes remote refs etc.) */
+  metadata: Record<string, string>;
+  warnings: string[];
+}
+
+export async function acceptTaskPreflight(
+  projectRoot: string,
+  params: AcceptTaskPreflightParams,
+): Promise<AcceptTaskPreflightResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+  const config = await loadConfig(projectRoot);
+
+  // --- Resolve task ---
+  const resolveResult = await storage.resolveTask(params.taskId);
+  if (!resolveResult.task) {
+    if (resolveResult.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolveResult.task;
+
+  // --- Session check (needed early for branch name during worktree recovery) ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+  }
+
+  // --- Worktree recovery + uncommitted changes check ---
+  const worktreePath = getWorktreePath(projectRoot, task);
+  if (!await pathExists(worktreePath)) {
+    // Worktree is gone — try to recover from local or remote branch
+    const branchName = sess.git_branch;
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, branchName, config.remote.git_remote, projectRoot,
+      );
+      if (!recovery.recovered) {
+        throw new RpcError(400,
+          `Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+      }
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError(400,
+        `Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  if (!params.acceptDirtyWorktree) {
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'accept');
+  }
+  if (sess.outcome === 'accepted') {
+    throw new RpcError(409, `Task ${displayId(task)} was already accepted.`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
+  }
+
+  // --- Status validation ---
+  if (task.status === 'pairing') {
+    throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
+  }
+
+  if (!isBlockedStatus(task.status) && task.status !== 'merging') {
+    if (task.status === 'interrupted') {
+      throw new RpcError(409, `Task ${displayId(task)} is interrupted. Resume it first: lazy resume ${displayId(task)}`);
+    } else if (task.status === 'working') {
+      throw new RpcError(409, `Task ${displayId(task)} is still working. Wait for it to finish.`);
+    } else {
+      throw new RpcError(409, `Task ${displayId(task)} is in state '${task.status}' and cannot be accepted.`);
+    }
+  }
+
+  // --- File violation checks ---
+  const turns = await storage.getSessionTurns(sess.id);
+  const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+  if (lastAgentTurn?.violations?.some(v => v.status === 'pending')) {
+    const pendingFiles = lastAgentTurn.violations
+      .filter(v => v.status === 'pending')
+      .map(v => v.file);
+
+    const approvedFiles = params.approvedFiles ?? [];
+
+    if (approvedFiles.length === 0) {
+      throw new RpcError(409, `Task ${displayId(task)} has unresolved file permission violations: ${pendingFiles.join(', ')}. Use --approve-file to approve each file.`);
+    }
+
+    const approvedSet = new Set(approvedFiles);
+    const missingFiles = pendingFiles.filter(f => !approvedSet.has(f));
+
+    if (missingFiles.length > 0) {
+      throw new RpcError(409, `Missing approval for violated file(s): ${missingFiles.join(', ')}. All violated files must be approved.`);
+    }
+
+    // Mark all pending violations as approved
+    const updatedViolations: FileViolation[] = lastAgentTurn.violations.map(v => ({
+      ...v,
+      status: v.status === 'pending' ? 'approved' as const : v.status,
+    }));
+    await storage.updateTurnViolations(task.id, lastAgentTurn.id, updatedViolations);
+    warnings.push(`Approved ${pendingFiles.length} protected file change(s): ${pendingFiles.join(', ')}`);
+  }
+
+  // --- Pairing lock check ---
+  checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
+
+  // --- Check for zero commits ---
+  const commits = await storage.getSessionCommits(sess.id);
+  if (commits.length === 0) {
+    throw new RpcError(409, `Task ${displayId(task)} has no commits. Nothing to merge. Use 'lazy close' instead.`);
+  }
+
+  // --- Determine merge target ---
+  let mergeTargetBranch: string;
+  let parentDisplayId: string | null = null;
+  let parentTask: Task | null = null;
+  const isChildTask = !!task.parent_task_id;
+
+  if (task.parent_task_id) {
+    parentTask = await storage.getTask(task.parent_task_id);
+    if (!parentTask) {
+      throw new RpcError(400, `Parent task ${task.parent_task_id} not found`);
+    }
+
+    // Refuse to merge into active parent
+    if (isActiveStatus(parentTask.status)) {
+      throw new RpcError(409, `Parent task ${displayId(parentTask)} is currently ${parentTask.status}. Wait for it to become blocked.`);
+    }
+
+    parentDisplayId = displayId(parentTask);
+    mergeTargetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+  } else {
+    const { resolveDetachedHead } = await import('../git/operations');
+    mergeTargetBranch = await resolveDetachedHead(task.metadata?.remote_target_branch ?? 'main', projectRoot, config.remote.git_remote);
+  }
+
+  // --- Branch sync validation (root tasks with remote driver) ---
+  if (!isChildTask) {
+    const driver = createDriver(config);
+    if (driver.needsSync) {
+      const syncCheck = await validateBranchInSyncWithRemote(mergeTargetBranch, config.remote.git_remote, projectRoot);
+      if (!syncCheck.inSync) {
+        throw new RpcError(409, `${syncCheck.error} Fix this before accepting to avoid a half-merged state.`);
+      }
+    }
+  }
+
+  return {
+    taskId: params.taskId,
+    fullTaskId: task.id,
+    displayId: displayId(task),
+    worktreePath,
+    branchName: sess.git_branch,
+    sessionId: sess.id,
+    parentTaskId: task.parent_task_id,
+    mergeTargetBranch,
+    isChildTask,
+    parentDisplayId,
+    taskStatus: task.status,
+    commitCount: commits.length,
+    metadata: task.metadata ?? {},
+    warnings,
+  };
+}
+
+// =====================================================================
+// Accept Task — full orchestration (preflight + merge + cleanup)
+// =====================================================================
+
+export interface AcceptTaskParams {
+  taskId: string;
+  reason?: string;
+  approvedFiles?: string[];
+  acceptDirtyWorktree?: boolean;
+}
+
+export interface AcceptTaskResult {
+  taskId: string;
+  displayId: string;
+  status: 'merged' | 'pending';
+  reason?: string;
+  prUrl?: string;
+  warnings: string[];
+}
+
+/**
+ * Accept a task: validate, merge to parent/target, and complete.
+ *
+ * This is the full accept orchestration — everything commandAccept does minus
+ * interactive prompts and console output. Follows the reference implementation
+ * in src/cli/commands/accept.ts.
+ *
+ * Flow:
+ * 1. Run preflight validation (status, session, uncommitted, violations, etc.)
+ * 2. Auto-create remote ref if needed (push branch + create PR)
+ * 3. Check pre-merge gates (CI status, required reviews, etc.)
+ * 4. Push parent branch local commits to remote (INVARIANT)
+ * 5. driver.merge() — attempt merge via remote driver
+ * 6. Handle result: failed (conflict → error with sync hint), pending (set merging status), merged (cleanup)
+ * 7. Fast-forward local branch, end session, post review
+ * 8. Reparent children, cleanup worktree/container/protocol
+ */
+export async function acceptTask(
+  projectRoot: string,
+  params: AcceptTaskParams,
+): Promise<AcceptTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+  const config = await loadConfig(projectRoot);
+  const driver = createDriver(config);
+
+  // --- Step 1: Pre-flight validation ---
+  const preflight = await acceptTaskPreflight(projectRoot, {
+    taskId: params.taskId,
+    approvedFiles: params.approvedFiles,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+
+  warnings.push(...preflight.warnings);
+
+  // Resolve task (need full object for driver operations)
+  const resolveResult = await storage.resolveTask(params.taskId);
+  if (!resolveResult.task) {
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolveResult.task;
+
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${preflight.displayId} has no session.`);
+  }
+
+  const worktreePath = preflight.worktreePath;
+  const mergeTargetBranch = preflight.mergeTargetBranch;
+  const isChildTask = preflight.isChildTask;
+  const reason = params.reason?.trim() || 'LGTM';
+
+  // --- Step 1b: Handle re-entry for tasks already in 'merging' state ---
+  // When a task is already merging (from a previous accept), check if the
+  // remote merge completed. This handles the common case where CI checks
+  // pass and the PR merges while the user is away.
+  if (preflight.taskStatus === 'merging') {
+    const prState = await driver.getPRState(task);
+
+    if (prState === 'MERGED') {
+      // Remote merge completed — fast-forward local and finalize
+      const { resolveDetachedHead } = await import('../git/operations');
+      const resolvedMergeTarget = await resolveDetachedHead(
+        task.metadata?.remote_target_branch ?? mergeTargetBranch,
+        projectRoot,
+        config.remote.git_remote,
+      );
+
+      const ffResult = await driver.fastForwardLocal(resolvedMergeTarget, projectRoot);
+      if (!ffResult.success) {
+        throw new RpcError(500, `${ffResult.warning || 'Failed to fast-forward local branch'}. The remote merge succeeded, but the local ${resolvedMergeTarget} branch could not be updated.`);
+      }
+      if (ffResult.warning) {
+        warnings.push(ffResult.warning);
+      }
+
+      await storage.endSession(sess.id, 'accepted');
+      await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+      const reparented = await reparentChildren(task, storage);
+      for (const child of reparented) {
+        await storage.incrementTaskPendingSync(child.id);
+      }
+
+      await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
+      await removeLock(worktreePath);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+      removeProtocolDir(getProtocolDir(task.id));
+
+      const prUrl = await driver.getTaskUrl(task);
+      return {
+        taskId: task.id,
+        displayId: preflight.displayId,
+        status: 'merged',
+        prUrl: prUrl ?? undefined,
+        warnings,
+      };
+    }
+
+    if (prState === 'CLOSED') {
+      throw new RpcError(409, `The merge request was closed externally. Use 'lazy close ${preflight.displayId}' to close the task, or reopen the MR/PR and re-run 'lazy accept ${preflight.displayId}'.`);
+    }
+
+    // PR is still open — check CI status
+    const checksStatus = await driver.getChecksStatus(task);
+
+    if (checksStatus.status === 'failed') {
+      const failedDetails = checksStatus.failed
+        .map(f => f.url ? `${f.name} (${f.url})` : f.name)
+        .join('; ');
+      await storage.updateTaskStatus(task.id, 'blocked', getActor());
+      await storage.createComment(task.id, `Pipeline/checks failed: ${failedDetails}. Task moved back to blocked.`, getActor());
+      throw new RpcError(409, `Pipeline/checks failed: ${failedDetails}. Task moved back to blocked. Fix the issue, then re-accept.`);
+    }
+
+    if (checksStatus.status === 'pending') {
+      // If --wait was requested, the CLI can poll. For the RPC, just report pending.
+      const prUrl = await driver.getTaskUrl(task);
+      return {
+        taskId: task.id,
+        displayId: preflight.displayId,
+        status: 'pending',
+        reason: 'CI checks still running',
+        prUrl: prUrl ?? undefined,
+        warnings,
+      };
+    }
+
+    // Checks passed but merge didn't happen yet — retry merge
+    const retryResult = await driver.merge({
+      sourceBranch: sess.git_branch,
+      targetBranch: mergeTargetBranch,
+      task,
+      taskShortId: taskRef(task),
+      root: projectRoot,
+    });
+
+    if (retryResult.metadata) {
+      for (const [key, value] of Object.entries(retryResult.metadata)) {
+        await storage.updateTaskMetadata(task.id, key, value);
+      }
+      if (!task.metadata) task.metadata = {};
+      Object.assign(task.metadata, retryResult.metadata);
+    }
+
+    if (retryResult.status === 'merged') {
+      const { resolveDetachedHead } = await import('../git/operations');
+      const resolvedMergeTarget = await resolveDetachedHead(
+        task.metadata?.remote_target_branch ?? mergeTargetBranch,
+        projectRoot,
+        config.remote.git_remote,
+      );
+
+      const ffResult = await driver.fastForwardLocal(resolvedMergeTarget, projectRoot);
+      if (!ffResult.success) {
+        throw new RpcError(500, `${ffResult.warning || 'Failed to fast-forward local branch'}`);
+      }
+      if (ffResult.warning) warnings.push(ffResult.warning);
+
+      await storage.endSession(sess.id, 'accepted');
+      await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+      const reparented = await reparentChildren(task, storage);
+      for (const child of reparented) {
+        await storage.incrementTaskPendingSync(child.id);
+      }
+
+      await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
+      await removeLock(worktreePath);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+      removeProtocolDir(getProtocolDir(task.id));
+
+      const prUrl = await driver.getTaskUrl(task);
+      return {
+        taskId: task.id,
+        displayId: preflight.displayId,
+        status: 'merged',
+        prUrl: prUrl ?? undefined,
+        warnings,
+      };
+    }
+
+    if (retryResult.status === 'pending') {
+      const prUrl = await driver.getTaskUrl(task);
+      return {
+        taskId: task.id,
+        displayId: preflight.displayId,
+        status: 'pending',
+        reason: retryResult.reason,
+        prUrl: prUrl ?? undefined,
+        warnings,
+      };
+    }
+
+    // Failed
+    throw new RpcError(500, `Merge failed: ${retryResult.error}`);
+  }
+
+  // --- Step 1c: Protected branch gate ---
+  // Check if the target branch has protection rules requiring approval.
+  // This must happen before auto-creating a PR (step 2) to avoid creating
+  // orphan PRs when the accept will be refused anyway.
+  let targetIsProtected = false;
+  if (driver.needsSync) {
+    targetIsProtected = await driver.isTargetBranchProtected(mergeTargetBranch);
+    if (targetIsProtected && !config.remote.auto_approve) {
+      // Without auto_approve, we need an existing external approval to proceed
+      const hasApproval = driver.hasRemoteRef(task) && await driver.hasExternalApproval(task);
+      if (!hasApproval) {
+        throw new RpcError(409,
+          `Branch \`${mergeTargetBranch}\` has protection rules requiring approval. ` +
+          `Use \`lazy submit\` to create an MR for external review. ` +
+          `After the MR is approved, run \`lazy accept\` to merge.`);
+      }
+    }
+  }
+
+  // --- Step 2: Auto-create remote ref if needed ---
+  const acceptError = driver.validateAccept(task);
+  if (acceptError) {
+    logger.debug('No remote reference found — pushing branch and creating PR...');
+    try {
+      await driver.pushBranch(sess.git_branch);
+      const prResult = await driver.markReadyForReview(task);
+      if (prResult.metadata) {
+        for (const [key, value] of Object.entries(prResult.metadata)) {
+          await storage.updateTaskMetadata(task.id, key, value);
+        }
+        if (!task.metadata) task.metadata = {};
+        Object.assign(task.metadata, prResult.metadata);
+      }
+      const retryError = driver.validateAccept(task);
+      if (retryError) {
+        throw new RpcError(500, 'Failed to create remote reference. Try running: lazy submit');
+      }
+    } catch (err) {
+      throw new RpcError(500, `Failed to push branch and create PR: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // --- Step 2b: Auto-approve if configured and branch is protected ---
+  // Submit an approving review before gate checks so the approval is visible.
+  if (targetIsProtected && config.remote.auto_approve) {
+    const approvalWarning = await driver.postAcceptReview(task, reason);
+    if (approvalWarning) {
+      warnings.push(`Auto-approve warning: ${approvalWarning}`);
+    }
+  }
+
+  // --- Step 3: Check pre-merge gates ---
+  const gateWarnings = await driver.checkAcceptGates(task);
+  // When auto_approve is set and we've just submitted an approval, skip the
+  // reviews gate — the approval may not have propagated to the API yet.
+  const effectiveWarnings = (targetIsProtected && config.remote.auto_approve)
+    ? gateWarnings.filter(w => w.gate !== 'reviews')
+    : gateWarnings;
+  if (effectiveWarnings.length > 0) {
+    const prUrl = await driver.getTaskUrl(task);
+    const gateMessages = effectiveWarnings.map(w => w.message).join('; ');
+    throw new RpcError(409, `Merge blocked by pre-merge gates: ${gateMessages}. ${prUrl ? `Resolve on PR: ${prUrl}` : ''}`);
+  }
+
+  // --- Step 4: Push parent branch local commits (INVARIANT) ---
+  // If the parent has local-only commits and the remote merge succeeds without them,
+  // the remote parent will have the merge commit but not the local commits, causing divergence.
+  if (driver.needsSync) {
+    try {
+      await driver.pushBranch(mergeTargetBranch);
+    } catch (err) {
+      throw new RpcError(500, `Failed to push ${mergeTargetBranch} to remote: ${err instanceof Error ? err.message : err}. The parent branch has local commits that must be pushed before merging.`);
+    }
+  }
+
+  // --- Step 5: Attempt merge via driver ---
+  let result = await driver.merge({
+    sourceBranch: sess.git_branch,
+    targetBranch: mergeTargetBranch,
+    task,
+    taskShortId: taskRef(task),
+    root: projectRoot,
+  });
+
+  // Always persist metadata immediately
+  if (result.metadata) {
+    for (const [key, value] of Object.entries(result.metadata)) {
+      await storage.updateTaskMetadata(task.id, key, value);
+    }
+    if (!task.metadata) task.metadata = {};
+    Object.assign(task.metadata, result.metadata);
+  }
+
+  // --- Step 6: Handle merge result ---
+  if (result.status === 'failed') {
+    if (result.isConflict) {
+      // Conflict detected — agent needs to sync and resolve
+      throw new RpcError(409, `${result.error}\nThe agent needs to merge upstream and resolve conflicts first. Run: lazy sync ${preflight.displayId}`);
+    } else {
+      throw new RpcError(500, `Merge failed: ${result.error}`);
+    }
+  }
+
+  if (result.status === 'pending') {
+    // Merge is pending (waiting for CI, manual merge, etc.)
+    await storage.updateTaskStatus(task.id, 'merging', getActor());
+    await storage.createComment(task.id, `[Accepted] ${reason}`, getActor());
+
+    const reviewWarning = await driver.postAcceptReview(task, reason);
+    if (reviewWarning) {
+      warnings.push(`Review warning: ${reviewWarning}`);
+    }
+
+    const prUrl = await driver.getTaskUrl(task);
+    return {
+      taskId: task.id,
+      displayId: preflight.displayId,
+      status: 'pending',
+      reason: result.reason,
+      prUrl: prUrl ?? undefined,
+      warnings,
+    };
+  }
+
+  // --- Step 7: Merge succeeded — fast-forward local and finalize ---
+  const { resolveDetachedHead } = await import('../git/operations');
+  const resolvedMergeTarget = await resolveDetachedHead(
+    task.metadata?.remote_target_branch ?? mergeTargetBranch,
+    projectRoot,
+    config.remote.git_remote,
+  );
+
+  const ffResult = await driver.fastForwardLocal(resolvedMergeTarget, projectRoot);
+  if (!ffResult.success) {
+    throw new RpcError(500, `${ffResult.warning || 'Failed to fast-forward local branch'}. The remote merge succeeded, but the local ${resolvedMergeTarget} branch could not be updated.`);
+  }
+  if (ffResult.warning) {
+    warnings.push(ffResult.warning);
+  }
+
+  // End session, create comment, post review
+  await storage.endSession(sess.id, 'accepted');
+  await storage.createComment(task.id, `[Accepted] ${reason}`, getActor());
+
+  const reviewWarning = await driver.postAcceptReview(task, reason);
+  if (reviewWarning) {
+    warnings.push(`Review warning: ${reviewWarning}`);
+  }
+
+  // Transition: merging → complete
+  await storage.updateTaskStatus(task.id, 'merging', getActor());
+  await storage.updateTaskStatus(task.id, 'complete', getActor());
+
+  // --- Step 8: Cleanup and reparent children ---
+  const reparented = await reparentChildren(task, storage);
+  // Mark reparented children for sync so the daemon merges the accepted
+  // parent's changes into their worktrees. Without this, the branch
+  // deletion after accept prevents detectParentBranchChanges() from
+  // triggering a sync automatically.
+  for (const child of reparented) {
+    await storage.incrementTaskPendingSync(child.id);
+  }
+
+  await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
+  await removeLock(worktreePath);
+  await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+  removeProtocolDir(getProtocolDir(task.id));
+
+  const prUrl = await driver.getTaskUrl(task);
+  return {
+    taskId: task.id,
+    displayId: preflight.displayId,
+    status: 'merged',
+    prUrl: prUrl ?? undefined,
+    warnings,
+  };
+}
+
+// =====================================================================
+// Sync Task — task-level upstream merge as standalone operation
+// =====================================================================
+
+export interface SyncTaskParams {
+  taskId: string;
+}
+
+export interface SyncTaskResult {
+  taskId: string;
+  displayId: string;
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync';
+  message: string;
+  warnings: string[];
+}
+
+/**
+ * Sync a task's worktree with its upstream (parent) branch.
+ *
+ * Flow:
+ * 1. Resolve task, validate it's in a syncable state (blocked/conflict/interrupted — not working)
+ * 2. Determine parent branch (same logic as unblock)
+ * 3. Attempt git fetch for the upstream ref
+ * 4. If fetch fails → set pending_sync metadata, return warning
+ * 5. If fetch succeeds and upstream has changes → launch supervisor with sync command
+ * 6. If no upstream changes → clear pending_sync, return "Already up to date"
+ * 7. On successful merge → clear pending_sync
+ */
+export async function syncTask(
+  projectRoot: string,
+  params: SyncTaskParams,
+): Promise<SyncTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const result = await storage.resolveTask(params.taskId);
+  if (!result.task) {
+    if (result.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'. Matches: ${result.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = result.task;
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session has ended. Cannot sync a completed task.`);
+  }
+
+  // --- Status validation ---
+  if (task.status === 'working') {
+    throw new RpcError(409, `Task ${displayId(task)} is currently working. Cannot sync while agent is running.`);
+  }
+  if (isTerminalStatus(task.status)) {
+    throw new RpcError(409, `Task ${displayId(task)} is ${task.status}. Cannot sync a terminal task.`);
+  }
+  if (task.status === 'backlog') {
+    throw new RpcError(409, `Task ${displayId(task)} is in backlog. Start it first with: lazy start ${displayId(task)}`);
+  }
+
+  // --- Pairing lock check ---
+  const tRef = taskRef(task);
+  checkPairingLockOrThrow(projectRoot, tRef, displayId(task));
+
+  // --- Worktree check ---
+  const worktreePath = getWorktreePathForRef(projectRoot, tRef);
+  if (!await pathExists(worktreePath)) {
+    // Worktree is gone — try to recover from local or remote branch
+    const branchName = sess.git_branch;
+    const syncConfig = await loadConfig(projectRoot);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, branchName, syncConfig.remote.git_remote, projectRoot,
+      );
+      if (!recovery.recovered) {
+        throw new RpcError(400,
+          `Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+      }
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError(400,
+        `Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Check for concurrent session lock
+  const existingLock = await checkLock(worktreePath);
+  if (existingLock) {
+    throw new RpcError(409, `Task ${shortId(task.id)} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
+  }
+
+  // --- Determine parent branch ---
+  let parentBranch: string | null = null;
+  if (task.parent_task_id) {
+    parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
+  } else {
+    parentBranch = task.metadata?.remote_target_branch ?? await getCurrentBranch(projectRoot);
+  }
+
+  if (!parentBranch) {
+    throw new RpcError(400, `Cannot determine parent branch for task ${displayId(task)}.`);
+  }
+
+  // --- Attempt to fetch upstream ref ---
+  const config = await loadConfig(projectRoot, { cwd: worktreePath });
+  let resolvedParentBranch = parentBranch;
+  try {
+    const driver = createDriver(config);
+    resolvedParentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
+  } catch (err) {
+    // Fetch failed — increment pending_sync so retry loop picks it up
+    logger.warn(`Sync fetch failed for ${parentBranch}: ${err instanceof Error ? err.message : err}`);
+    await storage.incrementTaskPendingSync(task.id);
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'pending_sync',
+      message: `Fetch failed for upstream branch ${parentBranch}. Marked for retry.`,
+      warnings: [`Fetch failed: ${err instanceof Error ? err.message : err}`],
+    };
+  }
+
+  // --- Check if upstream has changes ---
+  if (!await hasUpstreamChanges(resolvedParentBranch, worktreePath)) {
+    // No changes — reset counter (we've checked, nothing to do)
+    await storage.resetTaskPendingSync(task.id);
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'up_to_date',
+      message: 'Already up to date.',
+      warnings,
+    };
+  }
+
+  // --- Upstream has changes: launch supervisor with sync command ---
+  // Reset counter to 0 ("acting on everything up to now"). If new signals arrive
+  // while the merge is running, they'll increment the counter above 0, telling the
+  // completion handler that another sync is needed.
+  await storage.resetTaskPendingSync(task.id);
+
+  await acquireLock(worktreePath, 'lazy sync');
+
+  try {
+    const runner = await createRunner(projectRoot);
+    // Set agent on runner so auth uses the correct agent (not hardcoded ClaudeCodeAgent)
+    if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
+      (runner as any).setAgent(getAgent(task.agent_id));
+    }
+    runner.checkAvailability();
+
+    const containerName = runner.runNameForTask(tRef);
+    const sandbox: SandboxConfig = {
+      worktreePath,
+      sandboxPath: join(worktreePath, SANDBOX_DIR),
+    };
+
+    const protoDir = getProtocolDir(task.id);
+    ensureProtocolDir(protoDir);
+
+    // Write a sync command — semantically distinct from start/unblock
+    const syncCommand: SyncCommand = {
+      type: 'sync',
+      task_id: task.id,
+      parent_branch: resolvedParentBranch,
+      agent_session_id: sess.agent_session_id ?? undefined,
+      model_id: task.model ?? undefined,
+    };
+    writeCommand(protoDir, syncCommand);
+
+    // Generate daemon MCP config if needed
+    let daemonConfigPath: string | null = null;
+    if (runner.usesSandbox()) {
+      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
+    }
+
+    // Launch or reuse supervisor
+    if (runner.isRunning(containerName)) {
+      // Supervisor already running — it will pick up the new command
+    } else {
+      runner.removeRun(containerName);
+
+      try {
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+      } catch (err) {
+        throw new RpcError(500, `Failed to launch supervisor for sync: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // NOTE: pending_sync is NOT cleared here. It stays true until:
+    // - The supervisor completes the merge and writes a 'completed' response
+    // - The daemon's turn-completion handler clears it
+    // This ensures that if the supervisor crashes, pending_sync stays true for retry.
+
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'sync_launched',
+      message: `Upstream merge launched. Branch ${resolvedParentBranch} has changes to merge.`,
+      warnings,
+    };
+  } finally {
+    await removeLock(worktreePath);
+  }
+}
+
+// =====================================================================
+// Submit Task — create/update PR and transition to submitted
+// =====================================================================
+
+export interface SubmitTaskParams {
+  taskId: string;
+}
+
+export interface SubmitTaskResult {
+  taskId: string;
+  displayId: string;
+  prUrl: string | null;
+  warnings: string[];
+}
+
+/**
+ * Submit a task for review by creating/updating a PR on the remote.
+ *
+ * Pre-conditions:
+ * - Task must be in blocked or conflict status
+ * - Task must have at least one session commit (non-empty diff)
+ * - Remote driver must be configured (not local-only)
+ *
+ * Side effects:
+ * - Pushes the task branch to remote
+ * - Creates or updates a PR via driver.markReadyForReview()
+ * - Transitions task from blocked/conflict → submitted
+ */
+export async function submitTask(
+  projectRoot: string,
+  params: SubmitTaskParams,
+): Promise<SubmitTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const resolveResult = await storage.resolveTask(params.taskId);
+  if (!resolveResult.task) {
+    if (resolveResult.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolveResult.task;
+
+  // --- Status validation ---
+  if (task.status !== 'blocked' && task.status !== 'conflict') {
+    throw new RpcError(409, `Task ${displayId(task)} is ${task.status}. Only blocked or conflict tasks can be submitted.`);
+  }
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session.`);
+  }
+
+  // --- Non-empty diff check ---
+  const commits = await storage.getSessionCommits(sess.id);
+  if (commits.length === 0) {
+    throw new RpcError(400, `Task ${displayId(task)} has no commits. Nothing to submit for review.`);
+  }
+
+  // --- Remote driver check ---
+  const config = await loadConfig(projectRoot);
+  let driver;
+  try {
+    driver = createDriver(config);
+  } catch {
+    throw new RpcError(400, 'No remote driver configured. Set [remote] driver in lazy.toml to use submit.');
+  }
+
+  if (!driver.needsSync) {
+    throw new RpcError(400, 'Submit requires a remote driver (e.g., github). Local driver has no remote to create PRs on.');
+  }
+
+  // --- Push branch ---
+  try {
+    await driver.pushBranch(sess.git_branch);
+  } catch (err) {
+    throw new RpcError(500, `Failed to push branch ${sess.git_branch}: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // --- Create/update PR ---
+  let prUrl: string | null = null;
+  try {
+    const prResult = await driver.markReadyForReview(task);
+    if (prResult.metadata) {
+      for (const [key, value] of Object.entries(prResult.metadata)) {
+        await storage.updateTaskMetadata(task.id, key, value);
+      }
+      // Update in-memory metadata for getTaskUrl
+      if (!task.metadata) task.metadata = {};
+      Object.assign(task.metadata, prResult.metadata);
+    }
+
+    // Safety net: ensure remote ref metadata was persisted. If markReadyForReview
+    // created a PR but failed to return its ID (e.g., glab output parsing failure),
+    // the task would be stuck in submitted with no way to detect merge completion.
+    if (!driver.hasRemoteRef(task)) {
+      const recovered = await driver.recoverRemoteRef(task);
+      if (recovered) {
+        for (const [key, value] of Object.entries(recovered)) {
+          await storage.updateTaskMetadata(task.id, key, value);
+        }
+        if (!task.metadata) task.metadata = {};
+        Object.assign(task.metadata, recovered);
+        logger.warn(`submitTask ${displayId(task)}: recovered missing remote ref metadata after markReadyForReview`);
+      } else {
+        logger.warn(`submitTask ${displayId(task)}: no remote ref metadata after markReadyForReview — merge detection will not work until next sync`);
+      }
+    }
+
+    prUrl = await driver.getTaskUrl(task);
+  } catch (err) {
+    throw new RpcError(500, `Failed to create/update PR: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // --- Transition to submitted ---
+  await storage.updateTaskStatus(task.id, 'submitted', getActor());
+  await storage.createComment(task.id, `[Submitted] Task submitted for review${prUrl ? `: ${prUrl}` : ''}`, getActor());
+
+  return {
+    taskId: task.id,
+    displayId: displayId(task),
+    prUrl,
+    warnings,
+  };
+}
+
+// =====================================================================
+// Resume Task — restart an interrupted task
+// =====================================================================
+
+export interface ResumeTaskParams {
+  taskId: string;
+  modelOverride?: string;
+}
+
+export interface ResumeTaskResult {
+  sessionId: string;
+  containerName: string;
+  worktreePath: string;
+  branchName: string;
+  runnerType: string;
+  runnerLabel: string;
+  runnerDisplayName: string;
+  warnings: string[];
+}
+
+/**
+ * Search the sandbox .claude directory for a Claude session ID.
+ * Claude Code stores session data in ~/.claude/projects/<hash>/ as JSON files.
+ * Returns the most recent session ID found, or null if none.
+ */
+async function findClaudeSessionId(sandboxPath: string): Promise<string | null> {
+  const claudeDir = join(sandboxPath, '.claude');
+  if (!await pathExists(claudeDir)) return null;
+
+  try {
+    const projectsDir = join(claudeDir, 'projects');
+    if (!await pathExists(projectsDir)) return null;
+
+    const allEntries = await readdir(projectsDir);
+    const projectDirs: string[] = [];
+    for (const d of allEntries) {
+      try {
+        const entries = await readdir(join(projectsDir, d));
+        if (entries.length > 0) projectDirs.push(d);
+      } catch { /* skip unreadable dirs */ }
+    }
+
+    for (const projDir of projectDirs) {
+      const projPath = join(projectsDir, projDir);
+      const allFiles = await readdir(projPath);
+      const jsonFiles = allFiles.filter(f => f.endsWith('.json'));
+
+      for (const file of jsonFiles) {
+        try {
+          const content = await readFile(join(projPath, file), 'utf-8');
+          const data = JSON.parse(content);
+          if (data.sessionId) return data.sessionId;
+          if (data.session_id) return data.session_id;
+          if (data.id && typeof data.id === 'string') return data.id;
+        } catch {
+          // Skip files that can't be parsed
+        }
+      }
+    }
+  } catch {
+    // Ignore errors searching
+  }
+
+  return null;
+}
+
+/**
+ * Build the static system prompt for task resume (after interruption).
+ */
+export function buildSystemPromptForResume(runnerInstructions?: string): string {
+  let prompt = lazyToolInstructions + '\n' + systemInstructionsResumeText;
+  if (runnerInstructions) {
+    prompt += '\n' + runnerInstructions;
+  }
+  return prompt;
+}
+
+/**
+ * Build the dynamic user prompt for resuming after interruption.
+ */
+export function buildResumePrompt(goal: string): string {
+  const goalContext = goalContextResumeText.replace(/\{\{goal\}\}/g, goal) + '\n\n';
+  const resumeContext = resumeContextText + '\n';
+  return goalContext + resumeContext;
+}
+
+/**
+ * Resume an interrupted task.
+ *
+ * Pre-conditions:
+ * - Task must be in 'interrupted' status
+ * - Task must have an active (non-ended) session
+ *
+ * Side effects:
+ * - Recovers worktree if missing
+ * - Sets up sandbox, resolves model, discovers Claude session ID
+ * - Creates synthetic human turn for the resume
+ * - Transitions task to 'working'
+ * - Writes protocol command and launches supervisor
+ * - Resets circuit breaker and auto-react counters
+ */
+export async function resumeTask(
+  projectRoot: string,
+  params: ResumeTaskParams,
+): Promise<ResumeTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const result = await storage.resolveTask(params.taskId);
+  if (!result.task) {
+    if (result.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = result.task;
+
+  // --- Status validation ---
+  if (task.status !== 'interrupted') {
+    if (task.status === 'blocked' || task.status === 'conflict') {
+      throw new RpcError(409, `Task ${displayId(task)} is not interrupted (status: ${task.status}). Use 'lazy unblock ${displayId(task)}' to continue.`);
+    } else if (task.status === 'working') {
+      throw new RpcError(409, `Task ${displayId(task)} is still working. Use 'lazy blocked' to check when it finishes.`);
+    } else {
+      throw new RpcError(409, `Task ${displayId(task)} is not interrupted (status: ${task.status}).`);
+    }
+  }
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session.`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session has ended. Create a variant with: lazy branch ${displayId(task)}`);
+  }
+
+  const tRef = taskRef(task);
+
+  // --- Pairing lock check ---
+  checkPairingLockOrThrow(projectRoot, tRef, displayId(task));
+
+  // --- Runner pre-flight ---
+  const runner = await createRunner(projectRoot);
+  if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
+    (runner as any).setAgent(getAgent(task.agent_id));
+  }
+  runner.checkAvailability();
+
+  // --- Worktree recovery ---
+  const worktreePath = getWorktreePathForRef(projectRoot, tRef);
+
+  if (!await pathExists(worktreePath)) {
+    const branchName = sess.git_branch;
+    const resumeConfig = await loadConfig(projectRoot);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, branchName, resumeConfig.remote.git_remote, projectRoot,
+      );
+      if (!recovery.recovered) {
+        throw new RpcError(400,
+          `Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+      }
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError(400,
+        `Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // --- Lock check ---
+  const existingLock = await checkLock(worktreePath);
+  if (existingLock) {
+    throw new RpcError(409, `Task ${shortId(task.id)} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
+  }
+
+  await acquireLock(worktreePath, 'lazy resume');
+
+  const containerName = runner.runNameForTask(tRef);
+
+  try {
+    const config = await loadConfig(projectRoot, { cwd: worktreePath });
+
+    // Ensure sandbox exists
+    const sandboxPath = join(worktreePath, SANDBOX_DIR);
+    const claudeDir = join(sandboxPath, '.claude');
+    await mkdir(claudeDir, { recursive: true });
+
+    const hostGitconfig = join(getHome(), '.gitconfig');
+    const sandboxGitconfig = join(sandboxPath, '.gitconfig');
+    if (await dirExists(sandboxGitconfig)) {
+      await rm(sandboxGitconfig, { recursive: true });
+    }
+    if (await pathExists(hostGitconfig)) {
+      await copyFile(hostGitconfig, sandboxGitconfig);
+    } else {
+      await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
+    }
+
+    const sandbox: SandboxConfig = { worktreePath, sandboxPath };
+
+    // --- Model resolution ---
+    let stickyModel: string | undefined;
+    if (!params.modelOverride) {
+      const existingTurns = await storage.getSessionTurns(sess.id);
+      for (let i = existingTurns.length - 1; i >= 0; i--) {
+        if (existingTurns[i].model) {
+          stickyModel = existingTurns[i].model;
+          break;
+        }
+      }
+    }
+    // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
+    // model names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
+      ? config.ollama.model
+      : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
+    const modelId = modelName;
+
+    if (!task.model) {
+      await storage.updateTaskModel(task.id, modelName);
+    }
+
+    // --- Claude session ID discovery ---
+    let claudeSessionId = sess.agent_session_id;
+    if (!claudeSessionId) {
+      claudeSessionId = await findClaudeSessionId(sandboxPath);
+      if (claudeSessionId) {
+        await storage.updateSessionClaudeId(sess.id, claudeSessionId);
+      }
+    }
+
+    // --- Build prompts ---
+    const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions());
+    const fullPrompt = buildResumePrompt(task.goal);
+
+    // --- Persist state BEFORE launch ---
+    const nextSeq = await storage.getNextTurnSequence(sess.id);
+    await storage.createTurn({
+      sessionId: sess.id,
+      sequence: nextSeq,
+      role: 'human',
+      content: '[system] Session interrupted and resumed',
+      model: modelName,
+      actor: getActor(),
+    });
+
+    await storage.updateTaskStatus(task.id, 'working', getActor());
+
+    // --- Write command and launch supervisor ---
+    const protoDir = getProtocolDir(task.id);
+    ensureProtocolDir(protoDir);
+
+    const unblockCommand: UnblockCommand = {
+      type: 'unblock',
+      task_id: task.id,
+      goal: task.goal,
+      prompt: fullPrompt,
+      agent_id: task.agent_id,
+      system_prompt: systemPrompt,
+      model_id: modelId,
+      agent_session_id: claudeSessionId ?? undefined,
+      ...commonCommandFields(config),
+    };
+    writeCommand(protoDir, unblockCommand);
+
+    // Generate daemon MCP config
+    let daemonConfigPath: string | null = null;
+    if (runner.usesSandbox() && hasDaemonContext()) {
+      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
+    }
+
+    // Launch or reuse supervisor
+    if (runner.isRunning(containerName)) {
+      // Supervisor already running — it will pick up the new command
+    } else {
+      runner.removeRun(containerName);
+
+      try {
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+      } catch (err) {
+        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    // Store container name
+    await storage.updateSessionContainerName(sess.id, containerName);
+
+    // Manual resume resets the circuit breaker
+    await storage.resetConsecutiveInterruptions(sess.id);
+
+    // Manual resume resets auto-react counters (human is taking over)
+    try {
+      await resetAutoReactCounters(storage, task.id);
+    } catch {
+      // Non-critical
+    }
+
+    // Update last interaction timestamp
+    await storage.updateSessionInteraction(sess.id, 0);
+
+    return {
+      sessionId: sess.id,
+      containerName,
+      worktreePath,
+      branchName: sess.git_branch,
+      runnerType: runner.type,
+      runnerLabel: runner.runLabel,
+      runnerDisplayName: runner.runDisplayName(containerName),
+      warnings,
+    };
+  } finally {
+    removeLock(worktreePath);
+  }
+}

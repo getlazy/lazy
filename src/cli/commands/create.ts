@@ -1,8 +1,9 @@
 import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, promptLine, removeRecoveryFile, readStdinIfPiped } from '../editor';
-import type { ModelName, TaskType } from '../../types';
+import type { TaskType } from '../../types';
 import { VALID_TASK_TYPES } from '../../types';
 import { listAgents } from '../../agent/registry';
+import { loadConfig } from '../../config/loader';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
 
@@ -20,7 +21,7 @@ export async function commandCreate(args: string[]): Promise<void> {
 
   let goal: string;
   let prompt: string | null = null;
-  let model: ModelName | null = null;
+  let model: string | null = null;
   let taskType: TaskType | null = null;
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
@@ -54,7 +55,7 @@ export async function commandCreate(args: string[]): Promise<void> {
     code = codeValue;
   }
 
-  // Parse --agent flag
+  // Parse --agent flag (falls back to config's agent.agent_id)
   const agentValue = parsed.flags.get('agent') as string | undefined;
   if (agentValue !== undefined) {
     const validAgents = listAgents();
@@ -63,6 +64,12 @@ export async function commandCreate(args: string[]): Promise<void> {
       process.exit(1);
     }
     agentId = agentValue;
+  } else {
+    // Default to config's agent_id so tasks inherit the project's configured agent
+    const config = await loadConfig(process.cwd());
+    if (config.agent.agent_id && config.agent.agent_id !== 'claude-code') {
+      agentId = config.agent.agent_id;
+    }
   }
 
   // Flag mode: both goal and optionally prompt provided
@@ -166,7 +173,7 @@ Create a new task. Interactive if no flags provided.
 Options:
   --goal <goal>      Task goal
   --prompt <text>    Task prompt/specification
-  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Default: task
   --code <code>      Human-readable code (e.g. "fix-models", "add-auth")
@@ -182,7 +189,7 @@ Examples:
   lazy create --goal "Add auth"            # Create with goal only
   lazy create --goal "Add auth" --code add-auth
   lazy create --goal "Add auth" --prompt "Implement OAuth2 login"
-  lazy create --goal "Refactor" --model opus --type refactor
+  lazy create --goal "Refactor" --model claude-opus-4-6 --type refactor
   lazy create --goal "Sub-task" --parent abc12345
   lazy create --goal "Fix bug" --agent claude-code
   echo "Detailed prompt" | lazy create --goal "Add auth"  # Piped stdin as prompt`);

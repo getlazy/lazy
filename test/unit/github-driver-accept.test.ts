@@ -10,7 +10,7 @@ import type { DriverDeps, GhResult } from '../../src/remote/github-driver';
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'sonnet' as const },
+  models: { default: 'claude-sonnet-4-5-20250929' },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -21,18 +21,28 @@ const mockConfig: ResolvedConfig = {
   remote: {
     driver: 'github',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const, docker_agent_no_network: false },
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
+  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential' as const,
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
+  },
 };
 
 function makeTask(overrides?: Partial<Task>): Task {
@@ -51,6 +61,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     model: null,
     agent_id: 'claude-code',
     metadata: { remote_ref_id: '42', remote_ref_url: 'https://github.com/o/r/pull/42' },
+    pending_sync: 0,
     ...overrides,
   };
 }
@@ -58,10 +69,10 @@ function makeTask(overrides?: Partial<Task>): Task {
 const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
 const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
 
-function makeDeps(ghHandler: (args: string[], cwd?: string) => GhResult): DriverDeps {
+function makeDeps(ghHandler: (args: string[], cwd?: string) => Promise<GhResult>): DriverDeps {
   return {
     runGh: ghHandler,
-    runGit: (args: string[]) => {
+    runGit: async (args: string[]) => {
       if (args[0] === 'push') return ok();
       if (args[0] === 'merge-base') return fail('not ancestor');
       return fail('unexpected git call');
@@ -73,24 +84,24 @@ describe('GitHubDriver merge', () => {
   test('merges PR when existing PR is open', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([])); // No checks
+        return Promise.resolve(ok(JSON.stringify([]))); // No checks
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: '' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: '' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
+        return Promise.resolve(ok(JSON.stringify({ body: 'PR body' })));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return ok();
+        return Promise.resolve(ok());
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -110,30 +121,30 @@ describe('GitHubDriver merge', () => {
   test('creates replacement PR when existing is closed', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
-        return ok(JSON.stringify({ number: 99 }));
+        return Promise.resolve(ok(JSON.stringify({ number: 99 })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([]));
+        return Promise.resolve(ok(JSON.stringify([])));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: '' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: '' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
+        return Promise.resolve(ok(JSON.stringify({ body: 'PR body' })));
       }
       if (args[0] === 'pr' && args[1] === 'create') {
-        return ok('https://github.com/o/r/pull/99');
+        return Promise.resolve(ok('https://github.com/o/r/pull/99'));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return ok();
+        return Promise.resolve(ok());
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -159,32 +170,32 @@ describe('GitHubDriver merge', () => {
   test('returns replacement PR metadata on merge conflict', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
-        return ok(JSON.stringify({ number: 99 }));
+        return Promise.resolve(ok(JSON.stringify({ number: 99 })));
       }
       // Pre-merge checks pass
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([]));
+        return Promise.resolve(ok(JSON.stringify([])));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: '' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: '' })));
       }
       // gh pr view --json mergeable (conflict detection after merge failure)
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
-        return ok(JSON.stringify({ mergeable: 'CONFLICTING' }));
+        return Promise.resolve(ok(JSON.stringify({ mergeable: 'CONFLICTING' })));
       }
       if (args[0] === 'pr' && args[1] === 'create') {
-        return ok('https://github.com/o/r/pull/99');
+        return Promise.resolve(ok('https://github.com/o/r/pull/99'));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return fail('PR has merge conflicts');
+        return Promise.resolve(fail('PR has merge conflicts'));
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -209,29 +220,29 @@ describe('GitHubDriver merge', () => {
   test('returns replacement PR metadata on pending checks', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('number')) {
-        return ok(JSON.stringify({ number: 99 }));
+        return Promise.resolve(ok(JSON.stringify({ number: 99 })));
       }
       // gh pr view --json mergeable (not conflicting — fall through to checks)
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
-        return ok(JSON.stringify({ mergeable: 'MERGEABLE' }));
+        return Promise.resolve(ok(JSON.stringify({ mergeable: 'MERGEABLE' })));
       }
       // gh pr checks --json (pending checks detected)
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }]));
+        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }])));
       }
       if (args[0] === 'pr' && args[1] === 'create') {
-        return ok('https://github.com/o/r/pull/99');
+        return Promise.resolve(ok('https://github.com/o/r/pull/99'));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return fail('required status check is expected');
+        return Promise.resolve(fail('required status check is expected'));
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -254,27 +265,27 @@ describe('GitHubDriver merge', () => {
   // When no replacement PR is needed (original is still open), metadata should
   // be undefined on failure — there's nothing new to persist.
   test('does not return metadata on conflict when no replacement PR was created', async () => {
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([]));
+        return Promise.resolve(ok(JSON.stringify([])));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: '' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: '' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
+        return Promise.resolve(ok(JSON.stringify({ body: 'PR body' })));
       }
       // gh pr view --json mergeable (conflict detection after merge failure)
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
-        return ok(JSON.stringify({ mergeable: 'CONFLICTING' }));
+        return Promise.resolve(ok(JSON.stringify({ mergeable: 'CONFLICTING' })));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return fail('PR has merge conflicts');
+        return Promise.resolve(fail('PR has merge conflicts'));
       }
-      return fail('unexpected');
+      return Promise.resolve(fail('unexpected'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -300,11 +311,11 @@ describe('GitHubDriver merge', () => {
     const ghCalls: string[][] = [];
 
     const deps: DriverDeps = {
-      runGh: (args) => {
+      runGh: async (args) => {
         ghCalls.push([...args]);
         return fail('should not be called');
       },
-      runGit: (args: string[]) => {
+      runGit: async (args: string[]) => {
         // isBranchMerged check: merge-base --is-ancestor returns success
         if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return ok();
         if (args[0] === 'push') return ok();
@@ -330,15 +341,15 @@ describe('GitHubDriver merge', () => {
   // This tells the accept command to set the task to 'merging' status and exit cleanly.
   // Now caught by pre-merge CI check rather than post-merge-failure detection.
   test('returns pending when required checks are pending', async () => {
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       // Pre-merge CI check: pending checks detected
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }]));
+        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }])));
       }
-      return fail('unexpected');
+      return Promise.resolve(fail('unexpected'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -362,21 +373,21 @@ describe('GitHubDriver merge', () => {
   test('refuses to merge when CI checks are failing', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       // Pre-merge CI check: return failed checks
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([
+        return Promise.resolve(ok(JSON.stringify([
           { name: 'ci/build', state: 'FAILURE', bucket: 'fail', detailUrl: 'https://example.com/1' },
-        ]));
+        ])));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
         throw new Error('merge should not be called when checks are failing');
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -402,20 +413,20 @@ describe('GitHubDriver merge', () => {
   test('returns pending when CI checks are still running (pre-merge)', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([
+        return Promise.resolve(ok(JSON.stringify([
           { name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null },
-        ]));
+        ])));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
         throw new Error('merge should not be called when checks are pending');
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -439,25 +450,25 @@ describe('GitHubDriver merge', () => {
   test('refuses to merge when required reviews are not approved', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       // CI checks pass
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([
+        return Promise.resolve(ok(JSON.stringify([
           { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
-        ]));
+        ])));
       }
       // Review decision: not approved
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: 'REVIEW_REQUIRED' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'REVIEW_REQUIRED' })));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
         throw new Error('merge should not be called when reviews are missing');
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -480,26 +491,26 @@ describe('GitHubDriver merge', () => {
   test('merges when CI passes and reviews are approved', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([
+        return Promise.resolve(ok(JSON.stringify([
           { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
-        ]));
+        ])));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: 'APPROVED' }));
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'APPROVED' })));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
+        return Promise.resolve(ok(JSON.stringify({ body: 'PR body' })));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return ok();
+        return Promise.resolve(ok());
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -519,24 +530,24 @@ describe('GitHubDriver merge', () => {
   test('merges when no reviews are required', async () => {
     const ghCalls: string[][] = [];
 
-    const deps = makeDeps((args) => {
+    const deps = makeDeps(async (args) => {
       ghCalls.push([...args]);
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
+        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return ok(JSON.stringify([])); // No checks configured
+        return Promise.resolve(ok(JSON.stringify([]))); // No checks configured
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return ok(JSON.stringify({ reviewDecision: '' })); // No reviews required
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: '' }))); // No reviews required
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('body')) {
-        return ok(JSON.stringify({ body: 'PR body' }));
+        return Promise.resolve(ok(JSON.stringify({ body: 'PR body' })));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
-        return ok();
+        return Promise.resolve(ok());
       }
-      return fail('unexpected gh call');
+      return Promise.resolve(fail('unexpected gh call'));
     });
 
     const driver = new GitHubDriver(mockConfig, deps);
@@ -557,14 +568,14 @@ describe('GitHubDriver merge', () => {
     const ghCalls: string[][] = [];
 
     const deps: DriverDeps = {
-      runGh: (args) => {
+      runGh: async (args) => {
         ghCalls.push([...args]);
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'MERGED' }));
         }
         return fail('unexpected');
       },
-      runGit: (args: string[]) => {
+      runGit: async (args: string[]) => {
         // isBranchMerged: first check returns false (no --is-ancestor), then after
         // push + PR state check, the second check returns true
         if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return ok();
@@ -591,8 +602,8 @@ describe('GitHubDriver merge', () => {
 
   test('fails with push error', async () => {
     const deps: DriverDeps = {
-      runGh: () => fail('unexpected'),
-      runGit: (args: string[]) => {
+      runGh: async () => fail('unexpected'),
+      runGit: async (args: string[]) => {
         if (args[0] === 'push') return fail('no remote');
         return fail('unexpected');
       },
@@ -621,7 +632,7 @@ describe('GitHubDriver merge', () => {
     const gitCalls: string[][] = [];
 
     const deps: DriverDeps = {
-      runGh: (args) => {
+      runGh: async (args) => {
         ghCalls.push([...args]);
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
@@ -643,7 +654,7 @@ describe('GitHubDriver merge', () => {
         }
         return fail('unexpected gh call');
       },
-      runGit: (args: string[]) => {
+      runGit: async (args: string[]) => {
         gitCalls.push([...args]);
         if (args[0] === 'push') return ok();
         if (args[0] === 'merge-base') return fail('not ancestor');

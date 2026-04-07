@@ -40,6 +40,7 @@ describe('deferred PR creation', () => {
       model: null,
       agent_id: 'claude-code',
       metadata: null,
+      pending_sync: 0,
     };
 
     // publishBranch will fail to push (no remote), but we can verify the intent

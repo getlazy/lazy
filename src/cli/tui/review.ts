@@ -9,7 +9,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { Terminal, getTerminalSize, type KeyPress } from './terminal';
 import { render, renderTreeOverlay, renderHelpOverlay, flattenNavItems, formatMarkdown, colorDiff, wrapLines, statusColor, type NavItem, type LayoutState, type TreeOverlayNode, type SubtaskFilterMode } from './renderer';
-import { getDiffStat, getDiffFull, getCurrentBranch, getRemoteDefaultBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists } from '../../git/operations';
+import { getDiffStat, getDiffFull, getCurrentBranch, getRemoteDefaultBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchName, getBranchNameFromId } from '../helpers';
 import type { TaskTreeNode } from '../../storage/types';
 import { readPendingProposals, updateProposalStatus } from '../commands/propose';
@@ -19,6 +19,8 @@ import type { Proposal } from '../commands/propose';
 import type { Storage } from '../../storage';
 import { getDataDir } from '../init';
 import { ansi } from './terminal';
+import { loadConfig } from '../../config/loader';
+import type { ResolvedConfig } from '../../config/types';
 
 // ── Review result ──────────────────────────────────────────────────────
 
@@ -62,6 +64,7 @@ export async function loadReviewData(
   task: Task,
   session: Session | null,
   root: string,
+  config?: ResolvedConfig,
 ): Promise<ReviewData> {
   const taskShortId = shortId(task.id);
   const worktreePath = getWorktreePath(root, task);
@@ -71,7 +74,7 @@ export async function loadReviewData(
   if (task.parent_task_id) {
     targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
   } else {
-    targetBranch = getRemoteDefaultBranch(root);
+    targetBranch = await getRemoteDefaultBranch(root);
   }
 
   // Load all data in parallel (skip session-specific data if no session)
@@ -95,21 +98,40 @@ export async function loadReviewData(
   let diffFull = '';
   if (existsSync(worktreePath)) {
     try {
-      diffStat = getDiffStat(targetBranch, 'HEAD', worktreePath) || '';
+      diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || '';
     } catch { /* branch may not exist */ }
     try {
-      diffFull = getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
+      diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
     } catch { /* branch may not exist */ }
   } else {
-    // Worktree gone — try diffing the task branch from the main repo root
-    const taskBranch = getBranchName(task);
-    if (branchExists(taskBranch, root)) {
-      try {
-        diffStat = getDiffStat(targetBranch, taskBranch, root) || '';
-      } catch { /* branch comparison may fail */ }
-      try {
-        diffFull = getDiffFull(targetBranch, taskBranch, root) || '';
-      } catch { /* branch comparison may fail */ }
+    // Worktree gone — try to recover from local or remote branch
+    const taskBranch = session?.git_branch ?? getBranchName(task);
+    const resolvedConfig = config ?? await loadConfig(root);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, taskBranch, resolvedConfig.remote.git_remote, root,
+      );
+      if (recovery.recovered) {
+        // Worktree recovered — use it for diffing
+        try {
+          diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || '';
+        } catch { /* branch may not exist */ }
+        try {
+          diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
+        } catch { /* branch may not exist */ }
+      } else if (await branchExists(taskBranch, root)) {
+        // Recovery failed but branch exists locally — diff from main repo root
+        try {
+          diffStat = await getDiffStat(targetBranch, taskBranch, root) || '';
+        } catch { /* branch comparison may fail */ }
+        try {
+          diffFull = await getDiffFull(targetBranch, taskBranch, root) || '';
+        } catch { /* branch comparison may fail */ }
+      }
+      // else: no worktree, no branch — fall through to empty diff
+    } catch {
+      // Recovery attempt failed — fall through to empty diff
+      // Review should still work without diffs
     }
   }
 
@@ -131,7 +153,7 @@ export async function loadReviewData(
       const diffs: string[] = [];
       for (const c of turnCommits) {
         try {
-          const d = getCommitDiff(c.sha, diffCwd);
+          const d = await getCommitDiff(c.sha, diffCwd);
           if (d) diffs.push(d);
         } catch { /* commit may not be accessible */ }
       }
@@ -172,37 +194,81 @@ async function loadReviewDataForSubtask(
   storage: Storage,
   task: Task,
   root: string,
+  config?: ResolvedConfig,
 ): Promise<ReviewData> {
   const sess = await storage.getSessionByTaskId(task.id);
   if (sess) {
-    return loadReviewData(storage, task, sess, root);
+    return loadReviewData(storage, task, sess, root, config);
   }
 
-  // Minimal data for tasks without sessions — still try to get branch diff
+  // Minimal data for tasks without sessions
   const childTasks = await storage.getChildTasks(task.id);
   const parentTask = task.parent_task_id
     ? await storage.getTask(task.parent_task_id)
     : null;
 
+  const worktreePath = getWorktreePath(root, task);
+
+  // Backlog tasks have never been started — no branch, no worktree, no diff.
+  // Skip branch recovery entirely to avoid spurious fetch attempts.
+  if (task.status === 'backlog') {
+    return {
+      task,
+      session: null,
+      turns: [],
+      commits: [],
+      comments: await storage.getTaskComments(task.id),
+      unseenComments: [],
+      proposals: [],
+      diffStat: '',
+      diffFull: '',
+      worktreePath,
+      targetBranch: '',
+      lastAgentTurn: null,
+      turnInfoMap: new Map(),
+      taskTree: null,
+      childTasks,
+      parentTask,
+    };
+  }
+
+  // Non-backlog sessionless tasks (e.g., completed with cleaned-up session,
+  // or missing session record) — still try to get branch diff
   // Determine target branch for diff
   let targetBranch = '';
   if (task.parent_task_id) {
     targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
   } else {
-    targetBranch = getRemoteDefaultBranch(root);
+    targetBranch = await getRemoteDefaultBranch(root);
   }
 
-  // Try to get branch diff even without a session
   let diffStat = '';
   let diffFull = '';
-  const worktreePath = getWorktreePath(root, task);
   const taskBranch = getBranchName(task);
   if (existsSync(worktreePath)) {
-    try { diffStat = getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
-    try { diffFull = getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
-  } else if (branchExists(taskBranch, root)) {
-    try { diffStat = getDiffStat(targetBranch, taskBranch, root) || ''; } catch { /* */ }
-    try { diffFull = getDiffFull(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+    try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+    try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+  } else {
+    // Worktree gone — try to recover from local or remote branch
+    const resolvedConfig = config ?? await loadConfig(root);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, taskBranch, resolvedConfig.remote.git_remote, root,
+      );
+      if (recovery.recovered) {
+        // Worktree recovered — use it for diffing
+        try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+        try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+      } else if (await branchExists(taskBranch, root)) {
+        // Recovery failed but branch exists locally — diff from main repo root
+        try { diffStat = await getDiffStat(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+        try { diffFull = await getDiffFull(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+      }
+      // else: no worktree, no branch — fall through to empty diff
+    } catch {
+      // Recovery attempt failed — fall through to empty diff
+      // Review should still work without diffs
+    }
   }
 
   return {
@@ -237,13 +303,16 @@ async function loadSubtaskDataMap(
   const map = new Map<string, ReviewData>();
   const visited = new Set<string>();
 
+  // Load config once for all subtasks to avoid repeated disk reads
+  const config = await loadConfig(root);
+
   async function loadChildren(parentId: string): Promise<void> {
     const children = await storage.getChildTasks(parentId);
     for (const child of children) {
       if (visited.has(child.id)) continue;
       visited.add(child.id);
 
-      const data = await loadReviewDataForSubtask(storage, child, root);
+      const data = await loadReviewDataForSubtask(storage, child, root, config);
       map.set(shortId(child.id), data);
       await loadChildren(child.id);
     }
@@ -569,7 +638,7 @@ function partitionCommitsByTurn(sortedTurns: Turn[], allCommits: Commit[]): Map<
 
 // ── Content generation for each artifact ───────────────────────────────
 
-function getContentForItem(key: string, dataMap: Map<string, ReviewData>, mainData: ReviewData): string[] {
+async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, mainData: ReviewData): Promise<string[]> {
   // ── Sub-task key resolution ──────────────────────────────────────────
   // Keys prefixed with st:<shortId>: are resolved by peeling off the prefix
   // and looking up the correct ReviewData from the dataMap.
@@ -589,7 +658,7 @@ function getContentForItem(key: string, dataMap: Map<string, ReviewData>, mainDa
 
     const subData = dataMap.get(taskId);
     if (!subData) return [`Sub-task ${taskId} data not available.`];
-    return getContentForItem(innerKey, dataMap, subData);
+    return await getContentForItem(innerKey, dataMap, subData);
   }
 
   // Root task node overview
@@ -677,7 +746,7 @@ function getContentForItem(key: string, dataMap: Map<string, ReviewData>, mainDa
   }
   if (key.startsWith('commit:')) {
     const sha = key.substring(7);
-    return getCommitContent(mainData, sha);
+    return await getCommitContent(mainData, sha);
   }
 
   // All Diffs (top-level)
@@ -975,12 +1044,12 @@ function getCommitsOverview(data: ReviewData): string[] {
   return lines;
 }
 
-function getCommitContent(data: ReviewData, sha: string): string[] {
+async function getCommitContent(data: ReviewData, sha: string): Promise<string[]> {
   try {
     const lines: string[] = [];
 
     // Get the list of changed files in this commit
-    const changedFiles = getCommitChangedFiles(sha, data.worktreePath);
+    const changedFiles = await getCommitChangedFiles(sha, data.worktreePath);
 
     // Separate .md files from other files
     const mdFiles = changedFiles.filter(f => f.endsWith('.md'));
@@ -989,7 +1058,7 @@ function getCommitContent(data: ReviewData, sha: string): string[] {
     // Render .md files with the markdown viewer
     if (mdFiles.length > 0) {
       for (const filepath of mdFiles) {
-        const content = getFileAtCommit(sha, filepath, data.worktreePath);
+        const content = await getFileAtCommit(sha, filepath, data.worktreePath);
         // Only render if content exists and appears to be valid text
         if (content !== null && !content.includes('\0')) {
           // Add file header
@@ -1007,7 +1076,7 @@ function getCommitContent(data: ReviewData, sha: string): string[] {
 
     // Show diff for non-.md files
     if (otherFiles.length > 0 || mdFiles.length === 0) {
-      const diff = getCommitDiff(sha, data.worktreePath);
+      const diff = await getCommitDiff(sha, data.worktreePath);
       if (diff) {
         if (mdFiles.length > 0) {
           // Add separator if we already showed markdown files
@@ -1254,12 +1323,12 @@ function currentSubtaskId(state: LayoutState): string | null {
  * Cycle to the next/previous subtask in the current filter group.
  * When the filter group is exhausted, switch to the next/previous group.
  */
-function cycleSubtask(
+async function cycleSubtask(
   state: LayoutState,
   forward: boolean,
   dataMap: Map<string, ReviewData>,
   mainData: ReviewData,
-): void {
+): Promise<void> {
   const allEntries = collectSubtaskEntries(state.navItems);
   if (allEntries.length === 0) return;
 
@@ -1302,7 +1371,7 @@ function cycleSubtask(
       }
 
       const target = filtered[targetIdx];
-      navigateToSubtaskByKey(state, target.navKey, dataMap, mainData);
+      await navigateToSubtaskByKey(state, target.navKey, dataMap, mainData);
       return;
     }
 
@@ -1317,12 +1386,12 @@ function cycleSubtask(
 /**
  * Navigate to a subtask by its nav key, expanding ancestors as needed.
  */
-function navigateToSubtaskByKey(
+async function navigateToSubtaskByKey(
   state: LayoutState,
   navKey: string,
   dataMap: Map<string, ReviewData>,
   mainData: ReviewData,
-): void {
+): Promise<void> {
   // Expand all ancestors of the target key in the nav tree
   function expandAncestors(items: NavItem[]): boolean {
     for (const item of items) {
@@ -1355,7 +1424,7 @@ function navigateToSubtaskByKey(
 
   state.leftPanelFocused = true;
   ensureNavVisible(state);
-  updateContentFromNav(state, dataMap, mainData);
+  await updateContentFromNav(state, dataMap, mainData);
 }
 
 // ── Main review TUI ────────────────────────────────────────────────────
@@ -1386,11 +1455,11 @@ export async function runReviewTUI(
   })];
 
   /** Compute the right panel width and wrap content lines to fit. */
-  function wrappedContent(key: string): string[] {
+  async function wrappedContent(key: string): Promise<string[]> {
     const { cols } = getTerminalSize();
     const leftWidth = Math.max(Math.floor(cols / 5), 30);
     const rightWidth = cols - leftWidth - 3; // -1 divider, -1 left pad, -1 margin
-    const raw = getContentForItem(key, subtaskDataMap, data);
+    const raw = await getContentForItem(key, subtaskDataMap, data);
     return wrapLines(raw, rightWidth);
   }
 
@@ -1405,7 +1474,7 @@ export async function runReviewTUI(
     flatNavItems: flattenNavItems(navItems),
     selectedNavIndex: 0,
     navScrollOffset: 0,
-    contentLines: wrappedContent(navItems[0]?.key ?? ''),
+    contentLines: await wrappedContent(navItems[0]?.key ?? ''),
     contentScrollOffset: 0,
     statusLine: buildStatusLine(data),
     taskHeader: `Review: ${displayId(task)} — ${task.goal}`,
@@ -1431,10 +1500,10 @@ export async function runReviewTUI(
       }
     }
 
-    function updateContent(): void {
+    async function updateContent(): Promise<void> {
       const flat = state.flatNavItems[state.selectedNavIndex];
       if (flat) {
-        state.contentLines = wrappedContent(flat.item.key);
+        state.contentLines = await wrappedContent(flat.item.key);
         state.contentScrollOffset = 0;
       }
     }
@@ -1493,7 +1562,7 @@ export async function runReviewTUI(
         }
 
         // Update content for the selected item
-        updateContent();
+        await updateContent();
 
         // Rebuild tree overlay nodes
         state.treeOverlayNodes = freshData.taskTree
@@ -1523,7 +1592,7 @@ export async function runReviewTUI(
       draw();
     });
 
-    terminal.onKey((key: KeyPress) => {
+    terminal.onKey(async (key: KeyPress) => {
       // Ctrl+C always quits
       if (key.ctrl && key.name === 'c') {
         cleanup({ type: 'quit' });
@@ -1572,7 +1641,7 @@ export async function runReviewTUI(
           if (node) {
             state.showTaskTree = false;
             // Navigate to this task in the main nav tree
-            navigateToTaskInNav(state, node.taskId, node.isCurrent, subtaskDataMap, data);
+            await navigateToTaskInNav(state, node.taskId, node.isCurrent, subtaskDataMap, data);
           }
           draw();
           return;
@@ -1601,7 +1670,7 @@ export async function runReviewTUI(
       const navKeys = ['up', 'down', 'left', 'right', 'return', 'pageup', 'pagedown', 'home', 'end'];
       if (navKeys.includes(key.name)) {
         if (state.leftPanelFocused) {
-          handleLeftPanelKey(key, state, subtaskDataMap, data);
+          await handleLeftPanelKey(key, state, subtaskDataMap, data);
         } else {
           handleRightPanelKey(key, state);
         }
@@ -1630,7 +1699,7 @@ export async function runReviewTUI(
       // ]/[ cycle through subtasks by status group
       if (state.hasSubtasks && (key.raw === ']' || key.raw === '[')) {
         const forward = key.raw === ']';
-        cycleSubtask(state, forward, subtaskDataMap, data);
+        await cycleSubtask(state, forward, subtaskDataMap, data);
         draw();
         return;
       }
@@ -1664,13 +1733,13 @@ export async function runReviewTUI(
  * For the current task, selects the first item (Turns).
  * For sub-tasks, finds and expands the sub-task's node in the nav tree.
  */
-function navigateToTaskInNav(
+async function navigateToTaskInNav(
   state: LayoutState,
   taskShortId: string,
   isCurrent: boolean,
   dataMap: Map<string, ReviewData>,
   mainData: ReviewData,
-): void {
+): Promise<void> {
   if (isCurrent) {
     // Go to top of the nav tree
     state.selectedNavIndex = 0;
@@ -1717,7 +1786,7 @@ function navigateToTaskInNav(
 
   state.leftPanelFocused = true;
   ensureNavVisible(state);
-  updateContentFromNav(state, dataMap, mainData);
+  await updateContentFromNav(state, dataMap, mainData);
 }
 
 /** Keep navScrollOffset in sync so the selected item is always visible. */
@@ -1750,18 +1819,18 @@ function ensureTreeOverlayVisible(state: LayoutState): void {
   }
 }
 
-function handleLeftPanelKey(key: KeyPress, state: LayoutState, dataMap: Map<string, ReviewData>, mainData: ReviewData): void {
+async function handleLeftPanelKey(key: KeyPress, state: LayoutState, dataMap: Map<string, ReviewData>, mainData: ReviewData): Promise<void> {
   if (key.name === 'up') {
     if (state.selectedNavIndex > 0) {
       state.selectedNavIndex--;
       ensureNavVisible(state);
-      updateContentFromNav(state, dataMap, mainData);
+      await updateContentFromNav(state, dataMap, mainData);
     }
   } else if (key.name === 'down') {
     if (state.selectedNavIndex < state.flatNavItems.length - 1) {
       state.selectedNavIndex++;
       ensureNavVisible(state);
-      updateContentFromNav(state, dataMap, mainData);
+      await updateContentFromNav(state, dataMap, mainData);
     }
   } else if (key.name === 'return') {
     const flat = state.flatNavItems[state.selectedNavIndex];
@@ -1818,13 +1887,13 @@ function handleRightPanelKey(key: KeyPress, state: LayoutState): void {
   }
 }
 
-function updateContentFromNav(state: LayoutState, dataMap: Map<string, ReviewData>, mainData: ReviewData): void {
+async function updateContentFromNav(state: LayoutState, dataMap: Map<string, ReviewData>, mainData: ReviewData): Promise<void> {
   const flat = state.flatNavItems[state.selectedNavIndex];
   if (flat) {
     const { cols } = getTerminalSize();
     const leftWidth = Math.max(Math.floor(cols / 5), 30);
     const rightWidth = cols - leftWidth - 3;
-    state.contentLines = wrapLines(getContentForItem(flat.item.key, dataMap, mainData), rightWidth);
+    state.contentLines = wrapLines(await getContentForItem(flat.item.key, dataMap, mainData), rightWidth);
     state.contentScrollOffset = 0;
   }
 }

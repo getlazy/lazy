@@ -17,7 +17,7 @@ import type { GitLabDriverDeps, GlResult } from '../../src/remote/gitlab-driver'
 
 // Minimal config for testing
 const mockConfig: ResolvedConfig = {
-  models: { default: 'sonnet' as const },
+  models: { default: 'claude-sonnet-4-5-20250929' },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -28,18 +28,28 @@ const mockConfig: ResolvedConfig = {
   remote: {
     driver: 'github',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const, docker_agent_no_network: false },
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
+  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential' as const,
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
+  },
 };
 
 describe('resolveUpstreamRef', () => {
@@ -48,8 +58,8 @@ describe('resolveUpstreamRef', () => {
     // can warn loudly. Silent fallback to local ref causes stale merges.
     test('throws on fetch failure instead of silently falling back', async () => {
       const mockDeps: DriverDeps = {
-        runGh: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        runGit: (args: string[]) => {
+        runGh: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) => {
           if (args[0] === 'fetch') {
             return {
               stdout: '',
@@ -69,8 +79,8 @@ describe('resolveUpstreamRef', () => {
 
     test('returns remote ref on successful fetch', async () => {
       const mockDeps: DriverDeps = {
-        runGh: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        runGit: (args: string[]) => {
+        runGh: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) => {
           if (args[0] === 'fetch') {
             return { stdout: '', stderr: '', exitCode: 0 };
           }
@@ -91,8 +101,8 @@ describe('resolveUpstreamRef', () => {
       };
 
       const mockDeps: DriverDeps = {
-        runGh: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        runGit: (args: string[]) => {
+        runGh: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) => {
           if (args[0] === 'fetch') {
             fetchedRemote = args[1]; // capture which remote was fetched
             return { stdout: '', stderr: '', exitCode: 0 };
@@ -117,8 +127,8 @@ describe('resolveUpstreamRef', () => {
     // INVARIANT: Same as GitHub — must throw on fetch failure.
     test('throws on fetch failure instead of silently falling back', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        runGit: (args: string[]) => {
+        runGl: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) => {
           if (args[0] === 'fetch') {
             return {
               stdout: '',
@@ -138,8 +148,8 @@ describe('resolveUpstreamRef', () => {
 
     test('returns remote ref on successful fetch', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        runGit: (args: string[]) => {
+        runGl: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) => {
           if (args[0] === 'fetch') {
             return { stdout: '', stderr: '', exitCode: 0 };
           }

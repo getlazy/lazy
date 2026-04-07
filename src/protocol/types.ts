@@ -14,7 +14,7 @@ import type { TokenUsage, MergeConflict, FileViolation } from '../types';
 
 // --- Command (host → supervisor) ---
 
-export type CommandType = 'start' | 'unblock' | 'stop';
+export type CommandType = 'start' | 'unblock' | 'sync' | 'stop';
 
 export interface StartCommand {
   type: 'start';
@@ -57,13 +57,28 @@ export interface UnblockCommand {
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
 }
 
+/**
+ * Sync command — merge upstream into task worktree without agent work.
+ *
+ * Semantically distinct from Start (fresh start) and Unblock (feedback + work).
+ * Sync is a continuation of existing work: merge parent branch changes, resolve
+ * conflicts if needed, then stop. No agent work phase runs.
+ */
+export interface SyncCommand {
+  type: 'sync';
+  task_id: string;
+  parent_branch: string;       // upstream branch to merge
+  agent_session_id?: string;   // existing agent session for conflict resolution
+  model_id?: string;           // model for conflict resolution (if needed)
+}
+
 export interface StopCommand {
   type: 'stop';
   task_id: string;
   reason?: string;
 }
 
-export type Command = StartCommand | UnblockCommand | StopCommand;
+export type Command = StartCommand | UnblockCommand | SyncCommand | StopCommand;
 
 // --- Response (supervisor → host) ---
 

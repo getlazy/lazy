@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, copyFileSync, statSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { LAZY_COAUTHOR_TRAILER } from '../constants';
 import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
+import { withRemoteRetry } from '../utils/retry';
+import { pathExists, ensureDir, stat, copyFile, chmod } from '../utils/fs';
 import type { Task } from '../types';
 
 export interface GitCommitInfo {
@@ -14,8 +15,8 @@ export interface GitCommitInfo {
  * Check whether the repository has at least one commit.
  * Returns false on a freshly `git init`-ed repo with no commits.
  */
-export function repoHasCommits(cwd?: string): boolean {
-  const result = runGit(['rev-parse', 'HEAD'], {
+export async function repoHasCommits(cwd?: string): Promise<boolean> {
+  const result = await runGit(['rev-parse', 'HEAD'], {
     cwd,
     stdout: 'ignore',
     stderr: 'ignore',
@@ -23,16 +24,16 @@ export function repoHasCommits(cwd?: string): boolean {
   return result.exitCode === 0;
 }
 
-export function getCurrentSha(cwd?: string): string {
-  const result = runGit(['rev-parse', 'HEAD'], { cwd });
+export async function getCurrentSha(cwd?: string): Promise<string> {
+  const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git rev-parse HEAD failed: ${result.stderr}`);
   }
   return result.stdout;
 }
 
-export function getCurrentBranch(cwd?: string): string {
-  const result = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
+export async function getCurrentBranch(cwd?: string): Promise<string> {
+  const result = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`Failed to get current branch: ${result.stderr}`);
   }
@@ -46,9 +47,9 @@ export function getCurrentBranch(cwd?: string): string {
  * This resolves the branch via `git symbolic-ref refs/remotes/<remote>/HEAD`,
  * which returns the remote's default branch regardless of what's checked out locally.
  */
-export function getRemoteDefaultBranch(cwd?: string, remoteName: string = 'origin'): string {
+export async function getRemoteDefaultBranch(cwd?: string, remoteName: string = 'origin'): Promise<string> {
   // Try to resolve the remote's default branch via symbolic-ref
-  const result = runGit(['symbolic-ref', `refs/remotes/${remoteName}/HEAD`], { cwd });
+  const result = await runGit(['symbolic-ref', `refs/remotes/${remoteName}/HEAD`], { cwd });
   if (result.exitCode === 0) {
     // Returns something like "refs/remotes/origin/main" — extract the branch name
     const ref = result.stdout.trim();
@@ -72,10 +73,10 @@ export function getRemoteDefaultBranch(cwd?: string, remoteName: string = 'origi
  * out in a worktree). Passing "HEAD" as a base ref to GitHub's PR API causes failures
  * like "Base ref must be a branch".
  */
-export function resolveDetachedHead(branch: string, cwd?: string, remoteName: string = 'origin'): string {
+export async function resolveDetachedHead(branch: string, cwd?: string, remoteName: string = 'origin'): Promise<string> {
   if (branch !== 'HEAD') return branch;
 
-  const resolved = getRemoteDefaultBranch(cwd, remoteName);
+  const resolved = await getRemoteDefaultBranch(cwd, remoteName);
   logger.warn(`Detached HEAD detected — resolved to remote default branch '${resolved}'`);
   return resolved;
 }
@@ -89,14 +90,14 @@ export function resolveDetachedHead(branch: string, cwd?: string, remoteName: st
  * Returns undefined if the task has no `remote_target_branch` metadata, allowing
  * callers to provide their own fallback (e.g., getCurrentBranch or 'main').
  */
-export function getTaskTargetBranch(task: Task, cwd: string, remoteName: string = 'origin'): string | undefined {
+export async function getTaskTargetBranch(task: Task, cwd: string, remoteName: string = 'origin'): Promise<string | undefined> {
   const targetBranch = task.metadata?.remote_target_branch;
   if (!targetBranch) return undefined;
-  return resolveDetachedHead(targetBranch, cwd, remoteName);
+  return await resolveDetachedHead(targetBranch, cwd, remoteName);
 }
 
-export function createAndCheckoutBranch(name: string, cwd?: string): void {
-  const result = runGit(['checkout', '-b', name], { cwd });
+export async function createAndCheckoutBranch(name: string, cwd?: string): Promise<void> {
+  const result = await runGit(['checkout', '-b', name], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git checkout -b ${name} failed: ${result.stderr}`);
   }
@@ -106,8 +107,8 @@ export function createAndCheckoutBranch(name: string, cwd?: string): void {
  * Check if a branch already has a worktree checked out.
  * Returns the worktree path if found, or null if the branch has no worktree.
  */
-export function findWorktreeForBranch(branch: string, cwd?: string): string | null {
-  const result = runGit(['worktree', 'list', '--porcelain'], { cwd });
+export async function findWorktreeForBranch(branch: string, cwd?: string): Promise<string | null> {
+  const result = await runGit(['worktree', 'list', '--porcelain'], { cwd });
   if (result.exitCode !== 0) return null;
 
   const lines = result.stdout.split('\n');
@@ -129,27 +130,27 @@ export function findWorktreeForBranch(branch: string, cwd?: string): string | nu
   return null;
 }
 
-export function createWorktree(path: string, branch: string, cwd?: string): void {
+export async function createWorktree(path: string, branch: string, cwd?: string): Promise<void> {
   // Try creating with new branch first
-  const result = runGit(['worktree', 'add', path, '-b', branch], { cwd });
+  const result = await runGit(['worktree', 'add', path, '-b', branch], { cwd });
   if (result.exitCode === 0) return;
 
   // Branch already exists — attach worktree to existing branch
-  const retry = runGit(['worktree', 'add', path, branch], { cwd });
+  const retry = await runGit(['worktree', 'add', path, branch], { cwd });
   if (retry.exitCode === 0) return;
 
   throw new Error(`git worktree add failed: ${retry.stderr}`);
 }
 
-export function removeWorktree(path: string, cwd?: string): void {
-  const result = runGit(['worktree', 'remove', path, '--force'], { cwd });
+export async function removeWorktree(path: string, cwd?: string): Promise<void> {
+  const result = await runGit(['worktree', 'remove', path, '--force'], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git worktree remove failed: ${result.stderr}`);
   }
 }
 
-export function getNewCommits(sinceSha: string, cwd?: string): GitCommitInfo[] {
-  const result = runGit(['log', '--format=%H%n%s%n---END---', `${sinceSha}..HEAD`], { cwd });
+export async function getNewCommits(sinceSha: string, cwd?: string): Promise<GitCommitInfo[]> {
+  const result = await runGit(['log', '--format=%H%n%s%n---END---', `${sinceSha}..HEAD`], { cwd });
   if (result.exitCode !== 0) {
     return [];
   }
@@ -166,8 +167,8 @@ export function getNewCommits(sinceSha: string, cwd?: string): GitCommitInfo[] {
   return commits;
 }
 
-export function getCommitDiff(sha: string, cwd?: string): string {
-  const result = runGit(['show', '--no-color', '--format=', sha], { cwd });
+export async function getCommitDiff(sha: string, cwd?: string): Promise<string> {
+  const result = await runGit(['show', '--no-color', '--format=', sha], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
@@ -178,8 +179,8 @@ export function getCommitDiff(sha: string, cwd?: string): string {
  * Get the list of files changed in a commit.
  * Returns an array of file paths (added, modified, or deleted).
  */
-export function getCommitChangedFiles(sha: string, cwd?: string): string[] {
-  const result = runGit(['diff-tree', '--no-commit-id', '--name-only', '-r', sha], { cwd });
+export async function getCommitChangedFiles(sha: string, cwd?: string): Promise<string[]> {
+  const result = await runGit(['diff-tree', '--no-commit-id', '--name-only', '-r', sha], { cwd });
   if (result.exitCode !== 0) {
     return [];
   }
@@ -191,23 +192,23 @@ export function getCommitChangedFiles(sha: string, cwd?: string): string[] {
  * Get the content of a file at a specific commit.
  * Returns the file content as a string, or null if the file doesn't exist at that commit.
  */
-export function getFileAtCommit(sha: string, filepath: string, cwd?: string): string | null {
-  const result = runGit(['show', `${sha}:${filepath}`], { cwd });
+export async function getFileAtCommit(sha: string, filepath: string, cwd?: string): Promise<string | null> {
+  const result = await runGit(['show', `${sha}:${filepath}`], { cwd });
   if (result.exitCode !== 0) {
     return null;
   }
   return result.stdout;
 }
 
-export function createTag(name: string, cwd?: string): void {
-  const result = runGit(['tag', name], { cwd });
+export async function createTag(name: string, cwd?: string): Promise<void> {
+  const result = await runGit(['tag', name], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git tag ${name} failed: ${result.stderr}`);
   }
 }
 
-export function mergeBranch(branch: string, cwd?: string): void {
-  const result = runGit(['merge', branch, '--no-ff', '-m', `Merge ${branch}`], { cwd });
+export async function mergeBranch(branch: string, cwd?: string): Promise<void> {
+  const result = await runGit(['merge', branch, '--no-ff', '-m', `Merge ${branch}`], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git merge ${branch} failed: ${result.stderr}`);
   }
@@ -217,8 +218,8 @@ export function mergeBranch(branch: string, cwd?: string): void {
  * Get commit messages from a branch that are not in the target branch.
  * Used to build squash commit messages.
  */
-export function getBranchCommitMessages(sourceBranch: string, targetBranch: string, cwd?: string): string[] {
-  const result = runGit(
+export async function getBranchCommitMessages(sourceBranch: string, targetBranch: string, cwd?: string): Promise<string[]> {
+  const result = await runGit(
     ['log', '--format=%s', `${targetBranch}..${sourceBranch}`],
     { cwd }
   );
@@ -233,8 +234,8 @@ export function getBranchCommitMessages(sourceBranch: string, targetBranch: stri
  * Squash-merge a branch into the current branch (HEAD).
  * Stages all changes but does not auto-commit; the caller must commit separately.
  */
-export function squashMergeBranch(branch: string, cwd?: string): void {
-  const result = runGit(['merge', '--squash', branch], { cwd });
+export async function squashMergeBranch(branch: string, cwd?: string): Promise<void> {
+  const result = await runGit(['merge', '--squash', branch], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git merge --squash ${branch} failed: ${result.stderr}`);
   }
@@ -244,60 +245,60 @@ export function squashMergeBranch(branch: string, cwd?: string): void {
  * Squash-merge a source branch into a target branch.
  * Checks out the target, squash-merges, commits, then returns to the original branch.
  */
-export function squashMergeBranchIntoTarget(
+export async function squashMergeBranchIntoTarget(
   sourceBranch: string,
   targetBranch: string,
   commitMessage: string,
   cwd?: string
-): void {
-  const originalBranch = getCurrentBranch(cwd);
+): Promise<void> {
+  const originalBranch = await getCurrentBranch(cwd);
 
-  const checkout = runGit(['checkout', targetBranch], { cwd });
+  const checkout = await runGit(['checkout', targetBranch], { cwd });
   if (checkout.exitCode !== 0) {
     throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr}`);
   }
 
   try {
-    const merge = runGit(['merge', '--squash', sourceBranch], { cwd });
+    const merge = await runGit(['merge', '--squash', sourceBranch], { cwd });
     if (merge.exitCode !== 0) {
       throw new Error(`Squash merge failed: ${merge.stderr}`);
     }
 
     // Check if the squash merge produced any staged changes
-    const diffIndex = runGit(['diff', '--cached', '--quiet'], { cwd });
+    const diffIndex = await runGit(['diff', '--cached', '--quiet'], { cwd });
     if (diffIndex.exitCode === 0) {
       throw new Error(`Nothing to merge: ${sourceBranch} has no changes relative to ${targetBranch}. Use 'lazy close' or 'lazy reject' instead.`);
     }
 
-    const commit = runGit(['commit', '-m', commitMessage], { cwd });
+    const commit = await runGit(['commit', '-m', commitMessage], { cwd });
     if (commit.exitCode !== 0) {
       throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
     }
   } finally {
-    runGit(['checkout', originalBranch], { cwd });
+    await runGit(['checkout', originalBranch], { cwd });
   }
 }
 
-export function deleteBranch(branch: string, cwd?: string): void {
-  const result = runGit(['branch', '-D', branch], { cwd });
+export async function deleteBranch(branch: string, cwd?: string): Promise<void> {
+  const result = await runGit(['branch', '-D', branch], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git branch -D ${branch} failed: ${result.stderr}`);
   }
 }
 
-export function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): string {
+export async function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): Promise<string> {
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = runGit(['diff', '--no-color', '--stat', range], { cwd });
+  const result = await runGit(['diff', '--no-color', '--stat', range], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
   let output = result.stdout;
 
   // If toRef is HEAD and there are uncommitted changes, include them
-  if (toRef === 'HEAD' && hasUncommittedChanges(cwd)) {
-    const uncommittedStat = runGit(['diff', '--no-color', '--stat', 'HEAD'], { cwd });
+  if (toRef === 'HEAD' && await hasUncommittedChanges(cwd)) {
+    const uncommittedStat = await runGit(['diff', '--no-color', '--stat', 'HEAD'], { cwd });
     if (uncommittedStat.exitCode === 0 && uncommittedStat.stdout) {
       output += '\n--- Uncommitted changes ---\n' + uncommittedStat.stdout;
     }
@@ -306,19 +307,19 @@ export function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: strin
   return output;
 }
 
-export function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): string {
+export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): Promise<string> {
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = runGit(['diff', '--no-color', range], { cwd });
+  const result = await runGit(['diff', '--no-color', range], { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
   let output = result.stdout;
 
   // If toRef is HEAD and there are uncommitted changes, include them
-  if (toRef === 'HEAD' && hasUncommittedChanges(cwd)) {
-    const uncommittedDiff = runGit(['diff', '--no-color', 'HEAD'], { cwd });
+  if (toRef === 'HEAD' && await hasUncommittedChanges(cwd)) {
+    const uncommittedDiff = await runGit(['diff', '--no-color', 'HEAD'], { cwd });
     if (uncommittedDiff.exitCode === 0 && uncommittedDiff.stdout) {
       output += '\n\n--- Uncommitted changes ---\n' + uncommittedDiff.stdout;
     }
@@ -327,10 +328,10 @@ export function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: strin
   return output;
 }
 
-export function hasUncommittedChanges(cwd?: string): boolean {
+export async function hasUncommittedChanges(cwd?: string): Promise<boolean> {
   // Exclude .lazy-task-sandbox/ from dirty worktree checks — it contains lazy's own
   // runtime artifacts (agent sessions, protocol files) and should never affect dirty state.
-  const result = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
+  const result = await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
   if (result.exitCode !== 0) {
     return false;
   }
@@ -347,10 +348,10 @@ export function hasUncommittedChanges(cwd?: string): boolean {
   return hasRealChanges;
 }
 
-export function getUncommittedDiff(cwd?: string): string {
+export async function getUncommittedDiff(cwd?: string): Promise<string> {
   // Get both staged and unstaged changes
-  const staged = runGit(['diff', '--no-color', '--cached'], { cwd });
-  const unstaged = runGit(['diff', '--no-color'], { cwd });
+  const staged = await runGit(['diff', '--no-color', '--cached'], { cwd });
+  const unstaged = await runGit(['diff', '--no-color'], { cwd });
 
   let diff = '';
   if (staged.exitCode === 0 && staged.stdout) {
@@ -364,10 +365,10 @@ export function getUncommittedDiff(cwd?: string): string {
   return diff;
 }
 
-export function applyPatch(patch: string, cwd?: string): boolean {
+export async function applyPatch(patch: string, cwd?: string): Promise<boolean> {
   // Apply a git patch to the working directory
   // Use git apply which handles both staged and unstaged changes
-  const result = runGit(['apply'], {
+  const result = await runGit(['apply'], {
     cwd,
     stdin: new TextEncoder().encode(patch),
   });
@@ -379,9 +380,9 @@ export function applyPatch(patch: string, cwd?: string): boolean {
  * Create a worktree branching from a specific commit SHA
  * Used when creating child tasks that branch from parent's current state
  */
-export function createWorktreeFromSha(path: string, branch: string, startSha: string, cwd?: string): void {
+export async function createWorktreeFromSha(path: string, branch: string, startSha: string, cwd?: string): Promise<void> {
   // Create worktree with new branch starting from specified SHA
-  const result = runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd });
+  const result = await runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`git worktree add from SHA failed: ${result.stderr}`);
   }
@@ -391,12 +392,12 @@ export function createWorktreeFromSha(path: string, branch: string, startSha: st
  * Merge a source branch into a target branch (used for child→parent merges)
  * This checks out the target branch in the main repo, merges, then returns to original branch
  */
-export function mergeBranchIntoTarget(sourceBranch: string, targetBranch: string, message?: string, cwd?: string): void {
+export async function mergeBranchIntoTarget(sourceBranch: string, targetBranch: string, message?: string, cwd?: string): Promise<void> {
   // Save current branch
-  const originalBranch = getCurrentBranch(cwd);
+  const originalBranch = await getCurrentBranch(cwd);
 
   // Checkout target branch
-  const checkout = runGit(['checkout', targetBranch], { cwd });
+  const checkout = await runGit(['checkout', targetBranch], { cwd });
   if (checkout.exitCode !== 0) {
     throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr}`);
   }
@@ -404,21 +405,34 @@ export function mergeBranchIntoTarget(sourceBranch: string, targetBranch: string
   try {
     // Merge source branch
     const mergeMsg = message ?? `Merge ${sourceBranch} into ${targetBranch}`;
-    const merge = runGit(['merge', sourceBranch, '--no-ff', '-m', mergeMsg], { cwd });
+    const merge = await runGit(['merge', sourceBranch, '--no-ff', '-m', mergeMsg], { cwd });
     if (merge.exitCode !== 0) {
       throw new Error(`Merge failed: ${merge.stderr}`);
     }
   } finally {
     // Return to original branch (best effort)
-    runGit(['checkout', originalBranch], { cwd });
+    await runGit(['checkout', originalBranch], { cwd });
   }
 }
 
 /**
- * Check if a branch exists
+ * Check if a branch exists (any ref — local, remote, or tag).
  */
-export function branchExists(branch: string, cwd?: string): boolean {
-  const result = runGit(['rev-parse', '--verify', branch], { cwd });
+export async function branchExists(branch: string, cwd?: string): Promise<boolean> {
+  const result = await runGit(['rev-parse', '--verify', branch], { cwd });
+  return result.exitCode === 0;
+}
+
+/**
+ * Check if a LOCAL branch exists (refs/heads/ only).
+ *
+ * Unlike branchExists(), this explicitly checks refs/heads/<branch> so it
+ * won't match remote tracking branches (refs/remotes/origin/<branch>).
+ * Use this before git push to avoid "src refspec does not match any" errors
+ * on machines where the local branch was never created (e.g., after migration).
+ */
+export async function localBranchExists(branch: string, cwd?: string): Promise<boolean> {
+  const result = await runGit(['rev-parse', '--verify', `refs/heads/${branch}`], { cwd });
   return result.exitCode === 0;
 }
 
@@ -435,27 +449,100 @@ export interface WorktreeRecoveryResult {
  * If the branch exists in git, the worktree is recreated at the given path.
  * If the branch is gone, recovery fails and the caller should show an error.
  */
-export function recoverMissingWorktree(
+export async function recoverMissingWorktree(
   worktreePath: string,
   branch: string,
   cwd?: string,
-): WorktreeRecoveryResult {
-  if (!branchExists(branch, cwd)) {
+): Promise<WorktreeRecoveryResult> {
+  if (!await branchExists(branch, cwd)) {
     return { recovered: false, branchExists: false, dirty: false };
   }
 
   // Prune stale worktree entries so git doesn't reject the add
-  runGit(['worktree', 'prune'], { cwd });
+  await runGit(['worktree', 'prune'], { cwd });
 
-  const result = runGit(['worktree', 'add', worktreePath, branch], { cwd });
+  const result = await runGit(['worktree', 'add', worktreePath, branch], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`Failed to recreate worktree: ${result.stderr}`);
   }
 
   // Check if the recreated worktree has uncommitted changes
-  const dirty = hasUncommittedChanges(worktreePath);
+  const dirty = await hasUncommittedChanges(worktreePath);
 
   return { recovered: true, branchExists: true, dirty };
+}
+
+/**
+ * Fetch a branch from a remote and create a local tracking branch.
+ *
+ * Returns true if the branch was fetched and now exists locally,
+ * false if the branch doesn't exist on the remote.
+ * Throws if a network/auth error persists after retries.
+ */
+export async function fetchRemoteBranch(
+  branch: string,
+  remoteName: string = 'origin',
+  cwd?: string,
+): Promise<boolean> {
+  let branchNotOnRemote = false;
+
+  await withRemoteRetry(
+    async () => {
+      const result = await runGit(
+        ['fetch', remoteName, `${branch}:refs/heads/${branch}`],
+        { cwd },
+      );
+      if (result.exitCode !== 0) {
+        const stderr = result.stderr.toLowerCase();
+        // "couldn't find remote ref" / "no such remote ref" means the branch
+        // genuinely doesn't exist on the remote — retrying won't help.
+        if (
+          stderr.includes("couldn't find remote ref") ||
+          stderr.includes('no such remote ref')
+        ) {
+          branchNotOnRemote = true;
+          return;
+        }
+        throw new Error(result.stderr.trim());
+      }
+    },
+    `fetch branch ${branch} from ${remoteName}`,
+  );
+
+  if (branchNotOnRemote) {
+    return false;
+  }
+  return await branchExists(branch, cwd);
+}
+
+/**
+ * Attempt to recover a missing worktree, fetching the branch from a remote
+ * if it doesn't exist locally.
+ *
+ * This is the async counterpart of recoverMissingWorktree — it first tries
+ * a local recovery, and if the branch is missing locally, fetches from the
+ * remote before retrying.
+ */
+export async function recoverMissingWorktreeWithFetch(
+  worktreePath: string,
+  branch: string,
+  remoteName: string = 'origin',
+  cwd?: string,
+): Promise<WorktreeRecoveryResult> {
+  // Try local recovery first (fast path)
+  if (await branchExists(branch, cwd)) {
+    return await recoverMissingWorktree(worktreePath, branch, cwd);
+  }
+
+  // Branch not local — try fetching from remote
+  logger.info(`Branch '${branch}' not found locally. Fetching from ${remoteName}...`);
+  const fetched = await fetchRemoteBranch(branch, remoteName, cwd);
+  if (!fetched) {
+    return { recovered: false, branchExists: false, dirty: false };
+  }
+
+  logger.info(`Fetched branch '${branch}' from ${remoteName}.`);
+  return await recoverMissingWorktree(worktreePath, branch, cwd);
 }
 
 /**
@@ -469,15 +556,15 @@ export function recoverMissingWorktree(
  *
  * Also returns true for regular merges where the branch is an ancestor of the target.
  */
-export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: string): boolean {
+export async function isBranchMergedInto(branch: string, targetBranch: string, cwd?: string): Promise<boolean> {
   // Fast path: check if this is a regular (non-squash) merge
-  const ancestorCheck = runGit(['merge-base', '--is-ancestor', branch, targetBranch], { cwd });
+  const ancestorCheck = await runGit(['merge-base', '--is-ancestor', branch, targetBranch], { cwd });
   if (ancestorCheck.exitCode === 0) {
     // Branch is ancestor of target. But this is also true for freshly created branches
     // that have no new commits. Check that the branch actually has work on it by verifying
     // the branch tip is not the merge-base (i.e., they haven't diverged at all).
-    const mergeBase = runGit(['merge-base', branch, targetBranch], { cwd });
-    const branchTip = runGit(['rev-parse', branch], { cwd });
+    const mergeBase = await runGit(['merge-base', branch, targetBranch], { cwd });
+    const branchTip = await runGit(['rev-parse', branch], { cwd });
     if (mergeBase.exitCode === 0 && branchTip.exitCode === 0) {
       if (mergeBase.stdout === branchTip.stdout) {
         // Branch tip equals merge-base — no unique commits, freshly created branch
@@ -489,7 +576,7 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
 
   // Squash-merge detection: branch has unique commits but contents match target
   // First check the branch has diverged (has commits not on target)
-  const branchCommits = runGit(
+  const branchCommits = await runGit(
     ['rev-list', '--count', `${targetBranch}..${branch}`],
     { cwd }
   );
@@ -499,9 +586,9 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
 
   // Guard: if ALL unique commits are empty (no file changes), this is not a squash merge.
   // This prevents false positives from --allow-empty initial commits created by `lazy start`.
-  const mergeBase = runGit(['merge-base', branch, targetBranch], { cwd });
+  const mergeBase = await runGit(['merge-base', branch, targetBranch], { cwd });
   if (mergeBase.exitCode === 0) {
-    const filesChanged = runGit(['diff', '--name-only', mergeBase.stdout, branch], { cwd });
+    const filesChanged = await runGit(['diff', '--name-only', mergeBase.stdout, branch], { cwd });
     if (filesChanged.exitCode === 0 && filesChanged.stdout === '') {
       // Branch has commits but zero file changes — not a real merge, just empty commits
       return false;
@@ -510,7 +597,7 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
 
   // Branch has unique commits with real file changes. Check if the tree contents are
   // identical to target (squash merged).
-  const diff = runGit(['diff', '--quiet', targetBranch, branch], { cwd });
+  const diff = await runGit(['diff', '--quiet', targetBranch, branch], { cwd });
   return diff.exitCode === 0; // exit 0 = no diff = contents match
 }
 
@@ -519,8 +606,8 @@ export function isBranchMergedInto(branch: string, targetBranch: string, cwd?: s
  * Used to detect squash-merge commits when the source branch has been deleted.
  * Searches the last `limit` commits (default 100).
  */
-export function findCommitByMessage(targetBranch: string, searchText: string, cwd?: string, limit: number = 100): boolean {
-  const result = runGit(
+export async function findCommitByMessage(targetBranch: string, searchText: string, cwd?: string, limit: number = 100): Promise<boolean> {
+  const result = await runGit(
     ['log', targetBranch, `--max-count=${limit}`, '--format=%s', '--grep', searchText],
     { cwd }
   );
@@ -532,15 +619,15 @@ export function findCommitByMessage(targetBranch: string, searchText: string, cw
  * Check if a given parent branch has commits that are not yet in the current branch.
  * Returns true if the parent branch has upstream changes that should be merged.
  */
-export function hasUpstreamChanges(parentBranch: string, cwd?: string): boolean {
-  const currentBranch = getCurrentBranch(cwd);
+export async function hasUpstreamChanges(parentBranch: string, cwd?: string): Promise<boolean> {
+  const currentBranch = await getCurrentBranch(cwd);
 
-  if (!branchExists(parentBranch, cwd)) {
+  if (!await branchExists(parentBranch, cwd)) {
     return false;
   }
 
   // Check if there are commits in parent that are not in current branch
-  const result = runGit(
+  const result = await runGit(
     ['rev-list', '--count', `${currentBranch}..${parentBranch}`],
     { cwd }
   );
@@ -557,11 +644,11 @@ export function hasUpstreamChanges(parentBranch: string, cwd?: string): boolean 
  * Count how many commits targetBranch has that are not in sourceBranch.
  * Returns 0 if the count cannot be determined.
  */
-export function getCommitsBehindCount(sourceBranch: string, targetBranch: string, cwd?: string): number {
-  if (!branchExists(targetBranch, cwd)) {
+export async function getCommitsBehindCount(sourceBranch: string, targetBranch: string, cwd?: string): Promise<number> {
+  if (!await branchExists(targetBranch, cwd)) {
     return 0;
   }
-  const result = runGit(
+  const result = await runGit(
     ['rev-list', '--count', `${sourceBranch}..${targetBranch}`],
     { cwd }
   );
@@ -574,8 +661,8 @@ export function getCommitsBehindCount(sourceBranch: string, targetBranch: string
 /**
  * Get the merge base between two branches
  */
-export function getMergeBase(branch1: string, branch2: string, cwd?: string): string {
-  const result = runGit(['merge-base', branch1, branch2], { cwd });
+export async function getMergeBase(branch1: string, branch2: string, cwd?: string): Promise<string> {
+  const result = await runGit(['merge-base', branch1, branch2], { cwd });
   if (result.exitCode !== 0) {
     throw new Error(`Failed to find merge base: ${result.stderr}`);
   }
@@ -586,12 +673,12 @@ export function getMergeBase(branch1: string, branch2: string, cwd?: string): st
  * Check if merging fromBranch into current HEAD would result in conflicts.
  * Uses git merge-tree to detect conflicts without modifying the working directory.
  */
-export function checkMergeConflicts(fromBranch: string, cwd?: string): boolean {
+export async function checkMergeConflicts(fromBranch: string, cwd?: string): Promise<boolean> {
   // Get merge base between current HEAD and the branch we want to merge
-  const mergeBase = getMergeBase('HEAD', fromBranch, cwd);
+  const mergeBase = await getMergeBase('HEAD', fromBranch, cwd);
 
   // Use git merge-tree to simulate the merge
-  const result = runGit(['merge-tree', mergeBase, 'HEAD', fromBranch], { cwd });
+  const result = await runGit(['merge-tree', mergeBase, 'HEAD', fromBranch], { cwd });
 
   // merge-tree outputs conflict markers if there are conflicts
   return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
@@ -601,12 +688,12 @@ export function checkMergeConflicts(fromBranch: string, cwd?: string): boolean {
  * Check if merging sourceBranch into targetBranch would result in conflicts.
  * Similar to checkMergeConflicts but allows specifying the target branch.
  */
-export function checkMergeConflictsIntoTarget(sourceBranch: string, targetBranch: string, cwd?: string): boolean {
+export async function checkMergeConflictsIntoTarget(sourceBranch: string, targetBranch: string, cwd?: string): Promise<boolean> {
   // Get merge base between target branch and the source branch
-  const mergeBase = getMergeBase(targetBranch, sourceBranch, cwd);
+  const mergeBase = await getMergeBase(targetBranch, sourceBranch, cwd);
 
   // Use git merge-tree to simulate the merge
-  const result = runGit(['merge-tree', mergeBase, targetBranch, sourceBranch], { cwd });
+  const result = await runGit(['merge-tree', mergeBase, targetBranch, sourceBranch], { cwd });
 
   // merge-tree outputs conflict markers if there are conflicts
   return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
@@ -615,8 +702,8 @@ export function checkMergeConflictsIntoTarget(sourceBranch: string, targetBranch
 /**
  * Build a squash commit message for a task merge.
  */
-function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string): string {
-  const commitMsgs = getBranchCommitMessages(sourceBranch, targetBranch, root);
+async function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string): Promise<string> {
+  const commitMsgs = await getBranchCommitMessages(sourceBranch, targetBranch, root);
   let message = `Accept task ${taskShortId}: ${goal}`;
   if (commitMsgs.length > 0) {
     message += '\n\nSquashed commit of the following:\n' +
@@ -630,26 +717,26 @@ function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranc
 /**
  * Squash-merge a task branch into its target branch.
  */
-export function squashMergeTaskBranch(
+export async function squashMergeTaskBranch(
   sourceBranch: string,
   targetBranch: string,
   taskShortId: string,
   goal: string,
   root: string,
-): void {
-  const commitMessage = buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root);
-  squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
+): Promise<void> {
+  const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root);
+  await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
 }
 
 /**
  * Copy untracked files matching glob patterns into a worktree.
  * Used to copy files like .env that aren't checked into git but are needed at runtime.
  */
-export function copyUntrackedFilesIntoWorktree(
+export async function copyUntrackedFilesIntoWorktree(
   repoRoot: string,
   worktreePath: string,
   includePatterns: string[],
-): void {
+): Promise<void> {
   if (includePatterns.length === 0) return;
 
   for (const pattern of includePatterns) {
@@ -661,10 +748,10 @@ export function copyUntrackedFilesIntoWorktree(
       const destPath = join(worktreePath, relativePath);
 
       // Skip if file doesn't exist (shouldn't happen with scanSync but be safe)
-      if (!existsSync(sourcePath)) continue;
+      if (!(await pathExists(sourcePath))) continue;
 
       // Skip if file is tracked by git
-      const checkTracked = runGit(
+      const checkTracked = await runGit(
         ['ls-files', '--error-unmatch', relativePath],
         { cwd: repoRoot, stdout: 'ignore', stderr: 'ignore' }
       );
@@ -675,14 +762,12 @@ export function copyUntrackedFilesIntoWorktree(
 
       // Create parent directories in worktree
       const destDir = dirname(destPath);
-      if (!existsSync(destDir)) {
-        mkdirSync(destDir, { recursive: true });
-      }
+      await ensureDir(destDir);
 
       // Copy file preserving permissions
-      copyFileSync(sourcePath, destPath);
-      const stats = statSync(sourcePath);
-      chmodSync(destPath, stats.mode);
+      await copyFile(sourcePath, destPath);
+      const stats = await stat(sourcePath);
+      await chmod(destPath, stats.mode);
 
       logger.info(`Copied ${relativePath} to worktree`);
     }

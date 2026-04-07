@@ -15,7 +15,7 @@ import type { DriverDeps } from '../../src/remote/github-driver';
 
 describe('GitHubDriver waitForChecks', () => {
   const mockConfig: ResolvedConfig = {
-    models: { default: 'sonnet' as const },
+    models: { default: 'claude-sonnet-4-5-20250929' },
     session: { verbose: false, debug: false, auto_commit_instructions: false },
     data: { path: '/tmp/test/.lazy' },
     storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -26,18 +26,28 @@ describe('GitHubDriver waitForChecks', () => {
     remote: {
       driver: 'github',
       git_remote: 'origin',
+      auto_approve: false,
       github_auto_push: true,
       github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
       gitlab_auto_push: true,
       gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     },
     docker: { dockerfile: '', toolchain: '' },
-    runner: { type: 'docker' as const, docker_agent_no_network: false },
+    runner: { type: 'docker' as const },
     documents: { path: '' },
     features: {},
     worktree: { include: [] },
     permissions: { protected: [] },
     checks: { post_turn: '', post_turn_timeout: 300 },
+    ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+    daemon: {
+      auto_react_ci: true,
+      auto_react_comments: true,
+      auto_react_max_retries: 3,
+      auto_react_backoff: 'exponential' as const,
+      auto_react_daily_budget: 50,
+      max_auto_turns: 3,
+    },
   };
 
   const mockTask: Task = {
@@ -47,7 +57,7 @@ describe('GitHubDriver waitForChecks', () => {
     prompt: '',
     type: 'task',
     status: 'blocked',
-    model: 'sonnet',
+    model: 'claude-sonnet-4-5-20250929',
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
@@ -57,12 +67,13 @@ describe('GitHubDriver waitForChecks', () => {
     metadata: {
       github_remote_ref_id: '42',
     },
+    pending_sync: 0,
   };
 
   // INVARIANT: When all checks pass, waitForChecks returns { passed: true }.
   test('returns passed when all checks succeed', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
@@ -75,7 +86,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -87,7 +98,7 @@ describe('GitHubDriver waitForChecks', () => {
   // INVARIANT: When checks fail, waitForChecks returns { passed: false } with failed check details.
   test('returns failed checks when any check fails', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
@@ -100,7 +111,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -117,7 +128,7 @@ describe('GitHubDriver waitForChecks', () => {
   // INVARIANT: When no checks are configured, waitForChecks returns { passed: true }.
   test('returns passed when no checks are configured', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: '[]',
@@ -127,7 +138,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -144,8 +155,8 @@ describe('GitHubDriver waitForChecks', () => {
     };
 
     const mockDeps: DriverDeps = {
-      runGh: () => ({ stdout: '', stderr: 'unexpected call', exitCode: 1 }),
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGh: async () => ({ stdout: '', stderr: 'unexpected call', exitCode: 1 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -159,7 +170,7 @@ describe('GitHubDriver waitForChecks', () => {
     let callCount = 0;
 
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           callCount++;
           if (callCount <= 2) {
@@ -185,7 +196,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -198,7 +209,7 @@ describe('GitHubDriver waitForChecks', () => {
   // INVARIANT: waitForChecks times out and reports remaining pending checks.
   test('times out when checks stay pending', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
@@ -210,7 +221,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -228,7 +239,7 @@ describe('GitHubDriver waitForChecks', () => {
   // INVARIANT: waitForChecks handles gh CLI failures gracefully (no checks found).
   test('returns passed when gh pr checks fails', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: '',
@@ -238,7 +249,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -250,7 +261,7 @@ describe('GitHubDriver waitForChecks', () => {
   // INVARIANT: waitForChecks detects failure even when some checks pass.
   test('reports failure when some pass and some fail', async () => {
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
@@ -264,7 +275,7 @@ describe('GitHubDriver waitForChecks', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);

@@ -7,7 +7,7 @@ import { commandStart } from './start';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
 import { logger } from '../../utils/logger';
-import type { ModelName } from '../../types';
+
 import { getActor } from '../../constants';
 import type { Storage } from '../../storage/interface';
 
@@ -17,10 +17,10 @@ import { spawnSync } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
 import { escapeRegex } from '../../utils/regex';
 
-function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): void {
+async function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): Promise<void> {
   if (existsSync(worktreePath)) {
     try {
-      removeWorktree(worktreePath, root);
+      await removeWorktree(worktreePath, root);
     } catch {
       // Worktree may be corrupted. Fall back to manual removal + prune.
       spawnSync(['rm', '-rf', worktreePath]);
@@ -28,7 +28,7 @@ function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: st
     }
   }
   try {
-    deleteBranch(branch, root);
+    await deleteBranch(branch, root);
   } catch {
     // Branch may already be gone
   }
@@ -92,7 +92,7 @@ export async function commandRedo(args: string[]): Promise<void> {
     { name: 'model', takesValue: true },
     { name: 'no-start', takesValue: false },
     { name: 'yes', takesValue: false },
-    { name: 'docker-agent-no-network', takesValue: false },
+
   ], 'redo');
 
   const taskId = parsed.positional[0];
@@ -104,9 +104,8 @@ export async function commandRedo(args: string[]): Promise<void> {
   const promptOverride = parsed.flags.get('prompt') as string | undefined;
   const noStart = parsed.flags.get('no-start') === true;
   const yes = parsed.flags.get('yes') === true;
-  const dockerAgentNoNetwork = parsed.flags.get('docker-agent-no-network') === true;
 
-  let modelOverride: ModelName | undefined;
+  let modelOverride: string | undefined;
   const modelValue = parsed.flags.get('model') as string | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
@@ -136,7 +135,7 @@ export async function commandRedo(args: string[]): Promise<void> {
 
     // Check worktree for uncommitted changes
     const worktreePath = getWorktreePath(root, oldTask);
-    if (existsSync(worktreePath) && hasUncommittedChanges(worktreePath)) {
+    if (existsSync(worktreePath) && (await hasUncommittedChanges(worktreePath))) {
       console.error('Error: Task has uncommitted changes!');
       console.error('Commit or stash your changes before redoing.');
       console.error('Options:');
@@ -163,7 +162,7 @@ export async function commandRedo(args: string[]): Promise<void> {
 
       // Get diff stat from old task
       try {
-        const diffStat = getDiffStat(sess.git_start_sha, 'HEAD', worktreePath);
+        const diffStat = await getDiffStat(sess.git_start_sha, 'HEAD', worktreePath);
         if (diffStat.trim()) {
           redoContext += `\nFiles changed in previous attempt:\n\`\`\`\n${diffStat}\`\`\`\n`;
         }
@@ -228,14 +227,14 @@ export async function commandRedo(args: string[]): Promise<void> {
       await cleanupTaskContainer(storage, sess, taskRef(oldTask), root);
 
       try {
-        const config = loadConfig(root);
+        const config = await loadConfig(root);
         const driver = createDriver(config);
         await driver.cleanup(sess.git_branch);
       } catch (err) {
         logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
       }
 
-      cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
     }
 
     newTaskShortId = shortId(newTask.id);
@@ -255,9 +254,6 @@ export async function commandRedo(args: string[]): Promise<void> {
     const startArgs = [newTaskShortId, '--yes'];
     if (modelOverride) {
       startArgs.push('--model', modelOverride);
-    }
-    if (dockerAgentNoNetwork) {
-      startArgs.push('--docker-agent-no-network');
     }
     await commandStart(startArgs);
   } else {
@@ -279,10 +275,9 @@ Arguments:
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Override model for the new task (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
-  --docker-agent-no-network  Disable network access in container (overrides lazy.toml runner.docker_agent_no_network)
 
 What gets carried over:
   - Goal (always)
@@ -300,5 +295,5 @@ Examples:
   lazy redo abc123                        # Redo task, start immediately
   lazy redo abc123 --no-start             # Redo but keep in backlog
   lazy redo abc123 --prompt "Updated requirements"  # Redo with new prompt
-  lazy redo fix-auth --model opus         # Redo with different model`);
+  lazy redo fix-auth --model claude-opus-4-6         # Redo with different model`);
 }

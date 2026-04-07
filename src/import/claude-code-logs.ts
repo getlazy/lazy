@@ -14,7 +14,7 @@
 
 import { readFile, readdir, stat } from 'fs/promises';
 import { join, basename } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
 import type { TokenUsage } from '../types';
 
 // --- Raw JSONL types ---
@@ -108,7 +108,7 @@ export interface ParsedConversation {
  * Get the Claude Code projects directory
  */
 function getClaudeProjectsDir(): string {
-  return join(homedir(), '.claude', 'projects');
+  return join(getHome(), '.claude', 'projects');
 }
 
 /**

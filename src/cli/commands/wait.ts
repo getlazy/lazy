@@ -4,6 +4,7 @@ import { isBlockedStatus } from '../../types';
 import type { Task, TaskStatus } from '../../types';
 import type { Storage } from '../../storage';
 import { queryWait } from '../../daemon/rpc-fallback';
+import { createTerminal } from '../../terminal';
 
 const POLL_INTERVAL_MS = 1500;
 
@@ -35,7 +36,7 @@ export async function commandWait(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Single task, no --follow, no --next: use queryWait (daemon → direct fallback)
+  // Single task, no --follow, no --next: use queryWait via daemon RPC
   if (!isNext && !follow && parsed.positional.length === 1) {
     const taskId = parsed.positional[0];
     console.log(`Waiting for task ${taskId} to complete...`);
@@ -113,6 +114,11 @@ async function waitSingleTask(storage: Storage, task: Task, follow: boolean): Pr
       console.error(`Task ${displayId(task)} has no container name.`);
       process.exit(1);
     }
+
+    // Set terminal window title while following
+    const terminal = createTerminal();
+    terminal.setActivity(`lazy wait ${displayId(task)}`);
+    process.on('exit', () => terminal.restoreTitle());
 
     const lazyRoot = requireLazyRoot();
     const worktreePath = getWorktreePath(lazyRoot, task);

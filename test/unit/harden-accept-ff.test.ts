@@ -6,7 +6,7 @@ import {
 } from '../../src/utils/git';
 
 /** Helper: create a mock git function */
-function mockGit(handler: (args: string[], cwd?: string) => GitResult) {
+function mockGit(handler: (args: string[], cwd?: string) => Promise<GitResult>) {
   return handler;
 }
 
@@ -17,13 +17,13 @@ const fail = (stderr = 'error'): GitResult => ({ stdout: '', stderr, exitCode: 1
 // the operation actually failed is NEVER acceptable.
 describe('tryFastForwardInWorktree — fail hard on failures', () => {
   // INVARIANT: Fetch failure must return success:false, not success:true with warning.
-  test('fetch failure returns success:false', () => {
-    const git = mockGit((args) => {
+  test('fetch failure returns success:false', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return fail('fatal: Could not resolve host: github.com');
       return ok();
     });
 
-    const result = tryFastForwardInWorktree(
+    const result = await tryFastForwardInWorktree(
       'main', '/repo/.lazy/worktrees/task-abc', 'origin/main', 'origin', '/repo', git,
     );
 
@@ -34,8 +34,8 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
   });
 
   // INVARIANT: Merge failure must return success:false.
-  test('merge ff-only failure returns success:false', () => {
-    const git = mockGit((args) => {
+  test('merge ff-only failure returns success:false', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'merge' && args.includes('--ff-only')) {
         return fail('fatal: Not possible to fast-forward, aborting.');
@@ -43,7 +43,7 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
       return ok();
     });
 
-    const result = tryFastForwardInWorktree(
+    const result = await tryFastForwardInWorktree(
       'main', '/repo/.lazy/worktrees/task-abc', 'origin/main', 'origin', '/repo', git,
     );
 
@@ -52,14 +52,14 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
     expect(result.warning).toContain('could not be fast-forwarded');
   });
 
-  test('successful ff-only merge returns success:true', () => {
-    const git = mockGit((args) => {
+  test('successful ff-only merge returns success:true', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'merge' && args.includes('--ff-only')) return ok('Fast-forward');
       return ok();
     });
 
-    const result = tryFastForwardInWorktree(
+    const result = await tryFastForwardInWorktree(
       'main', '/repo/.lazy/worktrees/task-abc', 'origin/main', 'origin', '/repo', git,
     );
 
@@ -67,8 +67,8 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
     expect(result.warning).toBeUndefined();
   });
 
-  test('already up to date returns success:true', () => {
-    const git = mockGit((args) => {
+  test('already up to date returns success:true', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'merge' && args.includes('--ff-only')) {
         return { stdout: 'Already up to date.', stderr: '', exitCode: 1 };
@@ -76,7 +76,7 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
       return ok();
     });
 
-    const result = tryFastForwardInWorktree(
+    const result = await tryFastForwardInWorktree(
       'main', '/repo/.lazy/worktrees/task-abc', 'origin/main', 'origin', '/repo', git,
     );
 
@@ -89,13 +89,13 @@ describe('tryFastForwardInWorktree — fail hard on failures', () => {
 // never silently proceed with inSync:true.
 describe('validateBranchInSyncWithRemote — no silent fallbacks', () => {
   // INVARIANT: Fetch failure must return inSync:false, not inSync:true.
-  test('fetch failure returns inSync:false with actionable error', () => {
-    const git = mockGit((args) => {
+  test('fetch failure returns inSync:false with actionable error', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return fail('fatal: Could not resolve host: github.com');
       return ok();
     });
 
-    const result = validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
+    const result = await validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
 
     expect(result.inSync).toBe(false);
     expect(result.error).toBeDefined();
@@ -104,34 +104,34 @@ describe('validateBranchInSyncWithRemote — no silent fallbacks', () => {
   });
 
   // INVARIANT: Can't resolve refs must return inSync:false.
-  test('ref resolution failure returns inSync:false', () => {
-    const git = mockGit((args) => {
+  test('ref resolution failure returns inSync:false', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'rev-parse') return fail('fatal: not a valid ref');
       return ok();
     });
 
-    const result = validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
+    const result = await validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
 
     expect(result.inSync).toBe(false);
     expect(result.error).toBeDefined();
     expect(result.error).toContain('Failed to resolve refs');
   });
 
-  test('same SHA returns inSync:true', () => {
-    const git = mockGit((args) => {
+  test('same SHA returns inSync:true', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'rev-parse' && args[1] === 'main') return ok('aaa111');
       if (args[0] === 'rev-parse' && args[1] === 'origin/main') return ok('aaa111');
       return ok();
     });
 
-    const result = validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
+    const result = await validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
     expect(result.inSync).toBe(true);
   });
 
-  test('local behind remote (ancestor) returns inSync:true', () => {
-    const git = mockGit((args) => {
+  test('local behind remote (ancestor) returns inSync:true', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'rev-parse' && args[1] === 'main') return ok('aaa111');
       if (args[0] === 'rev-parse' && args[1] === 'origin/main') return ok('bbb222');
@@ -139,12 +139,12 @@ describe('validateBranchInSyncWithRemote — no silent fallbacks', () => {
       return ok();
     });
 
-    const result = validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
+    const result = await validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
     expect(result.inSync).toBe(true);
   });
 
-  test('local diverged from remote returns inSync:false', () => {
-    const git = mockGit((args) => {
+  test('local diverged from remote returns inSync:false', async () => {
+    const git = mockGit(async (args) => {
       if (args[0] === 'fetch') return ok();
       if (args[0] === 'rev-parse' && args[1] === 'main') return ok('aaa111');
       if (args[0] === 'rev-parse' && args[1] === 'origin/main') return ok('bbb222');
@@ -152,7 +152,7 @@ describe('validateBranchInSyncWithRemote — no silent fallbacks', () => {
       return ok();
     });
 
-    const result = validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
+    const result = await validateBranchInSyncWithRemote('main', 'origin', '/repo', git);
 
     expect(result.inSync).toBe(false);
     expect(result.error).toContain('diverged');

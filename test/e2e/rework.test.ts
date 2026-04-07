@@ -57,7 +57,7 @@ describe('lazy rework', () => {
 
   // INVARIANT: rework inherits the original task's model unless overridden.
   test('rework inherits model from original task', async () => {
-    const createResult = await ctx.lazy(['create', '--goal', 'Task with model', '--prompt', 'Do work', '--model', 'opus']);
+    const createResult = await ctx.lazy(['create', '--goal', 'Task with model', '--prompt', 'Do work', '--model', 'claude-opus-4-6']);
     expectSuccess(createResult);
     const taskId = extractTaskId(createResult.stdout);
 
@@ -70,7 +70,7 @@ describe('lazy rework', () => {
     // Rework without --model
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix something']);
     expectSuccess(result);
-    expectOutput(result, 'opus');
+    expectOutput(result, 'claude-opus-4-6');
   });
 
   // INVARIANT: --model overrides the inherited model.
@@ -82,9 +82,9 @@ describe('lazy rework', () => {
     });
     await ctx.lazy(['accept', taskId]);
 
-    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--model', 'haiku']);
+    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--model', 'claude-haiku-4-5-20251001']);
     expectSuccess(result);
-    expectOutput(result, 'haiku');
+    expectOutput(result, 'claude-haiku-4-5-20251001');
   });
 
   // INVARIANT: --goal overrides the default "Rework: <original goal>".

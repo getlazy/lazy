@@ -198,12 +198,12 @@ export interface TurnDiffResult {
  * Falls back to start_sha..end_sha if no upstream_merge_sha available.
  * Falls back to full task diff (fromRef..HEAD) if no SHAs available at all.
  */
-export function getTurnDiff(
+export async function getTurnDiff(
   turn: Turn,
   worktreePath: string,
   fallbackFromRef?: string,
   upstreamMergeSha?: string,
-): TurnDiffResult | null {
+): Promise<TurnDiffResult | null> {
   let fromSha: string;
   let toSha: string;
   let isFallback = false;
@@ -231,7 +231,7 @@ export function getTurnDiff(
   // upstream changes merged into the task branch. Specific SHA-to-SHA cases
   // use two-dot because those are concrete commits on the same branch.
   const diffRange = isFallback ? `${fromSha}...${toSha}` : `${fromSha}..${toSha}`;
-  const result = runGit(
+  const result = await runGit(
     ['diff', '--no-color', diffRange, '--', '.', ':!.lazy*'],
     { cwd: worktreePath },
   );
@@ -271,14 +271,14 @@ export interface EditorContentPair {
  * - Human deletes comments → diff is clean (no changes)
  * - Human edits comments → diff shows edited comments
  */
-export function buildEditorContentWithDiff(
+export async function buildEditorContentWithDiff(
   agentResponse: string,
   turnDiff: TurnDiffResult | null,
   taskId?: string,
   goal?: string,
   notes?: Comment[],
   remoteUrl?: string,
-): EditorContentPair {
+): Promise<EditorContentPair> {
   const base = buildEditorContent(agentResponse, taskId, goal, remoteUrl);
   const editorParts: string[] = [base];
   const comparisonParts: string[] = [base];

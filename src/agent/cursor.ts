@@ -17,55 +17,20 @@ import type { Agent } from './interface';
 export class CursorAgent implements Agent {
   readonly id = 'cursor';
 
-  getAuthEnv(): { key: string; value: string } {
+  getAuthEnvVars(): Array<{ key: string; value: string }> {
     const apiKey = process.env.CURSOR_API_KEY;
     if (apiKey) {
-      return { key: 'CURSOR_API_KEY', value: apiKey };
+      return [{ key: 'CURSOR_API_KEY', value: apiKey }];
     }
     // Cursor CLI can authenticate via `agent login` session on the host.
     // Return a no-op env var and let the CLI handle its own auth.
-    return { key: 'CURSOR_API_KEY', value: '' };
+    return [{ key: 'CURSOR_API_KEY', value: '' }];
   }
 
   hasAuthEnv(): boolean {
     // Cursor CLI can use either CURSOR_API_KEY or its own login session.
     // Always return true — let the CLI fail with its own auth error if needed.
     return true;
-  }
-
-  resolveModelId(modelName: string): string {
-    // Universal monikers return '' (empty) — omit --model and let Cursor use
-    // its default (`auto`). This works on free plans which can only use `auto`.
-    // Only pass --model when the user explicitly picks a Cursor-specific model.
-    const monikers = new Set(['apprentice', 'journeyman', 'master']);
-    if (monikers.has(modelName)) {
-      return '';
-    }
-
-    const cursorModels: Record<string, string> = {
-      'sonnet-4': 'sonnet-4',
-      'sonnet-4-thinking': 'sonnet-4-thinking',
-      'gpt-5': 'gpt-5',
-    };
-    const id = cursorModels[modelName];
-    if (!id) {
-      const validNames = [...monikers, ...Object.keys(cursorModels)].join(', ');
-      throw new Error(`Unknown model: ${modelName}. Valid options: ${validNames}`);
-    }
-    return id;
-  }
-
-  availableModels(): { name: string; modelId: string; isDefault: boolean }[] {
-    return [
-      // Universal monikers — use Cursor's default model (no --model flag)
-      { name: 'journeyman', modelId: '', isDefault: true },
-      { name: 'master', modelId: '', isDefault: false },
-      { name: 'apprentice', modelId: '', isDefault: false },
-      // Cursor-specific names — pass --model explicitly
-      { name: 'sonnet-4', modelId: 'sonnet-4', isDefault: false },
-      { name: 'sonnet-4-thinking', modelId: 'sonnet-4-thinking', isDefault: false },
-      { name: 'gpt-5', modelId: 'gpt-5', isDefault: false },
-    ];
   }
 
   buildExecArgs(opts: {

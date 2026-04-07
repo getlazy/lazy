@@ -91,7 +91,7 @@ async function runLazyMocked(
       LAZY_TEST: '1',
       LAZY_PROTOCOL_BASE: protocolBase,
       LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify(mockResponse),
-      // Provide fake auth so getAuthEnv() doesn't fail
+      // Provide fake auth so getAuthEnvVars() doesn't fail
       ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
     },
   });

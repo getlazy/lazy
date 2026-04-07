@@ -10,8 +10,12 @@
  */
 
 import { writeFileSync, readFileSync, mkdirSync, unlinkSync, appendFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { spawnSync } from '../utils/spawn';
+import { join, dirname, isAbsolute } from 'path';
+// qa-agent uses Bun.spawnSync directly instead of ../utils/spawn.
+// This is the ONLY file in the codebase where Bun.spawnSync is acceptable
+// outside of src/utils/spawn.ts. Reason: qa-agent must be self-contained
+// (zero internal imports) so it can run from an installed binary without
+// the source tree being present.
 import { randomUUID } from 'crypto';
 
 // --- Scenario schema ---
@@ -136,7 +140,7 @@ function executeAction(action: ScenarioAction, worktreePath: string): void {
       if (!action.command) {
         throw new Error('shell action requires command');
       }
-      const result = spawnSync(['sh', '-c', action.command], {
+      const result = Bun.spawnSync(['sh', '-c', action.command], {
         cwd: worktreePath,
         stdout: 'pipe',
         stderr: 'pipe',
@@ -154,7 +158,7 @@ function executeAction(action: ScenarioAction, worktreePath: string): void {
 
 function commitChanges(worktreePath: string, message: string): void {
   // Stage all changes
-  const addResult = spawnSync(['git', 'add', '-A'], {
+  const addResult = Bun.spawnSync(['git', 'add', '.'], {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -164,18 +168,22 @@ function commitChanges(worktreePath: string, message: string): void {
   }
 
   // Check if there are staged changes
-  const diffResult = spawnSync(['git', 'diff', '--cached', '--quiet'], {
+  const diffResult = Bun.spawnSync(['git', 'diff', '--cached', '--quiet'], {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'pipe',
   });
   // exitCode 1 means there are differences (changes to commit)
   if (diffResult.exitCode === 0) {
-    // No changes to commit — that's fine
+    // No changes to commit
+    try { appendFileSync(join(worktreePath, '.qa-agent-trace.log'), `commitChanges: NO staged changes, git-add exit=${addResult.exitCode}\n`); } catch {}
+    // Debug: check git status
+    const statusResult = Bun.spawnSync(['git', 'status', '--short'], { cwd: worktreePath, stdout: 'pipe', stderr: 'pipe' });
+    try { appendFileSync(join(worktreePath, '.qa-agent-trace.log'), `git-status: ${statusResult.stdout.toString().trim() || '(clean)'}\n`); } catch {}
     return;
   }
 
-  const commitResult = spawnSync(['git', 'commit', '-m', message], {
+  const commitResult = Bun.spawnSync(['git', 'commit', '-m', message], {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -195,7 +203,9 @@ function resolveScenarioFilePath(worktreePath: string): string {
   }
 
   // Read lazy.toml from the worktree root
-  const configPath = join(worktreePath, process.env.LAZY_CONFIG || 'lazy.toml');
+  // When LAZY_CONFIG is an absolute path, use it directly (supports VMs/CI).
+  const configName = process.env.LAZY_CONFIG || 'lazy.toml';
+  const configPath = isAbsolute(configName) ? configName : join(worktreePath, configName);
   if (existsSync(configPath)) {
     try {
       const raw = readFileSync(configPath, 'utf-8');
@@ -256,6 +266,8 @@ function main(): void {
   }
 
   if (!matched) {
+    // Dump prompt to worktree for debugging no-match failures
+    try { writeFileSync(join(worktreePath, '.qa-agent-no-match.txt'), prompt); } catch {}
     // Output error response in expected JSON format
     const errorResponse = {
       result: `qa-agent: no scenario matched the prompt. Prompt: "${prompt.substring(0, 200)}"`,

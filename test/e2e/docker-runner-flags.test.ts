@@ -44,34 +44,6 @@ type = "docker"
     expectOutput(result, 'Runner section test');
   });
 
-  test('[runner] section with docker_agent_no_network works', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + `
-[runner]
-type = "docker"
-docker_agent_no_network = true
-`);
-
-    const taskId = await createTask(ctx, 'Docker flags test');
-    const result = await ctx.lazy(['show', taskId]);
-    expectSuccess(result);
-    expectOutput(result, 'Docker flags test');
-  });
-
-  test('doctor shows docker_agent_no_network when enabled', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + `
-[runner]
-type = "docker"
-docker_agent_no_network = true
-`);
-
-    const result = await ctx.lazy(['doctor']);
-    expectOutput(result, 'docker_agent_no_network enabled');
-  });
-
   // INVARIANT: [runner] section keys are not flagged as unknown by doctor.
   test('[runner] section keys not reported as unknown', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
@@ -79,12 +51,10 @@ docker_agent_no_network = true
     writeFileSync(configPath, existingConfig + `
 [runner]
 type = "docker"
-docker_agent_no_network = false
 `);
 
     const result = await ctx.lazy(['doctor']);
     expectOutputExcludes(result, "Unknown config option 'runner.type'");
-    expectOutputExcludes(result, "Unknown config option 'runner.docker_agent_no_network'");
   });
 
   // INVARIANT: Legacy string runner = "docker" is not reported as unknown.

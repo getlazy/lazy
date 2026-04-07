@@ -52,18 +52,19 @@ import { PostgresStorage } from './postgres-storage';
 import type { Storage } from './interface';
 import { loadConfig } from '../config/loader';
 import { join } from 'path';
-import { homedir } from 'os';
 import { basename } from 'path';
+import { getHome } from '../utils/home';
+import { existsSync, mkdirSync } from 'fs';
 import { runGit } from '../utils/git';
 
 /**
  * Extract project name from git remote URL or directory name.
  * @param remoteName - the git remote name to check (default: 'origin')
  */
-export function getProjectName(lazyRoot: string, remoteName: string = 'origin'): string {
+export async function getProjectName(lazyRoot: string, remoteName: string = 'origin'): Promise<string> {
   try {
     // Try to get remote URL
-    const result = runGit(['remote', 'get-url', remoteName], { cwd: lazyRoot });
+    const result = await runGit(['remote', 'get-url', remoteName], { cwd: lazyRoot });
 
     if (result.exitCode === 0) {
       const url = result.stdout;
@@ -105,7 +106,7 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
 
   let gitRemote = 'origin';
   if (!backend) {
-    const config = loadConfig(lazyRoot);
+    const config = await loadConfig(lazyRoot);
     backend = config.storage.backend;
     externalPath = config.storage.external_path;
     gitRemote = config.remote.git_remote;
@@ -116,9 +117,35 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
   switch (backend) {
     case 'external': {
       if (!externalPath || externalPath === '') {
-        // Default external path
-        const projectName = getProjectName(lazyRoot, gitRemote);
-        externalPath = join(homedir(), '.lazy', projectName);
+        // Default external path: ~/.lazy/<projectName>
+        const home = getHome();
+        const lazyDir = join(home, '.lazy');
+
+        // Verify the home directory is accessible. On cross-platform VMs
+        // (e.g., Lima on macOS host), getHome() may return the host OS path
+        // (e.g., /Users/...) which doesn't exist on the Linux guest.
+        if (!existsSync(home)) {
+          throw new Error(
+            `Cannot create default storage path: home directory "${home}" does not exist.\n` +
+            `This typically happens on VMs where the OS-reported home differs from the actual filesystem.\n` +
+            `Fix: set external_path in your lazy.toml under [storage], e.g.:\n\n` +
+            `  [storage]\n` +
+            `  external_path = "${join('/home', basename(home), '.lazy', await getProjectName(lazyRoot, gitRemote))}"\n`,
+          );
+        }
+
+        // Ensure ~/.lazy/ exists before deriving the project subdir
+        try {
+          mkdirSync(lazyDir, { recursive: true });
+        } catch (err: any) {
+          throw new Error(
+            `Cannot create storage directory "${lazyDir}": ${err.message}\n` +
+            `Fix: set external_path in your lazy.toml under [storage] to a writable path.`,
+          );
+        }
+
+        const projectName = await getProjectName(lazyRoot, gitRemote);
+        externalPath = join(lazyDir, projectName);
       }
       storage = new FileStorage(lazyRoot, { basePath: externalPath });
       break;
@@ -127,7 +154,7 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
     case 'postgres': {
       // Credentials come from environment variables, never from lazy.toml.
       // LAZY_POSTGRES_URL takes priority; falls back to standard PG* env vars.
-      const config = loadConfig(lazyRoot);
+      const config = await loadConfig(lazyRoot);
       storage = new PostgresStorage(lazyRoot, {
         url: process.env.LAZY_POSTGRES_URL,
         host: process.env.PGHOST,

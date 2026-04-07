@@ -58,7 +58,7 @@ function makeTask() {
     prompt: '',
     status: 'working' as const,
     type: 'task' as const,
-    model: 'opus' as const,
+    model: 'claude-opus-4-6',
     created_at: Date.now(),
     completed_at: null,
     parent_task_id: null,

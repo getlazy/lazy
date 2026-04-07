@@ -11,15 +11,18 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
 import type { SandboxConfig } from '../capture/claude';
 import { spawn, spawnSync } from '../utils/spawn';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
-import { getAuthEnv } from '../capture/claude';
+import type { OllamaConfig } from '../config/types';
+import { getAuthEnvVars as getDefaultAuthEnvVars } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { logger } from '../utils/logger';
+import { checkOllamaConnectivity, getEffectiveModel } from '../utils/ollama';
 import { getLazyCommand } from '../utils/cli-path';
+import type { Agent } from '../agent/interface';
 import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
@@ -71,7 +74,7 @@ function removePidFile(runName: string): void {
 
 /** Directory where PID files are stored. */
 function pidFileDir(): string {
-  return join(homedir(), '.lazy', 'run');
+  return join(getHome(), '.lazy', 'run');
 }
 
 // Re-export alias for backward compat with call sites in this file
@@ -91,28 +94,61 @@ export class HostProcessRunner implements Runner {
   readonly type = 'dangerously-host-process-without-any-isolation' as const;
   readonly runLabel = 'Process';
 
+  private _agent?: Agent;
+  private _ollamaConfig?: OllamaConfig;
+
+  /** Set the agent to use for auth. If not set, falls back to ClaudeCodeAgent singleton. */
+  setAgent(agent: Agent): void {
+    this._agent = agent;
+  }
+
+  /** Set Ollama config for local model inference. */
+  setOllamaConfig(config: OllamaConfig): void {
+    this._ollamaConfig = config;
+  }
+
+  private getAuthEnvVars(): Array<{ key: string; value: string }> {
+    // When Ollama is configured, use Ollama env vars instead of API auth
+    if (this._ollamaConfig?.enabled) {
+      return getDefaultAuthEnvVars(this._ollamaConfig);
+    }
+    return this._agent ? this._agent.getAuthEnvVars() : getDefaultAuthEnvVars();
+  }
+
   runDisplayName(runName: string): string {
     const pidData = readPidFile(runName);
     return pidData ? `PID ${pidData.pid}` : runName;
   }
 
   checkAvailability(): void {
-    // Check that the agent binary is on PATH
-    const binaryName = agentPackaging.binaryName();
-    const result = spawnSync([binaryName, '--version'], {
-      stdout: 'pipe',
-      stderr: 'pipe',
-      timeout: 10_000,
-    });
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
-        `Host-process runner requires ${binaryName} to be installed on the host.`
-      );
+    // Check that the agent binary is on PATH.
+    // Skip for non-claude agents (e.g., qa-agent) — they don't use the claude CLI.
+    if (!this._agent || this._agent.id === 'claude-code') {
+      const binaryName = agentPackaging.binaryName();
+      const result = spawnSync([binaryName, '--version'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 10_000,
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
+          `Host-process runner requires ${binaryName} to be installed on the host.`
+        );
+      }
     }
 
-    // Check auth
-    getAuthEnv();
+    if (this._ollamaConfig?.enabled) {
+      // When Ollama is configured, auth is always available (dummy tokens).
+      // Log a warning if Ollama is unreachable (don't fail — it might come up later).
+      const check = checkOllamaConnectivity(this._ollamaConfig);
+      if (!check.reachable) {
+        logger.warn(check.reason);
+      }
+    } else {
+      // Check auth — fail fast on missing credentials
+      this.getAuthEnvVars();
+    }
   }
 
   async ensureReady(): Promise<void> {
@@ -128,11 +164,12 @@ export class HostProcessRunner implements Runner {
     runName: string,
     protocolDir: string,
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<void> {
-    const auth = getAuthEnv();
+    const authEnvVars = this.getAuthEnvVars();
 
     // Set up log file for this run
-    const logDir = join(homedir(), '.lazy', 'logs');
+    const logDir = join(getHome(), '.lazy', 'logs');
     mkdirSync(logDir, { recursive: true });
     const logFile = join(logDir, `${runName}.log`);
 
@@ -153,21 +190,30 @@ export class HostProcessRunner implements Runner {
     // Redirect stdout/stderr to a log file via Bun.file
     const logFileHandle = Bun.file(logFile);
 
-    // Build a clean env: strip CLAUDECODE to prevent "nested session" errors
-    // when lazy is invoked from inside a Claude Code session (e.g., lazy builder).
+    // Build a clean env: strip vars that cause issues in child processes.
     // Docker mode doesn't have this issue because containers get clean environments.
     const cleanEnv = { ...process.env } as Record<string, string>;
+    // CLAUDECODE: prevents "nested session" errors when lazy is invoked from
+    // inside a Claude Code session (e.g., lazy builder).
     delete cleanEnv.CLAUDECODE;
+    // LAZY_IS_DAEMON: when the daemon spawns the supervisor, this env var
+    // leaks down to Claude Code → MCP server. The MCP server's local handlers
+    // call requireDaemonStorage() which skips the daemon connection when
+    // LAZY_IS_DAEMON=1, breaking MCP tool execution.
+    delete cleanEnv.LAZY_IS_DAEMON;
 
     const proc = spawn(supervisorArgs, {
       cwd: sandbox.worktreePath,
       stdout: logFileHandle,
       stderr: logFileHandle,
+      timeout: 0, // Long-running: supervisor runs for the lifetime of the task
       env: {
         ...cleanEnv,
-        [auth.key]: auth.value,
+        ...Object.fromEntries(authEnvVars.map(v => [v.key, v.value])),
         // Ensure HOME is set for Claude Code
-        HOME: homedir(),
+        HOME: getHome(),
+        // Pass daemon config to supervisor so MCP server can route through daemon
+        ...(daemonConfigPath ? { LAZY_DAEMON_CONFIG: daemonConfigPath } : {}),
       },
     });
 
@@ -191,7 +237,9 @@ export class HostProcessRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<AgentResponse> {
-    const auth = getAuthEnv();
+    const authEnvVars = this.getAuthEnvVars();
+
+    const effectiveModel = getEffectiveModel(model, this._ollamaConfig);
 
     const claudeArgs = [
       'claude', '-p', prompt,
@@ -199,8 +247,8 @@ export class HostProcessRunner implements Runner {
       '--dangerously-skip-permissions',
     ];
 
-    if (model) {
-      claudeArgs.push('--model', model);
+    if (effectiveModel) {
+      claudeArgs.push('--model', effectiveModel);
     }
 
     if (debug) {
@@ -209,18 +257,20 @@ export class HostProcessRunner implements Runner {
 
     logger.info('Running Claude Code...');
 
-    // Strip CLAUDECODE to prevent "nested session" errors (same as launchSupervisor).
+    // Strip env vars that cause issues in child processes (same as launchSupervisor).
     const cleanEnv = { ...process.env } as Record<string, string>;
     delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.LAZY_IS_DAEMON;
 
     const proc = spawn(claudeArgs, {
       cwd: sandbox.worktreePath,
       stdout: 'pipe',
       stderr: verbose || debug ? 'inherit' : 'pipe',
+      timeout: 0, // Long-running: Claude Code sessions can take minutes or hours
       env: {
         ...cleanEnv,
-        [auth.key]: auth.value,
-        HOME: homedir(),
+        ...Object.fromEntries(authEnvVars.map(v => [v.key, v.value])),
+        HOME: getHome(),
       },
     });
 
@@ -419,6 +469,17 @@ export class HostProcessRunner implements Runner {
     results.push(...agentPackaging.diagnose());
 
     results.push({ state: 'ok', what: 'Runner mode: host-process (no container isolation)' });
+
+    // Check Ollama connectivity when configured
+    if (this._ollamaConfig?.enabled) {
+      const check = checkOllamaConnectivity(this._ollamaConfig);
+      if (check.reachable) {
+        results.push({ state: 'ok', what: `Ollama reachable at ${check.endpoint}` });
+      } else {
+        results.push({ state: 'fail', what: 'Ollama reachable', reason: check.reason });
+      }
+    }
+
     return results;
   }
 
@@ -438,6 +499,7 @@ export class HostProcessRunner implements Runner {
     _builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
     // Host-process mode: launch Claude Code directly (no supervisor, no MCP proxy).
     // MCP tools are not available in this mode — the builder relies on Claude Code's

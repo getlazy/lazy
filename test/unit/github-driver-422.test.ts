@@ -16,7 +16,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
   // Minimal config for testing
   const mockConfig: ResolvedConfig = {
     models: {
-      default: 'sonnet' as const,
+      default: 'claude-sonnet-4-5-20250929',
     },
     session: {
       verbose: false,
@@ -48,6 +48,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     remote: {
       driver: 'github',
       git_remote: 'origin',
+      auto_approve: false,
       github_auto_push: true,
       github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
       gitlab_auto_push: true,
@@ -57,7 +58,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       dockerfile: '',
       toolchain: '',
     },
-    runner: { type: 'docker' as const, docker_agent_no_network: false },
+    runner: { type: 'docker' as const },
     documents: {
       path: '',
     },
@@ -65,6 +66,15 @@ describe('GitHubDriver 422 self-approval handling', () => {
     worktree: { include: [] },
     permissions: { protected: [] },
     checks: { post_turn: '', post_turn_timeout: 300 },
+    ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+    daemon: {
+      auto_react_ci: true,
+      auto_react_comments: true,
+      auto_react_max_retries: 3,
+      auto_react_backoff: 'exponential' as const,
+      auto_react_daily_budget: 50,
+      max_auto_turns: 3,
+    },
   };
 
   // Minimal task with a PR number
@@ -75,7 +85,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     prompt: '',
     type: 'task',
     status: 'blocked',
-    model: 'sonnet',
+    model: 'claude-sonnet-4-5-20250929',
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
@@ -85,12 +95,13 @@ describe('GitHubDriver 422 self-approval handling', () => {
     metadata: {
       github_remote_ref_id: '123', // PR number
     },
+    pending_sync: 0,
   };
 
   test('postAcceptReview suppresses 422 error (self-approval)', async () => {
     // Mock gh CLI to return 422 error on review, success on comment
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'api' && args.includes('event=APPROVE')) {
           // Review request returns 422
           return {
@@ -109,7 +120,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -122,7 +133,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
   test('postAcceptReview does not suppress non-422 errors', async () => {
     // Mock gh CLI to return auth error on review, success on comment
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'api' && args.includes('event=APPROVE')) {
           // Review request returns auth error (not 422)
           return {
@@ -141,7 +152,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -156,7 +167,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
   test('postRejectReview suppresses 422 error (self-review)', async () => {
     // Mock gh CLI to return 422 error on review, success on comment
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'api' && args.includes('event=REQUEST_CHANGES')) {
           // Review request returns 422
           return {
@@ -175,7 +186,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);
@@ -188,7 +199,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
   test('postAcceptReview handles 422 with "Unprocessable Entity" text', async () => {
     // Mock gh CLI to return 422 error with different message format
     const mockDeps: DriverDeps = {
-      runGh: (args: string[]) => {
+      runGh: async (args: string[]) => {
         if (args[0] === 'api' && args.includes('event=APPROVE')) {
           // Review request returns 422 with different error text
           return {
@@ -207,7 +218,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
         }
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
-      runGit: () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
 
     const driver = new GitHubDriver(mockConfig, mockDeps);

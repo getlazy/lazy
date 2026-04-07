@@ -8,9 +8,9 @@
  * capabilities — they pass what they have and the agent does the right thing.
  */
 
-import type { ModelMoniker, AgentResponse } from '../types';
+import type { AgentResponse } from '../types';
 
-export type { ModelMoniker, AgentResponse };
+export type { AgentResponse };
 
 /**
  * Core agent contract — execution, parsing, and model resolution.
@@ -24,34 +24,15 @@ export interface Agent {
 
   /**
    * Get auth environment variables for this agent.
+   * Returns an array to support agents that need multiple env vars (e.g., Ollama).
    * Throws if required credentials are not available.
    */
-  getAuthEnv(): { key: string; value: string };
+  getAuthEnvVars(): Array<{ key: string; value: string }>;
 
   /**
    * Check if auth credentials are available (non-throwing).
    */
   hasAuthEnv(): boolean;
-
-  /**
-   * Resolve a model name to the agent's concrete model ID.
-   *
-   * Accepts universal monikers ('apprentice', 'journeyman', 'master') and
-   * agent-specific names. Throws if the name is not recognized — never
-   * silently passes through unknown strings.
-   */
-  resolveModelId(modelName: string): string;
-
-  /**
-   * List available model names for this agent. Includes both universal
-   * monikers and any agent-specific aliases. Used by CLI help text and
-   * `lazy models` to show the user what's valid.
-   *
-   * Returns entries like:
-   *   { name: 'master', modelId: 'claude-opus-4-6', isDefault: false }
-   *   { name: 'journeyman', modelId: 'claude-sonnet-4-5-20250929', isDefault: true }
-   */
-  availableModels(): { name: string; modelId: string; isDefault: boolean }[];
 
   /**
    * Build the CLI command to run the agent in headless mode.

@@ -58,6 +58,7 @@ Options:
   --system-prompt-file <path>  Path to the system prompt file (required)
   --worktree <path>            Path to the repo root (required)
   --builder-config <path>      Path to builder config JSON (host + port + token) (required)
+  --daemon-config <path>       Path to daemon MCP config (preferred over builder-config)
   -- <args...>                 Additional args passed to Claude Code`);
     process.exit(0);
   }
@@ -65,6 +66,7 @@ Options:
   const worktreeIdx = args.indexOf('--worktree');
   const promptFileIdx = args.indexOf('--system-prompt-file');
   const builderConfigIdx = args.indexOf('--builder-config');
+  const daemonConfigIdx = args.indexOf('--daemon-config');
   const dashDashIdx = args.indexOf('--');
 
   if (worktreeIdx === -1 || worktreeIdx + 1 >= args.length) {
@@ -83,6 +85,9 @@ Options:
   const worktreePath = args[worktreeIdx + 1];
   const systemPromptFile = args[promptFileIdx + 1];
   const builderConfigPath = args[builderConfigIdx + 1];
+  const daemonConfigPath = (daemonConfigIdx !== -1 && daemonConfigIdx + 1 < args.length)
+    ? args[daemonConfigIdx + 1]
+    : undefined;
   const claudeExtraArgs = dashDashIdx !== -1 ? args.slice(dashDashIdx + 1) : undefined;
 
   const { runBuilderSupervisor } = await import('./supervisor/builder');
@@ -90,13 +95,14 @@ Options:
     worktreePath,
     systemPromptFile,
     builderConfigPath,
+    daemonConfigPath,
     claudeExtraArgs,
     debug: args.includes('--debug'),
   });
 } else if (command === 'mcp') {
 // Handle mcp subcommand
   if (args.includes('--help') || args.includes('-h')) {
-    console.log(`Usage: lazy-agent mcp [--task-id <uuid>] --worktree <path> [--builder-config <path>]
+    console.log(`Usage: lazy-agent mcp [--task-id <uuid>] --worktree <path> [--daemon-config <path>] [--builder-config <path>]
 
 Start a stdio-based MCP server that exposes lazy tools to Claude Code.
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
@@ -104,10 +110,17 @@ The server reads JSON-RPC requests from stdin and writes responses to stdout.
 Options:
   --task-id <uuid>           Full UUID of the current task (optional for builder mode)
   --worktree <path>          Path to the worktree or repo root (required)
-  --builder-config <path>    Path to builder config JSON for proxy mode (optional)
+  --daemon-config <path>     Path to daemon MCP config for proxy mode (preferred)
+  --builder-config <path>    Path to builder config JSON for legacy proxy mode
 
-When --builder-config is provided, the MCP server runs in proxy mode: tool calls
-are forwarded to the host-side builder HTTP server over TCP.
+When --daemon-config is provided, the MCP server runs in daemon proxy mode: tool
+calls are forwarded to the daemon's /mcp routes over HTTP. This is the preferred
+mode — the daemon executes tools with full host access.
+
+When --builder-config is provided (legacy), tool calls are forwarded to a
+per-session builder HTTP server over TCP.
+
+When neither proxy config is provided, tools execute locally.
 
 When --task-id is omitted, the MCP server runs in project-scoped (builder) mode.
 Tools that require a task context (lazy_commit, lazy_propose) are unavailable.
@@ -118,6 +131,7 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
 
   const taskIdIdx = args.indexOf('--task-id');
   const worktreeIdx = args.indexOf('--worktree');
+  const daemonConfigIdx = args.indexOf('--daemon-config');
   const builderConfigIdx = args.indexOf('--builder-config');
 
   if (worktreeIdx === -1 || worktreeIdx + 1 >= args.length) {
@@ -125,8 +139,16 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
     process.exit(1);
   }
 
-  // Builder proxy mode: forward all tool calls to host HTTP server
-  if (builderConfigIdx !== -1 && builderConfigIdx + 1 < args.length) {
+  // Daemon proxy mode (preferred): forward all tool calls to the daemon
+  if (daemonConfigIdx !== -1 && daemonConfigIdx + 1 < args.length) {
+    const daemonConfigPath = args[daemonConfigIdx + 1];
+    // Task ID override: the daemon config template has taskId='' (empty).
+    // The supervisor passes --task-id to scope tool calls to the correct task.
+    const taskIdOverride = (taskIdIdx !== -1 && taskIdIdx + 1 < args.length) ? args[taskIdIdx + 1] : undefined;
+    const { startMcpServerDaemonProxy } = await import('./mcp/index');
+    await startMcpServerDaemonProxy(daemonConfigPath, taskIdOverride);
+  } else if (builderConfigIdx !== -1 && builderConfigIdx + 1 < args.length) {
+    // Legacy builder proxy mode: forward to per-session builder HTTP server
     const builderConfigPath = args[builderConfigIdx + 1];
     const { startMcpServerProxy } = await import('./mcp/index');
     await startMcpServerProxy(builderConfigPath);

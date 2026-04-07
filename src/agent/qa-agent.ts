@@ -10,33 +10,24 @@ import { join } from 'path';
 import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
 
-// Resolve the absolute path to the qa-agent script at import time.
-// import.meta.dir gives us the directory of THIS file (src/agent/),
-// so we navigate up to src/ then into qa/agent.ts.
-const QA_AGENT_SCRIPT = join(import.meta.dir, '..', 'qa', 'agent.ts');
+// Resolve the absolute path to the qa-agent script.
+// QA_AGENT_SCRIPT env var takes priority (set by QA test driver when running
+// against an installed binary where the source tree isn't at import.meta.dir).
+// Fallback: import.meta.dir resolution (works when running from source tree).
+const QA_AGENT_SCRIPT = process.env.QA_AGENT_SCRIPT
+  || join(import.meta.dir, '..', 'qa', 'agent.ts');
 
 export class QaAgent implements Agent {
   readonly id = 'qa-agent';
 
-  getAuthEnv(): { key: string; value: string } {
+  getAuthEnvVars(): Array<{ key: string; value: string }> {
     // qa-agent doesn't need auth — return a no-op env var.
-    return { key: 'QA_AGENT_AUTH', value: 'none' };
+    return [{ key: 'QA_AGENT_AUTH', value: 'none' }];
   }
 
   hasAuthEnv(): boolean {
     // Always true — no auth needed for a testing agent.
     return true;
-  }
-
-  resolveModelId(_modelName: string): string {
-    // qa-agent doesn't use models — return empty string regardless of input.
-    return '';
-  }
-
-  availableModels(): { name: string; modelId: string; isDefault: boolean }[] {
-    return [
-      { name: 'default', modelId: '', isDefault: true },
-    ];
   }
 
   buildExecArgs(opts: {

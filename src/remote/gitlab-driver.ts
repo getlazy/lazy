@@ -45,13 +45,16 @@ import type {
   ImportOptions,
   ImportResult,
   CIJobFailure,
+  AcceptGateWarning,
 } from './driver';
+import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
-import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
+import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 
@@ -63,25 +66,26 @@ export interface GlResult {
 
 /** Overridable subprocess runners for testing. */
 export interface GitLabDriverDeps {
-  runGl: (args: string[], cwd?: string) => GlResult;
-  runGit: (args: string[], cwd?: string) => GitResult;
+  runGl: (args: string[], cwd?: string) => Promise<GlResult>;
+  runGit: (args: string[], cwd?: string) => Promise<GitResult>;
   /** Override retry options for testing (e.g., { maxAttempts: 1 } to disable retries). */
   retryOptions?: RetryOptions;
 }
 
-function runGl(args: string[], cwd?: string): GlResult {
-  const spawnOpts: { cwd?: string; stdout: 'pipe'; stderr: 'pipe' } = {
+async function runGl(args: string[], cwd?: string): Promise<GlResult> {
+  const spawnOpts: Record<string, unknown> = {
     stdout: 'pipe',
     stderr: 'pipe',
   };
   if (cwd) spawnOpts.cwd = cwd;
 
   try {
-    const result = spawnSync(['glab', ...args], spawnOpts);
+    const proc = spawn(['glab', ...args], spawnOpts) as any;
+    const result = await proc.exited;
     return {
-      stdout: result.stdout.toString().trim(),
-      stderr: result.stderr.toString().trim(),
-      exitCode: result.exitCode,
+      stdout: (await Bun.readableStreamToText(proc.stdout)).trim(),
+      stderr: (await Bun.readableStreamToText(proc.stderr)).trim(),
+      exitCode: proc.exitCode ?? result,
     };
   } catch (err: unknown) {
     // glab binary not found
@@ -106,16 +110,17 @@ function parseMrNumberFromUrl(url: string): number | undefined {
  */
 export function detectGitLab(repoDir: string, remoteName: string = 'origin'): DriverDetection | null {
   try {
-    const result = defaultRunGit(['remote', 'get-url', remoteName], { cwd: repoDir });
+    // SYNC CALL: This is called during `lazy init` before any async context exists.
+    // It's a one-time detection check, not a runtime operation — blocking is acceptable here.
+    const proc = spawnSync(['git', 'remote', 'get-url', remoteName], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe' });
+    const exitCode = proc.exitCode ?? 1;
+    const url = proc.stdout ? proc.stdout.toString().trim() : '';
 
-    if (result.exitCode === 0) {
-      const url = result.stdout;
-      if (url.includes('gitlab.com')) {
-        return {
-          name: 'GitLab',
-          tomlOverrides: { 'remote.driver': 'gitlab' },
-        };
-      }
+    if (exitCode === 0 && url.includes('gitlab.com')) {
+      return {
+        name: 'GitLab',
+        tomlOverrides: { 'remote.driver': 'gitlab' },
+      };
     }
   } catch {
     // No remote or git error
@@ -127,8 +132,8 @@ export class GitLabDriver implements RepositoryDriver {
   needsSync = true;
 
   private config: ResolvedConfig;
-  private gl: (args: string[], cwd?: string) => GlResult;
-  private git: (args: string[], cwd?: string) => GlResult;
+  private gl: (args: string[], cwd?: string) => Promise<GlResult>;
+  private git: (args: string[], cwd?: string) => Promise<GitResult>;
   private repoPrivate: boolean | null = null;
 
   /** The configured git remote name (default: 'origin'). */
@@ -154,7 +159,7 @@ export class GitLabDriver implements RepositoryDriver {
     await withRemoteRetry(
       async () => {
         logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-        const result = this.git(['push', '-u', this.remoteName, branch]);
+        const result = await this.git(['push', '-u', this.remoteName, branch]);
         if (result.exitCode !== 0) {
           if (result.stderr.includes('Everything up-to-date')) {
             logger.debug('Branch already up-to-date on remote');
@@ -172,7 +177,7 @@ export class GitLabDriver implements RepositoryDriver {
   async fetchBranch(branch: string, worktreePath: string): Promise<boolean> {
     await withRemoteRetry(
       async () => {
-        const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
+        const fetchResult = await this.git(['fetch', this.remoteName, branch], worktreePath);
         if (fetchResult.exitCode !== 0) {
           throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
@@ -182,7 +187,7 @@ export class GitLabDriver implements RepositoryDriver {
     );
 
     const remoteRef = `${this.remoteName}/${branch}`;
-    const revListResult = this.git(
+    const revListResult = await this.git(
       ['rev-list', '--count', `HEAD..${remoteRef}`],
       worktreePath,
     );
@@ -205,7 +210,7 @@ export class GitLabDriver implements RepositoryDriver {
     const remoteRef = `${this.remoteName}/${parentBranch}`;
     await withRemoteRetry(
       async () => {
-        const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
+        const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
         if (fetchResult.exitCode !== 0) {
           throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
@@ -229,7 +234,7 @@ export class GitLabDriver implements RepositoryDriver {
     await this.pushBranch(branch);
 
     // If a MR already exists (e.g., imported from GitLab), return its metadata
-    const existing = this.findExistingMR(branch);
+    const existing = await this.findExistingMR(branch);
     if (existing) {
       logger.debug(`MR already exists: ${existing.url}`);
       return {
@@ -253,7 +258,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     if (existingMrIid) {
       // MR exists — mark it as ready (remove draft/WIP status)
-      const readyResult = this.gl(['mr', 'update', existingMrIid, '--ready']);
+      const readyResult = await this.gl(['mr', 'update', existingMrIid, '--ready']);
       if (readyResult.exitCode !== 0) {
         logger.debug(`Failed to mark MR !${existingMrIid} ready (non-fatal): ${readyResult.stderr}`);
       } else {
@@ -264,15 +269,15 @@ export class GitLabDriver implements RepositoryDriver {
 
     // No MR yet — create one (non-draft, since we're marking ready)
     const branchName = getBranchName(task);
-    const targetBranch = this.targetBranch(task);
+    const targetBranch = await this.targetBranch(task);
 
     const body = this.buildMRBody(task);
 
-    const createResult = this.gl([
+    const createResult = await this.gl([
       'mr', 'create',
       '--source-branch', branchName,
       '--target-branch', targetBranch,
-      '--title', task.goal,
+      '--title', truncateMRTitle(task.goal),
       '--description', body,
       '--no-editor',
     ]);
@@ -284,7 +289,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     // glab mr create outputs the MR URL on stdout
     const mrUrl = this.extractMrUrl(createResult.stdout);
-    const mrIid = this.getMRNumber(branchName, mrUrl);
+    const mrIid = await this.getMRNumber(branchName, mrUrl);
 
     if (mrUrl) {
       logger.info(`Created MR: ${mrUrl}`);
@@ -301,7 +306,7 @@ export class GitLabDriver implements RepositoryDriver {
     const { sourceBranch, targetBranch, task, root } = opts;
 
     // Step 0: Check if already merged (idempotent — noop if already done)
-    if (this.isBranchMerged(sourceBranch, targetBranch, root)) {
+    if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
       logger.info('Branch is already merged into target — nothing to do.');
       return { status: 'merged' };
     }
@@ -320,7 +325,7 @@ export class GitLabDriver implements RepositoryDriver {
     let mrIid = this.mrNumber(task);
     let updatedMetadata: Record<string, string> | undefined;
 
-    const existing = this.findExistingMR(sourceBranch);
+    const existing = await this.findExistingMR(sourceBranch);
 
     if (existing?.state === 'merged') {
       // MR was already merged on the remote
@@ -334,17 +339,17 @@ export class GitLabDriver implements RepositoryDriver {
       logger.info(`Existing MR is ${reason}, creating replacement MR...`);
 
       const body = this.buildMRBody(task);
-      const createResult = this.gl([
+      const createResult = await this.gl([
         'mr', 'create',
         '--source-branch', sourceBranch,
         '--target-branch', targetBranch,
-        '--title', task.goal,
+        '--title', truncateMRTitle(task.goal),
         '--description', body,
         '--no-editor',
       ]);
 
       if (createResult.exitCode !== 0) {
-        if (this.isBranchMerged(sourceBranch, targetBranch, root)) {
+        if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
           logger.info('Branch is already merged into target — nothing to do.');
           return { status: 'merged' };
         }
@@ -355,7 +360,7 @@ export class GitLabDriver implements RepositoryDriver {
       }
 
       const mrUrl = this.extractMrUrl(createResult.stdout);
-      const newMrIid = this.getMRNumber(sourceBranch, mrUrl);
+      const newMrIid = await this.getMRNumber(sourceBranch, mrUrl);
 
       if (newMrIid !== undefined) {
         mrIid = String(newMrIid);
@@ -371,63 +376,18 @@ export class GitLabDriver implements RepositoryDriver {
       logger.info(`Created replacement MR: ${mrUrl ?? 'unknown URL'}`);
     }
 
-    // Step 3: Pre-merge checks — verify pipeline and approvals BEFORE attempting merge.
-    // GitLab may allow maintainers to bypass merge checks by default.
-    // By checking here, we avoid accidentally merging when CI is failing or
-    // required approvals are missing.
+    // Gate checks (pipeline, approvals) are handled by checkAcceptGates() before merge() is called.
+    // merge() trusts that the caller has already validated gates.
     const mergeTarget = mrIid ?? sourceBranch;
 
-    if (mrIid) {
-      // 3a: Check pipeline status
-      const pipelines = this.getMRPipelines(mrIid);
-      if (pipelines.length > 0) {
-        const latest = pipelines[0];
-        const pipelineStatus = latest.status;
-
-        if (pipelineStatus === 'failed' || pipelineStatus === 'canceled') {
-          return {
-            status: 'failed',
-            error: `Pipeline ${pipelineStatus}`,
-            metadata: updatedMetadata,
-          };
-        }
-
-        if (pipelineStatus === 'running' || pipelineStatus === 'pending') {
-          return {
-            status: 'pending',
-            reason: `Pipeline ${pipelineStatus}`,
-            metadata: updatedMetadata,
-          };
-        }
-      }
-
-      // 3b: Check detailed merge status for approval requirements
-      const viewResult = this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
-      if (viewResult.exitCode === 0) {
-        try {
-          const data = JSON.parse(viewResult.stdout);
-          const detailedStatus = data.detailed_merge_status;
-          if (detailedStatus === 'not_approved') {
-            return {
-              status: 'pending',
-              reason: 'Required approvals not met',
-              metadata: updatedMetadata,
-            };
-          }
-        } catch {
-          logger.debug('Failed to parse MR view for approval status, proceeding with merge attempt');
-        }
-      }
-    }
-
-    // Step 4: Squash merge via glab mr merge
+    // Step 3: Squash merge via glab mr merge
     const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
 
     // Fetch current MR description to preserve in commit message
     let commitMessage = task.goal;
     let commitBody = LAZY_COAUTHOR_TRAILER;
     if (mrIid) {
-      const viewResult = this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
+      const viewResult = await this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
       if (viewResult.exitCode === 0) {
         try {
           const mrData = JSON.parse(viewResult.stdout);
@@ -439,14 +399,14 @@ export class GitLabDriver implements RepositoryDriver {
       }
     }
 
-    const mergeResult = this.gl(
+    const mergeResult = await this.gl(
       ['mr', 'merge', String(mergeTarget), '--squash', '--squash-message', `${commitMessage}\n\n${commitBody}`, '--yes'],
       root,
     );
     if (mergeResult.exitCode !== 0) {
       // Use structured JSON output from glab CLI to determine failure reason
       if (mrIid) {
-        const viewResult = this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
+        const viewResult = await this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
         if (viewResult.exitCode === 0) {
           try {
             const data = JSON.parse(viewResult.stdout);
@@ -510,7 +470,7 @@ export class GitLabDriver implements RepositoryDriver {
       return { status: 'passed' };
     }
 
-    const pipelines = this.getMRPipelines(mrIid);
+    const pipelines = await this.getMRPipelines(mrIid);
     if (pipelines.length === 0) {
       return { status: 'passed' };
     }
@@ -520,7 +480,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     if (status === 'failed' || status === 'canceled') {
       // Fetch job-level failures for more actionable details
-      const failedJobs = this.getPipelineFailedJobs(latest.id);
+      const failedJobs = await this.getPipelineFailedJobs(latest.id);
       if (failedJobs.length > 0) {
         return {
           status: 'failed',
@@ -554,7 +514,7 @@ export class GitLabDriver implements RepositoryDriver {
     const startTime = Date.now();
 
     while (true) {
-      const pipelines = this.getMRPipelines(mrIid);
+      const pipelines = await this.getMRPipelines(mrIid);
 
       if (pipelines.length === 0) {
         logger.debug('waitForChecks: no pipelines found, returning passed');
@@ -596,9 +556,9 @@ export class GitLabDriver implements RepositoryDriver {
    * Get pipelines for a merge request.
    * Uses glab api to fetch pipeline status.
    */
-  private getMRPipelines(mrIid: string): Array<{ id: number; status: string; web_url?: string }> {
+  private async getMRPipelines(mrIid: string): Promise<Array<{ id: number; status: string; web_url?: string }>> {
     // Use glab api to get MR pipelines
-    const result = this.gl([
+    const result = await this.gl([
       'api', `projects/:id/merge_requests/${mrIid}/pipelines`,
     ]);
 
@@ -619,8 +579,8 @@ export class GitLabDriver implements RepositoryDriver {
    * Get failed jobs for a specific pipeline.
    * Returns an array of jobs with name, status, and web_url.
    */
-  private getPipelineFailedJobs(pipelineId: number): Array<{ id: number; name: string; status: string; web_url?: string }> {
-    const result = this.gl([
+  private async getPipelineFailedJobs(pipelineId: number): Promise<Array<{ id: number; name: string; status: string; web_url?: string }>> {
+    const result = await this.gl([
       'api', `projects/:id/pipelines/${pipelineId}/jobs`,
     ]);
 
@@ -640,15 +600,20 @@ export class GitLabDriver implements RepositoryDriver {
 
   async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
     const mrIid = this.mrNumber(task);
-    if (!mrIid) return [];
 
-    const pipelines = this.getMRPipelines(mrIid);
+    // If there's an MR, use MR-based pipeline lookup (most precise).
+    // Otherwise, fall back to branch-based pipeline detection so
+    // CI failures are caught even before an MR exists (auto-push flow).
+    const pipelines = mrIid
+      ? await this.getMRPipelines(mrIid)
+      : await this.getBranchPipelines(getBranchName(task));
+
     if (pipelines.length === 0) return [];
 
     const latest = pipelines[0];
     if (latest.status !== 'failed' && latest.status !== 'canceled') return [];
 
-    const failedJobs = this.getPipelineFailedJobs(latest.id);
+    const failedJobs = await this.getPipelineFailedJobs(latest.id);
     if (failedJobs.length === 0) {
       // Fall back to pipeline-level info if no job details available
       return [{ name: `Pipeline #${latest.id}`, url: latest.web_url }];
@@ -664,7 +629,7 @@ export class GitLabDriver implements RepositoryDriver {
 
       // Fetch job trace (log output)
       try {
-        const traceResult = this.gl([
+        const traceResult = await this.gl([
           'api', `projects/:id/jobs/${job.id}/trace`,
         ]);
         if (traceResult.exitCode === 0 && traceResult.stdout) {
@@ -680,6 +645,29 @@ export class GitLabDriver implements RepositoryDriver {
     return results;
   }
 
+  /**
+   * Get pipelines for a branch directly (without an MR).
+   * Uses the GitLab pipelines API filtered by ref. This enables CI auto-react
+   * before an MR exists (auto-push flow).
+   */
+  private async getBranchPipelines(branch: string): Promise<Array<{ id: number; status: string; web_url?: string }>> {
+    const result = await this.gl([
+      'api', `projects/:id/pipelines?ref=${encodeURIComponent(branch)}&per_page=1`,
+    ]);
+
+    if (result.exitCode !== 0) {
+      logger.debug(`getBranchPipelines: glab api failed for branch ${branch}: ${result.stderr}`);
+      return [];
+    }
+
+    try {
+      return JSON.parse(result.stdout.trim());
+    } catch {
+      logger.debug(`getBranchPipelines: failed to parse response for branch ${branch}`);
+      return [];
+    }
+  }
+
   async postAcceptReview(task: Task, reason: string): Promise<string | null> {
     const mrIid = this.mrNumber(task);
     if (!mrIid) {
@@ -688,7 +676,7 @@ export class GitLabDriver implements RepositoryDriver {
     }
 
     // Step 1: Try approving the MR via glab
-    const approveResult = this.gl(['mr', 'approve', mrIid]);
+    const approveResult = await this.gl(['mr', 'approve', mrIid]);
     if (approveResult.exitCode === 0) {
       logger.debug(`postAcceptReview: approved MR !${mrIid}`);
     } else {
@@ -698,7 +686,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     // Step 2: Post a comment with the reason
     const commentBody = `[Lazy Accept] ${reason}`;
-    const commentResult = this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
+    const commentResult = await this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
 
     if (commentResult.exitCode === 0) {
       logger.debug(`postAcceptReview: posted accept comment to MR !${mrIid}`);
@@ -719,7 +707,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     // GitLab has no "request changes" review state — use a comment instead
     const commentBody = `[Lazy Reject] ${reason}`;
-    const commentResult = this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
+    const commentResult = await this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
 
     if (commentResult.exitCode === 0) {
       logger.debug(`postRejectReview: posted reject comment to MR !${mrIid}`);
@@ -732,10 +720,10 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   async cleanup(branch: string): Promise<void> {
-    const existing = this.findExistingMR(branch);
+    const existing = await this.findExistingMR(branch);
     if (existing && existing.state === 'opened') {
       logger.info(`Closing MR !${existing.iid} for branch ${branch}...`);
-      const closeResult = this.gl(['mr', 'close', String(existing.iid)]);
+      const closeResult = await this.gl(['mr', 'close', String(existing.iid)]);
       if (closeResult.exitCode !== 0) {
         logger.warn(`Failed to close MR !${existing.iid}: ${closeResult.stderr}`);
       } else {
@@ -745,34 +733,35 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   async syncComments(task: Task, since: string): Promise<RemoteComment[]> {
+    const taskLabel = task.code ?? task.id.substring(0, 8);
     const mrIid = this.mrNumber(task);
     if (!mrIid) {
-      logger.debug('syncComments: no MR number in task metadata, skipping');
+      logger.debug(`syncComments [${taskLabel}]: no MR number in task metadata, skipping`);
       return [];
     }
 
     // Public repos are a prompt injection vector — skip comment sync unless
     // the user has explicitly opted in via the intentionally-ugly config flag.
-    if (!this.isRepoPrivate()) {
+    if (!(await this.isRepoPrivate())) {
       if (!this.config.remote.gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection) {
-        logger.info('syncComments: skipping comment sync for public repo (prompt injection risk). Set gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote] to enable.');
+        logger.info(`syncComments [${taskLabel}]: skipping comment sync for public repo (prompt injection risk). Set gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote] to enable.`);
         return [];
       }
-      logger.warn('syncComments: syncing comments from PUBLIC repo — prompt injection risk accepted via config');
+      logger.warn(`syncComments [${taskLabel}]: syncing comments from PUBLIC repo — prompt injection risk accepted via config`);
     }
 
     const comments: RemoteComment[] = [];
 
     // Fetch MR notes (comments) via API
     try {
-      const notes = this.fetchPaginatedNotes(mrIid, since);
+      const notes = await this.fetchPaginatedNotes(mrIid, since);
       for (const note of notes) {
         const body = (note.body as string) ?? '';
         // Skip system notes (merge status changes, label additions, etc.)
         if (note.system === true) continue;
         // Skip comments marked as lazy's own output
         if (body.includes('<!-- lazy:')) {
-          logger.debug(`syncComments: skipping own comment (id: ${note.id})`);
+          logger.debug(`syncComments [${taskLabel}]: skipping own comment (id: ${note.id})`);
           continue;
         }
         const author = (note.author as Record<string, unknown> | undefined);
@@ -787,7 +776,7 @@ export class GitLabDriver implements RepositoryDriver {
         });
       }
     } catch (err) {
-      logger.warn(`syncComments: failed to fetch MR notes: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`syncComments [${taskLabel}]: failed to fetch MR notes: ${err instanceof Error ? err.message : err}`);
     }
 
     // Filter out comments posted by lazy itself
@@ -796,7 +785,7 @@ export class GitLabDriver implements RepositoryDriver {
     // Sort by creation time (oldest first)
     externalComments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-    logger.debug(`syncComments: fetched ${comments.length} comments since ${since}, ${externalComments.length} external`);
+    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since}, ${externalComments.length} external`);
     return externalComments;
   }
 
@@ -804,7 +793,7 @@ export class GitLabDriver implements RepositoryDriver {
     const mrIid = this.mrNumber(task);
     if (!mrIid) return null;
 
-    const result = this.gl(['mr', 'view', mrIid, '--output', 'json']);
+    const result = await this.gl(['mr', 'view', mrIid, '--output', 'json']);
     if (result.exitCode !== 0) {
       logger.debug(`getPRState: glab mr view failed for MR !${mrIid}: ${result.stderr}`);
       return null;
@@ -834,7 +823,7 @@ export class GitLabDriver implements RepositoryDriver {
     // Prepend hidden HTML marker to identify this comment as lazy's own output.
     const markedContent = '<!-- lazy:turn -->\n' + content;
 
-    const result = this.gl(['mr', 'comment', mrIid, '--message', markedContent]);
+    const result = await this.gl(['mr', 'comment', mrIid, '--message', markedContent]);
     if (result.exitCode !== 0) {
       logger.warn(`postTurnSummary: failed to post comment to MR !${mrIid}: ${result.stderr}`);
     } else {
@@ -846,7 +835,7 @@ export class GitLabDriver implements RepositoryDriver {
     const checks: HealthCheck[] = [];
 
     // 1. Check glab CLI is installed
-    const glabVersion = this.gl(['--version']);
+    const glabVersion = await this.gl(['--version']);
     if (glabVersion.exitCode !== 0) {
       checks.push({ state: 'fail', what: 'glab CLI installed', reason: 'Install from https://gitlab.com/gitlab-org/cli' });
       return checks;
@@ -854,7 +843,7 @@ export class GitLabDriver implements RepositoryDriver {
     checks.push({ state: 'ok', what: 'glab CLI installed' });
 
     // 2. Check glab auth status
-    const authStatus = this.gl(['auth', 'status']);
+    const authStatus = await this.gl(['auth', 'status']);
     if (authStatus.exitCode !== 0) {
       checks.push({ state: 'fail', what: 'GitLab authentication', reason: 'Run: glab auth login' });
       return checks;
@@ -877,7 +866,7 @@ export class GitLabDriver implements RepositoryDriver {
     }
 
     // 4. Check that the configured git remote exists and points to GitLab
-    const remoteUrl = this.git(['remote', 'get-url', this.remoteName]);
+    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
     if (remoteUrl.exitCode !== 0) {
       checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <gitlab-url>` });
       return checks;
@@ -894,7 +883,7 @@ export class GitLabDriver implements RepositoryDriver {
     }
 
     // 5. Check repo visibility and comment sync status
-    const projectInfo = this.gl(['api', 'projects/:id']);
+    const projectInfo = await this.gl(['api', 'projects/:id']);
     if (projectInfo.exitCode === 0) {
       try {
         const data = JSON.parse(projectInfo.stdout);
@@ -926,7 +915,7 @@ export class GitLabDriver implements RepositoryDriver {
 
   getConfigOptions(): DriverConfigOptions {
     return {
-      valid: ['gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection'],
+      valid: ['auto_approve', 'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection'],
       deprecated: [],
     };
   }
@@ -945,7 +934,7 @@ export class GitLabDriver implements RepositoryDriver {
     const mrIid = match[1];
 
     // Fetch MR details via glab CLI
-    const mrView = this.gl(['mr', 'view', mrIid, '--output', 'json']);
+    const mrView = await this.gl(['mr', 'view', mrIid, '--output', 'json']);
     if (mrView.exitCode !== 0) {
       throw new Error(`Failed to fetch MR !${mrIid}: ${mrView.stderr}`);
     }
@@ -969,7 +958,7 @@ export class GitLabDriver implements RepositoryDriver {
 
     // Fetch MR notes for import as comments
     const comments: string[] = [];
-    const notesResult = this.gl([
+    const notesResult = await this.gl([
       'api', `projects/:id/merge_requests/${mrIid}/notes`, '--paginate',
     ]);
     if (notesResult.exitCode === 0) {
@@ -1021,9 +1010,92 @@ export class GitLabDriver implements RepositoryDriver {
 
   validateAccept(task: Task): string | null {
     if (!this.hasRemoteRef(task)) {
-      return 'Task has no remote reference (MR). Push and create an MR first with: lazy sync';
+      return 'Task has no remote reference (MR). Push and create an MR first with: lazy submit';
     }
     return null;
+  }
+
+  async isTargetBranchProtected(targetBranch: string): Promise<boolean> {
+    const result = await this.gl([
+      'api', `projects/:id/protected_branches/${encodeURIComponent(targetBranch)}`,
+    ]);
+
+    // 200 = protected, 404 = not protected
+    return result.exitCode === 0;
+  }
+
+  async hasExternalApproval(task: Task): Promise<boolean> {
+    const mrIid = this.mrNumber(task);
+    if (!mrIid) return false;
+
+    // Get the authenticated user so we can exclude their approvals.
+    // If auto_approve previously submitted an approval (and accept failed later),
+    // that approval must not trick the non-auto-approve path into thinking
+    // a human reviewed it.
+    const userResult = await this.gl(['api', 'user', '--output', 'json']);
+    let currentUsername = '';
+    if (userResult.exitCode === 0) {
+      try {
+        const userData = JSON.parse(userResult.stdout);
+        currentUsername = userData.username ?? '';
+      } catch { /* fall through — include all approvals */ }
+    }
+
+    const result = await this.gl([
+      'api', `projects/:id/merge_requests/${mrIid}/approvals`,
+    ]);
+
+    if (result.exitCode !== 0) return false;
+
+    try {
+      const data = JSON.parse(result.stdout);
+      const approvedBy: Array<{ user?: { username?: string } }> = data.approved_by ?? [];
+      const externalApprovals = currentUsername
+        ? approvedBy.filter(a => a.user?.username !== currentUsername)
+        : approvedBy;
+      return externalApprovals.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async checkAcceptGates(task: Task): Promise<AcceptGateWarning[]> {
+    const warnings: AcceptGateWarning[] = [];
+    const mrIid = this.mrNumber(task);
+    if (!mrIid) return warnings;
+
+    // Gate 1: Pipeline status
+    const pipelines = await this.getMRPipelines(mrIid);
+    if (pipelines.length > 0) {
+      const latest = pipelines[0];
+      if (latest.status === 'failed' || latest.status === 'canceled') {
+        warnings.push({ gate: 'ci', message: `Pipeline ${latest.status}` });
+      } else if (latest.status === 'running' || latest.status === 'pending') {
+        warnings.push({ gate: 'ci', message: `Pipeline ${latest.status}` });
+      }
+    }
+
+    // Gate 2: Approval status
+    const viewResult = await this.gl(['mr', 'view', mrIid, '--output', 'json']);
+    if (viewResult.exitCode === 0) {
+      try {
+        const data = JSON.parse(viewResult.stdout);
+        if (data.detailed_merge_status === 'not_approved') {
+          warnings.push({ gate: 'reviews', message: 'Required approvals not met' });
+        }
+
+        // Gate 3: Unresolved discussions
+        // GitLab's blocking_discussions_resolved field indicates whether
+        // all discussions that block merging have been resolved.
+        if (data.blocking_discussions_resolved === false) {
+          warnings.push({ gate: 'comments', message: 'Unresolved blocking discussions' });
+        }
+      } catch {
+        logger.warn(`checkAcceptGates: failed to parse MR view response: ${viewResult.stdout.substring(0, 200)}`);
+      }
+    }
+
+    return warnings;
   }
 
   async fastForwardLocal(targetBranch: string, root: string): Promise<{ success: boolean; warning?: string }> {
@@ -1037,19 +1109,19 @@ export class GitLabDriver implements RepositoryDriver {
       shouldSkipWorktree = (path: string) => workingPaths.has(path);
     }
 
-    const headResult = this.git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+    const headResult = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
     const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
     const remoteRef = `${this.remoteName}/${targetBranch}`;
 
     if (currentBranch === targetBranch) {
-      const fetchResult = this.git(['fetch', this.remoteName, targetBranch], root);
+      const fetchResult = await this.git(['fetch', this.remoteName, targetBranch], root);
       if (fetchResult.exitCode !== 0) {
         const warning = `Failed to fetch ${targetBranch} from ${this.remoteName}: ${fetchResult.stderr.trim() || 'unknown error'}. Run \`git fetch ${this.remoteName}\` to retry.`;
         logger.warn(`fastForwardLocal: fetch failed: ${fetchResult.stderr}`);
         return { success: false, warning };
       }
 
-      const mergeResult = this.git(['merge', '--ff-only', remoteRef], root);
+      const mergeResult = await this.git(['merge', '--ff-only', remoteRef], root);
       if (mergeResult.exitCode === 0) {
         logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
         return { success: true };
@@ -1064,10 +1136,10 @@ export class GitLabDriver implements RepositoryDriver {
 
       // Disambiguate: is this true divergence or a transient failure?
       // Use merge-base --is-ancestor to check if local is an ancestor of remote.
-      const localSha = this.git(['rev-parse', targetBranch], root);
-      const remoteSha = this.git(['rev-parse', remoteRef], root);
+      const localSha = await this.git(['rev-parse', targetBranch], root);
+      const remoteSha = await this.git(['rev-parse', remoteRef], root);
       if (localSha.exitCode === 0 && remoteSha.exitCode === 0) {
-        const ancestorCheck = this.git(['merge-base', '--is-ancestor', localSha.stdout.trim(), remoteSha.stdout.trim()], root);
+        const ancestorCheck = await this.git(['merge-base', '--is-ancestor', localSha.stdout.trim(), remoteSha.stdout.trim()], root);
         if (ancestorCheck.exitCode === 0) {
           // Local IS an ancestor of remote — not diverged. The ff-only failed
           // for a transient reason (dirty working tree, lock file, etc.).
@@ -1083,12 +1155,12 @@ export class GitLabDriver implements RepositoryDriver {
       logger.warn(`fastForwardLocal: ${warning}`);
       return { success: false, warning };
     }
-    return sharedFastForwardLocal(targetBranch, this.remoteName, root, this.git, shouldSkipWorktree);
+    return await sharedFastForwardLocal(targetBranch, this.remoteName, root, this.git, shouldSkipWorktree);
   }
 
   async fetchRemoteState(root: string, branchesToUpdate?: string[]): Promise<void> {
     logger.info('Fetching from remote...');
-    const fetchResult = this.git(['fetch', this.remoteName], root);
+    const fetchResult = await this.git(['fetch', this.remoteName], root);
     if (fetchResult.exitCode !== 0) {
       logger.warn(`Fetch failed: ${fetchResult.stderr}`);
     } else {
@@ -1098,11 +1170,11 @@ export class GitLabDriver implements RepositoryDriver {
     const branches = new Set(['main', ...(branchesToUpdate ?? [])]);
 
     for (const branch of branches) {
-      this.fastForwardBranch(root, branch);
+      await this.fastForwardBranch(root, branch);
     }
   }
 
-  private fastForwardBranch(root: string, branch: string): void {
+  private async fastForwardBranch(root: string, branch: string): Promise<void> {
     // Skip git special refs that aren't real branches — "HEAD" always passes
     // rev-parse --verify, and `git fetch origin HEAD:HEAD` creates a phantom local branch.
     if (branch === 'HEAD') {
@@ -1111,27 +1183,39 @@ export class GitLabDriver implements RepositoryDriver {
     }
 
     logger.info(`Updating ${branch} branch...`);
-    const checkResult = this.git(['rev-parse', '--verify', branch], root);
+    const checkResult = await this.git(['rev-parse', '--verify', branch], root);
     if (checkResult.exitCode !== 0) {
       logger.debug(`${branch} branch not found locally, skipping`);
       return;
     }
 
-    const headResult = this.git(['symbolic-ref', '--short', 'HEAD'], root);
+    const headResult = await this.git(['symbolic-ref', '--short', 'HEAD'], root);
     const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
     const remoteRef = `${this.remoteName}/${branch}`;
 
     if (currentBranch === branch) {
-      const ffResult = this.git(['merge', '--ff-only', remoteRef], root);
+      const ffResult = await this.git(['merge', '--ff-only', remoteRef], root);
       if (ffResult.exitCode === 0) {
         logger.debug(`${branch} branch fast-forwarded to ${remoteRef}`);
       } else {
         this.logMergeFailure(branch, ffResult.stderr);
       }
     } else {
-      const ffResult = this.git(['fetch', this.remoteName, `${branch}:${branch}`], root);
+      // Not on the target branch: use fetch refspec to advance the local ref
+      const ffResult = await this.git(['fetch', this.remoteName, `${branch}:${branch}`], root);
       if (ffResult.exitCode === 0) {
         logger.debug(`${branch} branch fast-forwarded to ${remoteRef}`);
+      } else if (ffResult.stderr.includes('checked out at') || ffResult.stderr.includes('refusing to fetch')) {
+        // Branch is checked out in a worktree — fetch + ff-only merge there
+        const worktreePath = await findWorktreeForBranch(branch, root, this.git);
+        if (worktreePath) {
+          const result = await tryFastForwardInWorktree(branch, worktreePath, remoteRef, this.remoteName, root, this.git);
+          if (!result.success) {
+            logger.warn(`fastForwardBranch: ${result.warning}`);
+          }
+        } else {
+          this.logMergeFailure(branch, ffResult.stderr);
+        }
       } else {
         this.logMergeFailure(branch, ffResult.stderr);
       }
@@ -1198,6 +1282,17 @@ export class GitLabDriver implements RepositoryDriver {
     return /^\[MR !\d+ @[^\]]+\] \{(?:remote|gl):\w+\}/.test(noteContent);
   }
 
+  async recoverRemoteRef(task: Task): Promise<Record<string, string> | null> {
+    const branchName = getBranchName(task);
+    const existing = await this.findExistingMR(branchName);
+    if (!existing) return null;
+
+    return {
+      gitlab_remote_ref_url: existing.url,
+      gitlab_remote_ref_id: String(existing.iid),
+    };
+  }
+
   // --- Private helpers ---
 
   private mrNumber(task: Task): string | undefined {
@@ -1208,12 +1303,12 @@ export class GitLabDriver implements RepositoryDriver {
     return task.metadata?.gitlab_remote_ref_url;
   }
 
-  private targetBranch(task: Task): string {
+  private async targetBranch(task: Task): Promise<string> {
     const branch = task.metadata?.remote_target_branch;
     if (branch && branch !== 'HEAD') return branch;
     if (branch === 'HEAD') {
       logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
-      return this.resolveDefaultBranch() ?? 'main';
+      return (await this.resolveDefaultBranch()) ?? 'main';
     }
     return 'main';
   }
@@ -1222,8 +1317,8 @@ export class GitLabDriver implements RepositoryDriver {
    * Resolve the remote's default branch name via git symbolic-ref.
    * Returns null if resolution fails.
    */
-  private resolveDefaultBranch(): string | null {
-    const result = this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
+  private async resolveDefaultBranch(): Promise<string | null> {
+    const result = await this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
     if (result.exitCode === 0) {
       const ref = result.stdout.trim();
       const prefix = `refs/remotes/${this.remoteName}/`;
@@ -1239,10 +1334,10 @@ export class GitLabDriver implements RepositoryDriver {
    * Returns true if private, false otherwise. Defaults to false (public) on error
    * to err on the side of safety (skipping comment sync).
    */
-  private isRepoPrivate(): boolean {
+  private async isRepoPrivate(): Promise<boolean> {
     if (this.repoPrivate !== null) return this.repoPrivate;
 
-    const result = this.gl(['api', 'projects/:id']);
+    const result = await this.gl(['api', 'projects/:id']);
     if (result.exitCode !== 0) {
       logger.warn(`isRepoPrivate: glab api failed, assuming public (comment sync will be skipped): ${result.stderr}`);
       this.repoPrivate = false;
@@ -1275,16 +1370,16 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   /** Check if sourceBranch is already fully merged into targetBranch via git. */
-  private isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): boolean {
-    const result = this.git(
+  private async isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
+    const result = await this.git(
       ['merge-base', '--is-ancestor', sourceBranch, `${this.remoteName}/${targetBranch}`],
       cwd,
     );
     return result.exitCode === 0;
   }
 
-  private findExistingMR(branch: string): { url: string; iid: number; state: string } | null {
-    const result = this.gl(['mr', 'view', branch, '--output', 'json']);
+  private async findExistingMR(branch: string): Promise<{ url: string; iid: number; state: string } | null> {
+    const result = await this.gl(['mr', 'view', branch, '--output', 'json']);
     if (result.exitCode !== 0) return null;
 
     try {
@@ -1299,11 +1394,11 @@ export class GitLabDriver implements RepositoryDriver {
    * Fetch all notes from a MR since a given timestamp.
    * Uses glab api with --paginate.
    */
-  private fetchPaginatedNotes(
+  private async fetchPaginatedNotes(
     mrIid: string,
     since: string,
-  ): Array<Record<string, unknown>> {
-    const result = this.gl([
+  ): Promise<Array<Record<string, unknown>>> {
+    const result = await this.gl([
       'api', `projects/:id/merge_requests/${mrIid}/notes`,
       '--paginate',
     ]);
@@ -1356,9 +1451,9 @@ export class GitLabDriver implements RepositoryDriver {
     return match ? match[0] : undefined;
   }
 
-  private getMRNumber(branch: string, mrUrl?: string): number | undefined {
+  private async getMRNumber(branch: string, mrUrl?: string): Promise<number | undefined> {
     // Try glab mr view first
-    const viewResult = this.gl(['mr', 'view', branch, '--output', 'json']);
+    const viewResult = await this.gl(['mr', 'view', branch, '--output', 'json']);
     if (viewResult.exitCode === 0) {
       try {
         return JSON.parse(viewResult.stdout).iid;

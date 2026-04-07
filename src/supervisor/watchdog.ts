@@ -37,7 +37,8 @@ export interface WatchdogResult {
 
 /**
  * Resolve the effective watchdog timeout.
- * Config value of 0 means "use agent default". If agent default is also 0, disabled.
+ * Config value of 0 means "use agent default". Agent default is also 0 for
+ * claude-code, so users can disable the watchdog by setting watchdog_output_timeout_ms = 0.
  */
 export function resolveWatchdogTimeout(configValue: number, agentDefault: number): number {
   return configValue !== 0 ? configValue : agentDefault;
@@ -72,6 +73,7 @@ export async function execWithWatchdog(
     stdout: 'pipe',
     stderr: 'pipe',
     env,
+    timeout: 0, // Long-running: watchdog has its own output-based timeout mechanism
   });
 
   const stdoutChunks: Buffer[] = [];

@@ -6,23 +6,22 @@
  */
 
 import { join } from 'path';
-import { homedir } from 'os';
 import { existsSync, readdirSync } from 'fs';
-import { VALID_MODEL_NAMES } from '../types';
-import type { ModelName, AgentResponse } from '../types';
+import { getHome } from '../utils/home';
+import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
 
 export class ClaudeCodeAgent implements Agent {
   readonly id = 'claude-code';
 
-  getAuthEnv(): { key: string; value: string } {
+  getAuthEnvVars(): Array<{ key: string; value: string }> {
     const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     if (oauthToken) {
-      return { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken };
+      return [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken }];
     }
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (apiKey) {
-      return { key: 'ANTHROPIC_API_KEY', value: apiKey };
+      return [{ key: 'ANTHROPIC_API_KEY', value: apiKey }];
     }
     throw new Error(
       'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
@@ -31,36 +30,6 @@ export class ClaudeCodeAgent implements Agent {
 
   hasAuthEnv(): boolean {
     return !!(process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY);
-  }
-
-  resolveModelId(modelName: string): string {
-    const modelMap: Record<string, string> = {
-      // Universal monikers
-      'apprentice': 'claude-haiku-4-5-20251001',
-      'journeyman': 'claude-sonnet-4-5-20250929',
-      'master': 'claude-opus-4-6',
-      // Legacy Claude-specific aliases (backward compat)
-      'sonnet': 'claude-sonnet-4-5-20250929',
-      'opus': 'claude-opus-4-6',
-      'haiku': 'claude-haiku-4-5-20251001',
-    };
-    const id = modelMap[modelName];
-    if (!id) {
-      throw new Error(`Unknown model: ${modelName}. Valid options: ${VALID_MODEL_NAMES.join(', ')}`);
-    }
-    return id;
-  }
-
-  availableModels(): { name: string; modelId: string; isDefault: boolean }[] {
-    return [
-      { name: 'journeyman', modelId: 'claude-sonnet-4-5-20250929', isDefault: true },
-      { name: 'master', modelId: 'claude-opus-4-6', isDefault: false },
-      { name: 'apprentice', modelId: 'claude-haiku-4-5-20251001', isDefault: false },
-      // Agent-specific aliases
-      { name: 'sonnet', modelId: 'claude-sonnet-4-5-20250929', isDefault: false },
-      { name: 'opus', modelId: 'claude-opus-4-6', isDefault: false },
-      { name: 'haiku', modelId: 'claude-haiku-4-5-20251001', isDefault: false },
-    ];
   }
 
   buildExecArgs(opts: {
@@ -123,7 +92,7 @@ export class ClaudeCodeAgent implements Agent {
     configDir?: string;
   }): string[] {
     // Claude Code stores session files in ~/.claude/projects/<project-hash>/<session-id>.jsonl
-    const configDir = opts.configDir ?? join(homedir(), '.claude');
+    const configDir = opts.configDir ?? join(getHome(), '.claude');
     const projectsDir = join(configDir, 'projects');
 
     if (!existsSync(projectsDir)) {

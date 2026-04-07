@@ -1,4 +1,4 @@
-export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'merging' | 'conflict' | 'zombie' | 'complete' | 'abandoned' | 'closed' | 'backlog';
+export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'submitted' | 'merging' | 'conflict' | 'zombie' | 'complete' | 'abandoned' | 'closed' | 'backlog';
 
 // Status classification functions live in src/task-state-machine.ts (single source of truth).
 // Re-exported here for backward compatibility — consumers can import from either location.
@@ -18,17 +18,6 @@ export type TurnRole = 'human' | 'agent';
 /** Who performed an action: human (CLI), builder (MCP), or system (reconciler/auto-resume). */
 export type Actor = 'human' | 'builder' | 'system';
 
-/** Universal model monikers — agent-agnostic capability tiers. */
-export type ModelMoniker = 'apprentice' | 'journeyman' | 'master';
-
-/** All accepted model names: universal monikers + legacy Claude-specific aliases. */
-export type ModelName = ModelMoniker | 'sonnet' | 'opus' | 'haiku';
-
-/** Ordered list of all valid model names for validation and help text. */
-export const VALID_MODEL_NAMES: readonly ModelName[] = [
-  'apprentice', 'journeyman', 'master',
-  'sonnet', 'opus', 'haiku',
-] as const;
 
 export interface TokenUsage {
   inputTokens: number;
@@ -49,9 +38,16 @@ export interface Task {
   parent_task_id: string | null;
   branched_from_sha: string | null;
   close_reason: string | null;
-  model: ModelName | null;
+  model: string | null;
   agent_id: string;
   metadata: Record<string, string> | null;
+  /**
+   * Upstream sync counter. 0 = up to date, >0 = needs sync.
+   * Incremented when a sync signal arrives (parent changed, explicit request).
+   * Reset to 0 when sync launches. If new signals arrive during merge, the
+   * counter goes >0 again, signaling that another sync is needed after completion.
+   */
+  pending_sync: number;
 }
 
 export interface Session {
@@ -121,7 +117,7 @@ export interface Turn {
   /** Merge conflicts present at the start of this turn (before agent resolution) */
   merge_conflicts?: MergeConflict[];
   /** Model used for this turn (sticky: next turn inherits if no explicit override) */
-  model?: ModelName;
+  model?: string;
   /** Full prompt sent to agent (only for human turns that trigger agent work) */
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
@@ -132,6 +128,8 @@ export interface Turn {
   check_exit_code?: number;
   /** Captured output from the post-turn check command */
   check_output?: string;
+  /** Whether this turn was auto-triggered (CI failure, comment, upstream sync, crash) vs human-triggered */
+  auto_triggered?: boolean;
 }
 
 export interface Commit {

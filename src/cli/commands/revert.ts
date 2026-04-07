@@ -8,8 +8,8 @@ import { runGit } from '../../utils/git';
  * Find the merge commit SHA for an accepted task on the target branch.
  * Searches for commits matching "Accept task <shortId>" pattern.
  */
-function findMergeCommit(taskShortId: string, targetBranch: string, root: string): string | null {
-  const result = runGit(
+async function findMergeCommit(taskShortId: string, targetBranch: string, root: string): Promise<string | null> {
+  const result = await runGit(
     ['log', targetBranch, '--grep', `Accept task ${taskShortId}`, '--format=%H', '-1'],
     { cwd: root },
   );
@@ -63,7 +63,7 @@ export async function commandRevert(args: string[]): Promise<void> {
       : 'main';
 
     // Find the merge commit
-    const mergeSha = findMergeCommit(shortId(task.id), mergeTargetBranch, root);
+    const mergeSha = await findMergeCommit(shortId(task.id), mergeTargetBranch, root);
     if (!mergeSha) {
       console.error(`Could not find merge commit for task ${displayId(task)} on ${mergeTargetBranch}.`);
       console.error(`Expected a commit matching "Accept task ${shortId(task.id)}" on branch ${mergeTargetBranch}.`);

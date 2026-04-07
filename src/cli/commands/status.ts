@@ -75,7 +75,7 @@ export async function commandStatus(args: string[]): Promise<void> {
     // Get current HEAD (only if worktree exists)
     if (worktreeExists) {
       try {
-        const currentSha = getCurrentSha(worktreePath);
+        const currentSha = await getCurrentSha(worktreePath);
         console.log(`  ${theme.label('HEAD:')}     ${theme.commitSha(currentSha.substring(0, 8))}`);
       } catch {
         console.error('\n  ERROR: Failed to read HEAD from worktree!');
@@ -93,12 +93,12 @@ export async function commandStatus(args: string[]): Promise<void> {
 
     // Check for uncommitted changes (only if worktree exists)
     if (worktreeExists) {
-      const hasUncommitted = hasUncommittedChanges(worktreePath);
+      const hasUncommitted = await hasUncommittedChanges(worktreePath);
       console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
 
       if (hasUncommitted) {
-        const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
-        const files = gitStatus.trim().split('\n').filter(l => l.trim());
+        const gitStatus = (await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath })).stdout;
+        const files = gitStatus.trim().split('\n').filter((l: string) => l.trim());
         console.log(`  Modified files: ${files.length}`);
         for (const line of files.slice(0, 10)) {
           console.log(`    ${line}`);

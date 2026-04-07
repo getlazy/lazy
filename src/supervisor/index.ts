@@ -35,6 +35,7 @@ import type {
   Command,
   StartCommand,
   UnblockCommand,
+  SyncCommand,
   StopCommand,
   SupervisorStatus,
   SupervisorPhase,
@@ -119,7 +120,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
   checkRequiredTools(runner);
 
   // Recovery: clean up any in-progress merge left by a previous crash
-  recoverWorktreeState(worktreePath);
+  await recoverWorktreeState(worktreePath);
 
   // Recovery: check if there's an in-progress status from a previous supervisor
   const prevStatus = readStatus(protocolDir);
@@ -142,7 +143,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     const command = await waitForCommand(protocolDir, pollIntervalMs);
     if (!command) continue; // timeout (shouldn't happen with default 0 timeout)
 
-    const turnStartedAt = command.type !== 'stop' ? (command as StartCommand | UnblockCommand).turn_started_at : undefined;
+    const turnStartedAt = (command.type === 'start' || command.type === 'unblock') ? (command as StartCommand | UnblockCommand).turn_started_at : undefined;
     resetTimer(turnStartedAt);
     log(`[supervisor] Received command: ${command.type} for task ${command.task_id}`);
 
@@ -191,37 +192,43 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
  * Recover worktree state from a previous crash. Aborts any in-progress
  * merge and ensures the worktree is clean before work begins.
  */
-function recoverWorktreeState(worktreePath: string): void {
+async function recoverWorktreeState(worktreePath: string): Promise<void> {
   // Check for in-progress merge (MERGE_HEAD exists)
-  if (hasMergeInProgress(worktreePath)) {
+  if (await hasMergeInProgress(worktreePath)) {
     logWarn('[supervisor] Detected in-progress merge from previous crash. Aborting merge to recover clean state.');
-    abortMergeIfInProgress(worktreePath);
+    await abortMergeIfInProgress(worktreePath);
   }
 
   // Check for unmerged files (conflict markers without MERGE_HEAD — shouldn't happen but be safe)
-  if (hasUnmergedFiles(worktreePath)) {
+  if (await hasUnmergedFiles(worktreePath)) {
     logWarn('[supervisor] Detected unmerged files in worktree. Resetting to clean state.');
-    runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
+    await runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
   }
 }
 
 /**
- * Handle a start or unblock command: run phases and write response.
+ * Handle a start, unblock, or sync command: run phases and write response.
  */
 async function handleTurnCommand(command: Command, config: SupervisorConfig, runner: Runner): Promise<void> {
   const { protocolDir, worktreePath } = config;
 
   if (command.type === 'stop') return; // handled by caller
 
+  // Sync commands run only the merge phase — no agent work.
+  if (command.type === 'sync') {
+    await handleSyncCommand(command as SyncCommand, config, runner);
+    return;
+  }
+
   const cmd = command as StartCommand | UnblockCommand;
   const isResume = command.type === 'unblock' && !!(command as UnblockCommand).agent_session_id;
   log(`[supervisor] Command fields: protected_patterns=${JSON.stringify(cmd.protected_patterns)}, post_turn_check=${JSON.stringify(cmd.post_turn_check)}, parent_branch=${cmd.parent_branch}, agent_id=${cmd.agent_id}`);
 
   // Pre-turn worktree health check: ensure no leftover merge state
-  recoverWorktreeState(worktreePath);
+  await recoverWorktreeState(worktreePath);
 
   // Record pre-turn SHA for deterministic turn diff
-  const preTurnSha = getHeadSha(worktreePath);
+  const preTurnSha = await getHeadSha(worktreePath);
   log(`[supervisor] Pre-turn SHA: ${preTurnSha.substring(0, 8)}`);
 
   // Initialize status
@@ -246,7 +253,10 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     updatePhase(status, 'sync_with_remote', protocolDir);
 
     try {
-      const conflicts = await runSyncWithRemote(worktreePath, cmd.remote_branch, cmd.model_id);
+      const remoteSyncSessionId = command.type === 'unblock'
+        ? (command as UnblockCommand).agent_session_id
+        : undefined;
+      const conflicts = await runSyncWithRemote(worktreePath, cmd.remote_branch, cmd.model_id, remoteSyncSessionId);
       allMergeConflicts.push(...conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -261,30 +271,33 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       return;
     }
 
-    const postRemoteSyncSha = getHeadSha(worktreePath);
+    const postRemoteSyncSha = await getHeadSha(worktreePath);
     status.post_remote_sync_sha = postRemoteSyncSha;
     updatePhase(status, 'sync_with_remote_done', protocolDir);
 
     const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-remote-sync/${postRemoteSyncSha.substring(0, 8)}`;
-    tagHead(worktreePath, tagName);
+    await tagHead(worktreePath, tagName);
   }
 
-  // Phase 2: Pre-turn sync-with-upstream (if requested and parent_branch is specified)
-  // Backward compat: if sync_before_work is undefined but parent_branch is set,
-  // default to true (old behavior where parent_branch alone triggered pre-turn sync)
-  const syncBeforeWork = cmd.sync_before_work ?? (cmd.parent_branch ? true : false);
+  // Phase 2: Pre-turn sync-with-upstream (only when explicitly requested).
+  // Sync commands set sync_before_work=true; unblock commands set it to false.
+  // Default to false — unblock no longer triggers upstream merge automatically.
+  const syncBeforeWork = cmd.sync_before_work ?? false;
   if (cmd.parent_branch && syncBeforeWork) {
     updatePhase(status, 'merge_and_fix', protocolDir);
 
     // Capture the upstream branch SHA before merging for accurate diff scope
-    const upstreamSha = getBranchSha(worktreePath, cmd.parent_branch);
+    const upstreamSha = await getBranchSha(worktreePath, cmd.parent_branch);
     if (upstreamSha) {
       status.upstream_merge_sha = upstreamSha;
       writeStatus(protocolDir, status);
     }
 
     try {
-      const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id);
+      const mergeSessionId = command.type === 'unblock'
+        ? (command as UnblockCommand).agent_session_id
+        : undefined;
+      const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, mergeSessionId);
       allMergeConflicts.push(...conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -300,19 +313,19 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     }
 
     // Tag HEAD after merge for deterministic turn diff
-    const postMergeSha = getHeadSha(worktreePath);
+    const postMergeSha = await getHeadSha(worktreePath);
     status.post_merge_sha = postMergeSha;
     updatePhase(status, 'merge_and_fix_done', protocolDir);
 
     // Create a deterministic tag for the merge point
     const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-merge/${postMergeSha.substring(0, 8)}`;
-    tagHead(worktreePath, tagName);
+    await tagHead(worktreePath, tagName);
   }
 
   // Write MCP server config so Claude Code discovers lazy tools
   try {
     const mcpConfig = runner.mcpServerConfig(cmd.task_id, worktreePath);
-    writeMcpConfig(mcpConfig);
+    await writeMcpConfig(mcpConfig);
     log(`[supervisor] Wrote MCP config for task ${cmd.task_id.substring(0, 8)}`);
   } catch (err) {
     // Non-fatal: Claude Code will work without MCP tools (they just won't be available)
@@ -322,7 +335,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   // Pre-approve lazy MCP tools so Claude Code doesn't prompt for permission
   try {
     const toolNames = allTools.map(t => t.name);
-    writeToolPermissions(toolNames);
+    await writeToolPermissions(toolNames);
     log(`[supervisor] Pre-approved ${toolNames.length} MCP tools`);
   } catch (err) {
     logWarn(`[supervisor] Failed to write tool permissions: ${err instanceof Error ? err.message : err}`);
@@ -380,13 +393,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     log(`[supervisor] Agent result: session_id=${result.session_id?.substring(0, 8)}, result_length=${result.result.length}`);
 
     // Record agent's work endpoint (before any post-turn sync)
-    const postWorkSha = getHeadSha(worktreePath);
+    const postWorkSha = await getHeadSha(worktreePath);
     log(`[supervisor] Post-work SHA: ${postWorkSha.substring(0, 8)}`);
     status.post_work_sha = postWorkSha;
     writeStatus(protocolDir, status);
 
     const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postWorkSha.substring(0, 8)}`;
-    tagHead(worktreePath, tagName);
+    await tagHead(worktreePath, tagName);
     log(`[supervisor] Tagged HEAD: ${tagName}`);
 
     // Phase 3b: Check for file permission violations and push back if needed
@@ -398,7 +411,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // exempt from permission violations (they're not pre-existing files).
     let branchPointSha: string | undefined;
     if (cmd.parent_branch && protectedPatterns.length > 0) {
-      const mergeBaseResult = runGit(
+      const mergeBaseResult = await runGit(
         ['merge-base', cmd.parent_branch, 'HEAD'],
         { cwd: worktreePath },
       );
@@ -412,7 +425,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
     log(`[supervisor] Checking permissions: ${protectedPatterns.length} pattern(s) [${protectedPatterns.join(', ')}], diff ${startShaWork.substring(0, 8)}..${postWorkSha.substring(0, 8)}`);
     log(`[supervisor] status.post_merge_sha=${status.post_merge_sha?.substring(0, 8)}, status.pre_turn_sha=${status.pre_turn_sha?.substring(0, 8)}, preTurnSha=${preTurnSha.substring(0, 8)}`);
-    let violations = detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns, branchPointSha);
+    let violations = await detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns, branchPointSha);
     log(`[supervisor] Violations detected: ${violations.length}`);
 
     // Push-back: give the agent one chance to self-correct before blocking
@@ -431,8 +444,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       pushbackResponse = pushbackResult.response;
 
       // Re-check violations on the new HEAD (agent may have reverted some files)
-      const postPushbackSha = getHeadSha(worktreePath);
-      violations = detectViolations(worktreePath, startShaWork, postPushbackSha, protectedPatterns, branchPointSha);
+      const postPushbackSha = await getHeadSha(worktreePath);
+      violations = await detectViolations(worktreePath, startShaWork, postPushbackSha, protectedPatterns, branchPointSha);
       log(`[supervisor] After push-back: ${violations.length} violation(s) remaining`);
       updatePhase(status, 'permission_pushback_done', protocolDir);
 
@@ -442,7 +455,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         writeStatus(protocolDir, status);
 
         const pushbackTagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postPushbackSha.substring(0, 8)}`;
-        tagHead(worktreePath, pushbackTagName);
+        await tagHead(worktreePath, pushbackTagName);
       }
     }
 
@@ -459,6 +472,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
           cwd: worktreePath,
           stdout: 'pipe',
           stderr: 'pipe',
+          timeout: 0, // Long-running: post_turn_timeout in lazy.toml controls this (default 300s)
         });
 
         // Race the process against the timeout
@@ -494,14 +508,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       updatePhase(status, 'post_turn_sync', protocolDir);
 
       // Capture the upstream branch SHA before merging (updates the stored SHA for future diffs)
-      const upstreamSha = getBranchSha(worktreePath, cmd.parent_branch);
+      const upstreamSha = await getBranchSha(worktreePath, cmd.parent_branch);
       if (upstreamSha) {
         status.upstream_merge_sha = upstreamSha;
         writeStatus(protocolDir, status);
       }
 
       try {
-        const postTurnConflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id);
+        const postTurnConflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, result.session_id);
         allMergeConflicts.push(...postTurnConflicts);
         updatePhase(status, 'post_turn_sync_done', protocolDir);
       } catch (err) {
@@ -510,7 +524,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         logWarn(`[supervisor] Post-turn sync failed: ${errorMessage}. Skipping.`);
 
         // Abort any in-progress merge to leave the branch clean
-        runGit(['merge', '--abort'], { cwd: worktreePath });
+        await runGit(['merge', '--abort'], { cwd: worktreePath });
       }
     }
 
@@ -563,6 +577,99 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   }
 }
 
+/**
+ * Handle a sync command: merge upstream branch, write response, return.
+ * No agent work phase runs — this is purely a merge operation.
+ */
+async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, runner: Runner): Promise<void> {
+  const { protocolDir, worktreePath } = config;
+
+  // Pre-turn worktree health check
+  await recoverWorktreeState(worktreePath);
+
+  const preTurnSha = await getHeadSha(worktreePath);
+  log(`[supervisor] Sync command: pre-turn SHA ${preTurnSha.substring(0, 8)}, parent_branch=${cmd.parent_branch}`);
+
+  const status: SupervisorStatus = {
+    phase: 'reading_command',
+    task_id: cmd.task_id,
+    command_type: 'sync',
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    pre_turn_sha: preTurnSha,
+    pid: process.pid,
+  };
+  writeStatus(protocolDir, status);
+
+  // Write MCP server config so Claude Code discovers lazy tools during conflict resolution
+  try {
+    const mcpConfig = runner.mcpServerConfig(cmd.task_id, worktreePath);
+    await writeMcpConfig(mcpConfig);
+    log(`[supervisor] Wrote MCP config for task ${cmd.task_id.substring(0, 8)}`);
+  } catch (err) {
+    // Non-fatal: Claude Code will work without MCP tools (they just won't be available)
+    logWarn(`[supervisor] Failed to write MCP config: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Pre-approve lazy MCP tools so Claude Code doesn't prompt for permission
+  try {
+    const toolNames = allTools.map(t => t.name);
+    await writeToolPermissions(toolNames);
+    log(`[supervisor] Pre-approved ${toolNames.length} MCP tools`);
+  } catch (err) {
+    logWarn(`[supervisor] Failed to write tool permissions: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const allMergeConflicts: MergeConflict[] = [];
+
+  // Merge upstream branch
+  updatePhase(status, 'merge_and_fix', protocolDir);
+
+  const upstreamSha = await getBranchSha(worktreePath, cmd.parent_branch);
+  if (upstreamSha) {
+    status.upstream_merge_sha = upstreamSha;
+    writeStatus(protocolDir, status);
+  }
+
+  try {
+    // INVARIANT: Pass agent_session_id so conflict resolution reuses the existing
+    // agent session (add-session-merge) instead of cold-starting a fresh one.
+    const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, cmd.agent_session_id);
+    allMergeConflicts.push(...conflicts);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logError(`[supervisor] Sync merge failed: ${errorMessage}`);
+
+    const errorResponse: ErrorResponse = {
+      status: 'error',
+      error: `Sync merge failed: ${errorMessage}`,
+      phase: 'merge_and_fix',
+    };
+    writeResponse(protocolDir, errorResponse);
+    return;
+  }
+
+  const postMergeSha = await getHeadSha(worktreePath);
+  status.post_merge_sha = postMergeSha;
+  updatePhase(status, 'merge_and_fix_done', protocolDir);
+
+  const tagName = `turn/${cmd.task_id.substring(0, 8)}/post-merge/${postMergeSha.substring(0, 8)}`;
+  await tagHead(worktreePath, tagName);
+
+  // Write completed response
+  updatePhase(status, 'writing_response', protocolDir);
+  log(`[supervisor] Sync complete. Post-merge SHA: ${postMergeSha.substring(0, 8)}`);
+
+  const response: CompletedResponse = {
+    status: 'completed',
+    result: 'Sync merge completed successfully.',
+    session_id: '',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
+  };
+  writeResponse(protocolDir, response);
+}
+
 // --- Helpers ---
 
 function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: string): void {
@@ -572,16 +679,16 @@ function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: stri
   log(`[supervisor] Phase: ${phase}`);
 }
 
-function getHeadSha(cwd: string): string {
-  const result = runGit(['rev-parse', 'HEAD'], { cwd });
+async function getHeadSha(cwd: string): Promise<string> {
+  const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
     return 'unknown';
   }
   return result.stdout;
 }
 
-function getBranchSha(cwd: string, branch: string): string | null {
-  const result = runGit(['rev-parse', branch], { cwd });
+async function getBranchSha(cwd: string, branch: string): Promise<string | null> {
+  const result = await runGit(['rev-parse', branch], { cwd });
   if (result.exitCode !== 0) {
     logWarn(`[supervisor] Failed to get SHA for branch ${branch}: ${result.stderr}`);
     return null;
@@ -589,9 +696,9 @@ function getBranchSha(cwd: string, branch: string): string | null {
   return result.stdout;
 }
 
-function tagHead(cwd: string, tagName: string): void {
+async function tagHead(cwd: string, tagName: string): Promise<void> {
   // Best-effort tagging — don't fail the turn if tagging fails
-  const result = runGit(['tag', '-f', tagName], { cwd });
+  const result = await runGit(['tag', '-f', tagName], { cwd });
   if (result.exitCode !== 0) {
     logWarn(`[supervisor] Failed to create tag ${tagName}: ${result.stderr}`);
   } else {

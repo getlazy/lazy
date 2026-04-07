@@ -127,7 +127,7 @@ describe('lazy branch', () => {
     const parentId = await createAndStartParent(ctx);
 
     const result = await ctx.lazyMocked(
-      ['branch', parentId, '--goal', 'Use haiku', '--model', 'haiku', '--yes'],
+      ['branch', parentId, '--goal', 'Use haiku', '--model', 'claude-haiku-4-5-20251001', '--yes'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );

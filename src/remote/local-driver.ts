@@ -17,6 +17,7 @@ import type {
   PRState,
   HealthCheck,
   DriverConfigOptions,
+  AcceptGateWarning,
 } from './driver';
 import type { Task } from '../types';
 import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch } from '../git/operations';
@@ -36,8 +37,8 @@ export class LocalDriver implements RepositoryDriver {
     // Use the appropriate check based on whether we're merging to main (HEAD) or a specific target
     const isMainMerge = targetBranch === 'main';
     const hasConflicts = isMainMerge
-      ? checkMergeConflicts(sourceBranch, root)
-      : checkMergeConflictsIntoTarget(sourceBranch, targetBranch, root);
+      ? await checkMergeConflicts(sourceBranch, root)
+      : await checkMergeConflictsIntoTarget(sourceBranch, targetBranch, root);
 
     if (hasConflicts) {
       return {
@@ -142,6 +143,10 @@ export class LocalDriver implements RepositoryDriver {
     return false;
   }
 
+  async recoverRemoteRef(_task: Task): Promise<Record<string, string> | null> {
+    return null;
+  }
+
   getRemoteRefUrl(_task: Task): string | null {
     return null;
   }
@@ -153,6 +158,21 @@ export class LocalDriver implements RepositoryDriver {
   validateAccept(_task: Task): string | null {
     // Local driver can always accept — no remote preconditions
     return null;
+  }
+
+  async isTargetBranchProtected(_targetBranch: string): Promise<boolean> {
+    // Local driver has no remote protection rules
+    return false;
+  }
+
+  async hasExternalApproval(_task: Task): Promise<boolean> {
+    // Local driver has no remote approvals
+    return false;
+  }
+
+  async checkAcceptGates(_task: Task): Promise<AcceptGateWarning[]> {
+    // Local driver has no remote gates
+    return [];
   }
 
   async fetchRemoteState(_root: string, _branchesToUpdate?: string[]): Promise<void> {

@@ -77,7 +77,7 @@ describe('merge recovery utilities', () => {
   describe('hasMergeInProgress', () => {
     test('returns false when no merge is in progress', async () => {
       repoDir = await createTestRepo();
-      expect(hasMergeInProgress(repoDir)).toBe(false);
+      expect(await hasMergeInProgress(repoDir)).toBe(false);
     });
 
     test('returns true when MERGE_HEAD exists (merge in progress)', async () => {
@@ -88,7 +88,7 @@ describe('merge recovery utilities', () => {
       expect(mergeResult.exitCode).not.toBe(0); // should fail with conflicts
 
       // MERGE_HEAD should exist
-      expect(hasMergeInProgress(repoDir)).toBe(true);
+      expect(await hasMergeInProgress(repoDir)).toBe(true);
     });
 
     test('returns false after merge is completed', async () => {
@@ -102,14 +102,14 @@ describe('merge recovery utilities', () => {
       git(repoDir, 'add', 'file.txt');
       git(repoDir, 'commit', '-m', 'Resolve merge conflict');
 
-      expect(hasMergeInProgress(repoDir)).toBe(false);
+      expect(await hasMergeInProgress(repoDir)).toBe(false);
     });
   });
 
   describe('hasUnmergedFiles', () => {
     test('returns false in a clean repo', async () => {
       repoDir = await createTestRepo();
-      expect(hasUnmergedFiles(repoDir)).toBe(false);
+      expect(await hasUnmergedFiles(repoDir)).toBe(false);
     });
 
     test('returns true when there are unmerged files', async () => {
@@ -118,7 +118,7 @@ describe('merge recovery utilities', () => {
       // Start a conflicting merge
       git(repoDir, 'merge', 'main');
 
-      expect(hasUnmergedFiles(repoDir)).toBe(true);
+      expect(await hasUnmergedFiles(repoDir)).toBe(true);
     });
 
     test('returns false after conflicts are resolved', async () => {
@@ -132,14 +132,14 @@ describe('merge recovery utilities', () => {
       git(repoDir, 'add', 'file.txt');
       git(repoDir, 'commit', '-m', 'Resolve merge');
 
-      expect(hasUnmergedFiles(repoDir)).toBe(false);
+      expect(await hasUnmergedFiles(repoDir)).toBe(false);
     });
   });
 
   describe('abortMergeIfInProgress', () => {
     test('returns false when no merge is in progress', async () => {
       repoDir = await createTestRepo();
-      expect(abortMergeIfInProgress(repoDir)).toBe(false);
+      expect(await abortMergeIfInProgress(repoDir)).toBe(false);
     });
 
     test('aborts an in-progress merge and returns true', async () => {
@@ -147,17 +147,17 @@ describe('merge recovery utilities', () => {
 
       // Start a conflicting merge
       git(repoDir, 'merge', 'main');
-      expect(hasMergeInProgress(repoDir)).toBe(true);
+      expect(await hasMergeInProgress(repoDir)).toBe(true);
 
       // Abort it
-      const result = abortMergeIfInProgress(repoDir);
+      const result = await abortMergeIfInProgress(repoDir);
       expect(result).toBe(true);
 
       // MERGE_HEAD should be gone
-      expect(hasMergeInProgress(repoDir)).toBe(false);
+      expect(await hasMergeInProgress(repoDir)).toBe(false);
 
       // Worktree should be clean (no conflict markers)
-      expect(hasUnmergedFiles(repoDir)).toBe(false);
+      expect(await hasUnmergedFiles(repoDir)).toBe(false);
     });
 
     test('restores the pre-merge state after aborting', async () => {
@@ -171,7 +171,7 @@ describe('merge recovery utilities', () => {
       git(repoDir, 'merge', 'main');
 
       // Abort it
-      abortMergeIfInProgress(repoDir);
+      await abortMergeIfInProgress(repoDir);
 
       // HEAD should be back to where it was
       const postHeadResult = git(repoDir, 'rev-parse', 'HEAD');
@@ -185,20 +185,20 @@ describe('merge recovery utilities', () => {
 
       // Simulate a crash: start a merge and leave it in-progress
       git(repoDir, 'merge', 'main');
-      expect(hasMergeInProgress(repoDir)).toBe(true);
-      expect(hasUnmergedFiles(repoDir)).toBe(true);
+      expect(await hasMergeInProgress(repoDir)).toBe(true);
+      expect(await hasUnmergedFiles(repoDir)).toBe(true);
 
       // Now simulate what recoverWorktreeState does:
       // 1. Detect in-progress merge
-      expect(hasMergeInProgress(repoDir)).toBe(true);
+      expect(await hasMergeInProgress(repoDir)).toBe(true);
 
       // 2. Abort it
-      const aborted = abortMergeIfInProgress(repoDir);
+      const aborted = await abortMergeIfInProgress(repoDir);
       expect(aborted).toBe(true);
 
       // 3. Verify clean state
-      expect(hasMergeInProgress(repoDir)).toBe(false);
-      expect(hasUnmergedFiles(repoDir)).toBe(false);
+      expect(await hasMergeInProgress(repoDir)).toBe(false);
+      expect(await hasUnmergedFiles(repoDir)).toBe(false);
 
       // 4. Verify git status is clean
       const status = git(repoDir, 'status', '--porcelain');

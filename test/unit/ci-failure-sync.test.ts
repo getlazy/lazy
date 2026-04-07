@@ -7,16 +7,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { truncateLog } from '../../src/utils/log-truncate';
-
-// Replicate the ciFailureSignature function here to test in isolation,
-// since importing sync.ts pulls in the full CLI dependency chain.
-// The canonical implementation lives in src/cli/commands/sync.ts.
-function ciFailureSignature(failed: Array<{ name: string; url?: string }>): string {
-  return failed
-    .map(f => f.url ? `${f.name}|${f.url}` : f.name)
-    .sort()
-    .join('\n');
-}
+import { ciFailureSignature } from '../../src/daemon/remote-sync';
 
 describe('ciFailureSignature', () => {
   // INVARIANT: Same failures produce the same signature, preventing duplicate comments.

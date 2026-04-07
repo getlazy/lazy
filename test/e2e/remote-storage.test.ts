@@ -29,7 +29,7 @@ describe('RemoteStorage', () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-remote-storage-'));
     socketPath = join(tmpDir, 'remote-storage-test.sock');
     token = 'remote-storage-test-token';
-    daemon = startDaemonServer({ socketPath, token });
+    daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
   });
 
   afterAll(async () => {
@@ -289,7 +289,7 @@ describe('RemoteStorage', () => {
 
     // These all return void — should not throw
     await remote.updateTaskGoal(task.id, 'New goal');
-    await remote.updateTaskModel(task.id, 'sonnet');
+    await remote.updateTaskModel(task.id, 'claude-sonnet-4-5-20250929');
     await remote.updateTaskType(task.id, 'fix');
   });
 });

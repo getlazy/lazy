@@ -14,7 +14,7 @@ import type { GitLabDriverDeps, GlResult } from '../../src/remote/gitlab-driver'
  */
 
 const githubConfig: ResolvedConfig = {
-  models: { default: 'sonnet' as const },
+  models: { default: 'claude-sonnet-4-5-20250929' },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: {
@@ -29,18 +29,28 @@ const githubConfig: ResolvedConfig = {
   remote: {
     driver: 'github',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const, docker_agent_no_network: false },
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
+  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential' as const,
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
+  },
 };
 
 const gitlabConfig: ResolvedConfig = {
@@ -57,8 +67,8 @@ const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 
  */
 function makeGitHubDeps(gitHandler: (args: string[], cwd?: string) => GhResult): DriverDeps {
   return {
-    runGh: () => fail('unexpected gh call'),
-    runGit: gitHandler,
+    runGh: async () => Promise.resolve(fail('unexpected gh call')),
+    runGit: async (args: string[], cwd?: string) => Promise.resolve(gitHandler(args, cwd)),
   };
 }
 
@@ -67,8 +77,8 @@ function makeGitHubDeps(gitHandler: (args: string[], cwd?: string) => GhResult):
  */
 function makeGitLabDeps(gitHandler: (args: string[], cwd?: string) => GlResult): GitLabDriverDeps {
   return {
-    runGl: () => fail('unexpected glab call') as GlResult,
-    runGit: gitHandler,
+    runGl: async () => Promise.resolve(fail('unexpected glab call') as GlResult),
+    runGit: async (args: string[], cwd?: string) => Promise.resolve(gitHandler(args, cwd)),
   };
 }
 

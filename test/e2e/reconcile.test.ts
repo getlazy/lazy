@@ -11,6 +11,8 @@ import {
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
+import { reconcileTasks } from '../../src/utils/reconcile';
+import { createStorage } from '../../src/storage';
 
 // ============================================================
 // Helpers
@@ -44,6 +46,19 @@ function setTaskStatus(root: string, fullTaskId: string, status: string): void {
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     session.last_interaction_at = new Date(Date.now() - 60000).toISOString();
     writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+  }
+}
+
+/**
+ * Run reconciliation directly (simulates what the daemon does).
+ * Tests can't rely on CLI commands triggering reconciliation — only the daemon does that.
+ */
+async function runReconcile(root: string): Promise<void> {
+  const storage = await createStorage(root);
+  try {
+    await reconcileTasks(storage, root);
+  } finally {
+    await storage.close();
   }
 }
 
@@ -84,11 +99,10 @@ describe('lazy reconciliation grace period', () => {
     expectSuccess(startResult);
     expectOutput(startResult, 'Started task');
 
-    // Immediately run 'list' which triggers reconciliation
+    // Run reconciliation immediately after start.
     // The grace period should prevent the task from being marked as interrupted
-    // even though the container may not be fully running yet
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // even though the container may not be fully running yet.
+    await runReconcile(ctx.root);
 
     // Verify the task is still shown as working (or blocked if supervisor completed fast)
     // but NOT interrupted
@@ -115,7 +129,7 @@ describe('lazy reconciliation grace period', () => {
     });
 
     // Reconcile first to process any response
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -129,7 +143,7 @@ describe('lazy reconciliation grace period', () => {
 
     // Trigger reconciliation — with the fix, negative elapsed time should NOT
     // cause the grace period to skip reconciliation
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     // Task should be interrupted (no container running, no response)
     const showResult = await ctx.lazy(['show', taskId]);
@@ -178,9 +192,8 @@ describe('reconciliation sweep: interrupted task responses', () => {
     };
     writeResponse(protoDir, completedResp);
 
-    // 4. Trigger reconciliation via any command (e.g., 'list')
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // 4. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 5. Verify the task was transitioned from interrupted -> blocked
     const showResult = await ctx.lazy(['show', taskId]);
@@ -212,9 +225,8 @@ describe('reconciliation sweep: interrupted task responses', () => {
     };
     writeResponse(protoDir, errorResp);
 
-    // 4. Trigger reconciliation
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // 4. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 5. Task should still be interrupted (error response just gets consumed)
     const showResult = await ctx.lazy(['show', taskId]);
@@ -239,9 +251,8 @@ describe('reconciliation sweep: interrupted task responses', () => {
     setTaskStatus(ctx.root, fullTaskId, 'interrupted');
     consumeResponse(protoDir);
 
-    // 3. Trigger reconciliation
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // 3. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 4. Task should still be interrupted (no response to process)
     const showResult = await ctx.lazy(['show', taskId]);
@@ -271,8 +282,8 @@ describe('reconciliation sweep: interrupted task responses', () => {
     };
     writeResponse(protoDir, completedResp);
 
-    // 4. Trigger reconciliation
-    await ctx.lazy(['list']);
+    // 4. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 5. Verify the agent turn was recorded with the response text
     const showResult = await ctx.lazy(['show', taskId, '--full']);
@@ -304,13 +315,12 @@ describe('reconciliation sweep: terminal task containers', () => {
     });
 
     // 2. Reconcile to move to blocked, then set to complete
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     setTaskStatus(ctx.root, fullTaskId, 'complete');
 
     // 3. Trigger reconciliation again -- the terminal sweep should run without error
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
 
     // 4. Verify the task is still in complete status
     const showResult = await ctx.lazy(['show', taskId]);
@@ -330,7 +340,7 @@ describe('reconciliation sweep: terminal task containers', () => {
     }
 
     // Reconcile all to blocked first
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     // Set each to a different terminal state
     const statuses = ['complete', 'abandoned', 'closed'];
@@ -340,8 +350,7 @@ describe('reconciliation sweep: terminal task containers', () => {
     }
 
     // Trigger reconciliation -- all terminal sweeps should complete without error
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
   });
 });
 
@@ -368,7 +377,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 2. Reconcile to move to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -385,8 +394,9 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     ctx.git('commit', '-m', `Accept task ${taskId}: Zombie branch test`);
     ctx.git('checkout', branchName);
 
-    // 5. Trigger reconciliation — sweep 4 should detect and fix the zombie
-    //    Note: any CLI command triggers reconciliation, so 'show' also works
+    // 5. Trigger reconciliation — sweep should detect and fix the zombie
+    await runReconcile(ctx.root);
+
     const showAfter = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfter);
     expectOutput(showAfter, 'complete');
@@ -400,7 +410,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 2. Reconcile to move to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     const branchName = `lazy/${taskId}`;
@@ -417,9 +427,8 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     }
     ctx.git('branch', '-D', branchName);
 
-    // 4. Trigger reconciliation
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // 4. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 5. Verify task is now complete
     const showAfter = await ctx.lazy(['show', taskId]);
@@ -435,11 +444,10 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     // 3. Trigger reconciliation again — task should stay blocked
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
 
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
@@ -457,7 +465,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -486,8 +494,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     ctx.git('checkout', branchName);
 
     // 6. Trigger reconciliation — the sweep should skip this task
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
 
     // 7. Verify task is still blocked (NOT auto-accepted to complete)
     const showAfter = await ctx.lazy(['show', taskId]);
@@ -508,7 +515,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 3. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -548,8 +555,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     writeFileSync(sessionPath, JSON.stringify(session, null, 2));
 
     // 6. Trigger reconciliation — should NOT auto-accept despite empty init commit
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
 
     // 7. Verify task stays blocked
     const showAfter = await ctx.lazy(['show', taskId]);
@@ -565,7 +571,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     });
 
     // 2. Reconcile to blocked, then manually set to interrupted
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     setTaskStatus(ctx.root, fullTaskId, 'interrupted');
 
@@ -576,9 +582,8 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     ctx.git('commit', '-m', `Accept task ${taskId}: Interrupted zombie test`);
     ctx.git('checkout', branchName);
 
-    // 4. Trigger reconciliation
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // 4. Trigger reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // 5. Verify task is now complete
     const showAfter = await ctx.lazy(['show', taskId]);
@@ -623,7 +628,7 @@ describe('reconciliation error isolation', () => {
     });
 
     // 3. Reconcile all to blocked
-    await ctx.lazy(['list']);
+    await runReconcile(ctx.root);
 
     // 4. Set all tasks to interrupted so the sweep will try to process them
     const fullTaskId1 = findFullTaskId(ctx.root, taskId1);
@@ -652,8 +657,7 @@ describe('reconciliation error isolation', () => {
 
     // 7. Trigger reconciliation — sweep should continue despite task2 error
     // The reconciliation should not crash
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    await runReconcile(ctx.root);
 
     // 8. Verify task1 and task3 were still processed (moved to blocked)
     // Task2 may remain interrupted due to corrupt data, but reconciliation should not crash
@@ -668,19 +672,4 @@ describe('reconciliation error isolation', () => {
     expect(show3.stdout.includes('interrupted') || show3.stdout.includes('blocked') || show3.stdout.includes('complete')).toBe(true);
   });
 
-  // INVARIANT: Reconciliation failure must be visible, not silent.
-  // When reconcileTasks() is called from index.ts and fails, the error should be logged
-  // to console.error (not silently swallowed), but the command should still proceed.
-  test('reconciliation logs errors when storage is broken', async () => {
-    // 1. Corrupt the storage by removing the tasks directory
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
-    Bun.spawnSync(['rm', '-rf', tasksDir], { cwd: ctx.root });
-
-    // 2. Trigger any command that calls reconciliation (e.g., list)
-    // This should not crash — it should log an error and continue
-    const listResult = await ctx.lazy(['list']);
-
-    // The command should still exit successfully (reconciliation errors are non-fatal)
-    expectSuccess(listResult);
-  });
 });

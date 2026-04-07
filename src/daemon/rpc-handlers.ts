@@ -1,8 +1,8 @@
 /**
  * Daemon RPC handlers — execute command logic and return structured data.
  *
- * The daemon holds long-lived Storage instances per project (one per projectRoot).
- * All RPC handlers and the reconcile loop share the same instance via
+ * The daemon holds a single long-lived Storage instance for its project.
+ * All RPC handlers and the reconcile loop share this instance via
  * `getOrCreateStorage()`. This makes the daemon the single writer — CLI commands
  * use RemoteStorage and never touch .storage-lock.
  *
@@ -11,6 +11,11 @@
  * - Write to stdout/stderr
  * - Import CLI rendering/theme modules
  * - Call storage.close() — the daemon owns the Storage lifecycle
+ * - NEVER spawn lazy CLI as a subprocess (use internal functions instead)
+ *
+ * CRITICAL: The daemon has direct access to storage, runners, and all task
+ * lifecycle functions. Never use getLazyCommand() or spawn lazy CLI from
+ * daemon code — it causes deadlocks and storage lock contention.
  */
 
 import { existsSync } from 'fs';
@@ -20,10 +25,13 @@ import type { Task, SearchResult } from '../storage';
 import { buildTaskTree } from '../cli/commands/list';
 import { loadTaskShowData } from '../cli/commands/show';
 import { isStructuredQuery, structuredSearch } from '../search';
-import { getDiffStat, getDiffFull, getCurrentBranch, branchExists } from '../git/operations';
+import { getDiffStat, getDiffFull, getCurrentBranch, branchExists, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { getNewNotesSince } from '../cli/commands/shared';
 import { getWorktreePath, getBranchNameFromId, displayId, formatDate } from '../cli/helpers';
+import { launchTask, writeDaemonMcpConfig, type StartTaskParams } from './task-launcher';
+import { launchUnblockTask, rejectTask, closeTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type RejectTaskParams, type CloseTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
 import type { Comment } from '../types';
+import { logger } from '../utils/logger';
 
 export class RpcError extends Error {
   constructor(public status: number, message: string) {
@@ -32,55 +40,81 @@ export class RpcError extends Error {
 }
 
 /**
- * Long-lived Storage instances keyed by project root.
+ * Single long-lived Storage instance for the daemon's project.
  *
- * The daemon is single-threaded (Bun's event loop), so concurrent RPC calls
- * are serialized naturally — no explicit mutex is needed. Async operations
- * may interleave, but FileStorage uses file-level locking internally for
- * individual operations, so this is safe.
+ * The daemon is per-project and single-threaded (Bun's event loop), so
+ * concurrent RPC calls are serialized naturally — no explicit mutex is needed.
+ * Async operations may interleave, but FileStorage uses file-level locking
+ * internally for individual operations, so this is safe.
  */
-const storageRegistry = new Map<string, Storage>();
+let daemonStorage: Storage | null = null;
+
+/** Module-level project root, set once by initDaemonStorage(). */
+let daemonProjectRoot: string | null = null;
 
 /**
- * Get or create a long-lived Storage instance for a project.
- * The instance stays open for the lifetime of the daemon process.
+ * Initialize the daemon storage module with the project root.
+ * Must be called once during daemon startup before any RPC handlers run.
  */
-export async function getOrCreateStorage(projectRoot: string): Promise<Storage> {
-  let storage = storageRegistry.get(projectRoot);
-  if (!storage) {
-    const config = loadConfig(projectRoot, { cwd: projectRoot });
-    storage = await createStorage(projectRoot, {
-      backend: config.storage.backend as StorageBackend,
-      externalPath: config.storage.external_path || undefined,
-    });
-    storageRegistry.set(projectRoot, storage);
-  }
-  return storage;
+export function initDaemonStorage(projectRoot: string): void {
+  daemonProjectRoot = projectRoot;
 }
 
 /**
- * Close all long-lived Storage instances. Called on daemon shutdown.
+ * Get or create the long-lived Storage instance for the daemon's project.
+ * The instance stays open for the lifetime of the daemon process.
+ *
+ * The daemon is the sole writer — it acquires the storage lock once at startup
+ * and holds it forever. All FileStorage write operations become re-entrant
+ * (increment depth counter) instead of contending for the filesystem lock.
+ *
+ * Requires initDaemonStorage() to have been called first.
+ */
+export async function getOrCreateStorage(): Promise<Storage> {
+  if (!daemonProjectRoot) {
+    throw new Error('Daemon storage not initialized — call initDaemonStorage() first');
+  }
+  if (!daemonStorage) {
+    logger.debug('Initializing daemon storage...');
+    const config = await loadConfig(daemonProjectRoot);
+    daemonStorage = await createStorage(daemonProjectRoot, {
+      backend: config.storage.backend as StorageBackend,
+      externalPath: config.storage.external_path || undefined,
+    });
+    // Acquire storage lock once and hold forever. The daemon is the sole writer
+    // (CLI uses RemoteStorage, agents run in containers with their own data dir).
+    // All FileStorage.withLock() calls become re-entrant within this process.
+    await (daemonStorage as any).lock?.acquire?.();
+    logger.info(`Daemon storage initialized (backend: ${config.storage.backend})`);
+  }
+  return daemonStorage;
+}
+
+/**
+ * Close the long-lived Storage instance. Called on daemon shutdown.
  */
 export async function closeAllStorage(): Promise<void> {
-  for (const [projectRoot, storage] of storageRegistry) {
+  if (daemonStorage) {
+    logger.debug('Closing daemon storage...');
     try {
-      await storage.close();
-    } catch {
-      // Best-effort cleanup on shutdown
+      await daemonStorage.close();
+      logger.debug('Daemon storage closed');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`Error closing daemon storage: ${msg}`);
     }
+    daemonStorage = null;
   }
-  storageRegistry.clear();
 }
 
 /**
  * Open a fresh, short-lived Storage instance for a project.
- * Used by tests to verify data independently of the shared registry.
- * Not used by daemon handlers — they use getOrCreateStorage() instead.
+ * Used by tests to verify data independently of the shared instance,
+ * and by the SSE catchup path. Not used by daemon RPC handlers —
+ * they use getOrCreateStorage() instead.
  */
 export async function openProjectStorage(projectRoot: string): Promise<Storage> {
-  // Pass projectRoot as cwd so config resolution starts from the correct
-  // project directory, not the daemon's own cwd (which may be a different project).
-  const config = loadConfig(projectRoot, { cwd: projectRoot });
+  const config = await loadConfig(projectRoot);
   return createStorage(projectRoot, {
     backend: config.storage.backend as StorageBackend,
     externalPath: config.storage.external_path || undefined,
@@ -107,6 +141,16 @@ export async function handleRpc(
     case 'search': return handleSearch(projectRoot, params);
     case 'diff': return handleDiff(projectRoot, params);
     case 'wait': return handleWait(projectRoot, params);
+    case 'startTask': return handleStartTask(projectRoot, params);
+    case 'unblockTask': return handleUnblockTask(projectRoot, params);
+    case 'acceptTaskPreflight': return handleAcceptTaskPreflight(projectRoot, params);
+    case 'acceptTask': return handleAcceptTask(projectRoot, params);
+    case 'rejectTask': return handleRejectTask(projectRoot, params);
+    case 'closeTask': return handleCloseTask(projectRoot, params);
+    case 'submitTask': return handleSubmitTask(projectRoot, params);
+    case 'resumeTask': return handleResumeTask(projectRoot, params);
+    case 'syncTask': return handleSyncTask(projectRoot, params);
+    case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
     case 'storage': return handleStorageCall(projectRoot, params);
     default: throw new RpcError(404, `Unknown RPC command: ${command}`);
   }
@@ -127,7 +171,7 @@ function collectDescendants(taskId: string, allTasks: Task[]): Set<string> {
 }
 
 export async function handleList(projectRoot: string, params: Record<string, unknown>) {
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const all = params.all === true;
   let tasks = all
     ? await storage.listTasks()
@@ -150,7 +194,7 @@ export async function handleList(projectRoot: string, params: Record<string, unk
 // --- Blocked ---
 
 export async function handleBlocked(projectRoot: string) {
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const tasks = await storage.listTasksWithOptions({ blockedOnly: true });
   const tree = await buildTaskTree(storage, tasks, projectRoot);
   return { tree };
@@ -159,7 +203,7 @@ export async function handleBlocked(projectRoot: string) {
 // --- Active ---
 
 export async function handleActive(projectRoot: string) {
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
   const tree = await buildTaskTree(storage, tasks, projectRoot);
   return { tree };
@@ -172,7 +216,7 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     throw new RpcError(400, 'taskId is required');
   }
 
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const result = await storage.resolveTask(params.taskId);
   if (!result.task) {
     if (result.ambiguousMatches?.length) {
@@ -211,7 +255,7 @@ export async function handleSearch(projectRoot: string, params: Record<string, u
     throw new RpcError(400, 'query is required');
   }
 
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const query = params.query;
   const fuzzy = params.fuzzy === true;
 
@@ -271,7 +315,7 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
     throw new RpcError(400, 'taskId is required');
   }
 
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const result = await storage.resolveTask(params.taskId);
   if (!result.task) {
     throw new RpcError(404, `Task not found: ${params.taskId}`);
@@ -285,7 +329,22 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
 
   const worktreePath = getWorktreePath(projectRoot, task);
   if (!existsSync(worktreePath)) {
-    throw new RpcError(400, `Worktree not found: ${worktreePath}`);
+    // Worktree is gone — try to recover from local or remote branch
+    const branchName = sess.git_branch;
+    const config = await loadConfig(projectRoot);
+    try {
+      const recovery = await recoverMissingWorktreeWithFetch(
+        worktreePath, branchName, config.remote.git_remote, projectRoot,
+      );
+      if (!recovery.recovered) {
+        throw new RpcError(400,
+          `Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+      }
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError(400,
+        `Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   const full = params.full === true;
@@ -297,9 +356,9 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
 
   const parentBranch = task.parent_task_id
     ? await getBranchNameFromId(task.parent_task_id, storage)
-    : getCurrentBranch(projectRoot);
+    : await getCurrentBranch(projectRoot);
 
-  if (branchExists(parentBranch, worktreePath)) {
+  if (await branchExists(parentBranch, worktreePath)) {
     fromRef = parentBranch;
     useTwoDotDiff = false;
   } else if (sess.upstream_merge_sha) {
@@ -324,7 +383,7 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
 
   let output = '';
   if (full) {
-    const diff = getDiffFull(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
+    const diff = await getDiffFull(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
     if (!diff && !notesDiffSection) {
       output = 'No changes.';
     } else {
@@ -334,7 +393,7 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
       output = parts.join('\n\n');
     }
   } else {
-    const stat = getDiffStat(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
+    const stat = await getDiffStat(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
     if (!stat && newNotes.length === 0) {
       output = 'No changes.';
     } else {
@@ -374,7 +433,7 @@ export async function handleWait(projectRoot: string, params: Record<string, unk
   );
 
   // Resolve task and capture initial state
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const resolveResult = await storage.resolveTask(params.taskId);
   if (!resolveResult.task) {
     throw new RpcError(404, `Task not found: ${params.taskId}`);
@@ -445,6 +504,172 @@ export async function handleWait(projectRoot: string, params: Record<string, unk
   };
 }
 
+// --- Start Task ---
+
+export async function handleStartTask(projectRoot: string, params: Record<string, unknown>) {
+  const startParams: StartTaskParams = {
+    taskId: params.taskId as string,
+    modelOverride: params.modelOverride as string | undefined,
+    agentId: params.agentId as string | undefined,
+    forceLocal: params.forceLocal as boolean | undefined,
+    retargetOrphan: params.retargetOrphan as boolean | undefined,
+  };
+
+  if (!startParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  logger.info(`Starting task ${startParams.taskId.substring(0, 8)}`);
+  return launchTask(projectRoot, startParams);
+}
+
+// --- Unblock Task ---
+
+export async function handleUnblockTask(projectRoot: string, params: Record<string, unknown>) {
+  const unblockParams: UnblockTaskParams = {
+    taskId: params.taskId as string,
+    message: params.message as string,
+    modelOverride: params.modelOverride as string | undefined,
+    approvedFiles: params.approvedFiles as string[] | undefined,
+    retargetOrphan: params.retargetOrphan as boolean | undefined,
+    notesInEditor: params.notesInEditor as boolean | undefined,
+  };
+
+  if (!unblockParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (!unblockParams.message) {
+    throw new RpcError(400, 'message is required');
+  }
+
+  logger.info(`Unblocking task ${unblockParams.taskId.substring(0, 8)}`);
+  return launchUnblockTask(projectRoot, unblockParams);
+}
+
+// --- Accept Task Preflight ---
+
+export async function handleAcceptTaskPreflight(projectRoot: string, params: Record<string, unknown>) {
+  const preflightParams: AcceptTaskPreflightParams = {
+    taskId: params.taskId as string,
+    approvedFiles: params.approvedFiles as string[] | undefined,
+    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+  };
+
+  if (!preflightParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  return acceptTaskPreflight(projectRoot, preflightParams);
+}
+
+// --- Accept Task (Full) ---
+
+export async function handleAcceptTask(projectRoot: string, params: Record<string, unknown>) {
+  const acceptParams: AcceptTaskParams = {
+    taskId: params.taskId as string,
+    reason: params.reason as string | undefined,
+    approvedFiles: params.approvedFiles as string[] | undefined,
+    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+  };
+
+  if (!acceptParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  return acceptTask(projectRoot, acceptParams);
+}
+
+// --- Reject Task ---
+
+export async function handleRejectTask(projectRoot: string, params: Record<string, unknown>) {
+  const rejectParams: RejectTaskParams = {
+    taskId: params.taskId as string,
+    reason: params.reason as string,
+    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+  };
+
+  if (!rejectParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (!rejectParams.reason) {
+    throw new RpcError(400, 'reason is required');
+  }
+
+  return rejectTask(projectRoot, rejectParams);
+}
+
+// --- Close Task ---
+
+export async function handleCloseTask(projectRoot: string, params: Record<string, unknown>) {
+  const closeParams: CloseTaskParams = {
+    taskId: params.taskId as string,
+    reason: params.reason as string,
+    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+  };
+
+  if (!closeParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (!closeParams.reason) {
+    throw new RpcError(400, 'reason is required');
+  }
+
+  return closeTask(projectRoot, closeParams);
+}
+
+// --- Submit Task ---
+
+export async function handleSubmitTask(projectRoot: string, params: Record<string, unknown>) {
+  const submitParams: SubmitTaskParams = {
+    taskId: params.taskId as string,
+  };
+
+  if (!submitParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  return submitTask(projectRoot, submitParams);
+}
+
+// --- Resume Task ---
+
+export async function handleResumeTask(projectRoot: string, params: Record<string, unknown>) {
+  const resumeParams: ResumeTaskParams = {
+    taskId: params.taskId as string,
+    modelOverride: params.modelOverride as string | undefined,
+  };
+
+  if (!resumeParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  logger.info(`Resuming task ${resumeParams.taskId.substring(0, 8)}`);
+  return resumeTask(projectRoot, resumeParams);
+}
+
+// --- Sync Task ---
+
+export async function handleSyncTask(projectRoot: string, params: Record<string, unknown>) {
+  const syncParams: SyncTaskParams = {
+    taskId: params.taskId as string,
+  };
+
+  if (!syncParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+
+  return syncTask(projectRoot, syncParams);
+}
+
+// --- Get Daemon MCP Config ---
+
+export async function handleGetDaemonMcpConfig(projectRoot: string, params: Record<string, unknown>) {
+  const name = (params.name as string) || `builder-${Date.now()}`;
+  const config = await loadConfig(projectRoot);
+  const configPath = await writeDaemonMcpConfig(projectRoot, name, config.data.path);
+  return { configPath };
+}
+
 // --- Storage proxy ---
 
 /**
@@ -476,6 +701,8 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   updateTaskBranchedFromSha: (s, a) => s.updateTaskBranchedFromSha(a.taskId as string, a.sha as string),
   updateTaskModel: (s, a) => s.updateTaskModel(a.taskId as string, a.model as string),
   updateTaskType: (s, a) => s.updateTaskType(a.taskId as string, a.type as string),
+  resetTaskPendingSync: (s, a) => s.resetTaskPendingSync(a.taskId as string),
+  incrementTaskPendingSync: (s, a) => s.incrementTaskPendingSync(a.taskId as string),
   closeTask: (s, a) => s.closeTask(a.taskId as string, a.closeReason as string, a.actor as any),
   reopenTask: (s, a) => s.reopenTask(a.taskId as string, a.actor as any),
   updateTaskMetadata: (s, a) => s.updateTaskMetadata(a.taskId as string, a.key as string, a.value as string),
@@ -568,7 +795,7 @@ export async function handleStorageCall(projectRoot: string, params: Record<stri
     throw new RpcError(404, `Unknown storage method: ${method}`);
   }
 
-  const storage = await getOrCreateStorage(projectRoot);
+  const storage = await getOrCreateStorage();
   const result = handler(storage, args);
   // Handle both sync (getStoragePath, getTaskDir) and async methods
   return result instanceof Promise ? await result : result;

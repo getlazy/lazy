@@ -2,13 +2,16 @@ import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
-import type { AgentResponse, ModelName, TokenUsage } from '../types';
+import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
+import type { OllamaConfig } from '../config/types';
 import { logger } from '../utils/logger';
+import { getEffectiveModel } from '../utils/ollama';
 import { spawn, spawnSync } from '../utils/spawn';
+import { getHome } from '../utils/home';
 import { isValidToolchain, getToolchainDockerfileContent } from '../docker/toolchains';
 import type { ToolchainName } from '../docker/toolchains';
 
@@ -27,9 +30,7 @@ export interface SandboxConfig {
   sandboxPath: string;
 }
 
-export interface DockerRunOptions {
-  dockerAgentNoNetwork?: boolean;
-}
+
 
 const IMAGE_NAME = 'lazy-runner';
 const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
@@ -46,22 +47,13 @@ const _packaging = new ClaudeCodePackaging();
  */
 const DEFAULT_DOCKERFILE = getToolchainDockerfileContent('base');
 
-/**
- * Map model names (universal monikers or legacy aliases) to Claude model IDs.
- * Delegates to ClaudeCodeAgent.resolveModelId().
- */
-export function getModelId(modelName: ModelName): string {
-  return _agent.resolveModelId(modelName);
-}
-
 export function checkDocker(binary: string = 'docker'): void {
   logger.debug(`Checking ${binary}...`);
 
   const result = spawnSync([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
   if (result.exitCode !== 0) {
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
-    logger.error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
-    process.exit(1);
+    throw new Error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
   }
 
   logger.debug(`${binary} is running ✓`);
@@ -79,8 +71,8 @@ function getLazyRoot(): string {
  * Resolve the custom Dockerfile path from config.
  * Returns the absolute path if configured and the file exists, null otherwise.
  */
-function resolveCustomDockerfile(lazyRoot: string): string | null {
-  const config = loadConfig(lazyRoot);
+async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
+  const config = await loadConfig(lazyRoot);
   const configPath = config.docker.dockerfile;
   if (!configPath) return null;
 
@@ -106,14 +98,14 @@ function resolveCustomDockerfile(lazyRoot: string): string | null {
  * project, not for agent containers. Use `lazy init` to create a Dockerfile.lazy
  * based on the project's Dockerfile if needed.
  */
-function getDockerfileContent(lazyRoot: string): { content: string; isCustom: boolean; toolchain?: string } {
-  const customPath = resolveCustomDockerfile(lazyRoot);
+async function getDockerfileContent(lazyRoot: string): Promise<{ content: string; isCustom: boolean; toolchain?: string }> {
+  const customPath = await resolveCustomDockerfile(lazyRoot);
   if (customPath) {
     return { content: readFileSync(customPath, 'utf-8'), isCustom: true };
   }
 
   // Check for toolchain config
-  const config = loadConfig(lazyRoot);
+  const config = await loadConfig(lazyRoot);
   const toolchainName = config.docker.toolchain;
   if (toolchainName && isValidToolchain(toolchainName)) {
     return {
@@ -126,8 +118,8 @@ function getDockerfileContent(lazyRoot: string): { content: string; isCustom: bo
   return { content: DEFAULT_DOCKERFILE, isCustom: false };
 }
 
-export function calculateDockerfileHash(lazyRoot: string): string {
-  const { content } = getDockerfileContent(lazyRoot);
+export async function calculateDockerfileHash(lazyRoot: string): Promise<string> {
+  const { content } = await getDockerfileContent(lazyRoot);
   return createHash('sha256').update(content).digest('hex');
 }
 
@@ -136,8 +128,8 @@ export function calculateDockerfileHash(lazyRoot: string): string {
  * Default behavior uses 'lazy-runner'. Custom Dockerfiles use 'lazy-custom-{hash}'.
  * Toolchain Dockerfiles use 'lazy-{toolchain}' to avoid conflicts.
  */
-export function resolveImageName(lazyRoot: string): string {
-  const { isCustom, content, toolchain } = getDockerfileContent(lazyRoot);
+export async function resolveImageName(lazyRoot: string): Promise<string> {
+  const { isCustom, content, toolchain } = await getDockerfileContent(lazyRoot);
 
   if (isCustom) {
     const hash = createHash('sha256').update(content).digest('hex').substring(0, 12);
@@ -168,7 +160,7 @@ function getImageDockerfileHash(imageName: string, binary: string = 'docker'): s
 async function buildImage(lazyRoot: string, imageName: string, currentHash: string, binary: string = 'docker'): Promise<void> {
   logger.info(`Building ${imageName} container image...`);
 
-  const customPath = resolveCustomDockerfile(lazyRoot);
+  const customPath = await resolveCustomDockerfile(lazyRoot);
 
   let buildCwd: string;
   let dockerfileName: string;
@@ -181,7 +173,7 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
   } else {
     // Write the resolved Dockerfile (toolchain or default) to a temp directory for the build.
     // Never use the project's own Dockerfile — it's for the project, not agents.
-    const { content, toolchain } = getDockerfileContent(lazyRoot);
+    const { content, toolchain } = await getDockerfileContent(lazyRoot);
     const tempDir = join(tmpdir(), 'lazy-docker-build');
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(join(tempDir, 'Dockerfile'), content);
@@ -229,8 +221,8 @@ export async function ensureImage(binary: string = 'docker'): Promise<string> {
   checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
-  const imageName = resolveImageName(lazyRoot);
-  const currentHash = calculateDockerfileHash(lazyRoot);
+  const imageName = await resolveImageName(lazyRoot);
+  const currentHash = await calculateDockerfileHash(lazyRoot);
   const imageHash = getImageDockerfileHash(imageName, binary);
 
   if (imageHash === null) {
@@ -337,7 +329,7 @@ function extractEmbeddedAgentBinary(destDir: string): string | null {
  * Agent binaries are per-user operational state, not per-project.
  */
 function getUserBinDir(): string {
-  return join(homedir(), '.lazy', 'bin');
+  return join(getHome(), '.lazy', 'bin');
 }
 
 /**
@@ -474,21 +466,35 @@ export function hasAuthEnv(): boolean {
   return _agent.hasAuthEnv();
 }
 
+export type { OllamaConfig } from '../config/types';
+
 /**
  * Get auth environment variables.
- * Delegates to ClaudeCodeAgent.getAuthEnv().
+ * When Ollama is configured, returns env vars for Ollama instead of Anthropic API auth.
+ * Delegates to ClaudeCodeAgent.getAuthEnvVars() for standard auth.
  */
-export function getAuthEnv(): { key: string; value: string } {
-  return _agent.getAuthEnv();
+export function getAuthEnvVars(ollamaConfig?: OllamaConfig): Array<{ key: string; value: string }> {
+  if (ollamaConfig?.enabled) {
+    return [
+      { key: 'ANTHROPIC_BASE_URL', value: ollamaConfig.endpoint },
+      { key: 'ANTHROPIC_AUTH_TOKEN', value: 'ollama' },
+      { key: 'ANTHROPIC_API_KEY', value: 'ollama' },
+      { key: 'DISABLE_TELEMETRY', value: '1' },
+      { key: 'DISABLE_ERROR_REPORTING', value: '1' },
+      { key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', value: '1' },
+    ];
+  }
+  return _agent.getAuthEnvVars();
 }
 
-function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', options?: DockerRunOptions): string[] {
-  const auth = getAuthEnv();
+function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', ollamaConfig?: OllamaConfig): string[] {
+  const authEnvVars = getAuthEnvVars(ollamaConfig);
   const repoRoot = getLazyRoot();
 
   return [
     binary, 'run', '--rm', '--init',
-    ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
+    // Allow container to reach host services (daemon MCP, Ollama, etc.)
+    '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only so agent can read source but not modify the main tree.
     // The worktree and .git dir are mounted read-write on top (more specific mount wins).
     '-v', `${repoRoot}:${repoRoot}:ro`,
@@ -499,7 +505,7 @@ function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBina
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-    '-e', `${auth.key}=${auth.value}`,
+    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
     imageName,
     ...claudeArgs,
@@ -513,12 +519,14 @@ export async function runClaude(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
-  dockerOptions?: DockerRunOptions,
+  ollamaConfig?: OllamaConfig,
 ): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
+
+  const effectiveModel = getEffectiveModel(model, ollamaConfig);
 
   const claudeArgs = [
     'claude', '-p', prompt,
@@ -526,12 +534,12 @@ export async function runClaude(
     '--dangerously-skip-permissions',
   ];
 
-  if (model) {
-    claudeArgs.push('--model', model);
+  if (effectiveModel) {
+    claudeArgs.push('--model', effectiveModel);
   }
 
   logger.debug('Setting up sandbox...');
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, dockerOptions);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -579,11 +587,14 @@ export async function resumeClaude(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
+  ollamaConfig?: OllamaConfig,
 ): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
+
+  const effectiveModel = getEffectiveModel(model, ollamaConfig);
 
   const claudeArgs = [
     'claude', '-p', prompt,
@@ -592,14 +603,14 @@ export async function resumeClaude(
     '--dangerously-skip-permissions',
   ];
 
-  if (model) {
-    claudeArgs.push('--model', model);
+  if (effectiveModel) {
+    claudeArgs.push('--model', effectiveModel);
   }
 
   logger.info('Resuming Claude Code session...');
   logger.debug(`Claude session ID: ${claudeSessionId}`);
 
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -660,15 +671,16 @@ function buildDockerArgsAsync(
   agentBinaryPath: string,
   imageName: string,
   binary: string = 'docker',
-  options?: DockerRunOptions,
+  ollamaConfig?: OllamaConfig,
 ): string[] {
-  const auth = getAuthEnv();
+  const authEnvVars = getAuthEnvVars(ollamaConfig);
   const repoRoot = getLazyRoot();
 
   return [
     binary, 'run', '-d', '--init',
-    ...(options?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
+    // Allow container to reach host services (daemon MCP, Ollama, etc.)
+    '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only so agent can read source but not modify the main tree.
     // The worktree and .git dir are mounted read-write on top (more specific mount wins).
     '-v', `${repoRoot}:${repoRoot}:ro`,
@@ -678,7 +690,7 @@ function buildDockerArgsAsync(
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-    '-e', `${auth.key}=${auth.value}`,
+    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
     imageName,
     ...claudeArgs,
@@ -696,11 +708,14 @@ export async function launchClaudeAsync(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
+  ollamaConfig?: OllamaConfig,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
+
+  const effectiveModel = getEffectiveModel(model, ollamaConfig);
 
   const claudeArgs = [
     'claude', '-p', prompt,
@@ -708,12 +723,12 @@ export async function launchClaudeAsync(
     '--dangerously-skip-permissions',
   ];
 
-  if (model) {
-    claudeArgs.push('--model', model);
+  if (effectiveModel) {
+    claudeArgs.push('--model', effectiveModel);
   }
 
   logger.debug('Setting up sandbox for async launch...');
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary);
+  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -747,11 +762,14 @@ export async function resumeClaudeAsync(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
+  ollamaConfig?: OllamaConfig,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
+
+  const effectiveModel = getEffectiveModel(model, ollamaConfig);
 
   const claudeArgs = [
     'claude', '-p', prompt,
@@ -760,14 +778,14 @@ export async function resumeClaudeAsync(
     '--dangerously-skip-permissions',
   ];
 
-  if (model) {
-    claudeArgs.push('--model', model);
+  if (effectiveModel) {
+    claudeArgs.push('--model', effectiveModel);
   }
 
   logger.info('Launching Claude Code resume (async)...');
   logger.debug(`Claude session ID: ${claudeSessionId}`);
 
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary);
+  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -963,7 +981,11 @@ function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string)
   return [
     '#!/bin/sh',
     '# PID 1 wrapper — restarts supervisor between turns to release memory.',
+    '# Between turns, kills orphaned processes (MCP servers, node, bash, etc.)',
+    '# that survived the supervisor exit. tini (--init) reaps zombies but does',
+    '# not kill living orphans — without this they accumulate across turns.',
     'child_pid=""',
+    'my_pid=$$',
     'trap \'[ -n "$child_pid" ] && kill $child_pid 2>/dev/null; wait; exit\' TERM INT',
     'while true; do',
     `  lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
@@ -971,6 +993,18 @@ function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string)
     '  wait $child_pid',
     '  rc=$?',
     '  child_pid=""',
+    '  # Kill orphaned processes from the finished turn.',
+    '  for p in /proc/[0-9]*/status; do',
+    '    pid=${p#/proc/}; pid=${pid%/status}',
+    '    [ "$pid" = "1" ] || [ "$pid" = "$my_pid" ] && continue',
+    '    kill "$pid" 2>/dev/null',
+    '  done',
+    '  sleep 1',
+    '  for p in /proc/[0-9]*/status; do',
+    '    pid=${p#/proc/}; pid=${pid%/status}',
+    '    [ "$pid" = "1" ] || [ "$pid" = "$my_pid" ] && continue',
+    '    kill -9 "$pid" 2>/dev/null',
+    '  done',
     '  # 0 = turn done, restart. 42 = stop command, exit. Other = error, exit.',
     '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then exit $rc; fi',
     '  if [ $rc -eq 42 ]; then exit 0; fi',
@@ -992,22 +1026,28 @@ export async function launchSupervisorAsync(
   protocolDir: string,
   debug: boolean = false,
   binary: string = 'docker',
-  dockerOptions?: DockerRunOptions,
+  daemonConfigPath?: string,
+  ollamaConfig?: OllamaConfig,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
-  const auth = getAuthEnv();
+  const authEnvVars = getAuthEnvVars(ollamaConfig);
   const repoRoot = getLazyRoot();
 
   const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);
 
+  // Daemon MCP config is provided by the caller (daemon task launcher).
+  // The daemon always provides this when launching containers — it knows
+  // its own webPort and token, so there's no fallback or race condition.
+
   const args = [
     binary, 'run', '-d', '--init',
-    ...(dockerOptions?.dockerAgentNoNetwork ? ['--network', 'none'] : []),
     '--name', containerName,
+    // Allow container to reach host services (daemon MCP, Ollama, etc.)
+    '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only; worktree, .git, and protocol dir are mounted read-write on top.
     '-v', `${repoRoot}:${repoRoot}:ro`,
     '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
@@ -1017,8 +1057,13 @@ export async function launchSupervisorAsync(
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-    '-e', `${auth.key}=${auth.value}`,
+    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+    // Pass daemon config to container for MCP proxy mode
+    ...(daemonConfigPath ? [
+      '-v', `${daemonConfigPath}:${daemonConfigPath}:ro`,
+      '-e', `LAZY_DAEMON_CONFIG=${daemonConfigPath}`,
+    ] : []),
     imageName,
     'sh', '-c', wrapperScript,
   ];

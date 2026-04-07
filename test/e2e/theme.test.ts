@@ -99,7 +99,7 @@ describe('theme', () => {
 
       expect(theme.taskId('abc12345')).toBe('abc12345');
       expect(theme.status('working')).toBe('working');
-      expect(theme.model('opus')).toBe('opus');
+      expect(theme.model('claude-opus-4-6')).toBe('claude-opus-4-6');
       expect(theme.commitSha('82994b6')).toBe('82994b6');
       expect(theme.command('lazy start')).toBe('lazy start');
       expect(theme.header('ID')).toBe('ID');

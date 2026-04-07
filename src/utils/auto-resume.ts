@@ -7,12 +7,14 @@
  */
 
 import { join } from 'path';
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readdirSync, readFileSync, statSync, rmSync } from 'fs';
-import { homedir } from 'os';
+import { stat, mkdir, copyFile, writeFile, readdir, readFile, rm } from 'fs/promises';
+import { getHome } from './home';
+import { pathExists, dirExists } from './fs';
 import type { Storage } from '../storage';
-import type { Task, Session, ModelName } from '../types';
-import { getAuthEnv, getModelId } from '../capture/claude';
+import type { Task, Session } from '../types';
+import { getAuthEnvVars } from '../capture/claude';
 import type { SandboxConfig } from '../capture/claude';
+import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
@@ -22,6 +24,8 @@ import { logger } from './logger';
 import { getDataDir } from '../cli/init';
 import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { getCurrentBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
+import { writeDaemonMcpConfig } from '../daemon/task-launcher';
+import { hasDaemonContext } from '../daemon/context';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -58,27 +62,37 @@ function buildResumePrompt(goal: string): string {
 /**
  * Search the sandbox .claude directory for a Claude session ID.
  */
-function findClaudeSessionId(sandboxPath: string): string | null {
+async function findClaudeSessionId(sandboxPath: string): Promise<string | null> {
   const claudeDir = join(sandboxPath, '.claude');
-  if (!existsSync(claudeDir)) return null;
+  if (!await pathExists(claudeDir)) {
+    return null;
+  }
 
   try {
     const projectsDir = join(claudeDir, 'projects');
-    if (!existsSync(projectsDir)) return null;
+    if (!await pathExists(projectsDir)) {
+      return null;
+    }
 
-    const projectDirs = readdirSync(projectsDir).filter(d => {
+    const allDirs = await readdir(projectsDir);
+    const projectDirs: string[] = [];
+    for (const d of allDirs) {
       try {
-        return readdirSync(join(projectsDir, d)).length > 0;
-      } catch { return false; }
-    });
+        const contents = await readdir(join(projectsDir, d));
+        if (contents.length > 0) {
+          projectDirs.push(d);
+        }
+      } catch { /* skip unreadable dirs */ }
+    }
 
     for (const projDir of projectDirs) {
       const projPath = join(projectsDir, projDir);
-      const files = readdirSync(projPath).filter(f => f.endsWith('.json'));
+      const allFiles = await readdir(projPath);
+      const files = allFiles.filter(f => f.endsWith('.json'));
 
       for (const file of files) {
         try {
-          const content = readFileSync(join(projPath, file), 'utf-8');
+          const content = await readFile(join(projPath, file), 'utf-8');
           const data = JSON.parse(content);
           if (data.sessionId) return data.sessionId;
           if (data.session_id) return data.session_id;
@@ -112,12 +126,12 @@ export async function autoResumeTask(
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
 
   // Pre-flight checks
-  if (!existsSync(worktreePath)) {
+  if (!await pathExists(worktreePath)) {
     logger.debug(`Auto-resume ${taskShortId}: worktree not found, skipping`);
     return false;
   }
 
-  const runner = createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot);
 
   try {
     runner.checkAvailability();
@@ -128,7 +142,7 @@ export async function autoResumeTask(
 
   // Acquire worktree lock
   try {
-    acquireLock(worktreePath, 'lazy auto-resume');
+    await acquireLock(worktreePath, 'lazy auto-resume');
   } catch {
     logger.debug(`Auto-resume ${taskShortId}: could not acquire worktree lock, skipping`);
     return false;
@@ -139,36 +153,40 @@ export async function autoResumeTask(
   try {
     // Load config from the worktree — the branch may have settings (e.g., permissions)
     // that aren't on the project root's lazy.toml yet.
-    const config = loadConfig(lazyRoot, { cwd: worktreePath });
+    const config = await loadConfig(lazyRoot, { cwd: worktreePath });
 
     // Ensure sandbox exists
     const sandboxPath = join(worktreePath, SANDBOX_DIR);
     const claudeDir = join(sandboxPath, '.claude');
-    mkdirSync(claudeDir, { recursive: true });
+    await mkdir(claudeDir, { recursive: true });
 
     // Docker creates .gitconfig as a directory if the bind mount source doesn't exist.
     // Remove the stale directory before copying the file.
-    const hostGitconfig = join(homedir(), '.gitconfig');
+    const hostGitconfig = join(getHome(), '.gitconfig');
     const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-    if (existsSync(sandboxGitconfig) && statSync(sandboxGitconfig).isDirectory()) {
-      rmSync(sandboxGitconfig, { recursive: true });
+    if (await dirExists(sandboxGitconfig)) {
+      await rm(sandboxGitconfig, { recursive: true });
     }
-    if (existsSync(hostGitconfig)) {
-      copyFileSync(hostGitconfig, sandboxGitconfig);
+
+    if (await pathExists(hostGitconfig)) {
+      await copyFile(hostGitconfig, sandboxGitconfig);
     } else {
-      writeFileSync(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
+      await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
     }
 
     const sandbox: SandboxConfig = { worktreePath, sandboxPath };
 
-    // Determine model
-    const modelName: ModelName = task.model ?? config.models.default;
-    const modelId = getModelId(modelName);
+    // When Ollama is enabled for Claude Code, always use the Ollama model — task model
+    // names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
+      ? config.ollama.model
+      : (task.model ?? config.models.default);
+    const modelId = modelName;
 
     // Try to find Claude session ID
     let claudeSessionId = session.agent_session_id;
     if (!claudeSessionId) {
-      claudeSessionId = findClaudeSessionId(sandboxPath);
+      claudeSessionId = await findClaudeSessionId(sandboxPath);
       if (claudeSessionId) {
         await storage.updateSessionClaudeId(session.id, claudeSessionId);
       }
@@ -179,7 +197,10 @@ export async function autoResumeTask(
 
     // --- Persist state BEFORE launching container ---
 
-    // Record synthetic human turn for the auto-resume
+    // Record synthetic human turn for the auto-resume.
+    // NOT autoTriggered: resume continues an interrupted turn — it's the same
+    // logical turn, not a new auto-react trigger. Does not count against the
+    // auto-turn budget.
     const nextSeq = await storage.getNextTurnSequence(session.id);
     await storage.createTurn({
       sessionId: session.id,
@@ -207,7 +228,7 @@ export async function autoResumeTask(
     // changes from a crashed turn — git merge on a dirty worktree will fail
     // or create confusing state. In that case, skip the merge and let the
     // agent deal with the uncommitted changes first.
-    const worktreeDirty = hasUncommittedChanges(worktreePath);
+    const worktreeDirty = await hasUncommittedChanges(worktreePath);
     let parentBranch: string | undefined;
     let syncBeforeWork = false;
 
@@ -218,7 +239,7 @@ export async function autoResumeTask(
         if (task.parent_task_id) {
           parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
         } else {
-          parentBranch = getTaskTargetBranch(task, lazyRoot) ?? getCurrentBranch(lazyRoot);
+          parentBranch = await getTaskTargetBranch(task, lazyRoot) ?? await getCurrentBranch(lazyRoot);
         }
         syncBeforeWork = true;
       } catch (err) {
@@ -245,6 +266,12 @@ export async function autoResumeTask(
     };
     writeCommand(protoDir, unblockCommand);
 
+    // Generate daemon MCP config so the supervisor can provide MCP tools
+    let daemonConfigPath: string | undefined;
+    if (runner.usesSandbox() && hasDaemonContext()) {
+      daemonConfigPath = await writeDaemonMcpConfig(lazyRoot, containerName, config.data.path);
+    }
+
     // Check if supervisor is already running
     if (runner.isRunning(containerName)) {
       logger.debug(`Auto-resume ${taskShortId}: supervisor already running, command written`);
@@ -252,7 +279,7 @@ export async function autoResumeTask(
       runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath);
       } catch (err) {
         logger.warn(`Auto-resume ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         await storage.updateTaskStatus(task.id, 'interrupted', 'system');
@@ -263,6 +290,15 @@ export async function autoResumeTask(
     // Store container name and update interaction timestamp
     await storage.updateSessionContainerName(session.id, containerName);
     await storage.updateSessionInteraction(session.id, 0);
+
+    // Create a detached tmux session for `lazy watch`
+    const tmuxSessName = tmuxSessionName(taskShortId);
+    if (runner.usesSandbox()) {
+      createTmuxWatchSession(tmuxSessName, ['docker', 'logs', '-f', containerName]);
+    } else {
+      const logFile = join(getHome(), '.lazy', 'logs', `${containerName}.log`);
+      createTmuxWatchSession(tmuxSessName, ['tail', '-f', logFile]);
+    }
 
     logger.info(`Auto-resumed task ${taskShortId} (consecutive interruptions: ${session.consecutive_interruptions})`);
     return true;
@@ -276,6 +312,6 @@ export async function autoResumeTask(
     }
     return false;
   } finally {
-    removeLock(worktreePath);
+    await removeLock(worktreePath);
   }
 }

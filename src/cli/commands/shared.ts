@@ -6,31 +6,29 @@
 
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, getRemoteDefaultBranch, getDiffStat, getTaskTargetBranch } from '../../git/operations';
-import { getModelId } from '../../capture/claude';
+import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, getRemoteDefaultBranch, getDiffStat, getTaskTargetBranch } from '../../git/operations';
 import { createRunner } from '../../runner';
-import { hasResponse, readCommand, protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
+import { hasResponse, readCommand, protocolDir as getProtocolDir } from '../../protocol';
 import type { StartCommand, UnblockCommand } from '../../protocol';
-import { reconcileTasks } from '../../utils/reconcile';
+
 import { loadConfig } from '../../config/loader';
-import { checkLock, acquireLock, removeLock } from '../../utils/lock';
-import { openEditor, promptChoice, readStdin, removeRecoveryFile, requireTTY } from '../editor';
+import { openEditor, readStdin, removeRecoveryFile, requireTTY } from '../editor';
 import { buildEditorContentWithDiff, buildFreeformEditorContentWithNotes, extractFeedbackFromDiff, stripCommentLines, getTurnDiff } from '../../utils/diff';
 import { logger } from '../../utils/logger';
 import type { Storage } from '../../storage';
-import { requireStorage, shortId, displayId, taskRef, getBranchNameFromId } from '../helpers';
+import { requireStorage, shortId, displayId, getBranchNameFromId } from '../helpers';
 import { isTerminalStatus } from '../../types';
-import type { Task, Turn, Comment, ModelName, FileViolation } from '../../types';
+import type { Task, Turn, Comment } from '../../types';
 import { createDriver, type RemoteComment } from '../../remote';
-import type { SandboxConfig } from '../../capture/claude';
 
 import { commandAccept } from './accept';
 import { theme, dim } from '../theme';
 import { getActor } from '../../constants';
-import { isFeatureEnabled } from '../../utils/features';
+import { tmuxSessionName, killTmuxWatchSession } from '../../terminal';
 import { reparentChildren } from '../orphan';
-import { readPendingProposals, updateProposalStatus, type Proposal } from './propose';
+import { readPendingProposals } from './propose';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
+import { queryUnblockTask } from '../../daemon/rpc-fallback';
 
 import lazyToolInstructions from '../../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsText from '../../prompts/system-instructions.md' with { type: 'text' };
@@ -192,11 +190,11 @@ export function buildPromptWithInstructions(userPrompt: string, goal: string, pa
  * Remove a task's worktree only (preserve the branch for recovery).
  * Falls back to manual cleanup if git worktree remove fails.
  */
-export function cleanupWorktree(worktreePath: string, root: string): void {
+export async function cleanupWorktree(worktreePath: string, root: string): Promise<void> {
   if (existsSync(worktreePath)) {
     console.log('Removing worktree...');
     try {
-      removeWorktree(worktreePath, root);
+      await removeWorktree(worktreePath, root);
     } catch {
       // Worktree may be corrupted (e.g. .git is a dir instead of file).
       // Fall back to manual removal + prune.
@@ -211,10 +209,10 @@ export function cleanupWorktree(worktreePath: string, root: string): void {
  * Remove a task's worktree and delete its branch.
  * Falls back to manual cleanup if git worktree remove fails.
  */
-export function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): void {
-  cleanupWorktree(worktreePath, root);
+export async function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): Promise<void> {
+  await cleanupWorktree(worktreePath, root);
   try {
-    deleteBranch(branch, root);
+    await deleteBranch(branch, root);
   } catch {
     // Branch may already be gone
   }
@@ -231,20 +229,22 @@ export async function cleanupTaskContainer(
   tRef: string,
   lazyRoot: string,
 ): Promise<void> {
-  const runner = createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot);
   const runName = session.container_name ?? runner.runNameForTask(tRef);
   runner.removeRun(runName);
   if (session.container_name) {
     await storage.updateSessionContainerName(session.id, null);
   }
+  // Clean up the tmux watch session if one exists
+  killTmuxWatchSession(tmuxSessionName(tRef));
 }
 
 /**
  * Get the number of dirty (modified/untracked) files in a worktree.
  * Returns 0 if the git command fails (e.g. worktree is gone).
  */
-function getDirtyFileCount(worktreePath: string): number {
-  const result = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
+async function getDirtyFileCount(worktreePath: string): Promise<number> {
+  const result = await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], {
     cwd: worktreePath,
     stderr: 'ignore',
     timeout: 5000,
@@ -280,19 +280,19 @@ function monitorWorktreeProgress(
   let stopped = false;
 
   // Try to get the initial HEAD SHA; if worktree isn't ready, we'll pick it up later
-  try {
-    lastSeenSha = getCurrentSha(worktreePath);
-  } catch {
+  getCurrentSha(worktreePath).then(sha => {
+    lastSeenSha = sha;
+  }).catch(() => {
     // Worktree may not exist yet, will try again on next tick
-  }
+  });
 
-  const timer = setInterval(() => {
+  const timer = setInterval(async () => {
     if (stopped) return;
 
     try {
       // Check for new commits
       if (lastSeenSha) {
-        const newCommits = getNewCommits(lastSeenSha, worktreePath);
+        const newCommits = await getNewCommits(lastSeenSha, worktreePath);
         // Print in chronological order (getNewCommits returns newest first)
         for (let i = newCommits.length - 1; i >= 0; i--) {
           const commit = newCommits[i];
@@ -304,14 +304,14 @@ function monitorWorktreeProgress(
       } else {
         // Try to initialize lastSeenSha if we couldn't before
         try {
-          lastSeenSha = getCurrentSha(worktreePath);
+          lastSeenSha = await getCurrentSha(worktreePath);
         } catch {
           // Still not ready
         }
       }
 
       // Check for working file count changes
-      const dirtyCount = getDirtyFileCount(worktreePath);
+      const dirtyCount = await getDirtyFileCount(worktreePath);
       if (dirtyCount !== lastDirtyCount) {
         if (dirtyCount > 0) {
           console.log(`${ts()} [${theme.taskId(taskId)}] Working: ${dirtyCount} file${dirtyCount === 1 ? '' : 's'} changed`);
@@ -374,7 +374,7 @@ export async function followContainer(
 
   // Stream run logs in background, parsing supervisor output into
   // formatted activity lines instead of raw output.
-  const runner = existingRunner ?? createRunner(lazyRoot);
+  const runner = existingRunner ?? await createRunner(lazyRoot);
   let followHandle: ReturnType<typeof runner.followOutput> = null;
   try {
     followHandle = runner.followOutput(containerName, turnStartedAt);
@@ -455,17 +455,7 @@ export async function followContainer(
     }
   }
 
-  logger.debug(`Turn follow complete (response: ${turnCompleted}), running reconciliation...`);
-
-  // Acquire worktree lock before reconciliation — reconcileTask() skips
-  // tasks with worktree locks held by other processes, but allows the
-  // current process (re-entrant via PID check).
-  acquireLock(worktreePath, 'lazy follow');
-  try {
-    await reconcileTasks(storage, lazyRoot);
-  } finally {
-    removeLock(worktreePath);
-  }
+  logger.debug(`Turn follow complete (response: ${turnCompleted})`);
 
   return turnCompleted ? 0 : 1;
 }
@@ -491,7 +481,7 @@ export async function syncTaskFromRemote(
 ): Promise<void> {
   let config;
   try {
-    config = loadConfig(root);
+    config = await loadConfig(root);
   } catch {
     return;
   }
@@ -671,11 +661,11 @@ export async function showTaskContext(
   } else {
     // Use the branch this task was created from, falling back to remote default branch
     const taskData = await storage.getTask(taskId);
-    targetBranch = (taskData && getTaskTargetBranch(taskData, root)) ?? getRemoteDefaultBranch(root);
+    targetBranch = (taskData && await getTaskTargetBranch(taskData, root)) ?? (await getRemoteDefaultBranch(root));
   }
 
   try {
-    const commits = getBranchCommitMessages(gitBranch, targetBranch, root);
+    const commits = await getBranchCommitMessages(gitBranch, targetBranch, root);
     if (commits.length > 0) {
       const recent = commits.slice(0, 5);
       console.log(`\nRecent commits (${commits.length} total):`);
@@ -693,7 +683,7 @@ export async function showTaskContext(
   // Show condensed diff summary
   if (existsSync(worktreePath)) {
     try {
-      const stat = getDiffStat(targetBranch, 'HEAD', worktreePath);
+      const stat = await getDiffStat(targetBranch, 'HEAD', worktreePath);
       if (stat) {
         console.log(`\nDiff summary:`);
         console.log(stat);
@@ -749,7 +739,7 @@ export async function getEditorFeedback(
   try {
     const task = await storage.getTask(taskId);
     if (task && root) {
-      const config = loadConfig(root);
+      const config = await loadConfig(root);
       const driver = createDriver(config);
       remoteUrl = await driver.getTaskUrl(task);
     }
@@ -771,7 +761,7 @@ export async function getEditorFeedback(
         } else {
           // Use the branch this task was created from, falling back to remote default branch
           const taskData = await storage.getTask(taskId);
-          fallbackFromRef = (taskData && getTaskTargetBranch(taskData, root)) ?? getRemoteDefaultBranch(root);
+          fallbackFromRef = (taskData && await getTaskTargetBranch(taskData, root)) ?? (await getRemoteDefaultBranch(root));
         }
       }
 
@@ -779,7 +769,7 @@ export async function getEditorFeedback(
       const session = await storage.getSession(sessionId);
       const upstreamMergeSha = session?.upstream_merge_sha ?? undefined;
 
-      turnDiffResult = getTurnDiff(lastAgentTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
+      turnDiffResult = await getTurnDiff(lastAgentTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
     }
 
     // Fetch notes added since the last agent turn
@@ -789,7 +779,7 @@ export async function getEditorFeedback(
     // Build two versions: editorContent (with real comments) and
     // comparisonContent (with # placeholder where comments go).
     // The diff between comparison and edited produces comments as additions.
-    const { editorContent, comparisonContent } = buildEditorContentWithDiff(
+    const { editorContent, comparisonContent } = await buildEditorContentWithDiff(
       lastAgentTurn.content, turnDiffResult, editorTaskId, taskGoal, newNotes, remoteUrl ?? undefined,
     );
     console.log('Opening editor with agent\'s last response and code changes...');
@@ -882,7 +872,7 @@ export async function runFeedbackFlow(
   worktreePath: string,
   taskShortId: string,
   follow: boolean,
-  modelOverride?: ModelName,
+  modelOverride?: string,
 ): Promise<'continue' | 'done'> {
   const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, task!.parent_task_id, root, displayId(task!));
 
@@ -901,7 +891,59 @@ export async function runFeedbackFlow(
       process.exit(1);
     }
 
-    await launchFeedbackTurn(task!, sess, result.message, false, root, storage, worktreePath, taskShortId, follow, modelOverride, result.recoveryPath, result.notesInEditor);
+    // Close storage before RPC — daemon has its own
+    await storage.close();
+
+    // --- Delegate to daemon RPC ---
+    try {
+      const rpcResult = await queryUnblockTask({
+        taskId: task!.id,
+        message: result.message,
+        modelOverride,
+        notesInEditor: result.notesInEditor,
+      });
+
+      // Clean up recovery file — feedback is now durably persisted in daemon
+      if (result.recoveryPath) {
+        removeRecoveryFile(result.recoveryPath);
+      }
+
+      // Print warnings from daemon
+      for (const w of rpcResult.warnings) {
+        console.log(w);
+      }
+
+      // Print summary
+      console.log(theme.success(`\nTask ${taskShortId} unblocked (turn ${rpcResult.turnNumber})`));
+      console.log(`  ${theme.label(`${rpcResult.runnerLabel}:`)} ${rpcResult.runnerDisplayName}`);
+
+      if (!follow) {
+        console.log(`\nTask is working. The agent is running in the background.`);
+        console.log(`Check progress with: ${theme.command('lazy blocked')}`);
+        console.log(`Or check status with: ${theme.command('lazy status ' + displayId(task!))}`);
+      }
+
+      if (follow) {
+        const storage2 = await requireStorage();
+        try {
+          const runner = await createRunner(root);
+          const protoDir = getProtocolDir(task!.id);
+          const exitCode = await followContainer(rpcResult.containerName, storage2, root, rpcResult.worktreePath, protoDir, runner);
+          await storage2.close();
+          process.exit(exitCode);
+        } finally {
+          await storage2.close();
+        }
+      }
+    } catch (err) {
+      // If RPC fails, preserve recovery file so feedback isn't lost
+      if (result.recoveryPath) {
+        console.error(`Feedback saved to recovery file: ${result.recoveryPath}`);
+      }
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+
     return 'done';
   }
 }
@@ -942,7 +984,7 @@ export async function runSyncWithRemote(
 ): Promise<{ remoteCommentsCtx?: string; remoteBranch?: string }> {
   let config;
   try {
-    config = loadConfig(root);
+    config = await loadConfig(root);
   } catch {
     return {};
   }
@@ -1000,340 +1042,3 @@ export async function runSyncWithRemote(
   return { remoteCommentsCtx, remoteBranch };
 }
 
-/**
- * Launch a feedback turn: acquire lock, restore snapshot, build prompt,
- * persist turn, launch container.
- *
- * When notesInEditor is true, notes were shown in the editor and the human
- * had the chance to edit/delete them. The diff-based feedback already
- * captures whatever the human chose to keep, so we skip the independent
- * notesCtx injection to avoid sending conflicting duplicates.
- */
-export async function launchFeedbackTurn(
-  task: NonNullable<Awaited<ReturnType<Awaited<ReturnType<typeof requireStorage>>['getTask']>>>,
-  sess: NonNullable<Awaited<ReturnType<Awaited<ReturnType<typeof requireStorage>>['getSessionByTaskId']>>>,
-  message: string,
-  syncWithUpstream: boolean,
-  root: string,
-  storage: Awaited<ReturnType<typeof requireStorage>>,
-  worktreePath: string,
-  taskShortId: string,
-  follow: boolean,
-  modelOverride?: ModelName,
-  feedbackRecoveryPath?: string | null,
-  notesInEditor?: boolean,
-  approvedFiles?: string[],
-): Promise<void> {
-  const sandbox: SandboxConfig = {
-    worktreePath,
-    sandboxPath: join(worktreePath, SANDBOX_DIR),
-  };
-
-  if (!existsSync(worktreePath)) {
-    console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
-    process.exit(1);
-  }
-
-  // Check for concurrent session lock
-  const existingLock = checkLock(worktreePath);
-  if (existingLock) {
-    console.error(`Task ${taskShortId} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
-    console.error(`Started at: ${existingLock.started_at}`);
-    console.error('Wait for the other process to finish, or kill it (kill ' + existingLock.pid + ') to release the lock.');
-    process.exit(1);
-  }
-
-  // Acquire lock before doing work
-  acquireLock(worktreePath, 'lazy unblock');
-
-  const canResume = !!sess.agent_session_id;
-  const runner = createRunner(root);
-  const tRef = taskRef(task);
-  const containerName = runner.runNameForTask(tRef);
-
-  try {
-    // Check if there are uncommitted changes from a previous snapshot that need to be restored
-    const snapshot = await storage.getLatestWorktreeSnapshot(sess.id);
-    if (snapshot && !hasUncommittedChanges(worktreePath)) {
-      console.log('Found backup of uncommitted changes. Attempting to restore...');
-      let patch = snapshot.uncommitted_diff;
-      patch = patch.replace(/^--- STAGED CHANGES ---\n/gm, '');
-      patch = patch.replace(/^--- UNSTAGED CHANGES ---\n/gm, '');
-
-      if (applyPatch(patch, worktreePath)) {
-        console.log('Successfully restored uncommitted changes from backup.');
-      } else {
-        console.warn('Warning: Could not restore uncommitted changes. Continuing without them.');
-      }
-    }
-
-    // --- Revert rejected file violations (conflict tasks) ---
-    // When unblocking a task with violations, revert files that are NOT approved.
-    // Default (no --approve-file) = ALL violations rejected = all files reverted.
-    let violationRevertInfo: string | undefined;
-    if (task.status === 'conflict') {
-      const existingTurns = await storage.getSessionTurns(sess.id);
-      const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
-
-      if (latestAgentTurn?.violations?.length) {
-        const violations = latestAgentTurn.violations;
-        const approvedSet = new Set(approvedFiles ?? []);
-
-        const updatedViolations: FileViolation[] = violations.map(v => ({
-          ...v,
-          status: approvedSet.has(v.file) ? 'approved' as const : 'rejected' as const,
-        }));
-
-        const rejectedFiles = updatedViolations.filter(v => v.status === 'rejected');
-        const approvedViolations = updatedViolations.filter(v => v.status === 'approved');
-
-        // Revert rejected files to their base SHA
-        if (rejectedFiles.length > 0) {
-          for (const v of rejectedFiles) {
-            const result = runGit(['checkout', v.base_sha, '--', v.file], { cwd: worktreePath });
-            if (result.exitCode !== 0) {
-              throw new Error(`Failed to revert protected file ${v.file} to ${v.base_sha}: ${result.stderr}`);
-            }
-          }
-
-          const revertedPaths = rejectedFiles.map(v => v.file);
-          runGit(['add', ...revertedPaths], { cwd: worktreePath });
-          runGit(['commit', '-m', 'Revert protected file changes (rejected by reviewer)'], { cwd: worktreePath });
-          console.log(`Reverted ${revertedPaths.length} protected file(s): ${revertedPaths.join(', ')}`);
-        }
-
-        if (approvedViolations.length > 0) {
-          console.log(`Approved ${approvedViolations.length} protected file change(s): ${approvedViolations.map(v => v.file).join(', ')}`);
-        }
-
-        // Update violation statuses on the turn
-        await storage.updateTurnViolations(task.id, latestAgentTurn.id, updatedViolations);
-
-        // Build context for the agent prompt
-        const revertedList = rejectedFiles.map(v => v.file);
-        const approvedList = approvedViolations.map(v => v.file);
-        const parts: string[] = [];
-        if (revertedList.length > 0) {
-          parts.push(`The following protected files were REVERTED (do NOT modify them again):\n${revertedList.map(f => `  - ${f}`).join('\n')}`);
-        }
-        if (approvedList.length > 0) {
-          parts.push(`The following protected file changes were APPROVED by the reviewer:\n${approvedList.map(f => `  - ${f}`).join('\n')}`);
-        }
-        if (parts.length > 0) {
-          violationRevertInfo = parts.join('\n\n');
-        }
-      }
-    }
-
-    // Load config from the worktree — the branch may have settings (e.g., permissions)
-    // that aren't on the project root's lazy.toml yet.
-    const config = loadConfig(root, { cwd: worktreePath });
-
-    // Determine model to use: CLI flag > previous turn's model (sticky) > task.model > config default
-    let stickyModel: ModelName | undefined;
-    if (!modelOverride) {
-      const existingTurns = await storage.getSessionTurns(sess.id);
-      for (let i = existingTurns.length - 1; i >= 0; i--) {
-        if (existingTurns[i].model) {
-          stickyModel = existingTurns[i].model;
-          break;
-        }
-      }
-    }
-    const modelName: ModelName = modelOverride ?? stickyModel ?? task.model ?? config.models.default;
-    const modelId = getModelId(modelName);
-
-    // Persist the resolved model on the task so `lazy list` shows the actual model used
-    if (!task.model) {
-      await storage.updateTaskModel(task.id, modelName);
-      task.model = modelName;
-    }
-
-    // Determine parent branch for upstream merge check
-    let parentBranch: string | null = null;
-    if (task.parent_task_id) {
-      parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
-    } else {
-      // Use the branch this task was created from, falling back to remote default branch
-      parentBranch = getTaskTargetBranch(task, root) ?? getRemoteDefaultBranch(root);
-    }
-
-    // Resolve upstream ref through the driver so the supervisor merges
-    // origin/<branch> (fresh remote state) instead of a stale local branch.
-    // The host MUST fetch before writing the command — the supervisor runs
-    // in a container with no network access and can only merge refs the host
-    // has already fetched. Failure to fetch means the supervisor merges a
-    // potentially stale ref, which can cause accept to fail with conflicts.
-    if (parentBranch) {
-      try {
-        const driver = createDriver(config);
-        parentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
-      } catch (err) {
-        // Fetch failed — warn loudly so the user knows refs may be stale.
-        // Still fall back to local branch name so unblock isn't blocked entirely.
-        logger.warn(`Failed to fetch upstream ref for ${parentBranch}: ${err instanceof Error ? err.message : err}`);
-        logger.warn('Proceeding with potentially stale local ref. If accept fails with conflicts, re-run with: lazy unblock <task> --sync-with-upstream');
-      }
-    }
-
-    // INVARIANT: Every unblock merges upstream before giving feedback.
-    // Agents must always work against current main to prevent drift and keep
-    // the final accept clean. Without this, task branches silently diverge,
-    // merge conflicts accumulate, and the accept becomes a mess.
-    //
-    // --sync-with-upstream adds additional context on TOP of this: when the
-    // flag is set, we inject a merge-conflict warning into the agent prompt
-    // so it knows to prioritize conflict resolution. But the auto-merge
-    // itself is NOT gated behind the flag — it happens on every unblock
-    // whenever the parent branch has new commits.
-    //
-    // Do NOT "optimize" this away. Commit 5f87c13 tried that and caused a
-    // regression where task branches drifted silently.
-    const upstreamChanged = syncWithUpstream || (parentBranch && hasUpstreamChanges(parentBranch, worktreePath));
-    if (upstreamChanged) {
-      console.log(`Upstream branch (${parentBranch}) has changes. Supervisor will merge before proceeding.`);
-    }
-
-    // When launching a fresh session (no Claude session to resume), inject
-    // turn history so the new agent has context about prior conversations.
-    let turnHistory: string | undefined;
-    if (!canResume) {
-      const turns = await storage.getSessionTurns(sess.id);
-      if (turns.length > 0) {
-        turnHistory = buildTurnHistoryContext(turns);
-      }
-    }
-
-    // Fetch notes added since the last agent turn for situational awareness.
-    // Skip when notes were already shown in the editor — the diff-based
-    // feedback already captures whatever the human chose to keep/edit/delete.
-    // Injecting notesCtx on top of that would duplicate or contradict.
-    let notesCtx: string | undefined;
-    if (!notesInEditor) {
-      const allNotes = await storage.getTaskComments(task.id);
-      if (allNotes.length > 0) {
-        const turns = await storage.getSessionTurns(sess.id);
-        const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
-        const newNotes = lastAgentTurn
-          ? getNewNotesSince(allNotes, lastAgentTurn.timestamp)
-          : allNotes; // No agent turn yet — all notes are new
-        if (newNotes.length > 0) {
-          notesCtx = buildNotesContext(newNotes);
-        }
-      }
-    }
-
-    // Sync-with-remote (host part): fetch remote branch ref and PR comments.
-    // The actual merge happens in the supervisor's sync-with-remote phase.
-    // Automatic when the task has a remote ref (PR). Non-fatal on failure.
-    const syncResult = await runSyncWithRemote(task, sess, root, storage, worktreePath);
-    const remoteCommentsCtx = syncResult.remoteCommentsCtx;
-
-    // Prepend violation revert info so the agent knows what was reverted/approved
-    if (violationRevertInfo) {
-      message = `## Protected File Resolution\n\n${violationRevertInfo}\n\n---\n\n${message}`;
-    }
-
-    // Build the prompts: static system prompt and dynamic user prompt.
-    // (Merge instructions handled by supervisor's merge phase, so we pass null for parentBranch
-    // — the supervisor gets merge info via the command)
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
-    const fullMessage = buildPromptWithInstructions(message.trim(), task.goal, null, root, turnHistory, notesCtx, remoteCommentsCtx);
-
-    // --- Persist state BEFORE launching container ---
-
-    // Record human turn immediately (crash-safe), with model for sticky resolution
-    const nextSeq = await storage.getNextTurnSequence(sess.id);
-    await storage.createTurn({
-      sessionId: sess.id,
-      sequence: nextSeq,
-      role: 'human',
-      content: message.trim(),
-      model: modelName,
-      prompt: fullMessage,
-      actor: getActor(),
-    });
-
-    // Feedback is now durably persisted — clean up recovery file
-    if (feedbackRecoveryPath) {
-      removeRecoveryFile(feedbackRecoveryPath);
-    }
-
-    // Transition to working (from blocked, conflict, or interrupted)
-    if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'interrupted') {
-      await storage.updateTaskStatus(task.id, 'working', getActor());
-    }
-
-    // --- Write command and launch/reuse supervisor ---
-
-    // Set up protocol directory
-    const protoDir = getProtocolDir(task.id);
-    ensureProtocolDir(protoDir);
-
-    // Write the unblock command for the supervisor
-    const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', config);
-
-    const unblockCommand: UnblockCommand = {
-      type: 'unblock',
-      task_id: task.id,
-      goal: task.goal,
-      prompt: fullMessage,
-      agent_id: task.agent_id,
-      system_prompt: systemPrompt,
-      model_id: modelId,
-      agent_session_id: canResume ? sess.agent_session_id! : undefined,
-      parent_branch: parentBranch ?? undefined,
-      sync_before_work: !!upstreamChanged,
-      sync_after_work: autoSyncAfterTurn,
-      remote_branch: syncResult.remoteBranch,
-      ...commonCommandFields(config),
-    };
-    writeCommand(protoDir, unblockCommand);
-
-    // Check if supervisor is already running
-    if (runner.isRunning(containerName)) {
-      // Supervisor is still alive — it will pick up the new command
-      console.log(`Supervisor ${containerName} is running. Command written.`);
-    } else {
-      // Remove any stale stopped run with the same name
-      runner.removeRun(containerName);
-
-      try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false);
-      } catch (err) {
-        console.error(`Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
-        // Revert task status
-        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
-        process.exit(1);
-      }
-    }
-
-    // Store container name in session for reconciliation
-    await storage.updateSessionContainerName(sess.id, containerName);
-
-    // Update last interaction timestamp so duration tracking starts from now
-    await storage.updateSessionInteraction(sess.id, 0);
-
-    // Print summary — task is now running asynchronously
-    const turnNum = Math.floor(nextSeq / 2) + 1;
-    console.log(theme.success(`\nTask ${taskShortId} unblocked (turn ${turnNum})`));
-    console.log(`  ${theme.label(`${runner.runLabel}:`)} ${runner.runDisplayName(containerName)}`);
-
-    if (!follow) {
-      console.log(`\nTask is working. The agent is running in the background.`);
-      console.log(`Check progress with: ${theme.command('lazy blocked')}`);
-      console.log(`Or check status with: ${theme.command('lazy status ' + displayId(task))}`);
-    }
-  } finally {
-    removeLock(worktreePath);
-  }
-
-  // Follow container output after releasing the worktree lock (but before closing storage).
-  // followContainer will re-acquire the worktree lock around reconciliation.
-  if (follow) {
-    const protoDir2 = getProtocolDir(task.id);
-    const exitCode = await followContainer(containerName, storage, root, worktreePath, protoDir2, runner);
-    await storage.close();
-    process.exit(exitCode);
-  }
-}

@@ -96,7 +96,7 @@
         },
         {
           "id": "ci-failure-fix",
-          "match": "(SIGNAL: CI_FAILURE|CI run.*(fail|error)|workflow run.*fail|GitHub Actions.*fail|check run.*fail)",
+          "match": "(You are resuming work.*Create a project with tests|CI run.*(fail|error)|workflow run.*fail|GitHub Actions.*fail|check run.*fail)",
           "actions": [
             {
               "type": "write_file",
@@ -139,7 +139,7 @@
         },
         {
           "id": "pr-comment-respond",
-          "match": "(SIGNAL: PR_COMMENT|PR comment.*add input validation|Please add input validation|new review comment)",
+          "match": "(You are resuming work.*Create a basic module|add input validation|review comment|Please add input validation)",
           "actions": [
             {
               "type": "write_file",
@@ -190,7 +190,7 @@
 
     "upstream-change": {
       "id": "upstream-change",
-      "description": "Scenario D: Upstream change -> auto-deliver -> merge. Child task receives signal that parent branch has new commits and merges them.",
+      "description": "Scenario D: Upstream change -> sync merge. Child task's branch gets upstream changes merged via supervisor-only sync (no agent turn).",
       "steps": [
         {
           "id": "upstream-start",
@@ -209,33 +209,174 @@
           ],
           "commit_message": "Add currency and date formatting utilities with tests",
           "response": "I've created formatting utilities for the child feature:\n\n1. `formatCurrency(amount, currency)` - formats numbers as currency strings using `Intl.NumberFormat`\n2. `formatDate(date)` - formats dates in a human-readable format using `Intl.DateTimeFormat`\n\nUnit tests cover both functions. All tests pass."
-        },
-        {
-          "id": "upstream-merge",
-          "match": "(SIGNAL: UPSTREAM_CHANGE|upstream branch.*change|parent branch.*new commits|parent branch.*updated|merge upstream.*before proceeding)",
-          "actions": [
-            {
-              "type": "write_file",
-              "path": "src/formatter.ts",
-              "content": "/**\n * String formatting utilities for display.\n * Updated after upstream merge to use shared types.\n */\n\n/**\n * Formats a number as a currency string.\n */\nexport function formatCurrency(amount: number, currency: string = 'USD'): string {\n  return new Intl.NumberFormat('en-US', {\n    style: 'currency',\n    currency,\n  }).format(amount);\n}\n\n/**\n * Formats a date as a human-readable string.\n */\nexport function formatDate(date: Date): string {\n  return new Intl.DateTimeFormat('en-US', {\n    year: 'numeric',\n    month: 'long',\n    day: 'numeric',\n  }).format(date);\n}\n\n/**\n * Formats a percentage with specified decimal places.\n */\nexport function formatPercent(value: number, decimals: number = 1): string {\n  return `${(value * 100).toFixed(decimals)}%`;\n}\n"
-            },
-            {
-              "type": "write_file",
-              "path": "test/formatter.test.ts",
-              "content": "import { describe, test, expect } from 'bun:test';\nimport { formatCurrency, formatDate, formatPercent } from '../src/formatter';\n\ndescribe('formatter', () => {\n  test('formatCurrency defaults to USD', () => {\n    expect(formatCurrency(1234.56)).toBe('$1,234.56');\n  });\n\n  test('formatCurrency with EUR', () => {\n    const result = formatCurrency(1234.56, 'EUR');\n    expect(result).toContain('1,234.56');\n  });\n\n  test('formatDate', () => {\n    const date = new Date('2025-01-15');\n    const result = formatDate(date);\n    expect(result).toContain('January');\n    expect(result).toContain('2025');\n  });\n\n  test('formatPercent', () => {\n    expect(formatPercent(0.1234)).toBe('12.3%');\n    expect(formatPercent(0.1234, 2)).toBe('12.34%');\n    expect(formatPercent(1)).toBe('100.0%');\n  });\n});\n"
-            }
-          ],
-          "commit_message": "Merge upstream changes and add formatPercent function",
-          "response": "I received a signal that the parent branch has new commits. I've merged the upstream changes and continued development:\n\n1. **Merged upstream**: No conflicts detected, merge was clean.\n2. **Added `formatPercent`**: New function that formats a decimal value as a percentage string with configurable decimal places.\n3. **Updated tests**: Added tests for the new function.\n\nAll tests pass after the merge."
         }
       ]
     }
   },
 
+    "daemon-isolation-a": {
+      "id": "daemon-isolation-a",
+      "description": "Scenario E helper: First project for per-project daemon isolation test.",
+      "steps": [
+        {
+          "id": "daemon-iso-a-start",
+          "match": "You are starting to work on a new task.*Build a greeting module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/greet.ts",
+              "content": "export function greet(name: string): string {\n  return `Hello, ${name}!`;\n}\n"
+            }
+          ],
+          "commit_message": "Add greeting module",
+          "response": "Created a simple greeting module with a greet function."
+        }
+      ]
+    },
+
+    "daemon-isolation-b": {
+      "id": "daemon-isolation-b",
+      "description": "Scenario E helper: Second project for per-project daemon isolation test.",
+      "steps": [
+        {
+          "id": "daemon-iso-b-start",
+          "match": "You are starting to work on a new task.*Build a farewell module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/farewell.ts",
+              "content": "export function farewell(name: string): string {\n  return `Goodbye, ${name}!`;\n}\n"
+            }
+          ],
+          "commit_message": "Add farewell module",
+          "response": "Created a simple farewell module with a farewell function."
+        }
+      ]
+    },
+
+    "sync-manual": {
+      "id": "sync-manual",
+      "description": "Scenario F: Manual lazy sync test. Parent and child tasks for testing sync command directly.",
+      "steps": [
+        {
+          "id": "sync-manual-parent-start",
+          "match": "You are starting to work on a new task.*Create sync parent module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/config.ts",
+              "content": "export const VERSION = '1.0.0';\nexport const APP_NAME = 'sync-test';\n"
+            }
+          ],
+          "commit_message": "Add config module",
+          "response": "Created config module with version and app name constants."
+        },
+        {
+          "id": "sync-manual-child-start",
+          "match": "You are starting to work on a new task.*Create sync child feature",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/display.ts",
+              "content": "export function showVersion(version: string): string {\n  return `Version: ${version}`;\n}\n"
+            }
+          ],
+          "commit_message": "Add display module",
+          "response": "Created display module with showVersion function."
+        }
+      ]
+    },
+
+    "sync-retry": {
+      "id": "sync-retry",
+      "description": "Scenario G: Sync retry with backoff. Tests that sync failure increments pending_sync and retry succeeds.",
+      "steps": [
+        {
+          "id": "sync-retry-parent-start",
+          "match": "You are starting to work on a new task.*Create retry parent module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/base.ts",
+              "content": "export const BASE_URL = 'https://example.com';\n"
+            }
+          ],
+          "commit_message": "Add base module",
+          "response": "Created base module with BASE_URL constant."
+        },
+        {
+          "id": "sync-retry-child-start",
+          "match": "You are starting to work on a new task.*Create retry child feature",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/client.ts",
+              "content": "export function buildUrl(path: string): string {\n  return `https://example.com${path}`;\n}\n"
+            }
+          ],
+          "commit_message": "Add client module",
+          "response": "Created client module with buildUrl function."
+        }
+      ]
+    },
+
+    "unblock-preemption": {
+      "id": "unblock-preemption",
+      "description": "Scenario H: Unblock preemption test. Creates a task that will be working when unblock is attempted.",
+      "steps": [
+        {
+          "id": "preempt-start",
+          "match": "You are starting to work on a new task.*Build a slow computation module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/compute.ts",
+              "content": "export function fibonacci(n: number): number {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}\n"
+            }
+          ],
+          "commit_message": "Add computation module",
+          "response": "Created computation module with fibonacci function."
+        }
+      ]
+    },
+
+    "event-durability": {
+      "id": "event-durability",
+      "description": "Scenario I: Event durability across daemon restart. Tests that upstream changes are caught after daemon restart.",
+      "steps": [
+        {
+          "id": "durability-parent-start",
+          "match": "You are starting to work on a new task.*Create durability parent module",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/schema.ts",
+              "content": "export interface User {\n  id: string;\n  name: string;\n}\n"
+            }
+          ],
+          "commit_message": "Add schema module",
+          "response": "Created schema module with User interface."
+        },
+        {
+          "id": "durability-child-start",
+          "match": "You are starting to work on a new task.*Create durability child feature",
+          "actions": [
+            {
+              "type": "write_file",
+              "path": "src/repo.ts",
+              "content": "export function findUser(id: string): { id: string; name: string } | null {\n  return null;\n}\n"
+            }
+          ],
+          "commit_message": "Add repo module",
+          "response": "Created repo module with findUser function."
+        }
+      ]
+    },
+
   "_design_notes": {
-    "match_patterns": "Each step's 'match' field is a regex tested against the full prompt the supervisor sends to the agent. The qa-agent tries steps in order within a scenario, using the first unmatched step whose regex matches. For signal-based steps (CI failure, PR comment, upstream change), the match patterns are broad enough to match both the v0.11 signal prefix format (SIGNAL: <TYPE>) and natural language descriptions that might appear in feedback.",
+    "match_patterns": "Each step's 'match' field is a regex tested against the full prompt the supervisor sends to the agent. The qa-agent tries steps in order within a scenario, using the first unmatched step whose regex matches. For auto-react steps (CI failure, PR comment), the match patterns target the goal-context-resume.md prompt format ('You are resuming work on a task...') which is used by autoUnblockTask() for daemon-triggered feedback. Upstream sync does NOT invoke the agent at all — it is supervisor-only.",
     "actions": "Each action creates/modifies a file in the worktree. The qa-agent executes these actions, then runs `git add -A && git commit -m '<commit_message>'` before returning the response.",
     "scenario_selection": "The qa-agent selects the active scenario based on the QA_SCENARIO environment variable or by matching the task goal against scenario descriptions. Within a scenario, steps are consumed in order — once a step matches, it won't match again.",
-    "signal_format": "v0.11 auto-deliver prepends signal summaries to prompts. The exact format is TBD but will include a prefix like 'SIGNAL: CI_FAILURE' or 'SIGNAL: PR_COMMENT' followed by details. The match patterns here are designed to work with both the structured signal format and plain-text feedback."
+    "prompt_formats": "v0.11 uses three goal-context prompts: start (new task), continue (unblock with feedback), resume (auto-deliver from daemon). Auto-react events (CI failure, PR comment) use the resume prompt with event context prepended. Upstream sync is handled by handleSyncCommand() with no agent involvement."
   }
 }

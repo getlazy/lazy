@@ -127,11 +127,11 @@ describe('lazy redo', () => {
   test('redo with --model override and --no-start', async () => {
     const taskId = await createTask(ctx, 'Task to redo with model', 'Do work');
 
-    const result = await ctx.lazy(['redo', taskId, '--no-start', '--model', 'opus']);
+    const result = await ctx.lazy(['redo', taskId, '--no-start', '--model', 'claude-opus-4-6']);
 
     expectSuccess(result);
     expectOutput(result, 'redo of');
-    expectOutput(result, 'opus');
+    expectOutput(result, 'claude-opus-4-6');
   });
 
   test('shows usage when no task ID provided', async () => {

@@ -72,10 +72,10 @@ describe('lazy refactor', () => {
   });
 
   test('creates a task with --model flag', async () => {
-    const result = await ctx.lazy(['refactor', '--goal', 'Refactor auth', '--model', 'opus']);
+    const result = await ctx.lazy(['refactor', '--goal', 'Refactor auth', '--model', 'claude-opus-4-6']);
 
     expectSuccess(result);
-    expectOutput(result, 'opus');
+    expectOutput(result, 'claude-opus-4-6');
   });
 
   test('fails with invalid model', async () => {

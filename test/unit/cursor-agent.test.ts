@@ -14,61 +14,6 @@ describe('CursorAgent', () => {
     expect(agent.id).toBe('cursor');
   });
 
-  describe('resolveModelId', () => {
-    // INVARIANT: Universal monikers return '' so --model is omitted,
-    // letting Cursor use its default (`auto`). This works on free plans.
-    test('universal monikers resolve to empty string (use Cursor default)', () => {
-      expect(agent.resolveModelId('apprentice')).toBe('');
-      expect(agent.resolveModelId('journeyman')).toBe('');
-      expect(agent.resolveModelId('master')).toBe('');
-    });
-
-    test('resolves cursor-specific names to themselves', () => {
-      expect(agent.resolveModelId('sonnet-4')).toBe('sonnet-4');
-      expect(agent.resolveModelId('sonnet-4-thinking')).toBe('sonnet-4-thinking');
-      expect(agent.resolveModelId('gpt-5')).toBe('gpt-5');
-    });
-
-    test('throws on unknown model name', () => {
-      expect(() => agent.resolveModelId('cursor-default')).toThrow('Unknown model: cursor-default');
-    });
-
-    test('error message lists valid options', () => {
-      try {
-        agent.resolveModelId('invalid');
-      } catch (e: any) {
-        expect(e.message).toContain('apprentice');
-        expect(e.message).toContain('journeyman');
-        expect(e.message).toContain('master');
-        expect(e.message).toContain('sonnet-4');
-      }
-    });
-  });
-
-  describe('availableModels', () => {
-    test('includes universal monikers', () => {
-      const models = agent.availableModels();
-      const names = models.map(m => m.name);
-      expect(names).toContain('apprentice');
-      expect(names).toContain('journeyman');
-      expect(names).toContain('master');
-    });
-
-    test('journeyman is the default', () => {
-      const models = agent.availableModels();
-      const defaultModel = models.find(m => m.isDefault);
-      expect(defaultModel?.name).toBe('journeyman');
-    });
-
-    test('includes cursor-specific model names', () => {
-      const models = agent.availableModels();
-      const names = models.map(m => m.name);
-      expect(names).toContain('sonnet-4');
-      expect(names).toContain('sonnet-4-thinking');
-      expect(names).toContain('gpt-5');
-    });
-  });
-
   describe('buildExecArgs', () => {
     test('uses agent binary with --print and --trust', () => {
       const args = agent.buildExecArgs({
@@ -142,13 +87,10 @@ describe('CursorAgent', () => {
       expect(args).toContain('sonnet-4-thinking');
     });
 
-    // INVARIANT: Universal monikers resolve to '' which omits --model,
-    // letting Cursor use its default. This is critical for free plans.
-    test('omits --model when modelId is empty (moniker resolution)', () => {
-      const modelId = agent.resolveModelId('journeyman');
+    test('omits --model when modelId is empty', () => {
       const args = agent.buildExecArgs({
         prompt: 'Hello',
-        modelId,
+        modelId: '',
         dangerouslySkipPermissions: false,
       });
       expect(args).not.toContain('--model');
@@ -224,18 +166,16 @@ describe('CursorAgent', () => {
       expect(agent.hasAuthEnv()).toBe(true);
     });
 
-    test('getAuthEnv returns key when CURSOR_API_KEY is set', () => {
+    test('getAuthEnvVars returns key when CURSOR_API_KEY is set', () => {
       process.env.CURSOR_API_KEY = 'test-key';
-      const auth = agent.getAuthEnv();
-      expect(auth.key).toBe('CURSOR_API_KEY');
-      expect(auth.value).toBe('test-key');
+      const authVars = agent.getAuthEnvVars();
+      expect(authVars).toEqual([{ key: 'CURSOR_API_KEY', value: 'test-key' }]);
     });
 
-    test('getAuthEnv returns empty value when CURSOR_API_KEY is not set', () => {
+    test('getAuthEnvVars returns empty value when CURSOR_API_KEY is not set', () => {
       delete process.env.CURSOR_API_KEY;
-      const auth = agent.getAuthEnv();
-      expect(auth.key).toBe('CURSOR_API_KEY');
-      expect(auth.value).toBe('');
+      const authVars = agent.getAuthEnvVars();
+      expect(authVars).toEqual([{ key: 'CURSOR_API_KEY', value: '' }]);
     });
   });
 

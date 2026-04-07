@@ -59,6 +59,7 @@ export interface Runner {
     runName: string,
     protocolDir: string,
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<void>;
 
   /**
@@ -169,6 +170,7 @@ export interface Runner {
    * @param builderConfigPath  Path to the builder config JSON (empty string in host-process mode)
    * @param claudeExtraArgs    Additional args for Claude Code (e.g., --model)
    * @param debug              Enable debug logging
+   * @param daemonConfigPath   Optional path to daemon MCP config (preferred over builder server)
    * @returns Exit code and detected session ID (if available)
    */
   launchBuilderInteractive(
@@ -177,5 +179,6 @@ export interface Runner {
     builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }>;
 }

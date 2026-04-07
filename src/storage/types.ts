@@ -22,7 +22,6 @@ import type {
   SessionOutcome,
   TurnRole,
   TokenUsage,
-  ModelName,
   Actor,
 } from '../types';
 
@@ -44,7 +43,6 @@ export type {
   SessionOutcome,
   TurnRole,
   TokenUsage,
-  ModelName,
   Actor,
 };
 

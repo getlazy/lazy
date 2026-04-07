@@ -2,23 +2,24 @@
  * Daemon auto-start — starts the daemon if not running.
  *
  * Called early in the CLI entry point before command dispatch.
- * Forks a background daemon process and waits up to 5s for the socket.
+ * Also exports startDaemonBackground() for use by `lazy daemon start`.
  *
- * Skip when:
- * - LAZY_NO_DAEMON=1 is set
- * - The command is `daemon` itself (to avoid recursion)
- * - We're in a test environment (LAZY_TEST=1)
+ * In v0.11+, the daemon is required. If auto-start fails, the CLI
+ * exits with an actionable error. The only exceptions are:
+ * - Test mode (LAZY_TEST=1): daemon is bypassed entirely
+ * - Commands that don't need the daemon (daemon, init, completion, help)
  */
 
 import { mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { spawn } from '../utils/spawn';
-import { checkDaemonHealth, waitForDaemon, cleanupStaleFiles, getLogPath, acquireStartLock, releaseStartLock } from './index';
+import { waitForDaemon, cleanupStaleFiles, isDaemonRunning, getLogPath } from './index';
 import { getLazyCommand } from '../utils/cli-path';
 
-/** Commands that should NOT trigger auto-start */
+/** Commands that should NOT trigger auto-start (they work without daemon) */
 const SKIP_AUTO_START = new Set([
   'daemon',     // avoid recursion
+  'init',       // bootstrap command — must work before daemon exists
   'completion', // shell completion — must be fast
   '--help',
   '-h',
@@ -27,58 +28,71 @@ const SKIP_AUTO_START = new Set([
 ]);
 
 /**
- * Ensure the daemon is running. Called before command dispatch.
+ * Start the daemon in the background. Used by ensureDaemon() and daemonStart().
  *
- * If the daemon is already running, returns immediately.
- * If not, forks a background daemon and waits for it to be ready.
+ * Forks a child process and waits for its socket to become ready.
+ * Singleton enforcement is handled by startDaemonServer()'s flock — if two
+ * callers race and both spawn, only one child wins the lock; the other exits.
  *
- * Returns true if the daemon is running (or was started), false if skipped.
+ * @param projectRoot - Project root directory
  */
-export async function ensureDaemon(command: string | undefined): Promise<boolean> {
-  // Skip conditions
-  if (process.env.LAZY_NO_DAEMON === '1') return false;
+export async function startDaemonBackground(projectRoot: string): Promise<void> {
+  const logPath = getLogPath(projectRoot);
+
+  // Ensure daemon directory exists before spawning — Bun.spawn needs the
+  // log file's parent directory to exist for stdout/stderr redirection.
+  mkdirSync(dirname(logPath), { recursive: true });
+
+  // Fork a detached child running `lazy daemon start --foreground --project <root>`
+  const proc = spawn([...getLazyCommand(), 'daemon', 'start', '--foreground', '--project', projectRoot], {
+    stdout: Bun.file(logPath),
+    stderr: Bun.file(logPath),
+    stdin: 'ignore',
+    timeout: 0, // Long-running: daemon runs indefinitely
+  });
+
+  // Detach the child so it outlives this process
+  proc.unref();
+
+  // Wait for the daemon to become available
+  const ready = await waitForDaemon(projectRoot, 5000);
+  if (!ready) {
+    throw new Error(
+      `Daemon did not start within 5 seconds.\n` +
+      `Check logs: ${logPath}`,
+    );
+  }
+}
+
+/**
+ * Ensure the daemon is running for the given project. Called before command dispatch.
+ *
+ * Checks for the socket file — if it exists, the daemon is ready.
+ * If not, spawns a daemon and polls for the socket.
+ * Singleton enforcement is in startDaemonServer() (flock), not here.
+ *
+ * @param command - The CLI command being run (to check skip list)
+ * @param projectRoot - The project root directory (for per-project daemon paths)
+ */
+export async function ensureDaemon(command: string | undefined, projectRoot: string): Promise<boolean> {
+  // Test mode bypasses daemon entirely
   if (process.env.LAZY_TEST === '1') return false;
+
+  // Commands that don't need daemon
   if (!command || SKIP_AUTO_START.has(command)) return false;
 
-  // Check if already running
-  const status = await checkDaemonHealth();
-  if (status.running) return true;
-
-  // Try to acquire the startup lock to prevent concurrent spawns.
-  // If another process is already starting the daemon, wait for it.
-  if (!acquireStartLock()) {
-    // Another process is starting the daemon — wait for it
-    return await waitForDaemon(5000);
+  // Fast path: socket exists, token readable, AND process is alive.
+  // After a crash, socket+token files remain but the process is dead —
+  // the PID check catches this (the old check only tested file existence).
+  if (isDaemonRunning(projectRoot)) {
+    return true;
   }
 
-  try {
-    // Re-check after acquiring lock — daemon may have started while we waited
-    const recheck = await checkDaemonHealth();
-    if (recheck.running) return true;
-
-    // Clean up any stale files
-    cleanupStaleFiles();
-
-    // Fork a background daemon
-    const logPath = getLogPath();
-
-    // Ensure daemon directory exists before spawning — Bun.spawn needs the
-    // log file's parent directory to exist for stdout/stderr redirection.
-    mkdirSync(dirname(logPath), { recursive: true });
-
-    const proc = spawn([...getLazyCommand(), 'daemon', 'start', '--foreground'], {
-      stdout: Bun.file(logPath),
-      stderr: Bun.file(logPath),
-      stdin: 'ignore',
-    });
-    proc.unref();
-
-    // Wait for daemon to become ready (up to 5s)
-    return await waitForDaemon(5000);
-  } catch {
-    // Auto-start failure is non-fatal — the CLI command proceeds without daemon
-    return false;
-  } finally {
-    releaseStartLock();
-  }
+  // Daemon is dead or never started. Clean up stale files (socket, PID)
+  // left behind by a crash, then start a fresh daemon.
+  // startDaemonServer's flock ensures only one daemon wins if multiple
+  // callers race to start.
+  cleanupStaleFiles(projectRoot);
+  await startDaemonBackground(projectRoot);
+  return true;
 }

@@ -16,28 +16,30 @@
  */
 
 import { join } from 'path';
-import { homedir } from 'os';
 import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
-import { requireLazyRoot, parseFlags, type FlagDefinition } from '../helpers';
+import { getHome } from '../../utils/home';
+import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
 import { isTTY, promptLine, promptYesNo } from '../editor';
-import { createStorage, getProjectName } from '../../storage';
+import { getProjectName } from '../../storage';
 import { theme } from '../theme';
 import { createRunner, type Runner } from '../../runner';
-import { generateBuilderConfig, startBuilderServer } from '../../builder/server';
+import { generateBuilderConfig } from '../../builder/server';
+import { createTerminal } from '../../terminal';
+import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
 
 // Embedded at build/compile time — changes to these files require rebuild
 import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
 import modelGuidance from '../../prompts/model-guidance.md' with { type: 'text' };
 
-function buildSystemPrompt(lazyRoot: string, runner: Runner): string {
+async function buildSystemPrompt(lazyRoot: string, runner: Runner): Promise<string> {
   // Inject runner-specific instructions into the template
   const runnerInstructions = runner.getBuilderInstructions().trimEnd();
   let prompt = lazySystemPrompt.replace('{{RUNNER_INSTRUCTIONS}}', runnerInstructions).trimEnd();
 
-  if (hasExplicitModelConfig(lazyRoot)) {
+  if (await hasExplicitModelConfig(lazyRoot)) {
     // User configured a default model — tell builder to respect it
-    const config = loadConfig(lazyRoot);
+    const config = await loadConfig(lazyRoot);
     const defaultModel = config.models.default;
     prompt += `\n\n## Model selection\n\nThe project is configured to use **${defaultModel}** as the default model (in lazy.toml).\nDo NOT pass \`--model\` when creating or starting tasks unless the engineer explicitly asks for a different model.\nOmitting \`--model\` lets the CLI use the configured default automatically.`;
   } else {
@@ -51,22 +53,22 @@ function buildSystemPrompt(lazyRoot: string, runner: Runner): string {
  * Return the per-project marker directory under ~/.lazy/<project>/.
  * This is user-local state (not project state) for tracking first-run disclosure.
  */
-function builderMarkerDir(root: string): string {
-  const projectName = getProjectName(root);
-  return join(homedir(), '.lazy', projectName);
+async function builderMarkerDir(root: string): Promise<string> {
+  const projectName = await getProjectName(root);
+  return join(getHome(), '.lazy', projectName);
 }
 
 /**
  * Check if this is the first time builder has been run for this project.
  * Uses a marker file in ~/.lazy/<project>/ to track.
  */
-function isFirstBuilderRun(root: string): boolean {
-  const markerPath = join(builderMarkerDir(root), '.builder-launched');
+async function isFirstBuilderRun(root: string): Promise<boolean> {
+  const markerPath = join(await builderMarkerDir(root), '.builder-launched');
   return !existsSync(markerPath);
 }
 
-function markBuilderRun(root: string): void {
-  const markerDir = builderMarkerDir(root);
+async function markBuilderRun(root: string): Promise<void> {
+  const markerDir = await builderMarkerDir(root);
   if (!existsSync(markerDir)) {
     mkdirSync(markerDir, { recursive: true });
   }
@@ -75,8 +77,8 @@ function markBuilderRun(root: string): void {
 
 // --- Subcommand: list ---
 
-async function commandBuilderList(lazyRoot: string): Promise<void> {
-  const storage = await createStorage(lazyRoot);
+async function commandBuilderList(_lazyRoot: string): Promise<void> {
+  const storage = await requireStorage();
 
   try {
     const conversations = await storage.listConversations();
@@ -160,8 +162,8 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const resumeArg = parsed.flags.get('resume') ?? null;
 
   // Create the runner — determines Docker vs host-process mode
-  const runner = createRunner(root);
-  const config = loadConfig(root);
+  const runner = await createRunner(root);
+  const config = await loadConfig(root);
 
   // Autonomous mode warnings and confirmation
   // Show these BEFORE pre-flight checks so users see the warnings even if infrastructure fails
@@ -206,7 +208,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const systemPrompt = buildSystemPrompt(root, runner);
+  const systemPrompt = await buildSystemPrompt(root, runner);
 
   // Determine if we're resuming and which session ID to use.
   // Resume source: LAZY_LAST_SESSION_ID env var (terminal-scoped) or explicit --resume <id>.
@@ -242,7 +244,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Session disclosure — skip on resume (user already saw it in the original session)
   if (!isResuming) {
     const agentName = config.agent.agent_id === 'claude-code' ? 'Claude Code' : config.agent.agent_id;
-    const firstRun = isFirstBuilderRun(root);
+    const firstRun = await isFirstBuilderRun(root);
 
     console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
 
@@ -282,7 +284,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     }
   }
 
-  markBuilderRun(root);
+  await markBuilderRun(root);
 
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
@@ -292,30 +294,44 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const finalClaudeExtraArgs = [
     ...(autonomous ? ['--dangerously-skip-permissions'] : []),
     ...(resumeId ? ['--resume', resumeId] : []),
+    // When Ollama is enabled, force Claude Code to use the Ollama model.
+    // Without this, Claude Code defaults to its own model (opus) which doesn't exist in Ollama.
+    ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
   ];
+
+  // Set terminal window title to reflect activity
+  const terminal = createTerminal();
+  terminal.setActivity('lazy builder');
+  const restoreTerminal = () => terminal.restoreTitle();
+  process.on('exit', restoreTerminal);
 
   let exitCode: number;
   let sessionId: string | null = null;
 
   if (runner.usesSandbox()) {
-    // Container mode (Docker/Podman): start an HTTP server on localhost for tool calls.
-    // The supervisor inside the container connects via host.docker.internal.
+    // Container mode: use daemon MCP proxy so tool calls route through the daemon.
+    // The daemon generates the MCP config (it knows its own webPort and token).
+    const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
+      name: `builder-${Date.now()}`,
+    });
+
+    // Still need a builder config for conversation capture (the supervisor reads it)
+    // but we don't start a separate HTTP server.
     const dataDir = config.data.path;
     const { configPath, config: builderConfig } = generateBuilderConfig(root, dataDir);
-    const { cleanup: cleanupServer } = startBuilderServer(builderConfig, configPath);
+    writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
 
     try {
-      const result = await runner.launchBuilderInteractive(root, systemPrompt, configPath, finalClaudeExtraArgs);
+      const result = await runner.launchBuilderInteractive(
+        root, systemPrompt, configPath, finalClaudeExtraArgs, undefined, daemonConfigPath,
+      );
       exitCode = result.exitCode;
       sessionId = result.sessionId;
     } finally {
-      cleanupServer();
-      try {
-        if (existsSync(configPath)) {
-          unlinkSync(configPath);
-        }
-      } catch {
-        // Best effort
+      for (const tmpFile of [daemonConfigPath, configPath]) {
+        try {
+          if (existsSync(tmpFile)) unlinkSync(tmpFile);
+        } catch { /* best effort */ }
       }
     }
   } else {

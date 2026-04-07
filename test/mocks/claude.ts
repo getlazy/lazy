@@ -7,29 +7,11 @@
  * Must export every symbol that source files import from capture/claude.
  */
 
-import type { ModelName, AgentResponse, TokenUsage } from '../../src/types';
+import type { AgentResponse, TokenUsage } from '../../src/types';
 
 export interface SandboxConfig {
   worktreePath: string;
   sandboxPath: string;
-}
-
-export function getModelId(modelName: ModelName): string {
-  const modelMap: Record<ModelName, string> = {
-    // Universal monikers
-    'apprentice': 'claude-haiku-4-5-20251001',
-    'journeyman': 'claude-sonnet-4-5-20250929',
-    'master': 'claude-opus-4-6',
-    // Legacy Claude-specific aliases
-    'sonnet': 'claude-sonnet-4-5-20250929',
-    'opus': 'claude-opus-4-6',
-    'haiku': 'claude-haiku-4-5-20251001',
-  };
-  const id = modelMap[modelName];
-  if (!id) {
-    throw new Error(`Unknown model: ${modelName}. Valid options: apprentice, journeyman, master, sonnet, opus, haiku`);
-  }
-  return id;
 }
 
 export function checkDocker(): void {
@@ -53,14 +35,14 @@ export function hasAuthEnv(): boolean {
   return !!(process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY);
 }
 
-export function getAuthEnv(): { key: string; value: string } {
+export function getAuthEnvVars(): Array<{ key: string; value: string }> {
   const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (oauthToken) {
-    return { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken };
+    return [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken }];
   }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (apiKey) {
-    return { key: 'ANTHROPIC_API_KEY', value: apiKey };
+    return [{ key: 'ANTHROPIC_API_KEY', value: apiKey }];
   }
   throw new Error(
     'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
@@ -227,7 +209,7 @@ export async function launchSupervisorAsync(
       const patterns = cmd.protected_patterns as string[] | undefined;
       if (patterns && patterns.length > 0 && preTurnSha !== 'unknown' && postWorkSha && preTurnSha !== postWorkSha) {
         const { detectViolations } = await import('../../src/supervisor/permissions');
-        const detected = detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
+        const detected = await detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
         if (detected.length > 0) {
           // Simulate push-back: give the agent one chance to self-correct.
           // LAZY_MOCK_PUSHBACK_REVERTS: JSON array of file paths the agent "reverts" during push-back.
@@ -256,7 +238,7 @@ export async function launchSupervisorAsync(
           status.post_work_sha = postPushbackSha;
           writeFileSync(join(protocolDir, 'status.json'), JSON.stringify(status, null, 2));
 
-          const remaining = detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
+          const remaining = await detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
           violations = remaining.length > 0 ? remaining : undefined;
         }
       }

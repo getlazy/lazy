@@ -1,47 +1,71 @@
 /**
  * Daemon file paths.
  *
- * All daemon state lives under ~/.lazy/daemon/ — PID file, unix socket,
- * bearer token, and log file.
+ * All daemon state lives under ~/.lazy/daemon/<project-slug>/ — PID file,
+ * unix socket, bearer token, and log file. Each project gets its own daemon
+ * directory derived from the project root path.
  *
- * Uses process.env.HOME directly (not os.homedir()) because Bun's homedir()
- * doesn't respect the HOME env var, which breaks tests.
+ * Directory naming: <last-dir-component>-<sha256(projectRoot).slice(0,8)>
+ * e.g., /home/user/prg/workshop → ~/.lazy/daemon/workshop-a1b2c3d4/
+ *
+ * Uses getHome() from utils/home which prefers $HOME over os.homedir()
+ * because Bun's homedir() doesn't respect the HOME env var on some platforms.
  */
 
-import { join } from 'path';
-import { homedir } from 'os';
+import { join, basename } from 'path';
+import { createHash } from 'crypto';
+import { getHome } from '../utils/home';
 
-/** Get the user's home directory, preferring $HOME over os.homedir(). */
-function getHome(): string {
-  return process.env.HOME || homedir();
+/**
+ * Derive a human-readable, collision-resistant slug from a project root.
+ * Format: <last-dir-component>-<sha256(projectRoot).slice(0,8)>
+ */
+export function projectSlug(projectRoot: string): string {
+  const name = basename(projectRoot) || 'root';
+  const hash = createHash('sha256').update(projectRoot).digest('hex').slice(0, 8);
+  return `${name}-${hash}`;
 }
 
-/** Root directory for daemon state: ~/.lazy/daemon/ */
-export function getDaemonDir(): string {
+/** Root directory for all daemon state: ~/.lazy/daemon/ */
+export function getDaemonBaseDir(): string {
   return join(getHome(), '.lazy', 'daemon');
 }
 
-/** PID file: ~/.lazy/daemon/lazy.pid */
-export function getPidPath(): string {
-  return join(getDaemonDir(), 'lazy.pid');
+/** Per-project daemon directory: ~/.lazy/daemon/<slug>/ */
+export function getDaemonDir(projectRoot: string): string {
+  return join(getDaemonBaseDir(), projectSlug(projectRoot));
 }
 
-/** Unix socket: ~/.lazy/daemon/lazy.sock */
-export function getSocketPath(): string {
-  return join(getDaemonDir(), 'lazy.sock');
+/** PID file: ~/.lazy/daemon/<slug>/lazy.pid */
+export function getPidPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'lazy.pid');
 }
 
-/** Bearer token file: ~/.lazy/daemon/token */
-export function getTokenPath(): string {
-  return join(getDaemonDir(), 'token');
+/** Unix socket: ~/.lazy/daemon/<slug>/lazy.sock */
+export function getSocketPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'lazy.sock');
 }
 
-/** Daemon log file: ~/.lazy/daemon/daemon.log */
-export function getLogPath(): string {
-  return join(getDaemonDir(), 'daemon.log');
+/** Bearer token file: ~/.lazy/daemon/<slug>/token */
+export function getTokenPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'token');
 }
 
-/** Startup lock file: ~/.lazy/daemon/start.lock */
-export function getStartLockPath(): string {
-  return join(getDaemonDir(), 'start.lock');
+/** Daemon log file: ~/.lazy/daemon/<slug>/daemon.log */
+export function getLogPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'daemon.log');
+}
+
+/** Startup lock file: ~/.lazy/daemon/<slug>/start.lock
+ *  @deprecated Superseded by daemon.lock flock — kept for test compatibility. */
+export function getStartLockPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'start.lock');
+}
+
+/** Exclusive daemon lock file: ~/.lazy/daemon/<slug>/daemon.lock
+ *  Held by the running daemon for its entire lifetime via flock(2).
+ *  When the daemon exits (cleanly or via crash/SIGKILL), the OS releases
+ *  the lock automatically. This is the primary singleton enforcement. */
+export function getDaemonLockPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'daemon.lock');
 }

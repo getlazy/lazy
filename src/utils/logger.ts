@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from 'fs';
+import { appendFileSync, mkdirSync, statSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { getDataDir } from '../cli/init';
 
@@ -35,11 +35,20 @@ interface LoggerConfig {
   logFile?: string;
 }
 
+interface RotationConfig {
+  /** Maximum log file size in bytes before rotation (default: 10MB) */
+  maxBytes: number;
+  /** Number of rotated files to keep (default: 3) */
+  maxFiles: number;
+}
+
 class Logger {
   private config: LoggerConfig = {
     consoleLevel: LogLevel.INFO,
     fileLevel: LogLevel.DEBUG,
   };
+
+  private rotation: RotationConfig | null = null;
 
   configure(config: Partial<LoggerConfig>): void {
     this.config = { ...this.config, ...config };
@@ -53,11 +62,71 @@ class Logger {
     this.config.logFile = logFile;
   }
 
+  /**
+   * Enable log rotation for the configured logFile.
+   * Rotation is checked explicitly via checkRotation(), not on every write.
+   */
+  enableRotation(maxBytes: number = 10 * 1024 * 1024, maxFiles: number = 3): void {
+    this.rotation = { maxBytes, maxFiles };
+  }
+
+  /**
+   * Check if the log file needs rotation and rotate if so.
+   * Call this periodically (e.g., at the start of each reconcile tick)
+   * rather than on every write to avoid stat() overhead.
+   */
+  checkRotation(): void {
+    if (!this.rotation || !this.config.logFile) return;
+
+    try {
+      const stats = statSync(this.config.logFile);
+      if (stats.size >= this.rotation.maxBytes) {
+        this.rotateFiles();
+      }
+    } catch {
+      // File doesn't exist or can't be stat'd — nothing to rotate
+    }
+  }
+
+  /**
+   * Rotate log files: daemon.log → daemon.log.1 → daemon.log.2 → ...
+   * The oldest file beyond maxFiles is deleted.
+   * Safe for appendFileSync-based writes: each write reopens the file,
+   * so renaming the current file and creating a new one is atomic.
+   */
+  private rotateFiles(): void {
+    if (!this.rotation || !this.config.logFile) return;
+
+    const logFile = this.config.logFile;
+    const { maxFiles } = this.rotation;
+
+    try {
+      // Delete the oldest rotated file if it exists
+      const oldest = `${logFile}.${maxFiles}`;
+      try { unlinkSync(oldest); } catch { /* doesn't exist */ }
+
+      // Shift rotated files: .2 → .3, .1 → .2, etc.
+      for (let i = maxFiles - 1; i >= 1; i--) {
+        const from = `${logFile}.${i}`;
+        const to = `${logFile}.${i + 1}`;
+        try { renameSync(from, to); } catch { /* doesn't exist */ }
+      }
+
+      // Rotate current log file to .1
+      try { renameSync(logFile, `${logFile}.1`); } catch { /* doesn't exist */ }
+
+      // Next appendFileSync call will create a fresh logFile
+      appendFileSync(logFile, `${new Date().toISOString()} [INFO ] : Log rotated\n`);
+    } catch {
+      // Rotation failed — continue writing to existing file
+    }
+  }
+
   private writeToFile(level: string, message: string): void {
     if (this.config.logFile) {
       try {
         const timestamp = new Date().toISOString();
-        appendFileSync(this.config.logFile, `${timestamp} [${level}] ${message}\n`);
+        appendFileSync(this.config.logFile, `${timestamp} [${level.padEnd(5)}] : ${message}\n`);
       } catch {
         // Best effort logging
       }

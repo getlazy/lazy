@@ -33,20 +33,20 @@ function matchesProtectedPattern(filePath: string, patterns: string[]): boolean 
  * - The file is entirely new (status 'A' in git diff --name-status)
  * - All hunks in the diff are additions only (no '-' lines in the diff body)
  */
-function isPureAddition(
+async function isPureAddition(
   worktreePath: string,
   startSha: string,
   endSha: string,
   filePath: string,
   nameStatus: string,
-): boolean {
+): Promise<boolean> {
   // New file — always a pure addition
   if (nameStatus === 'A') {
     return true;
   }
 
   // For modified files, check if all hunks are additions only
-  const result = runGit(
+  const result = await runGit(
     ['diff', startSha, endSha, '--', filePath],
     { cwd: worktreePath },
   );
@@ -79,8 +79,8 @@ function isPureAddition(
  * Returns true if the file was present, false if it was not (i.e., it was
  * created by the task itself after branching).
  */
-function fileExistsAtSha(worktreePath: string, sha: string, filePath: string): boolean {
-  const result = runGit(
+async function fileExistsAtSha(worktreePath: string, sha: string, filePath: string): Promise<boolean> {
+  const result = await runGit(
     ['cat-file', '-e', `${sha}:${filePath}`],
     { cwd: worktreePath },
   );
@@ -96,13 +96,13 @@ function fileExistsAtSha(worktreePath: string, sha: string, filePath: string): b
  * When branchPointSha is provided, files that did not exist at the branch point
  * (i.e., files created by the task itself) are exempt from violation checks.
  */
-export function detectViolations(
+export async function detectViolations(
   worktreePath: string,
   startSha: string,
   endSha: string,
   protectedPatterns: string[],
   branchPointSha?: string,
-): FileViolation[] {
+): Promise<FileViolation[]> {
   log(`[permissions] detectViolations called: patterns=${JSON.stringify(protectedPatterns)}, startSha=${startSha.substring(0, 8)}, endSha=${endSha.substring(0, 8)}, branchPointSha=${branchPointSha?.substring(0, 8) ?? 'none'}`);
 
   if (protectedPatterns.length === 0) {
@@ -117,7 +117,7 @@ export function detectViolations(
 
   // Get list of changed files with their status
   log(`[permissions] Running: git diff --name-status ${startSha.substring(0, 8)} ${endSha.substring(0, 8)}`);
-  const result = runGit(
+  const result = await runGit(
     ['diff', '--name-status', startSha, endSha],
     { cwd: worktreePath },
   );
@@ -158,7 +158,7 @@ export function detectViolations(
     // If a branch point SHA is provided, check whether the file existed before the
     // task started. Files created by the task itself are exempt from violations —
     // the permission system protects pre-existing files, not agent-created ones.
-    if (branchPointSha && !fileExistsAtSha(worktreePath, branchPointSha, filePath)) {
+    if (branchPointSha && !await fileExistsAtSha(worktreePath, branchPointSha, filePath)) {
       log(`[permissions] Skipping ${filePath}: file did not exist at branch point ${branchPointSha.substring(0, 8)} (created by this task)`);
       continue;
     }
@@ -175,7 +175,7 @@ export function detectViolations(
     }
 
     // Check if the change is a pure addition
-    if (!isPureAddition(worktreePath, startSha, endSha, filePath, status)) {
+    if (!await isPureAddition(worktreePath, startSha, endSha, filePath, status)) {
       log(`[permissions] Violation: ${filePath} was modified (not a pure addition)`);
       violations.push({
         file: filePath,

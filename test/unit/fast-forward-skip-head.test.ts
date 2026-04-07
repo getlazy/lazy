@@ -17,7 +17,7 @@ import type { Task } from '../../src/storage/types';
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'sonnet' as const },
+  models: { default: 'claude-sonnet-4-5-20250929' },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -28,18 +28,28 @@ const mockConfig: ResolvedConfig = {
   remote: {
     driver: 'github',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const, docker_agent_no_network: false },
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
+  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential' as const,
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
+  },
 };
 
 const gitOk = (stdout = ''): GitResult => ({ stdout, stderr: '', exitCode: 0 });
@@ -50,8 +60,8 @@ describe('fastForwardBranch skips HEAD', () => {
   test('GitHubDriver.fetchRemoteState does not call git fetch for HEAD branch', async () => {
     const gitCalls: string[][] = [];
     const deps: DriverDeps = {
-      runGh: (): GhResult => ({ stdout: '', stderr: '', exitCode: 0 }),
-      runGit: (args: string[]): GitResult => {
+      runGh: async (): Promise<GhResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async (args: string[]): Promise<GitResult> => {
         gitCalls.push([...args]);
         // git fetch origin (initial fetch) — success
         if (args[0] === 'fetch' && args.length === 2) return gitOk();
@@ -90,8 +100,8 @@ describe('fastForwardBranch skips HEAD', () => {
     const gitCalls: string[][] = [];
     const gitlabConfig = { ...mockConfig, remote: { ...mockConfig.remote, driver: 'gitlab' as const } };
     const deps: GitLabDriverDeps = {
-      runGl: (): GlResult => ({ stdout: '', stderr: '', exitCode: 0 }),
-      runGit: (args: string[]): GitResult => {
+      runGl: async (): Promise<GlResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+      runGit: async (args: string[]): Promise<GitResult> => {
         gitCalls.push([...args]);
         if (args[0] === 'fetch' && args.length === 2) return gitOk();
         if (args[0] === 'rev-parse' && args[1] === '--verify') return gitOk();
@@ -143,6 +153,7 @@ function makeTask(metadata: Record<string, string>): Task {
     close_reason: null,
     model: null,
     metadata,
+    pending_sync: 0,
   };
 }
 
@@ -153,7 +164,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
     const glCalls: string[][] = [];
     const gitlabConfig = { ...mockConfig, remote: { ...mockConfig.remote, driver: 'gitlab' as const } };
     const deps: GitLabDriverDeps = {
-      runGl: (args: string[]): GlResult => {
+      runGl: async (args: string[]): Promise<GlResult> => {
         glCalls.push([...args]);
         // mr create — return a fake MR URL
         if (args[0] === 'mr' && args[1] === 'create') {
@@ -165,7 +176,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       },
-      runGit: (args: string[]): GitResult => {
+      runGit: async (args: string[]): Promise<GitResult> => {
         // symbolic-ref refs/remotes/origin/HEAD — return "develop" as default branch
         if (args[0] === 'symbolic-ref' && args[1]?.includes('remotes')) {
           return gitOk('refs/remotes/origin/develop');
@@ -192,7 +203,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
     const glCalls: string[][] = [];
     const gitlabConfig = { ...mockConfig, remote: { ...mockConfig.remote, driver: 'gitlab' as const } };
     const deps: GitLabDriverDeps = {
-      runGl: (args: string[]): GlResult => {
+      runGl: async (args: string[]): Promise<GlResult> => {
         glCalls.push([...args]);
         if (args[0] === 'mr' && args[1] === 'create') {
           return { stdout: 'https://gitlab.com/test/repo/-/merge_requests/1', stderr: '', exitCode: 0 };
@@ -202,7 +213,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       },
-      runGit: (args: string[]): GitResult => {
+      runGit: async (args: string[]): Promise<GitResult> => {
         // symbolic-ref fails — can't determine default branch
         if (args[0] === 'symbolic-ref' && args[1]?.includes('remotes')) {
           return { stdout: '', stderr: 'fatal: ref not found', exitCode: 1 };
@@ -227,7 +238,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
   test('GitHubDriver.markReadyForReview resolves HEAD target branch', async () => {
     const ghCalls: string[][] = [];
     const deps: DriverDeps = {
-      runGh: (args: string[]): GhResult => {
+      runGh: async (args: string[]): Promise<GhResult> => {
         ghCalls.push([...args]);
         // pr create — return a fake PR URL
         if (args[0] === 'pr' && args[1] === 'create') {
@@ -239,7 +250,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       },
-      runGit: (args: string[]): GitResult => {
+      runGit: async (args: string[]): Promise<GitResult> => {
         // symbolic-ref refs/remotes/origin/HEAD — return "develop" as default branch
         if (args[0] === 'symbolic-ref' && args[1]?.includes('remotes')) {
           return gitOk('refs/remotes/origin/develop');

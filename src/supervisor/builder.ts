@@ -22,7 +22,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync } from 'fs';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
 import { log, logError, setLogFile } from './log';
 
 // JSONL parsing for conversation capture
@@ -47,8 +47,10 @@ export interface BuilderSupervisorConfig {
   worktreePath: string;
   /** Path to a file containing the system prompt */
   systemPromptFile: string;
-  /** Path to the builder config JSON (host + port + token) */
+  /** Path to the builder config JSON (host + port + token) — used for conversation capture */
   builderConfigPath: string;
+  /** Path to the daemon MCP config JSON — routes MCP tool calls through daemon */
+  daemonConfigPath?: string;
   /** Additional args to pass to Claude Code */
   claudeExtraArgs?: string[];
   /** Debug mode */
@@ -82,7 +84,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   log(`[builder] Builder config loaded (host: ${builderConfig.host}, port: ${builderConfig.port})`);
 
   // Claude home for JSONL discovery
-  const claudeHome = homedir();
+  const claudeHome = getHome();
   const beforeTimes = getSessionFileTimes(claudeHome, config.worktreePath);
 
   // Build Claude args
@@ -107,6 +109,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
     stdin: 'inherit',
     stdout: 'inherit',
     stderr: 'inherit',
+    timeout: 0, // Long-running: builder Claude Code session can run for hours
   });
 
   const exitCode = await proc.exited;
@@ -120,14 +123,18 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
     console.error(`\nBuilder session: ${detectedSessionId}`);
   }
 
-  // Signal shutdown to host HTTP server
-  try {
-    const { signalShutdown } = await import('../builder/client');
-    await signalShutdown(builderConfig.host, builderConfig.port, builderConfig.token);
-    log('[builder] Shutdown signal sent to host');
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logError(`[builder] Failed to signal shutdown: ${msg}`);
+  // Signal shutdown to host HTTP server (host-process mode without daemon MCP proxy)
+  if (!config.daemonConfigPath) {
+    try {
+      const { signalShutdown } = await import('../builder/client');
+      await signalShutdown(builderConfig.host, builderConfig.port, builderConfig.token);
+      log('[builder] Shutdown signal sent to host');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logError(`[builder] Failed to signal shutdown: ${msg}`);
+    }
+  } else {
+    log('[builder] Using daemon MCP proxy — no shutdown signal needed');
   }
 
   process.exit(exitCode);

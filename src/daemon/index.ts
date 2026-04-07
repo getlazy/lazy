@@ -4,21 +4,26 @@
  * Re-exports the key functions needed by CLI commands and auto-start.
  */
 
-export { getDaemonDir, getPidPath, getSocketPath, getTokenPath, getLogPath } from './paths';
+export { getDaemonBaseDir, getDaemonDir, getPidPath, getSocketPath, getTokenPath, getLogPath, getDaemonLockPath, projectSlug } from './paths';
 export {
-  checkDaemonProcess,
   checkDaemonHealth,
+  isDaemonRunning,
+  isProcessAlive,
   requestShutdown,
   waitForDaemon,
   readPid,
   readToken,
   cleanupStaleFiles,
-  acquireStartLock,
-  releaseStartLock,
+  acquireDaemonLock,
+  releaseDaemonLock,
+  blockingFlock,
   type DaemonStatus,
 } from './lifecycle';
 export { startDaemonServer, type RunningDaemon, type DaemonServerOptions } from './server';
 export { ensureDaemon } from './auto-start';
-export { DaemonClient, tryRpc } from './client';
-export { queryTaskList, queryBlockedTasks, queryActiveTasks, queryTaskShow, querySearch, queryDiff, queryWait } from './rpc-fallback';
-export type { ListResult, ShowResult, SearchQueryResult, DiffResult, WaitResult } from './rpc-fallback';
+export { DaemonClient, DaemonNotRunningError, tryRpc } from './client';
+export { setDaemonContext, getDaemonContext } from './context';
+export { queryTaskList, queryBlockedTasks, queryActiveTasks, queryTaskShow, querySearch, queryDiff, queryWait, queryStartTask, queryDaemonMcpConfig } from './rpc-fallback';
+export type { ListResult, ShowResult, SearchQueryResult, DiffResult, WaitResult, StartTaskRpcResult, DaemonMcpConfigResult } from './rpc-fallback';
+export type { AutoReactTrigger, AutoReactDecision } from './auto-react-budget';
+export type { AutoReactBudgetEntry } from './lifecycle';

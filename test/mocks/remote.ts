@@ -5,21 +5,38 @@
  * whose importUrl resolves to the parsed JSON from that env var.
  * This allows link command e2e tests without needing real GitHub access.
  *
+ * When LAZY_MOCK_ACCEPT_GATES is set, checkAcceptGates returns the parsed
+ * JSON array from that env var. This allows accept gate e2e tests without
+ * needing real CI/review state.
+ *
  * This module replaces src/remote/index.ts via mock.module in preload-mocks.ts.
  * It only needs to export createDriver (the only import link.ts uses from remote).
  * Other exports are stubbed to avoid circular imports.
  */
 
-import type { ImportResult } from '../../src/remote/driver';
+import type { ImportResult, AcceptGateWarning } from '../../src/remote/driver';
 import type { RepositoryDriver } from '../../src/remote/driver';
 
 const mockImportJson = process.env.LAZY_MOCK_IMPORT_RESULT;
+const mockAcceptGatesJson = process.env.LAZY_MOCK_ACCEPT_GATES;
+const mockProtectedBranch = process.env.LAZY_MOCK_PROTECTED_BRANCH === '1';
+const mockHasExternalApproval = process.env.LAZY_MOCK_HAS_EXTERNAL_APPROVAL === '1';
+// Opt-in to remote driver behavior (needsSync=true). Required for tests that
+// exercise code paths gated on driver.needsSync (e.g., protected branch checks,
+// push-before-merge). Separate from other mock env vars because needsSync=true
+// triggers validateBranchInSyncWithRemote in preflight, which does real git
+// operations and would break tests without a real remote.
+const mockNeedsSync = process.env.LAZY_MOCK_NEEDS_SYNC === '1';
 
-function buildMockDriver(mockResult: ImportResult): RepositoryDriver {
+function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
+  const gateWarnings: AcceptGateWarning[] = mockAcceptGatesJson
+    ? JSON.parse(mockAcceptGatesJson)
+    : [];
+
   return {
-    needsSync: false,
+    needsSync: mockNeedsSync,
     canImport: (_url: string) => true,
-    importUrl: async (_url: string, _opts: unknown) => mockResult,
+    importUrl: async (_url: string, _opts: unknown) => mockResult!,
     merge: async () => ({ status: 'merged' as const }),
     getChecksStatus: async () => ({ status: 'passed' as const }),
     waitForChecks: async () => ({ passed: true as const }),
@@ -37,7 +54,11 @@ function buildMockDriver(mockResult: ImportResult): RepositoryDriver {
     getConfigOptions: () => ({ valid: [], deprecated: [] }),
     getTaskUrl: async () => null,
     hasRemoteRef: () => false,
+    recoverRemoteRef: async () => null,
     validateAccept: () => null,
+    isTargetBranchProtected: async () => mockProtectedBranch,
+    hasExternalApproval: async () => mockHasExternalApproval,
+    checkAcceptGates: async () => gateWarnings,
     resolveUpstreamRef: async (branch: string) => branch,
     fastForwardLocal: async () => ({ success: true }),
     fetchRemoteState: async () => {},
@@ -58,7 +79,7 @@ function buildMockDriver(mockResult: ImportResult): RepositoryDriver {
 }
 
 const _mockResult = mockImportJson ? JSON.parse(mockImportJson) as ImportResult : null;
-const _mockDriver = _mockResult ? buildMockDriver(_mockResult) : null;
+const _mockDriver = (mockImportJson || mockAcceptGatesJson || mockProtectedBranch || mockNeedsSync) ? buildMockDriver(_mockResult) : null;
 
 export function createDriver(_config: unknown): RepositoryDriver {
   return _mockDriver!;

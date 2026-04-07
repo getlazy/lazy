@@ -283,14 +283,14 @@ describeWithPg('PostgresStorage', () => {
       sequence: 1,
       role: 'agent',
       content: 'I fixed the bug',
-      model: 'sonnet',
+      model: 'claude-sonnet-4-5-20250929',
     });
 
     const turns = await storage.getSessionTurns(session.id);
     expect(turns).toHaveLength(2);
     expect(turns[0].role).toBe('human');
     expect(turns[1].role).toBe('agent');
-    expect(turns[1].model).toBe('sonnet');
+    expect(turns[1].model).toBe('claude-sonnet-4-5-20250929');
     expect(typeof turns[0].timestamp).toBe('number');
   });
 

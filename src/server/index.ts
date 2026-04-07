@@ -6,15 +6,11 @@
  */
 
 import type { Storage, Task, Session, StatusChange } from '../storage';
-import { createStorage } from '../storage';
 import { findLazyRoot } from '../cli/init';
+import { tryRemoteStorage } from '../cli/helpers';
 import { getCommitDiff } from '../git/operations';
 import { logger } from '../utils/logger';
-import { getLazyCommand } from '../utils/cli-path';
-import { reconcileTasks } from '../utils/reconcile';
-import { loadConfig } from '../config/loader';
-import { createDriver } from '../remote';
-import { spawn } from '../utils/spawn';
+
 import {
   taskListHtml,
   taskDetailHtml,
@@ -49,7 +45,7 @@ function getViewMode(url: URL): 'side-by-side' | 'unified' {
   return view === 'unified' ? 'unified' : 'side-by-side';
 }
 
-type SortField = 'status' | 'model' | 'last_active' | 'duration' | 'tokens' | 'goal' | 'created';
+type SortField = 'status' | 'model' | 'turns' | 'last_active' | 'duration' | 'tokens' | 'goal' | 'created';
 type SortDirection = 'asc' | 'desc';
 
 interface SortConfig {
@@ -77,7 +73,7 @@ function parseSortParam(sort: string | null, filter: string): SortConfig {
 }
 
 function sortTasks(
-  tasksWithSessions: { task: Task; session: Session | null }[],
+  tasksWithSessions: { task: Task; session: Session | null; turnCount?: number }[],
   sortConfig: SortConfig,
 ): void {
   const dir = sortConfig.direction === 'desc' ? -1 : 1;
@@ -109,6 +105,12 @@ function sortTasks(
         if (aTime === null || bTime === null) {
           return cmp || (b.task.created_at - a.task.created_at);
         }
+        break;
+      }
+      case 'turns': {
+        const aTurns = (a as { turnCount?: number }).turnCount ?? 0;
+        const bTurns = (b as { turnCount?: number }).turnCount ?? 0;
+        cmp = aTurns - bTurns;
         break;
       }
       case 'duration': {
@@ -360,7 +362,7 @@ async function handleDashboard(storage: Storage): Promise<Response> {
 
   // Blocked tasks needing attention
   const blockedTasks = allWithSessions
-    .filter(({ task }) => task.status === 'blocked' || task.status === 'conflict' || task.status === 'pairing')
+    .filter(({ task }) => task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted' || task.status === 'pairing')
     .sort((a, b) => {
       const aTime = a.session?.last_interaction_at ?? a.task.created_at;
       const bTime = b.session?.last_interaction_at ?? b.task.created_at;
@@ -427,11 +429,12 @@ async function handleTaskList(storage: Storage, url: URL): Promise<Response> {
       break;
   }
 
-  // Fetch sessions for each task
+  // Fetch sessions and turn counts for each task
   const tasksWithSessions = await Promise.all(
     tasks.map(async (task) => ({
       task,
       session: await storage.getSessionByTaskId(task.id),
+      turnCount: await storage.getTurnCountByTaskId(task.id),
     }))
   );
 
@@ -476,7 +479,7 @@ async function handleCommitDetail(storage: Storage, taskId: string, commitId: st
   }
 
   // Fetch diff from git on demand (no longer stored in commits.json)
-  const diffText = getCommitDiff(commit.sha);
+  const diffText = await getCommitDiff(commit.sha);
   const viewMode = getViewMode(url);
 
   return html(commitDetailHtml(task, commit, diffText, viewMode));
@@ -649,151 +652,15 @@ function matchRoute(path: string, pattern: string): Record<string, string> | nul
 
 const MAX_PORT_ATTEMPTS = 100;
 
-
 /**
- * Start a background sync loop that spawns `lazy sync` as a subprocess.
- * Returns a cleanup function that stops the loop.
+ * Create the web dashboard request handler for a given storage instance.
  *
- * Running sync in a subprocess prevents it from blocking the web server's
- * event loop. Sync involves synchronous git operations (Bun.spawnSync)
- * and GitHub API calls that would otherwise freeze HTTP request handling.
- *
- * - Skips a tick if the previous sync is still running
- * - Errors are logged but never crash the server
- * - First sync runs after 5s delay
- * - Does nothing if sync_interval is 0 or driver.needsSync is false
+ * This handler serves HTML pages and JSON API endpoints for the web dashboard.
+ * It's used by both the standalone `lazy server` command and the daemon's
+ * TCP-bound web server.
  */
-function startSyncLoop(
-  root: string,
-  intervalSeconds: number,
-): () => void {
-  const config = loadConfig(root);
-  const driver = createDriver(config);
-
-  if (!driver.needsSync) {
-    logger.debug('Background sync disabled: driver does not need sync');
-    return () => {};
-  }
-
-  if (intervalSeconds <= 0) {
-    logger.debug('Background sync disabled: sync_interval is 0');
-    return () => {};
-  }
-
-  let syncing = false;
-  let stopped = false;
-
-  const doSync = async () => {
-    if (stopped) return;
-    if (syncing) {
-      logger.debug('Background sync: skipping tick, previous sync still running');
-      return;
-    }
-    syncing = true;
-    try {
-      const cmd = getLazyCommand();
-      const proc = spawn([...cmd, 'sync'], {
-        cwd: root,
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: { ...process.env },
-      });
-      await proc.exited;
-      if (proc.exitCode !== 0) {
-        const stderr = await new Response(proc.stderr).text();
-        logger.debug(`Background sync exited with code ${proc.exitCode}: ${stderr.trim()}`);
-      }
-    } catch (err) {
-      logger.debug(`Background sync error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      syncing = false;
-    }
-  };
-
-  // First sync after a short delay to let the server finish starting
-  const initialTimeout = setTimeout(doSync, 5_000);
-
-  // Subsequent syncs on the configured interval
-  const intervalId = setInterval(doSync, intervalSeconds * 1_000);
-
-  logger.info(`Background sync enabled: every ${intervalSeconds}s`);
-
-  return () => {
-    stopped = true;
-    clearTimeout(initialTimeout);
-    clearInterval(intervalId);
-  };
-}
-
-/**
- * Start a periodic reconciliation loop.
- * Returns a cleanup function that stops the loop.
- *
- * Previously reconcileTasks ran on EVERY HTTP request, blocking request
- * handling while it checked Docker containers and ran git operations.
- * This loop runs it periodically instead, keeping the request handler fast.
- *
- * - Skips a tick if the previous reconcile is still running
- * - Errors are logged but never crash the server
- * - First reconcile runs after 1s delay
- */
-function startReconcileLoop(
-  root: string,
-  storage: Storage,
-  intervalSeconds: number,
-): () => void {
-  let reconciling = false;
-  let stopped = false;
-
-  const doReconcile = async () => {
-    if (stopped) return;
-    if (reconciling) {
-      logger.debug('Background reconcile: skipping tick, previous reconcile still running');
-      return;
-    }
-    reconciling = true;
-    try {
-      await reconcileTasks(storage, root);
-    } catch (err) {
-      logger.debug(`Background reconcile error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      reconciling = false;
-    }
-  };
-
-  // First reconcile shortly after server start
-  const initialTimeout = setTimeout(doReconcile, 1_000);
-
-  // Subsequent reconciles on interval
-  const intervalId = setInterval(doReconcile, intervalSeconds * 1_000);
-
-  logger.debug(`Background reconcile enabled: every ${intervalSeconds}s`);
-
-  return () => {
-    stopped = true;
-    clearTimeout(initialTimeout);
-    clearInterval(intervalId);
-  };
-}
-
-export async function startServer(port: number): Promise<void> {
-  const root = findLazyRoot();
-  if (!root) {
-    console.error('Error: not in a lazy project. Run `lazy init` first.');
-    process.exit(1);
-  }
-
-  const storage = await createStorage(root);
-
-  // Start background sync loop (runs as subprocess to avoid blocking event loop)
-  const config = loadConfig(root);
-  const stopSyncLoop = startSyncLoop(root, config.server.sync_interval);
-
-  // Start background reconcile loop (runs periodically instead of per-request)
-  const RECONCILE_INTERVAL_SECONDS = 5;
-  const stopReconcileLoop = startReconcileLoop(root, storage, RECONCILE_INTERVAL_SECONDS);
-
-  const requestHandler = async (req: Request) => {
+export function createWebRequestHandler(storage: Storage): (req: Request) => Promise<Response> {
+  return async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -867,22 +734,31 @@ export async function startServer(port: number): Promise<void> {
       return html(errorHtml('Server Error', message), 500);
     }
   };
+}
 
-  // Try to bind to the configured port, auto-incrementing on EADDRINUSE
-  let server: ReturnType<typeof Bun.serve> | null = null;
+/**
+ * Try to bind an HTTP server to a TCP port with auto-increment on conflict.
+ * Returns the server instance, or null if all ports were exhausted.
+ */
+export function tryBindTcpPort(
+  port: number,
+  handler: (req: Request) => Promise<Response>,
+  maxAttempts: number = MAX_PORT_ATTEMPTS,
+): { server: ReturnType<typeof Bun.serve>; lastError: unknown } | null {
   let lastError: unknown = null;
 
-  for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const tryPort = port + attempt;
     try {
-      server = Bun.serve({
+      const server = Bun.serve({
         port: tryPort,
-        fetch: requestHandler,
+        fetch: handler,
+        idleTimeout: 120,
       });
       if (tryPort !== port) {
         logger.info(`Port ${port} was busy, using port ${tryPort} instead`);
       }
-      break;
+      return { server, lastError: null };
     } catch (err) {
       lastError = err;
       const isAddrInUse =
@@ -896,16 +772,34 @@ export async function startServer(port: number): Promise<void> {
     }
   }
 
-  if (!server) {
+  return null;
+}
+
+export async function startServer(port: number): Promise<void> {
+  const root = findLazyRoot();
+  if (!root) {
+    console.error('Error: not in a lazy project. Run `lazy init` first.');
+    process.exit(1);
+  }
+
+  const storage = await tryRemoteStorage(root);
+  if (!storage) {
+    console.error('Error: Daemon is not running. Start it with: lazy daemon start');
+    process.exit(1);
+  }
+
+  const requestHandler = createWebRequestHandler(storage);
+
+  const result = tryBindTcpPort(port, requestHandler);
+  if (!result) {
     console.error(
       `Error: Could not find an available port (tried ${port}–${port + MAX_PORT_ATTEMPTS - 1}).`,
     );
-    if (lastError instanceof Error) {
-      console.error(`Last error: ${lastError.message}`);
-    }
     await storage.close();
     process.exit(1);
   }
+
+  const server = result.server;
 
   logger.info(`Lazy server running at http://localhost:${server.port}`);
   console.log(`Lazy server running at http://localhost:${server.port}`);
@@ -914,8 +808,6 @@ export async function startServer(port: number): Promise<void> {
   // Graceful shutdown handler
   const shutdown = async () => {
     logger.info('Shutting down server...');
-    stopSyncLoop();
-    stopReconcileLoop();
     server!.stop();
     await storage.close();
     process.exit(0);

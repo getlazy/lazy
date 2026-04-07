@@ -1,6 +1,6 @@
 import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef } from '../helpers';
 import type { Task, Session, Storage } from '../../storage';
-import { reconcileTasks } from '../../utils/reconcile';
+
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { createRunner } from '../../runner';
 import { getDataDir } from '../init';
@@ -17,7 +17,7 @@ export interface TaskWithSession {
 }
 
 export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: string): Promise<TaskWithSession[]> {
-  const runner = createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot);
   const taskMap = new Map<string, TaskWithSession>();
 
   // Create nodes for all tasks
@@ -139,6 +139,11 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   // Add crashed indicator
   if (node.crashed) {
     status = `${status} [CRASHED]`;
+  }
+
+  // Add auto-react paused indicator
+  if (task.metadata?.auto_react_paused === 'true') {
+    status = `${status} [AUTO-REACT PAUSED]`;
   }
 
   // Tree drawing characters
@@ -286,7 +291,6 @@ export async function commandActive(args: string[]): Promise<void> {
       let done = false;
       while (!done) {
         process.stdout.write('\x1B[2J\x1B[H');
-        await reconcileTasks(storage, root);
         const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
         if (tasks.length === 0) {
           console.log('No active tasks.');

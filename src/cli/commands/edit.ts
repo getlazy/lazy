@@ -1,7 +1,7 @@
 import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit } from '../helpers';
 import { openEditor, promptLine, promptYesNo, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { isTerminalStatus, VALID_TASK_TYPES } from '../../types';
-import type { ModelName, Task, TaskType } from '../../types';
+import type { Task, TaskType } from '../../types';
 import type { Storage } from '../../storage/interface';
 
 /**
@@ -66,7 +66,7 @@ export async function commandEdit(args: string[]): Promise<void> {
 
     let newGoal: string | null = null;
     let newPrompt: string | null = null;
-    let newModel: ModelName | null = null;
+    let newModel: string | null = null;
     let newType: TaskType | null = null;
     let newCode: string | null | undefined = undefined; // undefined = no change, null = clear, string = new code
     let newParent: string | null | undefined = undefined; // undefined = no change, null = clear, string = new parent ID
@@ -261,7 +261,7 @@ Arguments:
 Options:
   --goal <goal>      New goal
   --prompt <text>    New prompt
-  --model <model>    Change model (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Change model (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --type <type>      Change task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Warning: changing type after prompt is set may lead to mismatched expectations
   --code <code>      Set or change the task code (pass "" to clear)
@@ -274,7 +274,7 @@ Examples:
   lazy edit abc123                           # Interactive mode
   lazy edit abc123 --goal "New goal"
   lazy edit abc123 --prompt "Updated spec"
-  lazy edit abc123 --model opus
+  lazy edit abc123 --model claude-opus-4-6
   lazy edit abc123 --type refactor           # Change to refactor task
   lazy edit abc123 --code fix-auth
   lazy edit abc123 --code ""                 # Clear the code

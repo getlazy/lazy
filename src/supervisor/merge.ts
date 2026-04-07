@@ -19,16 +19,53 @@ import { log, logError } from './log';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
+import mergeConflictResolutionResumeTemplate from '../prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
 import remoteBranchMergeTemplate from '../prompts/remote-branch-merge.md' with { type: 'text' };
+import remoteBranchMergeResumeTemplate from '../prompts/remote-branch-merge-resume.md' with { type: 'text' };
 
 /** Maximum retries for Claude Code merge resolution failures */
 const MERGE_MAX_RETRIES = 2;
+
+/**
+ * Build the CLI arguments for Claude Code merge conflict resolution.
+ * Exported for testing — callers should use runSyncWithUpstream instead.
+ *
+ * @param prompt The merge prompt to use
+ * @param modelId Optional model override
+ * @param agentSessionId Optional session ID for --resume
+ * @param useResume Whether to use --resume mode
+ */
+export function buildMergeClaudeArgs(
+  prompt: string,
+  modelId?: string,
+  agentSessionId?: string,
+  useResume: boolean = false,
+): string[] {
+  const args = [
+    'claude', '-p', prompt,
+    '--output-format', 'json',
+    '--dangerously-skip-permissions',
+  ];
+
+  if (useResume && agentSessionId) {
+    args.push('--resume', agentSessionId);
+  }
+
+  if (modelId) {
+    args.push('--model', modelId);
+  }
+
+  return args;
+}
 
 /**
  * Run the sync-with-upstream phase (merge upstream and resolve conflicts).
  * @param worktreePath Working directory (the task's worktree)
  * @param parentBranch Branch to merge from
  * @param modelId Optional model override
+ * @param agentSessionId Optional existing agent session ID — when provided, conflict
+ *   resolution uses `claude --resume` so the agent has full context from prior work.
+ *   Falls back to standalone `claude -p` if resume fails or is not provided.
  * @returns Array of merge conflicts captured before resolution (empty if clean merge)
  * @throws If merge fails and cannot be resolved
  */
@@ -36,18 +73,19 @@ export async function runSyncWithUpstream(
   worktreePath: string,
   parentBranch: string,
   modelId?: string,
+  agentSessionId?: string,
 ): Promise<MergeConflict[]> {
   log(`[merge] Merging ${parentBranch} into current branch...`);
 
   // Check if parent branch has changes to merge
-  const hasChanges = checkUpstreamChanges(parentBranch, worktreePath);
+  const hasChanges = await checkUpstreamChanges(parentBranch, worktreePath);
   if (!hasChanges) {
     log('[merge] No upstream changes to merge.');
     return [];
   }
 
   // Attempt a clean merge first
-  const mergeResult = runGit(
+  const mergeResult = await runGit(
     ['merge', parentBranch, '--no-ff', '-m', `Merge ${parentBranch}`],
     { cwd: worktreePath },
   );
@@ -59,42 +97,47 @@ export async function runSyncWithUpstream(
 
   // Merge has conflicts — capture conflicted files before aborting
   log('[merge] Merge has conflicts. Using Claude Code to resolve...');
-  const conflicts = captureConflicts(worktreePath, parentBranch);
+  const conflicts = await captureConflicts(worktreePath, parentBranch);
 
-  runGit(['merge', '--abort'], { cwd: worktreePath });
+  await runGit(['merge', '--abort'], { cwd: worktreePath });
 
   // Run Claude Code with a scoped merge-only prompt (with retries)
-  const mergePrompt = mergeConflictResolutionTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
+  // When resuming an existing session, use a shorter prompt that leverages prior context
+  const standalonePrompt = mergeConflictResolutionTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
+  const resumePrompt = mergeConflictResolutionResumeTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
 
-  const claudeArgs = [
-    'claude', '-p', mergePrompt,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (modelId) {
-    claudeArgs.push('--model', modelId);
+  function buildClaudeArgs(shouldResume: boolean): string[] {
+    const prompt = shouldResume ? resumePrompt : standalonePrompt;
+    return buildMergeClaudeArgs(prompt, modelId, agentSessionId, shouldResume);
   }
 
   // Record HEAD before Claude runs so we can verify it advanced
-  const preMergeSha = getHeadSha(worktreePath);
+  const preMergeSha = await getHeadSha(worktreePath);
   log(`[merge] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
 
+  // Track whether we should try resuming. Start with resume if session exists.
+  let useResume = !!agentSessionId;
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= MERGE_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       log(`[merge] Retrying Claude Code for conflict resolution (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})...`);
       // Ensure any stale merge state is cleaned up before retry
-      abortMergeIfInProgress(worktreePath);
+      await abortMergeIfInProgress(worktreePath);
     } else {
       log('[merge] Running Claude Code for conflict resolution...');
     }
 
+    if (useResume) {
+      log(`[merge] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
+    }
+
+    const claudeArgs = buildClaudeArgs(useResume);
     const proc = spawn(claudeArgs, {
       cwd: worktreePath,
       stdout: 'pipe',
       stderr: 'pipe',
+      timeout: 0, // Long-running: merge conflict resolution can take minutes
       env: process.env as Record<string, string>,
     });
 
@@ -110,34 +153,45 @@ export async function runSyncWithUpstream(
     if (exitCode !== 0) {
       logError(`[merge] Claude Code failed with exit code ${exitCode} (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})`);
       logError(`[merge] stderr: ${stderr.slice(-500)}`);
-      abortMergeIfInProgress(worktreePath);
+      await abortMergeIfInProgress(worktreePath);
+
+      // If we were using --resume and it failed, fall back to standalone mode
+      // (session may be expired or not found) and don't count this as a retry
+      if (useResume) {
+        log('[merge] Resume failed — falling back to standalone Claude Code...');
+        useResume = false;
+        // Rewind attempt counter so this doesn't count against retries
+        attempt--;
+        continue;
+      }
+
       lastError = new Error(`Merge-and-fix Claude Code exited with code ${exitCode}`);
       continue;
     }
 
     // Verify the merge was actually completed:
     // 1. No unmerged files remain
-    const statusResult = runGit(
+    const statusResult = await runGit(
       ['diff', '--name-only', '--diff-filter=U'],
       { cwd: worktreePath },
     );
 
     const unmergedFiles = statusResult.stdout;
     if (unmergedFiles) {
-      abortMergeIfInProgress(worktreePath);
+      await abortMergeIfInProgress(worktreePath);
       lastError = new Error(`Merge-and-fix incomplete. Unmerged files remain:\n${unmergedFiles}`);
       continue;
     }
 
     // 2. MERGE_HEAD should not exist (merge was committed, not left in progress)
-    if (hasMergeInProgress(worktreePath)) {
-      abortMergeIfInProgress(worktreePath);
+    if (await hasMergeInProgress(worktreePath)) {
+      await abortMergeIfInProgress(worktreePath);
       lastError = new Error('Merge-and-fix incomplete: merge is still in progress (MERGE_HEAD exists). Claude resolved conflicts but did not commit the merge.');
       continue;
     }
 
     // 3. HEAD must have advanced (a merge commit was actually created)
-    const postMergeSha = getHeadSha(worktreePath);
+    const postMergeSha = await getHeadSha(worktreePath);
     if (postMergeSha === preMergeSha) {
       lastError = new Error('Merge-and-fix incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
       continue;
@@ -149,7 +203,7 @@ export async function runSyncWithUpstream(
   }
 
   // All retries exhausted
-  abortMergeIfInProgress(worktreePath);
+  await abortMergeIfInProgress(worktreePath);
   throw lastError ?? new Error('Merge-and-fix failed after all retries');
 }
 
@@ -161,6 +215,9 @@ export async function runSyncWithUpstream(
  * @param worktreePath Working directory (the task's worktree)
  * @param remoteBranch Remote tracking ref to merge (e.g., "origin/lazy/abc12345")
  * @param modelId Optional model override
+ * @param agentSessionId Optional existing agent session ID — when provided, conflict
+ *   resolution uses `claude --resume` so the agent has full context from prior work.
+ *   Falls back to standalone `claude -p` if resume fails or is not provided.
  * @returns Array of merge conflicts captured before resolution (empty if clean merge)
  * @throws If merge fails and cannot be resolved
  */
@@ -168,18 +225,19 @@ export async function runSyncWithRemote(
   worktreePath: string,
   remoteBranch: string,
   modelId?: string,
+  agentSessionId?: string,
 ): Promise<MergeConflict[]> {
   log(`[remote-sync] Merging ${remoteBranch} into current branch...`);
 
   // Check if remote branch has changes to merge
-  const hasChanges = checkRemoteChanges(remoteBranch, worktreePath);
+  const hasChanges = await checkRemoteChanges(remoteBranch, worktreePath);
   if (!hasChanges) {
     log('[remote-sync] No remote changes to merge.');
     return [];
   }
 
   // Attempt a clean merge first
-  const mergeResult = runGit(
+  const mergeResult = await runGit(
     ['merge', remoteBranch, '--no-ff', '-m', `Merge ${remoteBranch}`],
     { cwd: worktreePath },
   );
@@ -191,32 +249,34 @@ export async function runSyncWithRemote(
 
   // Merge has conflicts — capture conflicted files before aborting
   log('[remote-sync] Merge has conflicts. Using Claude Code to resolve...');
-  const conflicts = captureConflicts(worktreePath, remoteBranch);
+  const conflicts = await captureConflicts(worktreePath, remoteBranch);
 
-  runGit(['merge', '--abort'], { cwd: worktreePath });
+  await runGit(['merge', '--abort'], { cwd: worktreePath });
 
   // Run Claude Code with a scoped merge-only prompt
-  const mergePrompt = remoteBranchMergeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
-
-  const claudeArgs = [
-    'claude', '-p', mergePrompt,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (modelId) {
-    claudeArgs.push('--model', modelId);
-  }
+  // When resuming an existing session, use a shorter prompt that leverages prior context
+  const standalonePrompt = remoteBranchMergeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
+  const resumePrompt = remoteBranchMergeResumeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
 
   // Record HEAD before Claude runs so we can verify it advanced
-  const preMergeSha = getHeadSha(worktreePath);
+  const preMergeSha = await getHeadSha(worktreePath);
   log(`[remote-sync] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
+
+  let useResume = !!agentSessionId;
+
+  if (useResume) {
+    log(`[remote-sync] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
+  }
   log('[remote-sync] Running Claude Code for conflict resolution...');
+
+  const prompt = useResume ? resumePrompt : standalonePrompt;
+  let claudeArgs = buildMergeClaudeArgs(prompt, modelId, agentSessionId, useResume);
 
   const proc = spawn(claudeArgs, {
     cwd: worktreePath,
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: 0, // Long-running: merge conflict resolution can take minutes
     env: process.env as Record<string, string>,
   });
 
@@ -232,31 +292,64 @@ export async function runSyncWithRemote(
   if (exitCode !== 0) {
     logError(`[remote-sync] Claude Code failed with exit code ${exitCode}`);
     logError(`[remote-sync] stderr: ${stderr.slice(-500)}`);
-    abortMergeIfInProgress(worktreePath);
-    throw new Error(`Sync-with-remote Claude Code exited with code ${exitCode}`);
+    await abortMergeIfInProgress(worktreePath);
+
+    // If we were using --resume and it failed, fall back to standalone mode
+    if (useResume) {
+      log('[remote-sync] Resume failed — falling back to standalone Claude Code...');
+      useResume = false;
+      const fallbackPrompt = standalonePrompt;
+      claudeArgs = buildMergeClaudeArgs(fallbackPrompt, modelId, undefined, false);
+
+      const fallbackProc = spawn(claudeArgs, {
+        cwd: worktreePath,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 0, // Long-running: merge conflict resolution can take minutes
+        env: process.env as Record<string, string>,
+      });
+
+      const fallbackOutputPromise = new Response(fallbackProc.stdout).text();
+      const fallbackStderrPromise = new Response(fallbackProc.stderr).text();
+
+      const [fallbackOutput, fallbackStderr, fallbackExitCode] = await Promise.all([
+        fallbackOutputPromise,
+        fallbackStderrPromise,
+        fallbackProc.exited,
+      ]);
+
+      if (fallbackExitCode !== 0) {
+        logError(`[remote-sync] Fallback Claude Code failed with exit code ${fallbackExitCode}`);
+        logError(`[remote-sync] stderr: ${fallbackStderr.slice(-500)}`);
+        await abortMergeIfInProgress(worktreePath);
+        throw new Error(`Sync-with-remote Claude Code exited with code ${fallbackExitCode}`);
+      }
+    } else {
+      throw new Error(`Sync-with-remote Claude Code exited with code ${exitCode}`);
+    }
   }
 
   // Verify the merge was actually completed:
   // 1. No unmerged files remain
-  const statusResult = runGit(
+  const statusResult = await runGit(
     ['diff', '--name-only', '--diff-filter=U'],
     { cwd: worktreePath },
   );
 
   const unmergedFiles = statusResult.stdout;
   if (unmergedFiles) {
-    abortMergeIfInProgress(worktreePath);
+    await abortMergeIfInProgress(worktreePath);
     throw new Error(`Sync-with-remote incomplete. Unmerged files remain:\n${unmergedFiles}`);
   }
 
   // 2. MERGE_HEAD should not exist (merge was committed, not left in progress)
-  if (hasMergeInProgress(worktreePath)) {
-    abortMergeIfInProgress(worktreePath);
+  if (await hasMergeInProgress(worktreePath)) {
+    await abortMergeIfInProgress(worktreePath);
     throw new Error('Sync-with-remote incomplete: merge is still in progress (MERGE_HEAD exists). Claude resolved conflicts but did not commit the merge.');
   }
 
   // 3. HEAD must have advanced (a merge commit was actually created)
-  const postMergeSha = getHeadSha(worktreePath);
+  const postMergeSha = await getHeadSha(worktreePath);
   if (postMergeSha === preMergeSha) {
     throw new Error('Sync-with-remote incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
   }
@@ -272,8 +365,8 @@ export async function runSyncWithRemote(
  * Reads files listed by `git diff --name-only --diff-filter=U` which contain
  * conflict markers (<<<<<<< / ======= / >>>>>>>).
  */
-function captureConflicts(worktreePath: string, mergeSource: string): MergeConflict[] {
-  const result = runGit(
+async function captureConflicts(worktreePath: string, mergeSource: string): Promise<MergeConflict[]> {
+  const result = await runGit(
     ['diff', '--name-only', '--diff-filter=U'],
     { cwd: worktreePath },
   );
@@ -299,8 +392,8 @@ function captureConflicts(worktreePath: string, mergeSource: string): MergeConfl
   return conflicts;
 }
 
-function checkRemoteChanges(remoteBranch: string, cwd: string): boolean {
-  const result = runGit(
+async function checkRemoteChanges(remoteBranch: string, cwd: string): Promise<boolean> {
+  const result = await runGit(
     ['rev-list', '--count', `HEAD..${remoteBranch}`],
     { cwd },
   );
@@ -314,8 +407,8 @@ function checkRemoteChanges(remoteBranch: string, cwd: string): boolean {
   return count > 0;
 }
 
-function getHeadSha(cwd: string): string {
-  const result = runGit(['rev-parse', 'HEAD'], { cwd });
+async function getHeadSha(cwd: string): Promise<string> {
+  const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
     return 'unknown';
   }
@@ -325,8 +418,8 @@ function getHeadSha(cwd: string): string {
 /**
  * Check if a merge is in progress (MERGE_HEAD exists).
  */
-export function hasMergeInProgress(cwd: string): boolean {
-  const result = runGit(
+export async function hasMergeInProgress(cwd: string): Promise<boolean> {
+  const result = await runGit(
     ['rev-parse', '--verify', 'MERGE_HEAD'],
     { cwd },
   );
@@ -336,8 +429,8 @@ export function hasMergeInProgress(cwd: string): boolean {
 /**
  * Check if the worktree has unmerged files (conflict markers).
  */
-export function hasUnmergedFiles(cwd: string): boolean {
-  const result = runGit(
+export async function hasUnmergedFiles(cwd: string): Promise<boolean> {
+  const result = await runGit(
     ['diff', '--name-only', '--diff-filter=U'],
     { cwd },
   );
@@ -347,11 +440,11 @@ export function hasUnmergedFiles(cwd: string): boolean {
 /**
  * Abort an in-progress merge if one exists. Returns true if a merge was aborted.
  */
-export function abortMergeIfInProgress(cwd: string): boolean {
-  if (!hasMergeInProgress(cwd)) {
+export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
+  if (!await hasMergeInProgress(cwd)) {
     return false;
   }
-  const result = runGit(['merge', '--abort'], { cwd });
+  const result = await runGit(['merge', '--abort'], { cwd });
   if (result.exitCode === 0) {
     log('[merge] Aborted in-progress merge.');
     return true;
@@ -360,15 +453,15 @@ export function abortMergeIfInProgress(cwd: string): boolean {
   return false;
 }
 
-function checkUpstreamChanges(parentBranch: string, cwd: string): boolean {
-  const currentBranch = runGit(
+async function checkUpstreamChanges(parentBranch: string, cwd: string): Promise<boolean> {
+  const currentBranch = await runGit(
     ['rev-parse', '--abbrev-ref', 'HEAD'],
     { cwd },
   );
 
   if (currentBranch.exitCode !== 0) return false;
 
-  const result = runGit(
+  const result = await runGit(
     ['rev-list', '--count', `${currentBranch.stdout}..${parentBranch}`],
     { cwd },
   );

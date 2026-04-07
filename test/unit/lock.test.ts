@@ -17,62 +17,54 @@ describe('lock utilities', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  test('acquireLock throws clear error when worktree directory does not exist', () => {
+  test('acquireLock throws clear error when worktree directory does not exist', async () => {
     // INVARIANT: Lock acquisition must fail fast with a clear error when the
     // directory doesn't exist, not throw a raw ENOENT that confuses users.
-    expect(() => {
-      acquireLock(worktreePath, 'test-command');
-    }).toThrow('Cannot acquire lock: worktree directory does not exist');
-    expect(() => {
-      acquireLock(worktreePath, 'test-command');
-    }).toThrow(worktreePath);
+    await expect(acquireLock(worktreePath, 'test-command')).rejects.toThrow('Cannot acquire lock: worktree directory does not exist');
+    await expect(acquireLock(worktreePath, 'test-command')).rejects.toThrow(worktreePath);
   });
 
-  test('acquireLock succeeds when worktree directory exists', () => {
+  test('acquireLock succeeds when worktree directory exists', async () => {
     // Create the worktree directory
     Bun.write(join(worktreePath, '.gitkeep'), '');
 
-    expect(() => {
-      acquireLock(worktreePath, 'test-command');
-    }).not.toThrow();
+    await expect(acquireLock(worktreePath, 'test-command')).resolves.not.toThrow();
 
-    const lock = readLock(worktreePath);
+    const lock = await readLock(worktreePath);
     expect(lock).not.toBeNull();
     expect(lock?.command).toBe('test-command');
     expect(lock?.pid).toBe(process.pid);
   });
 
-  test('checkLock returns null when no lock exists', () => {
+  test('checkLock returns null when no lock exists', async () => {
     Bun.write(join(worktreePath, '.gitkeep'), '');
-    const lock = checkLock(worktreePath);
+    const lock = await checkLock(worktreePath);
     expect(lock).toBeNull();
   });
 
-  test('checkLock returns null when current process holds the lock', () => {
+  test('checkLock returns null when current process holds the lock', async () => {
     Bun.write(join(worktreePath, '.gitkeep'), '');
-    acquireLock(worktreePath, 'test-command');
+    await acquireLock(worktreePath, 'test-command');
 
-    const lock = checkLock(worktreePath);
+    const lock = await checkLock(worktreePath);
     expect(lock).toBeNull(); // Re-entrant safe
   });
 
-  test('removeLock removes the lock file', () => {
+  test('removeLock removes the lock file', async () => {
     Bun.write(join(worktreePath, '.gitkeep'), '');
-    acquireLock(worktreePath, 'test-command');
+    await acquireLock(worktreePath, 'test-command');
 
-    let lock = readLock(worktreePath);
+    let lock = await readLock(worktreePath);
     expect(lock).not.toBeNull();
 
-    removeLock(worktreePath);
+    await removeLock(worktreePath);
 
-    lock = readLock(worktreePath);
+    lock = await readLock(worktreePath);
     expect(lock).toBeNull();
   });
 
-  test('removeLock is safe to call when no lock exists', () => {
+  test('removeLock is safe to call when no lock exists', async () => {
     Bun.write(join(worktreePath, '.gitkeep'), '');
-    expect(() => {
-      removeLock(worktreePath);
-    }).not.toThrow();
+    await expect(removeLock(worktreePath)).resolves.not.toThrow();
   });
 });

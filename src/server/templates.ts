@@ -12,6 +12,7 @@ import { renderDiffSideBySide, renderDiffUnified, diffStyles } from './diff';
 export interface TaskWithSession {
   task: Task;
   session: Session | null;
+  turnCount?: number;
 }
 
 function shortId(id: string): string {
@@ -419,6 +420,7 @@ export function taskListHtml(
   const sortableColumns: { field: string; label: string }[] = [
     { field: 'status', label: 'Status' },
     { field: 'model', label: 'Model' },
+    { field: 'turns', label: 'Turns' },
     { field: 'last_active', label: 'Last Active' },
     { field: 'duration', label: 'Duration' },
     { field: 'tokens', label: 'Tokens' },
@@ -436,16 +438,18 @@ export function taskListHtml(
     return `<th><a href="${href}" class="sort-link${isActive ? ' sort-active' : ''}">${label}${indicator}</a></th>`;
   }
 
-  const rows = tasksWithSessions.map(({ task, session }) => {
+  const rows = tasksWithSessions.map(({ task, session, turnCount }) => {
     const status = getTaskStatus(task, session);
     const lastActive = session?.last_interaction_at ? formatDate(session.last_interaction_at) : '-';
     const duration = session ? formatDuration(session.total_duration_ms) : '-';
     const tokens = formatTokenUsage(session?.total_usage ?? null);
+    const turns = turnCount !== undefined && turnCount > 0 ? String(turnCount) : '-';
 
     return `<tr>
       <td><a href="/tasks/${task.id}">${escapeHtml(displayId(task))}</a></td>
       <td>${statusBadge(status)}</td>
       <td>${escapeHtml(task.model ?? '-')}</td>
+      <td>${escapeHtml(turns)}</td>
       <td>${escapeHtml(lastActive)}</td>
       <td>${escapeHtml(duration)}</td>
       <td>${escapeHtml(tokens)}</td>

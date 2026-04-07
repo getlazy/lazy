@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import { basename } from 'path';
+import { getHome } from '../utils/home';
 import { getDefaultConfigTemplate } from '../config/loader';
 import { createStorage } from '../storage';
 import { isTTY, promptLine, promptChoice, promptYesNo } from './editor';
@@ -147,7 +147,7 @@ async function checkDriverHealth(driverName: string): Promise<void> {
     const { loadConfig } = await import('../config/loader');
     const { createDriver } = await import('../remote');
 
-    const config = loadConfig(process.cwd());
+    const config = await loadConfig(process.cwd());
     const driver = createDriver(config);
     const checks = await driver.checkHealth();
 
@@ -176,10 +176,10 @@ interface StorageChoice {
  * Extract project name from git remote URL or directory name.
  * Used for external storage default path.
  */
-function getProjectName(targetDir: string, remoteName: string = 'origin'): string {
+async function getProjectName(targetDir: string, remoteName: string = 'origin'): Promise<string> {
   try {
     // Try to get remote URL
-    const result = runGit(['remote', 'get-url', remoteName], { cwd: targetDir });
+    const result = await runGit(['remote', 'get-url', remoteName], { cwd: targetDir });
 
     if (result.exitCode === 0) {
       const url = result.stdout;
@@ -204,9 +204,9 @@ function getProjectName(targetDir: string, remoteName: string = 'origin'): strin
  * List all git remotes in the repository.
  * Returns an array of remote names (e.g., ['origin', 'upstream']).
  */
-function listGitRemotes(repoDir: string): string[] {
+async function listGitRemotes(repoDir: string): Promise<string[]> {
   try {
-    const result = runGit(['remote'], { cwd: repoDir });
+    const result = await runGit(['remote'], { cwd: repoDir });
     if (result.exitCode !== 0) return [];
     return result.stdout.split('\n').filter(Boolean);
   } catch {
@@ -223,7 +223,7 @@ function listGitRemotes(repoDir: string): string[] {
  * - Multiple without 'origin' → prompt user to pick
  */
 async function chooseGitRemote(repoDir: string): Promise<string> {
-  const remotes = listGitRemotes(repoDir);
+  const remotes = await listGitRemotes(repoDir);
 
   if (remotes.length === 0) {
     // No remotes yet — use the default
@@ -246,16 +246,16 @@ async function chooseGitRemote(repoDir: string): Promise<string> {
   // Multiple remotes, no 'origin' — prompt user
   if (isTTY()) {
     console.log('');
-    const options = remotes.map(r => {
+    const options = await Promise.all(remotes.map(async r => {
       // Show the URL alongside each remote name for context
       try {
-        const result = runGit(['remote', 'get-url', r], { cwd: repoDir });
+        const result = await runGit(['remote', 'get-url', r], { cwd: repoDir });
         const url = result.exitCode === 0 ? result.stdout : '';
         return url ? `${r} (${url})` : r;
       } catch {
         return r;
       }
-    });
+    }));
     const choice = await promptChoice('Multiple git remotes found. Which remote should lazy use?', options);
     return remotes[choice];
   }
@@ -279,8 +279,8 @@ async function promptStorageChoice(targetDir: string, gitRemote: string = 'origi
 
   switch (choice) {
     case 0: {
-      const projectName = getProjectName(targetDir, gitRemote);
-      const defaultPath = join(homedir(), '.lazy', projectName);
+      const projectName = await getProjectName(targetDir, gitRemote);
+      const defaultPath = join(getHome(), '.lazy', projectName);
       console.log('');
       const path = await promptLine('External storage path', defaultPath);
       return { backend: 'external', path };
@@ -363,7 +363,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   }
 
   // Verify repo has at least one commit
-  if (!repoHasCommits(targetDir)) {
+  if (!(await repoHasCommits(targetDir))) {
     console.error('Error: this git repository has no commits. Please make an initial commit first:');
     console.error(`  ${theme.command("git commit --allow-empty -m 'Initial commit'")}`);
     process.exit(1);
@@ -389,16 +389,19 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   mkdirSync(lazyPath, { recursive: true });
 
   // Ensure ~/.lazy/ exists for per-user operational state (agent binaries, logs)
-  const userLazyDir = join(homedir(), '.lazy');
+  const userLazyDir = join(getHome(), '.lazy');
   if (!existsSync(userLazyDir)) {
     mkdirSync(userLazyDir, { recursive: true });
     console.log(`Creating ~/.lazy/ for internal housekeeping (agent binaries, protocol state, logs).`);
   }
 
-  // Determine storage path based on backend choice
+  // Determine storage path based on backend choice.
+  // Always resolve the full path so it can be persisted to lazy.toml.
+  // This prevents path drift when $HOME changes between sessions
+  // (e.g., Lima VMs, different user profiles, CI runners).
   let storagePath: string;
   if (storageChoice.backend === 'external') {
-    storagePath = storageChoice.path || join(homedir(), '.lazy', getProjectName(targetDir, gitRemote));
+    storagePath = storageChoice.path || join(getHome(), '.lazy', await getProjectName(targetDir, gitRemote));
     // Create external directory if it doesn't exist
     mkdirSync(storagePath, { recursive: true });
   } else {
@@ -406,10 +409,11 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     storagePath = lazyPath;
   }
 
-  // Initialize file-based storage
+  // Initialize file-based storage — pass the RESOLVED path, not the user input.
+  const externalPathForStorage = storageChoice.backend === 'external' ? storagePath : undefined;
   const storage = await createStorage(targetDir, {
     backend: storageChoice.backend,
-    externalPath: storageChoice.path,
+    externalPath: externalPathForStorage,
   });
   await storage.close();
 
@@ -432,7 +436,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // Create default lazy.toml if it doesn't exist
   const configPath = join(targetDir, CONFIG_FILENAME);
   if (!existsSync(configPath)) {
-    const template = getDefaultConfigTemplate(storageChoice.backend, storageChoice.path, toolchain, gitRemote);
+    const template = getDefaultConfigTemplate(storageChoice.backend, externalPathForStorage, toolchain, gitRemote);
     writeFileSync(configPath, template);
     console.log(`Created ${CONFIG_FILENAME} with default configuration`);
   }
@@ -513,7 +517,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
   // Recommend shell completions if not already installed
   if (!options.skipCompletionCheck) {
-    const shell = detectShell();
+    const shell = await detectShell();
     if (shell.name !== 'unknown') {
       const setupCmd = getCompletionSetupCommand(shell.name);
       if (setupCmd && !shell.completionInstalled) {
@@ -538,7 +542,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     if (createFirstTask) {
       const firstTaskStorage = await createStorage(targetDir, {
         backend: storageChoice.backend,
-        externalPath: storageChoice.path,
+        externalPath: externalPathForStorage,
       });
       try {
         const task = await firstTaskStorage.createTask(
@@ -575,7 +579,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     if (createDockerfileTask) {
       const dockerfileTaskStorage = await createStorage(targetDir, {
         backend: storageChoice.backend,
-        externalPath: storageChoice.path,
+        externalPath: externalPathForStorage,
       });
       try {
         const task = await dockerfileTaskStorage.createTask(

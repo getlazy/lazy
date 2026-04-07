@@ -42,16 +42,16 @@ describe('per-turn model override', () => {
   test('start with --model records model on the first turn', async () => {
     const taskId = await createTask(ctx, 'Model on start', 'Do work');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'haiku'], MOCK_CLAUDE_SUCCESS, {
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'claude-haiku-4-5-20251001'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
 
     const turns = readTurns(ctx.root, taskId);
-    // First turn (human) should have haiku recorded
+    // First turn (human) should have claude-haiku-4-5-20251001 recorded
     const humanTurn = turns.find(t => t.role === 'human');
     expect(humanTurn).toBeDefined();
-    expect(humanTurn!.model).toBe('haiku');
+    expect(humanTurn!.model).toBe('claude-haiku-4-5-20251001');
   });
 
   // INVARIANT: When --model is specified on unblock, the feedback turn records that model.
@@ -64,9 +64,9 @@ describe('per-turn model override', () => {
     });
     expectSuccess(startResult);
 
-    // Unblock with --model sonnet
+    // Unblock with --model claude-sonnet-4-5-20250929
     const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'Make it better', '--model', 'sonnet'],
+      ['unblock', taskId, '--message', 'Make it better', '--model', 'claude-sonnet-4-5-20250929'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
@@ -77,10 +77,10 @@ describe('per-turn model override', () => {
     const humanTurns = turns.filter(t => t.role === 'human');
     expect(humanTurns.length).toBeGreaterThanOrEqual(2);
     const feedbackTurn = humanTurns[humanTurns.length - 1];
-    expect(feedbackTurn.model).toBe('sonnet');
+    expect(feedbackTurn.model).toBe('claude-sonnet-4-5-20250929');
   });
 
-  // INVARIANT: Sticky behavior - after unblocking with --model haiku, the next unblock
+  // INVARIANT: Sticky behavior - after unblocking with --model claude-haiku-4-5-20251001, the next unblock
   // without --model should still use haiku (inherited from previous turn).
   // This prevents users from having to re-specify the model every turn.
   test('sticky model: next unblock without --model inherits from previous turn', async () => {
@@ -92,15 +92,15 @@ describe('per-turn model override', () => {
     });
     expectSuccess(startResult);
 
-    // First unblock with --model haiku
+    // First unblock with --model claude-haiku-4-5-20251001
     const unblock1 = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'Use haiku', '--model', 'haiku'],
+      ['unblock', taskId, '--message', 'Use claude-haiku-4-5-20251001', '--model', 'claude-haiku-4-5-20251001'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblock1);
 
-    // Second unblock WITHOUT --model — should inherit haiku from previous turn
+    // Second unblock WITHOUT --model — should inherit claude-haiku-4-5-20251001 from previous turn
     const unblock2 = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Continue'],
       MOCK_CLAUDE_SUCCESS,
@@ -113,7 +113,7 @@ describe('per-turn model override', () => {
     const humanTurns = turns.filter(t => t.role === 'human');
     // Last human turn should have haiku (sticky from previous)
     const lastHumanTurn = humanTurns[humanTurns.length - 1];
-    expect(lastHumanTurn.model).toBe('haiku');
+    expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
   });
 
   // INVARIANT: When no per-turn model has been set and no --model flag is given,
@@ -121,8 +121,8 @@ describe('per-turn model override', () => {
   test('fallback to task-level model when no per-turn model set', async () => {
     const taskId = await createTask(ctx, 'Task model fallback', 'Do work');
 
-    // Start with --model opus (sets both task model and first turn model)
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'opus'], MOCK_CLAUDE_SUCCESS, {
+    // Start with --model claude-opus-4-6 (sets both task model and first turn model)
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'claude-opus-4-6'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
@@ -130,31 +130,31 @@ describe('per-turn model override', () => {
     const turns = readTurns(ctx.root, taskId);
     const humanTurn = turns.find(t => t.role === 'human');
     expect(humanTurn).toBeDefined();
-    // First turn should record opus (the model used)
-    expect(humanTurn!.model).toBe('opus');
+    // First turn should record claude-opus-4-6 (the model used)
+    expect(humanTurn!.model).toBe('claude-opus-4-6');
   });
 
   // INVARIANT: show command displays per-turn model when it differs from task-level model.
   test('show displays per-turn model when it differs from task model', async () => {
     const taskId = await createTask(ctx, 'Show model display', 'Do work');
 
-    // Start with opus (sets task model)
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'opus'], MOCK_CLAUDE_SUCCESS, {
+    // Start with claude-opus-4-6 (sets task model)
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes', '--model', 'claude-opus-4-6'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
 
     // Unblock with haiku (different from task model)
     const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'Switch to haiku', '--model', 'haiku'],
+      ['unblock', taskId, '--message', 'Switch to claude-haiku-4-5-20251001', '--model', 'claude-haiku-4-5-20251001'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblockResult);
 
-    // Show should display haiku since it differs from task-level opus
+    // Show should display haiku since it differs from task-level claude-opus-4-6
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
-    expectOutput(showResult, 'haiku');
+    expectOutput(showResult, 'claude-haiku-4-5-20251001');
   });
 });

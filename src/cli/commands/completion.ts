@@ -28,7 +28,7 @@ function getLazyBinaryPath(): string {
 const TASK_ID_COMMANDS = [
   'show', 'start', 'edit', 'comment', 'unblock', 'review', 'resume', 'reopen',
   'branch', 'diff', 'status', 'shell', 'accept', 'reject', 'revert',
-  'close', 'wait',
+  'close', 'submit', 'wait',
 ];
 
 // All top-level commands (canonical names only, no aliases)
@@ -36,7 +36,7 @@ const ALL_COMMANDS = [
   'create', 'start', 'edit', 'comment', 'list', 'active', 'blocked', 'show', 'search',
   'review', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait',
   'diff', 'status', 'shell', 'accept', 'reject', 'revert', 'close',
-  'link', 'import-conversation', 'propose', 'sync', 'server', 'builder', 'init', 'doctor',
+  'link', 'import-conversation', 'propose', 'submit', 'sync', 'server', 'builder', 'init', 'doctor',
   'upgrade', 'completion',
 ];
 
@@ -59,7 +59,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   'resume':              ['--follow', '--model'],
   'revert':              ['--reason', '--yes'],
   'review':              ['--model', '--follow'],
-  'unblock':             ['--message', '--model', '--sync-with-upstream', '--follow'],
+  'unblock':             ['--message', '--model', '--follow'],
   'loop':                ['--model', '--follow'],
   'wait':                ['--follow', '--next'],
   'link':                ['--parent', '--code'],

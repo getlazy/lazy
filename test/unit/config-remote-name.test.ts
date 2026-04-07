@@ -36,8 +36,8 @@ describe('configurable git_remote', () => {
     test('pushBranch uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           return ok();
         },
@@ -48,16 +48,17 @@ describe('configurable git_remote', () => {
 
       const pushCall = gitCalls.find(c => c[0] === 'push');
       expect(pushCall).toBeDefined();
-      expect(pushCall![1]).toBe('-u');
-      expect(pushCall![2]).toBe('upstream');
-      expect(pushCall![3]).toBe('lazy/test');
+      // INVARIANT: Task branches must not set upstream tracking (-u flag)
+      expect(pushCall).not.toContain('-u');
+      expect(pushCall![1]).toBe('upstream');
+      expect(pushCall![2]).toBe('lazy/test');
     });
 
     test('fetchBranch uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('3');
@@ -83,8 +84,8 @@ describe('configurable git_remote', () => {
     test('resolveUpstreamRef uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           return fail('unexpected');
@@ -102,13 +103,13 @@ describe('configurable git_remote', () => {
     test('checkHealth checks configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === '--version') return ok('gh version 2.0.0');
           if (args[0] === 'auth' && args[1] === 'status') return ok('Logged in');
           if (args[0] === 'api') return ok(JSON.stringify({ private: true }));
           return fail('unexpected');
         },
-        runGit: (args) => {
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'remote' && args[1] === 'get-url') return ok('git@github.com:owner/repo.git');
           return fail('unexpected');
@@ -132,8 +133,8 @@ describe('configurable git_remote', () => {
     test('fastForwardLocal uses configured remote (target branch checked out)', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch' && args[1] === 'upstream') return ok();
@@ -157,8 +158,8 @@ describe('configurable git_remote', () => {
     test('fastForwardLocal uses configured remote (target branch not checked out)', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('lazy/abc12345');
           if (args[0] === 'fetch' && args[1] === 'upstream') return ok();
@@ -181,8 +182,8 @@ describe('configurable git_remote', () => {
     test('pushBranch uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => ok(),
-        runGit: (args) => {
+        runGl: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           return ok();
         },
@@ -193,14 +194,17 @@ describe('configurable git_remote', () => {
 
       const pushCall = gitCalls.find(c => c[0] === 'push');
       expect(pushCall).toBeDefined();
-      expect(pushCall![2]).toBe('gitlab-remote');
+      // INVARIANT: Task branches must not set upstream tracking (-u flag)
+      expect(pushCall).not.toContain('-u');
+      expect(pushCall![1]).toBe('gitlab-remote');
+      expect(pushCall![2]).toBe('lazy/test');
     });
 
     test('fetchBranch uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => ok(),
-        runGit: (args) => {
+        runGl: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('2');
@@ -221,8 +225,8 @@ describe('configurable git_remote', () => {
 
     test('resolveUpstreamRef uses configured remote', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => ok(),
-        runGit: (args) => {
+        runGl: async () => ok(),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return ok();
           return fail('unexpected');
         },
@@ -237,13 +241,13 @@ describe('configurable git_remote', () => {
     test('checkHealth checks configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: (args) => {
+        runGl: async (args) => {
           if (args[0] === '--version') return ok('glab version 1.0.0');
           if (args[0] === 'auth' && args[1] === 'status') return ok('Token scopes: api');
           if (args[0] === 'api' && args[1] === 'projects/:id') return ok(JSON.stringify({ visibility: 'private' }));
           return fail('unexpected');
         },
-        runGit: (args) => {
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'remote' && args[1] === 'get-url') return ok('git@gitlab.com:owner/repo.git');
           return fail('unexpected');
@@ -264,8 +268,8 @@ describe('configurable git_remote', () => {
     test('fastForwardLocal uses configured remote', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => ok(),
-        runGit: (args) => {
+        runGl: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch') return ok();
@@ -293,8 +297,8 @@ describe('configurable git_remote', () => {
     test('drivers use origin by default', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => ok(),
-        runGit: (args) => {
+        runGh: async () => ok(),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           return ok();
         },
@@ -304,7 +308,10 @@ describe('configurable git_remote', () => {
       await driver.pushBranch('lazy/test');
 
       const pushCall = gitCalls.find(c => c[0] === 'push');
-      expect(pushCall![2]).toBe('origin');
+      // INVARIANT: Task branches must not set upstream tracking (-u flag)
+      expect(pushCall).not.toContain('-u');
+      expect(pushCall![1]).toBe('origin');
+      expect(pushCall![2]).toBe('lazy/test');
     });
   });
 

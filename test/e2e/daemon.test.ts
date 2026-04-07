@@ -15,12 +15,13 @@ import {
   readPid,
   readToken,
   checkDaemonHealth,
+  isDaemonRunning,
   requestShutdown,
   cleanupStaleFiles,
   acquireStartLock,
   releaseStartLock,
 } from '../../src/daemon/lifecycle';
-import { getStartLockPath } from '../../src/daemon/paths';
+import { getStartLockPath, getDaemonDir } from '../../src/daemon/paths';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
@@ -29,10 +30,12 @@ import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 describe('lazy daemon', () => {
   describe('server module (unit-level)', () => {
     let daemon: RunningDaemon;
+    let ctx: TestContext;
     let tmpDir: string;
     let socketPath: string;
 
     beforeEach(async () => {
+      ctx = await setupTestLazy();
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-test-'));
       socketPath = join(tmpDir, 'test.sock');
     });
@@ -41,6 +44,7 @@ describe('lazy daemon', () => {
       if (daemon) {
         daemon.stop();
       }
+      await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
     });
 
@@ -48,7 +52,7 @@ describe('lazy daemon', () => {
     // This is the foundation for all daemon functionality — if the socket doesn't
     // work, nothing else (CLI pass-through, MCP proxy, auto-start) will work.
     test('starts server on unix socket and responds to health check', async () => {
-      daemon = startDaemonServer({ socketPath, token: 'test-token-123' });
+      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
 
       const resp = await fetch('http://localhost/daemon/status', {
         unix: socketPath,
@@ -65,7 +69,7 @@ describe('lazy daemon', () => {
     // INVARIANT: All daemon endpoints require bearer token authentication.
     // Without auth, any local process could control the daemon.
     test('rejects requests without valid bearer token', async () => {
-      daemon = startDaemonServer({ socketPath, token: 'test-token-123' });
+      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
 
       // No auth header
       const resp1 = await fetch('http://localhost/daemon/status', {
@@ -84,7 +88,7 @@ describe('lazy daemon', () => {
     // INVARIANT: Unknown routes return 404, not 500 or silent success.
     // Predictable error handling is essential for debugging.
     test('returns 404 for unknown routes', async () => {
-      daemon = startDaemonServer({ socketPath, token: 'test-token-123' });
+      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
 
       const resp = await fetch('http://localhost/unknown/path', {
         unix: socketPath,
@@ -97,7 +101,7 @@ describe('lazy daemon', () => {
     // INVARIANT: Shutdown endpoint responds before stopping the server.
     // The CLI needs to know the shutdown was accepted before the connection drops.
     test('shutdown endpoint responds with ok', async () => {
-      daemon = startDaemonServer({ socketPath, token: 'test-token-123' });
+      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
 
       const resp = await fetch('http://localhost/daemon/shutdown', {
         method: 'POST',
@@ -117,11 +121,16 @@ describe('lazy daemon', () => {
   describe('lifecycle module', () => {
     let originalHome: string | undefined;
     let tmpDir: string;
+    /** Fake project root — lifecycle functions derive daemon dir from this */
+    let fakeProjectRoot: string;
 
     beforeEach(async () => {
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-lifecycle-'));
       originalHome = process.env.HOME;
       process.env.HOME = tmpDir;
+      // Use a fake project root so that getDaemonDir(fakeProjectRoot) resolves
+      // under $HOME/.lazy/daemon/<slug>/
+      fakeProjectRoot = '/fake/project/root';
     });
 
     afterEach(async () => {
@@ -132,20 +141,20 @@ describe('lazy daemon', () => {
     // INVARIANT: readPid returns null when no PID file exists.
     // This is the base case for liveness detection — "not running".
     test('readPid returns null when no PID file', () => {
-      const pid = readPid();
+      const pid = readPid(fakeProjectRoot);
       expect(pid).toBeNull();
     });
 
     // INVARIANT: cleanupStaleFiles removes PID and socket files.
     // When the daemon crashes, stale files must be cleaned up before restart.
     test('cleanupStaleFiles removes daemon files', async () => {
-      const daemonDir = join(tmpDir, '.lazy', 'daemon');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
       const { mkdirSync, writeFileSync } = await import('fs');
       mkdirSync(daemonDir, { recursive: true });
       writeFileSync(join(daemonDir, 'lazy.pid'), '12345');
       writeFileSync(join(daemonDir, 'lazy.sock'), 'dummy');
 
-      cleanupStaleFiles();
+      cleanupStaleFiles(fakeProjectRoot);
 
       expect(existsSync(join(daemonDir, 'lazy.pid'))).toBe(false);
       expect(existsSync(join(daemonDir, 'lazy.sock'))).toBe(false);
@@ -154,7 +163,7 @@ describe('lazy daemon', () => {
     // INVARIANT: checkDaemonHealth returns running=false when no daemon exists.
     // CLI auto-start depends on this to decide whether to fork a daemon.
     test('checkDaemonHealth returns not running when no daemon', async () => {
-      const status = await checkDaemonHealth();
+      const status = await checkDaemonHealth(fakeProjectRoot);
       expect(status.running).toBe(false);
     });
 
@@ -162,53 +171,119 @@ describe('lazy daemon', () => {
     // Without this, concurrent CLI commands can both try to spawn a daemon,
     // leading to duplicate processes or PID file corruption.
     test('acquireStartLock returns true when no lock exists', () => {
-      expect(acquireStartLock()).toBe(true);
-      releaseStartLock();
+      expect(acquireStartLock(fakeProjectRoot)).toBe(true);
+      releaseStartLock(fakeProjectRoot);
     });
 
     // INVARIANT: Only one process can hold the startup lock at a time.
     // The second caller must wait for the first to finish.
     test('acquireStartLock returns false when lock already held', () => {
-      expect(acquireStartLock()).toBe(true);
-      expect(acquireStartLock()).toBe(false);
-      releaseStartLock();
+      expect(acquireStartLock(fakeProjectRoot)).toBe(true);
+      expect(acquireStartLock(fakeProjectRoot)).toBe(false);
+      releaseStartLock(fakeProjectRoot);
     });
 
     // INVARIANT: releaseStartLock removes the lock file so subsequent
     // starts can proceed.
     test('releaseStartLock allows re-acquisition', () => {
-      expect(acquireStartLock()).toBe(true);
-      releaseStartLock();
-      expect(acquireStartLock()).toBe(true);
-      releaseStartLock();
+      expect(acquireStartLock(fakeProjectRoot)).toBe(true);
+      releaseStartLock(fakeProjectRoot);
+      expect(acquireStartLock(fakeProjectRoot)).toBe(true);
+      releaseStartLock(fakeProjectRoot);
     });
 
     // INVARIANT: Stale locks (from crashed starters) are cleaned up
     // so that daemon startup isn't permanently blocked.
     test('acquireStartLock removes stale lock older than 30s', async () => {
       const { mkdirSync, writeFileSync, utimesSync } = await import('fs');
-      const lockPath = getStartLockPath();
-      mkdirSync(join(tmpDir, '.lazy', 'daemon'), { recursive: true });
+      const lockPath = getStartLockPath(fakeProjectRoot);
+      mkdirSync(getDaemonDir(fakeProjectRoot), { recursive: true });
       writeFileSync(lockPath, '99999');
       // Set mtime to 60 seconds ago (well past the 30s threshold)
       const past = new Date(Date.now() - 60_000);
       utimesSync(lockPath, past, past);
 
       // Should detect stale lock, remove it, and acquire
-      expect(acquireStartLock()).toBe(true);
-      releaseStartLock();
+      expect(acquireStartLock(fakeProjectRoot)).toBe(true);
+      releaseStartLock(fakeProjectRoot);
     });
 
     // INVARIANT: Non-stale locks are respected — prevents race condition.
     test('acquireStartLock respects recent lock from another process', async () => {
       const { mkdirSync, writeFileSync } = await import('fs');
-      const lockPath = getStartLockPath();
-      mkdirSync(join(tmpDir, '.lazy', 'daemon'), { recursive: true });
+      const lockPath = getStartLockPath(fakeProjectRoot);
+      mkdirSync(getDaemonDir(fakeProjectRoot), { recursive: true });
       writeFileSync(lockPath, '99999');
       // Lock was just created (mtime is now) — should NOT be considered stale
 
-      expect(acquireStartLock()).toBe(false);
-      releaseStartLock();
+      expect(acquireStartLock(fakeProjectRoot)).toBe(false);
+      releaseStartLock(fakeProjectRoot);
+    });
+
+    // INVARIANT: isDaemonRunning returns false when no daemon files exist.
+    // Base case — daemon was never started.
+    test('isDaemonRunning returns false when no files exist', () => {
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
+    });
+
+    // INVARIANT: isDaemonRunning returns false when socket exists but PID is dead.
+    // This is the crash recovery case — daemon died but left stale files behind.
+    // Previously, ensureDaemon and daemonStart only checked file existence, which
+    // caused "already running" when the daemon was actually dead.
+    test('isDaemonRunning returns false when socket exists but PID is dead (crash recovery)', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
+      mkdirSync(daemonDir, { recursive: true });
+
+      // Simulate crash: socket file, token, and PID file all exist,
+      // but the PID points to a dead process.
+      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'token'), 'stale-token');
+      writeFileSync(join(daemonDir, 'lazy.pid'), '999999'); // very likely dead PID
+
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
+    });
+
+    // INVARIANT: isDaemonRunning returns false when socket exists but no PID file.
+    // PID file missing means we can't verify the process is alive.
+    test('isDaemonRunning returns false when socket exists but no PID file', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
+      mkdirSync(daemonDir, { recursive: true });
+
+      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'token'), 'some-token');
+      // No PID file
+
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
+    });
+
+    // INVARIANT: isDaemonRunning returns false when socket exists but no token.
+    // Without a token, the daemon can't be authenticated.
+    test('isDaemonRunning returns false when socket exists but no token', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
+      mkdirSync(daemonDir, { recursive: true });
+
+      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'lazy.pid'), String(process.pid));
+      // No token file
+
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
+    });
+
+    // INVARIANT: isDaemonRunning returns true when all signals are present
+    // and the PID is alive (using current process PID as a known-alive process).
+    test('isDaemonRunning returns true when socket, token, and PID are alive', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
+      mkdirSync(daemonDir, { recursive: true });
+
+      writeFileSync(join(daemonDir, 'lazy.sock'), 'socket-placeholder');
+      writeFileSync(join(daemonDir, 'token'), 'test-token');
+      writeFileSync(join(daemonDir, 'lazy.pid'), String(process.pid)); // current process is alive
+
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(true);
     });
   });
 
@@ -240,9 +315,7 @@ describe('lazy daemon', () => {
     // INVARIANT: `lazy daemon status` reports "not running" when no daemon exists.
     // Users need clear status feedback to understand the system state.
     test('status reports not running when daemon is not active', async () => {
-      const result = await ctx.lazy(['daemon', 'status'], {
-        env: { HOME: ctx.root, LAZY_NO_DAEMON: '1' },
-      });
+      const result = await ctx.lazy(['daemon', 'status']);
       expectSuccess(result);
       expectOutput(result, 'not running');
     });
@@ -250,9 +323,7 @@ describe('lazy daemon', () => {
     // INVARIANT: `lazy daemon stop` is a no-op when daemon is not running.
     // Idempotent operations prevent user confusion and script errors.
     test('stop is a no-op when daemon is not running', async () => {
-      const result = await ctx.lazy(['daemon', 'stop'], {
-        env: { HOME: ctx.root, LAZY_NO_DAEMON: '1' },
-      });
+      const result = await ctx.lazy(['daemon', 'stop']);
       expectSuccess(result);
       expectOutput(result, 'not running');
     });
@@ -262,14 +333,40 @@ describe('lazy daemon', () => {
       expectFailure(result);
       expectError(result, 'Unknown daemon subcommand');
     });
+
+    // INVARIANT: `lazy daemon status` outside a lazy project dir gives a clear error.
+    // Users need to know they must be in a project directory.
+    test('status errors clearly when run outside a lazy project', async () => {
+      const plainDir = await mkdtemp(join(tmpdir(), 'lazy-no-project-'));
+      try {
+        const ENTRY_PATH = join(__dirname, '../../src/index.ts');
+        const proc = Bun.spawn(['bun', 'run', ENTRY_PATH, 'daemon', 'status'], {
+          cwd: plainDir,
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env: { ...process.env, LAZY_TEST: '1' },
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(exitCode).not.toBe(0);
+        expect(stderr).toContain('not in a lazy project');
+      } finally {
+        await rm(plainDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('daemon start/stop lifecycle (integration)', () => {
+    let ctx: TestContext;
     let tmpDir: string;
     let socketPath: string;
     let daemon: RunningDaemon;
 
     beforeEach(async () => {
+      ctx = await setupTestLazy();
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-integ-'));
       socketPath = join(tmpDir, 'lazy.sock');
     });
@@ -278,6 +375,7 @@ describe('lazy daemon', () => {
       if (daemon) {
         try { daemon.stop(); } catch { /* may already be stopped */ }
       }
+      await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
     });
 
@@ -285,7 +383,7 @@ describe('lazy daemon', () => {
     // This is the core lifecycle that all daemon features depend on.
     test('start, health check, and stop cycle works', async () => {
       // Start
-      daemon = startDaemonServer({ socketPath, token: 'lifecycle-token' });
+      daemon = await startDaemonServer({ socketPath, token: 'lifecycle-token', projectRoot: ctx.root });
 
       // Health check
       const resp = await fetch('http://localhost/daemon/status', {
@@ -306,7 +404,7 @@ describe('lazy daemon', () => {
     // INVARIANT: Daemon reports increasing uptime over time.
     // This confirms the daemon is actually a persistent process, not restarting.
     test('uptime increases between health checks', async () => {
-      daemon = startDaemonServer({ socketPath, token: 'uptime-token' });
+      daemon = await startDaemonServer({ socketPath, token: 'uptime-token', projectRoot: ctx.root });
 
       const resp1 = await fetch('http://localhost/daemon/status', {
         unix: socketPath,
@@ -339,7 +437,7 @@ describe('lazy daemon', () => {
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-rpc-'));
       socketPath = join(tmpDir, 'rpc-test.sock');
       token = 'rpc-test-token';
-      daemon = startDaemonServer({ socketPath, token });
+      daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
@@ -526,110 +624,151 @@ describe('lazy daemon', () => {
     });
   });
 
-  describe('multi-project routing', () => {
+  describe('project mismatch rejection', () => {
     let daemon: RunningDaemon;
-    let ctxA: TestContext;
-    let ctxB: TestContext;
+    let ctx: TestContext;
     let tmpDir: string;
     let socketPath: string;
     let token: string;
 
     beforeEach(async () => {
-      ctxA = await setupTestLazy();
-      ctxB = await setupTestLazy();
-      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-multi-'));
-      socketPath = join(tmpDir, 'multi-test.sock');
-      token = 'multi-project-token';
-      daemon = startDaemonServer({ socketPath, token });
+      ctx = await setupTestLazy();
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-mismatch-'));
+      socketPath = join(tmpDir, 'mismatch-test.sock');
+      token = 'mismatch-token';
+      daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
       if (daemon) {
         try { daemon.stop(); } catch { /* may already be stopped */ }
       }
-      await ctxA.cleanup();
-      await ctxB.cleanup();
+      await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
     });
 
-    function rpcForProject(project: string, command: string, params: Record<string, unknown> = {}): Promise<any> {
-      return fetch(`http://localhost/rpc/${command}`, {
+    // INVARIANT: RPC requests for a different project root are rejected with 400.
+    // The daemon is per-project — clients for other projects should connect to
+    // that project's daemon instead.
+    test('rejects RPC for wrong project with 400', async () => {
+      const response = await fetch('http://localhost/rpc/list', {
         method: 'POST',
         unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-          'X-Lazy-Project': project,
+          'X-Lazy-Project': '/some/other/project',
         },
-        body: JSON.stringify(params),
-      } as any).then(async (response) => ({
-        status: response.status,
-        data: await response.json(),
-      }));
-    }
-
-    // INVARIANT: The daemon routes requests to the correct project based on
-    // X-Lazy-Project header, not its own process.cwd(). Without this,
-    // whichever project spawned the daemon "captures" all subsequent requests.
-    test('returns different tasks for different projects', async () => {
-      // Create distinct tasks in each project
-      const taskIdA = await createTask(ctxA, 'Task in project Alpha');
-      const taskIdB = await createTask(ctxB, 'Task in project Beta');
-
-      // Query project A
-      const resultA = await rpcForProject(ctxA.root, 'list', { all: true });
-      expect(resultA.status).toBe(200);
-      const goalsA = resultA.data.tree.map((n: any) => n.task.goal);
-      expect(goalsA).toContain('Task in project Alpha');
-      expect(goalsA).not.toContain('Task in project Beta');
-
-      // Query project B
-      const resultB = await rpcForProject(ctxB.root, 'list', { all: true });
-      expect(resultB.status).toBe(200);
-      const goalsB = resultB.data.tree.map((n: any) => n.task.goal);
-      expect(goalsB).toContain('Task in project Beta');
-      expect(goalsB).not.toContain('Task in project Alpha');
+        body: '{}',
+      } as any);
+      expect(response.status).toBe(400);
+      const data = await response.json() as any;
+      expect(data.error).toContain('Project mismatch');
     });
 
-    // INVARIANT: show returns the correct task from the correct project.
-    test('show returns correct task from correct project', async () => {
-      const taskIdA = await createTask(ctxA, 'Alpha show test');
-      const taskIdB = await createTask(ctxB, 'Beta show test');
-
-      const showA = await rpcForProject(ctxA.root, 'show', { taskId: taskIdA });
-      expect(showA.status).toBe(200);
-      expect(showA.data.task.goal).toBe('Alpha show test');
-
-      const showB = await rpcForProject(ctxB.root, 'show', { taskId: taskIdB });
-      expect(showB.status).toBe(200);
-      expect(showB.data.task.goal).toBe('Beta show test');
+    // INVARIANT: SSE requests for a different project are rejected with 400.
+    test('rejects SSE for wrong project with 400', async () => {
+      const response = await fetch('http://localhost/events/stream?task_id=test123', {
+        unix: socketPath,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-Lazy-Project': '/some/other/project',
+        },
+      } as any);
+      expect(response.status).toBe(400);
+      const data = await response.json() as any;
+      expect(data.error).toContain('Project mismatch');
     });
 
-    // INVARIANT: search scopes results to the requested project.
-    test('search scopes results to the requested project', async () => {
-      await createTask(ctxA, 'Unique alpha unicorn task');
-      await createTask(ctxB, 'Unique beta dragon task');
-
-      const searchA = await rpcForProject(ctxA.root, 'search', { query: 'unicorn' });
-      expect(searchA.status).toBe(200);
-      expect(searchA.data.results.length).toBeGreaterThan(0);
-
-      const searchB = await rpcForProject(ctxB.root, 'search', { query: 'unicorn' });
-      expect(searchB.status).toBe(200);
-      expect(searchB.data.results.length).toBe(0);
+    // INVARIANT: MCP requests for a different project are rejected with 400.
+    test('rejects MCP for wrong project with 400', async () => {
+      const response = await fetch('http://localhost/mcp/task123/toolName', {
+        method: 'POST',
+        unix: socketPath,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-Lazy-Project': '/some/other/project',
+        },
+        body: '{}',
+      } as any);
+      expect(response.status).toBe(400);
+      const data = await response.json() as any;
+      expect(data.error).toContain('Project mismatch');
     });
 
-    // INVARIANT: A task from project A is not found in project B.
-    test('show returns 404 for task ID from wrong project', async () => {
-      const taskIdA = await createTask(ctxA, 'Alpha only task');
+    // INVARIANT: Requests matching the daemon's project root succeed.
+    test('accepts RPC for matching project', async () => {
+      const taskId = await createTask(ctx, 'Matching project task');
+      const response = await fetch('http://localhost/rpc/list', {
+        method: 'POST',
+        unix: socketPath,
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-Lazy-Project': ctx.root,
+        },
+        body: JSON.stringify({ all: true }),
+      } as any);
+      expect(response.status).toBe(200);
+    });
+  });
 
-      // Task exists in project A
-      const showA = await rpcForProject(ctxA.root, 'show', { taskId: taskIdA });
-      expect(showA.status).toBe(200);
+  describe('per-project isolation', () => {
+    let daemonA: RunningDaemon;
+    let daemonB: RunningDaemon;
+    let ctxA: TestContext;
+    let ctxB: TestContext;
+    let tmpDir: string;
 
-      // Same task ID does not exist in project B
-      const showB = await rpcForProject(ctxB.root, 'show', { taskId: taskIdA });
-      expect(showB.status).toBe(404);
+    beforeEach(async () => {
+      ctxA = await setupTestLazy();
+      ctxB = await setupTestLazy();
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-isolation-'));
+    });
+
+    afterEach(async () => {
+      if (daemonA) {
+        try { daemonA.stop(); } catch { /* may already be stopped */ }
+      }
+      if (daemonB) {
+        try { daemonB.stop(); } catch { /* may already be stopped */ }
+      }
+      await ctxA.cleanup();
+      await ctxB.cleanup();
+      await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    // INVARIANT: Two projects get separate daemon sockets.
+    // This is the core guarantee of per-project daemon isolation.
+    test('two projects get separate daemon sockets and respond independently', async () => {
+      const socketA = join(tmpDir, 'project-a.sock');
+      const socketB = join(tmpDir, 'project-b.sock');
+
+      daemonA = await startDaemonServer({ socketPath: socketA, token: 'token-a', projectRoot: ctxA.root });
+      daemonB = await startDaemonServer({ socketPath: socketB, token: 'token-b', projectRoot: ctxB.root });
+
+      // Both respond to health checks independently
+      const respA = await fetch('http://localhost/daemon/status', {
+        unix: socketA,
+        headers: { 'Authorization': 'Bearer token-a' },
+      } as any);
+      expect(respA.ok).toBe(true);
+
+      const respB = await fetch('http://localhost/daemon/status', {
+        unix: socketB,
+        headers: { 'Authorization': 'Bearer token-b' },
+      } as any);
+      expect(respB.ok).toBe(true);
+
+      // Stop one daemon, the other should still work
+      daemonA.stop();
+
+      const respB2 = await fetch('http://localhost/daemon/status', {
+        unix: socketB,
+        headers: { 'Authorization': 'Bearer token-b' },
+      } as any);
+      expect(respB2.ok).toBe(true);
     });
   });
 
@@ -648,7 +787,7 @@ describe('lazy daemon', () => {
       socketPath = join(tmpDir, 'reconcile-test.sock');
       token = 'reconcile-test-token';
       // Use a short reconcile interval for tests
-      daemon = startDaemonServer({ socketPath, token, reconcileIntervalSeconds: 1 });
+      daemon = await startDaemonServer({ socketPath, token, reconcileIntervalSeconds: 1, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
@@ -673,14 +812,9 @@ describe('lazy daemon', () => {
       return { status: response.status, data: await response.json() };
     }
 
-    // INVARIANT: RPC requests register the project for background reconciliation.
-    // Without this, the daemon wouldn't know which projects to reconcile.
-    test('RPC request registers project in activeProjects', async () => {
-      expect(daemon.activeProjects.size).toBe(0);
-
-      await rpc('list');
-
-      expect(daemon.activeProjects.has(ctx.root)).toBe(true);
+    // INVARIANT: The daemon knows its project root at startup.
+    test('daemon has projectRoot set from startup', async () => {
+      expect(daemon.projectRoot).toBe(ctx.root);
     });
 
     // INVARIANT: The daemon reconcile loop transitions working tasks with no
@@ -703,10 +837,9 @@ describe('lazy daemon', () => {
       await storage.updateTaskStatus(task!.id, 'working', 'system');
       await storage.close();
 
-      // 2. Register the project via RPC. The reconcile loop will pick it up
-      //    on its next tick and see the working task with no container.
+      // 2. The project is already registered at daemon start. Trigger an RPC
+      //    to ensure storage is initialized for the reconcile loop.
       await rpc('list');
-      expect(daemon.activeProjects.has(ctx.root)).toBe(true);
 
       // 3. Poll until the reconcile loop transitions the task to 'interrupted'.
       //    With 1s interval, this typically takes 1-2 ticks.

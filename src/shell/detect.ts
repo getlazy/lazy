@@ -6,10 +6,10 @@
  * (to validate completions are installed and working).
  */
 
-import { existsSync, readFileSync, readdirSync } from 'fs';
 import { basename, join } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
 import { spawnSync } from '../utils/spawn';
+import { pathExists, readFileSafe } from '../utils/fs';
 
 export type ShellName = 'bash' | 'zsh' | 'fish' | 'unknown';
 
@@ -79,24 +79,20 @@ function getShellVersion(shellPath: string, shellName: ShellName): string | unde
  * Check if lazy completions are configured for zsh.
  * Looks for 'lazy' completion setup in ~/.zshrc or fpath directories.
  */
-function checkZshCompletions(): boolean {
-  const home = homedir();
+async function checkZshCompletions(): Promise<boolean> {
+  const home = getHome();
   const zshrc = join(home, '.zshrc');
 
   // Check if ~/.zshrc sources lazy completions
-  if (existsSync(zshrc)) {
-    try {
-      const content = readFileSync(zshrc, 'utf-8');
-      // Match eval "$(lazy completion --zsh)" or similar patterns
-      if (content.includes('lazy completion') && content.includes('zsh')) {
-        return true;
-      }
-      // Also check for compdef _lazy lazy (manual completion setup)
-      if (content.includes('compdef _lazy lazy') || content.includes('compdef _lazy lazy')) {
-        return true;
-      }
-    } catch {
-      // Can't read file
+  const content = await readFileSafe(zshrc);
+  if (content) {
+    // Match eval "$(lazy completion --zsh)" or similar patterns
+    if (content.includes('lazy completion') && content.includes('zsh')) {
+      return true;
+    }
+    // Also check for compdef _lazy lazy (manual completion setup)
+    if (content.includes('compdef _lazy lazy') || content.includes('compdef _lazy lazy')) {
+      return true;
     }
   }
 
@@ -107,35 +103,27 @@ function checkZshCompletions(): boolean {
  * Check if lazy completions are configured for bash.
  * Looks in ~/.bashrc and bash_completion.d directories.
  */
-function checkBashCompletions(): boolean {
-  const home = homedir();
+async function checkBashCompletions(): Promise<boolean> {
+  const home = getHome();
 
   // Check ~/.bashrc
   const bashrc = join(home, '.bashrc');
-  if (existsSync(bashrc)) {
-    try {
-      const content = readFileSync(bashrc, 'utf-8');
-      if (content.includes('lazy completion') && content.includes('bash')) {
-        return true;
-      }
-      if (content.includes('complete -F _lazy_completions lazy')) {
-        return true;
-      }
-    } catch {
-      // Can't read file
+  const bashrcContent = await readFileSafe(bashrc);
+  if (bashrcContent) {
+    if (bashrcContent.includes('lazy completion') && bashrcContent.includes('bash')) {
+      return true;
+    }
+    if (bashrcContent.includes('complete -F _lazy_completions lazy')) {
+      return true;
     }
   }
 
   // Check ~/.bash_profile (macOS often uses this instead)
   const bashProfile = join(home, '.bash_profile');
-  if (existsSync(bashProfile)) {
-    try {
-      const content = readFileSync(bashProfile, 'utf-8');
-      if (content.includes('lazy completion') && content.includes('bash')) {
-        return true;
-      }
-    } catch {
-      // Can't read file
+  const bashProfileContent = await readFileSafe(bashProfile);
+  if (bashProfileContent) {
+    if (bashProfileContent.includes('lazy completion') && bashProfileContent.includes('bash')) {
+      return true;
     }
   }
 
@@ -148,7 +136,7 @@ function checkBashCompletions(): boolean {
 
   for (const dir of completionDirs) {
     const lazyCompletion = join(dir, 'lazy');
-    if (existsSync(lazyCompletion)) {
+    if (await pathExists(lazyCompletion)) {
       return true;
     }
   }
@@ -160,26 +148,20 @@ function checkBashCompletions(): boolean {
  * Check if lazy completions are configured for fish.
  * Looks in ~/.config/fish/completions/ for a lazy.fish file.
  */
-function checkFishCompletions(): boolean {
-  const home = homedir();
+async function checkFishCompletions(): Promise<boolean> {
+  const home = getHome();
 
   // Fish completions live in a well-known directory
   const fishCompletionFile = join(home, '.config', 'fish', 'completions', 'lazy.fish');
-  if (existsSync(fishCompletionFile)) {
+  if (await pathExists(fishCompletionFile)) {
     return true;
   }
 
   // Also check fish config for sourcing lazy completions
   const fishConfig = join(home, '.config', 'fish', 'config.fish');
-  if (existsSync(fishConfig)) {
-    try {
-      const content = readFileSync(fishConfig, 'utf-8');
-      if (content.includes('lazy completion')) {
-        return true;
-      }
-    } catch {
-      // Can't read file
-    }
+  const content = await readFileSafe(fishConfig);
+  if (content && content.includes('lazy completion')) {
+    return true;
   }
 
   return false;
@@ -188,11 +170,11 @@ function checkFishCompletions(): boolean {
 /**
  * Check whether lazy completions are installed for the detected shell.
  */
-function checkCompletionInstalled(shellName: ShellName): boolean {
+async function checkCompletionInstalled(shellName: ShellName): Promise<boolean> {
   switch (shellName) {
-    case 'zsh': return checkZshCompletions();
-    case 'bash': return checkBashCompletions();
-    case 'fish': return checkFishCompletions();
+    case 'zsh': return await checkZshCompletions();
+    case 'bash': return await checkBashCompletions();
+    case 'fish': return await checkFishCompletions();
     default: return false;
   }
 }
@@ -205,7 +187,7 @@ function checkCompletionInstalled(shellName: ShellName): boolean {
  * - Parses shell name from the path
  * - Checks if completions are installed for that shell
  */
-export function detectShell(): ShellInfo {
+export async function detectShell(): Promise<ShellInfo> {
   const shellPath = process.env.SHELL || '';
 
   if (!shellPath) {
@@ -218,7 +200,7 @@ export function detectShell(): ShellInfo {
 
   const name = parseShellName(shellPath);
   const version = getShellVersion(shellPath, name);
-  const completionInstalled = checkCompletionInstalled(name);
+  const completionInstalled = await checkCompletionInstalled(name);
 
   return {
     name,

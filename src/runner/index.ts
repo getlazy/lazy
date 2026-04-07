@@ -3,27 +3,25 @@
  *
  * Usage:
  *   import { createRunner } from '../runner';
- *   const runner = createRunner(lazyRoot);
+ *   const runner = await createRunner(lazyRoot);
  *   runner.checkAvailability();
  *   await runner.launchSupervisor(...);
  */
 
 export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck } from './types';
-export type { DockerRunnerOptions } from './docker-runner';
 
 import type { Runner } from './types';
 import type { RunnerType } from '../config/types';
-import { DockerRunner, type DockerRunnerOptions } from './docker-runner';
+import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
 import { HostProcessRunner } from './host-process-runner';
 import { loadConfig } from '../config/loader';
 
 /**
  * Create a Runner based on the configured runner type.
- * Accepts optional overrides for docker_agent_no_network (from CLI flags).
  */
-export function createRunner(lazyRoot: string, overrides?: Partial<DockerRunnerOptions>): Runner {
-  const config = loadConfig(lazyRoot);
+export async function createRunner(lazyRoot: string): Promise<Runner> {
+  const config = await loadConfig(lazyRoot);
 
   // Host-only agents cannot use container runners
   const agentId = config.agent.agent_id;
@@ -34,18 +32,25 @@ export function createRunner(lazyRoot: string, overrides?: Partial<DockerRunnerO
     );
   }
 
-  // Merge config values with CLI overrides (overrides take precedence)
-  const dockerOptions: DockerRunnerOptions = {
-    dockerAgentNoNetwork: overrides?.dockerAgentNoNetwork ?? config.runner.docker_agent_no_network,
-  };
+  // Wire Ollama config into runners so they can inject the right env vars
+  const ollamaConfig = config.ollama.enabled ? config.ollama : undefined;
 
   switch (config.runner.type) {
-    case 'docker':
-      return new DockerRunner('docker', 'docker', dockerOptions);
-    case 'podman':
-      return new PodmanRunner(dockerOptions);
-    case 'dangerously-host-process-without-any-isolation':
-      return new HostProcessRunner();
+    case 'docker': {
+      const runner = new DockerRunner('docker', 'docker');
+      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      return runner;
+    }
+    case 'podman': {
+      const runner = new PodmanRunner();
+      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      return runner;
+    }
+    case 'dangerously-host-process-without-any-isolation': {
+      const runner = new HostProcessRunner();
+      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      return runner;
+    }
     default:
       throw new Error(`Unknown runner type: ${config.runner.type}. Valid values: docker, podman, dangerously-host-process-without-any-isolation`);
   }

@@ -1,46 +1,37 @@
 /**
- * `lazy upgrade` — rebuild image/binary and restart containers.
+ * `lazy upgrade` — rebuild image/binary, restart daemon.
  *
  * When code changes are merged, running containers use stale code — both
  * the supervisor binary (loaded at process start) and the Docker image
  * (built at container launch). This command upgrades running infrastructure:
  *
- * 1. Rebuild agent binary AND Docker image (force rebuild regardless of hash)
- * 2. Find all running lazy containers
- * 3. If no containers are in 'working' state: proceed automatically
- * 4. If some containers are working: prompt for confirmation (--force skips)
- * 5. Stop containers (docker stop)
- * 6. Reconciler marks tasks as interrupted
- * 7. Auto-resume all interrupted tasks with new containers
+ * 1. Find all running lazy containers, prompt if any are working
+ * 2. Stop all running containers/processes
+ * 3. Rebuild agent binary AND Docker image (force rebuild regardless of hash)
+ * 4. Restart daemon with new code
+ *
+ * The restarted daemon handles everything else automatically:
+ * - Reconciles stopped containers → marks tasks as interrupted (~5s)
+ * - Auto-resumes interrupted tasks with new supervisors
  */
 
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-import { requireLazyRoot, requireStorage, shortId, parseFlags, taskRef, getWorktreePathForRef } from '../helpers';
-import { getAuthEnv, ensureImage, ensureAgentBinary, resolveImageName, getModelId } from '../../capture/claude';
+import { getHome } from '../../utils/home';
+import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
+import { ensureImage, ensureAgentBinary, resolveImageName } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
 import { isTTY } from '../editor';
 import { promptYesNo } from '../editor';
 import { theme } from '../theme';
-import { logger } from '../../utils/logger';
-import { reconcileTasks } from '../../utils/reconcile';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../../protocol';
-import { getDataDir } from '../init';
-import { checkLock, acquireLock, removeLock } from '../../utils/lock';
-import { checkPairingLock } from '../../utils/pairing-lock';
-import type { UnblockCommand } from '../../protocol';
-import { getActor } from '../../constants';
-import type { SandboxConfig } from '../../capture/claude';
-import type { Task, ModelName } from '../../types';
+import type { Task } from '../../types';
 import type { Storage } from '../../storage';
-import { buildSystemPromptForResume, buildResumePrompt } from './resume';
 import { checkDaemonHealth, requestShutdown } from '../../daemon';
+import { ensureDaemon } from '../../daemon/auto-start';
 import { spawnSync } from '../../utils/spawn';
 
-const SANDBOX_DIR = '.lazy-task-sandbox';
 const DOCKER_TIMEOUT_MS = 10_000;
 
 interface ContainerInfo {
@@ -98,7 +89,7 @@ function discoverRunningBuilderContainers(runner: Runner): string[] {
  * Force-rebuild the container image by removing the existing one first.
  */
 async function forceRebuildImage(root: string, binary: string = 'docker'): Promise<string> {
-  const imageName = resolveImageName(root);
+  const imageName = await resolveImageName(root);
 
   // Remove existing image to force rebuild
   try {
@@ -119,7 +110,7 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
  * Agent binaries live in ~/.lazy/bin/ (per-user, not per-project).
  */
 async function forceRebuildAgentBinary(): Promise<string> {
-  const binDir = join(homedir(), '.lazy', 'bin');
+  const binDir = join(getHome(), '.lazy', 'bin');
   const binaryFile = join(binDir, 'lazy-agent');
   const hashFile = join(binDir, 'lazy-agent.hash');
 
@@ -138,131 +129,6 @@ async function forceRebuildAgentBinary(): Promise<string> {
   return ensureAgentBinary();
 }
 
-/**
- * Resume a single interrupted task.
- * Returns true if successfully launched, false otherwise.
- */
-async function resumeTask(
-  storage: Storage,
-  task: Task,
-  root: string,
-): Promise<boolean> {
-  const tRef = taskRef(task);
-  const taskShortId = shortId(task.id);
-
-  const sess = await storage.getSessionByTaskId(task.id);
-  if (!sess) {
-    logger.warn(`Task ${taskShortId}: no session found, skipping auto-resume`);
-    return false;
-  }
-  if (sess.ended_at) {
-    logger.warn(`Task ${taskShortId}: session already ended, skipping auto-resume`);
-    return false;
-  }
-
-  const worktreePath = getWorktreePathForRef(root, tRef);
-  if (!existsSync(worktreePath)) {
-    logger.warn(`Task ${taskShortId}: worktree not found, skipping auto-resume`);
-    return false;
-  }
-
-  // Skip locked tasks
-  if (checkLock(worktreePath)) {
-    logger.warn(`Task ${taskShortId}: locked by another process, skipping auto-resume`);
-    return false;
-  }
-  if (checkPairingLock(worktreePath)) {
-    logger.warn(`Task ${taskShortId}: locked for pairing, skipping auto-resume`);
-    return false;
-  }
-
-  // Acquire lock
-  acquireLock(worktreePath, 'lazy upgrade');
-
-  const runner = createRunner(root);
-  const containerName = runner.runNameForTask(tRef);
-
-  try {
-    // Load config from the worktree — the branch may have settings (e.g., permissions)
-    // that aren't on the project root's lazy.toml yet.
-    const config = loadConfig(root, { cwd: worktreePath });
-
-    // Ensure sandbox exists
-    const sandboxPath = join(worktreePath, SANDBOX_DIR);
-    const claudeDir = join(sandboxPath, '.claude');
-    mkdirSync(claudeDir, { recursive: true });
-
-    const hostGitconfig = join(homedir(), '.gitconfig');
-    const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-    if (existsSync(hostGitconfig)) {
-      copyFileSync(hostGitconfig, sandboxGitconfig);
-    } else {
-      writeFileSync(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
-    }
-
-    const sandbox: SandboxConfig = { worktreePath, sandboxPath };
-    const modelName: ModelName = task.model ?? config.models.default;
-    const modelId = getModelId(modelName);
-
-    // Build the prompts: static system prompt and dynamic user prompt
-    const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions());
-    const fullPrompt = buildResumePrompt(task.goal, root);
-
-    // Record synthetic human turn
-    const nextSeq = await storage.getNextTurnSequence(sess.id);
-    await storage.createTurn({
-      sessionId: sess.id,
-      sequence: nextSeq,
-      role: 'human',
-      content: '[system] Session interrupted by upgrade and resumed',
-      actor: getActor(),
-    });
-
-    // Transition to working
-    await storage.updateTaskStatus(task.id, 'working', getActor());
-
-    // Set up protocol
-    const protoDir = getProtocolDir(task.id);
-    ensureProtocolDir(protoDir);
-
-    const unblockCommand: UnblockCommand = {
-      type: 'unblock',
-      task_id: task.id,
-      goal: task.goal,
-      prompt: fullPrompt,
-      agent_id: task.agent_id,
-      system_prompt: systemPrompt,
-      model_id: modelId,
-      agent_session_id: sess.agent_session_id ?? undefined,
-      ...commonCommandFields(config),
-    };
-    writeCommand(protoDir, unblockCommand);
-
-    // Remove any stale run
-    runner.removeRun(containerName);
-
-    // Launch new supervisor
-    await runner.launchSupervisor(sandbox, containerName, protoDir, false);
-
-    // Store container name
-    await storage.updateSessionContainerName(sess.id, containerName);
-    await storage.updateSessionInteraction(sess.id, 0);
-
-    return true;
-  } catch (err) {
-    logger.error(`Task ${taskShortId}: failed to resume: ${err instanceof Error ? err.message : err}`);
-    // Revert to interrupted if we changed status
-    try {
-      await storage.updateTaskStatus(task.id, 'interrupted', getActor());
-    } catch {
-      // Best effort
-    }
-    return false;
-  } finally {
-    removeLock(worktreePath);
-  }
-}
-
 export async function commandUpgrade(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'force', takesValue: false },
@@ -277,7 +143,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
   try {
     // Pre-flight checks
-    const runner = createRunner(root);
+    const runner = await createRunner(root);
     try {
       runner.checkAvailability();
     } catch (err) {
@@ -326,7 +192,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       }
 
       console.log('');
-      console.log('  After rebuild: all interrupted tasks will be auto-resumed.');
+      console.log('  After rebuild: daemon restarts and auto-resumes interrupted tasks (~10s).');
       console.log('  Builder containers will restart on next use.');
       return;
     }
@@ -385,13 +251,9 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log('\nNo running containers to stop.');
     }
 
-    // Step 2: Run reconciliation to mark stopped tasks as interrupted
-    console.log('\nReconciling task states...');
-    await reconcileTasks(storage, root);
-
-    // Step 3: Rebuild image and binary
+    // Step 2: Rebuild image and binary
     console.log('\nRebuilding...');
-    const config = loadConfig(root);
+    const config = await loadConfig(root);
     const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
     if (isContainerRunner) {
       const binary = config.runner.type; // 'docker' or 'podman'
@@ -407,46 +269,19 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log(`  ${theme.success('rebuilt')} agent binary`);
     }
 
-    // Step 4: Auto-resume interrupted tasks that had running containers
-    // Collect tasks that were running and are now interrupted
-    const tasksToResume: Task[] = [];
-    for (const c of containers) {
-      if (!c.task) continue;
-      // Re-fetch task to get updated status after reconciliation
-      const updatedTask = await storage.getTask(c.taskShortId);
-      if (updatedTask && updatedTask.status === 'interrupted') {
-        tasksToResume.push(updatedTask);
-      }
-    }
-
-    if (tasksToResume.length > 0) {
-      console.log(`\nAuto-resuming ${tasksToResume.length} task(s)...`);
-      let resumed = 0;
-      for (const task of tasksToResume) {
-        const taskShortId = shortId(task.id);
-        const success = await resumeTask(storage, task, root);
-        if (success) {
-          console.log(`  ${theme.success('resumed')} ${theme.taskId(taskShortId)} ${task.goal}`);
-          resumed++;
-        } else {
-          console.log(`  ${theme.error('failed')} ${theme.taskId(taskShortId)} ${task.goal}`);
-        }
-      }
-      console.log(`\nResumed ${resumed}/${tasksToResume.length} task(s).`);
-    } else {
-      console.log('\nNo tasks to auto-resume.');
-    }
-
-    // Step 5: Restart daemon if it's running
-    const daemonStatus = await checkDaemonHealth();
+    // Step 3: Restart daemon with new code.
+    // The new daemon will reconcile stopped containers (~5s) and auto-resume
+    // interrupted tasks — no need for upgrade to do either of those.
+    const daemonStatus = await checkDaemonHealth(root);
     if (daemonStatus.running) {
-      console.log('\nRestarting daemon with new version...');
-      const stopped = await requestShutdown();
-      if (stopped) {
-        console.log('  Daemon stopped — will restart automatically on next command.');
-      } else {
-        console.log('  Warning: Failed to stop daemon. You may need to restart it manually.');
-      }
+      console.log('\nRestarting daemon...');
+      await requestShutdown(root);
+    }
+    await ensureDaemon('upgrade', root);
+    console.log('  Daemon restarted with new version.');
+
+    if (containers.length > 0) {
+      console.log(`\n  ${containers.length} interrupted task(s) will auto-resume within ~10 seconds.`);
     }
 
     console.log(theme.success('\nUpgrade complete.'));
@@ -458,14 +293,14 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 export function upgradeUsage(): void {
   console.log(`Usage: lazy upgrade [--force] [--dry-run]
 
-Rebuild the Docker image and agent binary, then restart all running containers
-with the updated code.
+Rebuild the Docker image and agent binary, then restart the daemon.
 
 What happens:
   1. All running lazy containers are stopped (task supervisors and builders)
   2. Docker image and agent binary are force-rebuilt
-  3. Tasks that were interrupted by the stop are auto-resumed with new containers
-  4. Builder containers will restart on next use
+  3. Daemon is restarted with new code
+  4. Daemon auto-reconciles and auto-resumes interrupted tasks (~10 seconds)
+  5. Builder containers restart on next use
 
 If any containers are in 'working' state (mid-turn), you'll be prompted for
 confirmation before stopping them. Mid-turn work will be lost, but tasks resume

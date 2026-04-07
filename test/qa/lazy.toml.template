@@ -22,16 +22,15 @@ type = "dangerously-host-process-without-any-isolation"
 default = "journeyman"
 
 [daemon]
-# Enable daemon features for v0.11 testing.
-# These settings control the reconcile loop and auto-react behavior.
-auto_react = true
+# Enable daemon auto-react features for v0.11 testing.
 auto_react_ci = true
 auto_react_comments = true
 
-[daemon.reconcile]
-# Fast reconcile interval for testing (default is 5s in production).
-interval_ms = 2000
+[storage]
+# Storage backend — external is the default.
+# external_path is set dynamically by the QA test driver after copying this template.
+backend = "external"
 
 [session]
 verbose = false
-debug = false
+debug = true

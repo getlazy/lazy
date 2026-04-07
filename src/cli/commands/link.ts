@@ -42,7 +42,7 @@ export async function commandLink(args: string[]): Promise<void> {
   }
 
   const root = requireLazyRoot();
-  const config = loadConfig(root);
+  const config = await loadConfig(root);
 
   // Use the configured remote driver
   const driver = createDriver(config);
@@ -93,13 +93,13 @@ export async function commandLink(args: string[]): Promise<void> {
     // Fetch the branch from remote so we can create a worktree
     const gitRemote = config.remote.git_remote;
     console.log(`Fetching branch ${result.branch}...`);
-    const fetchResult = runGit(
+    const fetchResult = await runGit(
       ['fetch', gitRemote, `${result.branch}:${result.branch}`],
       { cwd: root },
     );
     if (fetchResult.exitCode !== 0) {
       // Branch might already exist locally — try to update it
-      const pullResult = runGit(
+      const pullResult = await runGit(
         ['fetch', gitRemote, result.branch],
         { cwd: root },
       );
@@ -112,7 +112,7 @@ export async function commandLink(args: string[]): Promise<void> {
     }
 
     // Check if branch already has a worktree before creating the task
-    const existingWorktree = findWorktreeForBranch(result.branch, root);
+    const existingWorktree = await findWorktreeForBranch(result.branch, root);
     if (existingWorktree) {
       console.error(`Branch '${result.branch}' already has a worktree at ${existingWorktree}.`);
       console.error('Cannot link — the branch is already checked out.');
@@ -143,15 +143,15 @@ export async function commandLink(args: string[]): Promise<void> {
 
     if (!existsSync(worktreePath)) {
       console.log(`Creating worktree for branch ${result.branch}...`);
-      createWorktree(worktreePath, result.branch, root);
+      await createWorktree(worktreePath, result.branch, root);
       // Copy untracked files configured in worktree.include
-      copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
+      await copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
     }
 
     // Detect the parent branch (the branch this was forked from).
     // Use the remote's default branch (e.g., main) to check merge-base.
-    const defaultBranch = getRemoteDefaultBranch(root, config.remote.git_remote);
-    const mergeBaseResult = runGit(
+    const defaultBranch = await getRemoteDefaultBranch(root, config.remote.git_remote);
+    const mergeBaseResult = await runGit(
       ['merge-base', defaultBranch, result.branch],
       { cwd: root },
     );
@@ -161,7 +161,7 @@ export async function commandLink(args: string[]): Promise<void> {
 
     // Create a session record so the task shows the correct branch
     const agentId = config.agent.agent_id;
-    const startSha = runGit(
+    const startSha = await runGit(
       ['rev-parse', result.branch],
       { cwd: root },
     );

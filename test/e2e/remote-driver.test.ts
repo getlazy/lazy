@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG } from '../../src/config/loader';
 import type { ResolvedConfig } from '../../src/config/types';
 import type { Task } from '../../src/types';
 import { buildRemoteCommentsContext } from '../../src/cli/commands/shared';
-import { formatAgentTurnSummary, formatHumanReviewTurn, formatNoteComment } from '../../src/cli/commands/sync';
+import { formatAgentTurnSummary, formatHumanReviewTurn, formatNoteComment } from '../../src/daemon/remote-sync';
 
 describe('remote driver', () => {
   describe('createDriver factory', () => {
@@ -51,34 +51,34 @@ describe('remote driver', () => {
 
     test('publishBranch is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       const result = await driver.publishBranch({ branch: 'some-branch', targetBranch: 'main', task });
       expect(result).toEqual({});
     });
 
     test('syncComments returns empty array', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
     });
 
     test('getPRState returns null', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       const result = await driver.getPRState(task);
       expect(result).toBeNull();
     });
 
     test('postTurnSummary is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       await driver.postTurnSummary(task, 'summary');
     });
 
     test('markReadyForReview is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       await driver.markReadyForReview(task);
     });
 
@@ -95,7 +95,7 @@ describe('remote driver', () => {
 
     test('validateAccept always returns null (no preconditions)', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
@@ -106,19 +106,19 @@ describe('remote driver', () => {
 
     test('getLastCommentSyncedAt returns undefined', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.getLastCommentSyncedAt(task)).toBeUndefined();
     });
 
     test('getLastPostedTurnSeq returns -1', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.getLastPostedTurnSeq(task)).toBe(-1);
     });
 
     test('getLastPostedNoteAt returns undefined', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.getLastPostedNoteAt(task)).toBeUndefined();
     });
 
@@ -193,7 +193,7 @@ describe('remote driver', () => {
     test('syncComments returns empty array when no PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
     });
@@ -201,7 +201,7 @@ describe('remote driver', () => {
     test('postTurnSummary is a no-op when no PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       await driver.postTurnSummary(task, 'summary');
     });
 
@@ -225,7 +225,7 @@ describe('remote driver', () => {
     test('markReadyForReview attempts PR creation without PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       // Should complete without error (PR creation fails gracefully when no remote)
       const result = await driver.markReadyForReview(task);
       expect(typeof result).toBe('object');
@@ -234,7 +234,7 @@ describe('remote driver', () => {
     test('validateAccept returns error when no remote ref', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       const result = driver.validateAccept(task);
       expect(result).toContain('no remote reference');
     });
@@ -242,7 +242,7 @@ describe('remote driver', () => {
     test('validateAccept returns null when remote ref exists', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' } };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' }, pending_sync: 0 };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
@@ -253,19 +253,19 @@ describe('remote driver', () => {
       const driver = new GitHubDriver(config);
 
       // New prefixed key takes precedence
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' } };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' }, pending_sync: 0 };
       expect(driver.getLastCommentSyncedAt(task1)).toBe('2024-06-01T00:00:00Z');
 
       // Falls back to unprefixed key (backward compat)
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_comment_synced_at: '2024-05-01T00:00:00Z' } };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_comment_synced_at: '2024-05-01T00:00:00Z' }, pending_sync: 0 };
       expect(driver.getLastCommentSyncedAt(task1b)).toBe('2024-05-01T00:00:00Z');
 
       // Falls back to old github_* key
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_comment_synced_at: '2024-01-01T00:00:00Z' } };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_comment_synced_at: '2024-01-01T00:00:00Z' }, pending_sync: 0 };
       expect(driver.getLastCommentSyncedAt(task2)).toBe('2024-01-01T00:00:00Z');
 
       // Returns undefined when no metadata
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.getLastCommentSyncedAt(task3)).toBeUndefined();
     });
 
@@ -273,16 +273,16 @@ describe('remote driver', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
 
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '5' } };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '5' }, pending_sync: 0 };
       expect(driver.getLastPostedTurnSeq(task1)).toBe(5);
 
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '4' } };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '4' }, pending_sync: 0 };
       expect(driver.getLastPostedTurnSeq(task1b)).toBe(4);
 
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '3' } };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '3' }, pending_sync: 0 };
       expect(driver.getLastPostedTurnSeq(task2)).toBe(3);
 
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null };
+      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
       expect(driver.getLastPostedTurnSeq(task3)).toBe(-1);
     });
 
@@ -290,13 +290,13 @@ describe('remote driver', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
 
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_note_at: '2024-06-01' } };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_note_at: '2024-06-01' }, pending_sync: 0 };
       expect(driver.getLastPostedNoteAt(task1)).toBe('2024-06-01');
 
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_note_at: '2024-05-01' } };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_note_at: '2024-05-01' }, pending_sync: 0 };
       expect(driver.getLastPostedNoteAt(task1b)).toBe('2024-05-01');
 
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_note_at: '2024-01-01' } };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_note_at: '2024-01-01' }, pending_sync: 0 };
       expect(driver.getLastPostedNoteAt(task2)).toBe('2024-01-01');
     });
 
@@ -314,7 +314,7 @@ describe('remote driver', () => {
       const result = await driver.merge({
         sourceBranch: 'test-branch',
         targetBranch: 'main',
-        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null },
+        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 },
         taskShortId: 'test1234',
         root: '/tmp/nonexistent',
       });
@@ -391,17 +391,18 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
+        pending_sync: 0,
         ...overrides,
       };
     }
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
-    function makeDeps(ghHandler: (args: string[], cwd?: string) => GhResult): DriverDeps {
+    function makeDeps(ghHandler: (args: string[], cwd?: string) => Promise<GhResult>): DriverDeps {
       return {
         runGh: ghHandler,
-        runGit: (args: string[]) => {
+        runGit: async (args: string[]) => {
           // pushBranch calls git push — always succeed
           if (args[0] === 'push') return ok();
           return fail('unexpected git call');
@@ -412,7 +413,7 @@ describe('remote driver', () => {
     test('merge creates replacement PR when existing PR is MERGED', async () => {
       const ghCalls: string[][] = [];
 
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         ghCalls.push([...args]);
         // findExistingPR: pr view → returns MERGED state
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
@@ -465,7 +466,7 @@ describe('remote driver', () => {
     test('merge creates replacement PR when existing PR is CLOSED', async () => {
       const ghCalls: string[][] = [];
 
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         ghCalls.push([...args]);
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
@@ -499,7 +500,7 @@ describe('remote driver', () => {
     test('merge creates PR when no PR exists at all', async () => {
       const ghCalls: string[][] = [];
 
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         ghCalls.push([...args]);
         // findExistingPR: pr view → no PR found
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
@@ -537,7 +538,7 @@ describe('remote driver', () => {
     test('merge skips PR creation when PR is OPEN (normal flow)', async () => {
       const ghCalls: string[][] = [];
 
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         ghCalls.push([...args]);
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
@@ -569,7 +570,7 @@ describe('remote driver', () => {
 
     test('merge fails when replacement PR creation fails and branch not merged', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
             return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
           }
@@ -578,7 +579,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         },
-        runGit: (args) => {
+        runGit: async (args) => {
           if (args[0] === 'push') return ok();
           // merge-base --is-ancestor → branch is NOT merged
           if (args[0] === 'merge-base') return fail('not ancestor');
@@ -604,7 +605,7 @@ describe('remote driver', () => {
 
     test('merge succeeds when PR creation fails but branch is already merged', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           // No PR exists
           if (args[0] === 'pr' && args[1] === 'view') {
             return fail('no pull requests found');
@@ -615,7 +616,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         },
-        runGit: (args) => {
+        runGit: async (args) => {
           if (args[0] === 'push') return ok();
           // merge-base --is-ancestor → branch IS already merged
           if (args[0] === 'merge-base') return ok();
@@ -636,7 +637,7 @@ describe('remote driver', () => {
     });
 
     test('merge detects conflicts on replacement PR merge', async () => {
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'CLOSED' }));
         }
@@ -668,7 +669,7 @@ describe('remote driver', () => {
     });
 
     test('merge detects GitHub "not mergeable" error as conflict', async () => {
-      const deps = makeDeps((args) => {
+      const deps = makeDeps(async (args) => {
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
           return ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' }));
         }
@@ -700,14 +701,14 @@ describe('remote driver', () => {
   describe('GitHubDriver fetchBranch (mocked)', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     test('returns false when remote branch has no new commits', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('0'); // no new commits
@@ -727,8 +728,8 @@ describe('remote driver', () => {
     test('returns true when remote has new commits (fetch only, no merge)', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('3'); // 3 new commits
@@ -747,8 +748,8 @@ describe('remote driver', () => {
 
     test('throws when fetch fails', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return fail('Could not resolve host');
           return fail('unexpected');
         },
@@ -761,8 +762,8 @@ describe('remote driver', () => {
 
     test('returns false when rev-list fails (no tracking ref)', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return fail('unknown revision');
           return fail('unexpected');
@@ -787,8 +788,8 @@ describe('remote driver', () => {
   describe('GitHubDriver fastForwardLocal (mocked)', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     // INVARIANT: After a successful remote accept, the local parent branch
     // must be fast-forwarded to match origin. This prevents the next task
@@ -798,8 +799,8 @@ describe('remote driver', () => {
     test('uses fetch + merge --ff-only when target branch is checked out (common case)', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           // HEAD is on main
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
@@ -827,8 +828,8 @@ describe('remote driver', () => {
     test('uses refspec fetch when target branch is NOT checked out', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           // HEAD is on a different branch
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('lazy/abc12345');
@@ -852,8 +853,8 @@ describe('remote driver', () => {
     // a warning so the user knows to reconcile manually.
     test('returns warning when checked-out branch has diverged (ff-only fails)', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'merge' && args[1] === '--ff-only') {
@@ -873,8 +874,8 @@ describe('remote driver', () => {
 
     test('returns warning when non-checked-out branch has diverged (refspec rejected)', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('lazy/abc12345');
           if (args[0] === 'fetch') {
             return fail('! [rejected]        main -> main  (non-fast-forward)');
@@ -893,8 +894,8 @@ describe('remote driver', () => {
 
     test('returns success when checked-out branch is already up to date', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'merge' && args[1] === '--ff-only') {
@@ -914,8 +915,8 @@ describe('remote driver', () => {
     test('works with non-main branches (e.g., parent task branch)', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           // HEAD is on a different branch
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
@@ -936,14 +937,14 @@ describe('remote driver', () => {
   describe('GitHubDriver resolveUpstreamRef (mocked)', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     test('fetches and returns origin/<branch> on success', async () => {
       const gitCalls: string[][] = [];
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           return fail('unexpected git call');
@@ -960,8 +961,8 @@ describe('remote driver', () => {
 
     test('resolves parent task branch (lazy/<id>)', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return ok();
           return fail('unexpected git call');
         },
@@ -975,8 +976,8 @@ describe('remote driver', () => {
 
     test('falls back to local branch name when fetch fails', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: (args) => {
+        runGh: async () => fail('should not be called'),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return fail('Could not resolve host');
           return fail('unexpected git call');
         },
@@ -990,8 +991,8 @@ describe('remote driver', () => {
 
     test('falls back to local branch name on exception', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: () => {
+        runGh: async () => fail('should not be called'),
+        runGit: async () => {
           throw new Error('Network unreachable');
         },
       };
@@ -1036,16 +1037,17 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
+        pending_sync: 0,
         ...overrides,
       };
     }
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     /** gh handler that reports repo as private and delegates API calls to the given handler */
-    function privateRepoGh(apiHandler: (args: string[]) => GhResult): (args: string[]) => GhResult {
-      return (args: string[]) => {
+    function privateRepoGh(apiHandler: (args: string[]) => Promise<GhResult>): (args: string[]) => Promise<GhResult> {
+      return async (args: string[]) => {
         if (args[0] === 'repo' && args[1] === 'view') {
           return ok(JSON.stringify({ isPrivate: true }));
         }
@@ -1055,8 +1057,8 @@ describe('remote driver', () => {
 
     test('returns empty array when no PR number in metadata', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: () => fail('should not be called'),
+        runGh: async () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const task = makeTask({ metadata: null });
@@ -1074,7 +1076,7 @@ describe('remote driver', () => {
       ];
 
       const deps: DriverDeps = {
-        runGh: privateRepoGh((args) => {
+        runGh: privateRepoGh(async (args) => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
@@ -1083,7 +1085,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         }),
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1106,7 +1108,7 @@ describe('remote driver', () => {
       ];
 
       const deps: DriverDeps = {
-        runGh: privateRepoGh((args) => {
+        runGh: privateRepoGh(async (args) => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
@@ -1115,7 +1117,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1130,7 +1132,7 @@ describe('remote driver', () => {
       const page2 = [{ id: 2, body: 'Page 2', user: { login: 'b' }, created_at: '2024-06-01T02:00:00Z' }];
 
       const deps: DriverDeps = {
-        runGh: privateRepoGh((args) => {
+        runGh: privateRepoGh(async (args) => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             // gh api --paginate concatenates arrays
             return ok(JSON.stringify(page1) + JSON.stringify(page2));
@@ -1140,7 +1142,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1157,7 +1159,7 @@ describe('remote driver', () => {
       ];
 
       const deps: DriverDeps = {
-        runGh: privateRepoGh((args) => {
+        runGh: privateRepoGh(async (args) => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
@@ -1166,7 +1168,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1179,8 +1181,8 @@ describe('remote driver', () => {
 
     test('returns empty when both API calls fail', async () => {
       const deps: DriverDeps = {
-        runGh: privateRepoGh(() => fail('Network error')),
-        runGit: () => fail('should not be called'),
+        runGh: privateRepoGh(async () => fail('Network error')),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1192,14 +1194,14 @@ describe('remote driver', () => {
     test('skips comments for public repos by default', async () => {
       let apiCalled = false;
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'repo' && args[1] === 'view') {
             return ok(JSON.stringify({ isPrivate: false }));
           }
           apiCalled = true;
           return fail('should not reach API');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1224,7 +1226,7 @@ describe('remote driver', () => {
       ];
 
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'repo' && args[1] === 'view') {
             return ok(JSON.stringify({ isPrivate: false }));
           }
@@ -1236,7 +1238,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(publicOkConfig, deps);
@@ -1249,14 +1251,14 @@ describe('remote driver', () => {
     test('treats repo as public when gh repo view fails (safe default)', async () => {
       let apiCalled = false;
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'repo' && args[1] === 'view') {
             return fail('not found');
           }
           apiCalled = true;
           return fail('should not reach API');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1278,7 +1280,7 @@ describe('remote driver', () => {
       ];
 
       const deps: DriverDeps = {
-        runGh: privateRepoGh((args) => {
+        runGh: privateRepoGh(async (args) => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
@@ -1287,7 +1289,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         }),
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1309,7 +1311,7 @@ describe('remote driver', () => {
     test('postTurnSummary prepends lazy marker to comment', async () => {
       let postedBody = '';
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'comment') {
             const bodyIdx = args.indexOf('--body');
             postedBody = bodyIdx >= 0 ? args[bodyIdx + 1] : '';
@@ -1317,7 +1319,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1349,17 +1351,18 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
+        pending_sync: 0,
         ...overrides,
       };
     }
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     test('returns null when no PR number in metadata', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('should not be called'),
-        runGit: () => fail('should not be called'),
+        runGh: async () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask({ metadata: null }));
@@ -1368,13 +1371,13 @@ describe('remote driver', () => {
 
     test('returns OPEN for open PR', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view') {
             return ok(JSON.stringify({ state: 'OPEN' }));
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask());
@@ -1383,13 +1386,13 @@ describe('remote driver', () => {
 
     test('returns MERGED for merged PR', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view') {
             return ok(JSON.stringify({ state: 'MERGED' }));
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask());
@@ -1398,13 +1401,13 @@ describe('remote driver', () => {
 
     test('returns CLOSED for closed PR', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view') {
             return ok(JSON.stringify({ state: 'CLOSED' }));
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask());
@@ -1413,8 +1416,8 @@ describe('remote driver', () => {
 
     test('returns null when gh fails', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('network error'),
-        runGit: () => fail('should not be called'),
+        runGh: async () => fail('network error'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask());
@@ -1423,13 +1426,13 @@ describe('remote driver', () => {
 
     test('returns null when response is unparseable', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view') {
             return ok('not json');
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
       const driver = new GitHubDriver(ghConfig, deps);
       const result = await driver.getPRState(makeTask());
@@ -1456,17 +1459,18 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
+        pending_sync: 0,
         ...overrides,
       };
     }
 
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     test('posts comment to PR', async () => {
       let postedBody = '';
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'comment') {
             const bodyIdx = args.indexOf('--body');
             postedBody = bodyIdx >= 0 ? args[bodyIdx + 1] : '';
@@ -1474,7 +1478,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected');
         },
-        runGit: () => fail('should not be called'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1489,8 +1493,8 @@ describe('remote driver', () => {
     test('skips when no PR number', async () => {
       let ghCalled = false;
       const deps: DriverDeps = {
-        runGh: () => { ghCalled = true; return fail('should not be called'); },
-        runGit: () => fail('should not be called'),
+        runGh: async () => { ghCalled = true; return fail('should not be called'); },
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1501,8 +1505,8 @@ describe('remote driver', () => {
 
     test('does not throw when posting fails', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('Network error'),
-        runGit: () => fail('should not be called'),
+        runGh: async () => fail('Network error'),
+        runGit: async () => fail('should not be called'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1519,13 +1523,13 @@ describe('remote driver', () => {
     /** Build deps where gh/git calls pass all basic checks, with custom repo view response */
     function healthyDeps(repoViewResult: GhResult): DriverDeps {
       return {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === '--version') return ok('gh version 2.0.0');
           if (args[0] === 'auth' && args[1] === 'status') return ok('Token scopes: repo');
           if (args[0] === 'repo' && args[1] === 'view') return repoViewResult;
           return fail('unexpected gh call');
         },
-        runGit: (args) => {
+        runGit: async (args) => {
           if (args[0] === 'remote' && args[1] === 'get-url') return ok('git@github.com:owner/repo.git');
           return fail('unexpected git call');
         },
@@ -1663,12 +1667,12 @@ describe('remote driver', () => {
 
   describe('GitHubDriver.importUrl', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-    const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = (stderr = 'error'): GhResult => ({ stdout: '', stderr, exitCode: 1 });
+    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
+    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
 
     test('imports PR with title, branch, and metadata', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view' && args.includes('title,headRefName,state,url,number,body')) {
             return ok(JSON.stringify({
               title: 'Fix authentication bug',
@@ -1684,7 +1688,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         },
-        runGit: () => fail('unexpected git call'),
+        runGit: async () => fail('unexpected git call'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1701,7 +1705,7 @@ describe('remote driver', () => {
 
     test('imports PR comments as notes', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view' && args.includes('title,headRefName,state,url,number,body')) {
             return ok(JSON.stringify({
               title: 'Add feature',
@@ -1723,7 +1727,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         },
-        runGit: () => fail('unexpected git call'),
+        runGit: async () => fail('unexpected git call'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1736,8 +1740,8 @@ describe('remote driver', () => {
 
     test('throws when gh pr view fails', async () => {
       const deps: DriverDeps = {
-        runGh: () => fail('not found'),
-        runGit: () => fail('unexpected git call'),
+        runGh: async () => fail('not found'),
+        runGit: async () => fail('unexpected git call'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
@@ -1753,7 +1757,7 @@ describe('remote driver', () => {
 
     test('continues without comments when comment fetch fails', async () => {
       const deps: DriverDeps = {
-        runGh: (args) => {
+        runGh: async (args) => {
           if (args[0] === 'pr' && args[1] === 'view' && args.includes('title,headRefName,state,url,number,body')) {
             return ok(JSON.stringify({
               title: 'Test PR',
@@ -1769,7 +1773,7 @@ describe('remote driver', () => {
           }
           return fail('unexpected gh call');
         },
-        runGit: () => fail('unexpected git call'),
+        runGit: async () => fail('unexpected git call'),
       };
 
       const driver = new GitHubDriver(ghConfig, deps);

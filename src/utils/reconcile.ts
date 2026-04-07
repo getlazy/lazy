@@ -11,7 +11,7 @@
  */
 
 import { join } from 'path';
-import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync, statSync } from 'fs';
+import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import type { Storage } from '../storage';
 import { TERMINAL_STATUSES } from '../types';
 import type { TokenUsage } from '../types';
@@ -23,9 +23,12 @@ import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha
 import { checkLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
-import { getDataDir } from '../cli/init';
+import { tmuxSessionName, killTmuxWatchSession } from '../terminal';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
+import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
+import type { AutoReactTrigger } from '../daemon/auto-react-budget';
+import { loadConfig } from '../config/loader';
 import { runGit } from './git';
 import { reparentChildren } from '../cli/orphan';
 
@@ -43,43 +46,34 @@ function getWorkingGracePeriodMs(): number {
   return process.env.LAZY_TEST === '1' ? 0 : 30000; // 30 seconds (0 in tests)
 }
 
-/**
- * Acquire a global reconciliation lock. Returns true if acquired, false if another process holds it.
- */
-function acquireReconcileLock(lazyRoot: string): boolean {
-  const lockPath = join(lazyRoot, getDataDir(lazyRoot), '.reconcile-lock');
-  try {
-    if (existsSync(lockPath)) {
-      const content = readFileSync(lockPath, 'utf-8');
-      const { pid } = JSON.parse(content);
-      // Check if the owning process is still alive
-      try {
-        process.kill(pid, 0);
-        return false; // Lock held by a live process
-      } catch {
-        // Stale lock — process is dead, take over
-      }
-    }
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function releaseReconcileLock(lazyRoot: string): void {
-  try {
-    unlinkSync(join(lazyRoot, getDataDir(lazyRoot), '.reconcile-lock'));
-  } catch {
-    // Best effort
-  }
-}
 
 function shortId(id: string): string {
   return id.substring(0, 8);
 }
 
 // TERMINAL_STATUSES imported from ../types
+
+/**
+ * Options for cooperative scheduling during reconciliation.
+ * When the daemon is running, these allow HTTP requests to preempt the
+ * reconcile loop so CLI/MCP commands are served promptly.
+ */
+export interface ReconcileSchedulingOptions {
+  /**
+   * Returns true when an HTTP request is waiting. The reconcile loop
+   * checks this between steps and bails early if true — the remaining
+   * work will be picked up on the next reconcile tick.
+   */
+  shouldAbort?: () => boolean;
+}
+
+/**
+ * Yield to the event loop so pending HTTP requests and microtasks get served.
+ * Used between reconcile steps for cooperative scheduling.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
 
 /**
  * Reconcile all tasks in 'working' status, plus:
@@ -92,49 +86,75 @@ function shortId(id: string): string {
  * 3. If container stopped without response -> check status.json for context, transition to 'interrupted'
  * 4. If no container and no response -> transition to 'interrupted'
  */
-export async function reconcileTasks(storage: Storage, lazyRoot: string): Promise<void> {
-  if (!acquireReconcileLock(lazyRoot)) {
-    logger.debug('Reconciliation skipped — another process is reconciling');
-    return;
-  }
+export async function reconcileTasks(
+  storage: Storage,
+  lazyRoot: string,
+  scheduling?: ReconcileSchedulingOptions,
+): Promise<void> {
+  const shouldAbort = scheduling?.shouldAbort ?? (() => false);
 
-  try {
-    const runner = createRunner(lazyRoot);
-    // Primary sweep: reconcile working tasks
-    const workingTasks = await storage.listTasksWithOptions({ workingOnly: true });
+  const runner = await createRunner(lazyRoot);
+  // Primary sweep: reconcile working tasks
+  const workingTasks = await storage.listTasksWithOptions({ workingOnly: true });
 
     for (const task of workingTasks) {
+      if (shouldAbort()) {
+        logger.debug('Reconcile aborted: HTTP request pending (during working task sweep)');
+        return;
+      }
       try {
         await reconcileTask(storage, task.id, lazyRoot, runner);
       } catch (err) {
         logger.debug(`Failed to reconcile task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
       }
+      // Yield to event loop between tasks so pending HTTP requests get served
+      await yieldToEventLoop();
+    }
+
+    if (shouldAbort()) {
+      logger.debug('Reconcile aborted: HTTP request pending (after working task sweep)');
+      return;
     }
 
     // Sweep 2: process stale responses for interrupted tasks
     // This handles the race where the supervisor writes a new response AFTER
     // reconciliation already moved the task to interrupted.
     try {
-      await sweepInterruptedResponses(storage, lazyRoot);
+      await sweepInterruptedResponses(storage, lazyRoot, shouldAbort);
     } catch (err) {
       logger.warn(`Sweep interrupted responses failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    if (shouldAbort()) {
+      logger.debug('Reconcile aborted: HTTP request pending (after interrupted sweep)');
+      return;
     }
 
     // Sweep 3: clean up orphaned runs for terminal-state tasks
     // This catches containers/processes that survived a failed cleanup during accept/close/reject.
     try {
-      await sweepTerminalContainers(storage, lazyRoot, runner);
+      await sweepTerminalContainers(storage, lazyRoot, runner, shouldAbort);
     } catch (err) {
       logger.warn(`Sweep terminal containers failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    if (shouldAbort()) {
+      logger.debug('Reconcile aborted: HTTP request pending (after terminal sweep)');
+      return;
     }
 
     // Sweep 4: detect tasks whose branch was already merged into their target
     // This catches the zombie scenario where accept squash-merged the branch
     // but crashed before updating session/task metadata.
     try {
-      await sweepMergedBranches(storage, lazyRoot);
+      await sweepMergedBranches(storage, lazyRoot, shouldAbort);
     } catch (err) {
       logger.warn(`Sweep merged branches failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    if (shouldAbort()) {
+      logger.debug('Reconcile aborted: HTTP request pending (after merged branch sweep)');
+      return;
     }
 
     // Sweep 5: recover stale pairing states
@@ -154,9 +174,6 @@ export async function reconcileTasks(storage: Storage, lazyRoot: string): Promis
     } catch (err) {
       logger.warn(`Migrate blocked to backlog failed: ${err instanceof Error ? err.message : err}`);
     }
-  } finally {
-    releaseReconcileLock(lazyRoot);
-  }
 }
 
 async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string, runner: Runner): Promise<void> {
@@ -170,7 +187,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
 
   // Skip tasks that are being actively worked on by another process (e.g., lazy start/unblock)
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
-  if (checkLock(worktreePath)) {
+  if (await checkLock(worktreePath)) {
     logger.debug(`Task ${taskShortId}: worktree locked by another process, skipping reconciliation`);
     return;
   }
@@ -192,7 +209,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   // the container time to start before checking if it's running.
   if (response) {
     if (response.status === 'completed') {
-      logger.debug(`Task ${taskShortId}: supervisor response found, transitioning to blocked`);
+      logger.info(`Task ${taskShortId} finished turn, transitioning to blocked`);
       await handleCompletedResponse(storage, taskId, session, response, worktreePath, protoDir);
 
       // Note: push and PR operations moved out of reconciler.
@@ -201,7 +218,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
       return;
     } else {
       // Error response — record as an agent error turn so crash details are visible
-      logger.debug(`Task ${taskShortId}: supervisor error response (phase: ${response.phase}): ${response.error}`);
+      logger.info(`Task ${taskShortId} crashed (phase: ${response.phase}): ${response.error}`);
       await handleErrorResponse(storage, taskId, session, response, protoDir, lazyRoot);
       return;
     }
@@ -235,12 +252,13 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     const status = readStatus(protoDir);
     const reason = exitCodeToReason(exitCode);
 
-    logger.debug(`Task ${taskShortId}: run stopped (exit: ${exitCode}), phase: ${status?.phase ?? 'unknown'}`);
+    logger.info(`Task ${taskShortId} crashed: run stopped (exit: ${exitCode}, phase: ${status?.phase ?? 'unknown'})`);
 
     // Run stopped without writing response — interrupted
     await storage.updateTaskStatus(taskId, 'interrupted', 'system');
     await storage.recordInterrupt(session.id, { reason, exit_code: exitCode, logs });
     await storage.updateSessionContainerName(session.id, null);
+    killTmuxWatchSession(tmuxSessionName(taskShortId));
     clearStatus(protoDir);
     runner.removeRun(containerName);
 
@@ -250,7 +268,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   }
 
   // Step 5: No run found at all — interrupted
-  logger.debug(`Task ${taskShortId}: no run found, transitioning to interrupted`);
+  logger.info(`Task ${taskShortId} crashed: run disappeared (no container found)`);
   await storage.updateTaskStatus(taskId, 'interrupted', 'system');
   await storage.recordInterrupt(session.id, {
     reason: 'Container disappeared (no exit code)',
@@ -258,6 +276,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     logs: null,
   });
   await storage.updateSessionContainerName(session.id, null);
+  killTmuxWatchSession(tmuxSessionName(taskShortId));
   clearStatus(protoDir);
 
   // Auto-resume if circuit breaker allows
@@ -265,10 +284,18 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
 }
 
 /**
- * Check circuit breaker and auto-resume an interrupted task if allowed.
+ * Check circuit breaker, auto-react budget, and auto-resume an interrupted task if allowed.
  * Re-reads the session to get the updated consecutive_interruptions count.
+ *
+ * @param trigger - The auto-react trigger type (defaults to 'crash' for interrupt recovery).
  */
-async function maybeAutoResume(storage: Storage, taskId: string, sessionId: string, lazyRoot: string): Promise<void> {
+async function maybeAutoResume(
+  storage: Storage,
+  taskId: string,
+  sessionId: string,
+  lazyRoot: string,
+  trigger: AutoReactTrigger = 'crash',
+): Promise<void> {
   const taskShortId = shortId(taskId);
 
   // Re-read session to get updated consecutive_interruptions from recordInterrupt
@@ -294,9 +321,38 @@ async function maybeAutoResume(storage: Storage, taskId: string, sessionId: stri
   // Only auto-resume interrupted tasks
   if (task.status !== 'interrupted') return;
 
+  // Auto-react budget gate: check per-task limits, backoff, and daily budget
+  try {
+    const config = await loadConfig(lazyRoot, { cwd: lazyRoot });
+    const dataDir = join(lazyRoot, '.lazy');
+    const decision = await shouldAutoReact(storage, taskId, trigger, config, dataDir);
+
+    if (!decision.allowed) {
+      if (decision.backoffRemainingMs) {
+        // Backoff not elapsed — the reconcile loop will retry on the next tick
+        logger.debug(`Task ${taskShortId}: auto-react blocked by backoff (${decision.reason})`);
+      } else {
+        // Hard limit reached — log as warning so it's visible
+        logger.warn(`Task ${taskShortId}: auto-react blocked: ${decision.reason}`);
+      }
+      return;
+    }
+  } catch (err) {
+    // Budget check failure should not prevent auto-resume — fail open
+    logger.debug(`Task ${taskShortId}: auto-react budget check failed: ${err instanceof Error ? err.message : err}`);
+  }
+
   try {
     const success = await autoResumeTask(storage, task, session, lazyRoot);
-    if (!success) {
+    if (success) {
+      // Record the auto-react consumption (counter + daily budget)
+      try {
+        const dataDir = join(lazyRoot, '.lazy');
+        await recordAutoReact(storage, taskId, trigger, dataDir);
+      } catch (err) {
+        logger.debug(`Task ${taskShortId}: failed to record auto-react: ${err instanceof Error ? err.message : err}`);
+      }
+    } else {
       logger.debug(`Task ${taskShortId}: auto-resume failed, task remains interrupted`);
     }
   } catch (err) {
@@ -403,7 +459,7 @@ async function handleCompletedResponse(
     turnStartShaWork = status.post_merge_sha ?? status.pre_turn_sha;
     turnEndShaWork = status.post_work_sha;
     try {
-      turnEndSha = getCurrentSha(worktreePath);
+      turnEndSha = await getCurrentSha(worktreePath);
     } catch {
       logger.debug(`Task ${taskShortId}: could not get current SHA for turn end`);
     }
@@ -460,19 +516,20 @@ async function handleCompletedResponse(
     : session.git_start_sha;
 
   try {
-    const newCommits = getNewCommits(lastKnownSha, worktreePath);
+    const newCommits = await getNewCommits(lastKnownSha, worktreePath);
+    logger.debug(`Task ${taskShortId}: detected ${newCommits.length} new commit(s) since ${lastKnownSha.substring(0, 8)} in ${worktreePath}`);
     for (const c of newCommits) {
       await storage.createCommit(session.id, c.sha, c.message);
     }
-  } catch {
-    logger.debug(`Task ${taskShortId}: could not detect new commits`);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not detect new commits: ${err instanceof Error ? err.message : err}`);
   }
 
   // Capture uncommitted changes
   try {
-    if (hasUncommittedChanges(worktreePath)) {
-      const uncommittedDiff = getUncommittedDiff(worktreePath);
-      const gitStatus = runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath }).stdout;
+    if (await hasUncommittedChanges(worktreePath)) {
+      const uncommittedDiff = await getUncommittedDiff(worktreePath);
+      const gitStatus = (await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath })).stdout;
       await storage.createWorktreeSnapshot(session.id, agentTurnSeq, uncommittedDiff, gitStatus);
     }
   } catch {
@@ -482,6 +539,9 @@ async function handleCompletedResponse(
   // Transition to blocked (or conflict if there are file permission violations)
   const nextStatus = (response.violations && response.violations.length > 0) ? 'conflict' : 'blocked';
   await storage.updateTaskStatus(taskId, nextStatus, 'system');
+
+  // pending_sync is managed by the daemon sync retry loop (src/daemon/sync-retry.ts).
+  // The reconciler does not touch the counter — only syncTask resets it on launch.
 
   // Reset consecutive interruptions counter — a successful turn means the agent is healthy
   await storage.resetConsecutiveInterruptions(session.id);
@@ -583,10 +643,14 @@ async function handleErrorResponse(
  *
  * This sweep finds interrupted tasks that have a valid response.json and processes them.
  */
-async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Promise<void> {
+async function sweepInterruptedResponses(storage: Storage, lazyRoot: string, shouldAbort: () => boolean = () => false): Promise<void> {
   const interruptedTasks = await storage.listTasksWithOptions({ interruptedOnly: true });
 
   for (const task of interruptedTasks) {
+    if (shouldAbort()) {
+      logger.debug('Sweep interrupted responses aborted: HTTP request pending');
+      return;
+    }
     try {
       const session = await storage.getSessionByTaskId(task.id);
       if (!session) continue;
@@ -596,7 +660,7 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
       const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
 
       // Skip tasks with active worktree locks (another process is working on them)
-      if (checkLock(worktreePath)) {
+      if (await checkLock(worktreePath)) {
         logger.debug(`Task ${taskShortId}: worktree locked, skipping interrupted sweep`);
         continue;
       }
@@ -632,11 +696,15 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
  * fail. Since the reconciler previously only looked at working tasks, these containers
  * would run forever. This sweep finds and removes them.
  */
-async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runner: Runner): Promise<void> {
+async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runner: Runner, shouldAbort: () => boolean = () => false): Promise<void> {
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
     if (!TERMINAL_STATUSES.has(task.status)) continue;
+    if (shouldAbort()) {
+      logger.debug('Sweep terminal containers aborted: HTTP request pending');
+      return;
+    }
 
     try {
       const taskShortId = shortId(task.id);
@@ -676,7 +744,7 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
  *       on the target mentioning the task's short ID
  * 2. If merged → fix: set session outcome to "accepted", set ended_at, set task status to "complete"
  */
-async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<void> {
+async function sweepMergedBranches(storage: Storage, lazyRoot: string, shouldAbort: () => boolean = () => false): Promise<void> {
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
@@ -686,6 +754,11 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
     // A working task's branch may appear "merged" if it was just created
     // from the target and the agent hasn't committed yet.
     if (task.status === 'working') continue;
+
+    if (shouldAbort()) {
+      logger.debug('Sweep merged branches aborted: HTTP request pending');
+      return;
+    }
 
     try {
       const session = await storage.getSessionByTaskId(task.id);
@@ -712,21 +785,21 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
         const parentRef = await taskRefFromId(task.parent_task_id, storage);
         mergeTarget = `lazy/${parentRef}`;
         // If parent's branch doesn't exist, we can't check — skip
-        if (!branchExists(mergeTarget, lazyRoot)) continue;
+        if (!await branchExists(mergeTarget, lazyRoot)) continue;
       } else {
-        mergeTarget = getTaskTargetBranch(task, lazyRoot) ?? 'main';
+        mergeTarget = await getTaskTargetBranch(task, lazyRoot) ?? 'main';
       }
 
       let isMerged = false;
 
-      if (branchExists(session.git_branch, lazyRoot)) {
+      if (await branchExists(session.git_branch, lazyRoot)) {
         // Branch still exists — check if all its commits are reachable from the target
-        isMerged = isBranchMergedInto(session.git_branch, mergeTarget, lazyRoot);
+        isMerged = await isBranchMergedInto(session.git_branch, mergeTarget, lazyRoot);
         logger.debug(`Task ${taskShortId}: branch ${session.git_branch} exists, isBranchMergedInto(${mergeTarget}) = ${isMerged}`);
       } else {
         // Branch was deleted (cleanup ran after merge) — look for the squash-merge
         // commit message pattern: "Accept task <shortId>: ..."
-        isMerged = findCommitByMessage(mergeTarget, `Accept task ${taskShortId}`, lazyRoot);
+        isMerged = await findCommitByMessage(mergeTarget, `Accept task ${taskShortId}`, lazyRoot);
         logger.debug(`Task ${taskShortId}: branch ${session.git_branch} deleted, findCommitByMessage = ${isMerged}`);
       }
 

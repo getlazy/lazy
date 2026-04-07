@@ -6,10 +6,11 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { writeFileSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync, readdirSync } from 'fs';
+import { join, basename } from 'path';
+import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('per-task sync (syncTaskFromRemote)', () => {
@@ -89,13 +90,11 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     expectOutput(showResult, 'Comment display test');
   });
 
-  // INVARIANT: Every unblock merges upstream before giving feedback.
-  // Agents must always work against current main to prevent drift.
-  // --sync-with-upstream is additive (injects merge conflict warning),
-  // not the only way to trigger merge.
-  test('unblock without --sync-with-upstream DOES trigger merge when upstream has changes', async () => {
+  // INVARIANT: Unblock does NOT trigger upstream merge — sync is separate.
+  // Use `lazy sync <task>` to merge upstream before or after unblocking.
+  test('unblock does NOT trigger merge even when upstream has changes', async () => {
     // Create and start a task
-    const taskId = await createTask(ctx, 'Auto merge task', 'Do some work');
+    const taskId = await createTask(ctx, 'No auto merge task', 'Do some work');
 
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -109,70 +108,15 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     ctx.git('commit', '-m', 'upstream change');
     ctx.git('checkout', '-'); // back to previous branch
 
-    // Unblock with just a message (no --sync-with-upstream)
+    // Unblock with just a message
     const unblockResult = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Fix the bug'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblockResult);
-    // SHOULD mention upstream merge — auto-merge is always on
-    expectOutput(unblockResult, 'Supervisor will merge before proceeding');
-  });
-
-  test('unblock with --sync-with-upstream triggers merge message', async () => {
-    const taskId = await createTask(ctx, 'Merge task', 'Do some work');
-
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // Unblock with --sync-with-upstream
-    const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--sync-with-upstream'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(unblockResult);
-    // Should mention upstream merge
-    expectOutput(unblockResult, 'Supervisor will merge before proceeding');
-  });
-
-  test('unblock with --sync-with-upstream and --message combines them', async () => {
-    const taskId = await createTask(ctx, 'Merge with feedback task', 'Do some work');
-
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // --sync-with-upstream combined with --message should succeed
-    const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--sync-with-upstream', '--message', 'Also fix the login bug'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(unblockResult);
-    expectOutput(unblockResult, 'Supervisor will merge before proceeding');
-  });
-
-  test('unblock with --sync-with-upstream and piped stdin combines them', async () => {
-    const taskId = await createTask(ctx, 'Merge with piped task', 'Do some work');
-
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // --sync-with-upstream combined with piped stdin should succeed
-    const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--sync-with-upstream'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' }, input: 'Fix the piped feedback bug' },
-    );
-    expectSuccess(unblockResult);
-    expectOutput(unblockResult, 'Supervisor will merge before proceeding');
+    // Should NOT mention upstream merge — unblock is just feedback now
+    expectOutputExcludes(unblockResult, 'Supervisor will merge before proceeding');
   });
 
   test('sync-with-remote: local driver skips fetch (no-op)', async () => {
@@ -241,5 +185,125 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'PR notes test');
+  });
+});
+
+// =====================================================================
+// lazy sync <task> — task-level upstream merge
+// =====================================================================
+
+describe('lazy sync <task> (task-level upstream merge)', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: Working tasks cannot be synced — the worktree is in use by the agent.
+  test('sync on a working task fails with clear error', async () => {
+    const taskId = await createTask(ctx, 'Test sync working task', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // Manually set task status to 'working'
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
+    const entries = readdirSync(tasksDir);
+    const fullId = entries.find(e => e.startsWith(taskId));
+    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
+    const taskJsonPath = join(tasksDir, fullId, 'task.json');
+    const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
+    taskData.status = 'working';
+    writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2) + '\n');
+
+    const result = await ctx.lazy(['sync', taskId]);
+    expectFailure(result);
+    const output = result.stdout + result.stderr;
+    expect(output.includes('currently working')).toBe(true);
+  });
+
+  test('sync on a backlog task with no session fails', async () => {
+    const taskId = await createTask(ctx, 'Test sync backlog task', 'Do work');
+
+    const result = await ctx.lazy(['sync', taskId]);
+    expectFailure(result);
+    const output = result.stdout + result.stderr;
+    expect(output.includes('no session') || output.includes('Start it first')).toBe(true);
+  });
+
+  /**
+   * Helper: set a task's status in storage directly.
+   * After lazyMocked start, the task may remain in 'working' because
+   * reconciliation hasn't run yet. This forces a specific status.
+   */
+  function setTaskStatus(taskId: string, status: string): void {
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
+    const entries = readdirSync(tasksDir);
+    const fullId = entries.find(e => e.startsWith(taskId));
+    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
+    const taskJsonPath = join(tasksDir, fullId, 'task.json');
+    const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
+    taskData.status = status;
+    writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2) + '\n');
+  }
+
+  // When no upstream changes exist, sync should report "up to date"
+  test('sync with no upstream changes reports up to date', async () => {
+    const taskId = await createTask(ctx, 'Test sync up to date', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // Force task to blocked (reconciliation may not have run)
+    setTaskStatus(taskId, 'blocked');
+
+    // Task is now blocked. Parent is main, which hasn't changed.
+    const result = await ctx.lazy(['sync', taskId]);
+    expectSuccess(result);
+    expectOutput(result, 'up to date');
+  });
+
+  // When upstream has changes, sync should launch a merge
+  test('sync when upstream has changes detects them', async () => {
+    const taskId = await createTask(ctx, 'Test sync with changes', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // Force task to blocked
+    setTaskStatus(taskId, 'blocked');
+
+    // Add a commit to main so there are upstream changes
+    ctx.git('checkout', 'main');
+    writeFileSync(join(ctx.root, 'upstream-change.txt'), 'New upstream content\n');
+    ctx.git('add', 'upstream-change.txt');
+    ctx.git('commit', '-m', 'Upstream change for sync test');
+    ctx.git('checkout', '-');
+
+    // Sync should detect upstream changes and attempt to launch a sync-only merge.
+    // In test mode without a real Docker runner, the supervisor launch may fail,
+    // but the command should at least progress past the "up to date" check.
+    const result = await ctx.lazy(['sync', taskId]);
+    const output = result.stdout + result.stderr;
+    // Should NOT say "up to date" — upstream has changes
+    expect(output.includes('up to date')).toBe(false);
+  });
+
+  test('sync on nonexistent task fails', async () => {
+    const result = await ctx.lazy(['sync', 'deadbeef']);
+    expectFailure(result);
+    const output = result.stdout + result.stderr;
+    expect(output.includes('not found') || output.includes('Task not found')).toBe(true);
+  });
+
+  test('sync help includes task-level sync documentation', async () => {
+    const result = await ctx.lazy(['sync', '--help']);
+    expectSuccess(result);
+    expectOutput(result, 'task ID');
+    expectOutput(result, 'upstream');
   });
 });

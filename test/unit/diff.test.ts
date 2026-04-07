@@ -33,8 +33,8 @@ describe('Editor content with remote URL', () => {
     expect(content).not.toContain('# Remote:');
   });
 
-  test('buildEditorContentWithDiff includes remote URL', () => {
-    const result = buildEditorContentWithDiff(
+  test('buildEditorContentWithDiff includes remote URL', async () => {
+    const result = await buildEditorContentWithDiff(
       'Agent response',
       null,
       'task789',

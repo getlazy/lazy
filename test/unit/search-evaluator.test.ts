@@ -17,9 +17,10 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     parent_task_id: null,
     branched_from_sha: null,
     close_reason: null,
-    model: 'opus',
+    model: 'claude-opus-4-6',
     agent_id: 'claude-code',
     metadata: null,
+    pending_sync: 0,
     ...overrides,
   };
 }

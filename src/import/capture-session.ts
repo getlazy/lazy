@@ -18,7 +18,8 @@ import {
   conversationStats,
 } from './claude-code-logs';
 import { toStoredConversation } from './conversation-storage';
-import { createStorage } from '../storage';
+import type { Storage } from '../storage';
+import { tryRemoteStorage } from '../cli/helpers';
 import { logger } from '../utils/logger';
 
 /**
@@ -75,17 +76,19 @@ function findNewOrModifiedFile(
 
 /**
  * Capture a conversation from JSONL files by comparing before/after snapshots.
- * Parses the conversation and stores it in lazy's storage.
+ * Parses the conversation and stores it in lazy's storage via the daemon.
  *
  * @param lazyRoot - The lazy project root directory
  * @param beforeSnapshot - Snapshot taken before the session started
  * @param label - Label for log messages (e.g. "builder", "pairing")
+ * @param existingStorage - Optional pre-existing Storage instance to use
  * @returns The detected session ID, or null if no new conversation was found
  */
 export async function captureConversation(
   lazyRoot: string,
   beforeSnapshot: Map<string, number>,
   label: string = 'session',
+  existingStorage?: Storage,
 ): Promise<string | null> {
   const afterSnapshot = snapshotSessionFiles(lazyRoot);
   const sessionFile = findNewOrModifiedFile(beforeSnapshot, afterSnapshot);
@@ -101,17 +104,20 @@ export async function captureConversation(
     const match = available.find(s => s.sessionId === sessionId);
 
     if (match) {
-      const storage = await createStorage(lazyRoot);
-      try {
-        const conversation = await parseConversation(match.projectPath, match.sessionId);
-        const summary = extractSummary(conversation);
-        const stats = conversationStats(conversation);
-        const stored = toStoredConversation(conversation, summary, stats);
-        await storage.saveConversation(stored);
-        logger.debug(`${label} conversation captured: ${sessionId}`);
-      } finally {
-        await storage.close();
+      // Use provided storage, or connect to daemon via RemoteStorage.
+      // Never create FileStorage directly — only the daemon owns the storage lock.
+      const storage = existingStorage ?? await tryRemoteStorage(lazyRoot);
+      if (!storage) {
+        logger.warn(`Failed to capture ${label} conversation: daemon is not running`);
+        return null;
       }
+
+      const conversation = await parseConversation(match.projectPath, match.sessionId);
+      const summary = extractSummary(conversation);
+      const stats = conversationStats(conversation);
+      const stored = toStoredConversation(conversation, summary, stats);
+      await storage.saveConversation(stored);
+      logger.debug(`${label} conversation captured: ${sessionId}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

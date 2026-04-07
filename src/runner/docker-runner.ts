@@ -8,17 +8,18 @@
 import type { SandboxConfig } from '../capture/claude';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
-import type { RunnerType } from '../config/types';
+import type { RunnerType, OllamaConfig } from '../config/types';
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { spawn, spawnSync } from '../utils/spawn';
 import { join, basename } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
+import { checkOllamaConnectivity } from '../utils/ollama';
 
 import {
   checkDocker,
-  getAuthEnv,
+  getAuthEnvVars,
   ensureImage,
   ensureAgentBinary,
   containerNameForTask,
@@ -42,9 +43,6 @@ const agentPackaging = new ClaudeCodePackaging();
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
-export interface DockerRunnerOptions {
-  dockerAgentNoNetwork?: boolean;
-}
 
 /**
  * Read-only MCP tools that should be pre-approved in the builder session.
@@ -69,12 +67,16 @@ export class DockerRunner implements Runner {
   readonly type: RunnerType;
   readonly runLabel = 'Container';
   protected readonly binary: string;
-  private options: DockerRunnerOptions;
+  protected _ollamaConfig?: OllamaConfig;
 
-  constructor(binary: string = 'docker', type: RunnerType = 'docker', options?: DockerRunnerOptions) {
+  constructor(binary: string = 'docker', type: RunnerType = 'docker') {
     this.binary = binary;
     this.type = type;
-    this.options = options ?? {};
+  }
+
+  /** Set Ollama config for local model inference. */
+  setOllamaConfig(config: OllamaConfig): void {
+    this._ollamaConfig = config;
   }
 
   runDisplayName(runName: string): string {
@@ -83,7 +85,16 @@ export class DockerRunner implements Runner {
 
   checkAvailability(): void {
     checkDocker(this.binary);
-    getAuthEnv(); // Fail fast on missing auth before creating state
+    if (this._ollamaConfig?.enabled) {
+      // When Ollama is configured, auth is always available (dummy tokens).
+      // Log a warning if Ollama is unreachable (don't fail — it might come up later).
+      const check = checkOllamaConnectivity(this._ollamaConfig);
+      if (!check.reachable) {
+        logger.warn(check.reason);
+      }
+    } else {
+      getAuthEnvVars(); // Fail fast on missing auth before creating state
+    }
   }
 
   async ensureReady(): Promise<void> {
@@ -100,8 +111,9 @@ export class DockerRunner implements Runner {
     runName: string,
     protocolDir: string,
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<void> {
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, this.options);
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this._ollamaConfig);
   }
 
   async runClaudeSync(
@@ -111,7 +123,7 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<AgentResponse> {
-    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this.options);
+    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this._ollamaConfig);
   }
 
   isRunning(runName: string): boolean {
@@ -195,9 +207,25 @@ export class DockerRunner implements Runner {
   }
 
   mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] } {
+    // The daemon is required in v0.11+ and always provides LAZY_DAEMON_CONFIG
+    // when launching containers. MCP tool calls route through the daemon's
+    // /mcp routes via HTTP proxy.
+    const daemonConfigTemplate = process.env.LAZY_DAEMON_CONFIG;
+    if (!daemonConfigTemplate) {
+      throw new Error(
+        'LAZY_DAEMON_CONFIG not set. The daemon must provide MCP config when launching containers.\n' +
+        'This indicates a bug in the launch path — containers should always receive daemon config.',
+      );
+    }
+
+    // Pass the daemon config template and task ID as separate args.
+    // The MCP server reads the template and overrides taskId in memory.
+    // We must NOT write a task-scoped config file here — the daemon config
+    // template is in .lazy/tmp/ which is under the container's read-only
+    // repo mount. Writing next to it would fail with EROFS.
     return {
       command: 'lazy-agent',
-      args: ['mcp', '--task-id', taskId, '--worktree', worktreePath],
+      args: ['mcp', '--daemon-config', daemonConfigTemplate, '--task-id', taskId, '--worktree', worktreePath],
     };
   }
 
@@ -252,6 +280,16 @@ export class DockerRunner implements Runner {
       results.push({ state: 'fail', what: `${name} daemon running`, reason: `${name} is not responsive.` });
     }
 
+    // Check Ollama connectivity when configured
+    if (this._ollamaConfig?.enabled) {
+      const check = checkOllamaConnectivity(this._ollamaConfig);
+      if (check.reachable) {
+        results.push({ state: 'ok', what: `Ollama reachable at ${check.endpoint}` });
+      } else {
+        results.push({ state: 'fail', what: 'Ollama reachable', reason: check.reason });
+      }
+    }
+
     return results;
   }
 
@@ -271,20 +309,21 @@ export class DockerRunner implements Runner {
     builderConfigPath: string,
     claudeExtraArgs: string[],
     debug?: boolean,
+    daemonConfigPath?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
     const [imageName, agentBinaryPath] = await Promise.all([
       ensureImage(this.binary),
       ensureAgentBinary(),
     ]);
 
-    const auth = getAuthEnv();
+    const authEnvVars = getAuthEnvVars(this._ollamaConfig);
 
     // Read the builder config to get port for the container config
     const builderConfig = JSON.parse(readFileSync(builderConfigPath, 'utf-8'));
 
     // Get the data directory path for mounting
     const { loadConfig } = await import('../config/loader');
-    const config = loadConfig(lazyRoot);
+    const config = await loadConfig(lazyRoot);
     const dataDir = join(lazyRoot, config.data.path);
 
     // Write system prompt to a temp file in the data dir (accessible inside container)
@@ -297,6 +336,9 @@ export class DockerRunner implements Runner {
     const configBasename = basename(builderConfigPath, '.json');
     const builderId = configBasename.replace('builder-', '');
 
+    // Determine MCP proxy mode: daemon (preferred) or legacy builder server
+    const useDaemonProxy = !!daemonConfigPath;
+
     // Write a container-specific config with host.docker.internal instead of 127.0.0.1.
     // The container can't reach the host's localhost, so we use Docker's built-in DNS alias.
     const containerConfigFile = join(tmpDir, `builder-container-${builderId}.json`);
@@ -306,12 +348,25 @@ export class DockerRunner implements Runner {
     };
     writeFileSync(containerConfigFile, JSON.stringify(containerConfig, null, 2));
 
+    // Build MCP server args based on proxy mode
+    let mcpArgs: string[];
+    const tempFilesToClean = [promptFile, containerConfigFile];
+
+    if (useDaemonProxy) {
+      // Daemon proxy mode: MCP server forwards tool calls to daemon /mcp routes
+      mcpArgs = ['mcp', '--daemon-config', daemonConfigPath!, '--worktree', lazyRoot];
+      // Mount daemon config into container
+      tempFilesToClean.push(daemonConfigPath!);
+    } else {
+      // Legacy mode: MCP server forwards to per-session builder HTTP server
+      mcpArgs = ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot];
+    }
+
     // Prepare merged Claude config: host's ~/.claude.json + lazy MCP server entry.
     // Claude Code reads config from ~/.claude.json (at $HOME root, not inside ~/.claude/).
     // We merge to a temp file so the host's real config is never modified.
-    // The MCP entry points to the container config file (host.docker.internal).
     const mergedConfigFile = join(tmpDir, `builder-claude-config-${Date.now()}.json`);
-    const hostConfigPath = join(homedir(), '.claude.json');
+    const hostConfigPath = join(getHome(), '.claude.json');
     let hostConfig: Record<string, unknown> = {};
     try {
       if (existsSync(hostConfigPath)) {
@@ -326,15 +381,16 @@ export class DockerRunner implements Runner {
         ...((hostConfig.mcpServers as Record<string, unknown>) ?? {}),
         lazy: {
           command: 'lazy-agent',
-          args: ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot],
+          args: mcpArgs,
         },
       },
     };
     writeFileSync(mergedConfigFile, JSON.stringify(mergedConfig, null, 2) + '\n');
+    tempFilesToClean.push(mergedConfigFile);
 
     // Pre-approve read-only lazy MCP tools so the builder doesn't prompt for permission.
     // Mutating tools (create, start, accept, etc.) still require user confirmation.
-    writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
+    await writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
 
     // Build container args: launch lazy-agent in builder mode
     // --init provides a proper PID 1 init process (tini/catatonit) that forwards
@@ -359,15 +415,23 @@ export class DockerRunner implements Runner {
       // Claude config dir (settings, conversations, credentials) — mount to container's home
       // so Claude Code finds them at $HOME/.claude and $HOME/.claude.json without needing
       // to override HOME (which would cause warnings about missing .local/bin).
-      '-v', `${homedir()}/.claude:/home/user/.claude`,
+      '-v', `${getHome()}/.claude:/home/user/.claude`,
       // Merged Claude config with MCP server entry (writable — Claude Code updates it on startup)
       '-v', `${mergedConfigFile}:/home/user/.claude.json`,
       // Auth
-      '-e', `${auth.key}=${auth.value}`,
+      ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
       // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
       '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
       // Working directory
       '-w', lazyRoot,
+    ];
+
+    // Mount daemon config file if using daemon proxy
+    if (useDaemonProxy && daemonConfigPath) {
+      dockerArgs.push('-v', `${daemonConfigPath}:${daemonConfigPath}:ro`);
+    }
+
+    dockerArgs.push(
       imageName,
       // Run the builder supervisor (not Claude directly)
       'lazy-agent', 'builder',
@@ -375,7 +439,12 @@ export class DockerRunner implements Runner {
       '--worktree', lazyRoot,
       // Use container config (host.docker.internal) not the host config (127.0.0.1)
       '--builder-config', containerConfigFile,
-    ];
+    );
+
+    // Pass daemon config to builder supervisor if available
+    if (useDaemonProxy && daemonConfigPath) {
+      dockerArgs.push('--daemon-config', daemonConfigPath);
+    }
 
     // Pass through extra Claude args after --
     if (claudeExtraArgs.length > 0) {
@@ -393,12 +462,13 @@ export class DockerRunner implements Runner {
       stdin: 'inherit',
       stdout: 'inherit',
       stderr: 'inherit',
+      timeout: 0, // Long-running: supervisor runs for the lifetime of the task
     });
 
     const exitCode = await proc.exited;
 
     // Clean up temp files
-    for (const tmpFile of [promptFile, mergedConfigFile, containerConfigFile]) {
+    for (const tmpFile of tempFilesToClean) {
       try {
         unlinkSync(tmpFile);
       } catch {

@@ -33,6 +33,7 @@ import {
   commandLoop, loopUsage,
   commandRevert, revertUsage,
   commandPropose, proposeUsage,
+  commandSubmit, submitUsage,
   commandSync, syncUsage,
   commandCompletion, completionUsage,
   commandReview, reviewUsage,
@@ -44,10 +45,13 @@ import {
   commandFix, fixUsage,
   commandRework, reworkUsage,
   commandDaemon, daemonUsage,
+  commandLogs, logsUsage,
+  commandWatch, watchUsage,
+  commandConfig, configUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
-import { createStorage } from './storage';
-import { reconcileTasks } from './utils/reconcile';
+
+
 import { VERSION } from './version';
 
 const args = process.argv.slice(2);
@@ -80,6 +84,7 @@ Working on Tasks:
   reopen <task_id>       Reopen a rejected task
   branch <task_id>       Create a variant task (fork)
   wait [<task_id>...]    Wait for task(s) to complete (--follow, --next)
+  watch [<task-code>]    Watch an agent working (read-only tmux view)
 
 System:
   system prompts         List built-in system prompt templates
@@ -108,17 +113,17 @@ Import:
 Remote:
   sync                   Sync lazy tasks with your remote repository
 
-Server:
-  server                 Start web dashboard server
+Daemon:
+  daemon start           Start the lazy daemon (includes web dashboard)
+  daemon stop            Stop the daemon gracefully
+  daemon restart         Restart the daemon
+  daemon status          Show daemon status and web URL
+  logs                   Tail daemon log file (primary debugging tool)
+  server                 Start daemon and show web dashboard URL
+  config set/get         Runtime config toggles (e.g., auto_react on/off)
 
 Builder:
   builder                Launch Claude Code with Lazy builder prompt
-
-Daemon:
-  daemon start           Start the lazy daemon
-  daemon stop            Stop the daemon gracefully
-  daemon restart         Restart the daemon
-  daemon status          Show daemon status
 
 Setup:
   init                   Initialize lazy in a git repository
@@ -195,6 +200,7 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'doctor':   { run: commandDoctor, usage: doctorUsage },
   'loop':     { run: commandLoop, usage: loopUsage },
   'propose':  { run: commandPropose, usage: proposeUsage },
+  'submit':   { run: commandSubmit, usage: submitUsage },
   'sync':     { run: commandSync, usage: syncUsage },
   'completion': { run: commandCompletion, usage: completionUsage },
   'review':   { run: commandReview, usage: reviewUsage },
@@ -207,44 +213,16 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'fix':      { run: commandFix, usage: fixUsage },
   'rework':   { run: commandRework, usage: reworkUsage },
   'daemon':   { run: commandDaemon, usage: daemonUsage },
+  'logs':     { run: commandLogs, usage: logsUsage },
+  'watch':    { run: commandWatch, usage: watchUsage },
+  'config':   { run: commandConfig, usage: configUsage },
 };
 
 // All valid command names for fuzzy matching (excludes aliases like ls/tasks/view
 // to avoid confusing suggestions — we match against canonical names only)
 const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view');
 
-/**
- * Run reconciliation before a command if needed.
- * Skip for commands that don't need storage (init, help, server).
- */
-async function reconcileIfNeeded(cmd: string): Promise<void> {
-  // Commands that don't need reconciliation
-  const skipReconciliation = ['init', 'server', 'builder', 'doctor', 'sync', 'completion', 'upgrade', 'system', 'daemon'];
 
-  if (skipReconciliation.includes(cmd)) {
-    return;
-  }
-
-  // Try to find lazy root and run reconciliation
-  const root = findLazyRoot();
-  if (!root) {
-    // Not in a lazy project — command will fail with its own error
-    return;
-  }
-
-  try {
-    const storage = await createStorage(root);
-    try {
-      await reconcileTasks(storage, root);
-    } finally {
-      await storage.close();
-    }
-  } catch (err) {
-    // Log reconciliation error but don't crash — command will handle storage errors
-    // Use console.error since logger may not be initialized at this point
-    console.error(`Warning: Reconciliation failed: ${err instanceof Error ? err.message : err}`);
-  }
-}
 
 async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
   const entry = commandMap[cmd];
@@ -253,8 +231,6 @@ async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
   if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
     entry.usage();
   } else {
-    // Run reconciliation before command execution
-    await reconcileIfNeeded(cmd);
     await entry.run(cmdArgs);
   }
 }
@@ -346,11 +322,14 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
   }
 }
 
-// Auto-start daemon if not running (non-blocking, best-effort).
-// Skips for daemon command itself, init, completion, hidden commands, and test env.
+// Auto-start daemon if not running. In v0.11+, daemon is required —
+// ensureDaemon() throws if it can't start. Skips for daemon, init, completion, help.
 if (!isHelpOrVersion) {
   const { ensureDaemon } = await import('./daemon/auto-start');
-  await ensureDaemon(command);
+  const root = findLazyRoot();
+  if (root) {
+    await ensureDaemon(command, root);
+  }
 }
 
 try {

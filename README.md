@@ -4,7 +4,7 @@
 
 * A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (`builder` mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
 * A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
-* An [software development lifecycle](#the-task-manager) integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
+* An [software development lifecycle](#the-task-manager) tool integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
 
 `lazy` is thus [my](https://github.com/ierceg) attempt to raise the abstraction on three different fronts at the same time:
 
@@ -55,9 +55,9 @@ lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 
 When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a linux build of `lazy` with a different CLI commands that run inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
 
-When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware so there is a single daemon for the system, not a deamon per project. Daemon runs task reconiciliation in the background and it is slowly becoming the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check deamon state through `lazy daemon` commands.
+When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware and there is a single daemon running for the project. Daemon runs task reconiciliation, CI checks, PR comment harvesting and so on in the background and is the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check deamon state through `lazy daemon` commands.
 
-Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon.
+Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon. Same as with deamon this upgrade will be per project.
 
 ## Core Concepts
 
@@ -133,7 +133,7 @@ Beside that, `lazy` does a lot of little "quality of life" things that are other
 
 ### At what is `lazy` particularly bad at?
 
-Right now, it's really annoying when I am preparing a new release and I am doing integration tests. These rarely expose major issues but rather a number of smaller issues for which I often fire off tasks to fix *but* I readily admit that sometimes the overhead is too large. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. To help that use case, `lazy pair` command can be invoked without the task ID which essentially puts you into a session that will be captured but where you can work in the traditional "micro-management" style.
+Originally, it was really annoying when I would be preparing a new release and I doing a lot of integration tests. This polishing would expose a number of smaller issues which in stable state are fine to fire off as small tasks but when you are trying to release, it becomes too heavy handed. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. But now you can use `lazy pair` without task ID, right on the branch that you want to modify (e.g. `release-v011`) and with it can go back to working in the traditional "micro-management" style which feels exactly right for small, last minute polishing tasks.
 
 Another thing that is annoying are bootstrapping failures: `lazy` failing so hard that I cannot fix it using `lazy`. But that is very rare these days and besides, it's only annoying to me.
 
@@ -395,20 +395,21 @@ Run `lazy doctor` to validate your configuration.
 ### Collaborative Pairing
 
 ```bash
-lazy pair <task-id>
+lazy pair [<task-id>]
 ```
 
-Launches an interactive Claude Code session in the task's worktree. You drive the conversation directly—asking Claude to make changes, running tests, editing code together. When you exit, `lazy` captures new commits and a summary as a turn. Useful for:
+Launches an interactive Claude Code session in the task's worktree **on the host**. You drive the conversation directly—asking Claude to make changes, running tests, editing code together. When you exit, `lazy` captures new commits and a summary as a turn. Useful for:
 
 - Debugging issues the agent can't resolve
 - Showing the agent how to do something by example
 - Taking over when the agent is stuck
+- Lots of little polishing tasks where you need short loop
 
 This is rarely needed as you usually want to unblock with review and move on. But when it's needed, it's a great escape hatch.
 
 #### Taskless pairing
 
-As I mentioned before, when you are working on a set of very, very small tasks, the turn based "lazy-ness" is... not great. At those times you are doing a lot of back and forth and you don't want to just delegate: you want to be hands-on. For those moments, `lazy pair` can be invoked without any task ID and it will start a new conversation that will be captured, just like any other `lazy` conversation, but without any task to anchor on.
+As I mentioned before, when you are working on a set of very, very small tasks, the turn based "lazy-ness" is... not great. At those times you are doing a lot of back and forth and you don't want to just delegate: you want to be hands-on. For those moments, `lazy pair` can be invoked without any task ID, right on the branch that you want to be modifying, and it will start a new conversation that will be captured, just like any other `lazy` conversation, but without any task to anchor on.
 
 ### Confirmation Protocol
 

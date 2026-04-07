@@ -13,7 +13,8 @@ import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readPlanContent, enrichResponseWithPlanContent } from '../../src/utils/reconcile';
+import { readPlanContent, enrichResponseWithPlanContent, reconcileTasks } from '../../src/utils/reconcile';
+import { createStorage } from '../../src/storage';
 import {
   writeCommand,
   readCommand,
@@ -344,9 +345,11 @@ describe('reconciliation with protocol', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // The mock writes response.json during launchSupervisorAsync.
-    // Any subsequent command triggers reconcileIfNeeded(), which reads
-    // the response and transitions working → blocked.
+    // The mock writes response.json during start. In production, the daemon's
+    // reconcile loop detects this and transitions working → blocked. In tests,
+    // we call reconcileTasks directly to simulate the daemon.
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'blocked');
@@ -360,6 +363,8 @@ describe('reconciliation with protocol', () => {
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
+
+    await runReconcile(ctx.root);
 
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
@@ -390,7 +395,9 @@ describe('reconciliation with protocol', () => {
     };
     writeResponse(protoDir, errorResp);
 
-    // Now trigger reconciliation — should read error response and transition to interrupted
+    // Run reconciliation (simulates daemon) — should read error response and transition to interrupted
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'interrupted');
@@ -418,7 +425,9 @@ describe('reconciliation with protocol', () => {
     };
     writeResponse(protoDir, errorResp);
 
-    // Trigger reconciliation and verify crash details appear in show output
+    // Run reconciliation (simulates daemon) and verify crash details appear in show output
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId, '--full']);
     expectSuccess(showResult);
     expectOutput(showResult, 'interrupted');
@@ -443,6 +452,8 @@ describe('reconciliation with protocol', () => {
 
     // In mock mode: isContainerRunning=false, containerExists=false
     // With no response and no container, reconciliation should → interrupted
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'interrupted');
@@ -460,8 +471,8 @@ describe('reconciliation with protocol', () => {
     // Before reconciliation, response.json exists
     expect(hasResponse(protoDir)).toBe(true);
 
-    // Trigger reconciliation
-    await ctx.lazy(['show', taskId]);
+    // Run reconciliation (simulates daemon)
+    await runReconcile(ctx.root);
 
     // After reconciliation, response.json should be consumed
     expect(hasResponse(protoDir)).toBe(false);
@@ -679,6 +690,19 @@ describe('plan content capture e2e', () => {
 // ============================================================
 // Helpers
 // ============================================================
+
+/**
+ * Run reconciliation directly (simulates what the daemon does).
+ * Tests can't rely on CLI commands triggering reconciliation — only the daemon does that.
+ */
+async function runReconcile(root: string): Promise<void> {
+  const storage = await createStorage(root);
+  try {
+    await reconcileTasks(storage, root);
+  } finally {
+    await storage.close();
+  }
+}
 
 /**
  * Find the full task ID from a short ID by scanning the tasks directory.

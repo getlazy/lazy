@@ -1,6 +1,6 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, displayIdFor, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { logger } from '../../utils/logger';
-import type { ModelName } from '../../types';
+
 import type { Storage } from '../../storage/interface';
 import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
@@ -94,7 +94,7 @@ export async function commandClone(args: string[]): Promise<void> {
   }
 
   // Validate --model flag if provided
-  let modelOverride: ModelName | undefined;
+  let modelOverride: string | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
   }
@@ -193,7 +193,7 @@ Options:
   --default-parent   Use default parent (null, root task) instead of inheriting from source
                      (conflicts with --parent)
   --code <code>      Set a custom code for the cloned task (default: auto-generated)
-  --model <model>    Override model for the cloned task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Override model for the cloned task (raw model ID, e.g. claude-sonnet-4-5-20250929)
                      Default: inherit from source task
 
 What gets carried over:
@@ -218,7 +218,7 @@ Examples:
   lazy clone abc123 --default-parent          # Clone as root task (no parent)
   lazy clone abc123 --parent def456           # Clone under a specific parent
   lazy clone abc123 --code my-new-code        # Clone with explicit code
-  lazy clone abc123 --model opus              # Clone with different model
+  lazy clone abc123 --model claude-opus-4-6              # Clone with different model
   lazy clone fix-auth --parent main-task      # Reparent a task
 
 After cloning:

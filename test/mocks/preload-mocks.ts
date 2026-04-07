@@ -22,8 +22,8 @@ if (process.env.LAZY_TEST === '1') {
 
   mock.module(realClaudePath, () => require(mockClaudePath));
 
-  // Mock the remote driver when a mock import result is configured
-  if (process.env.LAZY_MOCK_IMPORT_RESULT) {
+  // Mock the remote driver when a mock import result or accept gates are configured
+  if (process.env.LAZY_MOCK_IMPORT_RESULT || process.env.LAZY_MOCK_ACCEPT_GATES) {
     const mockRemotePath = resolve(__dirname, 'remote.ts');
     const realRemotePath = resolve(__dirname, '../../src/remote/index.ts');
 

@@ -1,7 +1,8 @@
-import { existsSync, readFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join, resolve, isAbsolute, dirname, basename } from 'path';
 import type { LazyConfig, ResolvedConfig, StorageBackendConfig } from './types';
 import { listAgents } from '../agent/registry';
+import { DEFAULT_WEB_PORT } from './constants';
+import { pathExists, readFile } from '../utils/fs';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -15,12 +16,12 @@ let _configOverrideWarned = false;
  * @param startDir - Directory to start searching from. Defaults to process.cwd().
  *   The daemon passes projectRoot here because its own cwd is meaningless.
  */
-function findConfigDir(lazyRoot: string, startDir?: string): string {
+async function findConfigDir(lazyRoot: string, startDir?: string): Promise<string> {
   const root = resolve(lazyRoot);
   let dir = resolve(startDir ?? process.cwd());
 
   while (true) {
-    if (existsSync(join(dir, CONFIG_FILENAME))) {
+    if (await pathExists(join(dir, CONFIG_FILENAME))) {
       if (dir !== root && !_configOverrideWarned) {
         _configOverrideWarned = true;
         console.warn(`Warning: Using ${CONFIG_FILENAME} from ${dir} (not the git root ${root})`);
@@ -39,7 +40,7 @@ function findConfigDir(lazyRoot: string, startDir?: string): string {
 // Default configuration values
 export const DEFAULT_CONFIG: ResolvedConfig = {
   models: {
-    default: 'journeyman',
+    default: 'claude-sonnet-4-5-20250929',
   },
   session: {
     verbose: false,
@@ -62,15 +63,16 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   agent: {
     agent_id: 'claude-code',
-    watchdog_output_timeout_ms: 0,
+    watchdog_output_timeout_ms: 7200000,
   },
   server: {
-    port: 26024,
+    port: DEFAULT_WEB_PORT,
     sync_interval: 60,
   },
   remote: {
     driver: 'local',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
@@ -82,7 +84,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   runner: {
     type: 'docker',
-    docker_agent_no_network: false,
+
   },
   documents: {
     path: '',
@@ -97,6 +99,19 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   checks: {
     post_turn: '',
     post_turn_timeout: 300,
+  },
+  ollama: {
+    enabled: false,
+    model: '',
+    endpoint: 'http://host.docker.internal:11434',
+  },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential',
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
   },
 };
 
@@ -141,13 +156,18 @@ function deepMerge<T>(target: T, source: DeepPartial<T>): T {
  * Returns null if no config file exists or parsing fails.
  * Used by doctor to detect unknown/deprecated keys.
  */
-export function loadRawConfig(lazyRoot: string): Record<string, unknown> | null {
-  const configDir = findConfigDir(lazyRoot);
-  const configPath = join(configDir, CONFIG_FILENAME);
-  if (!existsSync(configPath)) return null;
+export async function loadRawConfig(lazyRoot: string): Promise<Record<string, unknown> | null> {
+  let configPath: string;
+  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
+    configPath = process.env.LAZY_CONFIG;
+  } else {
+    const configDir = await findConfigDir(lazyRoot);
+    configPath = join(configDir, CONFIG_FILENAME);
+  }
+  if (!(await pathExists(configPath))) return null;
 
   try {
-    const configContent = readFileSync(configPath, 'utf-8');
+    const configContent = await readFile(configPath, 'utf-8');
     return Bun.TOML.parse(configContent) as Record<string, unknown>;
   } catch {
     return null;
@@ -161,27 +181,36 @@ export function loadRawConfig(lazyRoot: string): Record<string, unknown> | null 
  *   Normally starts from process.cwd(). The daemon passes the project root
  *   because its own cwd may belong to a different project.
  */
-export function loadConfig(lazyRoot: string, options?: { cwd?: string }): ResolvedConfig {
-  const configDir = findConfigDir(lazyRoot, options?.cwd);
-  const configPath = join(configDir, CONFIG_FILENAME);
+export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): Promise<ResolvedConfig> {
+  // When LAZY_CONFIG is an absolute path, use it directly instead of walking
+  // directories. This supports VMs and CI where the config lives outside the repo.
+  let configPath: string;
+  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
+    configPath = process.env.LAZY_CONFIG;
+  } else {
+    const configDir = await findConfigDir(lazyRoot, options?.cwd);
+    configPath = join(configDir, CONFIG_FILENAME);
+  }
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
-  if (process.env.LAZY_CONFIG && !existsSync(configPath)) {
+  if (process.env.LAZY_CONFIG && !(await pathExists(configPath))) {
     throw new Error(
       `LAZY_CONFIG is set to '${process.env.LAZY_CONFIG}' but the file does not exist.\n` +
-      `Searched from ${options?.cwd ?? process.cwd()} up to ${lazyRoot}.\n` +
+      (isAbsolute(process.env.LAZY_CONFIG)
+        ? `The absolute path does not exist.`
+        : `Searched from ${options?.cwd ?? process.cwd()} up to ${lazyRoot}.`) + '\n' +
       `Unset it with LAZY_CONFIG= or fix the path.`,
     );
   }
 
   // If no config file exists (and LAZY_CONFIG was not set), return defaults
-  if (!existsSync(configPath)) {
+  if (!(await pathExists(configPath))) {
     return DEFAULT_CONFIG;
   }
 
   let parsed: LazyConfig;
   try {
-    const configContent = readFileSync(configPath, 'utf-8');
+    const configContent = await readFile(configPath, 'utf-8');
     parsed = Bun.TOML.parse(configContent) as LazyConfig;
   } catch (error) {
     console.error(`Warning: Failed to parse ${CONFIG_FILENAME}:`, error);
@@ -247,6 +276,14 @@ export function loadConfig(lazyRoot: string, options?: { cwd?: string }): Resolv
     );
   }
 
+  // Validate Ollama config
+  if (config.ollama.enabled && !config.ollama.model) {
+    throw new Error(
+      'Ollama is enabled but no model is configured. ' +
+      'Set model in lazy.toml [ollama] section (e.g., model = "qwen3.5:35b-a3b-coding-nvfp4").'
+    );
+  }
+
   return config;
 }
 
@@ -255,13 +292,18 @@ export function loadConfig(lazyRoot: string, options?: { cwd?: string }): Resolv
  * Returns true if lazy.toml exists and has models.default set.
  * Used to decide whether to inject model guidance into the builder prompt.
  */
-export function hasExplicitModelConfig(lazyRoot: string): boolean {
-  const configDir = findConfigDir(lazyRoot);
-  const configPath = join(configDir, CONFIG_FILENAME);
-  if (!existsSync(configPath)) return false;
+export async function hasExplicitModelConfig(lazyRoot: string): Promise<boolean> {
+  let configPath: string;
+  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
+    configPath = process.env.LAZY_CONFIG;
+  } else {
+    const configDir = await findConfigDir(lazyRoot);
+    configPath = join(configDir, CONFIG_FILENAME);
+  }
+  if (!(await pathExists(configPath))) return false;
 
   try {
-    const configContent = readFileSync(configPath, 'utf-8');
+    const configContent = await readFile(configPath, 'utf-8');
     const parsed = Bun.TOML.parse(configContent) as LazyConfig;
     return parsed.models?.default !== undefined;
   } catch {
@@ -283,10 +325,9 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
 [models]
-# Default model for sessions
-# Universal monikers: "apprentice" (fast), "journeyman" (balanced), "master" (most capable)
-# Legacy aliases: "sonnet", "opus", "haiku" (still supported)
-default = "journeyman"
+# Default model for sessions — use raw model IDs (e.g., "claude-sonnet-4-5-20250929",
+# "claude-opus-4-6", "qwen3.5:35b-a3b-coding-nvfp4")
+default = "claude-sonnet-4-5-20250929"
 
 [session]
 # Show Docker output in real-time during session execution
@@ -332,14 +373,17 @@ port = 26024
 # Docker/Podman modes run agents in isolated containers. Host-process mode runs agents
 # directly on the host — use only in VMs or other already-isolated environments.
 type = "docker"
-# Disable network access inside containers (passes --network none to docker run).
-# docker_agent_no_network = false
+
 
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
 driver = "local"
 # Git remote name (default: "origin"). Change if your remote is named differently.
 ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "origin"'}
+# Auto-approve MRs/PRs on protected branches (default: false).
+# When true, lazy accept submits an approving review before merging.
+# For sole developers who don't want to manually approve their own MRs.
+# auto_approve = false
 # When using the GitHub driver, these options are also available:
 # github_auto_push = true   # Automatically push after each agent turn
 # Authentication is handled by gh CLI (run: gh auth login)
@@ -380,5 +424,30 @@ dockerfile = ""
 # post_turn = "bun test --bail"
 # Timeout in seconds for the post_turn command (default: 300 = 5 minutes).
 # post_turn_timeout = 300
+
+[ollama]
+# Use Ollama for local model inference instead of Anthropic's API.
+# Requires Ollama v0.14+ running on the host with the Anthropic Messages API.
+# enabled = false
+# Model name to pass to Claude Code (e.g., "qwen3.5:35b-a3b-coding-nvfp4")
+# model = ""
+# Ollama API endpoint (containers use host.docker.internal to reach the host)
+# endpoint = "http://host.docker.internal:11434"
+
+[daemon]
+# Auto-react: daemon auto-unblocks tasks on CI failures and PR comments.
+# React to CI failures (auto-unblock blocked tasks when CI fails).
+# auto_react_ci = true
+# React to PR comments (auto-unblock blocked tasks when humans comment on PRs).
+# auto_react_comments = true
+# Auto-react budget controls — prevent runaway costs from auto-triggered turns.
+# Max auto-unblocks per task per trigger type before escalating to human.
+# auto_react_max_retries = 3
+# Backoff strategy between repeated auto-unblocks: "none", "linear", "exponential".
+# auto_react_backoff = "exponential"
+# Max auto-triggered turns per day across all tasks in this project.
+# auto_react_daily_budget = 50
+# Max consecutive auto-triggered turns per task before pausing for human review.
+# max_auto_turns = 3
 `;
 }

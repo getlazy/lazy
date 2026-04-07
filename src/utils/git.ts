@@ -4,7 +4,7 @@
 
 import { existsSync } from 'node:fs';
 import { logger } from './logger';
-import { spawnSync } from './spawn';
+import { spawn, spawnSync } from './spawn';
 
 export interface GitResult {
   stdout: string;
@@ -21,10 +21,11 @@ export interface RunGitOptions {
 }
 
 /**
- * Execute a git command and return the result.
- * Default implementation uses spawnSync - can be overridden for testing.
+ * Execute a git command asynchronously and return the result.
+ * All git operations should use this to avoid blocking the event loop.
+ * Can be overridden for testing via dependency injection.
  */
-export function runGit(args: string[], opts?: RunGitOptions | string): GitResult {
+export async function runGit(args: string[], opts?: RunGitOptions | string): Promise<GitResult> {
   // Support legacy signature: runGit(args, cwd)
   const options: RunGitOptions = typeof opts === 'string' ? { cwd: opts } : (opts ?? {});
 
@@ -46,14 +47,15 @@ export function runGit(args: string[], opts?: RunGitOptions | string): GitResult
   };
   if (options.cwd) spawnOpts.cwd = options.cwd;
   if (options.stdin) spawnOpts.stdin = options.stdin;
-  if (options.timeout) spawnOpts.timeout = options.timeout;
+  if (options.timeout !== undefined) spawnOpts.timeout = options.timeout;
 
   try {
-    const result = spawnSync(['git', ...args], spawnOpts);
+    const proc = spawn(['git', ...args], spawnOpts) as any;
+    const result = await proc.exited;
     return {
-      stdout: stdoutMode === 'pipe' ? result.stdout.toString().trim() : '',
-      stderr: stderrMode === 'pipe' ? result.stderr.toString().trim() : '',
-      exitCode: result.exitCode,
+      stdout: stdoutMode === 'pipe' ? (await Bun.readableStreamToText(proc.stdout)).trim() : '',
+      stderr: stderrMode === 'pipe' ? (await Bun.readableStreamToText(proc.stderr)).trim() : '',
+      exitCode: proc.exitCode ?? result,
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -70,12 +72,12 @@ export function runGit(args: string[], opts?: RunGitOptions | string): GitResult
  * Finds the worktree path where the given branch is checked out.
  * Returns null if the branch is not checked out in any worktree.
  */
-export function findWorktreeForBranch(
+export async function findWorktreeForBranch(
   branch: string,
   root: string,
-  git: (args: string[], cwd?: string) => GitResult = runGit,
-): string | null {
-  const listResult = git(['worktree', 'list', '--porcelain'], root);
+  git: (args: string[], cwd?: string) => Promise<GitResult> = runGit,
+): Promise<string | null> {
+  const listResult = await git(['worktree', 'list', '--porcelain'], root);
   if (listResult.exitCode !== 0) {
     return null;
   }
@@ -111,18 +113,18 @@ export function findWorktreeForBranch(
  * Returns { success: true } if the merge succeeds or if it's already up to date.
  * Returns { success: true, warning } if the merge fails (non-blocking — remote merge succeeded).
  */
-export function tryFastForwardInWorktree(
+export async function tryFastForwardInWorktree(
   targetBranch: string,
   worktreePath: string,
   remoteRef: string,
   remoteName: string,
   root: string,
-  git: (args: string[], cwd?: string) => GitResult = runGit,
-): { success: boolean; warning?: string } {
+  git: (args: string[], cwd?: string) => Promise<GitResult> = runGit,
+): Promise<{ success: boolean; warning?: string }> {
   logger.debug(`fastForwardLocal: ${targetBranch} is checked out at ${worktreePath}, attempting ff-only merge`);
 
   // First fetch in the worktree to ensure we have the latest remote ref
-  const fetchResult = git(['fetch', remoteName, targetBranch], worktreePath);
+  const fetchResult = await git(['fetch', remoteName, targetBranch], worktreePath);
   if (fetchResult.exitCode !== 0) {
     // INVARIANT: Fetch failure is a real failure — no silent fallback to success.
     // The caller must handle this (retry, inform user, etc.).
@@ -131,7 +133,7 @@ export function tryFastForwardInWorktree(
     return { success: false, warning };
   }
 
-  const mergeResult = git(['merge', '--ff-only', remoteRef], worktreePath);
+  const mergeResult = await git(['merge', '--ff-only', remoteRef], worktreePath);
   if (mergeResult.exitCode === 0) {
     logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded in worktree at ${worktreePath}`);
     return { success: true };
@@ -155,31 +157,31 @@ export function tryFastForwardInWorktree(
  * Fast-forward a local branch to match its remote counterpart.
  * Handles cases where the branch is checked out in the current repo or in a worktree.
  */
-export function fastForwardLocal(
+export async function fastForwardLocal(
   targetBranch: string,
   remoteName: string,
   root: string,
-  git: (args: string[], cwd?: string) => GitResult = runGit,
+  git: (args: string[], cwd?: string) => Promise<GitResult> = runGit,
   shouldSkipWorktree?: (worktreePath: string) => boolean,
-): { success: boolean; warning?: string } {
+): Promise<{ success: boolean; warning?: string }> {
   // Detect whether targetBranch is currently checked out in the root repo.
   // `git fetch <remote> main:main` fails with "refusing to fetch into branch
   // checked out at ..." when main is the current branch. The accept command
   // typically runs from the user's main repo which is on main.
-  const headResult = git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+  const headResult = await git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
   const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
   const remoteRef = `${remoteName}/${targetBranch}`;
 
   if (currentBranch === targetBranch) {
     // Target branch IS checked out — fetch then ff-only merge.
-    const fetchResult = git(['fetch', remoteName, targetBranch], root);
+    const fetchResult = await git(['fetch', remoteName, targetBranch], root);
     if (fetchResult.exitCode !== 0) {
       const warning = `Local ${targetBranch} has diverged from ${remoteRef}. Run \`git pull\` to reconcile.`;
       logger.warn(`fastForwardLocal: fetch failed: ${fetchResult.stderr}`);
       return { success: false, warning };
     }
 
-    const mergeResult = git(['merge', '--ff-only', remoteRef], root);
+    const mergeResult = await git(['merge', '--ff-only', remoteRef], root);
     if (mergeResult.exitCode === 0) {
       logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
       return { success: true };
@@ -198,7 +200,7 @@ export function fastForwardLocal(
   }
 
   // Target branch is NOT checked out — use refspec fetch to advance the local ref.
-  const result = git(['fetch', remoteName, `${targetBranch}:${targetBranch}`], root);
+  const result = await git(['fetch', remoteName, `${targetBranch}:${targetBranch}`], root);
   if (result.exitCode === 0) {
     logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
     return { success: true };
@@ -206,20 +208,20 @@ export function fastForwardLocal(
 
   // Refspec fetch failed — check if it's because the branch is checked out in a worktree
   if (result.stderr.includes('checked out at') || result.stderr.includes('refusing to fetch')) {
-    const worktreePath = findWorktreeForBranch(targetBranch, root, git);
+    const worktreePath = await findWorktreeForBranch(targetBranch, root, git);
     if (worktreePath) {
       if (shouldSkipWorktree?.(worktreePath)) {
         const warning = `Skipped fast-forward of ${targetBranch}: worktree at ${worktreePath} belongs to an active task.`;
         logger.warn(`fastForwardLocal: ${warning}`);
         return { success: true, warning };
       }
-      return tryFastForwardInWorktree(targetBranch, worktreePath, remoteRef, remoteName, root, git);
+      return await tryFastForwardInWorktree(targetBranch, worktreePath, remoteRef, remoteName, root, git);
     }
   }
 
   // Fetch failed — check if local is just behind (can fast-forward) vs truly diverged
   // First, ensure we have the latest remote ref
-  const fetchRemoteResult = git(['fetch', remoteName, targetBranch], root);
+  const fetchRemoteResult = await git(['fetch', remoteName, targetBranch], root);
   if (fetchRemoteResult.exitCode !== 0) {
     const warning = `Failed to fetch ${remoteRef}. Run \`git fetch\` to update.`;
     logger.warn(`fastForwardLocal: ${warning}`);
@@ -227,8 +229,8 @@ export function fastForwardLocal(
   }
 
   // Get local and remote SHAs
-  const localShaResult = git(['rev-parse', targetBranch], root);
-  const remoteShaResult = git(['rev-parse', remoteRef], root);
+  const localShaResult = await git(['rev-parse', targetBranch], root);
+  const remoteShaResult = await git(['rev-parse', remoteRef], root);
 
   if (localShaResult.exitCode !== 0 || remoteShaResult.exitCode !== 0) {
     const warning = `Failed to get SHA for ${targetBranch} or ${remoteRef}.`;
@@ -246,11 +248,11 @@ export function fastForwardLocal(
   }
 
   // Check if local is an ancestor of remote (i.e., local is behind, can fast-forward)
-  const isAncestorResult = git(['merge-base', '--is-ancestor', localSha, remoteSha], root);
+  const isAncestorResult = await git(['merge-base', '--is-ancestor', localSha, remoteSha], root);
   if (isAncestorResult.exitCode === 0) {
     // Local is behind — force-update the local ref to match remote
     logger.debug(`fastForwardLocal: ${targetBranch} is behind ${remoteRef}, force-updating local ref`);
-    const updateResult = git(['branch', '-f', targetBranch, remoteRef], root);
+    const updateResult = await git(['branch', '-f', targetBranch, remoteRef], root);
     if (updateResult.exitCode === 0) {
       logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
       return { success: true };
@@ -258,14 +260,14 @@ export function fastForwardLocal(
 
     // git branch -f failed — check if it's because the branch is checked out in a worktree
     if (updateResult.stderr.includes('checked out at') || updateResult.stderr.includes('cannot force update')) {
-      const worktreePath = findWorktreeForBranch(targetBranch, root, git);
+      const worktreePath = await findWorktreeForBranch(targetBranch, root, git);
       if (worktreePath) {
         if (shouldSkipWorktree?.(worktreePath)) {
           const warning = `Skipped fast-forward of ${targetBranch}: worktree at ${worktreePath} belongs to an active task.`;
           logger.warn(`fastForwardLocal: ${warning}`);
           return { success: true, warning };
         }
-        return tryFastForwardInWorktree(targetBranch, worktreePath, remoteRef, remoteName, root, git);
+        return await tryFastForwardInWorktree(targetBranch, worktreePath, remoteRef, remoteName, root, git);
       }
     }
 
@@ -284,21 +286,22 @@ export function fastForwardLocal(
  * Pre-flight check: validate that a local branch is in sync with the driver's
  * configured remote before performing an irreversible remote merge.
  *
- * "In sync" means local is either equal to or behind (can fast-forward) the remote.
- * Divergence (local has commits not in remote) is the failure case — it means
- * fastForwardLocal will fail after the remote merge, leaving things half-merged.
+ * "In sync" means local is equal to, behind, or ahead of the remote — any
+ * linear relationship is fine. True divergence (both sides have commits the
+ * other doesn't) is the failure case — it means fastForwardLocal will fail
+ * after the remote merge, leaving things half-merged.
  *
  * Only checks the single remote that the driver uses — not all git remotes.
  * Users may have other remotes (heroku, personal forks) that are irrelevant.
  */
-export function validateBranchInSyncWithRemote(
+export async function validateBranchInSyncWithRemote(
   branch: string,
   remote: string,
   root: string,
-  git: (args: string[], cwd?: string) => GitResult = runGit,
-): { inSync: boolean; error?: string } {
+  git: (args: string[], cwd?: string) => Promise<GitResult> = runGit,
+): Promise<{ inSync: boolean; error?: string }> {
   // Fetch the branch from the driver's remote
-  const fetchResult = git(['fetch', remote, branch], root);
+  const fetchResult = await git(['fetch', remote, branch], root);
   if (fetchResult.exitCode !== 0) {
     // INVARIANT: Fetch failure is a real failure — no silent fallback.
     // If we can't verify sync, we must not proceed with an irreversible
@@ -312,8 +315,8 @@ export function validateBranchInSyncWithRemote(
   const remoteRef = `${remote}/${branch}`;
 
   // Get local and remote SHAs
-  const localShaResult = git(['rev-parse', branch], root);
-  const remoteShaResult = git(['rev-parse', remoteRef], root);
+  const localShaResult = await git(['rev-parse', branch], root);
+  const remoteShaResult = await git(['rev-parse', remoteRef], root);
 
   if (localShaResult.exitCode !== 0 || remoteShaResult.exitCode !== 0) {
     // Can't resolve refs — fail rather than silently proceeding
@@ -331,14 +334,22 @@ export function validateBranchInSyncWithRemote(
   }
 
   // Check if local is an ancestor of remote (local is behind — can fast-forward, OK)
-  const isAncestor = git(['merge-base', '--is-ancestor', localSha, remoteSha], root);
-  if (isAncestor.exitCode === 0) {
+  const localBehind = await git(['merge-base', '--is-ancestor', localSha, remoteSha], root);
+  if (localBehind.exitCode === 0) {
     return { inSync: true };
   }
 
-  // Local has diverged from this remote
+  // Check if remote is an ancestor of local (local is ahead — has unpushed commits, OK)
+  // This is fine because local has everything remote has plus more. The post-merge
+  // fast-forward will succeed since local can only be further ahead after merging.
+  const localAhead = await git(['merge-base', '--is-ancestor', remoteSha, localSha], root);
+  if (localAhead.exitCode === 0) {
+    return { inSync: true };
+  }
+
+  // True divergence: both sides have commits the other doesn't
   return {
     inSync: false,
-    error: `Local ${branch} has diverged from ${remoteRef}. Run \`git pull\` to reconcile before accepting.`,
+    error: `Local ${branch} has diverged from ${remoteRef} (both have commits the other doesn't). Reconcile with \`git pull\` or \`git push\` before accepting.`,
   };
 }

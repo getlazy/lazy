@@ -7,9 +7,9 @@
  * The user's .mcp.json in the worktree is NEVER touched.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../utils/home';
+import { pathExists, readFileSafe, writeFile, ensureDir } from '../utils/fs';
 
 interface ClaudeConfig {
   mcpServers?: Record<string, {
@@ -35,16 +35,16 @@ interface ClaudeSettings {
  *
  * @param mcpServerConfig - The command and args for the MCP server, provided by the Runner.
  */
-export function writeMcpConfig(mcpServerConfig: { command: string; args: string[] }): void {
-  const claudeConfigPath = join(homedir(), '.claude.json');
+export async function writeMcpConfig(mcpServerConfig: { command: string; args: string[] }): Promise<void> {
+  const claudeConfigPath = join(getHome(), '.claude.json');
 
   let config: ClaudeConfig = {};
 
   // Read existing config if present
-  if (existsSync(claudeConfigPath)) {
+  const existingContent = await readFileSafe(claudeConfigPath);
+  if (existingContent) {
     try {
-      const content = readFileSync(claudeConfigPath, 'utf-8');
-      config = JSON.parse(content);
+      config = JSON.parse(existingContent);
     } catch {
       // Malformed JSON — overwrite with fresh config
       config = {};
@@ -62,7 +62,7 @@ export function writeMcpConfig(mcpServerConfig: { command: string; args: string[
     args: mcpServerConfig.args,
   };
 
-  writeFileSync(claudeConfigPath, JSON.stringify(config, null, 2) + '\n');
+  await writeFile(claudeConfigPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
 }
 
 /**
@@ -77,18 +77,18 @@ export function writeMcpConfig(mcpServerConfig: { command: string; args: string[
  *
  * @param toolNames - Tool names to approve (e.g., ['lazy_search', 'lazy_show', ...])
  */
-export function writeToolPermissions(toolNames: string[]): void {
-  const claudeDir = join(homedir(), '.claude');
-  mkdirSync(claudeDir, { recursive: true });
+export async function writeToolPermissions(toolNames: string[]): Promise<void> {
+  const claudeDir = join(getHome(), '.claude');
+  await ensureDir(claudeDir);
 
   const settingsPath = join(claudeDir, 'settings.json');
 
   let settings: ClaudeSettings = {};
 
-  if (existsSync(settingsPath)) {
+  const existingContent = await readFileSafe(settingsPath);
+  if (existingContent) {
     try {
-      const content = readFileSync(settingsPath, 'utf-8');
-      settings = JSON.parse(content);
+      settings = JSON.parse(existingContent);
     } catch {
       settings = {};
     }
@@ -108,5 +108,5 @@ export function writeToolPermissions(toolNames: string[]): void {
 
   settings.permissions.allow = [...existing, ...lazyEntries];
 
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  await writeFile(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
 }

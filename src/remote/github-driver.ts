@@ -46,13 +46,16 @@ import type {
   ImportOptions,
   ImportResult,
   CIJobFailure,
+  AcceptGateWarning,
 } from './driver';
+import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
-import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, type GitResult } from '../utils/git';
+import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 
@@ -64,25 +67,26 @@ export interface GhResult {
 
 /** Overridable subprocess runners for testing. */
 export interface DriverDeps {
-  runGh: (args: string[], cwd?: string) => GhResult;
-  runGit: (args: string[], cwd?: string) => GitResult;
+  runGh: (args: string[], cwd?: string) => Promise<GhResult>;
+  runGit: (args: string[], cwd?: string) => Promise<GitResult>;
   /** Override retry options for testing (e.g., { maxAttempts: 1 } to disable retries). */
   retryOptions?: RetryOptions;
 }
 
-function runGh(args: string[], cwd?: string): GhResult {
-  const spawnOpts: { cwd?: string; stdout: 'pipe'; stderr: 'pipe' } = {
+async function runGh(args: string[], cwd?: string): Promise<GhResult> {
+  const spawnOpts: Record<string, unknown> = {
     stdout: 'pipe',
     stderr: 'pipe',
   };
   if (cwd) spawnOpts.cwd = cwd;
 
   try {
-    const result = spawnSync(['gh', ...args], spawnOpts);
+    const proc = spawn(['gh', ...args], spawnOpts) as any;
+    const result = await proc.exited;
     return {
-      stdout: result.stdout.toString().trim(),
-      stderr: result.stderr.toString().trim(),
-      exitCode: result.exitCode,
+      stdout: (await Bun.readableStreamToText(proc.stdout)).trim(),
+      stderr: (await Bun.readableStreamToText(proc.stderr)).trim(),
+      exitCode: proc.exitCode ?? result,
     };
   } catch (err: unknown) {
     // gh binary not found
@@ -116,8 +120,8 @@ function parseGitHubRepoIdentifier(url: string): string | null {
   const sshMatch = url.match(/git@github\.com:([^/]+\/[^/]+?)(\.git)?$/);
   if (sshMatch) return sshMatch[1];
 
-  // HTTPS format: https://github.com/owner/repo.git or https://github.com/owner/repo
-  const httpsMatch = url.match(/https:\/\/github\.com\/([^/]+\/[^/]+?)(\.git)?$/);
+  // HTTPS format: https://github.com/owner/repo or https://user:token@github.com/owner/repo
+  const httpsMatch = url.match(/https:\/\/(?:[^@]+@)?github\.com\/([^/]+\/[^/]+?)(\.git)?$/);
   if (httpsMatch) return httpsMatch[1];
 
   return null;
@@ -129,16 +133,17 @@ function parseGitHubRepoIdentifier(url: string): string | null {
  */
 export function detectGitHub(repoDir: string, remoteName: string = 'origin'): DriverDetection | null {
   try {
-    const result = defaultRunGit(['remote', 'get-url', remoteName], { cwd: repoDir });
+    // SYNC CALL: This is called during `lazy init` before any async context exists.
+    // It's a one-time detection check, not a runtime operation — blocking is acceptable here.
+    const proc = spawnSync(['git', 'remote', 'get-url', remoteName], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe' });
+    const exitCode = proc.exitCode ?? 1;
+    const url = proc.stdout ? proc.stdout.toString().trim() : '';
 
-    if (result.exitCode === 0) {
-      const url = result.stdout;
-      if (url.includes('github.com')) {
-        return {
-          name: 'GitHub',
-          tomlOverrides: { 'remote.driver': 'github' },
-        };
-      }
+    if (exitCode === 0 && url.includes('github.com')) {
+      return {
+        name: 'GitHub',
+        tomlOverrides: { 'remote.driver': 'github' },
+      };
     }
   } catch {
     // No remote or git error
@@ -150,8 +155,8 @@ export class GitHubDriver implements RepositoryDriver {
   needsSync = true;
 
   private config: ResolvedConfig;
-  private gh: (args: string[], cwd?: string) => GhResult;
-  private git: (args: string[], cwd?: string) => GhResult;
+  private gh: (args: string[], cwd?: string) => Promise<GhResult>;
+  private git: (args: string[], cwd?: string) => Promise<GitResult>;
   private repoPrivate: boolean | null = null;
 
   /** The configured git remote name (default: 'origin'). */
@@ -164,9 +169,16 @@ export class GitHubDriver implements RepositoryDriver {
 
   constructor(config: ResolvedConfig, deps?: DriverDeps, context?: DriverContext) {
     this.config = config;
-    this.gh = deps?.runGh ?? runGh;
-    this.git = deps?.runGit ?? defaultRunGit;
     this.driverContext = context;
+
+    // Wrap gh to default cwd to the project root so {owner}/{repo} placeholders
+    // resolve correctly. Without this, daemon processes resolve against their own
+    // cwd (e.g., the lazy source tree) instead of the QA/user project.
+    const baseGh = deps?.runGh ?? runGh;
+    this.gh = (args: string[], cwd?: string) => baseGh(args, cwd ?? context?.lazyRoot);
+
+    this.git = deps?.runGit ?? defaultRunGit;
+
     // When deps are injected (test mode), default to no-retry to avoid test
     // timeouts from backoff delays. Tests that want to verify retry behavior
     // can explicitly set retryOptions with appropriate timeouts.
@@ -177,7 +189,7 @@ export class GitHubDriver implements RepositoryDriver {
     await withRemoteRetry(
       async () => {
         logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-        const result = this.git(['push', '-u', this.remoteName, branch]);
+        const result = await this.git(['push', '-u', this.remoteName, branch]);
         if (result.exitCode !== 0) {
           if (result.stderr.includes('Everything up-to-date')) {
             logger.debug('Branch already up-to-date on remote');
@@ -196,7 +208,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Fetch the latest state of the branch from remote (updates <remote>/<branch> ref)
     await withRemoteRetry(
       async () => {
-        const fetchResult = this.git(['fetch', this.remoteName, branch], worktreePath);
+        const fetchResult = await this.git(['fetch', this.remoteName, branch], worktreePath);
         if (fetchResult.exitCode !== 0) {
           throw new Error(`Failed to fetch branch ${branch} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
@@ -207,7 +219,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Check if <remote>/<branch> is ahead of local HEAD
     const remoteRef = `${this.remoteName}/${branch}`;
-    const revListResult = this.git(
+    const revListResult = await this.git(
       ['rev-list', '--count', `HEAD..${remoteRef}`],
       worktreePath,
     );
@@ -231,7 +243,7 @@ export class GitHubDriver implements RepositoryDriver {
     const remoteRef = `${this.remoteName}/${parentBranch}`;
     await withRemoteRetry(
       async () => {
-        const fetchResult = this.git(['fetch', this.remoteName, parentBranch], worktreePath);
+        const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
         if (fetchResult.exitCode !== 0) {
           throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
@@ -256,7 +268,7 @@ export class GitHubDriver implements RepositoryDriver {
     await this.pushBranch(branch);
 
     // If a PR already exists (e.g., imported from GitHub), return its metadata
-    const existing = this.findExistingPR(branch);
+    const existing = await this.findExistingPR(branch);
     if (existing) {
       logger.debug(`PR already exists: ${existing.url}`);
       return {
@@ -280,7 +292,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     if (existingPrNumber) {
       // PR exists — undraft it
-      const readyResult = runGh(['pr', 'ready', existingPrNumber]);
+      const readyResult = await this.gh(['pr', 'ready', existingPrNumber]);
       if (readyResult.exitCode !== 0) {
         // Non-fatal: PR may already be non-draft, or repo may not use drafts
         logger.debug(`Failed to mark PR #${existingPrNumber} ready (non-fatal): ${readyResult.stderr}`);
@@ -292,7 +304,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // No PR yet — create one (non-draft, since we're marking ready)
     const branchName = getBranchName(task);
-    const targetBranch = this.targetBranch(task);
+    const targetBranch = await this.targetBranch(task);
 
     // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
     if (!targetBranch || targetBranch.trim() === '') {
@@ -314,7 +326,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Get the repository identifier to explicitly specify --repo for gh CLI.
     // This ensures the PR is created in the correct repository when multiple
     // GitHub remotes exist (e.g., origin → GitLab, github-obsolete → GitHub).
-    const repoIdentifier = this.getRepoIdentifier();
+    const repoIdentifier = await this.getRepoIdentifier();
     if (!repoIdentifier) {
       logger.warn(`Failed to determine GitHub repository from remote ${this.remoteName} — PR creation may fail`);
     }
@@ -323,7 +335,7 @@ export class GitHubDriver implements RepositoryDriver {
       'pr', 'create',
       '--head', branchName,
       '--base', targetBranch,
-      '--title', task.goal,
+      '--title', truncateMRTitle(task.goal),
       '--body', body,
     ];
 
@@ -335,7 +347,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Log the exact command for debugging PR creation failures
     logger.debug(`markReadyForReview: executing: gh ${createArgs.join(' ')}`);
 
-    const createResult = this.gh(createArgs);
+    const createResult = await this.gh(createArgs);
 
     if (createResult.exitCode !== 0) {
       logger.warn(`Failed to create PR (non-fatal): ${createResult.stderr}`);
@@ -343,7 +355,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     const prUrl = createResult.stdout.trim();
-    const prNumber = this.getPRNumber(branchName, prUrl);
+    const prNumber = await this.getPRNumber(branchName, prUrl);
 
     logger.info(`Created PR: ${prUrl}`);
     return {
@@ -358,7 +370,7 @@ export class GitHubDriver implements RepositoryDriver {
     const { sourceBranch, targetBranch, task, root } = opts;
 
     // Step 0: Check if already merged (idempotent — noop if already done)
-    if (this.isBranchMerged(sourceBranch, targetBranch, root)) {
+    if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
       logger.info('Branch is already merged into target — nothing to do.');
       return { status: 'merged' };
     }
@@ -377,14 +389,14 @@ export class GitHubDriver implements RepositoryDriver {
     let prNumber = this.prNumber(task);
     let updatedMetadata: Record<string, string> | undefined;
 
-    const existing = this.findExistingPR(sourceBranch);
+    const existing = await this.findExistingPR(sourceBranch);
 
     if (existing?.state === 'MERGED') {
       // PR was already merged — check if the branch content is fully in target.
       // GitHub can spuriously merge a PR (e.g., no unique commits) while the branch
       // has since gained new commits. If truly merged, return merged. Otherwise,
       // create a replacement PR for the new commits.
-      if (this.isBranchMerged(sourceBranch, targetBranch, root)) {
+      if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
         logger.info('PR and branch already merged — nothing to do.');
         return { status: 'merged' };
       }
@@ -414,10 +426,10 @@ export class GitHubDriver implements RepositoryDriver {
         'pr', 'create',
         '--head', sourceBranch,
         '--base', targetBranch,
-        '--title', task.goal,
+        '--title', truncateMRTitle(task.goal),
         '--body', body,
       ];
-      const repoIdentifier = this.getRepoIdentifier();
+      const repoIdentifier = await this.getRepoIdentifier();
       if (repoIdentifier) {
         createArgs.push('--repo', repoIdentifier);
       }
@@ -425,12 +437,12 @@ export class GitHubDriver implements RepositoryDriver {
       // Log the exact command for debugging PR creation failures
       logger.debug(`merge: executing: gh ${createArgs.join(' ')}`);
 
-      const createResult = this.gh(createArgs);
+      const createResult = await this.gh(createArgs);
 
       if (createResult.exitCode !== 0) {
         // If PR creation fails, the branch may already be fully merged into
         // the target (e.g., fast-forward or no unique commits). Check via git.
-        if (this.isBranchMerged(sourceBranch, targetBranch, root)) {
+        if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
           logger.info('Branch is already merged into target — nothing to do.');
           return { status: 'merged' };
         }
@@ -441,7 +453,7 @@ export class GitHubDriver implements RepositoryDriver {
       }
 
       const prUrl = createResult.stdout.trim();
-      const newPrNumber = this.getPRNumber(sourceBranch, prUrl);
+      const newPrNumber = await this.getPRNumber(sourceBranch, prUrl);
 
       if (newPrNumber !== undefined) {
         prNumber = String(newPrNumber);
@@ -457,65 +469,18 @@ export class GitHubDriver implements RepositoryDriver {
       logger.info(`Created replacement PR: ${prUrl}`);
     }
 
-    // Step 3: Pre-merge checks — verify CI and reviews BEFORE attempting merge.
-    // GitHub allows repo admins to bypass branch protection by default.
-    // By checking here, we avoid accidentally merging when CI is failing or
-    // required reviews are missing, even if the user has admin privileges.
+    // Gate checks (CI, reviews) are handled by checkAcceptGates() before merge() is called.
+    // merge() trusts that the caller has already validated gates.
     const mergeTarget = prNumber ?? sourceBranch;
 
-    if (prNumber) {
-      // 3a: Check CI status
-      const checks = this.getPRChecks(prNumber);
-      const pending = checks.filter(c => c.bucket === 'pending');
-      const failed = checks.filter(c => c.bucket === 'fail');
-
-      if (failed.length > 0) {
-        const names = failed.map(c => c.name).join(', ');
-        return {
-          status: 'failed',
-          error: `CI checks failed: ${names}`,
-          metadata: updatedMetadata,
-        };
-      }
-
-      if (pending.length > 0) {
-        const names = pending.map(c => c.name).join(', ');
-        return {
-          status: 'pending',
-          reason: `CI checks pending: ${names}`,
-          metadata: updatedMetadata,
-        };
-      }
-
-      // 3b: Check review status
-      const reviewResult = this.gh(['pr', 'view', prNumber, '--json', 'reviewDecision'], root);
-      if (reviewResult.exitCode === 0) {
-        try {
-          const data = JSON.parse(reviewResult.stdout);
-          const decision = data.reviewDecision;
-          // reviewDecision is empty string when no reviews are required,
-          // 'APPROVED' when approved, 'CHANGES_REQUESTED' or 'REVIEW_REQUIRED' otherwise.
-          if (decision && decision !== 'APPROVED') {
-            return {
-              status: 'pending',
-              reason: `Required reviews not approved (status: ${decision})`,
-              metadata: updatedMetadata,
-            };
-          }
-        } catch {
-          logger.debug('Failed to parse reviewDecision, proceeding with merge attempt');
-        }
-      }
-    }
-
-    // Step 4: Squash merge via gh pr merge
+    // Step 3: Squash merge via gh pr merge
     // Fetch the PR body and append Lazy co-author trailer
     const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
 
     // Fetch current PR body to preserve it in the squash commit
     let commitBody = LAZY_COAUTHOR_TRAILER;
     if (prNumber) {
-      const viewResult = this.gh(['pr', 'view', prNumber, '--json', 'body'], root);
+      const viewResult = await this.gh(['pr', 'view', prNumber, '--json', 'body'], root);
       if (viewResult.exitCode === 0) {
         try {
           const prData = JSON.parse(viewResult.stdout);
@@ -529,7 +494,7 @@ export class GitHubDriver implements RepositoryDriver {
       }
     }
 
-    const mergeResult = this.gh(
+    const mergeResult = await this.gh(
       ['pr', 'merge', String(mergeTarget), '--squash', '--body', commitBody],
       root,
     );
@@ -537,7 +502,7 @@ export class GitHubDriver implements RepositoryDriver {
       // Use structured JSON output from gh CLI to determine failure reason
 
       // Check PR mergeability for conflicts via gh pr view --json
-      const prView = this.gh(['pr', 'view', String(mergeTarget), '--json', 'mergeable']);
+      const prView = await this.gh(['pr', 'view', String(mergeTarget), '--json', 'mergeable']);
       if (prView.exitCode === 0) {
         try {
           const data = JSON.parse(prView.stdout);
@@ -554,7 +519,7 @@ export class GitHubDriver implements RepositoryDriver {
 
       // Check for pending CI checks via gh pr checks --json
       if (prNumber) {
-        const checks = this.getPRChecks(prNumber);
+        const checks = await this.getPRChecks(prNumber);
         const pending = checks.filter(c => c.bucket === 'pending');
         if (pending.length > 0) {
           const names = pending.map(c => c.name).join(', ');
@@ -583,7 +548,7 @@ export class GitHubDriver implements RepositoryDriver {
       return { status: 'passed' };
     }
 
-    const checks = this.getPRChecks(prNumber);
+    const checks = await this.getPRChecks(prNumber);
     if (checks.length === 0) {
       return { status: 'passed' };
     }
@@ -618,7 +583,7 @@ export class GitHubDriver implements RepositoryDriver {
     const startTime = Date.now();
 
     while (true) {
-      const checks = this.getPRChecks(prNumber);
+      const checks = await this.getPRChecks(prNumber);
 
       if (checks.length === 0) {
         // No checks configured — nothing to wait for
@@ -662,8 +627,8 @@ export class GitHubDriver implements RepositoryDriver {
    * Get the current status of all PR checks.
    * Returns an array of check objects with name, state, bucket, and detailUrl.
    */
-  private getPRChecks(prNumber: string): Array<{ name: string; state: string; bucket: string; detailUrl?: string }> {
-    const result = this.gh([
+  private async getPRChecks(prNumber: string): Promise<Array<{ name: string; state: string; bucket: string; detailUrl?: string }>> {
+    const result = await this.gh([
       'pr', 'checks', prNumber,
       '--json', 'name,state,bucket,detailUrl',
     ]);
@@ -683,10 +648,14 @@ export class GitHubDriver implements RepositoryDriver {
 
   async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
     const prNumber = this.prNumber(task);
-    if (!prNumber) return [];
 
-    const checks = this.getPRChecks(prNumber);
-    const failed = checks.filter(c => c.bucket === 'fail');
+    // If there's a PR, use PR-based check status (most precise).
+    // Otherwise, fall back to branch-based workflow run detection so
+    // CI failures are caught even before a PR exists (auto-push flow).
+    const failed = prNumber
+      ? (await this.getPRChecks(prNumber)).filter(c => c.bucket === 'fail')
+      : await this.getBranchFailedChecks(getBranchName(task));
+
     if (failed.length === 0) return [];
 
     const results: CIJobFailure[] = [];
@@ -704,7 +673,7 @@ export class GitHubDriver implements RepositoryDriver {
         if (jobMatch) {
           const jobId = jobMatch[1];
           try {
-            const logResult = this.gh([
+            const logResult = await this.gh([
               'api',
               `repos/{owner}/{repo}/actions/jobs/${jobId}/logs`,
             ]);
@@ -723,6 +692,66 @@ export class GitHubDriver implements RepositoryDriver {
     return results;
   }
 
+  /**
+   * Get failed CI checks for a branch directly (without a PR).
+   * Uses `gh run list --branch <branch>` to find the latest workflow run,
+   * then checks for failed jobs. This enables CI auto-react before a PR exists.
+   */
+  private async getBranchFailedChecks(branch: string): Promise<Array<{ name: string; bucket: string; detailUrl?: string }>> {
+    // Get the most recent workflow run for the branch.
+    // Must pass --repo explicitly because the git remote URL may have embedded
+    // credentials (x-access-token:TOKEN@github.com) which gh doesn't recognize.
+    const repoId = await this.getRepoIdentifier();
+    const args = [
+      'run', 'list',
+      '--branch', branch,
+      '--limit', '1',
+      '--json', 'databaseId,status,conclusion',
+    ];
+    if (repoId) args.push('--repo', repoId);
+    const result = await this.gh(args);
+
+    if (result.exitCode !== 0) {
+      logger.debug(`getBranchFailedChecks: gh run list failed for branch ${branch}: ${result.stderr}`);
+      return [];
+    }
+
+    let runs: Array<{ databaseId: number; status: string; conclusion: string }>;
+    try {
+      runs = JSON.parse(result.stdout.trim());
+    } catch {
+      logger.debug(`getBranchFailedChecks: failed to parse run list for branch ${branch}`);
+      return [];
+    }
+
+    if (runs.length === 0) return [];
+    const run = runs[0];
+
+    // Only inspect completed runs with failure conclusion
+    if (run.status !== 'completed' || run.conclusion !== 'failure') return [];
+
+    // Fetch failed jobs from this run
+    const jobsArgs = ['run', 'view', String(run.databaseId), '--json', 'jobs'];
+    if (repoId) jobsArgs.push('--repo', repoId);
+    const jobsResult = await this.gh(jobsArgs);
+
+    if (jobsResult.exitCode !== 0) {
+      logger.debug(`getBranchFailedChecks: gh run view failed for run ${run.databaseId}: ${jobsResult.stderr}`);
+      return [];
+    }
+
+    try {
+      const data = JSON.parse(jobsResult.stdout.trim());
+      const jobs: Array<{ name: string; conclusion: string; url?: string }> = data.jobs ?? [];
+      return jobs
+        .filter(j => j.conclusion === 'failure')
+        .map(j => ({ name: j.name, bucket: 'fail', detailUrl: j.url }));
+    } catch {
+      logger.debug(`getBranchFailedChecks: failed to parse jobs for run ${run.databaseId}`);
+      return [];
+    }
+  }
+
   async postAcceptReview(task: Task, reason: string): Promise<string | null> {
     const prNumber = this.prNumber(task);
     if (!prNumber) {
@@ -731,7 +760,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // Step 1: Try submitting an approving PR review via the GitHub API
-    const reviewResult = this.gh([
+    const reviewResult = await this.gh([
       'api',
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--method', 'POST',
@@ -758,7 +787,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Fall back to a regular comment
     const commentBody = `[Lazy Accept] ${reason}`;
-    const commentResult = this.gh([
+    const commentResult = await this.gh([
       'pr', 'comment', prNumber, '--body', commentBody,
     ]);
 
@@ -781,7 +810,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // Step 1: Try submitting a REQUEST_CHANGES PR review via the GitHub API
-    const reviewResult = this.gh([
+    const reviewResult = await this.gh([
       'api',
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--method', 'POST',
@@ -808,7 +837,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Fall back to a regular comment
     const commentBody = `[Lazy Reject] ${reason}`;
-    const commentResult = this.gh([
+    const commentResult = await this.gh([
       'pr', 'comment', prNumber, '--body', commentBody,
     ]);
 
@@ -825,10 +854,10 @@ export class GitHubDriver implements RepositoryDriver {
 
   async cleanup(branch: string): Promise<void> {
     // Check if a PR exists for this branch and close it
-    const existing = this.findExistingPR(branch);
+    const existing = await this.findExistingPR(branch);
     if (existing && existing.state === 'OPEN') {
       logger.info(`Closing PR #${existing.number} for branch ${branch}...`);
-      const closeResult = this.gh(['pr', 'close', String(existing.number)]);
+      const closeResult = await this.gh(['pr', 'close', String(existing.number)]);
       if (closeResult.exitCode !== 0) {
         logger.warn(`Failed to close PR #${existing.number}: ${closeResult.stderr}`);
       } else {
@@ -839,27 +868,28 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   async syncComments(task: Task, since: string): Promise<RemoteComment[]> {
+    const taskLabel = task.code ?? task.id.substring(0, 8);
     const prNumber = this.prNumber(task);
     if (!prNumber) {
-      logger.debug('syncComments: no PR number in task metadata, skipping');
+      logger.debug(`syncComments [${taskLabel}]: no PR number in task metadata, skipping`);
       return [];
     }
 
     // Public repos are a prompt injection vector — skip comment sync unless
     // the user has explicitly opted in via the intentionally-ugly config flag.
-    if (!this.isRepoPrivate()) {
+    if (!(await this.isRepoPrivate())) {
       if (!this.config.remote.github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection) {
-        logger.info('syncComments: skipping comment sync for public repo (prompt injection risk). Set github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote] to enable.');
+        logger.info(`syncComments [${taskLabel}]: skipping comment sync for public repo (prompt injection risk). Set github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote] to enable.`);
         return [];
       }
-      logger.warn('syncComments: syncing comments from PUBLIC repo — prompt injection risk accepted via config');
+      logger.warn(`syncComments [${taskLabel}]: syncing comments from PUBLIC repo — prompt injection risk accepted via config`);
     }
 
     const comments: RemoteComment[] = [];
 
     // Fetch issue comments (top-level PR comments) with pagination
     try {
-      const issueComments = this.fetchPaginatedComments(
+      const issueComments = await this.fetchPaginatedComments(
         `repos/{owner}/{repo}/issues/${prNumber}/comments`,
         since,
       );
@@ -867,7 +897,7 @@ export class GitHubDriver implements RepositoryDriver {
         const body = (c.body as string) ?? '';
         // Skip comments marked as lazy's own output (they contain the HTML marker)
         if (body.includes('<!-- lazy:')) {
-          logger.debug(`syncComments: skipping own comment (id: ${c.id})`);
+          logger.debug(`syncComments [${taskLabel}]: skipping own comment (id: ${c.id})`);
           continue;
         }
         const user = c.user as Record<string, unknown> | undefined;
@@ -879,12 +909,12 @@ export class GitHubDriver implements RepositoryDriver {
         });
       }
     } catch (err) {
-      logger.warn(`syncComments: failed to fetch issue comments: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`syncComments [${taskLabel}]: failed to fetch issue comments: ${err instanceof Error ? err.message : err}`);
     }
 
     // Fetch review comments (inline code comments) with pagination
     try {
-      const reviewComments = this.fetchPaginatedComments(
+      const reviewComments = await this.fetchPaginatedComments(
         `repos/{owner}/{repo}/pulls/${prNumber}/comments`,
         since,
       );
@@ -892,7 +922,7 @@ export class GitHubDriver implements RepositoryDriver {
         const body = (c.body as string) ?? '';
         // Skip comments marked as lazy's own output (they contain the HTML marker)
         if (body.includes('<!-- lazy:')) {
-          logger.debug(`syncComments: skipping own comment (id: ${c.id})`);
+          logger.debug(`syncComments [${taskLabel}]: skipping own comment (id: ${c.id})`);
           continue;
         }
         const user = c.user as Record<string, unknown> | undefined;
@@ -906,7 +936,7 @@ export class GitHubDriver implements RepositoryDriver {
         });
       }
     } catch (err) {
-      logger.warn(`syncComments: failed to fetch review comments: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`syncComments [${taskLabel}]: failed to fetch review comments: ${err instanceof Error ? err.message : err}`);
     }
 
     // Filter out comments posted by lazy itself (identified by hidden markers).
@@ -917,7 +947,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Sort by creation time (oldest first)
     externalComments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-    logger.debug(`syncComments: fetched ${comments.length} comments since ${since}, ${externalComments.length} external (filtered ${comments.length - externalComments.length} lazy-posted)`);
+    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since}, ${externalComments.length} external (filtered ${comments.length - externalComments.length} lazy-posted)`);
     return externalComments;
   }
 
@@ -925,7 +955,7 @@ export class GitHubDriver implements RepositoryDriver {
     const prNumber = this.prNumber(task);
     if (!prNumber) return null;
 
-    const result = this.gh(['pr', 'view', prNumber, '--json', 'state']);
+    const result = await this.gh(['pr', 'view', prNumber, '--json', 'state']);
     if (result.exitCode !== 0) {
       logger.debug(`getPRState: gh pr view failed for PR #${prNumber}: ${result.stderr}`);
       return null;
@@ -955,7 +985,7 @@ export class GitHubDriver implements RepositoryDriver {
     // The marker is invisible in GitHub's rendered view but detectable by syncComments.
     const markedContent = '<!-- lazy:turn -->\n' + content;
 
-    const result = this.gh(['pr', 'comment', prNumber, '--body', markedContent]);
+    const result = await this.gh(['pr', 'comment', prNumber, '--body', markedContent]);
     if (result.exitCode !== 0) {
       logger.warn(`postTurnSummary: failed to post comment to PR #${prNumber}: ${result.stderr}`);
     } else {
@@ -967,7 +997,7 @@ export class GitHubDriver implements RepositoryDriver {
     const checks: HealthCheck[] = [];
 
     // 1. Check gh CLI is installed
-    const ghVersion = this.gh(['--version']);
+    const ghVersion = await this.gh(['--version']);
     if (ghVersion.exitCode !== 0) {
       checks.push({ state: 'fail', what: 'gh CLI installed', reason: 'Install from https://cli.github.com/' });
       return checks;
@@ -975,7 +1005,7 @@ export class GitHubDriver implements RepositoryDriver {
     checks.push({ state: 'ok', what: 'gh CLI installed' });
 
     // 2. Check gh auth status
-    const authStatus = this.gh(['auth', 'status']);
+    const authStatus = await this.gh(['auth', 'status']);
     if (authStatus.exitCode !== 0) {
       checks.push({ state: 'fail', what: 'GitHub authentication', reason: 'Run: gh auth login' });
       return checks;
@@ -997,7 +1027,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // 4. Check that the configured git remote exists and points to GitHub
-    const remoteUrl = this.git(['remote', 'get-url', this.remoteName]);
+    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
     if (remoteUrl.exitCode !== 0) {
       checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <github-url>` });
       return checks;
@@ -1014,7 +1044,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // 5. Check repo visibility and comment sync status
-    const repoView = this.gh(['repo', 'view', '--json', 'isPrivate']);
+    const repoView = await this.gh(['repo', 'view', '--json', 'isPrivate']);
     if (repoView.exitCode === 0) {
       try {
         const data = JSON.parse(repoView.stdout);
@@ -1046,7 +1076,7 @@ export class GitHubDriver implements RepositoryDriver {
 
   getConfigOptions(): DriverConfigOptions {
     return {
-      valid: ['github_auto_push', 'github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection'],
+      valid: ['auto_approve', 'github_auto_push', 'github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection'],
       deprecated: [
         {
           key: 'token_env',
@@ -1071,7 +1101,7 @@ export class GitHubDriver implements RepositoryDriver {
     const prNumber = match[1];
 
     // Fetch PR details via gh CLI
-    const prView = this.gh([
+    const prView = await this.gh([
       'pr', 'view', prNumber,
       '--json', 'title,headRefName,state,url,number,body',
     ]);
@@ -1098,7 +1128,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Fetch PR comments for import as notes
     const comments: string[] = [];
-    const commentsResult = this.gh([
+    const commentsResult = await this.gh([
       'pr', 'view', prNumber,
       '--json', 'comments',
     ]);
@@ -1136,6 +1166,29 @@ export class GitHubDriver implements RepositoryDriver {
 
   // --- Private helpers ---
 
+  async recoverRemoteRef(task: Task): Promise<Record<string, string> | null> {
+    const branchName = getBranchName(task);
+    // Note: findExistingPR skips CLOSED/MERGED PRs for safety in the publish flow,
+    // but for recovery we need to find ANY PR including merged ones.
+    const args = ['pr', 'view', branchName, '--json', 'url,number,state'];
+    const repoIdentifier = await this.getRepoIdentifier();
+    if (repoIdentifier) {
+      args.push('--repo', repoIdentifier);
+    }
+    const result = await this.gh(args);
+    if (result.exitCode !== 0) return null;
+
+    try {
+      const data = JSON.parse(result.stdout);
+      return {
+        github_remote_ref_url: data.url,
+        github_remote_ref_id: String(data.number),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Read the PR number from task metadata with backward compatibility.
    * Fallback chain: github_remote_ref_id → remote_ref_id → github_pr_number.
@@ -1156,7 +1209,7 @@ export class GitHubDriver implements RepositoryDriver {
    * Read the target branch from task metadata with backward compatibility.
    * remote_target_branch is driver-agnostic, github_pr_target_branch is legacy.
    */
-  private targetBranch(task: Task): string {
+  private async targetBranch(task: Task): Promise<string> {
     const remote = task.metadata?.remote_target_branch;
     const github = task.metadata?.github_pr_target_branch;
 
@@ -1171,7 +1224,7 @@ export class GitHubDriver implements RepositoryDriver {
       // task was started (getCurrentBranch returns literal "HEAD" in that case).
       if (remote === 'HEAD') {
         logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
-        return this.resolveDefaultBranch() ?? (github || 'main');
+        return (await this.resolveDefaultBranch()) ?? (github || 'main');
       }
       return remote;
     }
@@ -1183,7 +1236,7 @@ export class GitHubDriver implements RepositoryDriver {
       }
       if (github === 'HEAD') {
         logger.warn(`targetBranch: github_pr_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
-        return this.resolveDefaultBranch() ?? 'main';
+        return (await this.resolveDefaultBranch()) ?? 'main';
       }
       return github;
     }
@@ -1195,8 +1248,8 @@ export class GitHubDriver implements RepositoryDriver {
    * Resolve the remote's default branch name via git symbolic-ref.
    * Returns null if resolution fails.
    */
-  private resolveDefaultBranch(): string | null {
-    const result = this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
+  private async resolveDefaultBranch(): Promise<string | null> {
+    const result = await this.git(['symbolic-ref', `refs/remotes/${this.remoteName}/HEAD`]);
     if (result.exitCode === 0) {
       const ref = result.stdout.trim();
       const prefix = `refs/remotes/${this.remoteName}/`;
@@ -1213,8 +1266,8 @@ export class GitHubDriver implements RepositoryDriver {
    * This is used to explicitly specify --repo for gh CLI commands to avoid ambiguity
    * when multiple GitHub remotes exist.
    */
-  private getRepoIdentifier(): string | null {
-    const remoteUrl = this.git(['remote', 'get-url', this.remoteName]);
+  private async getRepoIdentifier(): Promise<string | null> {
+    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
     if (remoteUrl.exitCode !== 0) {
       logger.debug(`getRepoIdentifier: failed to get URL for remote ${this.remoteName}: ${remoteUrl.stderr}`);
       return null;
@@ -1227,10 +1280,10 @@ export class GitHubDriver implements RepositoryDriver {
    * Returns true if private, false if public. Defaults to false (public) on error
    * to err on the side of safety (skipping comment sync).
    */
-  private isRepoPrivate(): boolean {
+  private async isRepoPrivate(): Promise<boolean> {
     if (this.repoPrivate !== null) return this.repoPrivate;
 
-    const result = this.gh(['repo', 'view', '--json', 'isPrivate']);
+    const result = await this.gh(['repo', 'view', '--json', 'isPrivate']);
     if (result.exitCode !== 0) {
       logger.warn(`isRepoPrivate: gh repo view failed, assuming public (comment sync will be skipped): ${result.stderr}`);
       this.repoPrivate = false;
@@ -1263,26 +1316,32 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   /** Check if sourceBranch is already fully merged into targetBranch via git. */
-  private isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): boolean {
+  private async isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
     // git merge-base --is-ancestor <branch> <remote>/<target> returns 0 if branch is an ancestor
-    const result = this.git(
+    const result = await this.git(
       ['merge-base', '--is-ancestor', sourceBranch, `${this.remoteName}/${targetBranch}`],
       cwd,
     );
     return result.exitCode === 0;
   }
 
-  private findExistingPR(branch: string): { url: string; number: number; state: string } | null {
+  private async findExistingPR(branch: string): Promise<{ url: string; number: number; state: string } | null> {
     const args = ['pr', 'view', branch, '--json', 'url,number,state'];
-    const repoIdentifier = this.getRepoIdentifier();
+    const repoIdentifier = await this.getRepoIdentifier();
     if (repoIdentifier) {
       args.push('--repo', repoIdentifier);
     }
-    const result = this.gh(args);
+    const result = await this.gh(args);
     if (result.exitCode !== 0) return null;
 
     try {
       const data = JSON.parse(result.stdout);
+      // Skip closed/merged PRs — linking to a stale PR causes the daemon's
+      // external change detection to auto-close the task.
+      if (data.state === 'CLOSED' || data.state === 'MERGED') {
+        logger.debug(`findExistingPR: skipping ${data.state} PR #${data.number} for branch ${branch}`);
+        return null;
+      }
       return { url: data.url, number: data.number, state: data.state };
     } catch {
       return null;
@@ -1294,14 +1353,14 @@ export class GitHubDriver implements RepositoryDriver {
    * Uses gh api with --paginate to deterministically fetch all pages.
    * Returns raw JSON objects from the API.
    */
-  private fetchPaginatedComments(
+  private async fetchPaginatedComments(
     endpoint: string,
     since: string,
-  ): Array<Record<string, unknown>> {
+  ): Promise<Array<Record<string, unknown>>> {
     // Use since parameter on the API request for issue comments (supported natively).
     // For review comments, the API supports since but only for updated_at, so we
     // fetch all and filter in code for consistency.
-    const result = this.gh([
+    const result = await this.gh([
       'api', endpoint,
       '--paginate',
     ]);
@@ -1340,14 +1399,14 @@ export class GitHubDriver implements RepositoryDriver {
     }
   }
 
-  private getPRNumber(branch: string, prUrl: string): number | undefined {
+  private async getPRNumber(branch: string, prUrl: string): Promise<number | undefined> {
     // Try gh pr view first
     const args = ['pr', 'view', branch, '--json', 'number'];
-    const repoIdentifier = this.getRepoIdentifier();
+    const repoIdentifier = await this.getRepoIdentifier();
     if (repoIdentifier) {
       args.push('--repo', repoIdentifier);
     }
-    const viewResult = this.gh(args);
+    const viewResult = await this.gh(args);
     if (viewResult.exitCode === 0) {
       try {
         return JSON.parse(viewResult.stdout).number;
@@ -1378,9 +1437,96 @@ export class GitHubDriver implements RepositoryDriver {
 
   validateAccept(task: Task): string | null {
     if (!this.hasRemoteRef(task)) {
-      return 'Task has no remote reference (PR). Push and create a PR first with: lazy sync';
+      return 'Task has no remote reference (PR). Push and create a PR first with: lazy submit';
     }
     return null;
+  }
+
+  async isTargetBranchProtected(targetBranch: string): Promise<boolean> {
+    const repoIdentifier = await this.getRepoIdentifier();
+    if (!repoIdentifier) return false;
+
+    const result = await this.gh([
+      'api',
+      `repos/${repoIdentifier}/branches/${encodeURIComponent(targetBranch)}/protection`,
+      '--silent',
+    ]);
+
+    // 200 = protected, 404 = not protected
+    return result.exitCode === 0;
+  }
+
+  async hasExternalApproval(task: Task): Promise<boolean> {
+    const prNumber = this.prNumber(task);
+    if (!prNumber) return false;
+
+    // Get the authenticated user so we can exclude their approvals.
+    // If auto_approve previously submitted an approval (and accept failed later),
+    // that approval must not trick the non-auto-approve path into thinking
+    // a human reviewed it.
+    const userResult = await this.gh(['api', 'user', '--jq', '.login']);
+    const currentUser = userResult.exitCode === 0 ? userResult.stdout.trim() : '';
+
+    const jqFilter = currentUser
+      ? `[.[] | select(.state == "APPROVED" and .user.login != "${currentUser}")] | length`
+      : '[.[] | select(.state == "APPROVED")] | length';
+
+    const result = await this.gh([
+      'api',
+      `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
+      '--jq', jqFilter,
+    ]);
+
+    if (result.exitCode !== 0) return false;
+
+    const approvalCount = parseInt(result.stdout.trim(), 10);
+    return !isNaN(approvalCount) && approvalCount > 0;
+  }
+
+  async checkAcceptGates(task: Task): Promise<AcceptGateWarning[]> {
+    const warnings: AcceptGateWarning[] = [];
+    const prNumber = this.prNumber(task);
+    if (!prNumber) return warnings;
+
+    // Gate 1: CI checks
+    const checks = await this.getPRChecks(prNumber);
+    const failed = checks.filter(c => c.bucket === 'fail');
+    const pending = checks.filter(c => c.bucket === 'pending');
+
+    if (failed.length > 0) {
+      const names = failed.map(c => c.name).join(', ');
+      warnings.push({ gate: 'ci', message: `CI checks failing: ${names}` });
+    } else if (pending.length > 0) {
+      const names = pending.map(c => c.name).join(', ');
+      warnings.push({ gate: 'ci', message: `CI checks still running: ${names}` });
+    }
+
+    // Gate 2 & 3: Review status and unresolved threads (single call for consistency)
+    const reviewResult = await this.gh(['pr', 'view', prNumber, '--json', 'reviewDecision,reviewThreads']);
+    if (reviewResult.exitCode === 0) {
+      try {
+        const data = JSON.parse(reviewResult.stdout);
+
+        // Review decision
+        const decision = data.reviewDecision;
+        if (decision && decision !== 'APPROVED') {
+          const label = decision === 'CHANGES_REQUESTED' ? 'Changes requested' : 'Review required';
+          warnings.push({ gate: 'reviews', message: `${label} (status: ${decision})` });
+        }
+
+        // Unresolved review threads
+        const threads = data.reviewThreads ?? [];
+        const unresolved = threads.filter((t: { isResolved: boolean }) => !t.isResolved);
+        if (unresolved.length > 0) {
+          const plural = unresolved.length === 1 ? 'thread' : 'threads';
+          warnings.push({ gate: 'comments', message: `${unresolved.length} unresolved review ${plural}` });
+        }
+      } catch {
+        logger.warn(`checkAcceptGates: failed to parse review response: ${reviewResult.stdout.substring(0, 200)}`);
+      }
+    }
+
+    return warnings;
   }
 
   async fastForwardLocal(targetBranch: string, root: string): Promise<{ success: boolean; warning?: string }> {
@@ -1398,20 +1544,20 @@ export class GitHubDriver implements RepositoryDriver {
     // `git fetch <remote> main:main` fails with "refusing to fetch into branch
     // checked out at ..." when main is the current branch. The accept command
     // typically runs from the user's main repo which is on main.
-    const headResult = this.git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+    const headResult = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
     const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
     const remoteRef = `${this.remoteName}/${targetBranch}`;
 
     if (currentBranch === targetBranch) {
       // Target branch IS checked out — fetch then ff-only merge.
-      const fetchResult = this.git(['fetch', this.remoteName, targetBranch], root);
+      const fetchResult = await this.git(['fetch', this.remoteName, targetBranch], root);
       if (fetchResult.exitCode !== 0) {
         const warning = `Failed to fetch ${targetBranch} from ${this.remoteName}: ${fetchResult.stderr.trim() || 'unknown error'}. Run \`git fetch ${this.remoteName}\` to retry.`;
         logger.warn(`fastForwardLocal: fetch failed: ${fetchResult.stderr}`);
         return { success: false, warning };
       }
 
-      const mergeResult = this.git(['merge', '--ff-only', remoteRef], root);
+      const mergeResult = await this.git(['merge', '--ff-only', remoteRef], root);
       if (mergeResult.exitCode === 0) {
         logger.debug(`fastForwardLocal: ${targetBranch} fast-forwarded to ${remoteRef}`);
         return { success: true };
@@ -1426,10 +1572,10 @@ export class GitHubDriver implements RepositoryDriver {
 
       // Disambiguate: is this true divergence or a transient failure?
       // Use merge-base --is-ancestor to check if local is an ancestor of remote.
-      const localSha = this.git(['rev-parse', targetBranch], root);
-      const remoteSha = this.git(['rev-parse', remoteRef], root);
+      const localSha = await this.git(['rev-parse', targetBranch], root);
+      const remoteSha = await this.git(['rev-parse', remoteRef], root);
       if (localSha.exitCode === 0 && remoteSha.exitCode === 0) {
-        const ancestorCheck = this.git(['merge-base', '--is-ancestor', localSha.stdout.trim(), remoteSha.stdout.trim()], root);
+        const ancestorCheck = await this.git(['merge-base', '--is-ancestor', localSha.stdout.trim(), remoteSha.stdout.trim()], root);
         if (ancestorCheck.exitCode === 0) {
           // Local IS an ancestor of remote — not diverged. The ff-only failed
           // for a transient reason (dirty working tree, lock file, etc.).
@@ -1451,7 +1597,7 @@ export class GitHubDriver implements RepositoryDriver {
   async fetchRemoteState(root: string, branchesToUpdate?: string[]): Promise<void> {
     // Fetch latest from remote
     logger.info('Fetching from remote...');
-    const fetchResult = this.git(['fetch', this.remoteName], root);
+    const fetchResult = await this.git(['fetch', this.remoteName], root);
     if (fetchResult.exitCode !== 0) {
       logger.warn(`Fetch failed: ${fetchResult.stderr}`);
     } else {
@@ -1462,7 +1608,7 @@ export class GitHubDriver implements RepositoryDriver {
     const branches = new Set(['main', ...(branchesToUpdate ?? [])]);
 
     for (const branch of branches) {
-      this.fastForwardBranch(root, branch);
+      await this.fastForwardBranch(root, branch);
     }
   }
 
@@ -1474,7 +1620,7 @@ export class GitHubDriver implements RepositoryDriver {
    * (safe fast-forward of the local ref) and `git merge --ff-only` when
    * the branch is currently checked out.
    */
-  private fastForwardBranch(root: string, branch: string): void {
+  private async fastForwardBranch(root: string, branch: string): Promise<void> {
     // Skip git special refs that aren't real branches — "HEAD" always passes
     // rev-parse --verify, and `git fetch origin HEAD:HEAD` creates a phantom local branch.
     if (branch === 'HEAD') {
@@ -1483,20 +1629,20 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     logger.info(`Updating ${branch} branch...`);
-    const checkResult = this.git(['rev-parse', '--verify', branch], root);
+    const checkResult = await this.git(['rev-parse', '--verify', branch], root);
     if (checkResult.exitCode !== 0) {
       logger.debug(`${branch} branch not found locally, skipping`);
       return;
     }
 
     // Check if we're currently on this branch — determines update strategy
-    const headResult = this.git(['symbolic-ref', '--short', 'HEAD'], root);
+    const headResult = await this.git(['symbolic-ref', '--short', 'HEAD'], root);
     const currentBranch = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
     const remoteRef = `${this.remoteName}/${branch}`;
 
     if (currentBranch === branch) {
       // On the target branch: use merge --ff-only (updates working tree too)
-      const ffResult = this.git(['merge', '--ff-only', remoteRef], root);
+      const ffResult = await this.git(['merge', '--ff-only', remoteRef], root);
       if (ffResult.exitCode === 0) {
         logger.debug(`${branch} branch fast-forwarded to ${remoteRef}`);
       } else {
@@ -1504,9 +1650,20 @@ export class GitHubDriver implements RepositoryDriver {
       }
     } else {
       // Not on the target branch: use fetch refspec to advance the local ref
-      const ffResult = this.git(['fetch', this.remoteName, `${branch}:${branch}`], root);
+      const ffResult = await this.git(['fetch', this.remoteName, `${branch}:${branch}`], root);
       if (ffResult.exitCode === 0) {
         logger.debug(`${branch} branch fast-forwarded to ${remoteRef}`);
+      } else if (ffResult.stderr.includes('checked out at') || ffResult.stderr.includes('refusing to fetch')) {
+        // Branch is checked out in a worktree — fetch + ff-only merge there
+        const worktreePath = await findWorktreeForBranch(branch, root, this.git);
+        if (worktreePath) {
+          const result = await tryFastForwardInWorktree(branch, worktreePath, remoteRef, this.remoteName, root, this.git);
+          if (!result.success) {
+            logger.warn(`fastForwardBranch: ${result.warning}`);
+          }
+        } else {
+          this.logMergeFailure(branch, ffResult.stderr);
+        }
       } else {
         this.logMergeFailure(branch, ffResult.stderr);
       }

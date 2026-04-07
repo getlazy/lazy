@@ -38,25 +38,25 @@ describe('detectViolations', () => {
     await rm(repoDir, { recursive: true, force: true });
   });
 
-  test('returns empty array when no files changed', () => {
+  test('returns empty array when no files changed', async () => {
     const sha = getSha(repoDir);
-    const violations = detectViolations(repoDir, sha, sha, ['test/**']);
+    const violations = await detectViolations(repoDir, sha, sha, ['test/**']);
     expect(violations).toEqual([]);
   });
 
-  test('returns empty array when no patterns provided', () => {
+  test('returns empty array when no patterns provided', async () => {
     const startSha = getSha(repoDir);
     writeFileSync(join(repoDir, 'test.spec.ts'), 'modified\n');
     git(repoDir, 'add', '.');
     git(repoDir, 'commit', '-m', 'Change test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, []);
+    const violations = await detectViolations(repoDir, startSha, endSha, []);
     expect(violations).toEqual([]);
   });
 
   // INVARIANT: New test files are pure additions — no violation.
-  test('allows new file creation in protected directory', () => {
+  test('allows new file creation in protected directory', async () => {
     const startSha = getSha(repoDir);
 
     mkdirSync(join(repoDir, 'test'), { recursive: true });
@@ -65,12 +65,12 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Add new test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**']);
     expect(violations).toEqual([]);
   });
 
   // INVARIANT: Modifying an existing test file triggers a violation.
-  test('detects modification of existing protected file', () => {
+  test('detects modification of existing protected file', async () => {
     // Create a test file first
     mkdirSync(join(repoDir, 'test'), { recursive: true });
     writeFileSync(join(repoDir, 'test', 'existing.test.ts'), 'test("original", () => {});\n');
@@ -84,7 +84,7 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Modify test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**']);
     expect(violations.length).toBe(1);
     expect(violations[0].file).toBe('test/existing.test.ts');
     expect(violations[0].base_sha).toBe(startSha);
@@ -92,7 +92,7 @@ describe('detectViolations', () => {
   });
 
   // INVARIANT: Deleting a protected file triggers a violation.
-  test('detects deletion of protected file', () => {
+  test('detects deletion of protected file', async () => {
     mkdirSync(join(repoDir, 'test'), { recursive: true });
     writeFileSync(join(repoDir, 'test', 'to-delete.test.ts'), 'test("will be deleted", () => {});\n');
     git(repoDir, 'add', '.');
@@ -103,13 +103,13 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Delete test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**']);
     expect(violations.length).toBe(1);
     expect(violations[0].file).toBe('test/to-delete.test.ts');
   });
 
   // INVARIANT: Only appending to a file (pure addition) is allowed.
-  test('allows appending-only changes to protected files', () => {
+  test('allows appending-only changes to protected files', async () => {
     mkdirSync(join(repoDir, 'test'), { recursive: true });
     writeFileSync(join(repoDir, 'test', 'append.test.ts'), 'test("original", () => {});\n');
     git(repoDir, 'add', '.');
@@ -122,12 +122,12 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Append to test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**']);
     expect(violations).toEqual([]);
   });
 
   // INVARIANT: Pattern matching uses glob syntax (e.g., *.test.* matches any level).
-  test('matches glob patterns like *.test.*', () => {
+  test('matches glob patterns like *.test.*', async () => {
     writeFileSync(join(repoDir, 'foo.test.ts'), 'original\n');
     git(repoDir, 'add', '.');
     git(repoDir, 'commit', '-m', 'Add test');
@@ -138,14 +138,14 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Modify test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['*.test.*']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['*.test.*']);
     expect(violations.length).toBe(1);
     expect(violations[0].file).toBe('foo.test.ts');
   });
 
   // INVARIANT: Files created by the task itself are not violations when modified later.
   // The permission system protects pre-existing files, not agent-created ones.
-  test('allows modification of file created by earlier commits in same task', () => {
+  test('allows modification of file created by earlier commits in same task', async () => {
     // Record the branch point (before the task creates any files)
     const branchPointSha = getSha(repoDir);
 
@@ -163,16 +163,16 @@ describe('detectViolations', () => {
     const endSha = getSha(repoDir);
 
     // Without branchPointSha, this would be flagged as a violation
-    const violationsWithout = detectViolations(repoDir, startSha, endSha, ['test/**']);
+    const violationsWithout = await detectViolations(repoDir, startSha, endSha, ['test/**']);
     expect(violationsWithout.length).toBe(1);
 
     // With branchPointSha, the file is recognized as task-created and exempt
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
     expect(violations).toEqual([]);
   });
 
   // INVARIANT: Files created by the task itself can be deleted without violation.
-  test('allows deletion of file created by earlier commits in same task', () => {
+  test('allows deletion of file created by earlier commits in same task', async () => {
     const branchPointSha = getSha(repoDir);
 
     mkdirSync(join(repoDir, 'test'), { recursive: true });
@@ -185,12 +185,12 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Delete temp test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
     expect(violations).toEqual([]);
   });
 
   // INVARIANT: Pre-existing files are still protected even when branchPointSha is provided.
-  test('still detects modification of pre-existing file with branchPointSha', () => {
+  test('still detects modification of pre-existing file with branchPointSha', async () => {
     mkdirSync(join(repoDir, 'test'), { recursive: true });
     writeFileSync(join(repoDir, 'test', 'existing.test.ts'), 'test("original", () => {});\n');
     git(repoDir, 'add', '.');
@@ -205,13 +205,13 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Modify existing test');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**'], branchPointSha);
     expect(violations.length).toBe(1);
     expect(violations[0].file).toBe('test/existing.test.ts');
   });
 
   // INVARIANT: Non-protected files are never flagged.
-  test('ignores changes to non-protected files', () => {
+  test('ignores changes to non-protected files', async () => {
     const startSha = getSha(repoDir);
 
     writeFileSync(join(repoDir, 'src.ts'), 'code\n');
@@ -219,7 +219,7 @@ describe('detectViolations', () => {
     git(repoDir, 'commit', '-m', 'Add source');
     const endSha = getSha(repoDir);
 
-    const violations = detectViolations(repoDir, startSha, endSha, ['test/**', '*.test.*']);
+    const violations = await detectViolations(repoDir, startSha, endSha, ['test/**', '*.test.*']);
     expect(violations).toEqual([]);
   });
 });

@@ -4,16 +4,18 @@ import { commandAccept } from './accept';
 import { commandReject } from './reject';
 import { commandUnblock } from './unblock';
 import { showTaskContext, runFeedbackFlow, syncTaskFromRemote } from './shared';
+import { commandSyncTask } from './sync';
 import { buildTaskTree, printTaskTree } from './list';
-import { reconcileTasks } from '../../utils/reconcile';
+
 import { isTerminalStatus } from '../../types';
 import { theme, dim } from '../theme';
-import type { ModelName } from '../../types';
+
 import { ActivityMonitor } from '../activity-monitor';
 
 
 import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
 import { getActor } from '../../constants';
+import { createTerminal } from '../../terminal';
 
 /** Maximum number of recent activity lines to display in the polling view. */
 const MAX_ACTIVITY_LINES = 10;
@@ -154,7 +156,7 @@ async function handleInterruptedTasks(
 
     try {
       const { getBranchCommitMessages } = await import('../../git/operations');
-      const commits = getBranchCommitMessages(sess.git_branch, targetBranch, root);
+      const commits = await getBranchCommitMessages(sess.git_branch, targetBranch, root);
       if (commits.length > 0) {
         const recent = commits.slice(0, 3);
         console.log(`\nRecent commits (${commits.length} total):`);
@@ -207,7 +209,7 @@ async function handleInterruptedTasks(
 
         // Clean up worktree and branch
         try {
-          cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
+          await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
         } catch (err) {
           // Log but don't fail — partial cleanup is acceptable
           console.error(`Warning: could not fully clean up worktree: ${err instanceof Error ? err.message : err}`);
@@ -246,9 +248,14 @@ export async function commandLoop(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Set terminal window title
+  const terminal = createTerminal();
+  terminal.setActivity('lazy loop');
+  process.on('exit', () => terminal.restoreTitle());
+
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
-  let modelOverride: ModelName | undefined;
+  let modelOverride: string | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
   }
@@ -258,7 +265,7 @@ export async function commandLoop(args: string[]): Promise<void> {
 
   // Pre-flight checks before entering the review loop
   const { createRunner } = await import('../../runner');
-  const runner = createRunner(root);
+  const runner = await createRunner(root);
   try {
     runner.checkAvailability();
   } catch (err) {
@@ -298,9 +305,6 @@ export async function commandLoop(args: string[]): Promise<void> {
         while (!foundBlocked) {
           // Clear screen for clean display
           process.stdout.write('\x1B[2J\x1B[H');
-
-          // Reconcile to detect working → blocked transitions
-          await reconcileTasks(storage, root);
 
           // Check for newly blocked tasks that weren't already skipped
           const newBlocked = await storage.listTasksWithOptions({ blockedOnly: true, withSessionsOnly: true });
@@ -428,14 +432,14 @@ export async function commandLoop(args: string[]): Promise<void> {
             'Give feedback - includes unseen comments (recommended)',
             `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
             'Reject (discard work)',
-            'Just merge upstream (--sync-with-upstream)',
+            'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ]
         : [
             'Give feedback (open editor)',
             'Accept (merge work)',
             'Reject (discard work)',
-            'Just merge upstream (--sync-with-upstream)',
+            'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ];
 
@@ -461,8 +465,8 @@ export async function commandLoop(args: string[]): Promise<void> {
           await commandReject([taskShortId]);
           break;
         case 3:
-          // Merge upstream
-          await commandUnblock([taskShortId, '--sync-with-upstream']);
+          // Merge upstream via lazy sync
+          await commandSyncTask([taskShortId]);
           break;
         default: {
           // Give feedback (choice 0)
@@ -500,11 +504,11 @@ remain, enters a follow mode that shows active tasks and polls for new blocked
 tasks every 3 seconds. Ctrl+C exits at any time.
 
 Options:
-  --model <model>   Override model for feedback turns (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>   Override model for feedback turns (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --follow          Wait for agent after giving feedback
 
 Examples:
   lazy loop                          # Review all blocked tasks
-  lazy loop --model opus             # Use opus for feedback turns
+  lazy loop --model claude-opus-4-6             # Use opus for feedback turns
   lazy loop --follow                 # Wait for agent after giving feedback`);
 }

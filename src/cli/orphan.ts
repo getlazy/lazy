@@ -59,20 +59,20 @@ export async function checkOrphanedChild(
     parentBranchName = await getBranchNameFromId(task.parent_task_id, storage);
   } catch {
     // Can't determine parent's branch name — treat as orphaned
-    return { isOrphaned: true, parentTask, retargetBranch: getTaskTargetBranch(parentTask, root) ?? 'main' };
+    return { isOrphaned: true, parentTask, retargetBranch: await getTaskTargetBranch(parentTask, root) ?? 'main' };
   }
 
-  if (branchExists(parentBranchName, root)) {
+  if (await branchExists(parentBranchName, root)) {
     // Parent's branch still exists (maybe not cleaned up yet). Not orphaned.
     return { isOrphaned: false, parentTask, retargetBranch: null };
   }
 
   // Parent is terminal and branch is gone. Determine the retarget branch.
   // Use the parent's target branch (what the parent was merging into), defaulting to main.
-  let retargetBranch = getTaskTargetBranch(parentTask, root) ?? 'main';
+  let retargetBranch = await getTaskTargetBranch(parentTask, root) ?? 'main';
 
   // If the retarget branch also doesn't exist (chained accepts), fall back to main
-  if (!branchExists(retargetBranch, root)) {
+  if (!await branchExists(retargetBranch, root)) {
     retargetBranch = 'main';
   }
 
@@ -88,7 +88,7 @@ export async function checkOrphanedChild(
  * 3. Sets remote_target_branch to the retarget branch
  * 4. Adds a comment recording the retarget
  *
- * After retargeting, the next sync-with-upstream will merge the new target
+ * After retargeting, the next `lazy sync` will merge the new target
  * branch into the child's worktree, and the agent resolves any conflicts.
  */
 export async function retargetOrphanedChild(
@@ -135,7 +135,7 @@ export async function getActiveChildren(
  * the grandparent (or makes them top-level if the accepted task had no parent).
  *
  * Only updates parent_task_id — does NOT touch worktrees. The next
- * sync-with-upstream on each child will handle merging the new parent branch.
+ * `lazy sync` on each child will handle merging the new parent branch.
  *
  * Returns the list of re-parented children (for logging).
  */
@@ -148,8 +148,27 @@ export async function reparentChildren(
 
   const newParentId = acceptedTask.parent_task_id ?? null;
 
+  // Determine the new merge target for reparented children.
+  // The accepted task's remote_target_branch is where it merged into — children
+  // should now target the same branch (or the new parent's branch if reparented
+  // to another task).
+  let newTargetBranch: string | undefined;
+  if (newParentId) {
+    // Reparented to grandparent — children will use getBranchNameFromId() at sync time
+  } else {
+    // Reparented to top-level — update remote_target_branch to match the accepted
+    // task's target so syncTask can find the right branch.
+    newTargetBranch = acceptedTask.metadata?.remote_target_branch ?? undefined;
+  }
+
   for (const child of activeChildren) {
     await storage.updateTaskParent(child.id, newParentId);
+
+    // Update remote_target_branch so syncTask() can find the correct upstream
+    // after the old parent branch is deleted.
+    if (newTargetBranch) {
+      await storage.updateTaskMetadata(child.id, 'remote_target_branch', newTargetBranch);
+    }
 
     const acceptedRef = acceptedTask.code ?? acceptedTask.id.substring(0, 8);
     const newParentRef = newParentId ? newParentId.substring(0, 8) : 'top-level';

@@ -23,7 +23,7 @@ describe('lazy edit', () => {
     expectOutput(showResult, 'Model:   -');
 
     // Update model to opus
-    const editResult = await ctx.lazy(['edit', taskId, '--model', 'opus']);
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6']);
     expectSuccess(editResult);
     expectOutput(editResult, 'Updated model: opus');
 
@@ -54,11 +54,11 @@ describe('lazy edit', () => {
       '--goal',
       'updated goal',
       '--model',
-      'haiku',
+      'claude-haiku-4-5-20251001',
     ]);
     expectSuccess(editResult);
     expectOutput(editResult, 'Updated goal: updated goal');
-    expectOutput(editResult, 'Updated model: haiku');
+    expectOutput(editResult, 'Updated model: claude-haiku-4-5-20251001');
 
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);

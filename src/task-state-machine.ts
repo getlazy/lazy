@@ -25,9 +25,9 @@ export function isActiveStatus(status: TaskStatus): boolean {
   return status === 'working' || status === 'interrupted' || status === 'pairing' || status === 'merging';
 }
 
-/** Task is waiting for human or agent action (includes conflict — permission violations needing review) */
+/** Task is waiting for human or agent action (includes conflict and submitted — PR awaiting review) */
 export function isBlockedStatus(status: TaskStatus): boolean {
-  return status === 'blocked' || status === 'conflict';
+  return status === 'blocked' || status === 'conflict' || status === 'submitted';
 }
 
 // ---------------------------------------------------------------------------
@@ -49,10 +49,11 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  *                blocked → backlog (migration: never-started tasks)
  *   auto-resume: interrupted → working
  *   unblock:     blocked/conflict → working, merging → blocked
- *   accept:      blocked/conflict → merging → complete, merging → blocked (checks fail)
- *   reject:      blocked/interrupted → abandoned
- *   close:       blocked/conflict/interrupted/backlog → closed
- *   pair:        blocked/conflict/interrupted → pairing, pairing → blocked
+ *   submit:      blocked/conflict → submitted (creates PR, ready for review)
+ *   accept:      blocked/conflict/submitted → merging → complete, merging → blocked (checks fail)
+ *   reject:      blocked/interrupted/submitted → abandoned
+ *   close:       blocked/conflict/interrupted/submitted/backlog → closed
+ *   pair:        blocked/conflict/interrupted/submitted → pairing, pairing → blocked
  *   resume:      interrupted → working
  *   reopen:      complete/abandoned/closed → blocked (with session) or backlog (no session)
  *   zombie:      any non-terminal → zombie (system only), zombie → complete
@@ -60,9 +61,10 @@ export function isBlockedStatus(status: TaskStatus): boolean {
 export const VALID_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   backlog:     ['working', 'closed'],
   working:     ['blocked', 'conflict', 'interrupted'],
-  blocked:     ['working', 'merging', 'pairing', 'abandoned', 'closed', 'backlog'],
-  conflict:    ['working', 'merging', 'pairing', 'abandoned', 'closed'],
+  blocked:     ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'closed', 'backlog'],
+  conflict:    ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'closed'],
   interrupted: ['working', 'pairing', 'abandoned', 'closed'],
+  submitted:   ['working', 'merging', 'pairing', 'abandoned', 'closed'],
   pairing:     ['blocked'],
   merging:     ['complete', 'blocked'],
   zombie:      ['complete'],

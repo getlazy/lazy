@@ -1,6 +1,7 @@
-import { requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireStorage, requireLazyRoot, shortId, displayId, parseFlags, resolveTaskOrExit } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { getActor } from '../../constants';
+import { emitSignal, initSignalDb } from '../../daemon/signals';
 
 export async function commandComment(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -61,6 +62,30 @@ export async function commandComment(args: string[]): Promise<void> {
     const comment = await storage.createComment(task.id, content.trim(), getActor());
     // Comment is now durably persisted — clean up recovery file
     if (commentRecoveryPath) removeRecoveryFile(commentRecoveryPath);
+
+    // Emit a comment signal unconditionally — state checks belong in the
+    // delivery/consumption phase, not at emission time. Retry up to 2 attempts
+    // and fail loudly so the human knows if signal emission broke.
+    const root = requireLazyRoot();
+    initSignalDb(root);
+    let signalEmitted = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        emitSignal(task.id, {
+          type: 'comment',
+          summary: content.trim(),
+          details: { comment_id: comment.id, actor: getActor(), source: 'local' },
+        });
+        signalEmitted = true;
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          console.error(`Warning: failed to emit comment signal after 2 attempts: ${err instanceof Error ? err.message : err}`);
+          console.error('The comment was saved, but the daemon may not deliver it automatically.');
+        }
+      }
+    }
+
     console.log(`Added comment to task ${displayId(task)}`);
     console.log(`  Comment ID: ${shortId(comment.id)}`);
     console.log(`  Created: ${comment.created_at}`);

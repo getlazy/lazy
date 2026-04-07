@@ -16,26 +16,26 @@ import type { Storage } from '../../src/storage';
 
 /** Helper: create a mock git function that returns canned responses */
 function mockGit(responses: Record<string, GitResult>) {
-  return (args: string[], _cwd?: string): GitResult => {
+  return async (args: string[], _cwd?: string): Promise<GitResult> => {
     const cmd = args.join(' ');
 
     // Check for exact match first
-    if (responses[cmd]) return responses[cmd];
+    if (responses[cmd]) return Promise.resolve(responses[cmd]);
 
     // Check for prefix match (for commands with variable args)
     for (const [pattern, result] of Object.entries(responses)) {
-      if (cmd.startsWith(pattern)) return result;
+      if (cmd.startsWith(pattern)) return Promise.resolve(result);
     }
 
     // Default: success
-    return { stdout: '', stderr: '', exitCode: 0 };
+    return Promise.resolve({ stdout: '', stderr: '', exitCode: 0 });
   };
 }
 
 describe('fastForwardLocal shouldSkipWorktree', () => {
   // INVARIANT: When a worktree belongs to a working task, the skip callback
   // prevents fastForwardLocal from merging into it.
-  test('skips fast-forward when shouldSkipWorktree returns true (refspec path)', () => {
+  test('skips fast-forward when shouldSkipWorktree returns true (refspec path)', async () => {
     const git = mockGit({
       // HEAD is on a different branch (not the target)
       'rev-parse --abbrev-ref HEAD': { stdout: 'main', stderr: '', exitCode: 0 },
@@ -65,14 +65,14 @@ describe('fastForwardLocal shouldSkipWorktree', () => {
     // Skip callback: this worktree belongs to a working task
     const shouldSkip = (path: string) => path === '/repo/.lazy/worktrees/task-abc';
 
-    const result = fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
+    const result = await fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
 
     expect(result.success).toBe(true);
     expect(result.warning).toContain('active task');
     expect(result.warning).toContain('Skipped fast-forward');
   });
 
-  test('proceeds with fast-forward when shouldSkipWorktree returns false', () => {
+  test('proceeds with fast-forward when shouldSkipWorktree returns false', async () => {
     const git = mockGit({
       'rev-parse --abbrev-ref HEAD': { stdout: 'main', stderr: '', exitCode: 0 },
       'fetch origin feature:feature': {
@@ -99,13 +99,13 @@ describe('fastForwardLocal shouldSkipWorktree', () => {
     // Skip callback: this worktree does NOT belong to a working task
     const shouldSkip = (_path: string) => false;
 
-    const result = fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
+    const result = await fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
 
     expect(result.success).toBe(true);
     expect(result.warning).toBeUndefined();
   });
 
-  test('proceeds normally when no shouldSkipWorktree callback is provided', () => {
+  test('proceeds normally when no shouldSkipWorktree callback is provided', async () => {
     const git = mockGit({
       'rev-parse --abbrev-ref HEAD': { stdout: 'main', stderr: '', exitCode: 0 },
       'fetch origin feature:feature': {
@@ -128,14 +128,14 @@ describe('fastForwardLocal shouldSkipWorktree', () => {
     });
 
     // No callback — should proceed normally
-    const result = fastForwardLocal('feature', 'origin', '/repo', git);
+    const result = await fastForwardLocal('feature', 'origin', '/repo', git);
 
     expect(result.success).toBe(true);
     expect(result.warning).toBeUndefined();
   });
 
   // INVARIANT: The skip check also applies in the branch -f fallback path.
-  test('skips fast-forward when shouldSkipWorktree returns true (branch -f path)', () => {
+  test('skips fast-forward when shouldSkipWorktree returns true (branch -f path)', async () => {
     const git = mockGit({
       'rev-parse --abbrev-ref HEAD': { stdout: 'main', stderr: '', exitCode: 0 },
       // Refspec fetch fails for a non-worktree reason
@@ -171,7 +171,7 @@ describe('fastForwardLocal shouldSkipWorktree', () => {
 
     const shouldSkip = (path: string) => path === '/repo/.lazy/worktrees/task-xyz';
 
-    const result = fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
+    const result = await fastForwardLocal('feature', 'origin', '/repo', git, shouldSkip);
 
     expect(result.success).toBe(true);
     expect(result.warning).toContain('active task');

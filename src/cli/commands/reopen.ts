@@ -150,7 +150,7 @@ export async function commandReopen(args: string[]): Promise<void> {
         }
 
         // Parent worktree exists - use its HEAD
-        startSha = getCurrentSha(parentWorktreePath);
+        startSha = await getCurrentSha(parentWorktreePath);
         // Update branched_from_sha for future reference
         await storage.updateTaskBranchedFromSha(task.id, startSha);
       }
@@ -159,9 +159,9 @@ export async function commandReopen(args: string[]): Promise<void> {
       // branch from parent's HEAD (if child task) or main (otherwise).
       try {
         if (startSha) {
-          createWorktreeFromSha(worktreePath, sess.git_branch, startSha, root);
+          await createWorktreeFromSha(worktreePath, sess.git_branch, startSha, root);
         } else {
-          createWorktree(worktreePath, sess.git_branch, root);
+          await createWorktree(worktreePath, sess.git_branch, root);
         }
       } catch (err) {
         console.error(`Failed to recreate worktree: ${err instanceof Error ? err.message : err}`);
@@ -169,8 +169,8 @@ export async function commandReopen(args: string[]): Promise<void> {
       }
 
       // Copy untracked files configured in worktree.include
-      const config = loadConfig(root);
-      copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
+      const config = await loadConfig(root);
+      await copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
 
       // Reset session: clear ended_at, outcome, and agent_session_id
       await storage.resetSession(sess.id);

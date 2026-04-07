@@ -294,6 +294,47 @@ describe('lazy pair', () => {
 
     expectOutputExcludes(result, 'No API token found');
   });
+
+  // INVARIANT: --resume is only valid in branchless mode.
+  // Task-based pairing resumes sessions automatically via agent_session_id.
+  test('--resume works in branchless mode', async () => {
+    // On main branch (no task context), `lazy pair --resume` should attempt
+    // to launch Claude Code with the --resume flag. It will fail because
+    // the `claude` binary doesn't exist, but should show branchless launch message.
+    const result = await ctx.lazy(['pair', '--resume', 'abc123session']);
+    expectOutputExcludes(result, 'Usage: lazy pair');
+    expectOutput(result, 'Launching Claude Code');
+    expectOutput(result, 'no task context');
+  });
+
+  test('--resume fails when task ID is explicitly provided', async () => {
+    const taskId = await createTask(ctx, 'Explicit task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    const result = await ctx.lazy(['pair', taskId, '--resume', 'abc123session']);
+
+    expectFailure(result);
+    expectError(result, '--resume is only valid in branchless mode');
+    expectError(result, 'Task-based pairing resumes sessions automatically');
+  });
+
+  test('--resume fails when on task branch (detected task)', async () => {
+    const taskId = await createTask(ctx, 'Branch-detected task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    // Switch to the task branch in the main repo
+    const branchName = `lazy/${taskId}`;
+    ctx.git('checkout', branchName);
+
+    // Running `lazy pair --resume` should detect the task and reject the flag
+    const result = await ctx.lazy(['pair', '--resume', 'abc123session']);
+
+    expectFailure(result);
+    expectError(result, '--resume is only valid in branchless mode');
+    expectError(result, 'Task-based pairing resumes sessions automatically');
+  });
 });
 
 describe('pairing state blocks operations', () => {

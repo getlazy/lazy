@@ -29,4 +29,8 @@ src/version.ts
 dist/
 
 .DS_Store
-.lazy/
+.env
+.lazy/tasks/*/*.tmp.*
+.lazy/tasks/*/*.backup.*
+.lazy/.reconcile-lock
+.lazy

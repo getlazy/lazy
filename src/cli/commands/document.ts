@@ -3,7 +3,7 @@ import { join } from 'path';
 import { requireLazyRoot, requireStorage, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { loadConfig } from '../../config/loader';
-import type { ModelName } from '../../types';
+
 
 import documentConstraints from '../../prompts/document-constraints.md' with { type: 'text' };
 
@@ -20,8 +20,8 @@ const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
  * If the directory doesn't exist, creates it.
  * If no config was set, appends a [documents] section to lazy.toml.
  */
-function resolveDocsPath(root: string): string {
-  const config = loadConfig(root);
+async function resolveDocsPath(root: string): Promise<string> {
+  const config = await loadConfig(root);
   const configuredPath = config.documents.path;
 
   let docsPath: string;
@@ -71,7 +71,7 @@ export async function commandDocument(args: string[]): Promise<void> {
 
   let goal: string;
   let prompt: string | null = null;
-  let model: ModelName | null = null;
+  let model: string | null = null;
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
@@ -138,7 +138,7 @@ export async function commandDocument(args: string[]): Promise<void> {
 
   // Resolve docs path before creating the task (this may modify lazy.toml)
   const root = requireLazyRoot();
-  const docsPath = resolveDocsPath(root);
+  const docsPath = await resolveDocsPath(root);
 
   // Build the full prompt: user prompt + document constraints
   const constraints = documentConstraints.replace(/\{\{docsPath\}\}/g, docsPath);
@@ -199,7 +199,7 @@ in markdown with mermaid diagrams. It does NOT modify code files.
 Options:
   --goal <goal>      Documentation goal (what to document)
   --prompt <text>    Additional instructions for the documentation agent
-  --model <model>    Set model for this task (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --code <code>      Human-readable code (e.g. "doc-storage", "doc-architecture")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

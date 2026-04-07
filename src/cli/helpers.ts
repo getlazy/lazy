@@ -6,13 +6,11 @@
 
 import { join } from 'path';
 import { findLazyRoot, getDataDir } from './init';
-import { createStorage, type Storage, type StorageBackend } from '../storage';
-import { loadConfig } from '../config/loader';
+import type { Storage } from '../storage';
 import { repoHasCommits } from '../git/operations';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
-import { VALID_MODEL_NAMES } from '../types';
-import type { ModelName, Task, TokenUsage } from '../types';
+import type { Task, TokenUsage } from '../types';
 import { DaemonClient } from '../daemon/client';
 import { RemoteStorage } from '../storage/remote-storage';
 
@@ -43,13 +41,12 @@ export function requireLazyRoot(): string {
  * Try to create a RemoteStorage that proxies through the daemon.
  * Returns null if the daemon is unavailable or in test/daemon mode.
  */
-async function tryRemoteStorage(root: string): Promise<Storage | null> {
-  // Skip daemon in test mode, when explicitly disabled, or when we ARE the daemon
-  if (process.env.LAZY_NO_DAEMON === '1') return null;
+export async function tryRemoteStorage(root: string): Promise<Storage | null> {
+  // Skip daemon in test mode or when we ARE the daemon
   if (process.env.LAZY_TEST === '1') return null;
   if (process.env.LAZY_IS_DAEMON === '1') return null;
 
-  const client = DaemonClient.create();
+  const client = DaemonClient.create(root);
   if (!client) return null;
 
   try {
@@ -61,30 +58,26 @@ async function tryRemoteStorage(root: string): Promise<Storage | null> {
 
     return new RemoteStorage(client, root, info);
   } catch {
-    // Daemon unavailable — fall back to direct storage
+    // Daemon unavailable
     return null;
   }
 }
 
 /**
  * Create and initialize storage, or exit with an error.
- * When a daemon is running, returns a RemoteStorage proxy that routes
- * all calls through the daemon (eliminating lock contention).
- * Falls back to direct storage when the daemon isn't available.
+ * Routes all calls through the daemon via RemoteStorage — CLI processes
+ * never touch .storage-lock directly. Only the daemon creates FileStorage.
+ *
+ * Exits with an error if the daemon is not running.
  */
 export async function requireStorage(): Promise<Storage> {
   const root = requireLazyRoot();
 
-  // Try daemon first — CLI commands become lock-free
   const remote = await tryRemoteStorage(root);
   if (remote) return remote;
 
-  // Fallback: direct storage (acquires .storage-lock)
-  const config = loadConfig(root);
-  return createStorage(root, {
-    backend: config.storage.backend as StorageBackend,
-    externalPath: config.storage.external_path || undefined,
-  });
+  console.error('Error: Daemon is not running. Start it with: lazy daemon start');
+  process.exit(1);
 }
 
 /**
@@ -519,16 +512,14 @@ export async function resolveTaskOrExit(storage: Storage, input: string): Promis
 
 /**
  * Validate a model name value.
- * Returns the validated model name or exits with an error.
- * Accepts both universal monikers (apprentice/journeyman/master) and
- * legacy Claude-specific aliases (sonnet/opus/haiku).
+ * Accepts any non-empty string — users pass raw model IDs directly.
  */
-export function validateModel(value: string): ModelName {
-  if (!(VALID_MODEL_NAMES as readonly string[]).includes(value)) {
-    console.error(`Invalid model: ${value}. Must be one of: ${VALID_MODEL_NAMES.join(', ')}`);
+export function validateModel(value: string): string {
+  if (!value.trim()) {
+    console.error('Model name cannot be empty');
     process.exit(1);
   }
-  return value as ModelName;
+  return value;
 }
 
 /**

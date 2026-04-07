@@ -44,9 +44,9 @@ shortid_length = 8
 agent_id = "claude-code"
 
 # Watchdog timeout for detecting hung agent processes (milliseconds)
-# 0 = use agent default (claude-code: disabled)
-# Set to positive number to override agent default
-# watchdog_output_timeout_ms = 0
+# Default: 7200000 (2 hours) — kills agent if no output for that duration
+# Set to 0 to disable, or override with a different timeout
+# watchdog_output_timeout_ms = 7200000
 
 [server]
 # Default port for the web dashboard server
@@ -59,8 +59,6 @@ port = 26024
 # Docker mode runs agents in isolated containers. Host-process mode runs agents
 # directly on the host — use **only** in VMs or other already-isolated environments.
 type = "docker"
-# Disable network access inside containers (passes --network none to docker run).
-# docker_agent_no_network = false
 
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
@@ -116,3 +114,8 @@ post_turn = "echo all-good >&2"
 # Timeout in seconds for the post_turn command (default: 300 = 5 minutes).
 # If the command exceeds this, it is killed and recorded as exit code -2.
 post_turn_timeout = 300
+
+[ollama]
+# enabled = true
+# model = "qwen3.5:35b-a3b-coding-nvfp4"
+# endpoint defaults to http://host.docker.internal:11434 if omitted

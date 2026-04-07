@@ -26,7 +26,6 @@ import type {
   SearchResult,
   StoredConversation,
   StatusChange,
-  ModelName,
   Actor,
   FileViolation,
   CommentSource,
@@ -248,6 +247,14 @@ export class PostgresStorage implements Storage {
         END $$
       `;
 
+      // Migration: add auto_triggered column if missing (for existing databases)
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS auto_triggered BOOLEAN DEFAULT FALSE;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+
       // Commits table
       await sql`
         CREATE TABLE IF NOT EXISTS commits (
@@ -422,6 +429,7 @@ export class PostgresStorage implements Storage {
       metadata: null,
       created_at: now,
       completed_at: null,
+      pending_sync: 0,
     };
   }
 
@@ -484,7 +492,7 @@ export class PostgresStorage implements Storage {
       SELECT * FROM tasks
       WHERE 1=1
       ${options.rootsOnly ? this.sql`AND parent_task_id IS NULL` : this.sql``}
-      ${options.blockedOnly ? this.sql`AND status IN ('blocked', 'conflict')` : this.sql``}
+      ${options.blockedOnly ? this.sql`AND status IN ('blocked', 'conflict', 'submitted')` : this.sql``}
       ${options.backlogOnly ? this.sql`AND status = 'backlog'` : this.sql``}
       ${options.workingOnly ? this.sql`AND status = 'working'` : this.sql``}
       ${options.interruptedOnly ? this.sql`AND status = 'interrupted'` : this.sql``}
@@ -540,6 +548,14 @@ export class PostgresStorage implements Storage {
 
   async updateTaskType(taskId: string, type: string): Promise<void> {
     await this.sql`UPDATE tasks SET type = ${type} WHERE id = ${taskId}`;
+  }
+
+  async resetTaskPendingSync(taskId: string): Promise<void> {
+    await this.sql`UPDATE tasks SET pending_sync = 0 WHERE id = ${taskId}`;
+  }
+
+  async incrementTaskPendingSync(taskId: string): Promise<void> {
+    await this.sql`UPDATE tasks SET pending_sync = pending_sync + 1 WHERE id = ${taskId}`;
   }
 
   async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {
@@ -782,7 +798,7 @@ export class PostgresStorage implements Storage {
         id, session_id, sequence, role, content, model, prompt,
         start_sha, end_sha, start_sha_work, end_sha_work,
         merge_conflicts, violations, usage, timestamp,
-        check_exit_code, check_output
+        check_exit_code, check_output, auto_triggered
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${options.content},
@@ -791,7 +807,8 @@ export class PostgresStorage implements Storage {
         ${options.mergeConflicts ? JSON.stringify(options.mergeConflicts) : null},
         ${options.violations ? JSON.stringify(options.violations) : null},
         ${options.usage ? JSON.stringify(options.usage) : null}, ${now},
-        ${options.checkExitCode ?? null}, ${options.checkOutput ?? null}
+        ${options.checkExitCode ?? null}, ${options.checkOutput ?? null},
+        ${options.autoTriggered ?? false}
       )
     `;
 
@@ -813,6 +830,7 @@ export class PostgresStorage implements Storage {
       timestamp: now,
       ...(options.checkExitCode !== undefined ? { check_exit_code: options.checkExitCode } : {}),
       ...(options.checkOutput !== undefined ? { check_output: options.checkOutput } : {}),
+      ...(options.autoTriggered ? { auto_triggered: true } : {}),
     };
   }
 

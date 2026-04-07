@@ -75,16 +75,16 @@ describe('lazy clone', () => {
   test('clone with --model flag', async () => {
     const taskId = await createTask(ctx, 'Task to clone', 'Original prompt');
 
-    const result = await ctx.lazy(['clone', taskId, '--model', 'opus']);
+    const result = await ctx.lazy(['clone', taskId, '--model', 'claude-opus-4-6']);
 
     expectSuccess(result);
     expectOutput(result, 'clone of');
-    expectOutput(result, 'opus');
+    expectOutput(result, 'claude-opus-4-6');
 
     const clonedTaskId = extractNewTaskId(result.stdout);
     const clonedShow = await ctx.lazy(['show', clonedTaskId]);
     expectSuccess(clonedShow);
-    expectOutput(clonedShow, 'opus');
+    expectOutput(clonedShow, 'claude-opus-4-6');
   });
 
   test('clone generates -clone-N code from old task code', async () => {
@@ -200,12 +200,12 @@ describe('lazy clone', () => {
     expectSuccess(createResult);
     const taskId = extractNewTaskId(createResult.stdout);
 
-    const result = await ctx.lazy(['clone', taskId, '--parent', parentId, '--code', 'new-code', '--model', 'opus']);
+    const result = await ctx.lazy(['clone', taskId, '--parent', parentId, '--code', 'new-code', '--model', 'claude-opus-4-6']);
 
     expectSuccess(result);
     expectOutput(result, 'clone of');
     expectOutput(result, 'new-code');
-    expectOutput(result, 'opus');
+    expectOutput(result, 'claude-opus-4-6');
     expectOutput(result, 'Parent:');
 
     const clonedTaskId = extractNewTaskId(result.stdout);
@@ -213,7 +213,7 @@ describe('lazy clone', () => {
     expectSuccess(clonedShow);
     expectOutput(clonedShow, 'Source task');
     expectOutput(clonedShow, 'new-code');
-    expectOutput(clonedShow, 'opus');
+    expectOutput(clonedShow, 'claude-opus-4-6');
     expectOutput(clonedShow, 'Parent Task:');
     expectOutput(clonedShow, parentId);
   });

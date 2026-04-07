@@ -12,7 +12,7 @@ import type { GitLabDriverDeps, GlResult } from '../../src/remote/gitlab-driver'
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'sonnet' as const },
+  models: { default: 'claude-sonnet-4-5-20250929' },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -23,18 +23,28 @@ const mockConfig: ResolvedConfig = {
   remote: {
     driver: 'gitlab',
     git_remote: 'origin',
+    auto_approve: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '', toolchain: '' },
-  runner: { type: 'docker' as const, docker_agent_no_network: false },
+  runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
+  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  daemon: {
+    auto_react_ci: true,
+    auto_react_comments: true,
+    auto_react_max_retries: 3,
+    auto_react_backoff: 'exponential' as const,
+    auto_react_daily_budget: 50,
+    max_auto_turns: 3,
+  },
 };
 
 function makeTask(overrides?: Partial<Task>): Task {
@@ -53,6 +63,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     model: null,
     agent_id: 'claude-code',
     metadata: { gitlab_remote_ref_id: '42', gitlab_remote_ref_url: 'https://gitlab.com/o/r/-/merge_requests/42' },
+    pending_sync: 0,
     ...overrides,
   };
 }
@@ -65,13 +76,13 @@ describe('GitLabDriver', () => {
     test('approves MR and posts comment', async () => {
       const glCalls: string[][] = [];
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           glCalls.push([...args]);
-          if (args[0] === 'mr' && args[1] === 'approve') return ok();
-          if (args[0] === 'mr' && args[1] === 'comment') return ok();
-          return fail('unexpected call');
+          if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(ok());
+          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(ok());
+          return Promise.resolve(fail('unexpected call'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -85,12 +96,12 @@ describe('GitLabDriver', () => {
 
     test('posts comment even when approve fails (self-approval)', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'approve') return fail('You cannot approve your own MR');
-          if (args[0] === 'mr' && args[1] === 'comment') return ok();
-          return fail('unexpected call');
+        runGl: async (args: string[]) => {
+          if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(fail('You cannot approve your own MR'));
+          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(ok());
+          return Promise.resolve(fail('unexpected call'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -102,12 +113,12 @@ describe('GitLabDriver', () => {
 
     test('returns warning when comment fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'approve') return ok();
-          if (args[0] === 'mr' && args[1] === 'comment') return fail('Network error');
-          return fail('unexpected call');
+        runGl: async (args: string[]) => {
+          if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(ok());
+          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(fail('Network error'));
+          return Promise.resolve(fail('unexpected call'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -120,8 +131,8 @@ describe('GitLabDriver', () => {
     test('skips when no MR number', async () => {
       let glCalled = false;
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => { glCalled = true; return fail(); },
-        runGit: () => ok(),
+        runGl: async () => { glCalled = true; return Promise.resolve(fail()); },
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -138,15 +149,15 @@ describe('GitLabDriver', () => {
     test('posts reject comment (GitLab has no request-changes state)', async () => {
       let postedBody = '';
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'mr' && args[1] === 'comment') {
             const msgIdx = args.indexOf('--message');
             postedBody = msgIdx >= 0 ? args[msgIdx + 1] : '';
-            return ok();
+            return Promise.resolve(ok());
           }
-          return fail('unexpected call');
+          return Promise.resolve(fail('unexpected call'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -159,8 +170,8 @@ describe('GitLabDriver', () => {
 
     test('returns warning when comment fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('Network error'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('Network error')),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -173,8 +184,8 @@ describe('GitLabDriver', () => {
     test('skips when no MR number', async () => {
       let glCalled = false;
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => { glCalled = true; return fail(); },
-        runGit: () => ok(),
+        runGl: async () => { glCalled = true; return Promise.resolve(fail()); },
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -189,15 +200,15 @@ describe('GitLabDriver', () => {
     test('posts comment with lazy marker to MR', async () => {
       let postedBody = '';
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'mr' && args[1] === 'comment') {
             const msgIdx = args.indexOf('--message');
             postedBody = msgIdx >= 0 ? args[msgIdx + 1] : '';
-            return ok();
+            return Promise.resolve(ok());
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -211,8 +222,8 @@ describe('GitLabDriver', () => {
     test('skips when no MR number', async () => {
       let glCalled = false;
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => { glCalled = true; return fail(); },
-        runGit: () => ok(),
+        runGl: async () => { glCalled = true; return Promise.resolve(fail()); },
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -223,8 +234,8 @@ describe('GitLabDriver', () => {
 
     test('does not throw when posting fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('Network error'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('Network error')),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -235,8 +246,8 @@ describe('GitLabDriver', () => {
   describe('getPRState', () => {
     test('returns null when no MR number in metadata', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: () => fail('should not be called'),
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async () => Promise.resolve(fail('should not be called')),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.getPRState(makeTask({ metadata: null }));
@@ -247,13 +258,13 @@ describe('GitLabDriver', () => {
     // to the canonical PRState type (OPEN, CLOSED, MERGED).
     test('returns OPEN for opened MR', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'mr' && args[1] === 'view') {
-            return ok(JSON.stringify({ state: 'opened' }));
+            return Promise.resolve(ok(JSON.stringify({ state: 'opened' })));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.getPRState(makeTask());
@@ -262,13 +273,13 @@ describe('GitLabDriver', () => {
 
     test('returns MERGED for merged MR', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'mr' && args[1] === 'view') {
-            return ok(JSON.stringify({ state: 'merged' }));
+            return Promise.resolve(ok(JSON.stringify({ state: 'merged' })));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.getPRState(makeTask());
@@ -277,13 +288,13 @@ describe('GitLabDriver', () => {
 
     test('returns CLOSED for closed MR', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'mr' && args[1] === 'view') {
-            return ok(JSON.stringify({ state: 'closed' }));
+            return Promise.resolve(ok(JSON.stringify({ state: 'closed' })));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.getPRState(makeTask());
@@ -292,8 +303,8 @@ describe('GitLabDriver', () => {
 
     test('returns null when glab fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('network error'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('network error')),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.getPRState(makeTask());
@@ -303,19 +314,19 @@ describe('GitLabDriver', () => {
 
   describe('syncComments', () => {
     /** glab handler that reports project as private and delegates API calls */
-    function privateRepoGl(apiHandler: (args: string[]) => GlResult): (args: string[]) => GlResult {
-      return (args: string[]) => {
+    function privateRepoGl(apiHandler: (args: string[]) => GlResult): (args: string[]) => Promise<GlResult> {
+      return async (args: string[]) => {
         if (args[0] === 'api' && args[1] === 'projects/:id' && args.length === 2) {
-          return ok(JSON.stringify({ visibility: 'private' }));
+          return Promise.resolve(ok(JSON.stringify({ visibility: 'private' })));
         }
-        return apiHandler(args);
+        return Promise.resolve(apiHandler(args));
       };
     }
 
     test('returns empty array when no MR number in metadata', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: () => fail('should not be called'),
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async () => Promise.resolve(fail('should not be called')),
       };
       const driver = new GitLabDriver(mockConfig, mockDeps);
       const result = await driver.syncComments(makeTask({ metadata: null }), '2024-01-01T00:00:00Z');
@@ -335,7 +346,7 @@ describe('GitLabDriver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -360,7 +371,7 @@ describe('GitLabDriver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -383,7 +394,7 @@ describe('GitLabDriver', () => {
           }
           return fail('unexpected');
         }),
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -396,14 +407,14 @@ describe('GitLabDriver', () => {
     test('skips comments for public repos by default', async () => {
       let apiCalled = false;
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args) => {
+        runGl: async (args) => {
           if (args[0] === 'api' && args[1] === 'projects/:id' && args.length === 2) {
-            return ok(JSON.stringify({ visibility: 'public' }));
+            return Promise.resolve(ok(JSON.stringify({ visibility: 'public' })));
           }
           apiCalled = true;
-          return fail('should not reach API');
+          return Promise.resolve(fail('should not reach API'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -427,16 +438,16 @@ describe('GitLabDriver', () => {
       ];
 
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args) => {
+        runGl: async (args) => {
           if (args[0] === 'api' && args[1] === 'projects/:id' && args.length === 2) {
-            return ok(JSON.stringify({ visibility: 'public' }));
+            return Promise.resolve(ok(JSON.stringify({ visibility: 'public' })));
           }
           if (args[0] === 'api' && args[1].includes('notes')) {
-            return ok(JSON.stringify(notes));
+            return Promise.resolve(ok(JSON.stringify(notes)));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(publicOkConfig, mockDeps);
@@ -450,15 +461,15 @@ describe('GitLabDriver', () => {
   describe('checkHealth', () => {
     function healthyDeps(projectViewResult: GlResult): GitLabDriverDeps {
       return {
-        runGl: (args) => {
-          if (args[0] === '--version') return ok('glab version 1.0.0');
-          if (args[0] === 'auth' && args[1] === 'status') return ok('Token scopes: api');
-          if (args[0] === 'api' && args[1] === 'projects/:id') return projectViewResult;
-          return fail('unexpected glab call');
+        runGl: async (args) => {
+          if (args[0] === '--version') return Promise.resolve(ok('glab version 1.0.0'));
+          if (args[0] === 'auth' && args[1] === 'status') return Promise.resolve(ok('Token scopes: api'));
+          if (args[0] === 'api' && args[1] === 'projects/:id') return Promise.resolve(projectViewResult);
+          return Promise.resolve(fail('unexpected glab call'));
         },
-        runGit: (args) => {
-          if (args[0] === 'remote' && args[1] === 'get-url') return ok('git@gitlab.com:owner/repo.git');
-          return fail('unexpected git call');
+        runGit: async (args) => {
+          if (args[0] === 'remote' && args[1] === 'get-url') return Promise.resolve(ok('git@gitlab.com:owner/repo.git'));
+          return Promise.resolve(fail('unexpected git call'));
         },
       };
     }
@@ -499,8 +510,8 @@ describe('GitLabDriver', () => {
 
     test('fails when glab is not installed', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('glab: command not found'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('glab: command not found')),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, deps);
       const checks = await driver.checkHealth();
@@ -511,12 +522,12 @@ describe('GitLabDriver', () => {
 
     test('fails when not authenticated', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: (args) => {
-          if (args[0] === '--version') return ok('glab version 1.0.0');
-          if (args[0] === 'auth') return fail('not authenticated');
-          return fail('unexpected');
+        runGl: async (args) => {
+          if (args[0] === '--version') return Promise.resolve(ok('glab version 1.0.0'));
+          if (args[0] === 'auth') return Promise.resolve(fail('not authenticated'));
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
       const driver = new GitLabDriver(mockConfig, deps);
       const checks = await driver.checkHealth();
@@ -529,15 +540,15 @@ describe('GitLabDriver', () => {
 
     test('warns when remote does not point to GitLab', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: (args) => {
-          if (args[0] === '--version') return ok('glab version 1.0.0');
-          if (args[0] === 'auth' && args[1] === 'status') return ok('Token scopes: api');
-          if (args[0] === 'api') return ok(JSON.stringify({ visibility: 'private' }));
-          return fail('unexpected');
+        runGl: async (args) => {
+          if (args[0] === '--version') return Promise.resolve(ok('glab version 1.0.0'));
+          if (args[0] === 'auth' && args[1] === 'status') return Promise.resolve(ok('Token scopes: api'));
+          if (args[0] === 'api') return Promise.resolve(ok(JSON.stringify({ visibility: 'private' })));
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: (args) => {
-          if (args[0] === 'remote' && args[1] === 'get-url') return ok('git@github.com:owner/repo.git');
-          return fail('unexpected');
+        runGit: async (args) => {
+          if (args[0] === 'remote' && args[1] === 'get-url') return Promise.resolve(ok('git@github.com:owner/repo.git'));
+          return Promise.resolve(fail('unexpected'));
         },
       };
       const driver = new GitLabDriver(mockConfig, deps);
@@ -555,15 +566,15 @@ describe('GitLabDriver', () => {
     // when all checks complete or on timeout.
     test('returns passed when pipeline succeeds', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'api' && args[1].includes('pipelines')) {
-            return ok(JSON.stringify([
+            return Promise.resolve(ok(JSON.stringify([
               { id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' },
-            ]));
+            ])));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -574,15 +585,15 @@ describe('GitLabDriver', () => {
 
     test('returns failed when pipeline fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'api' && args[1].includes('pipelines')) {
-            return ok(JSON.stringify([
+            return Promise.resolve(ok(JSON.stringify([
               { id: 1, status: 'failed', web_url: 'https://gitlab.com/pipeline/1' },
-            ]));
+            ])));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -597,13 +608,13 @@ describe('GitLabDriver', () => {
 
     test('returns passed when no pipelines exist', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'api' && args[1].includes('pipelines')) {
-            return ok('[]');
+            return Promise.resolve(ok('[]'));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -614,8 +625,8 @@ describe('GitLabDriver', () => {
 
     test('returns passed when no MR number', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -626,15 +637,15 @@ describe('GitLabDriver', () => {
 
     test('times out when pipeline stays running', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           if (args[0] === 'api' && args[1].includes('pipelines')) {
-            return ok(JSON.stringify([
+            return Promise.resolve(ok(JSON.stringify([
               { id: 1, status: 'running', web_url: 'https://gitlab.com/pipeline/1' },
-            ]));
+            ])));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -650,10 +661,10 @@ describe('GitLabDriver', () => {
   describe('merge (mocked)', () => {
     function makeDeps(glHandler: (args: string[], cwd?: string) => GlResult): GitLabDriverDeps {
       return {
-        runGl: glHandler,
-        runGit: (args: string[]) => {
-          if (args[0] === 'push') return ok();
-          return fail('unexpected git call');
+        runGl: async (args: string[], cwd?: string) => Promise.resolve(glHandler(args, cwd)),
+        runGit: async (args: string[]) => {
+          if (args[0] === 'push') return Promise.resolve(ok());
+          return Promise.resolve(fail('unexpected git call'));
         },
       };
     }
@@ -734,10 +745,10 @@ describe('GitLabDriver', () => {
 
     test('fails with push error', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('unexpected'),
-        runGit: (args: string[]) => {
-          if (args[0] === 'push') return fail('no remote');
-          return fail('unexpected');
+        runGl: async () => Promise.resolve(fail('unexpected')),
+        runGit: async (args: string[]) => {
+          if (args[0] === 'push') return Promise.resolve(fail('no remote'));
+          return Promise.resolve(fail('unexpected'));
         },
       };
 
@@ -983,15 +994,15 @@ describe('GitLabDriver', () => {
       const glCalls: string[][] = [];
 
       const deps: GitLabDriverDeps = {
-        runGl: (args) => {
+        runGl: async (args) => {
           glCalls.push([...args]);
-          return fail('should not be called');
+          return Promise.resolve(fail('should not be called'));
         },
-        runGit: (args: string[]) => {
+        runGit: async (args: string[]) => {
           // isBranchMerged check: merge-base --is-ancestor returns success
-          if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return ok();
-          if (args[0] === 'push') return ok();
-          return fail('unexpected git call');
+          if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return Promise.resolve(ok());
+          if (args[0] === 'push') return Promise.resolve(ok());
+          return Promise.resolve(fail('unexpected git call'));
         },
       };
 
@@ -1120,17 +1131,17 @@ describe('GitLabDriver', () => {
     test('closes open MR', async () => {
       const glCalls: string[][] = [];
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
+        runGl: async (args: string[]) => {
           glCalls.push([...args]);
           if (args[0] === 'mr' && args[1] === 'view') {
-            return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
+            return Promise.resolve(ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' })));
           }
           if (args[0] === 'mr' && args[1] === 'close') {
-            return ok();
+            return Promise.resolve(ok());
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -1143,12 +1154,12 @@ describe('GitLabDriver', () => {
     test('skips when no MR exists', async () => {
       let closeCalled = false;
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'view') return fail('not found');
-          if (args[0] === 'mr' && args[1] === 'close') { closeCalled = true; return ok(); }
-          return fail('unexpected');
+        runGl: async (args: string[]) => {
+          if (args[0] === 'mr' && args[1] === 'view') return Promise.resolve(fail('not found'));
+          if (args[0] === 'mr' && args[1] === 'close') { closeCalled = true; return Promise.resolve(ok()); }
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -1249,23 +1260,23 @@ describe('GitLabDriver', () => {
   describe('importUrl', () => {
     test('imports MR with title, branch, and metadata', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: (args) => {
+        runGl: async (args) => {
           if (args[0] === 'mr' && args[1] === 'view') {
-            return ok(JSON.stringify({
+            return Promise.resolve(ok(JSON.stringify({
               title: 'Fix authentication bug',
               source_branch: 'fix/auth-bug',
               state: 'opened',
               web_url: 'https://gitlab.com/org/repo/-/merge_requests/42',
               iid: 42,
               description: 'This fixes the auth bug',
-            }));
+            })));
           }
           if (args[0] === 'api' && args[1].includes('notes')) {
-            return ok(JSON.stringify([]));
+            return Promise.resolve(ok(JSON.stringify([])));
           }
-          return fail('unexpected');
+          return Promise.resolve(fail('unexpected'));
         },
-        runGit: () => ok(),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -1286,8 +1297,8 @@ describe('GitLabDriver', () => {
 
     test('throws when glab mr view fails', async () => {
       const mockDeps: GitLabDriverDeps = {
-        runGl: () => fail('not found'),
-        runGit: () => ok(),
+        runGl: async () => Promise.resolve(fail('not found')),
+        runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
@@ -1338,8 +1349,8 @@ describe('GitLabDriver', () => {
     test('returns false when remote branch has no new commits', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('0');
@@ -1355,8 +1366,8 @@ describe('GitLabDriver', () => {
 
     test('returns true when remote has new commits', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'rev-list') return ok('3');
           return fail('unexpected');
@@ -1371,8 +1382,8 @@ describe('GitLabDriver', () => {
 
     test('throws when fetch fails', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return fail('Could not resolve host');
           return fail('unexpected');
         },
@@ -1387,8 +1398,8 @@ describe('GitLabDriver', () => {
   describe('resolveUpstreamRef (mocked)', () => {
     test('fetches and returns origin/<branch> on success', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return ok();
           return fail('unexpected');
         },
@@ -1404,8 +1415,8 @@ describe('GitLabDriver', () => {
     // can warn loudly. Silent fallback to local ref causes stale merges.
     test('throws on fetch failure instead of silently falling back', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           if (args[0] === 'fetch') return fail('Could not resolve host');
           return fail('unexpected');
         },
@@ -1423,8 +1434,8 @@ describe('GitLabDriver', () => {
     test('uses fetch + merge --ff-only when target branch is checked out', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch' && args[1] === 'origin' && args[2] === 'main') return ok();
@@ -1443,8 +1454,8 @@ describe('GitLabDriver', () => {
     test('uses refspec fetch when target branch is NOT checked out', async () => {
       const gitCalls: string[][] = [];
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           gitCalls.push([...args]);
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('lazy/abc12345');
           if (args[0] === 'fetch' && args[1] === 'origin' && args[2] === 'main:main') return ok();
@@ -1461,8 +1472,8 @@ describe('GitLabDriver', () => {
 
     test('returns warning when branch has diverged', async () => {
       const deps: GitLabDriverDeps = {
-        runGl: () => fail('should not be called'),
-        runGit: (args) => {
+        runGl: async () => Promise.resolve(fail('should not be called')),
+        runGit: async (args) => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('main');
           if (args[0] === 'fetch') return ok();
           if (args[0] === 'merge' && args[1] === '--ff-only') return fail('Not possible to fast-forward');

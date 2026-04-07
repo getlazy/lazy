@@ -40,9 +40,9 @@ Rules:
 
 These are load-bearing design decisions. Do NOT change, "optimize away," or weaken them without explicit human approval. Each exists for a reason learned the hard way.
 
-### Every unblock merges upstream
+### Upstream merge is sync's job, not unblock's
 
-When a task is unblocked (feedback given), the system MUST merge the parent/upstream branch into the task worktree before the agent resumes work. This prevents branch drift — without it, task branches fall behind main, merge conflicts accumulate silently, and the final accept becomes a mess. The `--sync-with-upstream` flag is additive (it injects merge conflict context into the agent's prompt), NOT the only way to trigger upstream merge. A previous "optimization" removed auto-merge from normal unblock and caused a major regression (commit 5f87c13).
+Upstream merge is a separate operation — triggered by `lazy sync <task>`, daemon signals, or the builder. Unblock only delivers feedback to the agent with zero network dependencies. To merge upstream changes into a task branch before giving feedback, run `lazy sync <task>` first.
 
 ### Storage is abstracted — never bypass it
 
@@ -53,9 +53,9 @@ All persistent state (tasks, sessions, turns, commits, comments, conversations) 
 When you write a test, you're asserting "this behavior is correct and should not change." Every test that encodes a design decision MUST have a comment explaining WHY:
 
 ```typescript
-// INVARIANT: Every unblock merges upstream before giving feedback.
-// Agents must always work against current main to prevent drift.
-test('unblock triggers upstream merge when parent has changes', ...);
+// INVARIANT: Upstream merge is sync's job, not unblock's.
+// Unblock only delivers feedback — sync handles merging upstream.
+test('unblock does NOT trigger upstream merge', ...);
 ```
 
 Do NOT add tests that assert the absence of correct behavior. Do NOT modify or delete existing invariant tests without human approval. If a test seems wrong, ask — don't "fix" it by making it match your new code.

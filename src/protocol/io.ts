@@ -16,8 +16,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
-import { homedir } from 'os';
 import { randomUUID } from 'crypto';
+import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
 import type { ResolvedConfig } from '../config/types';
 
@@ -52,7 +52,7 @@ export function commonCommandFields(config: ResolvedConfig): {
  * Defaults to ~/.lazy/protocol. Override with LAZY_PROTOCOL_BASE for testing.
  */
 function protocolBase(): string {
-  return process.env.LAZY_PROTOCOL_BASE || join(homedir(), '.lazy', 'protocol');
+  return process.env.LAZY_PROTOCOL_BASE || join(getHome(), '.lazy', 'protocol');
 }
 
 /**

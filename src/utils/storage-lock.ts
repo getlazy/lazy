@@ -13,7 +13,7 @@
  * so nested storage calls don't deadlock.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, constants } from 'fs';
 import { join, dirname } from 'path';
 import { getDataDir } from '../cli/init';
 
@@ -132,6 +132,9 @@ export class StorageLock {
   /**
    * Try to acquire the file-system lock once.
    * Returns true if acquired, false if held by another live process.
+   *
+   * Uses O_EXCL for atomic create-or-fail to prevent TOCTOU races where
+   * two processes both see "no lock file" and both write their own.
    */
   private tryAcquire(): boolean {
     // Precondition: lock directory must exist
@@ -142,31 +145,66 @@ export class StorageLock {
       );
     }
 
+    const lockData: StorageLockFile = {
+      pid: process.pid,
+      acquired_at: new Date().toISOString(),
+    };
+    const lockContent = JSON.stringify(lockData, null, 2) + '\n';
+
+    // Fast path: try atomic create with O_EXCL — fails if file already exists.
+    // This eliminates the TOCTOU race in the old check-then-write approach.
     try {
-      if (existsSync(this.lockPath)) {
-        const content = readFileSync(this.lockPath, 'utf-8');
-        const lock: StorageLockFile = JSON.parse(content);
+      const fd = openSync(this.lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+      try {
+        writeFileSync(fd, lockContent, 'utf-8');
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch (err: unknown) {
+      // EEXIST means the lock file already exists — check if it's stale
+      if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        return false; // Unexpected error — treat as failed acquisition
+      }
+    }
 
-        // If the current process already holds the file lock, allow it
-        if (lock.pid === process.pid) {
-          return true;
-        }
+    // Lock file exists — check if we own it or if it's stale
+    try {
+      const content = readFileSync(this.lockPath, 'utf-8');
+      const lock: StorageLockFile = JSON.parse(content);
 
-        // Check if the owning process is still alive
-        if (isProcessRunning(lock.pid)) {
-          return false; // Lock held by a live process
-        }
-
-        // Stale lock — process is dead, take over (fall through to write)
+      // If the current process already holds the file lock, allow it
+      if (lock.pid === process.pid) {
+        return true;
       }
 
-      // Write our lock
-      const lockData: StorageLockFile = {
-        pid: process.pid,
-        acquired_at: new Date().toISOString(),
-      };
-      writeFileSync(this.lockPath, JSON.stringify(lockData, null, 2) + '\n', 'utf-8');
-      return true;
+      // Check if the owning process is still alive
+      if (isProcessRunning(lock.pid)) {
+        return false; // Lock held by a live process
+      }
+
+      // Stale lock — process is dead. Remove and retry atomically.
+      // Another process might also be trying to claim this stale lock,
+      // so we remove-then-create with O_EXCL to race safely.
+      try {
+        unlinkSync(this.lockPath);
+      } catch {
+        // Someone else already removed it — that's fine, we'll retry next attempt
+        return false;
+      }
+
+      // Try atomic create again after removing stale lock
+      try {
+        const fd = openSync(this.lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+        try {
+          writeFileSync(fd, lockContent, 'utf-8');
+        } finally {
+          closeSync(fd);
+        }
+        return true;
+      } catch {
+        return false; // Another process got it first — retry on next attempt
+      }
     } catch {
       return false;
     }

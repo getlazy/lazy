@@ -8,7 +8,7 @@
 
 import { existsSync, readdirSync, readFileSync, statfsSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { getHome } from '../../utils/home';
 import { findLazyRoot, getDataDir } from '../init';
 import { getProjectName } from '../../storage';
 import { TERMINAL_STATUSES } from '../../types';
@@ -47,9 +47,9 @@ const MIN_FREE_BYTES = 1_000_000_000;
 
 // ── individual checks ────────────────────────────────────────────────────
 
-function checkGit(): CheckResult {
+async function checkGit(): Promise<CheckResult> {
   try {
-    const result = runGit(['--version'], {
+    const result = await runGit(['--version'], {
       stderr: 'ignore',
       timeout: 5_000,
     });
@@ -61,8 +61,8 @@ function checkGit(): CheckResult {
   return { ok: false, label: 'Git installed', detail: 'Git is not installed. Install it: https://git-scm.com/downloads' };
 }
 
-function checkGitHasCommits(): CheckResult {
-  if (repoHasCommits()) {
+async function checkGitHasCommits(): Promise<CheckResult> {
+  if (await repoHasCommits()) {
     return { ok: true, label: 'Repository has commits' };
   }
   return {
@@ -163,7 +163,7 @@ async function checkPostgresConnectivity(config: ResolvedConfig): Promise<CheckR
   }
 }
 
-function checkDataDir(root: string): CheckResult {
+async function checkDataDir(root: string): Promise<CheckResult> {
   const dataDir = getDataDir(root);
   const dataPath = join(root, dataDir);
 
@@ -172,7 +172,7 @@ function checkDataDir(root: string): CheckResult {
   }
 
   // Resolve the actual tasks directory based on storage backend config
-  const config = loadConfig(root);
+  const config = await loadConfig(root);
   let tasksDir: string;
   let displayPath: string;
 
@@ -183,8 +183,8 @@ function checkDataDir(root: string): CheckResult {
     case 'external': {
       let externalPath = config.storage.external_path;
       if (!externalPath || externalPath === '') {
-        const projectName = getProjectName(root, config.remote.git_remote);
-        externalPath = join(homedir(), '.lazy', projectName);
+        const projectName = await getProjectName(root, config.remote.git_remote);
+        externalPath = join(getHome(), '.lazy', projectName);
       }
       tasksDir = join(externalPath, 'tasks');
       displayPath = externalPath;
@@ -218,13 +218,13 @@ function checkContainerImage(imageName: string, binary: string = 'docker'): Chec
   };
 }
 
-function checkImageUpToDate(root: string, imageName: string, binary: string = 'docker'): CheckResult {
+async function checkImageUpToDate(root: string, imageName: string, binary: string = 'docker'): Promise<CheckResult> {
   // Use the same Dockerfile hash logic as the build code in capture/claude.ts.
   // This hashes the custom Dockerfile if configured, or the embedded default
   // Dockerfile — never the project's own Dockerfile at the repo root.
   let currentHash: string;
   try {
-    currentHash = calculateDockerfileHash(root);
+    currentHash = await calculateDockerfileHash(root);
   } catch (err) {
     // calculateDockerfileHash throws if a custom Dockerfile is configured but missing
     return {
@@ -394,7 +394,7 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
       // For interrupted tasks: report if run still exists (not yet cleaned up)
       // For working/blocked tasks: run died but reconciler hasn't caught it yet
-      if (task.status === 'interrupted' || task.status === 'working' || task.status === 'blocked' || task.status === 'conflict' || task.status === 'merging') {
+      if (task.status === 'interrupted' || task.status === 'working' || task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted' || task.status === 'merging') {
         crashed.push({
           taskCode: displayId(task),
           taskId: task.id,
@@ -511,8 +511,8 @@ async function checkOrphanedContainers(root: string | null, binary: string = 'do
   return { ok: true, label: 'No orphaned containers' };
 }
 
-function checkShellDetected(): { result: CheckResult; shell: ShellInfo } {
-  const shell = detectShell();
+async function checkShellDetected(): Promise<{ result: CheckResult; shell: ShellInfo }> {
+  const shell = await detectShell();
 
   if (shell.name === 'unknown') {
     return {
@@ -672,8 +672,8 @@ async function checkRemoteDriver(config: ResolvedConfig): Promise<{ driver: Repo
   return { driver, driverResults };
 }
 
-function checkSplitStorage(root: string): CheckResult {
-  const config = loadConfig(root);
+async function checkSplitStorage(root: string): Promise<CheckResult> {
+  const config = await loadConfig(root);
 
   // External storage: check if .lazy/tasks/ also has stale task data
   const dataDir = getDataDir(root);
@@ -699,6 +699,55 @@ function checkSplitStorage(root: string): CheckResult {
     };
   } catch {
     return { ok: true, label: 'No split storage' };
+  }
+}
+
+async function checkTaskBranchUpstreamTracking(): Promise<CheckResult> {
+  try {
+    // Get list of all local branches
+    const result = await runGit(['branch', '--format=%(refname:short)'], {
+      stderr: 'ignore',
+      timeout: 5_000,
+    });
+
+    if (result.exitCode !== 0) {
+      return { ok: true, label: 'No task branches with upstream tracking' };
+    }
+
+    const branches = result.stdout.split('\n').filter((b: string) => b.trim() && b.startsWith('lazy/'));
+    if (branches.length === 0) {
+      return { ok: true, label: 'No task branches with upstream tracking' };
+    }
+
+    const tracked: string[] = [];
+    for (const branch of branches) {
+      const remoteResult = await runGit(['config', `branch.${branch}.remote`], {
+        stderr: 'ignore',
+        timeout: 1_000,
+      });
+      if (remoteResult.exitCode === 0 && remoteResult.stdout.trim()) {
+        tracked.push(branch);
+      }
+    }
+
+    if (tracked.length === 0) {
+      return { ok: true, label: 'No task branches with upstream tracking' };
+    }
+
+    // Build unset commands
+    const unsetCommands = tracked.map(branch =>
+      `git config --unset branch.${branch}.remote; git config --unset branch.${branch}.merge || true`
+    ).join(' && ');
+
+    return {
+      ok: true,
+      label: 'No task branches with upstream tracking',
+      warning: `${tracked.length} task branch(es) have upstream tracking: ${tracked.join(', ')}. ` +
+               `This can cause 'git pull' to merge task branches into main. ` +
+               `Clean up with: ${theme.command(unsetCommands)}`,
+    };
+  } catch {
+    return { ok: true, label: 'No task branches with upstream tracking' };
   }
 }
 
@@ -735,17 +784,17 @@ export async function commandDoctor(args: string[]): Promise<void> {
   const results: CheckResult[] = [];
 
   // Always run these regardless of lazy root
-  results.push(checkGit());
-  results.push(checkGitHasCommits());
+  results.push(await checkGit());
+  results.push(await checkGitHasCommits());
 
   // Checks that require a lazy root
   const root = findLazyRoot();
   let crashedTasks: CrashedTask[] = [];
 
   // Determine runner type for conditional checks
-  const config = root ? loadConfig(root) : null;
+  const config = root ? await loadConfig(root) : null;
   const runnerType = config?.runner?.type ?? 'docker';
-  const runner = root ? createRunner(root) : null;
+  const runner = root ? await createRunner(root) : null;
 
   const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
 
@@ -770,7 +819,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
   results.push(checkAuth());
 
   // Shell and completion checks
-  const { result: shellResult, shell } = checkShellDetected();
+  const { result: shellResult, shell } = await checkShellDetected();
   results.push(shellResult);
   results.push(checkCompletionsInstalled(shell));
 
@@ -780,14 +829,14 @@ export async function commandDoctor(args: string[]): Promise<void> {
     : false;
 
   if (root) {
-    results.push(checkDataDir(root));
+    results.push(await checkDataDir(root));
     results.push(await checkPostgresConnectivity(config!));
 
     // Container-dependent checks (Docker or Podman) — only if runtime is healthy
     if (isContainerRunner && runnerDiagnosticsOk) {
-      const imageName = resolveImageName(root);
+      const imageName = await resolveImageName(root);
       results.push(checkContainerImage(imageName, runnerType));
-      results.push(checkImageUpToDate(root, imageName, runnerType));
+      results.push(await checkImageUpToDate(root, imageName, runnerType));
       if (runnerType === 'docker') {
         results.push(await checkOrphanedContainers(root));
       } else {
@@ -820,11 +869,12 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
     results.push(checkStaleLocks(root));
     results.push(checkStorageLock(root));
-    results.push(checkSplitStorage(root));
+    results.push(await checkSplitStorage(root));
+    results.push(await checkTaskBranchUpstreamTracking());
     results.push(checkDiskSpace(root));
 
     // Remote driver checks and config validation
-    const rawConfig = loadRawConfig(root);
+    const rawConfig = await loadRawConfig(root);
     const { driver, driverResults } = await checkRemoteDriver(config!);
     results.push(...driverResults);
 
@@ -928,6 +978,7 @@ Checks performed:
   - No stale locks or orphaned containers
   - No split storage (when external storage is configured)
   - Crashed task containers (auto-resumes interrupted tasks by default)
+  - No task branches with upstream tracking (prevents git pull pollution)
   - Adequate disk space
   - Unknown or deprecated config options in lazy.toml
   - Remote driver health checks

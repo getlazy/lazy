@@ -4,7 +4,7 @@ import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, valida
 import { getCurrentSha } from '../../git/operations';
 import { openEditor, promptLine, promptYesNo, removeRecoveryFile, requireTTY } from '../editor';
 import { commandStart } from './start';
-import type { ModelName } from '../../types';
+
 
 import { getDataDir } from '../init';
 
@@ -28,7 +28,7 @@ export async function commandBranch(args: string[]): Promise<void> {
   const storage = await requireStorage();
 
   let childTaskId: string;
-  let childModel: ModelName | null = null;
+  let childModel: string | null = null;
   let childCode: string | undefined;
 
   // Validate --code flag
@@ -60,7 +60,7 @@ export async function commandBranch(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const branchFromSha = getCurrentSha(parentWorktreePath);
+    const branchFromSha = await getCurrentSha(parentWorktreePath);
 
     // Parse options
     const goalValue = parsed.flags.get('goal') as string | undefined;
@@ -174,7 +174,7 @@ Arguments:
 Options:
   --goal <goal>      Goal for the variant (default: parent goal + "(variant)")
   --prompt <text>    Prompt for the variant (default: inherit parent's prompt)
-  --model <model>    Override model for the variant (apprentice, journeyman, master, sonnet, opus, haiku)
+  --model <model>    Override model for the variant (raw model ID, e.g. claude-sonnet-4-5-20250929)
   --code <code>      Set a human-readable code for the variant task
   --yes              Skip confirmation prompt when starting the variant task
 

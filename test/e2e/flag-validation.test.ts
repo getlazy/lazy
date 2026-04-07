@@ -21,18 +21,17 @@ describe('flag validation', () => {
     expectError(result, 'lazy create --help');
   });
 
-  test('edit validates model values', async () => {
+  test('edit accepts any model string', async () => {
     // Create a task first
     const createResult = await ctx.lazy(['create', '--goal', 'Test task']);
     expectSuccess(createResult);
     const taskId = createResult.stdout.match(/Created task (\w+)/)?.[1];
 
-    // Try to edit with invalid model value
-    const result = await ctx.lazy(['edit', taskId!, '--model', 'invalid-model']);
+    // Any non-empty model string is now accepted (raw model IDs)
+    const result = await ctx.lazy(['edit', taskId!, '--model', 'any-model-id']);
 
-    expectFailure(result);
-    expectError(result, 'Invalid model: invalid-model');
-    expectError(result, 'Must be one of: apprentice, journeyman, master, sonnet, opus, haiku');
+    expectSuccess(result);
+    expectOutput(result, 'Updated model: any-model-id');
   });
 
   test('start rejects unknown flag', async () => {
@@ -158,41 +157,19 @@ describe('flag validation', () => {
     expectError(result, 'lazy import-conversation --help');
   });
 
-  test('create validates model values', async () => {
-    const result = await ctx.lazy(['create', '--goal', 'Test', '--model', 'invalid-model']);
-
-    expectFailure(result);
-    expectError(result, 'Invalid model: invalid-model');
-    expectError(result, 'Must be one of: apprentice, journeyman, master, sonnet, opus, haiku');
-  });
-
-  test('create accepts valid model values', async () => {
-    const sonnetResult = await ctx.lazy(['create', '--goal', 'Test sonnet', '--model', 'sonnet']);
+  // INVARIANT: Model names are raw model IDs — any non-empty string is accepted.
+  // No alias resolution or validation against a fixed list.
+  test('create accepts raw model IDs', async () => {
+    const sonnetResult = await ctx.lazy(['create', '--goal', 'Test sonnet', '--model', 'claude-sonnet-4-5-20250929']);
     expectSuccess(sonnetResult);
-    expectOutput(sonnetResult, 'sonnet');
+    expectOutput(sonnetResult, 'claude-sonnet-4-5-20250929');
 
-    const opusResult = await ctx.lazy(['create', '--goal', 'Test opus', '--model', 'opus']);
+    const opusResult = await ctx.lazy(['create', '--goal', 'Test opus', '--model', 'claude-opus-4-6']);
     expectSuccess(opusResult);
-    expectOutput(opusResult, 'opus');
+    expectOutput(opusResult, 'claude-opus-4-6');
 
-    const haikuResult = await ctx.lazy(['create', '--goal', 'Test haiku', '--model', 'haiku']);
-    expectSuccess(haikuResult);
-    expectOutput(haikuResult, 'haiku');
-  });
-
-  // INVARIANT: Universal monikers must be accepted as valid model names.
-  // These are agent-agnostic aliases that map to capability tiers.
-  test('create accepts universal moniker model values', async () => {
-    const apprenticeResult = await ctx.lazy(['create', '--goal', 'Test apprentice', '--model', 'apprentice']);
-    expectSuccess(apprenticeResult);
-    expectOutput(apprenticeResult, 'apprentice');
-
-    const journeymanResult = await ctx.lazy(['create', '--goal', 'Test journeyman', '--model', 'journeyman']);
-    expectSuccess(journeymanResult);
-    expectOutput(journeymanResult, 'journeyman');
-
-    const masterResult = await ctx.lazy(['create', '--goal', 'Test master', '--model', 'master']);
-    expectSuccess(masterResult);
-    expectOutput(masterResult, 'master');
+    const ollamaResult = await ctx.lazy(['create', '--goal', 'Test ollama', '--model', 'qwen3.5:35b-a3b-coding-nvfp4']);
+    expectSuccess(ollamaResult);
+    expectOutput(ollamaResult, 'qwen3.5:35b-a3b-coding-nvfp4');
   });
 });

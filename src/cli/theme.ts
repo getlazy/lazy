@@ -65,6 +65,7 @@ const STATUS_COLORS: Record<string, (s: string) => string> = {
   working: blue,
   blocked: yellow,
   conflict: red,
+  submitted: cyan,
   pairing: magenta,
   merging: cyan,
   complete: green,

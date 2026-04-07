@@ -1,5 +1,84 @@
 # Changelog
 
+## [0.11.942] - 2026-04-06 - The Daemon Release
+
+Lazy v0.11 turns the daemon into the central nervous system of the system — CLI and MCP all connect through it, and tasks advance themselves in response to real-world signals.
+
+### Daemon as central nervous system
+
+- **Event-driven task graph** — The daemon detects state changes during reconcile and acts on them by routing through the task graph: when a parent branch advances, the daemon notifies children and siblings. Notifications are delivered by writing an unblock command into the target task's protocol directory and launching (or reusing) the supervisor — the same path `lazy unblock` uses. Auto-react triggers (CI failures, PR comments) feed into the same delivery path
+- **Auto-push task branches** — Task branches are automatically pushed to the remote after state changes (turn completion, acceptance, upstream merge). No manual `git push` needed. Pushes are serialized, retry on transient failures, and respect the configured remote driver. Enabled by default when a remote is configured
+- **Per-project daemon** — Each project now gets its own daemon process with an isolated unix socket, PID file, and log. Socket paths are derived from the project root (`~/.lazy/daemon/<dir>-<hash>/lazy.sock`), so projects with different configs (API keys, remotes) no longer collide. `lazy daemon start/stop/status` operate on the current project's daemon and error clearly when run outside a lazy project
+- **MCP proxy for containerized agents** — The daemon serves as the MCP endpoint for agents running in Docker containers. Agents access lazy tools (storage, git, task management) through the daemon over HTTP, replacing the old per-session builder server. Task-scoped tool execution ensures agents can only access their own worktree
+- **CLI as thin RPC layer** — CLI commands are now thin wrappers over daemon RPC calls. `lazy start`, `lazy unblock`, `lazy upgrade`, and other lifecycle commands route through the daemon instead of launching supervisors directly or competing for file locks. Eliminates duplicate orchestration logic and the old server sync loop
+
+### Auto-react and event delivery
+
+- **Auto-react to CI failures** — When CI fails on a task branch, the daemon detects the failure during sync, extracts job name, failure reason, and logs, then auto-unblocks the task with structured error context so the agent can fix it. Duplicate failures (same CI signature) are not re-triggered
+- **Auto-react to PR comments** — When a human comments on a task's pull request, the daemon auto-unblocks the task with the comment content. Comments on blocked tasks are auto-delivered as daemon events, giving the agent another turn without manual relay. Comment deduplication prevents re-triggering on already-seen comments
+- **Auto-delivery of task tree events** — Events cascade through the task graph: when a child task completes, its parent is notified; when a parent accepts a child, sibling tasks auto-sync with upstream. `upstream.updated` events trigger `--sync-with-upstream` merges. Working tasks receive events via SSE; blocked tasks are auto-unblocked with context
+- **Circuit breakers and budget controls** — Auto-triggered turns are governed by per-task turn budgets (default 3 auto-turns per trigger type), exponential backoff between retries, and a project-wide daily budget (`auto_react_daily_budget`, default 50). When limits are hit, the task pauses for human intervention. Counters reset only on manual unblock — never automatically. Defense-in-depth budget checks prevent runaway auto-triggers even if outer guards fail
+
+### Developer experience
+
+- **Ollama support** — Run lazy agents against local models served by host Ollama from inside Docker containers. Enables fully offline agent runs without burning Anthropic API credits.
+- **`lazy pair --autonomous`** — New flag lets pair sessions run autonomously like the builder, with `--yes` guard for safety. Useful for fire-and-forget tasks where you want pair-mode context but don't need to watch
+- **`lazy pair --resume`** — Resume a previous pair session in branchless mode, preserving conversation context across sessions
+- **`lazy logs`** — New command to view daemon and supervisor logs. Task IDs are included in daemon logs and ISO8601 timestamps in supervisor logs for easier debugging
+- **Default watchdog timeout** — Agent watchdog timeout now defaults to 2 hours (7,200,000ms) instead of being disabled. Prevents runaway agents from consuming resources indefinitely. Override with `[agent] watchdog_output_timeout_ms` in `lazy.toml`
+- **`lazy submit`** — New command to explicitly create a PR/MR for a task branch. Introduces a `submitted` task state between `blocked` and the merge path. Agents can call `lazy_submit` via MCP to push their branch and open a PR when they believe the work is ready for review
+- **Turn visibility** — Agent turns are now visible in task detail views, making it easier to track how many auto-turns a task has consumed
+
+### Pre-merge gates
+
+- **Accept checks CI and review gates** — `lazy accept` now verifies CI status, required reviews, and unresolved PR comments before merging. If any gate fails, accept is hard-blocked with a link to the PR showing what needs attention. No `--force` bypass — gates must be satisfied. Implemented via `checkAcceptGates()` on the driver interface, so each remote driver (GitHub, GitLab) checks its own platform's gate semantics
+- **Protected branch accept controls** — `lazy accept` on protected branches (main, master, etc.) is refused by default. Enable with `auto_approve` config or when the PR already has an external approval. Prevents accidental merges to protected branches without review
+
+### Fixed
+
+- **Daemon resilience** — Skip missing-branch pushes instead of crashing, unified liveness checks, and robust crash recovery. `checkDocker` no longer calls `process.exit(1)` during signal delivery, which was killing the daemon
+- **Auto-react spin loop** — Auto-react used subprocess-based unblock which re-triggered the event loop. Now uses in-process unblock. Budget counters no longer reset during reconcile — only on human unblock
+- **Submitted tasks stuck in `submitted`** — Tasks in `submitted` status were not transitioning to `complete` when the MR was merged on the remote
+- **Spawn timeout killed long-running processes** — The spawn utility had a default 60-second timeout that killed supervisors, Claude Code, the builder, and watchdog processes. Long-running processes now run without a timeout
+- **MCP tools broken in containers** — `requireDaemonStorage()` failed when called inside the daemon process itself. MCP tools now fail fast when the daemon is unavailable instead of falling back to direct storage (which caused lock contention)
+- **MCP tools not available to agents** — Agents in containers could not access `lazy_search`, `lazy_show`, and other lazy MCP tools due to missing MCP config. `handleSyncCommand` now writes `.claude.json` correctly
+- **Reconciler stall** — Daemon reconciler did not detect finished tasks, leaving them stuck in `working` status after the agent completed
+- **Misleading "Daemon RPC failed" error** — Application-level errors from daemon RPC were wrapped in a generic "Daemon RPC failed" message that suggested restarting the daemon. Application errors now surface directly
+- **Sync used wrong branch check** — `remote-sync.ts` used `branchExists` (which checks remote) instead of `localBranchExists`, causing unnecessary push retries for remote-only branches
+- **Daemon sync missed main branch updates** — The daemon sync loop was not fetching changes to the main branch, causing stale upstream state
+- **`atomicWriteTask` race condition** — Concurrent async operations on the same task directory caused intermittent write failures. Also fixed stale `.tmp` directories from interrupted writes
+- **Diff/accept/resume with missing worktree** — When a worktree was gone but the branch existed on the remote, diff, accept, and resume operations crashed. Now recovers from remote branch state
+- **False divergence in accept** — Accept incorrectly blocked when local main was ahead of origin/main, treating it as divergence
+- **MR/PR titles exceeding limits** — Titles are now truncated to 128 characters to avoid GitLab's 255-character limit
+- **Review TUI missing branch data** — Review command crashed when fetching branches for backlog subtasks that have no branch. Added remote branch recovery to `loadReviewData`
+- **Orphaned processes in containers** — Container wrapper script now kills orphaned processes between turns
+- **Invalid `rejected` status in auto-deliver** — Fixed TypeScript errors where auto-deliver compared task status against non-existent `"rejected"` value; the correct terminal status is `"abandoned"`
+
+### Changed
+
+- **Async IO throughout** — Converted all unjustified synchronous IO to async across the entire codebase, including all `spawnSync` calls in GitHub and GitLab drivers. The daemon event loop is no longer blocked by driver operations
+- **Daemon logging** — All signals, decisions, and RPC calls are logged with safe rotation. Task codes appear in syncComments logs for easier correlation
+
+### Configuration reference
+
+New `lazy.toml` options in this release:
+
+```toml
+[server]
+port = 26024                          # Web dashboard port
+
+[agent]
+watchdog_output_timeout_ms = 7200000 # Default: 2 hours
+
+[daemon]
+auto_react_ci = true                 # React to CI failures
+auto_react_comments = true           # React to PR comments
+auto_react_max_retries = 3           # Per-task retry limit per trigger type
+auto_react_backoff = "exponential"   # Backoff: none, linear, exponential
+auto_react_daily_budget = 50         # Project-wide daily auto-turn limit
+auto_approve = false                 # Allow accept on protected branches
+```
+
 ## [0.10.827] - 2026-03-28 - Storage proxy, branch protection, and reliability hardening
 
 ### Added
@@ -34,6 +113,8 @@
 - **GitHub PR creation diagnostics** — added `--repo` flag to all `gh` CLI calls for explicit repository targeting, debug logging of exact `gh` command arguments, and guards against empty `targetBranch` values (the `??` operator doesn't catch empty strings `""`)
 - **False conflict on files created by the task itself** — agent-created files matching protected patterns were flagged as permission violations when modified in later turns. Now uses merge-base to distinguish pre-existing files from task-created ones
 - **`lazy_create` MCP guard missed blocked tasks** — parentless-task guard only checked `working` tasks, missing `blocked` ones. Also escalates to stern confirmation when active tasks have children, naming the parent tasks explicitly
+- **`lazy pair` broken with host-process runner** — session bridging failed because the sandbox directory doesn't exist for host-process tasks. Now creates the sandbox directory before attempting to bridge
+- **`lazy_accept` passed HEAD as base ref for GitHub PRs** — when creating a PR via the GitHub driver, the base ref was passed as the literal string "HEAD" instead of resolving to the actual branch name. Now resolves HEAD to the current branch before passing to the API
 
 ## [0.10.763] - 2026-03-13 - Confirmation protocol and soft push-bach on file violations
 
@@ -102,7 +183,7 @@
 
 ### Added
 
-- **Daemon infrastructure** — `lazy daemon start|stop|restart|status` commands with unix socket server, PID file management, bearer token auth, and auto-start mechanism. Daemon automatically starts when running CLI commands unless `LAZY_NO_DAEMON=1` is set
+- **Daemon infrastructure** — `lazy daemon start|stop|restart|status` commands with unix socket server, PID file management, bearer token auth, and auto-start mechanism. Daemon is required and automatically starts when running CLI commands
 - **Agent selection in MCP tools and CLI** — `lazy_create`, `lazy_start`, `lazy_unblock`, and `lazy_edit` MCP tools now accept an `agent` parameter. CLI `lazy edit --agent` and `lazy unblock --agent` allow switching agents per-task. Builder prompt documents agent selection guidance
 - **Builder `--resume` support** — `lazy builder --resume` restores previous builder conversation, preserving context across sessions
 - **CLI pass-through mode** — read-only commands (`list`, `show`, `search`, `blocked`, `active`, `diff`) route through daemon for improved performance with transparent fallback to direct execution when daemon is unavailable
@@ -177,7 +258,7 @@ Internal refactor to support multiple AI agents. The agent abstraction layer dec
 
 - **PostgreSQL storage driver** — team/shared use with connection pooling, migrations, and comprehensive test coverage. Configure with `[storage] driver = "postgres"` and `connection_string` in lazy.toml
 - **worktree.include config** — copy untracked files into new task worktrees. Use glob patterns to include build artifacts, credentials, or other files agents need to test their work or user needs if testing manually through `lazy shell`
-- **docker_agent_root and docker_agent_no_network runner options** — advanced Docker container configuration for running agents as root or without network access
+- **docker_agent_root runner option** — advanced Docker container configuration for running agents as root
 - **Markdown formatting in lazy start** — prettier prompt display in TTY confirmation with proper code blocks and emphasis
 
 ### Fixed

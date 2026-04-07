@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, displayId, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines, getWorktreePath, getBranchNameFromId } from '../helpers';
-import { getCurrentBranch, getRemoteDefaultBranch } from '../../git/operations';
+import { getCurrentBranch, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
@@ -45,8 +45,22 @@ export async function commandDiff(args: string[]): Promise<void> {
       }
       const worktreePath = getWorktreePath(root, task);
       if (!existsSync(worktreePath)) {
-        console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
-        process.exit(1);
+        // Worktree is gone — try to recover from local or remote branch
+        const branchName = sess.git_branch;
+        const config = await loadConfig(root);
+        try {
+          const recovery = await recoverMissingWorktreeWithFetch(
+            worktreePath, branchName, config.remote.git_remote, root,
+          );
+          if (!recovery.recovered) {
+            console.error(`Worktree is gone and branch '${branchName}' not found locally or on remote.`);
+            process.exit(1);
+          }
+          console.error(`Worktree recovered from branch '${branchName}'.`);
+        } catch (err) {
+          console.error(`Failed to recover worktree: ${err instanceof Error ? err.message : err}`);
+          process.exit(1);
+        }
       }
       await handleTurnDiff(storage, sess.id, turnValue, worktreePath, task.parent_task_id, root, lineRange);
     } finally {
@@ -55,7 +69,7 @@ export async function commandDiff(args: string[]): Promise<void> {
     return;
   }
 
-  // Default diff — daemon-vs-direct handled by queryDiff
+  // Default diff via daemon RPC
   const full = parsed.flags.get('full') === true;
   const { output: diffOutput } = await queryDiff({ taskId, full });
 
@@ -109,13 +123,13 @@ async function handleTurnDiff(
   if (parentTaskId) {
     fallbackFromRef = await getBranchNameFromId(parentTaskId, storage);
   } else {
-    fallbackFromRef = getRemoteDefaultBranch(root);
+    fallbackFromRef = await getRemoteDefaultBranch(root);
   }
 
   // Resolve the base ref through the driver to get origin/<branch> when using
   // a remote driver, or the local branch when using local driver.
   try {
-    const config = loadConfig(root);
+    const config = await loadConfig(root);
     const driver = createDriver(config);
     fallbackFromRef = await driver.resolveUpstreamRef(fallbackFromRef, worktreePath);
   } catch {
@@ -126,7 +140,7 @@ async function handleTurnDiff(
   const session = await storage.getSession(sessionId);
   const upstreamMergeSha = session?.upstream_merge_sha ?? undefined;
 
-  const result = getTurnDiff(targetTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
+  const result = await getTurnDiff(targetTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
 
   if (!result || !result.diff.trim()) {
     let output = 'No changes in this turn.';

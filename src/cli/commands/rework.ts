@@ -2,7 +2,7 @@ import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateM
 import { openEditor, removeRecoveryFile, readStdinIfPiped, requireTTY } from '../editor';
 import { buildTurnHistoryContext } from './shared';
 import { theme } from '../theme';
-import type { ModelName, Task } from '../../types';
+import type { Task } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { logger } from '../../utils/logger';
 
@@ -97,7 +97,7 @@ export async function commandRework(args: string[]): Promise<void> {
   const codeOverride = parsed.flags.get('code') as string | undefined;
   const parentFlag = parsed.flags.get('parent') as string | undefined;
 
-  let modelOverride: ModelName | undefined;
+  let modelOverride: string | undefined;
   const modelValue = parsed.flags.get('model') as string | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
@@ -296,7 +296,7 @@ Examples:
   lazy rework fix-auth
   lazy rework fix-auth --goal "Fix token expiry edge case"
   lazy rework fix-auth --prompt "The refresh token logic doesn't handle expired sessions"
-  lazy rework abc12345 --code rework-fix-auth --model opus
+  lazy rework abc12345 --code rework-fix-auth --model claude-opus-4-6
   lazy rework fix-auth --parent release-v2
   echo "Fix the race condition in auth" | lazy rework fix-auth`);
 }

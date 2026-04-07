@@ -339,10 +339,10 @@ describe('buildEditorContentWithDiff with notes', () => {
     created_at,
   });
 
-  test('editorContent includes notes between response and diff', () => {
+  test('editorContent includes notes between response and diff', async () => {
     const notes = [makeNote('Check edge case', 1735725600000)]; // 2025-01-01T10:00:00Z
     const diff = { diff: 'diff --git a/file b/file\n+new line', filesChanged: 1, isFallback: false };
-    const { editorContent } = buildEditorContentWithDiff('Agent response text', diff, 'abc123', 'Goal', notes);
+    const { editorContent } = await buildEditorContentWithDiff('Agent response text', diff, 'abc123', 'Goal', notes);
 
     // Notes section should be present
     expect(editorContent).toContain('# --- Unseen comments (edit or delete as needed) ---');
@@ -355,10 +355,10 @@ describe('buildEditorContentWithDiff with notes', () => {
     expect(notesPos).toBeLessThan(diffPos);
   });
 
-  test('comparisonContent has placeholder instead of real comments', () => {
+  test('comparisonContent has placeholder instead of real comments', async () => {
     const notes = [makeNote('Check edge case', 1735725600000)];
     const diff = { diff: 'diff --git a/file b/file\n+new line', filesChanged: 1, isFallback: false };
-    const { comparisonContent } = buildEditorContentWithDiff('Agent response text', diff, 'abc123', 'Goal', notes);
+    const { comparisonContent } = await buildEditorContentWithDiff('Agent response text', diff, 'abc123', 'Goal', notes);
 
     // Markers should be present
     expect(comparisonContent).toContain('# --- Unseen comments (edit or delete as needed) ---');
@@ -367,17 +367,17 @@ describe('buildEditorContentWithDiff with notes', () => {
     expect(comparisonContent).not.toContain('Check edge case');
   });
 
-  test('omits notes section when no notes', () => {
+  test('omits notes section when no notes', async () => {
     const diff = { diff: 'diff --git a/file b/file\n+new line', filesChanged: 1, isFallback: false };
-    const { editorContent } = buildEditorContentWithDiff('Agent response', diff, 'abc123', 'Goal', []);
+    const { editorContent } = await buildEditorContentWithDiff('Agent response', diff, 'abc123', 'Goal', []);
 
     expect(editorContent).not.toContain('Unseen comments');
     expect(editorContent).not.toContain('End comments');
   });
 
-  test('diff between comparison and unedited editor shows comments as additions', () => {
+  test('diff between comparison and unedited editor shows comments as additions', async () => {
     const notes = [makeNote('Important design note', 1735725600000)];
-    const { editorContent, comparisonContent } = buildEditorContentWithDiff(
+    const { editorContent, comparisonContent } = await buildEditorContentWithDiff(
       'Agent response text', null, 'abc123', 'Goal', notes,
     );
 
@@ -387,9 +387,9 @@ describe('buildEditorContentWithDiff with notes', () => {
     expect(result.feedbackText).toContain('Important design note');
   });
 
-  test('diff is clean when human deletes all comments', () => {
+  test('diff is clean when human deletes all comments', async () => {
     const notes = [makeNote('Delete me', 1735725600000)];
-    const { editorContent, comparisonContent } = buildEditorContentWithDiff(
+    const { editorContent, comparisonContent } = await buildEditorContentWithDiff(
       'Agent response text', null, 'abc123', 'Goal', notes,
     );
 
@@ -403,9 +403,9 @@ describe('buildEditorContentWithDiff with notes', () => {
     expect(result.hasChanges).toBe(false);
   });
 
-  test('diff shows edited comments when human modifies them', () => {
+  test('diff shows edited comments when human modifies them', async () => {
     const notes = [makeNote('Original note', 1735725600000)];
-    const { editorContent, comparisonContent } = buildEditorContentWithDiff(
+    const { editorContent, comparisonContent } = await buildEditorContentWithDiff(
       'Agent response text', null, 'abc123', 'Goal', notes,
     );
 

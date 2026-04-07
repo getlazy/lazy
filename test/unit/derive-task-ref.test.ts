@@ -16,6 +16,7 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     agent_id: 'claude-code',
     metadata: null,
     code: null,
+    pending_sync: 0,
     ...overrides,
   };
 }

@@ -8,8 +8,9 @@
  * stale lock detection when the process has exited.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { stat, readFile, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
+import { pathExists } from './fs';
 
 export interface LockInfo {
   pid: number;
@@ -43,35 +44,35 @@ function isProcessRunning(pid: number): boolean {
  * Returns the lock info if the lock is valid (process still running), null otherwise.
  * Automatically cleans up stale locks from dead processes.
  */
-export function readLock(worktreePath: string): LockInfo | null {
+export async function readLock(worktreePath: string): Promise<LockInfo | null> {
   const lockPath = getLockPath(worktreePath);
 
-  if (!existsSync(lockPath)) {
+  if (!(await pathExists(lockPath))) {
     return null;
   }
 
   try {
-    const content = readFileSync(lockPath, 'utf-8');
+    const content = await readFile(lockPath, 'utf-8');
     const lock: LockInfo = JSON.parse(content);
 
     // Validate required fields
     if (!lock.pid || !lock.started_at || !lock.command) {
       // Corrupt lock file — remove it
-      removeLock(worktreePath);
+      await removeLock(worktreePath);
       return null;
     }
 
     // Check if the owning process is still alive
     if (!isProcessRunning(lock.pid)) {
       // Stale lock — process has exited, clean up
-      removeLock(worktreePath);
+      await removeLock(worktreePath);
       return null;
     }
 
     return lock;
   } catch {
     // Corrupt or unreadable lock file — remove it
-    removeLock(worktreePath);
+    await removeLock(worktreePath);
     return null;
   }
 }
@@ -81,8 +82,8 @@ export function readLock(worktreePath: string): LockInfo | null {
  * Creates the lock file with current process info.
  * The worktree directory must already exist.
  */
-export function acquireLock(worktreePath: string, command: string): void {
-  if (!existsSync(worktreePath)) {
+export async function acquireLock(worktreePath: string, command: string): Promise<void> {
+  if (!(await pathExists(worktreePath))) {
     throw new Error(`Cannot acquire lock: worktree directory does not exist: ${worktreePath}`);
   }
 
@@ -93,19 +94,18 @@ export function acquireLock(worktreePath: string, command: string): void {
   };
 
   const lockPath = getLockPath(worktreePath);
-  writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf-8');
+  await writeFile(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf-8');
 }
 
 /**
  * Remove the lock file for the given worktree.
  * Safe to call even if no lock exists.
  */
-export function removeLock(worktreePath: string): void {
+export async function removeLock(worktreePath: string): Promise<void> {
   const lockPath = getLockPath(worktreePath);
   try {
-    if (existsSync(lockPath)) {
-      unlinkSync(lockPath);
-    }
+    await stat(lockPath);
+    await unlink(lockPath);
   } catch {
     // Best effort — lock file may already be gone
   }
@@ -117,8 +117,8 @@ export function removeLock(worktreePath: string): void {
  *
  * If the current process holds the lock, returns null (re-entrant safe).
  */
-export function checkLock(worktreePath: string): LockInfo | null {
-  const lock = readLock(worktreePath);
+export async function checkLock(worktreePath: string): Promise<LockInfo | null> {
+  const lock = await readLock(worktreePath);
 
   if (!lock) {
     return null;

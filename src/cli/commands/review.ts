@@ -1,11 +1,11 @@
 /**
- * `lazy review <task_id>` — TUI-based read-only review of a blocked task.
+ * `lazy review <task_id>` — TUI-based read-only review.
  *
- * Opens a full-screen two-panel interface showing all task artifacts:
- * response, plan, diff (per-file), comments, proposals, and commits.
+ * Opens a full-screen two-panel interface showing all task artifacts
+ * (response, plan, diff, comments, proposals, commits).
  *
- * The human can navigate artifacts and quit. Actions (accept, reject, feedback)
- * should be performed via the CLI after exiting the review TUI.
+ * Actions (accept, reject, feedback) should be performed via the CLI
+ * after exiting the review TUI.
  */
 
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, rejectIfPairing } from '../helpers';
@@ -14,30 +14,31 @@ import { runReviewTUI } from '../tui';
 export async function commandReview(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [], 'review');
 
-  const taskId = parsed.positional[0];
-  if (!taskId) {
-    reviewUsage();
-    process.exit(1);
-  }
-
   if (!process.stdin.isTTY) {
     console.error('lazy review requires an interactive terminal.');
     process.exit(1);
   }
 
   const root = requireLazyRoot();
+  const storage = await requireStorage();
 
+  const taskId = parsed.positional[0];
+
+  if (!taskId) {
+    reviewUsage();
+    process.exit(1);
+  }
+
+  // Single-task review mode
   // Pre-flight checks before entering the TUI
   const { createRunner } = await import('../../runner');
-  const runner = createRunner(root);
+  const runner = await createRunner(root);
   try {
     runner.checkAvailability();
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
   }
-
-  const storage = await requireStorage();
 
   try {
     const task = await resolveTaskOrExit(storage, taskId);
@@ -62,8 +63,7 @@ export async function commandReview(args: string[]): Promise<void> {
 export function reviewUsage(): void {
   console.log(`Usage: lazy review <task_id>
 
-Read-only TUI review of a task. Opens a full-screen interface showing
-all task artifacts in a two-panel layout.
+Opens a full-screen two-panel review of the specified task.
 
 Left panel: navigation tree of artifacts
   - Response (agent's summary/questions)
@@ -75,7 +75,7 @@ Left panel: navigation tree of artifacts
 
 Right panel: content of the selected artifact
 
-Navigation:
+Review navigation:
   Tab          Switch between left and right panels
   ↑/↓          Navigate items (left) or scroll (right)
   Enter        Select/expand item
@@ -87,8 +87,8 @@ Actions (use CLI after exiting review):
   lazy unblock <task_id>                 Give feedback
   lazy accept <task_id>                  Accept the task
   lazy reject <task_id>                  Reject the task
-  lazy unblock <task_id> --sync-with-upstream  Merge upstream changes
+  lazy sync <task_id>                    Merge upstream changes
 
-Examples:
-  lazy review abc123`);
+Example:
+  lazy review abc123       Review specific task`);
 }

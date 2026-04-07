@@ -36,6 +36,7 @@ mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     hasRemoteRef: (task: any) => task.metadata?.github_pr_number !== undefined,
+    recoverRemoteRef: async () => null,
     getPRState: async () => mockPRState,
     getChecksStatus: async () => ({ status: 'pending', failed: [] }),
     fetchRemoteState: async () => {},
@@ -78,7 +79,7 @@ mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
 }));
 
 // Import after mocking
-const { runSync } = await import('../../src/cli/commands/sync');
+const { runSync } = await import('../../src/daemon/remote-sync');
 
 // Mock storage
 function createMockStorage() {
@@ -118,7 +119,7 @@ function makeTask(status: 'blocked' | 'conflict' | 'merging', hasRemoteRef = tru
     prompt: '',
     status,
     type: 'task' as const,
-    model: 'opus' as const,
+    model: 'claude-opus-4-6',
     created_at: Date.now(),
     completed_at: null,
     parent_task_id: null,

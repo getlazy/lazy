@@ -10,6 +10,42 @@ import type { Task } from '../types';
 import type { Storage } from '../storage';
 
 /**
+ * Truncate a PR/MR title to 128 characters to avoid GitLab's 255-char limit.
+ * If truncated, appends "..." to indicate the title was cut.
+ *
+ * The 128-char limit provides a safety margin — GitLab enforces 255 chars,
+ * but keeping titles shorter improves readability in UI lists.
+ *
+ * Counts UTF-16 code units (string.length) while respecting code point
+ * boundaries to prevent splitting multi-byte characters like emoji.
+ */
+export function truncateMRTitle(title: string): string {
+  const MAX_LENGTH = 128;
+
+  // Fast path: if already short enough, return as-is
+  if (title.length <= MAX_LENGTH) {
+    return title;
+  }
+
+  // Iterate by code points, tracking UTF-16 code unit length
+  const chars = Array.from(title);
+  let codeUnitLength = 0;
+  let codePointCount = 0;
+
+  // Find how many code points we can fit in (MAX_LENGTH - 3) code units
+  for (const char of chars) {
+    const charLength = char.length; // UTF-16 code units for this code point
+    if (codeUnitLength + charLength > MAX_LENGTH - 3) {
+      break;
+    }
+    codeUnitLength += charLength;
+    codePointCount++;
+  }
+
+  return chars.slice(0, codePointCount).join('') + '...';
+}
+
+/**
  * Lightweight dependency injection context for drivers that need
  * access to task state (e.g., checking if a worktree belongs to
  * a working task before fast-forwarding into it).
@@ -53,6 +89,17 @@ export interface MergeOptions {
   taskShortId: string;
   /** Repository root path */
   root: string;
+}
+
+/**
+ * A warning from a pre-merge gate check.
+ * Each warning represents a condition that would normally block the merge.
+ */
+export interface AcceptGateWarning {
+  /** Which gate produced this warning (e.g., "ci", "reviews", "comments") */
+  gate: string;
+  /** Human-readable description of the issue */
+  message: string;
 }
 
 /**
@@ -317,6 +364,40 @@ export interface RepositoryDriver {
   validateAccept(task: Task): string | null;
 
   /**
+   * Check whether a target branch has protection rules on the remote.
+   * Returns true if the branch has protection rules (e.g., required reviews,
+   * required status checks), false otherwise.
+   *
+   * LocalDriver: always returns false (no remote protection).
+   * GitHubDriver: checks via GitHub API branch protection endpoint.
+   * GitLabDriver: checks via GitLab API protected branches endpoint.
+   */
+  isTargetBranchProtected(targetBranch: string): Promise<boolean>;
+
+  /**
+   * Check whether the MR/PR for a task has at least one external approval.
+   * "External" means from someone other than the lazy service account.
+   * Returns true if at least one approval exists, false otherwise.
+   *
+   * LocalDriver: always returns false (no remote approvals).
+   * GitHubDriver: checks PR reviews for APPROVED status.
+   * GitLabDriver: checks MR approval status via API.
+   */
+  hasExternalApproval(task: Task): Promise<boolean>;
+
+  /**
+   * Check pre-merge gates (CI status, review status, unresolved comments).
+   *
+   * Returns an array of warnings. An empty array means all gates pass.
+   * Used by the accept CLI to block merges when gates are failing.
+   *
+   * LocalDriver: always returns [] (no remote gates).
+   * GitHubDriver: checks CI checks, review decision, and unresolved review threads.
+   * GitLabDriver: checks pipeline status, approval status, and unresolved discussions.
+   */
+  checkAcceptGates(task: Task): Promise<AcceptGateWarning[]>;
+
+  /**
    * Resolve the upstream branch ref for sync-with-upstream.
    *
    * For remote drivers (e.g., GitHub): fetches origin/<branch> and returns
@@ -441,6 +522,18 @@ export interface RepositoryDriver {
    * Used to avoid echoing imported comments back to the remote.
    */
   isImportedComment(noteContent: string): boolean;
+
+  /**
+   * Attempt to recover a task's remote reference (PR/MR) by looking it up
+   * via branch name. Called when a submitted task has no remote ref metadata,
+   * which prevents the daemon from detecting when the PR/MR is merged.
+   *
+   * Returns metadata to persist (e.g., PR number, URL) if a remote ref is
+   * found, or null if no matching PR/MR exists on the remote.
+   *
+   * LocalDriver: always returns null (no remote refs).
+   */
+  recoverRemoteRef(task: Task): Promise<Record<string, string> | null>;
 
   /** Check if this driver can handle an import URL. */
   canImport?(url: string): boolean;

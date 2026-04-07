@@ -1,9 +1,10 @@
 import { join } from 'path';
-import { homedir } from 'os';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync, readFileSync } from 'fs';
+import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
 import { isBlockedStatus } from '../../types';
 import { theme } from '../theme';
+import { isTTY, promptLine } from '../editor';
 import { getCurrentBranch, getCurrentSha, getNewCommits, getDiffStat } from '../../git/operations';
 import {
   acquirePairingLock,
@@ -18,6 +19,7 @@ import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { getActor } from '../../constants';
 import { spawnSync, spawn } from '../../utils/spawn';
+import { createTerminal } from '../../terminal';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -35,7 +37,7 @@ function readSessionTranscript(worktreePath: string, sessionId: string, sinceTim
   // 1. Host ~/.claude/projects/ (direct pairing or persisted symlink)
   // 2. Sandbox .lazy-task-sandbox/.claude/projects/ (supervisor-created sessions)
   const candidates = [
-    join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`),
+    join(getHome(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`),
     join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encodedPath, `${sessionId}.jsonl`),
   ];
 
@@ -116,7 +118,7 @@ function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeRes
   const sandboxClaudeDir = join(worktreePath, SANDBOX_DIR, '.claude');
   const encodedPath = encodeProjectPath(worktreePath);
   const sandboxProjectDir = join(sandboxClaudeDir, 'projects', encodedPath);
-  const hostProjectsDir = join(homedir(), '.claude', 'projects');
+  const hostProjectsDir = join(getHome(), '.claude', 'projects');
   const hostProjectDir = join(hostProjectsDir, encodedPath);
 
   const noop: BridgeResult = { accessible: false, cleanup: () => {} };
@@ -229,9 +231,9 @@ function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeRes
  * configured branch prefix pattern (e.g. `lazy/<ref>`), or null if
  * on a non-task branch.
  */
-function detectTaskRefFromBranch(branchPrefix: string): string | null {
+async function detectTaskRefFromBranch(branchPrefix: string): Promise<string | null> {
   try {
-    const branch = getCurrentBranch();
+    const branch = await getCurrentBranch();
     const prefix = `${branchPrefix}/`;
     if (branch.startsWith(prefix)) {
       return branch.slice(prefix.length);
@@ -246,23 +248,39 @@ function detectTaskRefFromBranch(branchPrefix: string): string | null {
  * Launch Claude Code in the current directory with no task context.
  * Captures the conversation into lazy's storage after exit.
  */
-async function pairBranchless(root: string): Promise<void> {
+async function pairBranchless(root: string, resumeSessionId?: string, autonomous?: boolean): Promise<void> {
   console.log(`\nLaunching Claude Code in ${process.cwd()}...`);
   console.log(`(no task context — conversation will be captured for search)\n`);
 
   const beforeSnapshot = snapshotSessionFiles(root);
 
+  // Build claude command
+  const claudeArgs = ['claude'];
+  if (resumeSessionId) {
+    claudeArgs.push('--resume', resumeSessionId);
+  }
+  if (autonomous) {
+    claudeArgs.push('--dangerously-skip-permissions');
+  }
+  // When Ollama is enabled, force Claude Code to use the Ollama model
+  const config = await loadConfig(root);
+  if (config.ollama.enabled && config.ollama.model) {
+    claudeArgs.push('--model', config.ollama.model);
+  }
+
   // Launch Claude Code interactively in the current directory
-  const proc = spawn(['claude'], {
+  const proc = spawn(claudeArgs, {
     cwd: process.cwd(),
     stdin: 'inherit',
     stdout: 'inherit',
     stderr: 'inherit',
+    timeout: 0, // Long-running: interactive session runs until the user exits
   });
 
   const exitCode = await proc.exited;
 
-  // Capture conversation from JSONL files
+  // Capture conversation from JSONL files via the daemon.
+  // Returns null if no conversation found or if capture failed (daemon unavailable).
   const sessionId = await captureConversation(root, beforeSnapshot, 'Pairing');
   if (sessionId) {
     console.log(`\nConversation captured (session ${sessionId.substring(0, 8)}...)`);
@@ -278,30 +296,77 @@ export async function commandPair(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'unlock', takesValue: false },
     { name: 'no-summary', takesValue: false },
+    { name: 'resume', takesValue: true },
+    { name: 'autonomous', takesValue: false },
+    { name: 'yes', takesValue: false },
   ], 'pair');
 
   let taskId = parsed.positional[0];
   const unlock = parsed.flags.get('unlock') === true;
   const noSummary = parsed.flags.get('no-summary') === true;
+  const resumeSessionId = parsed.flags.get('resume') as string | undefined;
+  const autonomous = parsed.flags.get('autonomous') === true;
+  const yes = parsed.flags.get('yes') === true;
 
   const root = requireLazyRoot();
 
+  // Autonomous mode warnings and confirmation
+  // Show these BEFORE other checks so users see the warnings even if something fails later
+  if (autonomous) {
+    console.log('');
+    console.log('⚠ Autonomous mode: Claude Code will run without permission prompts.');
+    console.log('⚠ WARNING: Pairing runs Claude Code directly on the host.');
+    console.log('  The agent has unrestricted access to your system.');
+    console.log('  Only proceed on an isolated/disposable machine.');
+    console.log('');
+
+    // Require confirmation
+    if (isTTY()) {
+      const response = await promptLine("Type 'yes' to proceed");
+      if (response !== 'yes') {
+        console.log('Aborted.');
+        process.exit(0);
+      }
+    } else {
+      if (!yes) {
+        console.error('Error: --autonomous requires --yes flag in non-interactive mode.');
+        process.exit(1);
+      }
+    }
+
+    console.log('');
+  }
+
   // If no task argument, try to detect from current branch
   if (!taskId) {
-    const config = loadConfig(root);
-    const detectedRef = detectTaskRefFromBranch(config.git.default_branch_prefix);
+    const config = await loadConfig(root);
+    const detectedRef = await detectTaskRefFromBranch(config.git.default_branch_prefix);
 
     if (detectedRef) {
       // On a lazy/* branch — use the ref as the task identifier
       taskId = detectedRef;
+
+      // Validate: --resume is not allowed with task-based pairing
+      if (resumeSessionId) {
+        console.error('Error: --resume is only valid in branchless mode (no task argument).');
+        console.error('Task-based pairing resumes sessions automatically.');
+        process.exit(1);
+      }
     } else if (unlock) {
       // --unlock without a task and not on a task branch
       console.error('Error: --unlock requires a task argument or a lazy/* branch.');
       process.exit(1);
     } else {
       // On main or non-task branch — launch branchless pairing
-      await pairBranchless(root);
+      await pairBranchless(root, resumeSessionId, autonomous);
       return;
+    }
+  } else {
+    // Task ID was explicitly provided — validate that --resume is not used
+    if (resumeSessionId) {
+      console.error('Error: --resume is only valid in branchless mode (no task argument).');
+      console.error('Task-based pairing resumes sessions automatically.');
+      process.exit(1);
     }
   }
 
@@ -389,7 +454,7 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     // Record HEAD before pairing starts
-    const headBefore = getCurrentSha(worktreePath);
+    const headBefore = await getCurrentSha(worktreePath);
 
     // Acquire pairing lock
     acquirePairingLock(worktreePath);
@@ -401,6 +466,12 @@ export async function commandPair(args: string[]): Promise<void> {
     // Store pairing metadata for reconciliation (stale pairing detection)
     await storage.updateTaskMetadata(task.id, 'pairing_pid', String(process.pid));
     await storage.updateTaskMetadata(task.id, 'pairing_started_at', new Date().toISOString());
+
+    // Set terminal window title
+    const terminal = createTerminal();
+    terminal.setActivity(`lazy pair ${displayId(task)}`);
+    const restoreTerminal = () => terminal.restoreTitle();
+    process.on('exit', restoreTerminal);
 
     console.log(`\nPairing on task ${theme.taskId(taskShortId)}: ${task.goal}`);
     console.log(`  ${theme.label('Branch:')}    ${sess.git_branch}`);
@@ -431,6 +502,14 @@ export async function commandPair(args: string[]): Promise<void> {
       const claudeArgs = ['claude'];
       if (claudeSessionId) {
         claudeArgs.push('--resume', claudeSessionId);
+      }
+      if (autonomous) {
+        claudeArgs.push('--dangerously-skip-permissions');
+      }
+      // When Ollama is enabled, force Claude Code to use the Ollama model
+      const config = await loadConfig(root);
+      if (config.ollama.enabled && config.ollama.model) {
+        claudeArgs.push('--model', config.ollama.model);
       }
 
       // Launch Claude Code interactively in the worktree
@@ -467,9 +546,9 @@ export async function commandPair(args: string[]): Promise<void> {
     // Detect new commits since pairing started
     let newCommits: { sha: string; message: string }[] = [];
     try {
-      const headAfter = getCurrentSha(worktreePath);
+      const headAfter = await getCurrentSha(worktreePath);
       if (headAfter !== headBefore) {
-        newCommits = getNewCommits(headBefore, worktreePath);
+        newCommits = await getNewCommits(headBefore, worktreePath);
       }
     } catch {
       // Best effort — worktree may be in a weird state
@@ -502,8 +581,8 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     if (newCommits.length > 0) {
-      const headAfter = getCurrentSha(worktreePath);
-      const diffStat = getDiffStat(headBefore, headAfter, worktreePath);
+      const headAfter = await getCurrentSha(worktreePath);
+      const diffStat = await getDiffStat(headBefore, headAfter, worktreePath);
       const commitDetails = newCommits
         .map(c => `${c.sha.substring(0, 7)}: ${c.message}`)
         .join('\n');
@@ -527,12 +606,12 @@ Keep the summary concise and factual.`;
         logger.configure({ consoleLevel: LogLevel.WARN });
 
         const sandboxPath = join(worktreePath, SANDBOX_DIR);
-        const pairConfig = loadConfig(root);
+        const pairConfig = await loadConfig(root);
         const binary = (pairConfig.runner.type === 'docker' || pairConfig.runner.type === 'podman') ? pairConfig.runner.type : 'docker';
         const response = await runClaude(summaryPrompt, {
           worktreePath,
           sandboxPath,
-        }, false, false, 'haiku', binary);
+        }, false, false, 'claude-haiku-4-5-20251001', binary);
 
         logger.configure({ consoleLevel: LogLevel.INFO });
 
@@ -570,7 +649,7 @@ Keep the summary concise and factual.`;
     const nextSeq = await storage.getNextTurnSequence(sess.id);
     let headAfter: string;
     try {
-      headAfter = getCurrentSha(worktreePath);
+      headAfter = await getCurrentSha(worktreePath);
     } catch {
       headAfter = headBefore;
     }
@@ -606,7 +685,7 @@ Keep the summary concise and factual.`;
 }
 
 export function pairUsage(): void {
-  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary]
+  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes]
 
 Open an interactive Claude Code session, context-aware.
 
@@ -628,12 +707,17 @@ Arguments:
   [task_id]    ID of the task to pair on (optional — detected from branch)
 
 Options:
-  --unlock       Force-remove a stale pairing lock (e.g., after a crash)
-  --no-summary   Skip AI summarization of the pairing session
+  --unlock               Force-remove a stale pairing lock (e.g., after a crash)
+  --no-summary           Skip AI summarization of the pairing session
+  --resume <session_id>  Resume a previous Claude Code session (branchless mode only)
+  --autonomous           Run without permission prompts (adds --dangerously-skip-permissions)
+  --yes                  Auto-confirm prompts (required with --autonomous in non-TTY mode)
 
 Examples:
   lazy pair abc123                   # Pair on a specific task
   lazy pair abc123 --unlock          # Clear a stale pairing lock
   lazy pair                          # Detect task from branch, or launch branchless
-  lazy pair --no-summary             # Pair without AI summary`);
+  lazy pair --no-summary             # Pair without AI summary
+  lazy pair --resume abc123def       # Resume previous branchless session
+  lazy pair --autonomous             # Run without permission prompts`);
 }
