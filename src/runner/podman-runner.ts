@@ -11,7 +11,7 @@
  * - Availability check looks for 'podman' and provides Podman-specific guidance
  */
 
-import { DockerRunner } from './docker-runner';
+import { DockerRunner, type DockerRunnerOptions } from './docker-runner';
 import { getAuthEnvVars } from '../capture/claude';
 import { logger } from '../utils/logger';
 import { spawnSync } from '../utils/spawn';
@@ -19,8 +19,8 @@ import { spawnSync } from '../utils/spawn';
 const PODMAN_TIMEOUT_MS = 10_000;
 
 export class PodmanRunner extends DockerRunner {
-  constructor() {
-    super('podman', 'podman');
+  constructor(options?: DockerRunnerOptions, lazyRoot?: string) {
+    super('podman', 'podman', options, lazyRoot);
   }
 
   /**

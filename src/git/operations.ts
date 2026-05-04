@@ -616,27 +616,33 @@ export async function findCommitByMessage(targetBranch: string, searchText: stri
 }
 
 /**
- * Check if a given parent branch has commits that are not yet in the current branch.
- * Returns true if the parent branch has upstream changes that should be merged.
+ * True iff `target` (a commit-ish — branch, ref, or SHA) has commits that
+ * aren't reachable from HEAD. Used to decide whether an upstream merge is
+ * needed.
+ *
+ * INVARIANT (fix-sync-no-merge): errors throw with an actionable message —
+ * they do NOT return false. The previous silent-false behavior was the
+ * mechanism by which `lazy sync` reported fake "completed successfully"
+ * responses while no merge ran. Per CLAUDE.md "errors are actionable",
+ * a broken rev-list, a missing ref, or a malformed working tree must
+ * surface to the caller rather than masquerading as "up to date".
  */
-export async function hasUpstreamChanges(parentBranch: string, cwd?: string): Promise<boolean> {
-  const currentBranch = await getCurrentBranch(cwd);
-
-  if (!await branchExists(parentBranch, cwd)) {
-    return false;
-  }
-
-  // Check if there are commits in parent that are not in current branch
+export async function hasUpstreamChanges(target: string, cwd?: string): Promise<boolean> {
   const result = await runGit(
-    ['rev-list', '--count', `${currentBranch}..${parentBranch}`],
+    ['rev-list', '--count', `HEAD..${target}`],
     { cwd }
   );
-
   if (result.exitCode !== 0) {
-    return false;
+    throw new Error(
+      `git rev-list HEAD..${target} failed${cwd ? ` in ${cwd}` : ''}: ${result.stderr || 'unknown error'}`,
+    );
   }
-
   const count = parseInt(result.stdout, 10);
+  if (Number.isNaN(count)) {
+    throw new Error(
+      `git rev-list HEAD..${target} returned non-numeric output: ${JSON.stringify(result.stdout)}`,
+    );
+  }
   return count > 0;
 }
 

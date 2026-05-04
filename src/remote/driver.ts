@@ -493,8 +493,12 @@ export interface RepositoryDriver {
    *
    * Returns an empty array if no CI failures exist, or if the task has no remote ref.
    * LocalDriver: always returns [] (no remote CI).
+   *
+   * When branchName is provided, looks up CI status by branch (works even
+   * without a PR/MR). Falls back to PR/MR-based lookup if branch lookup
+   * fails or branchName is not provided.
    */
-  getFailedCIJobs(task: Task): Promise<CIJobFailure[]>;
+  getFailedCIJobs(task: Task, branchName?: string): Promise<CIJobFailure[]>;
 
   /**
    * Get the remote reference URL (PR/MR URL) from task metadata.

@@ -142,7 +142,11 @@ describe('remote driver', () => {
     let ctx: TestContext;
 
     beforeEach(async () => {
-      ctx = await setupTestLazy();
+      // INVARIANT: `start` + `accept` require a real daemon. Since the v0.11
+      // daemon refactor (93f6a839), CLI commands must go through the daemon
+      // for storage — LAZY_TEST=1 no longer falls back to FileStorage. Tests
+      // that exercise `start`/`accept` must run against a real daemon.
+      ctx = await setupTestLazy({ withDaemon: true });
     });
 
     afterEach(async () => {
@@ -156,6 +160,13 @@ describe('remote driver', () => {
         env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
       });
       expectSuccess(startResult);
+
+      // INVARIANT: `start` launches the supervisor asynchronously via the
+      // daemon — it returns before the task transitions out of 'working'.
+      // Wait for the daemon reconciler to pick up the supervisor's response
+      // and move the task to a non-'working' state before calling accept.
+      const waitResult = await ctx.lazy(['wait', taskId]);
+      expect(waitResult.exitCode).toBe(0);
 
       // Make a commit in the worktree
       const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -222,13 +233,14 @@ describe('remote driver', () => {
       }
     });
 
-    test('markReadyForReview attempts PR creation without PR metadata', async () => {
+    test('markReadyForReview surfaces gh pr create failure when no remote is configured', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
       const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, parent_task_id: null, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
-      // Should complete without error (PR creation fails gracefully when no remote)
-      const result = await driver.markReadyForReview(task);
-      expect(typeof result).toBe('object');
+      // Without a configured gh remote (or with gh missing), the driver must throw
+      // a descriptive error rather than silently return empty metadata — otherwise
+      // callers report a misleading "no remote reference" downstream.
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/gh pr create failed/);
     });
 
     test('validateAccept returns error when no remote ref', () => {
@@ -308,9 +320,24 @@ describe('remote driver', () => {
       expect(driver.postedNoteAtKey()).toBe('github_remote_last_posted_note_at');
     });
 
+    // INVARIANT: When `git push` fails, merge() returns status='failed' with
+    // isConflict=false (push failures are not merge conflicts). Deps are injected
+    // so the test never invokes the real git binary against the worktree's `origin`
+    // — earlier versions of this test ran a real push and could leak to the
+    // developer's actual remote.
     test('merge fails with error when push fails (no remote)', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-      const driver = new GitHubDriver(config);
+      const deps: DriverDeps = {
+        runGh: async () => ({ stdout: '', stderr: 'should not be called', exitCode: 1 }),
+        runGit: async (args) => {
+          // isBranchMerged uses merge-base --is-ancestor before pushing; let it
+          // report "not merged" so we reach the push step.
+          if (args[0] === 'merge-base') return { stdout: '', stderr: 'not ancestor', exitCode: 1 };
+          if (args[0] === 'push') return { stdout: '', stderr: 'fatal: no such remote', exitCode: 1 };
+          return { stdout: '', stderr: `unexpected git call: ${args.join(' ')}`, exitCode: 1 };
+        },
+      };
+      const driver = new GitHubDriver(config, deps);
       const result = await driver.merge({
         sourceBranch: 'test-branch',
         targetBranch: 'main',
@@ -318,7 +345,7 @@ describe('remote driver', () => {
         taskShortId: 'test1234',
         root: '/tmp/nonexistent',
       });
-      // Should fail because there's no git remote to push to
+      // Should fail because the mocked push failed
       expect(result.status).toBe('failed');
       expect(result.status === 'failed' && result.isConflict).toBeFalsy();
     });
@@ -328,14 +355,15 @@ describe('remote driver', () => {
     let ctx: TestContext;
 
     beforeEach(async () => {
-      ctx = await setupTestLazy();
+      // INVARIANT: `start` + `accept` require a real daemon (see above).
+      ctx = await setupTestLazy({ withDaemon: true });
     });
 
     afterEach(async () => {
       await ctx.cleanup();
     });
 
-    test('merge with github driver auto-syncs when no PR exists', async () => {
+    test('merge with github driver fails with clear error when origin is missing', async () => {
       // Start task with local driver (default)
       const taskId = await createTask(ctx, 'GitHub PR test', 'Add a file');
 
@@ -343,6 +371,11 @@ describe('remote driver', () => {
         env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
       });
       expectSuccess(startResult);
+
+      // Wait for the daemon reconciler to transition the task out of 'working'
+      // (see the LocalDriver test above for the rationale).
+      const waitResult = await ctx.lazy(['wait', taskId]);
+      expect(waitResult.exitCode).toBe(0);
 
       // Make a commit in the worktree
       const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -359,16 +392,19 @@ describe('remote driver', () => {
       const configPath = join(ctx.root, 'lazy.toml');
       writeFileSync(configPath, '[remote]\ndriver = "github"\n');
 
-      // Accept should attempt auto-sync (push + create PR) instead of immediately failing.
-      // Since there's no origin remote, the push will fail with an accurate error.
+      // INVARIANT: Remote-driver accepts must fail hard (fail-fast preflight)
+      // when the configured remote is unreachable — no silent local fallback,
+      // no half-merged states. With no 'origin' configured, the preflight
+      // `validateBranchInSyncWithRemote` fetch fails, and accept aborts
+      // before any push/merge is attempted.
       const acceptResult = await ctx.lazy(['accept', taskId]);
       expectFailure(acceptResult);
-      // Should show the auto-sync attempt, not the old "has no remote reference" message
-      expect(acceptResult.stdout.includes('No remote reference found')).toBe(true);
-      // Should suggest lazy sync as the fallback
-      expect(acceptResult.stderr.includes('lazy sync')).toBe(true);
+      // Error should clearly name the fetch failure and the remote
+      const combined = acceptResult.stdout + acceptResult.stderr;
+      expect(combined).toContain('origin');
+      expect(combined.toLowerCase()).toContain('fetch');
       // Should NOT show the old misleading "start the task" message
-      expect(acceptResult.stderr.includes('start the task to push the branch')).toBe(false);
+      expect(combined.includes('start the task to push the branch')).toBe(false);
     });
   });
 
@@ -636,6 +672,9 @@ describe('remote driver', () => {
       expect(result.status).toBe('merged');
     });
 
+    // INVARIANT: When the squash merge fails and `gh pr view --json mergeable`
+    // reports CONFLICTING, merge() returns isConflict=true so the daemon can
+    // surface a conflict-resolution turn rather than retrying the merge.
     test('merge detects conflicts on replacement PR merge', async () => {
       const deps = makeDeps(async (args) => {
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
@@ -649,6 +688,11 @@ describe('remote driver', () => {
         }
         if (args[0] === 'pr' && args[1] === 'merge') {
           return fail('merge conflict detected');
+        }
+        // Post-merge-failure: the driver inspects PR mergeability via
+        // `gh pr view --json mergeable` to decide isConflict.
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
+          return ok(JSON.stringify({ mergeable: 'CONFLICTING' }));
         }
         return fail('unexpected gh call');
       });
@@ -668,6 +712,10 @@ describe('remote driver', () => {
       }
     });
 
+    // INVARIANT: When `gh pr merge` fails and the PR is reported as CONFLICTING
+    // by `gh pr view --json mergeable`, the driver classifies it as a conflict.
+    // GitHub's "Pull Request is not mergeable" message is the canonical case
+    // that surfaces this — the post-failure `gh pr view` query is what catches it.
     test('merge detects GitHub "not mergeable" error as conflict', async () => {
       const deps = makeDeps(async (args) => {
         if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
@@ -676,6 +724,10 @@ describe('remote driver', () => {
         if (args[0] === 'pr' && args[1] === 'merge') {
           // GitHub returns "not mergeable" error when PR has unresolved conflicts
           return fail('GraphQL: Pull Request is not mergeable (mergePullRequest)');
+        }
+        // Driver inspects mergeability after failure to classify it.
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('mergeable')) {
+          return ok(JSON.stringify({ mergeable: 'CONFLICTING' }));
         }
         return fail('unexpected gh call');
       });
@@ -693,7 +745,7 @@ describe('remote driver', () => {
       if (result.status === 'failed') {
         // Should be detected as conflict, not generic error
         expect(result.isConflict).toBe(true);
-        expect(result.error).toContain('not mergeable');
+        expect(result.error).toContain('conflict');
       }
     });
   });
@@ -872,14 +924,29 @@ describe('remote driver', () => {
       expect(result.warning).toContain('git pull');
     });
 
+    // INVARIANT: When the target branch is not checked out and refspec fetch
+    // rejects, the driver disambiguates "behind" vs "diverged" by performing a
+    // second non-refspec fetch + comparing SHAs via merge-base --is-ancestor.
+    // This test exercises the diverged path: refspec fetch fails, second fetch
+    // succeeds, but local is NOT an ancestor of remote — driver reports
+    // diverged + suggests git pull.
     test('returns warning when non-checked-out branch has diverged (refspec rejected)', async () => {
       const deps: DriverDeps = {
         runGh: async () => fail('should not be called'),
         runGit: async (args) => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('lazy/abc12345');
-          if (args[0] === 'fetch') {
+          // Refspec fetch (e.g. `fetch origin main:main`) — rejected.
+          if (args[0] === 'fetch' && args[2] === 'main:main') {
             return fail('! [rejected]        main -> main  (non-fast-forward)');
           }
+          // Non-refspec fetch (e.g. `fetch origin main`) — succeeds so the
+          // driver can compare SHAs to decide divergence.
+          if (args[0] === 'fetch' && args[2] === 'main') return ok();
+          // Local SHA differs from origin SHA.
+          if (args[0] === 'rev-parse' && args[1] === 'main') return ok('aaaaaaaa');
+          if (args[0] === 'rev-parse' && args[1] === 'origin/main') return ok('bbbbbbbb');
+          // merge-base --is-ancestor fails → local is NOT an ancestor → diverged.
+          if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return fail('not an ancestor');
           return fail('unexpected git call');
         },
       };
@@ -974,7 +1041,13 @@ describe('remote driver', () => {
       expect(result).toBe('origin/lazy/abc12345');
     });
 
-    test('falls back to local branch name when fetch fails', async () => {
+    // INVARIANT: resolveUpstreamRef must throw when fetch fails — there is no
+    // silent fallback to the local branch name. Two tests previously asserted
+    // the opposite ("falls back to local branch name when fetch fails" and
+    // "...on exception"); they were deleted because the fallback behaviour was
+    // intentionally removed per CLAUDE.md's "fail hard on remote failures" rule.
+    // See commit d7ef9af2 for the production change.
+    test('throws when fetch fails', async () => {
       const deps: DriverDeps = {
         runGh: async () => fail('should not be called'),
         runGit: async (args) => {
@@ -984,23 +1057,7 @@ describe('remote driver', () => {
       };
 
       const driver = new GitHubDriver(ghConfig, deps);
-      const result = await driver.resolveUpstreamRef('main', '/tmp/worktree');
-
-      expect(result).toBe('main');
-    });
-
-    test('falls back to local branch name on exception', async () => {
-      const deps: DriverDeps = {
-        runGh: async () => fail('should not be called'),
-        runGit: async () => {
-          throw new Error('Network unreachable');
-        },
-      };
-
-      const driver = new GitHubDriver(ghConfig, deps);
-      const result = await driver.resolveUpstreamRef('main', '/tmp/worktree');
-
-      expect(result).toBe('main');
+      await expect(driver.resolveUpstreamRef('main', '/tmp/worktree')).rejects.toThrow(/fetch/);
     });
   });
 

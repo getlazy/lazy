@@ -19,6 +19,7 @@ import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
+import { PROTOCOL_VERSION } from './types';
 import type { ResolvedConfig } from '../config/types';
 
 /**
@@ -26,8 +27,12 @@ import type { ResolvedConfig } from '../config/types';
  *
  * Centralizes fields that must be on every command — callers spread
  * the result into their command object so nobody forgets them.
+ *
+ * `protocol_version` is injected here so every command sent to the
+ * supervisor passes the version gate. See PROTOCOL_VERSION for bump rules.
  */
 export function commonCommandFields(config: ResolvedConfig): {
+  protocol_version: number;
   turn_started_at: string;
   watchdog_output_timeout_ms?: number;
   protected_patterns: string[];
@@ -35,6 +40,7 @@ export function commonCommandFields(config: ResolvedConfig): {
   post_turn_timeout?: number;
 } {
   return {
+    protocol_version: PROTOCOL_VERSION,
     turn_started_at: new Date().toISOString(),
     ...(config.agent.watchdog_output_timeout_ms !== 0 && {
       watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,

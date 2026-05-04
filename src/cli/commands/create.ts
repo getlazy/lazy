@@ -4,8 +4,9 @@ import type { TaskType } from '../../types';
 import { VALID_TASK_TYPES } from '../../types';
 import { listAgents } from '../../agent/registry';
 import { loadConfig } from '../../config/loader';
+import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
-const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
+const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
 export async function commandCreate(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -17,6 +18,7 @@ export async function commandCreate(args: string[]): Promise<void> {
     { name: 'code', takesValue: true },
     { name: 'parent', takesValue: true },
     { name: 'agent', takesValue: true },
+    { name: 'effort', takesValue: true },
   ], 'create');
 
   let goal: string;
@@ -27,6 +29,17 @@ export async function commandCreate(args: string[]): Promise<void> {
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
   let agentId: string | undefined;
+  let effort: EffortLevel | undefined;
+
+  // Parse --effort flag
+  const effortValue = parsed.flags.get('effort') as string | undefined;
+  if (effortValue !== undefined) {
+    if (!VALID_EFFORT_LEVELS.includes(effortValue as EffortLevel)) {
+      console.error(`Invalid effort '${effortValue}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
+      process.exit(1);
+    }
+    effort = effortValue as EffortLevel;
+  }
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -159,6 +172,12 @@ export async function commandCreate(args: string[]): Promise<void> {
       console.log(`  Model:  ${model}`);
     }
 
+    // Set effort if provided (stored as metadata so it persists across resumes)
+    if (effort) {
+      await storage.updateTaskMetadata(t.id, 'effort', effort);
+      console.log(`  Effort: ${effort}`);
+    }
+
     console.log(`\nStart working on it with: lazy start ${displayId(t)}`);
   } finally {
     await storage.close();
@@ -166,14 +185,14 @@ export async function commandCreate(args: string[]): Promise<void> {
 }
 
 export function createUsage(): void {
-  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <agent_id>]
+  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <agent_id>] [--effort <level>]
 
 Create a new task. Interactive if no flags provided.
 
 Options:
   --goal <goal>      Task goal
   --prompt <text>    Task prompt/specification
-  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Default: task
   --code <code>      Human-readable code (e.g. "fix-models", "add-auth")
@@ -181,6 +200,8 @@ Options:
   --parent <task_id> Parent task ID (creates a child task)
                      Parent must exist and not be in a terminal state
   --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
+  --effort <level>   Claude Code reasoning effort for this task (low, medium, high, xhigh, max)
+                     Persists across resumes. Default: from lazy.toml [agent].effort (medium)
 
 Prompt input priority: --prompt flag > piped stdin > $EDITOR (interactive)
 
@@ -189,7 +210,7 @@ Examples:
   lazy create --goal "Add auth"            # Create with goal only
   lazy create --goal "Add auth" --code add-auth
   lazy create --goal "Add auth" --prompt "Implement OAuth2 login"
-  lazy create --goal "Refactor" --model claude-opus-4-6 --type refactor
+  lazy create --goal "Refactor" --model opus --type refactor
   lazy create --goal "Sub-task" --parent abc12345
   lazy create --goal "Fix bug" --agent claude-code
   echo "Detailed prompt" | lazy create --goal "Add auth"  # Piped stdin as prompt`);

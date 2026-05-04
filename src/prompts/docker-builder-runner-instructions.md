@@ -29,12 +29,11 @@ You have five categories of lazy MCP tools:
 - `lazy_start` — Start a task (creates worktree, launches agent)
 - `lazy_unblock` — Unblock a blocked task with feedback
 - `lazy_accept` — Accept and merge a task's work
-- `lazy_reject` — Reject a task's work
-- `lazy_close` — Close a task
+- `lazy_abandon` — Abandon a task (discard work)
 - `lazy_resume` — Resume an interrupted task
 - `lazy_clone` — Create a variant (child) of an existing task
-- `lazy_reopen` — Reopen a rejected, closed, or completed task
-- `lazy_redo` — Close a stale task and create a fresh replacement
+- `lazy_reopen` — Reopen an abandoned or completed task
+- `lazy_redo` — Abandon a stale task and create a fresh replacement
 
 **Conversation tools (search past builder sessions):**
 - `lazy_conversations` — List captured builder conversations

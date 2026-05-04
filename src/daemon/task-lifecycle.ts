@@ -26,31 +26,32 @@ import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
 import { createDriver } from '../remote';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
+import { resolveAndPersistEffort } from './effort';
 import { getAgent } from '../agent/registry';
 import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir } from '../protocol';
+import { protocolDir as getProtocolDir, writeCommand, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus } from '../protocol';
 import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
-import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren } from '../cli/orphan';
+import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { resetAutoReactCounters } from './auto-react-budget';
 import { isFeatureEnabled } from '../utils/features';
 import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
 import { logger } from '../utils/logger';
 import { getActor } from '../constants';
-import { writeDaemonMcpConfig, SANDBOX_DIR } from './task-launcher';
+import { writeDaemonMcpConfig } from './task-launcher';
+import { setupSandbox } from '../utils/sandbox';
 import { hasDaemonContext } from './context';
 import { runGit } from '../utils/git';
 import { validateBranchInSyncWithRemote } from '../utils/git';
-import { mkdir, copyFile, writeFile, rm, readdir, readFile } from 'fs/promises';
-import { getHome } from '../utils/home';
-import { dirExists } from '../utils/fs';
+import { isOfflineMode } from '../utils/offline';
+import { readdir, readFile } from 'fs/promises';
 
-import type { StartCommand, UnblockCommand, SyncCommand } from '../protocol';
-import type { FileViolation, Task } from '../types';
+import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, CompletedResponse, ErrorResponse } from '../protocol';
+import { PROTOCOL_VERSION } from '../protocol/types';
+import type { FileViolation, Task, TokenUsage } from '../types';
 import type { Storage } from '../storage';
-import type { SandboxConfig } from '../capture/claude';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -82,6 +83,113 @@ async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskI
   }
 }
 
+/**
+ * Resolve the upstream branch for a task, walking up past terminal parents.
+ *
+ * When a parent task is complete/closed/abandoned but the child wasn't
+ * reparented (e.g., reparent-on-accept didn't fire, or the child was
+ * created after the parent completed), this walks up the ancestor chain
+ * until it finds a living parent or reaches top-level.
+ *
+ * Side effect: reparents the task to the living ancestor found (or top-level)
+ * so future operations don't need to walk up again.
+ *
+ * Returns the resolved branch name and any warnings generated.
+ */
+export async function resolveParentBranchWithFallback(
+  task: Task,
+  storage: Storage,
+  projectRoot: string,
+): Promise<{ branch: string; warnings: string[] }> {
+  const warnings: string[] = [];
+
+  if (!task.parent_task_id) {
+    let branch = task.metadata?.remote_target_branch;
+    if (!branch || branch.startsWith('lazy/')) {
+      // Stale task-branch reference or missing — resolve to actual main branch
+      branch = await getCurrentBranch(projectRoot);
+      if (task.metadata?.remote_target_branch) {
+        // Overwrite stale metadata so future syncs use the correct branch
+        await storage.updateTaskMetadata(task.id, 'remote_target_branch', branch);
+        warnings.push(`Corrected stale remote_target_branch from ${task.metadata.remote_target_branch} to ${branch}.`);
+      }
+    }
+    return { branch, warnings };
+  }
+
+  // Check if the direct parent is still alive
+  const parentTask = await storage.getTask(task.parent_task_id);
+  if (parentTask && !isTerminalStatus(parentTask.status)) {
+    // Parent is alive — use its branch directly
+    return {
+      branch: await getBranchNameFromId(task.parent_task_id, storage),
+      warnings,
+    };
+  }
+
+  // Parent is terminal (or missing) — walk up to find a living ancestor
+  let currentParentId: string | null = task.parent_task_id;
+  const staleAncestors: string[] = [];
+
+  while (currentParentId) {
+    const ancestor = await storage.getTask(currentParentId);
+    if (!ancestor) {
+      // Ancestor not found — stop walking
+      staleAncestors.push(currentParentId.substring(0, 8));
+      break;
+    }
+
+    if (!isTerminalStatus(ancestor.status)) {
+      // Found a living ancestor — reparent to it.
+      // Note: remote_target_branch may be stale (set relative to the old parent),
+      // but it's not used when parent_task_id is set — the branch is derived from
+      // the parent task ID. If this ancestor later becomes terminal too, the
+      // "all ancestors terminal" path below ignores remote_target_branch.
+      const ancestorDisplay = displayId(ancestor);
+      const staleList = staleAncestors.join(' → ');
+      logger.info(`Task ${displayId(task)}: parent chain ${staleList} is terminal, reparenting to ${ancestorDisplay}`);
+      warnings.push(`Parent task ${staleList} is complete. Reparented to ${ancestorDisplay}.`);
+
+      await storage.updateTaskParent(task.id, ancestor.id);
+      await storage.createComment(
+        task.id,
+        `[Re-parented] Stale parent chain detected during sync. Re-parented from ${staleList} to ${ancestorDisplay}.`,
+        getActor(),
+      );
+
+      return {
+        branch: await getBranchNameFromId(ancestor.id, storage),
+        warnings,
+      };
+    }
+
+    // This ancestor is terminal too — keep walking
+    staleAncestors.push(displayId(ancestor));
+    currentParentId = ancestor.parent_task_id;
+  }
+
+  // Reached top-level — all ancestors are terminal or missing.
+  // Ignore remote_target_branch: it was set relative to the now-dead parent chain.
+  // Use getCurrentBranch to get the actual main branch.
+  const staleList = staleAncestors.join(' → ');
+  const fallbackBranch = await getCurrentBranch(projectRoot);
+  logger.info(`Task ${displayId(task)}: entire parent chain ${staleList} is terminal, falling back to ${fallbackBranch}`);
+  warnings.push(`Parent task ${staleList} is complete. Syncing with ${fallbackBranch} instead.`);
+
+  await storage.updateTaskParent(task.id, null);
+  await storage.updateTaskMetadata(task.id, 'remote_target_branch', fallbackBranch);
+  await storage.createComment(
+    task.id,
+    `[Re-parented] Stale parent chain detected during sync. All ancestors terminal (${staleList}). Re-parented to top-level, targeting ${fallbackBranch}.`,
+    getActor(),
+  );
+
+  return {
+    branch: fallbackBranch,
+    warnings,
+  };
+}
+
 // =====================================================================
 // Unblock Task
 // =====================================================================
@@ -95,6 +203,18 @@ export interface UnblockTaskParams {
   retargetOrphan?: boolean;
   /** Whether notes were already shown in editor (skip re-injection) */
   notesInEditor?: boolean;
+  /** CLI `--effort` override. Persists on the task so future turns use same value. */
+  effortOverride?: string;
+  /**
+   * Agent permission mode for this turn. When 'plan', the agent is launched
+   * read-only (Q&A against the session). Used by `lazy review -i` ask path.
+   *
+   * INVARIANT: when set to 'plan', the task MUST be exactly 'blocked' — this
+   * is the only path that allows an interactive-review question to turn into
+   * an agent turn. Any other status (working/pairing/conflict/merging/…)
+   * rejects with 409 and the reviewer retains their typed question.
+   */
+  permissionMode?: 'plan' | 'default';
 }
 
 export interface UnblockTaskResult {
@@ -137,6 +257,19 @@ export async function launchUnblockTask(
   }
 
   // --- Status validation ---
+
+  // INVARIANT: plan-mode turns (Q&A from `lazy review -i`) are only allowed
+  // when the task is exactly 'blocked'. The daemon may autonomously transition
+  // blocked → working on CI failures, comment arrival, upstream sync, etc. —
+  // if that race loses the reviewer must retry, not stomp live work. Reject
+  // with 409 so the CLI can preserve the typed question.
+  if (params.permissionMode === 'plan' && task.status !== 'blocked') {
+    throw new RpcError(409,
+      `Task ${displayId(task)} is '${task.status}', not 'blocked'. ` +
+      `Review questions only run while the task is blocked — the agent may have picked up autonomous work. Retry once it's blocked again.`,
+    );
+  }
+
   if (task.status === 'working') {
     throw new RpcError(409, `Task ${displayId(task)} is still working. Wait for it to finish.`);
   }
@@ -219,10 +352,7 @@ export async function launchUnblockTask(
   const canResume = !!sess.agent_session_id;
   const containerName = runner.runNameForTask(tRef);
 
-  const sandbox: SandboxConfig = {
-    worktreePath,
-    sandboxPath: join(worktreePath, SANDBOX_DIR),
-  };
+  const sandbox = await setupSandbox(worktreePath);
 
   try {
     // Restore snapshot if exists
@@ -310,7 +440,7 @@ export async function launchUnblockTask(
       }
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
@@ -321,12 +451,13 @@ export async function launchUnblockTask(
       task.model = modelName;
     }
 
-    // Determine parent branch
-    let parentBranch: string | null = null;
-    if (task.parent_task_id) {
-      parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
-    } else {
-      parentBranch = task.metadata?.remote_target_branch ?? await getCurrentBranch(projectRoot);
+    const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
+
+    // Determine parent branch (with stale-parent fallback)
+    const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot);
+    const parentBranch = parentResolution.branch;
+    if (parentResolution.warnings.length > 0) {
+      warnings.push(...parentResolution.warnings);
     }
 
     // Parent branch is still passed to the supervisor for context (protected
@@ -383,7 +514,12 @@ export async function launchUnblockTask(
       actor: getActor(),
     });
 
-    // Transition to working
+    // Transition to working. Unblock is only semantically valid from these
+    // four statuses; other live statuses are handled above (working/pairing/
+    // merging) or caught by the ended_at check (terminal). A `backlog` task
+    // is "never started" — the right command is `lazy start`, not unblock.
+    // The transition itself is validated against the canonical table in
+    // src/task-state-machine.ts inside storage.updateTaskStatus.
     if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted' || task.status === 'interrupted') {
       await storage.updateTaskStatus(task.id, 'working', getActor());
     }
@@ -402,11 +538,13 @@ export async function launchUnblockTask(
       agent_id: task.agent_id,
       system_prompt: systemPrompt,
       model_id: modelId,
+      effort: effortValue,
       agent_session_id: canResume ? sess.agent_session_id! : undefined,
       parent_branch: parentBranch ?? undefined,
       sync_before_work: false,
       sync_after_work: autoSyncAfterTurn,
       remote_branch: syncResult.remoteBranch,
+      permission_mode: params.permissionMode,
       ...commonCommandFields(config),
     };
     writeCommand(protoDir, unblockCommand);
@@ -450,8 +588,356 @@ export async function launchUnblockTask(
       warnings,
     };
   } finally {
-    removeLock(worktreePath);
+    await removeLock(worktreePath);
   }
+}
+
+// =====================================================================
+// Ask Task (read-only Q&A against the agent session)
+// =====================================================================
+
+export interface AskTaskParams {
+  taskId: string;
+  message: string;
+  effortOverride?: string;
+}
+
+export interface AskTaskResult {
+  sessionId: string;
+  turnNumber: number;
+  answer: string;
+  usage?: TokenUsage;
+  warnings: string[];
+  /**
+   * Latency breakdown (ms) for LAZY_VERBOSE telemetry. Populated even if the
+   * supervisor didn't report agent_duration_ms (agent_ms will be undefined).
+   *
+   *   daemon_ms:  wall-clock of the daemon handler (entry → return)
+   *   wait_ms:    time between writeCommand and waitForResponse returning
+   *   agent_ms:   claude's own process time (from supervisor response)
+   *
+   * The CLI subtracts these from its total wall-clock to derive RPC and
+   * supervisor overheads.
+   */
+  timings: {
+    daemon_ms: number;
+    wait_ms: number;
+    agent_ms?: number;
+  };
+}
+
+/**
+ * Max wall-clock a reviewer waits for an ask turn to complete before the
+ * daemon gives up and returns 504. Sized generously because the agent may
+ * spend a minute chewing on a question before producing an answer.
+ */
+const ASK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Launch a read-only "ask turn" against an existing agent session and
+ * return the agent's answer synchronously.
+ *
+ * Unlike unblock, an ask:
+ *   - Always runs in plan mode (read-only, no writes, no commits).
+ *   - Skips all integration machinery: no upstream sync, no pre/post-turn
+ *     merge, no violation detection, no post-turn check.
+ *   - Rejects with 409 unless the task is currently 'blocked' (an ask only
+ *     makes sense against a paused, reviewable task).
+ *   - Is daemon-owned end-to-end: the daemon waits for response.json, processes
+ *     it, and returns the answer in the RPC result — so the CLI doesn't poll
+ *     and can't race the reconciler.
+ */
+export async function launchAskTask(
+  projectRoot: string,
+  params: AskTaskParams,
+): Promise<AskTaskResult> {
+  const daemonStart = Date.now();
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const resolved = await storage.resolveTask(params.taskId);
+  if (!resolved.task) {
+    if (resolved.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolved.task;
+
+  // --- Session check ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session has ended. Create a variant with: lazy branch ${displayId(task)}`);
+  }
+  if (!sess.agent_session_id) {
+    throw new RpcError(409, `Task ${displayId(task)} has no agent session to resume — cannot ask until the agent has run at least once.`);
+  }
+
+  // --- Status gate: only ever ask a task that's blocked ---
+  // The daemon may autonomously flip blocked → working at any moment (CI
+  // trigger, comment arrival, upstream sync). If that race loses, the
+  // reviewer must retry; we must not stomp live work with a read-only turn.
+  if (task.status !== 'blocked') {
+    throw new RpcError(409,
+      `Task ${displayId(task)} is '${task.status}', not 'blocked'. ` +
+      `Review questions only run while the task is blocked — the agent may have picked up autonomous work. Retry once it's blocked again.`,
+    );
+  }
+
+  // --- Pairing lock check ---
+  checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
+
+  // --- Worktree lock ---
+  const tRef = taskRef(task);
+  const worktreePath = getWorktreePathForRef(projectRoot, tRef);
+  if (!await pathExists(worktreePath)) {
+    throw new RpcError(400, `Worktree missing for task ${displayId(task)}. Run 'lazy sync ${displayId(task)}' to recover.`);
+  }
+  const existingLock = await checkLock(worktreePath);
+  if (existingLock) {
+    throw new RpcError(409, `Task ${shortId(task.id)} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
+  }
+  await acquireLock(worktreePath, 'lazy ask');
+
+  try {
+    // --- Model + effort resolution ---
+    const config = await loadConfig(projectRoot, { cwd: worktreePath });
+
+    let stickyModel: string | undefined;
+    const existingTurns = await storage.getSessionTurns(sess.id);
+    for (let i = existingTurns.length - 1; i >= 0; i--) {
+      if (existingTurns[i].model) {
+        stickyModel = existingTurns[i].model;
+        break;
+      }
+    }
+    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
+      ? config.ollama.model
+      : (stickyModel ?? task.model ?? config.models.default);
+    const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
+
+    // --- Build prompts ---
+    // Asks always resume a live agent session, so no turn-history injection
+    // is needed — the agent already has all prior context in its context window.
+    // Notes are also skipped: an ask is a single reviewer question, not a
+    // feedback delivery channel.
+    const runner = await createRunner(projectRoot);
+    if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
+      (runner as any).setAgent(getAgent(task.agent_id));
+    }
+    runner.checkAvailability();
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
+    const fullMessage = buildPromptWithInstructions(params.message.trim(), task.goal, null, projectRoot);
+
+    // --- Record the human turn BEFORE launching ---
+    // INVARIANT (CLAUDE.md): human feedback must be durably saved before any
+    // operation that might fail can discard it. For an ask, the question is
+    // the feedback.
+    const nextSeq = await storage.getNextTurnSequence(sess.id);
+    await storage.createTurn({
+      sessionId: sess.id,
+      sequence: nextSeq,
+      role: 'human',
+      content: params.message.trim(),
+      model: modelName,
+      prompt: fullMessage,
+      actor: getActor(),
+      turnType: 'ask',
+    });
+
+    // --- Transition blocked → working ---
+    await storage.updateTaskStatus(task.id, 'working', getActor());
+
+    // --- Dispatch ask command to supervisor ---
+    const protoDir = getProtocolDir(task.id);
+    ensureProtocolDir(protoDir);
+
+    const askCommand: AskCommand = {
+      type: 'ask',
+      task_id: task.id,
+      goal: task.goal,
+      prompt: fullMessage,
+      agent_id: task.agent_id,
+      system_prompt: systemPrompt,
+      model_id: modelName,
+      effort: effortValue,
+      agent_session_id: sess.agent_session_id,
+      turn_started_at: new Date().toISOString(),
+      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
+        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
+      }),
+    };
+    writeCommand(protoDir, askCommand);
+
+    // --- Launch or reuse supervisor ---
+    const containerName = runner.runNameForTask(tRef);
+    const sandbox = await setupSandbox(worktreePath);
+
+    let daemonConfigPath: string | null = null;
+    if (runner.usesSandbox()) {
+      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
+    }
+
+    if (runner.isRunning(containerName)) {
+      // Supervisor already running — it will pick up the ask command
+    } else {
+      runner.removeRun(containerName);
+      try {
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+      } catch (err) {
+        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    await storage.updateSessionContainerName(sess.id, containerName);
+
+    // --- Wait synchronously for the supervisor's response ---
+    const waitStart = Date.now();
+    const response = await waitForResponse(protoDir, 500, ASK_TIMEOUT_MS);
+    const waitMs = Date.now() - waitStart;
+    if (!response) {
+      // Timeout — leave the supervisor alone (it may still finish later and
+      // be picked up by the reconciler); we just can't hand an answer back.
+      throw new RpcError(504, `Ask timed out after ${Math.floor(ASK_TIMEOUT_MS / 1000)}s.`);
+    }
+
+    if (response.status === 'error') {
+      await recordAskErrorTurn(storage, task.id, sess.id, response, protoDir);
+      throw new RpcError(500, `Ask failed: ${response.error}`);
+    }
+
+    // --- Completed: record agent turn, transition back to blocked ---
+    const turnNumber = await recordAskCompletedTurn(storage, sess, response, protoDir);
+    await storage.updateTaskStatus(task.id, 'blocked', 'system');
+
+    return {
+      sessionId: sess.id,
+      turnNumber,
+      answer: response.result,
+      usage: response.usage
+        ? {
+            inputTokens: response.usage.input_tokens ?? 0,
+            outputTokens: response.usage.output_tokens ?? 0,
+            cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
+            cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+          }
+        : undefined,
+      warnings,
+      timings: {
+        daemon_ms: Date.now() - daemonStart,
+        wait_ms: waitMs,
+        agent_ms: response.agent_duration_ms,
+      },
+    };
+  } finally {
+    await removeLock(worktreePath);
+  }
+}
+
+/**
+ * Inline the slice of reconciler logic that applies to an ask's completed
+ * response: capture Claude session ID, record the agent turn, roll up
+ * usage, reset interruption counter, consume protocol files. Skips commit
+ * detection, uncommitted snapshotting, and plan-content enrichment — a
+ * read-only ask produces none of those.
+ */
+async function recordAskCompletedTurn(
+  storage: Storage,
+  session: { id: string; agent_session_id: string | null },
+  response: CompletedResponse,
+  protoDir: string,
+): Promise<number> {
+  if (response.session_id && !session.agent_session_id) {
+    await storage.updateSessionClaudeId(session.id, response.session_id);
+  }
+
+  const turnUsage: TokenUsage | undefined = response.usage ? {
+    inputTokens: response.usage.input_tokens ?? 0,
+    outputTokens: response.usage.output_tokens ?? 0,
+    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
+    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+  } : undefined;
+
+  // Idempotency: if a previous flush already recorded the agent turn, reuse it.
+  const existingTurns = await storage.getSessionTurns(session.id);
+  const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
+  let agentTurnSeq: number;
+  if (lastTurn?.role === 'agent') {
+    agentTurnSeq = lastTurn.sequence;
+  } else {
+    agentTurnSeq = await storage.getNextTurnSequence(session.id);
+    await storage.createTurn({
+      sessionId: session.id,
+      sequence: agentTurnSeq,
+      role: 'agent',
+      content: response.result,
+      usage: turnUsage,
+      turnType: 'ask',
+    });
+  }
+
+  if (turnUsage) {
+    try {
+      await storage.updateSessionUsage(session.id, turnUsage);
+    } catch {
+      // Token-usage rollup is best-effort — do not fail the ask over it.
+    }
+  }
+
+  try {
+    await storage.resetConsecutiveInterruptions(session.id);
+  } catch {
+    // Counter reset is best-effort.
+  }
+
+  consumeResponse(protoDir);
+  clearStatus(protoDir);
+
+  return Math.floor(agentTurnSeq / 2) + 1;
+}
+
+async function recordAskErrorTurn(
+  storage: Storage,
+  taskId: string,
+  sessionId: string,
+  response: ErrorResponse,
+  protoDir: string,
+): Promise<void> {
+  const lines: string[] = ['[Agent crashed]', ''];
+  lines.push(`Error: ${response.error}`);
+  if (response.exit_code !== undefined) lines.push(`Exit code: ${response.exit_code}`);
+  if (response.duration_ms !== undefined) {
+    lines.push(`Runtime: ${(response.duration_ms / 1000).toFixed(1)}s`);
+  }
+  lines.push(`Phase: ${response.phase}`);
+  if (response.stdout_error && response.stdout_error !== response.error) {
+    lines.push('', 'Stdout error:', response.stdout_error);
+  }
+  if (response.stderr) {
+    lines.push('', 'Stderr:', response.stderr);
+  }
+  const turnContent = lines.join('\n');
+
+  const existingTurns = await storage.getSessionTurns(sessionId);
+  const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
+  if (lastTurn?.role !== 'agent') {
+    const seq = await storage.getNextTurnSequence(sessionId);
+    await storage.createTurn({
+      sessionId,
+      sequence: seq,
+      role: 'agent',
+      content: turnContent,
+      turnType: 'ask',
+    });
+  }
+
+  consumeResponse(protoDir);
+  clearStatus(protoDir);
+  await storage.updateTaskStatus(taskId, 'interrupted', 'system');
 }
 
 // =====================================================================
@@ -631,7 +1117,18 @@ export async function closeTask(
   }
 
   // Close task (persists reason)
-  await storage.closeTask(task.id, params.reason, getActor());
+  await storage.abandonTask(task.id, params.reason, getActor());
+
+  // Re-parent unfinished children to the grandparent (or top-level).
+  // Same logic as accept: closing a parent orphans its children.
+  const reparented = await reparentChildren(task, storage);
+  const reparentMsg = formatReparentWarning(reparented, task);
+  if (reparentMsg) {
+    warnings.push(`${reparentMsg}.`);
+    for (const child of reparented) {
+      await storage.incrementTaskPendingSync(child.id);
+    }
+  }
 
   // Clean up container, remote resources, and worktree
   if (sess) {
@@ -906,7 +1403,11 @@ export async function acceptTask(
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
   const config = await loadConfig(projectRoot);
-  const driver = createDriver(config);
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  const driver = createDriver(config, undefined, { offline });
+  if (offline) {
+    warnings.push('Offline mode: using local merge (remote operations skipped)');
+  }
 
   // --- Step 1: Pre-flight validation ---
   const preflight = await acceptTaskPreflight(projectRoot, {
@@ -962,6 +1463,8 @@ export async function acceptTask(
       await storage.updateTaskStatus(task.id, 'complete', getActor());
 
       const reparented = await reparentChildren(task, storage);
+      const reparentMsg = formatReparentWarning(reparented, task);
+      if (reparentMsg) warnings.push(`${reparentMsg}.`);
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
@@ -1045,6 +1548,8 @@ export async function acceptTask(
       await storage.updateTaskStatus(task.id, 'complete', getActor());
 
       const reparented = await reparentChildren(task, storage);
+      const reparentMsg = formatReparentWarning(reparented, task);
+      if (reparentMsg) warnings.push(`${reparentMsg}.`);
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
@@ -1103,8 +1608,14 @@ export async function acceptTask(
   const acceptError = driver.validateAccept(task);
   if (acceptError) {
     logger.debug('No remote reference found — pushing branch and creating PR...');
+
     try {
       await driver.pushBranch(sess.git_branch);
+    } catch (err) {
+      throw new RpcError(500, `Failed to push branch ${sess.git_branch}: ${err instanceof Error ? err.message : err}`);
+    }
+
+    try {
       const prResult = await driver.markReadyForReview(task);
       if (prResult.metadata) {
         for (const [key, value] of Object.entries(prResult.metadata)) {
@@ -1115,10 +1626,13 @@ export async function acceptTask(
       }
       const retryError = driver.validateAccept(task);
       if (retryError) {
-        throw new RpcError(500, 'Failed to create remote reference. Try running: lazy submit');
+        // PR creation returned no error but also no metadata the acceptor can
+        // use. This shouldn't happen in practice (markReadyForReview now throws
+        // on gh failures), but guard against it to give a concrete message.
+        throw new Error('markReadyForReview did not produce remote reference metadata');
       }
     } catch (err) {
-      throw new RpcError(500, `Failed to push branch and create PR: ${err instanceof Error ? err.message : err}`);
+      throw new RpcError(500, `Branch ${sess.git_branch} was pushed, but PR creation failed: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -1239,6 +1753,8 @@ export async function acceptTask(
   // parent's changes into their worktrees. Without this, the branch
   // deletion after accept prevents detectParentBranchChanges() from
   // triggering a sync automatically.
+  const reparentMsg = formatReparentWarning(reparented, task);
+  if (reparentMsg) warnings.push(`${reparentMsg}.`);
   for (const child of reparented) {
     await storage.incrementTaskPendingSync(child.id);
   }
@@ -1354,13 +1870,10 @@ export async function syncTask(
     throw new RpcError(409, `Task ${shortId(task.id)} is already locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
   }
 
-  // --- Determine parent branch ---
-  let parentBranch: string | null = null;
-  if (task.parent_task_id) {
-    parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
-  } else {
-    parentBranch = task.metadata?.remote_target_branch ?? await getCurrentBranch(projectRoot);
-  }
+  // --- Determine parent branch (with stale-parent fallback) ---
+  const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot);
+  const parentBranch = parentResolution.branch;
+  warnings.push(...parentResolution.warnings);
 
   if (!parentBranch) {
     throw new RpcError(400, `Cannot determine parent branch for task ${displayId(task)}.`);
@@ -1368,12 +1881,15 @@ export async function syncTask(
 
   // --- Attempt to fetch upstream ref ---
   const config = await loadConfig(projectRoot, { cwd: worktreePath });
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
   let resolvedParentBranch = parentBranch;
   try {
-    const driver = createDriver(config);
+    const driver = createDriver(config, undefined, { offline });
     resolvedParentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
   } catch (err) {
-    // Fetch failed — increment pending_sync so retry loop picks it up
+    // Fetch failed — increment pending_sync so retry loop picks it up.
+    // LocalDriver.resolveUpstreamRef resolves locally without fetching, so
+    // a throw here is a real failure even when offline.
     logger.warn(`Sync fetch failed for ${parentBranch}: ${err instanceof Error ? err.message : err}`);
     await storage.incrementTaskPendingSync(task.id);
     return {
@@ -1385,8 +1901,41 @@ export async function syncTask(
     };
   }
 
+  // --- Resolve upstream SHA so the supervisor merges an immutable commit ---
+  // Resolve the upstream to a SHA on the host, right after resolveUpstreamRef
+  // fetched it, and pass that SHA to the supervisor. The original silent
+  // no-op sync regression (fix-sync-no-merge) had the supervisor short-circuit
+  // with "no upstream changes" even though the daemon saw commits; the root
+  // cause of the short-circuit is still unidentified — it was hidden behind a
+  // silent `return false` in the rev-list error path. Pinning the merge
+  // target to a SHA is correctness-preserving regardless of the underlying
+  // cause, and the SHA-disagreement warning in handleSyncCommand will surface
+  // any actual ref-state divergence if it recurs.
+  const upstreamShaResult = await runGit(['rev-parse', resolvedParentBranch], { cwd: worktreePath });
+  if (upstreamShaResult.exitCode !== 0) {
+    throw new RpcError(
+      500,
+      `Failed to resolve SHA for ${resolvedParentBranch} in ${worktreePath}: ${upstreamShaResult.stderr || 'unknown error'}`,
+    );
+  }
+  const resolvedUpstreamSha = upstreamShaResult.stdout.trim();
+
   // --- Check if upstream has changes ---
-  if (!await hasUpstreamChanges(resolvedParentBranch, worktreePath)) {
+  // Use the SHA we just resolved — it's guaranteed to exist in the worktree's
+  // object store (we fetched it and rev-parse succeeded), so we don't need
+  // to re-resolve the ref. hasUpstreamChanges now throws on git failure per
+  // CLAUDE.md "errors are actionable"; a real rev-list failure here must
+  // surface to the RPC caller instead of silently returning "up to date".
+  let upstreamHasChanges: boolean;
+  try {
+    upstreamHasChanges = await hasUpstreamChanges(resolvedUpstreamSha, worktreePath);
+  } catch (err) {
+    throw new RpcError(
+      500,
+      `Failed to check for upstream changes in ${worktreePath}: ${err instanceof Error ? err.message : err}`,
+    );
+  }
+  if (!upstreamHasChanges) {
     // No changes — reset counter (we've checked, nothing to do)
     await storage.resetTaskPendingSync(task.id);
     return {
@@ -1406,6 +1955,8 @@ export async function syncTask(
 
   await acquireLock(worktreePath, 'lazy sync');
 
+  const priorStatus = task.status;
+
   try {
     const runner = await createRunner(projectRoot);
     // Set agent on runner so auth uses the correct agent (not hardcoded ClaudeCodeAgent)
@@ -1415,19 +1966,38 @@ export async function syncTask(
     runner.checkAvailability();
 
     const containerName = runner.runNameForTask(tRef);
-    const sandbox: SandboxConfig = {
-      worktreePath,
-      sandboxPath: join(worktreePath, SANDBOX_DIR),
-    };
+    const sandbox = await setupSandbox(worktreePath);
 
     const protoDir = getProtocolDir(task.id);
     ensureProtocolDir(protoDir);
+
+    // --- Persist state BEFORE launching supervisor ---
+    // Record a synthetic human turn so the supervisor's completed response
+    // doesn't collide with the idempotency check in handleCompletedResponse
+    // (which skips when the last turn is already an agent turn). This also
+    // gives users a visible record in `lazy show` that sync was requested.
+    const nextSeq = await storage.getNextTurnSequence(sess.id);
+    await storage.createTurn({
+      sessionId: sess.id,
+      sequence: nextSeq,
+      role: 'human',
+      content: `[built-in] Upstream merge requested (parent: ${resolvedParentBranch} @ ${resolvedUpstreamSha.substring(0, 8)})`,
+      actor: getActor(),
+    });
+
+    // Transition to 'working' so the reconciler picks up the supervisor's
+    // response.json and records the agent turn / status transition when the
+    // merge completes. Without this, the supervisor runs but the response
+    // sits in protocol/ forever and the task stays in its prior status.
+    await storage.updateTaskStatus(task.id, 'working', getActor());
 
     // Write a sync command — semantically distinct from start/unblock
     const syncCommand: SyncCommand = {
       type: 'sync',
       task_id: task.id,
+      protocol_version: PROTOCOL_VERSION,
       parent_branch: resolvedParentBranch,
+      upstream_sha: resolvedUpstreamSha,
       agent_session_id: sess.agent_session_id ?? undefined,
       model_id: task.model ?? undefined,
     };
@@ -1448,9 +2018,31 @@ export async function syncTask(
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
       } catch (err) {
+        // Supervisor failed to launch — revert the working transition so the
+        // task doesn't get stuck waiting for a supervisor that never started.
+        // Going back to the prior status is safer than 'interrupted' because
+        // no work has happened yet; the user can simply retry sync.
+        try {
+          await storage.updateTaskStatus(task.id, priorStatus, getActor());
+        } catch (revertErr) {
+          logger.warn(`Failed to revert status for ${displayId(task)} after supervisor launch failure: ${revertErr instanceof Error ? revertErr.message : revertErr}`);
+        }
+        // Clean up the command file — there's no supervisor to consume it,
+        // so a stale sync command shouldn't linger in protoDir.
+        try {
+          consumeCommand(protoDir);
+        } catch (cleanupErr) {
+          logger.warn(`Failed to clean up sync command file for ${displayId(task)} after supervisor launch failure: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`);
+        }
         throw new RpcError(500, `Failed to launch supervisor for sync: ${err instanceof Error ? err.message : err}`);
       }
     }
+
+    // Record container name and reset interaction timer so the reconciler's
+    // grace period applies (prevents a premature 'interrupted' transition
+    // before the supervisor picks up the command).
+    await storage.updateSessionContainerName(sess.id, containerName);
+    await storage.updateSessionInteraction(sess.id, 0);
 
     // NOTE: pending_sync is NOT cleared here. It stays true until:
     // - The supervisor completes the merge and writes a 'completed' response
@@ -1461,7 +2053,7 @@ export async function syncTask(
       taskId: task.id,
       displayId: displayId(task),
       status: 'sync_launched',
-      message: `Upstream merge launched. Branch ${resolvedParentBranch} has changes to merge.`,
+      message: `Merging ${resolvedParentBranch} into the task branch in the background. Check progress with: lazy watch ${displayId(task)}`,
       warnings,
     };
   } finally {
@@ -1514,6 +2106,12 @@ export async function submitTask(
   }
   const task = resolveResult.task;
 
+  // --- Offline check (before any other validation) ---
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  if (offline) {
+    throw new RpcError(400, 'Cannot submit while in offline mode. Run `lazy system online` to restore remote operations, then retry.');
+  }
+
   // --- Status validation ---
   if (task.status !== 'blocked' && task.status !== 'conflict') {
     throw new RpcError(409, `Task ${displayId(task)} is ${task.status}. Only blocked or conflict tasks can be submitted.`);
@@ -1533,6 +2131,7 @@ export async function submitTask(
 
   // --- Remote driver check ---
   const config = await loadConfig(projectRoot);
+
   let driver;
   try {
     driver = createDriver(config);
@@ -1605,6 +2204,8 @@ export async function submitTask(
 export interface ResumeTaskParams {
   taskId: string;
   modelOverride?: string;
+  /** CLI `--effort` override. Persists on the task so future turns use same value. */
+  effortOverride?: string;
 }
 
 export interface ResumeTaskResult {
@@ -1782,23 +2383,8 @@ export async function resumeTask(
   try {
     const config = await loadConfig(projectRoot, { cwd: worktreePath });
 
-    // Ensure sandbox exists
-    const sandboxPath = join(worktreePath, SANDBOX_DIR);
-    const claudeDir = join(sandboxPath, '.claude');
-    await mkdir(claudeDir, { recursive: true });
-
-    const hostGitconfig = join(getHome(), '.gitconfig');
-    const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-    if (await dirExists(sandboxGitconfig)) {
-      await rm(sandboxGitconfig, { recursive: true });
-    }
-    if (await pathExists(hostGitconfig)) {
-      await copyFile(hostGitconfig, sandboxGitconfig);
-    } else {
-      await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
-    }
-
-    const sandbox: SandboxConfig = { worktreePath, sandboxPath };
+    const sandbox = await setupSandbox(worktreePath);
+    const sandboxPath = sandbox.sandboxPath;
 
     // --- Model resolution ---
     let stickyModel: string | undefined;
@@ -1812,7 +2398,7 @@ export async function resumeTask(
       }
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
@@ -1821,6 +2407,8 @@ export async function resumeTask(
     if (!task.model) {
       await storage.updateTaskModel(task.id, modelName);
     }
+
+    const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
 
     // --- Claude session ID discovery ---
     let claudeSessionId = sess.agent_session_id;
@@ -1860,6 +2448,7 @@ export async function resumeTask(
       agent_id: task.agent_id,
       system_prompt: systemPrompt,
       model_id: modelId,
+      effort: effortValue,
       agent_session_id: claudeSessionId ?? undefined,
       ...commonCommandFields(config),
     };
@@ -1912,6 +2501,6 @@ export async function resumeTask(
       warnings,
     };
   } finally {
-    removeLock(worktreePath);
+    await removeLock(worktreePath);
   }
 }

@@ -297,7 +297,7 @@ Examples:
   lazy search catchup --fuzzy                              # Fuzzy search
   lazy search 'status:blocked AND in:turns "reconciler"'   # Structured query
   lazy search 'in:conversations "design decision"'         # Search conversations
-  lazy search 'status:rejected OR status:closed'           # Boolean OR
+  lazy search 'status:abandoned OR status:complete'         # Boolean OR
   lazy search 'has:commits AND NOT in:commits "wip"'       # Negation
   lazy search 'created:>2026-02-15 AND status:working'     # Date filter
   lazy search "design decision" --conversations            # Filter to conversations only

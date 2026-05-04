@@ -24,10 +24,12 @@ import {
   handleWait,
   handleStartTask,
   handleUnblockTask,
+  handleAskTask,
   handleAcceptTaskPreflight,
   handleAcceptTask,
   handleRejectTask,
   handleCloseTask,
+  handleAbandonTask,
   handleSyncTask,
   handleResumeTask,
   handleGetDaemonMcpConfig,
@@ -231,8 +233,8 @@ export async function queryStartTask(params: {
   modelOverride?: string;
   agentId?: string;
   forceLocal?: boolean;
-
   retargetOrphan?: boolean;
+  effortOverride?: string;
 }): Promise<StartTaskRpcResult> {
   const rpc = await tryRpc<StartTaskRpcResult>('startTask', {
     taskId: params.taskId,
@@ -240,6 +242,7 @@ export async function queryStartTask(params: {
     agentId: params.agentId,
     forceLocal: params.forceLocal,
     retargetOrphan: params.retargetOrphan,
+    effortOverride: params.effortOverride,
   });
   if (rpc) return rpc;
 
@@ -288,6 +291,8 @@ export async function queryUnblockTask(params: {
   approvedFiles?: string[];
   retargetOrphan?: boolean;
   notesInEditor?: boolean;
+  effortOverride?: string;
+  permissionMode?: 'plan' | 'default';
 }): Promise<UnblockTaskRpcResult> {
   const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
     taskId: params.taskId,
@@ -296,12 +301,50 @@ export async function queryUnblockTask(params: {
     approvedFiles: params.approvedFiles,
     retargetOrphan: params.retargetOrphan,
     notesInEditor: params.notesInEditor,
+    effortOverride: params.effortOverride,
+    permissionMode: params.permissionMode,
   });
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
   const root = requireLazyRoot();
   return await handleUnblockTask(root, params) as UnblockTaskRpcResult;
+}
+
+// --- Ask Task (read-only Q&A) ---
+
+export interface AskTaskRpcResult {
+  sessionId: string;
+  turnNumber: number;
+  answer: string;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+  };
+  warnings: string[];
+  timings: {
+    daemon_ms: number;
+    wait_ms: number;
+    agent_ms?: number;
+  };
+}
+
+export async function queryAskTask(params: {
+  taskId: string;
+  message: string;
+  effortOverride?: string;
+}): Promise<AskTaskRpcResult> {
+  const rpc = await tryRpc<AskTaskRpcResult>('askTask', {
+    taskId: params.taskId,
+    message: params.message,
+    effortOverride: params.effortOverride,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleAskTask(root, params) as AskTaskRpcResult;
 }
 
 // --- Accept Task Preflight ---
@@ -420,6 +463,32 @@ export async function queryCloseTask(params: {
   return await handleCloseTask(root, params) as CloseTaskRpcResult;
 }
 
+// --- Abandon Task ---
+
+export interface AbandonTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  branchName: string | null;
+  parentTaskId: string | null;
+  warnings: string[];
+}
+
+export async function queryAbandonTask(params: {
+  taskId: string;
+  reason: string;
+  acceptDirtyWorktree?: boolean;
+}): Promise<AbandonTaskRpcResult> {
+  const rpc = await tryRpc<AbandonTaskRpcResult>('abandonTask', {
+    taskId: params.taskId,
+    reason: params.reason,
+    acceptDirtyWorktree: params.acceptDirtyWorktree,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleAbandonTask(root, params) as AbandonTaskRpcResult;
+}
+
 // --- Submit Task ---
 
 export interface SubmitTaskRpcResult {
@@ -458,11 +527,12 @@ export interface ResumeTaskRpcResult {
 export async function queryResumeTask(params: {
   taskId: string;
   modelOverride?: string;
-
+  effortOverride?: string;
 }): Promise<ResumeTaskRpcResult> {
   const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
     taskId: params.taskId,
     modelOverride: params.modelOverride,
+    effortOverride: params.effortOverride,
   });
   if (rpc) return rpc;
 

@@ -69,3 +69,14 @@ export function getStartLockPath(projectRoot: string): string {
 export function getDaemonLockPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), 'daemon.lock');
 }
+
+/** Startup error marker: ~/.lazy/daemon/<slug>/startup-error
+ *  Written by a background daemon child just before it throws a fatal
+ *  startup error (e.g., web-port bind failure). The parent process
+ *  (startDaemonBackground) reads this file after its readiness poll
+ *  times out, so it can surface the actual error to the user's terminal
+ *  instead of a generic "daemon did not start within Ns" message.
+ *  Cleared before each spawn. */
+export function getStartupErrorPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'startup-error');
+}

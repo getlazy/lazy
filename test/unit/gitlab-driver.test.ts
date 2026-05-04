@@ -18,7 +18,8 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'gitlab',
@@ -29,7 +30,7 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '', toolchain: '' },
+  docker: { dockerfile: '' },
   runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
@@ -924,36 +925,12 @@ describe('GitLabDriver', () => {
       }
     });
 
-    // INVARIANT: When the pipeline is running, merge() returns 'pending' instead of 'failed'.
-    // Now caught by pre-merge pipeline check rather than post-merge-failure detection.
-    test('returns pending when pipeline must succeed', async () => {
-      const deps = makeDeps((args) => {
-        // Pre-merge pipeline check: pipeline is running
-        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
-          return ok(JSON.stringify([{ id: 1, status: 'running', web_url: 'https://gitlab.com/pipeline/1' }]));
-        }
-        if (args[0] === 'mr' && args[1] === 'view') {
-          return ok(JSON.stringify({
-            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
-          }));
-        }
-        return fail('unexpected');
-      });
-
-      const driver = new GitLabDriver(mockConfig, deps);
-      const result = await driver.merge({
-        sourceBranch: 'lazy/test1234',
-        targetBranch: 'main',
-        task: makeTask(),
-        taskShortId: 'test1234',
-        root: '/tmp/test',
-      });
-
-      expect(result.status).toBe('pending');
-      if (result.status === 'pending') {
-        expect(result.reason).toContain('Pipeline');
-      }
-    });
+    // INVARIANT (moved to checkAcceptGates): pre-merge gate checks (pipeline,
+    // approvals) are the responsibility of `checkAcceptGates`, not `merge()`.
+    // The original test asserted that `merge()` itself returned 'pending' when
+    // the pipeline was running; that gate behavior now lives in
+    // `checkAcceptGates`. The corresponding gate-level coverage lives in
+    // `checkAcceptGates (mocked)` below.
 
     // INVARIANT: When glab mr merge succeeds but the MR is still open (auto-merge
     // was set), merge() returns 'pending' instead of 'merged'. The task should be
@@ -988,6 +965,42 @@ describe('GitLabDriver', () => {
       }
     });
 
+    // INVARIANT: every successful accept must set auto-merge on the MR,
+    // regardless of pipeline state. The driver passes `--auto-merge` to
+    // `glab mr merge` explicitly so behavior is stable across glab versions
+    // and obvious to readers — never relying on glab's CLI default.
+    test('always passes --auto-merge to glab mr merge', async () => {
+      const glCalls: string[][] = [];
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view' && args.includes('json')) {
+          const mergeAlreadyCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          const state = mergeAlreadyCalled ? 'merged' : 'opened';
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          return ok();
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      const mergeCall = glCalls.find(c => c[0] === 'mr' && c[1] === 'merge');
+      expect(mergeCall).toBeDefined();
+      expect(mergeCall).toContain('--auto-merge');
+    });
+
     // INVARIANT: When the branch is already merged into the target, merge()
     // returns 'merged' immediately without making any glab API calls.
     test('returns merged when branch is already merged into target', async () => {
@@ -1020,78 +1033,11 @@ describe('GitLabDriver', () => {
       expect(glCalls.length).toBe(0);
     });
 
-    // INVARIANT: merge() must check pipeline status before attempting merge.
-    // This prevents maintainers from accidentally bypassing merge checks.
-    test('refuses to merge when pipeline has failed (pre-merge)', async () => {
-      const glCalls: string[][] = [];
-
-      const deps = makeDeps((args) => {
-        glCalls.push([...args]);
-        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
-          return ok(JSON.stringify([{ id: 1, status: 'failed', web_url: 'https://gitlab.com/pipeline/1' }]));
-        }
-        if (args[0] === 'mr' && args[1] === 'view') {
-          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
-        }
-        if (args[0] === 'mr' && args[1] === 'merge') {
-          throw new Error('merge should not be called when pipeline has failed');
-        }
-        return fail('unexpected glab call');
-      });
-
-      const driver = new GitLabDriver(mockConfig, deps);
-      const result = await driver.merge({
-        sourceBranch: 'lazy/test1234',
-        targetBranch: 'main',
-        task: makeTask(),
-        taskShortId: 'test1234',
-        root: '/tmp/test',
-      });
-
-      expect(result.status).toBe('failed');
-      if (result.status === 'failed') {
-        expect(result.error).toContain('Pipeline failed');
-      }
-      expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeUndefined();
-    });
-
-    // INVARIANT: merge() must check approval status before attempting merge.
-    // Required approvals must be met before merging.
-    test('refuses to merge when required approvals are not met', async () => {
-      const glCalls: string[][] = [];
-
-      const deps = makeDeps((args) => {
-        glCalls.push([...args]);
-        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
-          return ok(JSON.stringify([{ id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' }]));
-        }
-        if (args[0] === 'mr' && args[1] === 'view') {
-          return ok(JSON.stringify({
-            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
-            detailed_merge_status: 'not_approved',
-          }));
-        }
-        if (args[0] === 'mr' && args[1] === 'merge') {
-          throw new Error('merge should not be called when approvals are missing');
-        }
-        return fail('unexpected glab call');
-      });
-
-      const driver = new GitLabDriver(mockConfig, deps);
-      const result = await driver.merge({
-        sourceBranch: 'lazy/test1234',
-        targetBranch: 'main',
-        task: makeTask(),
-        taskShortId: 'test1234',
-        root: '/tmp/test',
-      });
-
-      expect(result.status).toBe('pending');
-      if (result.status === 'pending') {
-        expect(result.reason).toContain('Required approvals not met');
-      }
-      expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeUndefined();
-    });
+    // INVARIANT (moved to checkAcceptGates): pipeline-failure and
+    // approvals-missing gates are now enforced by checkAcceptGates() before
+    // the orchestrator calls merge(). The original "merge() refuses ..." tests
+    // are obsolete because merge() trusts the caller to have validated gates;
+    // the gate-level coverage lives in `checkAcceptGates (mocked)` below.
 
     // merge() proceeds when pipeline passes and no approval issues.
     test('merges when pipeline passes and approvals are met', async () => {
@@ -1124,6 +1070,255 @@ describe('GitLabDriver', () => {
 
       expect(result.status).toBe('merged');
       expect(glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')).toBeDefined();
+    });
+  });
+
+  describe('checkAcceptGates (mocked)', () => {
+    function makeDeps(glHandler: (args: string[], cwd?: string) => GlResult): GitLabDriverDeps {
+      return {
+        runGl: async (args: string[], cwd?: string) => Promise.resolve(glHandler(args, cwd)),
+        runGit: async () => Promise.resolve(fail('unexpected git call')),
+      };
+    }
+
+    // INVARIANT: a running (or pending) pipeline is NOT a blocker for accept —
+    // auto-merge handles that case (glab queues "merge when pipeline succeeds").
+    // Treating a running pipeline as a gate failure caused the
+    // "Merge blocked by pre-merge gates: Pipeline running" bug where two accepts
+    // on the same branch would behave inconsistently depending on whether the
+    // pipeline happened to be running at gate-check time.
+    test('does NOT warn when latest pipeline is running (auto-merge handles it)', async () => {
+      const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'running', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({
+            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
+            detailed_merge_status: 'mergeable', blocking_discussions_resolved: true,
+          }));
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const warnings = await driver.checkAcceptGates(makeTask());
+
+      const ciWarning = warnings.find(w => w.gate === 'ci');
+      expect(ciWarning).toBeUndefined();
+    });
+
+    test('does NOT warn when latest pipeline is pending (auto-merge handles it)', async () => {
+      const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'pending', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({
+            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
+            detailed_merge_status: 'mergeable', blocking_discussions_resolved: true,
+          }));
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const warnings = await driver.checkAcceptGates(makeTask());
+
+      const ciWarning = warnings.find(w => w.gate === 'ci');
+      expect(ciWarning).toBeUndefined();
+    });
+
+    // INVARIANT: When the latest pipeline has failed, checkAcceptGates surfaces
+    // a 'ci' warning. (Migrated from the deleted `merge() refuses to merge when
+    // pipeline has failed (pre-merge)` test.)
+    test('warns when latest pipeline has failed', async () => {
+      const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'failed', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const warnings = await driver.checkAcceptGates(makeTask());
+
+      const ciWarning = warnings.find(w => w.gate === 'ci');
+      expect(ciWarning).toBeDefined();
+      expect(ciWarning?.message).toContain('failed');
+    });
+
+    // INVARIANT: When required approvals are missing (detailed_merge_status ===
+    // 'not_approved'), checkAcceptGates surfaces a 'reviews' warning.
+    // (Migrated from the deleted `merge() refuses to merge when required
+    // approvals are not met` test.)
+    test('warns when required approvals are not met', async () => {
+      const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({
+            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
+            detailed_merge_status: 'not_approved',
+          }));
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const warnings = await driver.checkAcceptGates(makeTask());
+
+      const reviewWarning = warnings.find(w => w.gate === 'reviews');
+      expect(reviewWarning).toBeDefined();
+      expect(reviewWarning?.message).toContain('approvals');
+    });
+
+    // Negative case: with a green pipeline, approvals satisfied, and no
+    // unresolved discussions, checkAcceptGates returns no warnings.
+    test('returns no warnings when all gates pass', async () => {
+      const deps = makeDeps((args) => {
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([{ id: 1, status: 'success', web_url: 'https://gitlab.com/pipeline/1' }]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          return ok(JSON.stringify({
+            web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened',
+            detailed_merge_status: 'mergeable',
+            blocking_discussions_resolved: true,
+          }));
+        }
+        return fail('unexpected glab call');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const warnings = await driver.checkAcceptGates(makeTask());
+
+      expect(warnings).toEqual([]);
+    });
+  });
+
+  describe('markReadyForReview error propagation', () => {
+    // INVARIANT: `glab mr create` failures must surface the real stderr with
+    // branch and target branch context. Silently returning empty metadata
+    // leaves the caller to report a misleading "no remote reference" error
+    // and hides the actual gitlab failure (auth, invalid target, etc.).
+    test('propagates glab mr create stderr on failure', async () => {
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          if (args[0] === 'mr' && args[1] === 'create') {
+            return {
+              stdout: '',
+              stderr: 'error: target branch "main" does not exist',
+              exitCode: 1,
+            };
+          }
+          return fail('unexpected glab call');
+        },
+        runGit: async () => ok(),
+      };
+
+      // No existing MR metadata — forces the create path.
+      const task = makeTask({ metadata: { remote_target_branch: 'main' } });
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/glab mr create failed/);
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/target branch "main" does not exist/);
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/main/);
+    });
+
+    // INVARIANT: Idempotency is decided by an explicit state query (draft flag)
+    // instead of substring-matching glab stderr. If the MR is already ready,
+    // `glab mr update --ready` must not be called.
+    test('skips glab mr update --ready when MR is already non-draft (state check)', async () => {
+      const glCalls: string[][] = [];
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          glCalls.push([...args]);
+          if (args[0] === 'mr' && args[1] === 'view' && args.includes('--output')) {
+            return ok(JSON.stringify({ draft: false, work_in_progress: false, iid: 42 }));
+          }
+          return fail('unexpected glab call');
+        },
+        runGit: async () => ok(),
+      };
+
+      // Existing MR metadata — enters the update path.
+      const task = makeTask();
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      const result = await driver.markReadyForReview(task);
+      expect(result).toEqual({});
+
+      // `glab mr update --ready` must not have been called.
+      const updateCall = glCalls.find(c =>
+        c[0] === 'mr' && c[1] === 'update' && c.includes('--ready')
+      );
+      expect(updateCall).toBeUndefined();
+    });
+
+    // INVARIANT: If the MR is actually a draft, `glab mr update --ready`
+    // failures are real failures and must propagate — no stderr substring
+    // matching to decide idempotency.
+    test('propagates glab mr update --ready stderr when MR is draft', async () => {
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          if (args[0] === 'mr' && args[1] === 'view' && args.includes('--output')) {
+            return ok(JSON.stringify({ draft: true, work_in_progress: true, iid: 42 }));
+          }
+          if (args[0] === 'mr' && args[1] === 'update' && args.includes('--ready')) {
+            return {
+              stdout: '',
+              stderr: '403 Forbidden: insufficient permissions',
+              exitCode: 1,
+            };
+          }
+          return fail('unexpected glab call');
+        },
+        runGit: async () => ok(),
+      };
+
+      const task = makeTask();
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/glab mr update --ready failed/);
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/insufficient permissions/);
+    });
+
+    // INVARIANT: `glab mr view` failure is itself a real failure (auth,
+    // missing MR, network) and must propagate — a silent fallback would hide
+    // the real cause and leave the task in an undefined state.
+    test('propagates glab mr view failure before attempting update', async () => {
+      const glCalls: string[][] = [];
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          glCalls.push([...args]);
+          if (args[0] === 'mr' && args[1] === 'view' && args.includes('--output')) {
+            return {
+              stdout: '',
+              stderr: '401 Unauthorized',
+              exitCode: 1,
+            };
+          }
+          return fail('unexpected glab call');
+        },
+        runGit: async () => ok(),
+      };
+
+      const task = makeTask();
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/glab mr view failed/);
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/401 Unauthorized/);
+
+      // Must not fall through to `glab mr update --ready` after the state check failed.
+      const updateCall = glCalls.find(c =>
+        c[0] === 'mr' && c[1] === 'update' && c.includes('--ready')
+      );
+      expect(updateCall).toBeUndefined();
     });
   });
 

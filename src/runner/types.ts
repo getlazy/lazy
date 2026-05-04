@@ -99,6 +99,17 @@ export interface Runner {
   discoverRunningRuns(): string[];
 
   /**
+   * List builder run names that belong to the given project root.
+   *
+   * Builders are launched via `launchBuilderInteractive` and — unlike task
+   * supervisors — have no corresponding entity in storage, so ownership
+   * cannot be reconciled via a task-id lookup. Implementations must use a
+   * runner-specific mechanism to identify project ownership (DockerRunner
+   * uses a container label; host-process mode has no builder runs).
+   */
+  discoverProjectBuilderRuns(projectRoot: string): string[];
+
+  /**
    * Start following a run's output for live display.
    * Returns a handle to the follow process, or null if not supported.
    * @param since - Optional ISO timestamp; only show logs after this time (Docker --since).

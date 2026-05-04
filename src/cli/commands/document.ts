@@ -7,7 +7,7 @@ import { loadConfig } from '../../config/loader';
 
 import documentConstraints from '../../prompts/document-constraints.md' with { type: 'text' };
 
-const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
+const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
 /**
  * Resolve the documents directory path.
@@ -199,7 +199,7 @@ in markdown with mermaid diagrams. It does NOT modify code files.
 Options:
   --goal <goal>      Documentation goal (what to document)
   --prompt <text>    Additional instructions for the documentation agent
-  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --code <code>      Human-readable code (e.g. "doc-storage", "doc-architecture")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

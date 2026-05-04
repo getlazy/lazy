@@ -48,10 +48,13 @@ import type {
   SnapshotsFile,
   ReviewsFile,
   CommentsFile,
+  HunkApprovalsFile,
   StatusChange,
   StatusChangelogFile,
   Actor,
   CommentSource,
+  HunkApproval,
+  HunkApprovalLineage,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { assertValidTransition } from '../task-state-machine';
@@ -59,6 +62,13 @@ import { StorageLock } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
 
 const STORAGE_VERSION = 1;
+
+/** Legacy model aliases → current names (removed in remove-model-aliases) */
+const LEGACY_MODEL_MAP: Record<string, string> = {
+  apprentice: 'haiku',
+  journeyman: 'sonnet',
+  master: 'opus',
+};
 
 export interface FileStorageOptions {
   /** Override the base path instead of computing from lazyRoot + dataDir */
@@ -198,6 +208,12 @@ export class FileStorage implements Storage {
       needsWrite = true;
     }
 
+    // Migrate legacy model aliases to current names
+    if (raw.model && LEGACY_MODEL_MAP[raw.model as string]) {
+      raw.model = LEGACY_MODEL_MAP[raw.model as string];
+      needsWrite = true;
+    }
+
     // Migrate pending_sync: boolean→number (false→0, true→1, undefined→0)
     if (raw.pending_sync === undefined || raw.pending_sync === false) {
       raw.pending_sync = 0;
@@ -218,6 +234,12 @@ export class FileStorage implements Storage {
     // Handle legacy 'active' -> 'blocked' migration
     if (raw.status === 'active') {
       raw.status = 'blocked';
+      needsWrite = true;
+    }
+
+    // Migrate 'closed' → 'abandoned' (unified abandon command)
+    if (raw.status === 'closed') {
+      raw.status = 'abandoned';
       needsWrite = true;
     }
 
@@ -896,7 +918,7 @@ export class FileStorage implements Storage {
     });
   }
 
-  async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {
+  async abandonTask(taskId: string, reason: string, actor?: Actor): Promise<void> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
       if (!fullId) return;
@@ -904,14 +926,14 @@ export class FileStorage implements Storage {
       const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
       if (!task) return;
 
-      assertValidTransition(task.status, 'closed');
+      assertValidTransition(task.status, 'abandoned');
 
       const now = Date.now();
-      task.status = 'closed';
-      task.close_reason = closeReason;
+      task.status = 'abandoned';
+      task.close_reason = reason;
       task.completed_at = now;
 
-      const changelog = await this.readAndAppendStatusChange(fullId, 'closed', now, actor);
+      const changelog = await this.readAndAppendStatusChange(fullId, 'abandoned', now, actor);
       await this.atomicWriteTask(fullId, { 'task.json': task, 'status-changelog.json': changelog });
     });
   }
@@ -1317,6 +1339,7 @@ export class FileStorage implements Storage {
         checkExitCode,
         checkOutput,
         autoTriggered,
+        turnType,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1332,6 +1355,13 @@ export class FileStorage implements Storage {
         turns as unknown as Record<string, unknown>[],
         ['timestamp']
       );
+
+      // Migrate legacy model aliases in existing turns
+      for (const turn of turns) {
+        if (turn.model && LEGACY_MODEL_MAP[turn.model]) {
+          turn.model = LEGACY_MODEL_MAP[turn.model];
+        }
+      }
 
       const now = Date.now();
 
@@ -1355,6 +1385,8 @@ export class FileStorage implements Storage {
         ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
         ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
         ...(autoTriggered ? { auto_triggered: true } : {}),
+        // Only persist non-default turn types — missing field implies 'work'.
+        ...(turnType && turnType !== 'work' ? { turn_type: turnType } : {}),
       };
 
       turns.push(turn);
@@ -1396,10 +1428,19 @@ export class FileStorage implements Storage {
     const turns = turnsFile?.turns ?? [];
 
     // Migrate legacy string timestamps (best-effort write, no lock needed)
-    const migrated = this.migrateTimestampFields(
+    let migrated = this.migrateTimestampFields(
       turns as unknown as Record<string, unknown>[],
       ['timestamp']
     );
+
+    // Migrate legacy model aliases in turns
+    for (const turn of turns) {
+      if (turn.model && LEGACY_MODEL_MAP[turn.model]) {
+        turn.model = LEGACY_MODEL_MAP[turn.model];
+        migrated = true;
+      }
+    }
+
     if (migrated) {
       try {
         await this.writeJson(join(this.taskDir(taskId), 'turns.json'), { turns });
@@ -1814,6 +1855,58 @@ export class FileStorage implements Storage {
     }
 
     return comments.sort((a, b) => a.created_at - b.created_at);
+  }
+
+  // --- Hunk Approvals ---
+
+  async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return [];
+    const file = await this.readJson<HunkApprovalsFile>(
+      join(this.taskDir(fullId), 'hunk-approvals.json'),
+    );
+    return file?.approvals ?? [];
+  }
+
+  async createHunkApproval(
+    taskId: string,
+    hunkHash: string,
+    actor?: Actor,
+    lineage?: HunkApprovalLineage,
+  ): Promise<HunkApproval> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      const file = await this.readJson<HunkApprovalsFile>(
+        join(this.taskDir(fullId), 'hunk-approvals.json'),
+      );
+      const approvals = file?.approvals ?? [];
+
+      // Idempotent: a re-press of `o` on a hunk that's already approved
+      // returns the existing record without duplicating a row.
+      const existing = approvals.find(a => a.hunk_hash === hunkHash);
+      if (existing) return existing;
+
+      const approval: HunkApproval = {
+        id: randomUUID(),
+        task_id: fullId,
+        hunk_hash: hunkHash,
+        approved_at: Date.now(),
+        ...(actor ? { approved_by: actor } : {}),
+        ...(lineage ? {
+          parent_file: lineage.parent_file,
+          parent_lines: lineage.parent_lines,
+          split_path: lineage.split_path,
+        } : {}),
+      };
+      approvals.push(approval);
+
+      await this.atomicWriteTask(fullId, { 'hunk-approvals.json': { approvals } });
+      return approval;
+    });
   }
 
   // --- Conversations ---

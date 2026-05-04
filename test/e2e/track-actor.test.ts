@@ -101,32 +101,32 @@ describe('actor tracking', () => {
 
   // INVARIANT: Status transitions record the actor who triggered them.
   // This enables usage stats on human vs builder workflow balance.
-  test('close from CLI records actor=human on status changelog', async () => {
+  test('abandon from CLI records actor=human on status changelog', async () => {
     const taskId = await createTask(ctx, 'Status actor test');
 
-    const result = await ctx.lazy(['close', taskId, '--yes', '--reason', 'Done']);
+    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
     expectSuccess(result);
 
     const changelog = readStatusChangelog(ctx.root, taskId);
-    // Should have at least the 'backlog' entry (from create) and the 'closed' entry
-    const closedEntry = changelog.find(c => c.status === 'closed');
-    expect(closedEntry).toBeDefined();
-    expect(closedEntry!.actor).toBe('human');
+    // Should have at least the 'backlog' entry (from create) and the 'abandoned' entry
+    const abandonedEntry = changelog.find(c => c.status === 'abandoned');
+    expect(abandonedEntry).toBeDefined();
+    expect(abandonedEntry!.actor).toBe('human');
   });
 
   // INVARIANT: Status transitions via LAZY_ACTOR=builder record actor=builder.
-  test('close with LAZY_ACTOR=builder records actor=builder on status changelog', async () => {
-    const taskId = await createTask(ctx, 'Builder close test');
+  test('abandon with LAZY_ACTOR=builder records actor=builder on status changelog', async () => {
+    const taskId = await createTask(ctx, 'Builder abandon test');
 
-    const result = await ctx.lazy(['close', taskId, '--yes', '--reason', 'Builder close'], {
+    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Builder abandon'], {
       env: { LAZY_ACTOR: 'builder' },
     });
     expectSuccess(result);
 
     const changelog = readStatusChangelog(ctx.root, taskId);
-    const closedEntry = changelog.find(c => c.status === 'closed');
-    expect(closedEntry).toBeDefined();
-    expect(closedEntry!.actor).toBe('builder');
+    const abandonedEntry = changelog.find(c => c.status === 'abandoned');
+    expect(abandonedEntry).toBeDefined();
+    expect(abandonedEntry!.actor).toBe('builder');
   });
 
   // INVARIANT: Human turns record the actor who created them.

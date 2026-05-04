@@ -81,7 +81,6 @@ function statusBadge(status: string): string {
     interrupted: '#9333ea',
     complete: '#16a34a',
     abandoned: '#dc2626',
-    closed: '#9ca3af',
     accepted: '#16a34a',
     rejected: '#dc2626',
     ended: '#6b7280',
@@ -517,7 +516,7 @@ export function taskDetailHtml(
       ${task.model ? `<div class="detail-row"><span class="detail-label">Model</span><span>${escapeHtml(task.model)}</span></div>` : ''}
       <div class="detail-row"><span class="detail-label">Created</span><span>${escapeHtml(formatDate(task.created_at))}</span></div>
       ${task.completed_at ? `<div class="detail-row"><span class="detail-label">Completed</span><span>${escapeHtml(formatDate(task.completed_at))}</span></div>` : ''}
-      ${task.close_reason ? `<div class="detail-row"><span class="detail-label">Close Reason</span><span>${escapeHtml(task.close_reason)}</span></div>` : ''}
+      ${task.close_reason ? `<div class="detail-row"><span class="detail-label">Reason</span><span>${escapeHtml(task.close_reason)}</span></div>` : ''}
       ${task.parent_task_id ? `<div class="detail-row"><span class="detail-label">Parent</span><span><a href="/tasks/${task.parent_task_id}">${escapeHtml(parentTask ? displayId(parentTask) : shortId(task.parent_task_id))}</a></span></div>` : ''}
       ${task.branched_from_sha ? `<div class="detail-row"><span class="detail-label">Branched From</span><span>${escapeHtml(task.branched_from_sha.substring(0, 8))}</span></div>` : ''}
     </div>
@@ -854,7 +853,7 @@ export interface ChartDataPoint {
   date: string;
   backlog: number;      // Backlog size at end of day (snapshot)
   completed: number;    // Tasks accepted that day (daily count)
-  closed: number;       // Tasks closed or rejected that day (daily count)
+  closed: number;       // Tasks abandoned that day (daily count)
 }
 
 export interface ActivityDay {
@@ -1307,7 +1306,7 @@ export function dashboardHtml(stats: DashboardStats): string {
                 tension: 0.2
               },
               {
-                label: 'Closed',
+                label: 'Abandoned',
                 data: data.map(function(d) { return d.closed; }),
                 borderColor: '#dc2626',
                 backgroundColor: 'rgba(220,38,38,0.1)',

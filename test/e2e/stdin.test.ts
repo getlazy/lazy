@@ -107,29 +107,29 @@ describe('stdin piping', () => {
     });
   });
 
-  describe('lazy close', () => {
+  describe('lazy abandon', () => {
     test('reads reason from piped stdin', async () => {
-      const taskId = await createTask(ctx, 'Task to close via stdin');
+      const taskId = await createTask(ctx, 'Task to abandon via stdin');
 
-      const result = await ctx.lazy(['close', taskId], {
-        input: 'Closing because of stdin reason\n',
+      const result = await ctx.lazy(['abandon', taskId], {
+        input: 'Abandoning because of stdin reason\n',
       });
 
       expectSuccess(result);
-      expectOutput(result, 'closed');
-      expectOutput(result, 'Closing because of stdin reason');
+      expectOutput(result, 'abandoned');
+      expectOutput(result, 'Abandoning because of stdin reason');
     });
 
     test('--reason flag takes priority over piped stdin', async () => {
-      const taskId = await createTask(ctx, 'Task to close with flag');
+      const taskId = await createTask(ctx, 'Task to abandon with flag');
 
       const result = await ctx.lazy(
-        ['close', taskId, '--reason', 'Flag reason'],
+        ['abandon', taskId, '--reason', 'Flag reason'],
         { input: 'Stdin reason\n' },
       );
 
       expectSuccess(result);
-      expectOutput(result, 'closed');
+      expectOutput(result, 'abandoned');
       expectOutput(result, 'Flag reason');
     });
   });

@@ -41,6 +41,7 @@ function diagnoseEnoent(
     return `spawn failed: working directory '${options.cwd}' does not exist`;
   }
 
+
   // Check stdout/stderr file paths first — this is the common misdiagnosis case
   for (const stream of ['stdout', 'stderr'] as const) {
     const filePath = extractFilePath(options[stream]);

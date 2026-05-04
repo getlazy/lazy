@@ -1,38 +1,25 @@
 /**
- * Auto-delivery — daemon acts on routed events to auto-sync and auto-notify.
+ * Auto-delivery — daemon detects state changes and delivers signals to tasks.
  *
- * When transient events target blocked tasks (no SSE connection), the daemon
- * auto-unblocks them with appropriate context. For working tasks with SSE
- * connections, events flow automatically via SSE.
- *
- * This module bridges the event routing system (events.ts) with the auto-react
- * budget controls (auto-react-budget.ts) and the task lifecycle (auto-resume.ts
- * pattern).
+ * The single delivery path: state changes detected by reconcile → signals
+ * emitted to SQLite → blocked/submitted tasks drain the queue and auto-unblock
+ * through the protocol (UnblockCommand written to protocol dir, supervisor
+ * picks it up at the next turn boundary).
  *
  * Event types and their delivery:
  *
  *   upstream.updated → blocked children: syncTask() (merge only, no agent turn)
- *                    → working children: SSE delivery (handled by events.ts)
- *
  *   task.completed   → blocked parent: auto-unblock with child completion context
- *                    → working parent: SSE delivery (handled by events.ts)
- *
  *   task.failed      → blocked parent: auto-unblock with failure context
- *                    → working parent: SSE delivery (handled by events.ts)
- *
- *   task.accepted    → parent: SSE delivery
- *                    → blocked siblings: syncTask() (merge only)
- *                    → working siblings: SSE delivery
+ *   task.accepted    → blocked siblings: syncTask() (merge only)
  */
 
 import { join } from 'path';
-import { stat, mkdir, copyFile, writeFile, rm } from 'fs/promises';
-import { getHome } from '../utils/home';
-import { pathExists, dirExists } from '../utils/fs';
+import { pathExists } from '../utils/fs';
+import { setupSandbox } from '../utils/sandbox';
 import type { Storage } from '../storage';
 import type { Task, Session, TaskStatus } from '../types';
-import type { SandboxConfig } from '../capture/claude';
-import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
+
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
@@ -40,8 +27,8 @@ import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
 import { logger } from '../utils/logger';
 import { taskRef, getWorktreePathForRef } from '../cli/helpers';
+import { branchExists } from '../git/operations';
 import { shouldAutoReact, recordAutoReact, type AutoReactTrigger } from './auto-react-budget';
-import { hasConnection, sendEvent, isParentBranchAhead } from './events';
 import { runGit } from '../utils/git';
 import { emitSignal, readSignals, consumeSignals, consumeSignalsById } from './signals';
 import { writeDaemonMcpConfig } from './task-launcher';
@@ -52,7 +39,48 @@ import systemInstructionsResumeText from '../prompts/system-instructions-resume.
 import resumeContextText from '../prompts/resume-context.md' with { type: 'text' };
 import goalContextResumeText from '../prompts/goal-context-resume.md' with { type: 'text' };
 
-const SANDBOX_DIR = '.lazy-task-sandbox';
+/**
+ * Check whether a task's parent branch has commits that the task branch
+ * hasn't merged yet. Returns the parent tip SHA if ahead, null otherwise.
+ *
+ * This is a stateless check — it compares the merge-base to the parent
+ * branch tip using only git state. Safe to call repeatedly without risk
+ * of duplicating actions (caller is responsible for dedup/delivery).
+ */
+async function isParentBranchAhead(
+  storage: Storage,
+  task: Task,
+  lazyRoot: string,
+): Promise<{ ahead: boolean; parentTip: string | null }> {
+  if (!task.parent_task_id) return { ahead: false, parentTip: null };
+
+  const session = await storage.getSessionByTaskId(task.id);
+  if (!session?.git_branch) return { ahead: false, parentTip: null };
+
+  const parentTask = await storage.getTask(task.parent_task_id);
+  if (!parentTask) return { ahead: false, parentTip: null };
+
+  const parentRef = taskRef(parentTask);
+  const parentBranch = `lazy/${parentRef}`;
+
+  if (!await branchExists(parentBranch, lazyRoot) || !await branchExists(session.git_branch, lazyRoot)) {
+    return { ahead: false, parentTip: null };
+  }
+
+  try {
+    const mergeBase = await runGit(['merge-base', session.git_branch, parentBranch], { cwd: lazyRoot });
+    if (mergeBase.exitCode !== 0) return { ahead: false, parentTip: null };
+
+    const parentTip = await runGit(['rev-parse', parentBranch], { cwd: lazyRoot });
+    if (parentTip.exitCode !== 0) return { ahead: false, parentTip: null };
+
+    const tip = parentTip.stdout.trim();
+    const ahead = mergeBase.stdout.trim() !== tip;
+    return { ahead, parentTip: tip };
+  } catch {
+    return { ahead: false, parentTip: null };
+  }
+}
 
 function shortId(id: string): string {
   return id.substring(0, 8);
@@ -141,31 +169,13 @@ export async function autoUnblockTask(
   try {
     const config = await loadConfig(lazyRoot, { cwd: worktreePath });
     // When Ollama is enabled for Claude Code, always use the Ollama model — task model
-    // names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    // names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (task.model ?? config.models.default);
     const modelId = modelName;
 
-    // Ensure sandbox exists
-    const sandboxPath = join(worktreePath, SANDBOX_DIR);
-    const claudeDir = join(sandboxPath, '.claude');
-    await mkdir(claudeDir, { recursive: true });
-
-    // Docker creates .gitconfig as a directory if the bind mount source doesn't exist.
-    const hostGitconfig = join(getHome(), '.gitconfig');
-    const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-    if (await dirExists(sandboxGitconfig)) {
-      await rm(sandboxGitconfig, { recursive: true });
-    }
-
-    if (await pathExists(hostGitconfig)) {
-      await copyFile(hostGitconfig, sandboxGitconfig);
-    } else {
-      await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
-    }
-
-    const sandbox: SandboxConfig = { worktreePath, sandboxPath };
+    const sandbox = await setupSandbox(worktreePath);
 
     // Build the full prompt with event context
     const fullPrompt = message + '\n\n' + buildAutoDeliverPrompt(task.goal);
@@ -228,15 +238,6 @@ export async function autoUnblockTask(
     // Store container name and update interaction timestamp
     await storage.updateSessionContainerName(session.id, containerName);
     await storage.updateSessionInteraction(session.id, 0);
-
-    // Create a detached tmux session for `lazy watch`
-    const tmuxSessName = tmuxSessionName(taskShortId);
-    if (runner.usesSandbox()) {
-      createTmuxWatchSession(tmuxSessName, ['docker', 'logs', '-f', containerName]);
-    } else {
-      const logFile = join(getHome(), '.lazy', 'logs', `${containerName}.log`);
-      createTmuxWatchSession(tmuxSessName, ['tail', '-f', logFile]);
-    }
 
     logger.info(`Auto-unblocked task ${taskShortId}: ${message}`);
     return true;
@@ -451,6 +452,13 @@ export async function deliverCISignals(
 
 // --- Reconcile-time event detection and delivery ---
 
+export interface StateChange {
+  taskId: string;
+  previousStatus: TaskStatus;
+  currentStatus: TaskStatus;
+  parentTaskId: string | null;
+}
+
 /**
  * State tracked across daemon reconcile ticks for detecting changes.
  */
@@ -491,7 +499,7 @@ export async function detectAndDeliverEvents(
   try {
     const allTasks = await storage.listTasks();
     const nonTerminalTasks = allTasks.filter(t =>
-      t.status !== 'complete' && t.status !== 'closed' && t.status !== 'abandoned'
+      t.status !== 'complete' && t.status !== 'abandoned'
     );
 
     // Build current status map
@@ -536,19 +544,11 @@ async function handleTaskAccepted(
   parentTaskId: string,
   _lazyRoot: string,
 ): Promise<void> {
-  const { routeAcceptedEvents } = await import('./events');
-
-  // Route events via SSE to connected supervisors
-  await routeAcceptedEvents(storage, acceptedTaskId, parentTaskId);
-
-  // Emit upstream_change signals for blocked siblings (not connected via SSE).
+  // Emit upstream_change signals for all siblings.
   // The signal delivery phase will handle the actual sync/unblock.
   const siblings = await storage.getChildTasks(parentTaskId);
   for (const sibling of siblings) {
     if (sibling.id === acceptedTaskId) continue;
-
-    // Skip if already connected via SSE (event was sent by routeAcceptedEvents)
-    if (hasConnection(sibling.id)) continue;
 
     // Emit signal unconditionally — state checks belong in the delivery phase.
     emitSignal(sibling.id, {
@@ -561,12 +561,11 @@ async function handleTaskAccepted(
 }
 
 /**
- * Detect parent branch changes and emit signals / route SSE events to children.
+ * Detect parent branch changes and emit signals to children.
  *
  * For each task with a parent, checks if the parent branch tip has changed
- * since the last reconcile tick. If so:
- * - Working tasks with SSE: send upstream.updated event via SSE
- * - Blocked tasks: emit upstream_change signal (delivered in signal delivery phase)
+ * since the last reconcile tick. If so, emits an upstream_change signal
+ * (delivered in the signal delivery phase).
  *
  * This is event-driven: signals are only emitted when the parent branch tip
  * actually changes (a discrete event), not when a condition is detected.
@@ -609,17 +608,8 @@ async function detectParentBranchChanges(
       const children = await storage.getChildTasks(parentId);
       for (const child of children) {
         // Skip terminal tasks
-        if (child.status === 'complete' || child.status === 'closed' || child.status === 'abandoned') {
+        if (child.status === 'complete' || child.status === 'abandoned') {
           continue;
-        }
-
-        // For working tasks with SSE: send event
-        if (hasConnection(child.id)) {
-          sendEvent(child.id, {
-            type: 'upstream.updated',
-            source_task_id: parentId,
-            payload: { reason: 'branch_push' },
-          });
         }
 
         // Emit signal unconditionally — state checks belong in the delivery phase.
@@ -639,9 +629,8 @@ async function detectParentBranchChanges(
 /**
  * Deliver events for state changes detected by the reconcile loop.
  *
- * Called after routeStateChangeEvents() to handle blocked task delivery.
- * The SSE-based delivery is already done by routeStateChangeEvents — this
- * function handles auto-unblock for blocked parents.
+ * Called after reconcileTasks() to handle auto-unblock for blocked parents
+ * when children complete or fail.
  */
 export async function deliverStateChangeEvents(
   storage: Storage,
@@ -660,7 +649,7 @@ export async function deliverStateChangeEvents(
     // task.completed: working → blocked (turn finished)
     if (previousStatus === 'working' && (currentStatus === 'blocked' || currentStatus === 'conflict')) {
       const parentTask = await storage.getTask(parentTaskId);
-      if (parentTask && parentTask.status === 'blocked' && !hasConnection(parentTaskId)) {
+      if (parentTask && parentTask.status === 'blocked') {
         await deliverTaskCompleted(storage, parentTask, taskId, lazyRoot);
       }
     }
@@ -668,7 +657,7 @@ export async function deliverStateChangeEvents(
     // task.failed: working → interrupted
     if (previousStatus === 'working' && currentStatus === 'interrupted') {
       const parentTask = await storage.getTask(parentTaskId);
-      if (parentTask && parentTask.status === 'blocked' && !hasConnection(parentTaskId)) {
+      if (parentTask && parentTask.status === 'blocked') {
         await deliverTaskFailed(storage, parentTask, taskId, lazyRoot);
       }
     }
@@ -698,8 +687,6 @@ export async function deliverStateChangeEvents(
  * This is the safety net that ensures no signal is lost across daemon
  * restarts, supervisor restarts, or concurrent signal arrival. Signals
  * persist in SQLite, so they survive daemon restarts without re-derivation.
- * The transition-based detection remains for SSE events to working tasks;
- * this function handles blocked tasks with durable persistence.
  */
 export async function runBlockedTaskCatchup(
   storage: Storage,

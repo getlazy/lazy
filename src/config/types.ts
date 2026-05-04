@@ -7,6 +7,14 @@ export type StorageBackendConfig = 'external' | 'postgres';
 /** Runner types for task execution */
 export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
 
+/**
+ * Claude Code `--effort` levels. Controls how hard the model thinks before responding.
+ * Higher levels spend more tokens on internal reasoning before emitting output.
+ */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export const VALID_EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
 export interface LazyConfig {
   models?: {
     default?: string;
@@ -35,6 +43,12 @@ export interface LazyConfig {
     agent_id?: string;
     /** Kill agent process if no output for this many ms. 0 = use agent default. */
     watchdog_output_timeout_ms?: number;
+    /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
+    effort?: EffortLevel;
+  };
+  builder?: {
+    /** Default reasoning effort level passed to Claude Code via --effort for builder sessions. */
+    effort?: EffortLevel;
   };
   server?: {
     port?: number;
@@ -51,7 +65,6 @@ export interface LazyConfig {
   };
   docker?: {
     dockerfile?: string;
-    toolchain?: string;
   };
   runner?: RunnerType | {
     type?: RunnerType;
@@ -123,6 +136,12 @@ export interface ResolvedConfig {
     agent_id: string;
     /** Kill agent process if no output for this many ms. 0 = use agent default. */
     watchdog_output_timeout_ms: number;
+    /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
+    effort: EffortLevel;
+  };
+  builder: {
+    /** Default reasoning effort level passed to Claude Code via --effort for builder sessions. */
+    effort: EffortLevel;
   };
   server: {
     port: number;
@@ -139,7 +158,6 @@ export interface ResolvedConfig {
   };
   docker: {
     dockerfile: string;
-    toolchain: string;
   };
   runner: {
     type: RunnerType;

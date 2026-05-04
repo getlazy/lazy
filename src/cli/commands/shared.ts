@@ -25,7 +25,7 @@ import { commandAccept } from './accept';
 import { theme, dim } from '../theme';
 import { getActor } from '../../constants';
 import { tmuxSessionName, killTmuxWatchSession } from '../../terminal';
-import { reparentChildren } from '../orphan';
+import { reparentChildren, formatReparentWarning } from '../orphan';
 import { readPendingProposals } from './propose';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
@@ -594,17 +594,17 @@ export async function syncTaskFromRemote(
           await storage.updateTaskStatus(task.id, 'complete', getActor());
           // Re-parent unfinished children to the grandparent
           const reparented = await reparentChildren(task, storage);
-          if (reparented.length > 0) {
-            const newParentDesc = task.parent_task_id
-              ? task.parent_task_id.substring(0, 8)
-              : 'top-level';
-            const plural = reparented.length === 1 ? 'child' : 'children';
-            console.log(`Re-parented ${reparented.length} unfinished ${plural} of ${displayId(task)} to ${newParentDesc}.`);
-          }
+          const reparentMsg = formatReparentWarning(reparented, task);
+          if (reparentMsg) console.log(`${reparentMsg}.`);
         }
       } else if (prState === 'CLOSED') {
-        console.log(`Remote ref was closed externally — marking task ${displayId(task)} closed`);
-        await storage.closeTask(task.id, 'Closed externally via remote', getActor());
+        console.log(`Remote ref was closed externally — marking task ${displayId(task)} abandoned`);
+        await storage.abandonTask(task.id, 'Closed externally via remote', getActor());
+
+        // Re-parent unfinished children (same as accept path)
+        const closedReparented = await reparentChildren(task, storage);
+        const closedReparentMsg = formatReparentWarning(closedReparented, task);
+        if (closedReparentMsg) console.log(`${closedReparentMsg}.`);
       }
     }
   } catch (err) {
@@ -873,6 +873,7 @@ export async function runFeedbackFlow(
   taskShortId: string,
   follow: boolean,
   modelOverride?: string,
+  effortOverride?: string,
 ): Promise<'continue' | 'done'> {
   const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, task!.parent_task_id, root, displayId(task!));
 
@@ -901,6 +902,7 @@ export async function runFeedbackFlow(
         message: result.message,
         modelOverride,
         notesInEditor: result.notesInEditor,
+        effortOverride,
       });
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -943,6 +945,7 @@ export async function runFeedbackFlow(
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
     }
+
 
     return 'done';
   }
@@ -1041,4 +1044,3 @@ export async function runSyncWithRemote(
 
   return { remoteCommentsCtx, remoteBranch };
 }
-

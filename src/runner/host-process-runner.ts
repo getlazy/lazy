@@ -37,6 +37,8 @@ interface PidFileData {
   pid: number;
   startedAt: string;
   logFile: string;
+  /** Project root path — used to scope discovery to the current project. */
+  projectRoot?: string;
 }
 
 function runStateDir(worktreePath: string): string {
@@ -93,6 +95,11 @@ function isProcessAlive(pid: number): boolean {
 export class HostProcessRunner implements Runner {
   readonly type = 'dangerously-host-process-without-any-isolation' as const;
   readonly runLabel = 'Process';
+  private lazyRoot: string | undefined;
+
+  constructor(lazyRoot?: string) {
+    this.lazyRoot = lazyRoot;
+  }
 
   private _agent?: Agent;
   private _ollamaConfig?: OllamaConfig;
@@ -225,6 +232,7 @@ export class HostProcessRunner implements Runner {
       pid: proc.pid,
       startedAt: new Date().toISOString(),
       logFile,
+      projectRoot: this.lazyRoot,
     });
 
     logger.debug(`Supervisor process ${runName} launched (PID ${proc.pid})`);
@@ -411,7 +419,16 @@ export class HostProcessRunner implements Runner {
         if (!file.endsWith('.json')) continue;
         const runName = file.replace(/\.json$/, '');
         const pidData = readPidFile(runName);
-        if (pidData && isProcessAlive(pidData.pid)) {
+        if (!pidData || !isProcessAlive(pidData.pid)) continue;
+
+        if (this.lazyRoot) {
+          // Project-scoped filtering: include processes that belong to this project
+          // (matching projectRoot) OR have no projectRoot (backward compat with pre-label PID files).
+          if (pidData.projectRoot === this.lazyRoot || !pidData.projectRoot) {
+            running.push(runName);
+          }
+        } else {
+          // No project root available — return all (legacy behavior).
           running.push(runName);
         }
       }
@@ -420,6 +437,14 @@ export class HostProcessRunner implements Runner {
     } catch {
       return [];
     }
+  }
+
+  discoverProjectBuilderRuns(_projectRoot: string): string[] {
+    // Host-process mode launches the builder as a foreground Claude Code
+    // process without writing a PID file, so there are no builder runs to
+    // enumerate here. `lazy upgrade` therefore has nothing to stop for
+    // host-process builders.
+    return [];
   }
 
   followOutput(runName: string, _since?: string): FollowHandle | null {

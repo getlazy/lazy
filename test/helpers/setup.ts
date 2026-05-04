@@ -8,6 +8,7 @@
 import { join, resolve } from 'path';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
+import { waitForDaemon, readPid, getDaemonDir } from '../../src/daemon';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 const PRELOAD_PATH = resolve(__dirname, '../mocks/preload-mocks.ts');
@@ -45,6 +46,27 @@ export interface TestContext {
   cleanup: () => Promise<void>;
 }
 
+export interface SetupOptions {
+  /**
+   * Start a real `lazy` daemon bound to this test project. The daemon runs as
+   * a detached subprocess (loaded with the mock preload so agent calls stay
+   * mocked) and is torn down in cleanup(). Required for tests that exercise
+   * commands which need daemon-backed storage (e.g. `start`, `accept`).
+   *
+   * When true, `lazyMocked()` does NOT set `LAZY_TEST=1` — otherwise the CLI
+   * would bypass the daemon entirely (see `tryRemoteStorage`). Mocks are still
+   * activated via `LAZY_MOCK_CLAUDE_RESPONSE` (see preload-mocks.ts).
+   */
+  withDaemon?: boolean;
+  /**
+   * Extra env vars to pass to the test daemon at startup. Use this to activate
+   * mock modules (e.g. `LAZY_MOCK_ACCEPT_GATES: '[]'` to load the remote mock
+   * inside the daemon). Per-test mock state can then be injected via files
+   * the mocks read on each call (see test/mocks/remote.ts readGatesFromFile).
+   */
+  daemonEnv?: Record<string, string>;
+}
+
 function spawnGit(cwd: string, ...args: string[]) {
   const result = Bun.spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return {
@@ -77,9 +99,16 @@ async function runLazyMocked(
   args: string[],
   mockResponse: MockAgentResponse,
   protocolBase: string,
+  withDaemon: boolean,
   extraEnv?: Record<string, string>,
   input?: string,
 ): Promise<WorkResult> {
+  // When a real daemon is running for this test, LAZY_TEST=1 must NOT be set —
+  // it would short-circuit tryRemoteStorage/tryRpc and bypass the daemon,
+  // defeating the whole point of `withDaemon`. Mocks still activate because
+  // preload-mocks.ts also checks for LAZY_MOCK_CLAUDE_RESPONSE.
+  const lazyTestEnv = withDaemon ? {} : { LAZY_TEST: '1' };
+
   const proc = Bun.spawn(['bun', 'run', '--preload', PRELOAD_PATH, ENTRY_PATH, ...args], {
     cwd,
     stdin: input !== undefined ? new Blob([input]) : undefined,
@@ -88,7 +117,7 @@ async function runLazyMocked(
     env: {
       ...process.env,
       ...extraEnv,
-      LAZY_TEST: '1',
+      ...lazyTestEnv,
       LAZY_PROTOCOL_BASE: protocolBase,
       LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify(mockResponse),
       // Provide fake auth so getAuthEnvVars() doesn't fail
@@ -106,10 +135,114 @@ async function runLazyMocked(
 }
 
 /**
+ * Start a detached `lazy daemon` for the given project. Loads the mock preload
+ * so agent/claude calls stay mocked even when the daemon is the one launching
+ * the task. Waits for the daemon socket to become responsive before returning.
+ */
+async function startTestDaemon(projectRoot: string, protocolBase: string, extraEnv: Record<string, string> = {}): Promise<void> {
+  const { mkdir, open } = await import('fs/promises');
+  const { join: pathJoin } = await import('path');
+  const daemonDir = getDaemonDir(projectRoot);
+  await mkdir(daemonDir, { recursive: true });
+
+  // Capture daemon stdout/stderr so failures to start show up somewhere. The
+  // default daemon.log isn't written until after the logger is configured,
+  // which is after most startup failures.
+  const startupLogPath = pathJoin(daemonDir, 'test-startup.log');
+  const logHandle = await open(startupLogPath, 'a');
+
+  try {
+    const proc = Bun.spawn(
+      ['bun', 'run', '--preload', PRELOAD_PATH, ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot],
+      {
+        // cwd=projectRoot so preflight/findLazyRoot don't climb up to the
+        // parent worktree and probe .lazy there (causing EROFS in sandboxed
+        // test runs where the worktree is read-only).
+        cwd: projectRoot,
+        stdin: 'ignore',
+        stdout: logHandle.fd,
+        stderr: logHandle.fd,
+        env: {
+          ...process.env,
+          LAZY_PROTOCOL_BASE: protocolBase,
+          // Fake auth so agent launches in the daemon don't fail on getAuthEnvVars()
+          ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
+          // Activate preload-mocks.ts inside the daemon process itself. The
+          // daemon runs task launches (createRunner, checkDocker, supervisor
+          // spawn) in-process; without mocks loaded here those calls hit the
+          // real docker binary / real capture/claude.ts and fail. Value is
+          // a default "success" response — per-test mock overrides set by
+          // runLazyMocked don't propagate into the already-running daemon,
+          // but that's fine: start/accept tests only need the launch to
+          // succeed, not a specific transcript.
+          LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify({
+            result: 'Mock daemon task completion',
+            session_id: 'mock-sess-daemon',
+            usage: { input_tokens: 100, output_tokens: 200 },
+          }),
+          // extraEnv last so callers can override anything above (e.g.
+          // LAZY_MOCK_ACCEPT_GATES='[]' to activate the remote mock inside
+          // the daemon for accept-gates tests).
+          ...extraEnv,
+        },
+      },
+    );
+    proc.unref();
+  } finally {
+    await logHandle.close();
+  }
+
+  const ready = await waitForDaemon(projectRoot, 4_000);
+  if (!ready) {
+    const { readFile } = await import('fs/promises');
+    let diag = '';
+    try { diag = await readFile(startupLogPath, 'utf8'); } catch { /* ignore */ }
+    throw new Error(
+      `Test daemon failed to start for ${projectRoot}\n` +
+      `Startup log:\n${diag.slice(-2000)}`,
+    );
+  }
+}
+
+/**
+ * Stop any daemon running for the given project. Best-effort: reads the
+ * pidfile and sends SIGTERM, then SIGKILL if the process refuses to exit.
+ * Always safe to call — does nothing if no daemon is running.
+ */
+async function stopTestDaemon(projectRoot: string): Promise<void> {
+  const pid = readPid(projectRoot);
+  if (pid === null) return;
+
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    // Process already gone
+    return;
+  }
+
+  // Give it up to 2s to exit cleanly
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return; // exited
+    }
+  }
+
+  // Still alive — force-kill
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // already gone
+  }
+}
+
+/**
  * Create an isolated test lazy project: temp dir with git repo + `lazy init`.
  * Call cleanup() in afterEach to remove it.
  */
-export async function setupTestLazy(): Promise<TestContext> {
+export async function setupTestLazy(options: SetupOptions = {}): Promise<TestContext> {
   const root = await mkdtemp(join(tmpdir(), 'lazy-e2e-'));
   const protocolBase = await mkdtemp(join(tmpdir(), 'lazy-e2e-protocol-'));
 
@@ -137,17 +270,29 @@ export async function setupTestLazy(): Promise<TestContext> {
   spawnGit(root, 'add', '.');
   spawnGit(root, 'commit', '-m', 'Initialize lazy');
 
+  if (options.withDaemon) {
+    await startTestDaemon(root, protocolBase, options.daemonEnv);
+  }
+
   const ctx: TestContext = {
     root,
     protocolBase,
-    lazy: (args, options) => runLazy(root, args, protocolBase, options?.env, options?.input),
-    lazyMocked: (args, mockResponse, options) =>
-      runLazyMocked(root, args, mockResponse, protocolBase, options?.env, options?.input),
+    lazy: (args, optsArg) => runLazy(root, args, protocolBase, optsArg?.env, optsArg?.input),
+    lazyMocked: (args, mockResponse, optsArg) =>
+      runLazyMocked(root, args, mockResponse, protocolBase, options.withDaemon === true, optsArg?.env, optsArg?.input),
     git: (...args) => spawnGit(root, ...args),
     cleanup: async () => {
+      // Always stop any daemon that was spawned for this project — either
+      // explicitly via withDaemon or implicitly auto-started by a CLI call
+      // (ensureDaemon in src/daemon/auto-start.ts). Without this the daemon
+      // outlives the temp dir and leaks its TCP port (we've seen 248 orphan
+      // daemons exhaust the 26024–26123 range across repeated test runs).
+      await stopTestDaemon(root);
+
       await Promise.all([
         rm(root, { recursive: true, force: true }),
         rm(protocolBase, { recursive: true, force: true }),
+        rm(getDaemonDir(root), { recursive: true, force: true }),
       ]);
     },
   };

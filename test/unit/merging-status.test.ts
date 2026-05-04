@@ -20,14 +20,13 @@ describe('merging task status', () => {
     expect(isTerminalStatus('merging' as TaskStatus)).toBe(false);
   });
 
-  // INVARIANT: Terminal statuses are exactly: complete, abandoned, closed.
+  // INVARIANT: Terminal statuses are exactly: complete, abandoned.
   // No other status should be terminal. This ensures the reconciler
   // processes all non-terminal tasks correctly.
-  test('terminal statuses are exactly complete, abandoned, closed', () => {
+  test('terminal statuses are exactly complete and abandoned', () => {
     expect(TERMINAL_STATUSES.has('complete')).toBe(true);
     expect(TERMINAL_STATUSES.has('abandoned')).toBe(true);
-    expect(TERMINAL_STATUSES.has('closed')).toBe(true);
-    expect(TERMINAL_STATUSES.size).toBe(3);
+    expect(TERMINAL_STATUSES.size).toBe(2);
   });
 
   // INVARIANT: 'merging' is a valid TaskStatus value.

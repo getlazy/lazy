@@ -38,10 +38,16 @@ export class ClaudeCodeAgent implements Agent {
     modelId?: string;
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
+    effort?: string;
+    permissionMode?: 'plan' | 'default';
   }): string[] {
     const args = ['claude', '-p', opts.prompt, '--output-format', 'json'];
 
-    if (opts.dangerouslySkipPermissions) {
+    // Plan mode cannot be combined with --dangerously-skip-permissions (claude
+    // rejects the combination). When the caller asks for plan, honor that.
+    if (opts.permissionMode === 'plan') {
+      args.push('--permission-mode', 'plan');
+    } else if (opts.dangerouslySkipPermissions) {
       args.push('--dangerously-skip-permissions');
     }
 
@@ -55,6 +61,10 @@ export class ClaudeCodeAgent implements Agent {
 
     if (opts.modelId) {
       args.push('--model', opts.modelId);
+    }
+
+    if (opts.effort) {
+      args.push('--effort', opts.effort);
     }
 
     return args;

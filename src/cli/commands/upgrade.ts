@@ -24,13 +24,14 @@ import { loadConfig } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
 import { isTTY } from '../editor';
-import { promptYesNo } from '../editor';
+import { promptChoice } from '../editor';
 import { theme } from '../theme';
 import type { Task } from '../../types';
 import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown } from '../../daemon';
 import { ensureDaemon } from '../../daemon/auto-start';
 import { spawnSync } from '../../utils/spawn';
+import { VERSION } from '../../version';
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
@@ -75,15 +76,55 @@ async function discoverRunningContainers(storage: Storage, runner: Runner): Prom
 }
 
 /**
- * Discover all running builder containers.
- * Builder containers are named lazy-builder-{id} and don't have associated tasks.
+ * Discover running builder containers that belong to THIS project.
+ *
+ * INVARIANT: `lazy upgrade` in project A must never enumerate or stop
+ * containers belonging to project B. Builder containers have no matching
+ * task in storage (unlike supervisors), so ownership is determined via a
+ * runner-specific mechanism — DockerRunner uses the `lazy.project` label,
+ * host-process mode has no builder runs at all.
  */
-function discoverRunningBuilderContainers(runner: Runner): string[] {
-  const allNames = runner.discoverRunningRuns();
-  return allNames.filter(name => name.startsWith('lazy-builder-'));
+function discoverProjectBuilderContainers(runner: Runner, projectRoot: string): string[] {
+  return runner.discoverProjectBuilderRuns(projectRoot);
 }
 
+const WAIT_POLL_INTERVAL_MS = 5_000;
+
 // stopRun is now handled by runner.stopRun()
+
+/**
+ * Poll until all working tasks have finished (status != 'working').
+ */
+async function waitForWorkingTasks(storage: Storage, workingContainers: ContainerInfo[]): Promise<void> {
+  const taskIds = workingContainers
+    .filter(c => c.task)
+    .map(c => c.taskShortId);
+
+  if (taskIds.length === 0) return;
+
+  const pollSeconds = Math.round(WAIT_POLL_INTERVAL_MS / 1000);
+  console.log(`\nWaiting for ${taskIds.length} working task(s) to finish... (ctrl-c to cancel)`);
+  console.log(`Polling every ${pollSeconds}s.`);
+
+  while (true) {
+    // Check which tasks are still working
+    const stillWorking: string[] = [];
+    for (const id of taskIds) {
+      const task = await storage.getTask(id);
+      if (task && task.status === 'working') {
+        stillWorking.push(id);
+      }
+    }
+
+    if (stillWorking.length === 0) {
+      console.log('All tasks finished. Proceeding with upgrade...');
+      return;
+    }
+
+    console.log(`  Still waiting on ${stillWorking.length} task(s): ${stillWorking.join(', ')}`);
+    await new Promise(resolve => setTimeout(resolve, WAIT_POLL_INTERVAL_MS));
+  }
+}
 
 /**
  * Force-rebuild the container image by removing the existing one first.
@@ -101,8 +142,9 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
     // Container runtime not available — ensureImage will handle this
   }
 
-  // ensureImage will detect the missing image and rebuild
-  return ensureImage(binary);
+  // ensureImage will detect the missing image and rebuild — with --no-cache
+  // so Docker doesn't serve stale layers (e.g. cached curl install of Claude Code)
+  return ensureImage(binary, { noCache: true });
 }
 
 /**
@@ -132,11 +174,18 @@ async function forceRebuildAgentBinary(): Promise<string> {
 export async function commandUpgrade(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'force', takesValue: false },
+    { name: 'wait', takesValue: false },
     { name: 'dry-run', takesValue: false },
   ], 'upgrade');
 
   const force = parsed.flags.get('force') === true;
+  const wait = parsed.flags.get('wait') === true;
   const dryRun = parsed.flags.get('dry-run') === true;
+
+  if (force && wait) {
+    console.error('Error: --force and --wait are mutually exclusive.');
+    process.exit(1);
+  }
 
   const root = requireLazyRoot();
   const storage = await requireStorage();
@@ -151,10 +200,13 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Discover running runs
+    // Discover running runs scoped to this project. Task containers are
+    // scoped via storage lookup (see discoverRunningContainers); builder
+    // containers are scoped via the lazy.project Docker label so we never
+    // touch builders from other projects.
     const containers = await discoverRunningContainers(storage, runner);
     const workingContainers = containers.filter(c => c.isWorking);
-    const builderContainers = discoverRunningBuilderContainers(runner);
+    const builderContainers = discoverProjectBuilderContainers(runner, root);
 
     // Dry run: show what would happen
     if (dryRun) {
@@ -198,7 +250,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     }
 
     // Check for working containers
-    if (workingContainers.length > 0 && !force) {
+    if (workingContainers.length > 0 && !force && !wait) {
       console.log(theme.warning(`${workingContainers.length} container(s) are currently working:`));
       for (const c of workingContainers) {
         const goal = c.task?.goal ?? '(unknown)';
@@ -208,15 +260,31 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log('Stopping them will interrupt mid-turn work. Tasks will resume from their last checkpoint.');
 
       if (!isTTY()) {
-        console.error('Cannot prompt for confirmation (no TTY). Use --force to skip.');
+        console.error('Cannot prompt for confirmation (no TTY). Use --force or --wait to skip.');
         process.exit(1);
       }
 
-      const confirmed = await promptYesNo('Continue?');
-      if (!confirmed) {
+      const choice = await promptChoice('How would you like to proceed?', [
+        'Stop and upgrade now',
+        'Wait for all tasks to block, then upgrade',
+        'Cancel',
+      ]);
+
+      if (choice === 2) {
         console.log('Upgrade cancelled.');
         return;
       }
+
+      if (choice === 1) {
+        // User chose to wait — fall through to the wait logic below
+        await waitForWorkingTasks(storage, workingContainers);
+      }
+      // choice === 0: stop and upgrade now — continue with existing flow
+    }
+
+    // --wait flag: wait for working tasks to finish before proceeding
+    if (wait && workingContainers.length > 0) {
+      await waitForWorkingTasks(storage, workingContainers);
     }
 
     // Step 1: Stop all running containers/processes for this project
@@ -291,7 +359,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 }
 
 export function upgradeUsage(): void {
-  console.log(`Usage: lazy upgrade [--force] [--dry-run]
+  console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run]
 
 Rebuild the Docker image and agent binary, then restart the daemon.
 
@@ -302,16 +370,21 @@ What happens:
   4. Daemon auto-reconciles and auto-resumes interrupted tasks (~10 seconds)
   5. Builder containers restart on next use
 
-If any containers are in 'working' state (mid-turn), you'll be prompted for
-confirmation before stopping them. Mid-turn work will be lost, but tasks resume
-from their last checkpoint.
+If any containers are in 'working' state (mid-turn), you'll be prompted with
+three options: stop and upgrade now, wait for tasks to finish, or cancel.
+Mid-turn work will be lost if you stop, but tasks resume from their last
+checkpoint.
 
 Options:
   --force     Don't prompt, stop everything including working containers
+  --wait      Wait for all working tasks to block before upgrading
   --dry-run   Show what would be rebuilt and stopped, without doing anything
 
+--force and --wait are mutually exclusive.
+
 Examples:
-  lazy upgrade              # Interactive: rebuild and restart
+  lazy upgrade              # Interactive: prompt if working tasks exist
   lazy upgrade --force      # Non-interactive: stop everything and rebuild
+  lazy upgrade --wait       # Non-interactive: wait for tasks to finish, then upgrade
   lazy upgrade --dry-run    # Preview what would happen`);
 }

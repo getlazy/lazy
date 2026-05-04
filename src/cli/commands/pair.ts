@@ -1,7 +1,8 @@
 import { join } from 'path';
-import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync, readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
+import { bridgeSessionFiles, summarizeSandboxSessions, type SandboxSessionSummary } from './pair-bridge';
 import { isBlockedStatus } from '../../types';
 import { theme } from '../theme';
 import { isTTY, promptLine } from '../editor';
@@ -101,128 +102,74 @@ function readSessionTranscript(worktreePath: string, sessionId: string, sinceTim
   return result;
 }
 
-/**
- * Symlink session files from the sandbox's .claude/projects into the user's
- * ~/.claude/projects so that `claude --resume` can find them on the host.
- *
- * Returns a cleanup function that removes the symlinks we created.
- */
-interface BridgeResult {
-  /** True if the session JSONL is accessible at the host's ~/.claude/projects/ */
-  accessible: boolean;
-  /** Cleanup function that removes any symlinks we created */
-  cleanup: () => void;
+function formatAge(ageMs: number | null): string {
+  if (ageMs == null) return 'unknown age';
+  const s = Math.floor(ageMs / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  const w = Math.floor(d / 7);
+  return `${w}w ago`;
 }
 
-function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeResult {
-  const sandboxClaudeDir = join(worktreePath, SANDBOX_DIR, '.claude');
-  const encodedPath = encodeProjectPath(worktreePath);
-  const sandboxProjectDir = join(sandboxClaudeDir, 'projects', encodedPath);
-  const hostProjectsDir = join(getHome(), '.claude', 'projects');
-  const hostProjectDir = join(hostProjectsDir, encodedPath);
+function previewText(s: string, max = 80): string {
+  const oneLine = s.replace(/\s+/g, ' ').trim();
+  if (oneLine.length <= max) return oneLine;
+  return oneLine.slice(0, max - 1) + '…';
+}
 
-  const noop: BridgeResult = { accessible: false, cleanup: () => {} };
-
-  // If there's no sandbox dir, check if the session is already accessible
-  // at the host location (host-process runner writes directly to ~/.claude/).
-  if (!existsSync(sandboxProjectDir)) {
-    if (sessionId) {
-      const hostSessionFile = join(hostProjectDir, `${sessionId}.jsonl`);
-      if (existsSync(hostSessionFile)) {
-        return { accessible: true, cleanup: () => {} };
-      }
-    }
-    return noop;
-  }
-
-  // If the session file already exists at the destination, check if it's
-  // actually the same file (e.g., Docker bind mount). If so, no bridging needed.
-  if (sessionId) {
-    const sessionFile = `${sessionId}.jsonl`;
-    const destFile = join(hostProjectDir, sessionFile);
-    const srcFile = join(sandboxProjectDir, sessionFile);
-    if (existsSync(destFile) && existsSync(srcFile)) {
-      try {
-        const destStat = lstatSync(destFile);
-        const srcStat = lstatSync(srcFile);
-        if (destStat.ino === srcStat.ino && destStat.dev === srcStat.dev) {
-          return { accessible: true, cleanup: () => {} };
-        }
-      } catch {
-        // Fall through to symlink approach
-      }
+function printCandidateList(staleId: string, summaries: SandboxSessionSummary[]): void {
+  console.error('');
+  console.error(
+    `The stored session ID (${staleId.substring(0, 8)}...) doesn't match any file in the sandbox.`,
+  );
+  console.error('Multiple other sessions are present:');
+  console.error('');
+  for (let i = 0; i < summaries.length; i++) {
+    const s = summaries[i];
+    console.error(`  [${i + 1}] ${s.id.substring(0, 8)}...  (${formatAge(s.ageMs)})`);
+    if (s.lastHumanText) {
+      console.error(`      Last human: "${previewText(s.lastHumanText)}"`);
+    } else {
+      console.error('      (no human messages found)');
     }
   }
+  console.error('');
+}
 
-  // Ensure host projects dir exists
-  mkdirSync(hostProjectsDir, { recursive: true });
+/**
+ * Multi-candidate stale-session recovery. Lists each candidate with its age
+ * and last-human-message preview so the user can recognize the right one,
+ * then prompts for selection. Returns the chosen session ID, or null if the
+ * user aborted or we can't prompt (non-TTY).
+ */
+async function pickFromStaleSessions(
+  worktreePath: string,
+  staleId: string,
+  candidates: string[],
+): Promise<string | null> {
+  const summaries = await summarizeSandboxSessions(worktreePath, candidates);
+  printCandidateList(staleId, summaries);
 
-  // Strategy: if the host project dir doesn't exist, symlink the entire
-  // sandbox project dir. If it does exist (host has its own sessions for
-  // this project), symlink individual session files that don't conflict.
-  let hostDirExisted = false;
-  try {
-    lstatSync(hostProjectDir);
-    hostDirExisted = true;
-  } catch {
-    hostDirExisted = false;
+  if (!isTTY()) {
+    console.error('Cannot prompt for selection in non-interactive mode.');
+    console.error('Re-run `lazy pair` in an interactive terminal to pick one of the sessions above.');
+    return null;
   }
 
-  const createdSymlinks: string[] = [];
+  const answer = (await promptLine(`Pick a session [1-${summaries.length}], or empty to abort`)).trim();
+  if (!answer) return null;
 
-  if (!hostDirExisted) {
-    // No host project dir — symlink the entire sandbox project dir
-    try {
-      symlinkSync(sandboxProjectDir, hostProjectDir);
-      createdSymlinks.push(hostProjectDir);
-    } catch {
-      return noop;
-    }
-  } else {
-    // Host project dir exists — symlink individual session files
-    const entries = readdirSync(sandboxProjectDir, { withFileTypes: true });
-    for (const entry of entries) {
-      const srcPath = join(sandboxProjectDir, entry.name);
-      const destPath = join(hostProjectDir, entry.name);
-
-      // Don't overwrite existing files (could be from a real host session)
-      try {
-        lstatSync(destPath);
-        continue;
-      } catch {
-        // Doesn't exist — safe to create symlink
-      }
-
-      try {
-        symlinkSync(srcPath, destPath);
-        createdSymlinks.push(destPath);
-      } catch {
-        // Best effort — continue with other files
-      }
-    }
+  const idx = Number.parseInt(answer, 10) - 1;
+  if (Number.isNaN(idx) || idx < 0 || idx >= summaries.length) {
+    console.error(`Invalid selection: "${answer}". Aborting.`);
+    return null;
   }
-
-  // Verify the session file is actually accessible now
-  let accessible = true;
-  if (sessionId) {
-    const sessionFile = join(hostProjectDir, `${sessionId}.jsonl`);
-    accessible = existsSync(sessionFile);
-  }
-
-  const cleanup = () => {
-    for (const linkPath of createdSymlinks) {
-      try {
-        const stat = lstatSync(linkPath);
-        if (stat.isSymbolicLink()) {
-          unlinkSync(linkPath);
-        }
-      } catch {
-        // Best effort cleanup
-      }
-    }
-  };
-
-  return { accessible, cleanup };
+  return summaries[idx].id;
 }
 
 /**
@@ -448,7 +395,7 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     // Task must have a claude session ID to resume (or we'll start fresh)
-    const claudeSessionId = sess.agent_session_id;
+    let claudeSessionId = sess.agent_session_id;
     if (!claudeSessionId) {
       console.log('No existing Claude session to resume. Claude Code will start a fresh session.');
     }
@@ -487,13 +434,89 @@ export async function commandPair(args: string[]): Promise<void> {
     // Bridge session files from sandbox into host ~/.claude/projects/ so
     // that `claude --resume` can find them without overriding CLAUDE_CONFIG_DIR
     // (which would also lose credentials and user preferences).
-    const bridge = bridgeSessionFiles(worktreePath, claudeSessionId ?? undefined);
+    let bridge = bridgeSessionFiles(worktreePath, claudeSessionId ?? undefined);
+
+    // Stale-session fallback: the stored session ID doesn't correspond to any
+    // JSONL in the sandbox, but the sandbox does contain sessions. This happens
+    // when Claude Code rotated the session ID (auto-compact, --resume fallback)
+    // or when the user switched computers so the DB and sandbox are out of sync.
+    if (
+      claudeSessionId &&
+      !bridge.accessible &&
+      bridge.availableSandboxSessions.length === 1
+    ) {
+      const recoveredId = bridge.availableSandboxSessions[0];
+      console.warn('');
+      console.warn(
+        `Warning: stored session ID ${claudeSessionId.substring(0, 8)}... is stale; ` +
+        `resuming the sandbox's only session ${recoveredId.substring(0, 8)}... instead.`
+      );
+      console.warn('Updating the DB so subsequent operations use the recovered session.');
+      console.warn('');
+      // Durable DB update BEFORE we launch Claude Code — a crash during pair
+      // must not lose this reconciliation (otherwise the next pair drifts again).
+      await storage.updateSessionClaudeId(sess.id, recoveredId);
+      bridge.cleanup();
+      claudeSessionId = recoveredId;
+      bridge = bridgeSessionFiles(worktreePath, recoveredId);
+    }
+
+    // Multi-candidate stale recovery: prompt the user to pick by showing
+    // recognition cues (age + last human message). We refuse to auto-pick.
+    if (
+      claudeSessionId &&
+      !bridge.accessible &&
+      bridge.availableSandboxSessions.length > 1
+    ) {
+      const candidates = bridge.availableSandboxSessions;
+      bridge.cleanup();
+      const recoveredId = await pickFromStaleSessions(worktreePath, claudeSessionId, candidates);
+      if (recoveredId) {
+        // Durable DB update BEFORE Claude Code launches — a crash must not
+        // lose this reconciliation (otherwise the next pair drifts again).
+        await storage.updateSessionClaudeId(sess.id, recoveredId);
+        claudeSessionId = recoveredId;
+        bridge = bridgeSessionFiles(worktreePath, recoveredId);
+      } else {
+        // User-initiated abort (empty input, invalid input, or non-TTY).
+        // Per "principle of least surprise": don't dump bridge diagnostics on
+        // top of the picker output the user just walked away from. Roll back
+        // pairing state and exit with a single line.
+        removePairingLock(worktreePath);
+        try {
+          await storage.updateTaskStatus(task.id, 'blocked', getActor());
+          await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
+          await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
+        } catch {
+          // Best effort — the reconciler will clean this up eventually
+        }
+        console.error('Aborted; no session selected.');
+        process.exit(1);
+      }
+    }
 
     if (claudeSessionId && !bridge.accessible) {
       bridge.cleanup();
       removePairingLock(worktreePath);
+      // Roll back the pairing state transition since we never actually paired.
+      try {
+        await storage.updateTaskStatus(task.id, 'blocked', getActor());
+        await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
+        await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
+      } catch {
+        // Best effort — the reconciler will clean this up eventually
+      }
       console.error(`Could not make session ${claudeSessionId.substring(0, 8)}... accessible to Claude Code.`);
-      console.error(`The session data in the sandbox could not be bridged to ~/.claude/projects/.`);
+      console.error('');
+      console.error('Bridging diagnostics:');
+      for (const line of bridge.diagnostics) {
+        console.error(`  ${line}`);
+      }
+      if (bridge.availableSandboxSessions.length === 0) {
+        console.error('');
+        console.error('No session JSONL files were found in the sandbox. The agent may never have');
+        console.error('written a session for this task, or the sandbox was cleared.');
+      }
       process.exit(1);
     }
 

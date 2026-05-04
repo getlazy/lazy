@@ -257,13 +257,39 @@ export class GitLabDriver implements RepositoryDriver {
     const existingMrIid = this.mrNumber(task);
 
     if (existingMrIid) {
-      // MR exists — mark it as ready (remove draft/WIP status)
+      // MR exists — check draft/WIP state explicitly before calling
+      // `glab mr update --ready`. Substring-matching stderr for idempotency is
+      // fragile; propagate real failures. If the MR isn't a draft, nothing to do.
+      const viewResult = await this.gl(['mr', 'view', existingMrIid, '--output', 'json']);
+      if (viewResult.exitCode !== 0) {
+        throw new Error(
+          `glab mr view failed (exit ${viewResult.exitCode}) for MR !${existingMrIid}: ${viewResult.stderr.trim()}`
+        );
+      }
+
+      let isDraft: boolean;
+      try {
+        const data = JSON.parse(viewResult.stdout);
+        // GitLab represents draft state via `draft` (newer) and `work_in_progress` (legacy).
+        isDraft = data.draft === true || data.work_in_progress === true;
+      } catch (err) {
+        throw new Error(
+          `glab mr view returned unparseable JSON for MR !${existingMrIid}: ${err instanceof Error ? err.message : err}`
+        );
+      }
+
+      if (!isDraft) {
+        logger.debug(`MR !${existingMrIid} is already non-draft — nothing to do`);
+        return {};
+      }
+
       const readyResult = await this.gl(['mr', 'update', existingMrIid, '--ready']);
       if (readyResult.exitCode !== 0) {
-        logger.debug(`Failed to mark MR !${existingMrIid} ready (non-fatal): ${readyResult.stderr}`);
-      } else {
-        logger.info(`Marked MR !${existingMrIid} as ready for review`);
+        throw new Error(
+          `glab mr update --ready failed (exit ${readyResult.exitCode}) for MR !${existingMrIid}: ${readyResult.stderr.trim()}`
+        );
       }
+      logger.info(`Marked MR !${existingMrIid} as ready for review`);
       return {};
     }
 
@@ -283,8 +309,9 @@ export class GitLabDriver implements RepositoryDriver {
     ]);
 
     if (createResult.exitCode !== 0) {
-      logger.warn(`Failed to create MR (non-fatal): ${createResult.stderr}`);
-      return {};
+      throw new Error(
+        `glab mr create failed (exit ${createResult.exitCode}) for branch ${branchName} -> ${targetBranch}: ${createResult.stderr.trim()}`
+      );
     }
 
     // glab mr create outputs the MR URL on stdout
@@ -399,8 +426,13 @@ export class GitLabDriver implements RepositoryDriver {
       }
     }
 
+    // INVARIANT: every successful accept must leave the MR with auto-merge enabled,
+    // regardless of pipeline state. `--auto-merge` is glab's default but we pass it
+    // explicitly so behavior is stable across glab versions and obvious to readers.
+    // When the pipeline is already passing (or absent), GitLab will merge immediately;
+    // when it is running/pending, GitLab queues "merge when pipeline succeeds".
     const mergeResult = await this.gl(
-      ['mr', 'merge', String(mergeTarget), '--squash', '--squash-message', `${commitMessage}\n\n${commitBody}`, '--yes'],
+      ['mr', 'merge', String(mergeTarget), '--squash', '--squash-message', `${commitMessage}\n\n${commitBody}`, '--auto-merge', '--yes'],
       root,
     );
     if (mergeResult.exitCode !== 0) {
@@ -598,7 +630,38 @@ export class GitLabDriver implements RepositoryDriver {
     }
   }
 
-  async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
+  async getFailedCIJobs(task: Task, branchName?: string): Promise<CIJobFailure[]> {
+    // Try branch-based pipeline lookup first (works without an MR)
+    if (branchName) {
+      const branchPipelines = await this.getBranchPipelines(branchName);
+      if (branchPipelines.length > 0) {
+        const latest = branchPipelines[0];
+        if (latest.status !== 'failed' && latest.status !== 'canceled') {
+          // Pipeline exists but not failed — no CI failures
+          return [];
+        }
+        const failedJobs = await this.getPipelineFailedJobs(latest.id);
+        if (failedJobs.length === 0) {
+          return [{ name: `Pipeline #${latest.id}`, url: latest.web_url }];
+        }
+        const results: CIJobFailure[] = [];
+        for (const job of failedJobs) {
+          const failure: CIJobFailure = { name: job.name, url: job.web_url };
+          try {
+            const traceResult = await this.gl(['api', `projects/:id/jobs/${job.id}/trace`]);
+            if (traceResult.exitCode === 0 && traceResult.stdout) {
+              failure.log = truncateLog(traceResult.stdout, 200);
+            }
+          } catch {
+            logger.debug(`getFailedCIJobs: failed to fetch trace for job ${job.name}`);
+          }
+          results.push(failure);
+        }
+        return results;
+      }
+    }
+
+    // Fall back to MR-based lookup
     const mrIid = this.mrNumber(task);
 
     // If there's an MR, use MR-based pipeline lookup (most precise).
@@ -1065,12 +1128,14 @@ export class GitLabDriver implements RepositoryDriver {
     if (!mrIid) return warnings;
 
     // Gate 1: Pipeline status
+    // INVARIANT: a running/pending pipeline is NOT a blocker — auto-merge handles
+    // it (glab queues "merge when pipeline succeeds"). Only failed/canceled
+    // pipelines block accept; surfacing those as warnings prevents the orchestrator
+    // from queueing auto-merge against a known-bad pipeline.
     const pipelines = await this.getMRPipelines(mrIid);
     if (pipelines.length > 0) {
       const latest = pipelines[0];
       if (latest.status === 'failed' || latest.status === 'canceled') {
-        warnings.push({ gate: 'ci', message: `Pipeline ${latest.status}` });
-      } else if (latest.status === 'running' || latest.status === 'pending') {
         warnings.push({ gate: 'ci', message: `Pipeline ${latest.status}` });
       }
     }

@@ -34,14 +34,14 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'github_auto_push', 'github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
-  docker: ['dockerfile', 'toolchain'],
-  runner: ['type'],
+  docker: ['dockerfile'],
+  runner: ['type', 'docker_agent_no_network'],
   ollama: ['enabled', 'model', 'endpoint'],
   documents: ['path'],
   worktree: ['include'],
   permissions: ['protected'],
   checks: ['post_turn', 'post_turn_timeout'],
-  daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget'],
+  daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
 

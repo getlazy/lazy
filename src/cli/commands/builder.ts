@@ -27,6 +27,7 @@ import { createRunner, type Runner } from '../../runner';
 import { generateBuilderConfig } from '../../builder/server';
 import { createTerminal } from '../../terminal';
 import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
+import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 // Embedded at build/compile time — changes to these files require rebuild
 import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
@@ -155,11 +156,23 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'autonomous', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'resume', takesValue: true, optionalValue: true },
+    { name: 'effort', takesValue: true },
   ];
   const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
   const autonomous = parsed.flags.get('autonomous') === true;
   const yes = parsed.flags.get('yes') === true;
   const resumeArg = parsed.flags.get('resume') ?? null;
+
+  // --effort override > config.builder.effort > built-in default (enforced in loader: "high")
+  let effortOverride: EffortLevel | undefined;
+  const effortValue = parsed.flags.get('effort') as string | undefined;
+  if (effortValue !== undefined) {
+    if (!VALID_EFFORT_LEVELS.includes(effortValue as EffortLevel)) {
+      console.error(`Invalid effort '${effortValue}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
+      process.exit(1);
+    }
+    effortOverride = effortValue as EffortLevel;
+  }
 
   // Create the runner — determines Docker vs host-process mode
   const runner = await createRunner(root);
@@ -289,6 +302,9 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
 
+  // Resolve builder effort: --effort flag > config.builder.effort (default "high").
+  const builderEffort = effortOverride ?? config.builder.effort;
+
   // Add --dangerously-skip-permissions when in autonomous mode,
   // and --resume <id> when resuming a session
   const finalClaudeExtraArgs = [
@@ -297,6 +313,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // When Ollama is enabled, force Claude Code to use the Ollama model.
     // Without this, Claude Code defaults to its own model (opus) which doesn't exist in Ollama.
     ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
+    '--effort', builderEffort,
   ];
 
   // Set terminal window title to reflect activity
@@ -381,6 +398,8 @@ The interactive system prompt warning is automatically skipped when resuming.
 Flags:
   --autonomous         Run without permission prompts (adds --dangerously-skip-permissions)
   --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
+  --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
+                       Defaults to lazy.toml [builder].effort (default "high")
 
 Examples:
   lazy builder                    # Start new session

@@ -1,4 +1,4 @@
-export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'submitted' | 'merging' | 'conflict' | 'zombie' | 'complete' | 'abandoned' | 'closed' | 'backlog';
+export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'submitted' | 'merging' | 'conflict' | 'zombie' | 'complete' | 'abandoned' | 'backlog';
 
 // Status classification functions live in src/task-state-machine.ts (single source of truth).
 // Re-exported here for backward compatibility — consumers can import from either location.
@@ -130,7 +130,24 @@ export interface Turn {
   check_output?: string;
   /** Whether this turn was auto-triggered (CI failure, comment, upstream sync, crash) vs human-triggered */
   auto_triggered?: boolean;
+  /**
+   * Category of work this turn represents. Default (missing) is 'work' —
+   * a substantive agent turn that advances the task's narrative. 'ask' is
+   * a read-only Q&A exchange (e.g. from `lazy review -i`) that doesn't
+   * advance the task and should be skipped by "latest summary" lookups.
+   *
+   * New values can be added without a migration: storage treats missing as
+   * 'work', and unknown values fall through to work-like defaults.
+   */
+  turn_type?: TurnType;
 }
+
+/**
+ * Category of a turn. Extend with new variants (e.g. 'comment', 'hook') as
+ * new turn flavors appear — storage and UI code should branch on this
+ * rather than adding more boolean flags.
+ */
+export type TurnType = 'work' | 'ask';
 
 export interface Commit {
   id: string;
@@ -175,6 +192,49 @@ export interface Comment {
 
 /** @deprecated Use Comment instead */
 export type Note = Comment;
+
+/**
+ * Persistent record that a reviewer has marked a hunk as reviewed in
+ * `lazy review -i`. Keyed by a content hash (see `src/utils/hunk-hash.ts`)
+ * so a hunk's approval survives re-parses of the diff and is invalidated
+ * the moment the hunk's content changes.
+ */
+export interface HunkApproval {
+  id: string;
+  task_id: string;
+  hunk_hash: string;
+  approved_by?: Actor;
+  approved_at: number;
+  /**
+   * For sub-hunks created via split: the file path of the parent (un-split)
+   * hunk as it appears in the freshly-parsed diff. Anchors the approval by
+   * location, not by parent hash, so unrelated edits to the surrounding
+   * diff don't flip the parent's identity and orphan its children.
+   */
+  parent_file?: string;
+  /** Parent hunk's `lines` field (e.g. "10-20" or "summary"). */
+  parent_lines?: string;
+  /**
+   * Deterministic recipe to replay the splits that produced the approved
+   * sub-hunk from its parent. A string of '0'/'1' digits — each digit picks
+   * the first or second half from `splitHunk()`. Empty/absent for whole-
+   * hunk approvals where the leaf hash alone identifies the target.
+   */
+  split_path?: string;
+}
+
+/**
+ * Optional split-lineage metadata persisted alongside an approval. Present
+ * only when approving a sub-hunk produced by `splitHunk()`. The `hunk_hash`
+ * itself (already on `HunkApproval`) is the content tripwire; the lineage
+ * fields here let the next session re-perform the split and locate the same
+ * sub-hunk before checking the hash.
+ */
+export interface HunkApprovalLineage {
+  parent_file: string;
+  parent_lines: string;
+  split_path: string;
+}
 
 export interface AgentResponse {
   result: string;

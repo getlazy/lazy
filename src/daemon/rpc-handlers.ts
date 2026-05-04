@@ -29,7 +29,7 @@ import { getDiffStat, getDiffFull, getCurrentBranch, branchExists, recoverMissin
 import { getNewNotesSince } from '../cli/commands/shared';
 import { getWorktreePath, getBranchNameFromId, displayId, formatDate } from '../cli/helpers';
 import { launchTask, writeDaemonMcpConfig, type StartTaskParams } from './task-launcher';
-import { launchUnblockTask, rejectTask, closeTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type RejectTaskParams, type CloseTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
+import { launchUnblockTask, launchAskTask, rejectTask, closeTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
 import type { Comment } from '../types';
 import { logger } from '../utils/logger';
 
@@ -143,9 +143,11 @@ export async function handleRpc(
     case 'wait': return handleWait(projectRoot, params);
     case 'startTask': return handleStartTask(projectRoot, params);
     case 'unblockTask': return handleUnblockTask(projectRoot, params);
+    case 'askTask': return handleAskTask(projectRoot, params);
     case 'acceptTaskPreflight': return handleAcceptTaskPreflight(projectRoot, params);
     case 'acceptTask': return handleAcceptTask(projectRoot, params);
     case 'rejectTask': return handleRejectTask(projectRoot, params);
+    case 'abandonTask': return handleAbandonTask(projectRoot, params);
     case 'closeTask': return handleCloseTask(projectRoot, params);
     case 'submitTask': return handleSubmitTask(projectRoot, params);
     case 'resumeTask': return handleResumeTask(projectRoot, params);
@@ -513,6 +515,7 @@ export async function handleStartTask(projectRoot: string, params: Record<string
     agentId: params.agentId as string | undefined,
     forceLocal: params.forceLocal as boolean | undefined,
     retargetOrphan: params.retargetOrphan as boolean | undefined,
+    effortOverride: params.effortOverride as string | undefined,
   };
 
   if (!startParams.taskId) {
@@ -526,6 +529,15 @@ export async function handleStartTask(projectRoot: string, params: Record<string
 // --- Unblock Task ---
 
 export async function handleUnblockTask(projectRoot: string, params: Record<string, unknown>) {
+  const rawPermissionMode = params.permissionMode;
+  let permissionMode: 'plan' | 'default' | undefined;
+  if (rawPermissionMode !== undefined) {
+    if (rawPermissionMode !== 'plan' && rawPermissionMode !== 'default') {
+      throw new RpcError(400, `Invalid permissionMode: ${String(rawPermissionMode)}. Expected 'plan' or 'default'.`);
+    }
+    permissionMode = rawPermissionMode;
+  }
+
   const unblockParams: UnblockTaskParams = {
     taskId: params.taskId as string,
     message: params.message as string,
@@ -533,6 +545,8 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
     approvedFiles: params.approvedFiles as string[] | undefined,
     retargetOrphan: params.retargetOrphan as boolean | undefined,
     notesInEditor: params.notesInEditor as boolean | undefined,
+    effortOverride: params.effortOverride as string | undefined,
+    permissionMode,
   };
 
   if (!unblockParams.taskId) {
@@ -544,6 +558,22 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
 
   logger.info(`Unblocking task ${unblockParams.taskId.substring(0, 8)}`);
   return launchUnblockTask(projectRoot, unblockParams);
+}
+
+// --- Ask Task (read-only Q&A against the session) ---
+
+export async function handleAskTask(projectRoot: string, params: Record<string, unknown>) {
+  const askParams: AskTaskParams = {
+    taskId: params.taskId as string,
+    message: params.message as string,
+    effortOverride: params.effortOverride as string | undefined,
+  };
+
+  if (!askParams.taskId) throw new RpcError(400, 'taskId is required');
+  if (!askParams.message) throw new RpcError(400, 'message is required');
+
+  logger.info(`Asking task ${askParams.taskId.substring(0, 8)}`);
+  return launchAskTask(projectRoot, askParams);
 }
 
 // --- Accept Task Preflight ---
@@ -617,6 +647,25 @@ export async function handleCloseTask(projectRoot: string, params: Record<string
   return closeTask(projectRoot, closeParams);
 }
 
+// --- Abandon Task ---
+
+export async function handleAbandonTask(projectRoot: string, params: Record<string, unknown>) {
+  const abandonParams: CloseTaskParams = {
+    taskId: params.taskId as string,
+    reason: params.reason as string,
+    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+  };
+
+  if (!abandonParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (!abandonParams.reason) {
+    throw new RpcError(400, 'reason is required');
+  }
+
+  return closeTask(projectRoot, abandonParams);
+}
+
 // --- Submit Task ---
 
 export async function handleSubmitTask(projectRoot: string, params: Record<string, unknown>) {
@@ -637,6 +686,7 @@ export async function handleResumeTask(projectRoot: string, params: Record<strin
   const resumeParams: ResumeTaskParams = {
     taskId: params.taskId as string,
     modelOverride: params.modelOverride as string | undefined,
+    effortOverride: params.effortOverride as string | undefined,
   };
 
   if (!resumeParams.taskId) {
@@ -666,8 +716,27 @@ export async function handleSyncTask(projectRoot: string, params: Record<string,
 export async function handleGetDaemonMcpConfig(projectRoot: string, params: Record<string, unknown>) {
   const name = (params.name as string) || `builder-${Date.now()}`;
   const config = await loadConfig(projectRoot);
-  const configPath = await writeDaemonMcpConfig(projectRoot, name, config.data.path);
-  return { configPath };
+  try {
+    const configPath = await writeDaemonMcpConfig(projectRoot, name, config.data.path);
+    return { configPath };
+  } catch (err) {
+    // Safety net: if writeDaemonMcpConfig hits an uninitialized daemon
+    // context (web bind failed on startup), surface a 503 with a clear,
+    // actionable message instead of the opaque "Daemon context not
+    // initialized" internal error. Post-fix, startDaemonServer refuses to
+    // start without a web port, so this path should only trigger for a
+    // daemon built before the fix — but we keep the safety net in case a
+    // future change reintroduces a partial-startup state.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('Daemon context not initialized')) {
+      throw new RpcError(
+        503,
+        'Daemon running in degraded mode: web port not bound. ' +
+        'Restart the daemon after freeing the port: lazy daemon restart',
+      );
+    }
+    throw err;
+  }
 }
 
 // --- Storage proxy ---
@@ -703,7 +772,7 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   updateTaskType: (s, a) => s.updateTaskType(a.taskId as string, a.type as string),
   resetTaskPendingSync: (s, a) => s.resetTaskPendingSync(a.taskId as string),
   incrementTaskPendingSync: (s, a) => s.incrementTaskPendingSync(a.taskId as string),
-  closeTask: (s, a) => s.closeTask(a.taskId as string, a.closeReason as string, a.actor as any),
+  abandonTask: (s, a) => s.abandonTask(a.taskId as string, a.reason as string, a.actor as any),
   reopenTask: (s, a) => s.reopenTask(a.taskId as string, a.actor as any),
   updateTaskMetadata: (s, a) => s.updateTaskMetadata(a.taskId as string, a.key as string, a.value as string),
   getTaskMetadata: (s, a) => s.getTaskMetadata(a.taskId as string, a.key as string),
@@ -762,6 +831,10 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   // Comments
   createComment: (s, a) => s.createComment(a.taskId as string, a.content as string, a.actor as any, a.source as any),
   getTaskComments: (s, a) => s.getTaskComments(a.taskId as string),
+
+  // Hunk approvals (per-hunk reviewed state for `lazy review -i`)
+  listHunkApprovals: (s, a) => s.listHunkApprovals(a.taskId as string),
+  createHunkApproval: (s, a) => s.createHunkApproval(a.taskId as string, a.hunkHash as string, a.actor as any, a.lineage as any),
 
   // Conversations
   saveConversation: (s, a) => s.saveConversation(a.conversation as any),

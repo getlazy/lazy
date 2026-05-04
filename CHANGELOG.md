@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.12.1023] - 2026-05-04 - Sync, Abandon, and Cleanup
+
+Lazy v0.12 sharpens the workflow: sync is now its own operation, close/reject collapse into a single `abandon` command, toolchains are gone, and the daemon hardens around version safety and project isolation. Offline behavior, interactive review, watch, and a new `lazy doctor <task-id>` round out the release.
+
+### New commands
+
+- **`lazy review -i`** — interactive per-hunk review with inline Q&A against the agent's session. Approve, reject, split, or ask the agent about a hunk without leaving the review TUI. Approvals persist across re-runs so split-hunk decisions aren't lost
+- **`lazy watch`** — rewritten as a direct JSONL conversation renderer. Reads the agent's session log and prints full thinking, tool calls, and tool results in real time. Works on any agent runner (Docker, host-process) without tmux
+- **`lazy sync <task>`** — standalone upstream merge for a task branch. Decoupled from unblock so feedback delivery has zero network dependencies. The daemon retries failed syncs with progressive backoff; a real unblock preempts but never cancels a pending sync
+- **`lazy abandon`** — replaces both `lazy close` and `lazy reject`. One verb to create, one to start, one to abandon, one to accept. `lazy close` and `lazy reject` are kept as aliases for backward compatibility. The `closed` task status is retired — tasks are `abandoned` when discarded, regardless of whether work was done
+- **`lazy doctor <task-id>`** — task-level diagnostics and repair. Detects stale parents (parent already complete/accepted), missing local branches, missing worktrees, local/remote divergence, status mismatches, and orphaned worktrees. Interactive by default, with `--yes` to apply fixes automatically and `--dry-run` to report only
+- **`lazy system offline`** / **`lazy system online`** — toggle offline mode for a project. When offline, lazy skips remote pushes/fetches, starts tasks from local HEAD, accepts via local squash merge, and blocks submit with a clear error. The daemon stops sync/push background work on the next tick. Equivalent to `lazy config set offline on`/`off`
+- **`lazy system build lazy-runner`** — explicitly prebuild the base runner Docker image so the first task launch isn't blocked on a cold image build
+
+### Changed
+
+- **Daemon is required** — fallback to daemon-less mode is removed. The daemon must be running; `lazy daemon start` is the entry point
+- **Unblock is pure feedback delivery** — `lazy unblock` no longer attempts upstream merge. Network failures no longer block or corrupt feedback. To merge upstream changes into a branch before unblocking, run `lazy sync <task>` first. The `--sync-with-upstream` flag is removed
+- **Toolchains removed** — the 15 language-specific toolchain Dockerfiles, the `toolchains-list` command, and all `lazy init` toolchain selection are deleted. Agents have passwordless sudo and install what they need; toolchains added complexity without value
+- **Same-session conflict resolution** — the supervisor now uses the agent's existing Claude Code session for merge conflict resolution instead of spawning a cold-start `claude -p` process. The agent has full task context and makes better choices about which side of a conflict to keep
+- **Unblock/accept pre-flight validation moves into daemon RPC** — state transitions happen atomically inside the daemon, eliminating races between concurrent CLI and daemon operations
+- **PostgreSQL storage hidden** — not documented in `lazy init` output; embedded-postgres dependency may be removed in a future release. `external` storage (FileStorage) is the only documented backend
+- **SSE event delivery dropped** — the daemon no longer pushes events to working agents over Server-Sent Events. All event delivery now flows through the unblock/protocol-directory path, removing a second code path that drifted from the primary one. Working tasks pick up sibling/parent updates on their next turn or via auto-unblock
+- **Legacy model alias migration** — task `model` fields stored as `apprentice` / `journeyman` / `master` are auto-migrated to `haiku` / `sonnet` / `opus` on read. Old aliases keep working for existing tasks while new tasks use canonical names
+- **Reconciler concurrency and pacing** — the daemon reconciler issues up to 5 concurrent remote requests instead of serializing, and the tick interval moved from 5s to 30s. Faster end-to-end signal propagation with less idle traffic
+- **Builder containers scoped to project** — builder containers are labeled with the project root and filtered on discovery. `lazy upgrade` in one project no longer stops builder containers belonging to other projects
+- **`lazy upgrade --wait`** — waits for all working tasks to reach a blocked/terminal state before upgrading, instead of killing them. Interactive prompt now offers three options when working containers exist: kill now, wait, or cancel
+- **Updated shell completion** — `lazy` shell completion includes all verbs added in v0.11/v0.12 (`abandon`, `sync`, `doctor`, `submit`, `system`, etc.)
+
+### Added
+
+- **Claude Opus 4.7 support** — added as a selectable model alongside Opus 4.6, Sonnet 4.6, and Haiku 4.5
+- **Protocol version gate on supervisor** — the supervisor refuses commands whose wire protocol is incompatible (Start/Unblock/Sync command shape, RPC signatures, supervisor↔daemon format) and tells the user to run `lazy upgrade` to rebuild containers. The lazy version itself is NOT part of the gate, so different projects on one machine can run different lazy versions concurrently as long as their protocol versions match. Bumping the protocol version is the explicit signal that containers must be rebuilt
+- **Default `--effort` per role** — Claude Code is now invoked with role-aware effort: builder runs at `high`, agents at `medium`. Override via `[agent]` config in `lazy.toml`
+- **`lazy_diff` offset parameter** — MCP tool accepts an `offset` parameter to paginate large diffs instead of returning the full diff in one response
+- **Auto-react gate diagnostics in `lazy status`** — for blocked/submitted tasks, `lazy status <task>` now shows why auto-react is or isn't firing (budget exhausted, task not eligible, gate checks, etc.)
+- **Filesystem-access pre-flight** — lazy now detects when the terminal lacks OS-level filesystem permission (e.g. macOS TCC/Full Disk Access prompts not granted) and surfaces an actionable error before opening `$EDITOR` or running commands that would silently fail
+- **Daemon startup error UX** — daemon startup errors are surfaced to the terminal instead of disappearing into the daemon log, and the previous triple-logging in `daemon.log` is gone
+
+### Fixed
+
+- **CI failure detection no longer requires a PR/MR** — CI status is now looked up by branch name directly (GitLab: pipelines API; GitHub: check-runs API). Branches with no open PR/MR now correctly surface CI failures. Falls back to PR/MR lookup if branch lookup fails
+- **False positive permission violation** — files created by the agent in one turn and modified in a later turn are no longer falsely flagged as violations. The check now correctly considers which files pre-existed on the branch
+- **`lazy upgrade` Docker rebuild used stale cache** — `--no-cache` is now passed when rebuilding the Docker image during upgrade, preventing stale layers from masking version changes
+- **`git push -u` set upstream tracking on task branches** — upstream tracking caused `git pull` on main to merge task branches in. Task branch pushes no longer set `-u`
+- **`lazy status` early return on missing worktree** — a missing worktree previously cut off all remaining status output. Now prints an inline warning and continues rendering diagnostics
+- **GitLab driver auto-merge on accept** — the GitLab driver now self-approves and sets auto-merge when the target branch is unprotected, matching the documented accept flow
+- **GitHub driver swallowed PR creation errors** — failed `gh pr create` calls were reported as a generic "Failed to create remote reference" message. The actual gh CLI error is now surfaced
+- **`lazy pair` session drift** — the pair session ID is now reconciled at turn end, with a safe fallback when the stored ID is stale. Pair session bridging works in the Docker runner for external projects (the pair container can find the agent's session over the daemon bridge)
+- **Daemon startup hang** — daemon process logged "sync loop init" then nothing and never bound its socket. The startup path no longer blocks on a sync loop init that waits for the socket to be ready
+- **Daemon degraded state when web port is taken** — failing to bind the web TCP port now fails fast with an actionable error and is surfaced in `lazy daemon status`, instead of leaving the daemon half-running
+- **Backlog tasks stuck after non-zero check exit** — when an agent turn ended with a non-zero exit from a check command, tasks were stuck in `backlog`. They now transition correctly
+- **Docker build killed by 60s subprocess timeout** — the default subprocess timeout was killing long Docker builds. Docker builds now run without that timeout
+- **Stale `remote_target_branch` on reparent** — `resolveParentBranchWithFallback` could resolve to a stale `lazy/*` parent (e.g. a completed `release-v011`) when reparenting to a top-level branch. Stale targets are now detected and ignored
+- **Reparenting to completed parent** — tasks whose parent was already complete/accepted no longer sync against that stale parent; reparenting to the grandparent (or main) happens up-front
+- **Daemon reconciliation blocked by slow sync** — a slow sync call could starve the reconcile loop. The reconciler no longer awaits potentially-slow remote work on the hot path
+- **Reconcile starvation removed** — the legacy `shouldAbort` / `hasPendingRequests` mechanism inside the reconcile loop is gone; async work already yields, so the manual abort plumbing was creating priority-inversion bugs
+- **Literal `~` not expanded in paths** — some code paths created a literal `~` subdirectory in the project root instead of expanding to `$HOME`. All callers now go through path expansion before opening the file
+
 ## [0.11.942] - 2026-04-06 - The Daemon Release
 
 Lazy v0.11 turns the daemon into the central nervous system of the system — CLI and MCP all connect through it, and tasks advance themselves in response to real-world signals.
@@ -14,7 +73,6 @@ Lazy v0.11 turns the daemon into the central nervous system of the system — CL
 
 ### Auto-react and event delivery
 
-- **Auto-react to CI failures** — When CI fails on a task branch, the daemon detects the failure during sync, extracts job name, failure reason, and logs, then auto-unblocks the task with structured error context so the agent can fix it. Duplicate failures (same CI signature) are not re-triggered
 - **Auto-react to PR comments** — When a human comments on a task's pull request, the daemon auto-unblocks the task with the comment content. Comments on blocked tasks are auto-delivered as daemon events, giving the agent another turn without manual relay. Comment deduplication prevents re-triggering on already-seen comments
 - **Auto-delivery of task tree events** — Events cascade through the task graph: when a child task completes, its parent is notified; when a parent accepts a child, sibling tasks auto-sync with upstream. `upstream.updated` events trigger `--sync-with-upstream` merges. Working tasks receive events via SSE; blocked tasks are auto-unblocked with context
 - **Circuit breakers and budget controls** — Auto-triggered turns are governed by per-task turn budgets (default 3 auto-turns per trigger type), exponential backoff between retries, and a project-wide daily budget (`auto_react_daily_budget`, default 50). When limits are hit, the task pauses for human intervention. Counters reset only on manual unblock — never automatically. Defense-in-depth budget checks prevent runaway auto-triggers even if outer guards fail

@@ -22,3 +22,17 @@ import { homedir } from 'os';
 export function getHome(): string {
   return process.env.HOME || homedir();
 }
+
+/**
+ * Expand a leading `~` or `~/` in a path to the user's home directory.
+ *
+ * Only a leading tilde is recognized — `~user` style expansion is not
+ * supported, and tildes mid-path are returned unchanged. Non-string or
+ * empty input is returned as-is.
+ */
+export function expandTilde(p: string): string {
+  if (!p) return p;
+  if (p === '~') return getHome();
+  if (p.startsWith('~/')) return getHome() + p.slice(1);
+  return p;
+}

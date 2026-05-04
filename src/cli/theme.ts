@@ -75,7 +75,6 @@ const STATUS_COLORS: Record<string, (s: string) => string> = {
   interrupted: red,
   abandoned: red,
   rejected: red,
-  closed: dim,
   ended: dim,
 };
 

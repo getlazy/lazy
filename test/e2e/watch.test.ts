@@ -36,6 +36,14 @@ describe('lazy watch', () => {
   test('shows help with --help flag', async () => {
     const result = await ctx.lazy(['watch', '--help']);
     expectOutput(result, 'lazy watch');
-    expectOutput(result, 'read-only');
+    expectOutput(result, 'real-time');
+  });
+
+  test('help text does not require tmux', async () => {
+    const result = await ctx.lazy(['watch', '--help']);
+    // INVARIANT: lazy watch no longer depends on tmux
+    if (result.stdout.includes('tmux must be installed')) {
+      throw new Error('Watch help text should not require tmux');
+    }
   });
 });

@@ -79,7 +79,10 @@ describe('lazy status', () => {
     expectOutputExcludes(result, 'The session cannot be resumed without the worktree.');
   });
 
-  test('shows ERROR for non-terminal task with missing worktree', async () => {
+  // INVARIANT: Missing worktree on a non-terminal task should show a warning
+  // but NOT early-return — remaining diagnostics (auto-react, session info) are
+  // still valuable and must be rendered.
+  test('shows WARNING for non-terminal task with missing worktree but continues output', async () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Active task test');
 
     // Unblock to move it to 'blocked' status (non-terminal)
@@ -104,14 +107,16 @@ describe('lazy status', () => {
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     rmSync(worktreePath, { recursive: true, force: true });
 
-    // Run status command - should show error for non-terminal task
+    // Run status command - should show warning but continue rendering
     const result = await ctx.lazy(['status', taskId]);
 
-    // For non-terminal tasks with missing worktree, we expect the command to exit early
-    // after showing the error, so it's still a success exit code but with error message
     expectSuccess(result);
-    expectOutput(result, 'ERROR: Worktree directory does not exist!');
+    // Should show WARNING (not ERROR) for missing worktree
+    expectOutput(result, 'WARNING:');
+    expectOutput(result, 'Worktree directory does not exist!');
     expectOutput(result, 'The session cannot be resumed without the worktree.');
+    // Should NOT early-return — session status and other sections should still appear
+    expectOutput(result, 'Session status:');
   });
 
   test('handles missing worktree gracefully for abandoned task', async () => {

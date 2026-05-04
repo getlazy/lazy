@@ -92,7 +92,7 @@ function createMockStorage() {
       statusTransitions.push({ taskId, status, actor });
     },
     createComment: async () => {},
-    closeTask: async () => {},
+    abandonTask: async () => {},
     updateTaskMetadata: async () => {},
     getTaskComments: async () => [],
     getSessionTurns: async () => [],

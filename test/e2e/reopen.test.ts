@@ -16,13 +16,13 @@ describe('lazy reopen', () => {
     await ctx.cleanup();
   });
 
-  test('reopens a closed task', async () => {
-    const taskId = await createTask(ctx, 'Task to close then reopen');
+  test('reopens an abandoned task (no session)', async () => {
+    const taskId = await createTask(ctx, 'Task to abandon then reopen');
 
-    // Close the task
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Premature closure']);
-    expectSuccess(closeResult);
-    expectOutput(closeResult, 'closed');
+    // Abandon the task
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Premature closure']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
 
     // Reopen it
     const reopenResult = await ctx.lazy(['reopen', taskId]);
@@ -36,18 +36,18 @@ describe('lazy reopen', () => {
     expectOutput(showResult, 'backlog');
   });
 
-  test('reopens an abandoned (rejected) task', async () => {
-    const taskId = await createTask(ctx, 'Task to reject then reopen', 'Do some work');
+  test('reopens an abandoned task (with session)', async () => {
+    const taskId = await createTask(ctx, 'Task to abandon then reopen', 'Do some work');
 
     // Start and let the mock agent "work"
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // Reject the task
-    const rejectResult = await ctx.lazy(['reject', taskId, '--reason', 'Wrong approach', '--yes']);
-    expectSuccess(rejectResult);
-    expectOutput(rejectResult, 'rejected');
+    // Abandon the task
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Wrong approach', '--yes']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
 
     // Reopen it
     const reopenResult = await ctx.lazy(['reopen', taskId]);
@@ -61,23 +61,22 @@ describe('lazy reopen', () => {
     expectOutput(showResult, 'blocked');
   });
 
-  // INVARIANT: Close must remove the worktree but preserve the git branch,
+  // INVARIANT: Abandon must remove the worktree but preserve the git branch,
   // so that reopen can recreate the worktree from the preserved branch.
-  // Previously, close deleted both worktree and branch, making reopen impossible.
-  test('reopens a closed task that had a session (worktree removed, branch preserved)', async () => {
-    const taskId = await createTask(ctx, 'Task to start, close, then reopen', 'Do some work');
+  test('reopens an abandoned task that had a session (worktree removed, branch preserved)', async () => {
+    const taskId = await createTask(ctx, 'Task to start, abandon, then reopen', 'Do some work');
 
     // Start and let the mock agent "work"
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // Close the task (should remove worktree but preserve branch)
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Taking a different approach']);
-    expectSuccess(closeResult);
-    expectOutput(closeResult, 'closed');
-    expectOutput(closeResult, 'Worktree removed');
-    expectOutput(closeResult, 'Branch preserved');
+    // Abandon the task (should remove worktree but preserve branch)
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Taking a different approach', '--yes']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
+    expectOutput(abandonResult, 'Worktree removed');
+    expectOutput(abandonResult, 'Branch preserved');
 
     // Verify worktree directory is gone
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

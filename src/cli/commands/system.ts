@@ -1,5 +1,6 @@
 import { printBuiltinPrompts } from './prompts';
-import { printBuiltinToolchains } from './toolchains-list';
+import { commandSystemBuild } from './system-build';
+import { commandOffline, commandOnline } from './offline';
 
 export async function commandSystem(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -9,12 +10,20 @@ export async function commandSystem(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const sub = args.slice(1);
+
   switch (subcommand) {
     case 'prompts':
       printBuiltinPrompts();
       break;
-    case 'toolchains':
-      printBuiltinToolchains();
+    case 'build':
+      await commandSystemBuild(sub);
+      break;
+    case 'offline':
+      await commandOffline(sub);
+      break;
+    case 'online':
+      await commandOnline(sub);
       break;
     default:
       console.error(`Unknown subcommand: system ${subcommand}`);
@@ -26,19 +35,21 @@ export async function commandSystem(args: string[]): Promise<void> {
 export function systemUsage(): void {
   console.log(`Usage: lazy system <subcommand>
 
-Inspect Lazy system internals.
+Inspect and prebuild Lazy system internals, and toggle project-wide modes.
 
 Subcommands:
-  prompts      List built-in system prompt templates
-  toolchains   List built-in toolchain Dockerfiles
+  prompts            List built-in system prompt templates
+  build <name>       Prebuild a lazy system image (bypasses lazy.toml)
+  offline            Enable offline mode (skip all remote operations)
+  online             Disable offline mode (restore remote operations)
 
 System prompts use the 'lazy-prompt-' prefix (e.g. lazy-prompt-system-instructions).
-Toolchains use the 'lazy-toolchain-' prefix (e.g. lazy-toolchain-rust).
 View any with: lazy show <code>
 
 Examples:
   lazy system prompts                             # List all built-in system prompts
-  lazy system toolchains                          # List all built-in toolchains
-  lazy show lazy-prompt-system-instructions       # View a specific system prompt
-  lazy show lazy-toolchain-rust                   # View a toolchain Dockerfile`);
+  lazy system build lazy-runner                   # Prebuild the base runner image
+  lazy system offline                             # Skip all remote operations
+  lazy system online                              # Restore remote operations
+  lazy show lazy-prompt-system-instructions       # View a specific system prompt`);
 }

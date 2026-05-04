@@ -14,7 +14,11 @@ describe('lazy accept auto-sync', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // INVARIANT: `start` + `accept` require a real daemon. Since the v0.11
+    // daemon refactor (93f6a839), CLI commands must go through the daemon
+    // for storage — LAZY_TEST=1 no longer falls back to FileStorage. Tests
+    // that exercise `start`/`accept` must run against a real daemon.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -67,6 +71,12 @@ describe('lazy accept auto-sync', () => {
     });
     expectSuccess(startResult);
 
+    // INVARIANT: `start` launches the supervisor asynchronously via the
+    // daemon — it returns before the task transitions out of 'working'.
+    // Wait for the daemon reconciler to pick up the supervisor's response
+    // and move the task to a non-'working' state before calling accept.
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
     // 2. Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     const worktreeFile = join(worktreePath, 'new-file.txt');
@@ -85,12 +95,15 @@ describe('lazy accept auto-sync', () => {
     const acceptResult = await ctx.lazy(['accept', taskId]);
 
     // The auto-sync will push (succeeds with bare remote) but PR creation
-    // fails (no real GitHub). The accept should fail gracefully.
+    // fails (no real GitHub / gh CLI). The accept should fail gracefully.
     expectFailure(acceptResult);
 
-    // Should show the auto-sync attempt message
-    expectOutput(acceptResult, 'No remote reference found');
-    expectOutput(acceptResult, 'pushing branch and creating PR');
+    // INVARIANT: Auto-sync MUST be attempted — the error must indicate the
+    // branch was pushed before PR creation failed. If this assertion fails
+    // because the message moved out of stderr, check that auto-sync still
+    // happens (don't drop the assertion: it's the entire point of the test).
+    expectError(acceptResult, 'was pushed');
+    expectError(acceptResult, 'PR creation failed');
 
     // Should NOT show the old misleading "start the task" message
     expect(acceptResult.stderr).not.toContain('start the task to push the branch');
@@ -105,6 +118,9 @@ describe('lazy accept auto-sync', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+
+    // Wait for the daemon reconciler (see test above for rationale).
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // 2. Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -124,12 +140,16 @@ describe('lazy accept auto-sync', () => {
     const acceptResult = await ctx.lazy(['accept', taskId]);
     expectFailure(acceptResult);
 
-    // Should suggest `lazy sync` (not `lazy start`)
-    expectError(acceptResult, 'lazy sync');
+    // INVARIANT: Error message must be accurate — must mention that PR
+    // creation failed (the actual root cause), NOT the old misleading
+    // "start the task" message. The post-daemon-refactor error wording is
+    // "Branch X was pushed, but PR creation failed: <gh error>".
+    expectError(acceptResult, 'PR creation failed');
 
-    // Should NOT contain the old misleading message
+    // Should NOT contain the old misleading messages
     expect(acceptResult.stdout).not.toContain('Or start the task');
     expect(acceptResult.stderr).not.toContain('Or start the task');
+    expect(acceptResult.stderr).not.toContain('lazy start');
   });
 
   test('accept with local driver still works (no auto-sync needed)', async () => {
@@ -140,6 +160,9 @@ describe('lazy accept auto-sync', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+
+    // Wait for the daemon reconciler (see tests above for rationale).
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

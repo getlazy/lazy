@@ -7,7 +7,7 @@ import { runGit } from '../../utils/git';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
 import { showTaskContext, runFeedbackFlow, getEditorFeedback, syncTaskFromRemote, getNewNotesSince } from './shared';
 import { commandAccept } from './accept';
-import { commandReject } from './reject';
+import { commandAbandon } from './abandon';
 import { commandRedo } from './redo';
 import { readPendingProposals, updateProposalStatus, type Proposal } from './propose';
 import { commandCreate } from './create';
@@ -16,6 +16,7 @@ import { isTerminalStatus } from '../../types';
 
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 import { removeRecoveryFile } from '../editor';
+import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
 
@@ -38,6 +39,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'f', takesValue: true },
     { name: 'message', takesValue: true },
     { name: 'model', takesValue: true },
+    { name: 'effort', takesValue: true },
     { name: 'follow', takesValue: false },
 
     { name: 'approve-file', takesValue: true, accumulate: true },
@@ -64,6 +66,17 @@ export async function commandUnblock(args: string[]): Promise<void> {
   let modelOverride: string | undefined;
   if (modelValue !== undefined) {
     modelOverride = validateModel(modelValue);
+  }
+
+  // Parse --effort flag
+  let effortOverride: EffortLevel | undefined;
+  const effortValue = parsed.flags.get('effort') as string | undefined;
+  if (effortValue !== undefined) {
+    if (!VALID_EFFORT_LEVELS.includes(effortValue as EffortLevel)) {
+      console.error(`Invalid effort '${effortValue}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
+      process.exit(1);
+    }
+    effortOverride = effortValue as EffortLevel;
   }
 
   const root = requireLazyRoot();
@@ -252,14 +265,14 @@ export async function commandUnblock(args: string[]): Promise<void> {
           ? [
               'Give feedback - includes unseen comments (recommended)',
               `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
-              'Reject (discard work)',
+              'Abandon (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
               ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ]
           : [
               'Give feedback (open editor)',
               'Accept (merge work)',
-              'Reject (discard work)',
+              'Abandon (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
               ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ];
@@ -275,7 +288,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           continue;
         }
 
-        // Close storage before delegating to accept/reject/redo (they open their own)
+        // Close storage before delegating to accept/abandon/redo (they open their own)
         await storage.close();
 
         if (choice === redoIdx) {
@@ -288,7 +301,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
             await commandAccept([taskShortId]);
             return;
           case 2:
-            await commandReject([taskShortId]);
+            await commandAbandon([taskShortId]);
             return;
           default:
             break;
@@ -303,7 +316,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           const sess2 = await storage2.getSessionByTaskId(task2.id);
           if (!sess2) { console.error(`Task ${taskShortId} has no session.`); process.exit(1); }
 
-          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride);
+          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride, effortOverride);
           shouldContinue = result === 'continue';
         } finally {
           await storage2.close();
@@ -396,6 +409,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
         approvedFiles,
         retargetOrphan,
         notesInEditor,
+        effortOverride,
       });
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -534,7 +548,9 @@ Arguments:
 Options:
   -f <file>           Read feedback from a file
   --message <text>    Provide inline feedback
-  --model <model>     Override model for this turn (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
+                      Persists on the task for future turns.
   --approve-file <file>   Approve a violated file (repeatable, for conflict tasks)
   --no-approve-files  Explicitly revert all violated files (for conflict tasks)
   --yes               Skip interactive prompts (non-interactive mode)
@@ -585,7 +601,7 @@ Examples:
   lazy unblock abc123                                   # Interactive review
   lazy unblock abc123 --message "Add error handling"    # Direct feedback
   lazy unblock abc123 -f feedback.md
-  lazy unblock abc123 --model claude-opus-4-6 --message "Complex refactoring needed"
+  lazy unblock abc123 --model opus --message "Complex refactoring needed"
   lazy unblock abc123 --message "Fix it" --follow       # Wait for completion
   lazy unblock abc123 --message "Fix it" --yes          # Non-interactive
   echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback

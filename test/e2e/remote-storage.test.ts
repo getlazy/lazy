@@ -250,15 +250,15 @@ describe('RemoteStorage', () => {
     expect(updated!.status).toBe('working');
   });
 
-  // INVARIANT: RemoteStorage correctly proxies closeTask with reason.
-  test('closeTask sets close reason', async () => {
+  // INVARIANT: RemoteStorage correctly proxies abandonTask with reason.
+  test('abandonTask sets close reason', async () => {
     const remote = await makeRemoteStorage();
-    const task = await remote.createTask('Close test');
+    const task = await remote.createTask('Abandon test');
 
-    await remote.closeTask(task.id, 'Test close reason');
-    const closed = await remote.getTask(task.id.substring(0, 8));
-    expect(closed!.status).toBe('closed');
-    expect(closed!.close_reason).toBe('Test close reason');
+    await remote.abandonTask(task.id, 'Test abandon reason');
+    const abandoned = await remote.getTask(task.id.substring(0, 8));
+    expect(abandoned!.status).toBe('abandoned');
+    expect(abandoned!.close_reason).toBe('Test abandon reason');
   });
 
   // INVARIANT: RemoteStorage correctly proxies metadata operations.

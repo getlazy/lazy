@@ -21,8 +21,11 @@ import type {
   TaskStatus,
   SessionOutcome,
   TurnRole,
+  TurnType,
   TokenUsage,
   Actor,
+  HunkApproval,
+  HunkApprovalLineage,
 } from '../types';
 
 // Re-export domain types that are used as-is
@@ -42,8 +45,11 @@ export type {
   TaskStatus,
   SessionOutcome,
   TurnRole,
+  TurnType,
   TokenUsage,
   Actor,
+  HunkApproval,
+  HunkApprovalLineage,
 };
 
 /**
@@ -156,6 +162,13 @@ export interface CommentsFile {
 
 /** @deprecated Use CommentsFile instead */
 export type NotesFile = CommentsFile;
+
+/**
+ * Internal format for hunk-approvals.json (per-task review approvals)
+ */
+export interface HunkApprovalsFile {
+  approvals: HunkApproval[];
+}
 
 /**
  * Search result entry

@@ -37,8 +37,8 @@ lazy builder # Ask it "what can you do?"
 lazy create --code add-auth --goal "Add user authentication" --prompt "Use JWT tokens, bcrypt for passwords"
 lazy start <task-id>
 
-# Review the agent's work in a full-screen TUI
-lazy review <task-id>
+# Review the agent's work while chatting with agent itself
+lazy review -i <task-id>
 
 # On a rare (and they truly *ought* to be rare) occasion you may need to pair directly
 # with the agent, use `lazy pair` to the agent's session but now with you in control
@@ -261,7 +261,7 @@ Or just leave out the configuration of the runner - it's docker by default.
 
 ### VM development
 
-If you have a complex toolchain, I recommend developing in an isolated VM, which doesn't have anything but the repo and the toolchain. I **strongly** recommend creating a specifically crafted token for remote repositories to minimize any dangers of possible prompt injections affecting remote repositories.
+If you have complex dependencies or environment requirements, I recommend developing in an isolated VM, which doesn't have anything but the repo and your development environment. I **strongly** recommend creating a specifically crafted token for remote repositories to minimize any dangers of possible prompt injections affecting remote repositories.
 
 If all of the above is true, then yes, with trepidation, you can use:
 
@@ -274,11 +274,9 @@ The name says it all - you really **ought** to **never** run like that unless in
 
 Regarding VM, there is one more thing that you will likely want to do which is to configure a different `lazy.toml` file to be used inside of VM. This is useful if you sometimes work in the VM and sometimes on the host or if there is a difference the way team mates work. To make use of that, override `LAZY_CONFIG` envvar inside of the VM to point to the alternative lazy.toml. For example, in this repo you will find `lazy.lima.toml` which uses this technique to pass the correct **VM** configuration which has the host runners unlike the host lima configuration which uses docker runners.
 
-### Centralized Store
+### Storage Location
 
-Starting with release v0.6, PostgreSQL can be used for centralized `lazy` store. This allows team coordination and collaboration which is difficult and prone to conflicts with same-repo storage configurations. That said, I wouldn't call support for it 1st class because `lazy` still lacks guarantees around say starting one task on one machine and finishing it on another. As a matter of fact, this should "just work", but it has not been thoroughly tested and depends very much on running `lazy sync` after each turn.
-
-The only other alterantive at this time is storing `lazy` files directly on your computer, outside of the projcect's repository itself. You can then back them up in your usual manner or put them into another repisitory for safe-keeping.
+By default, `lazy` stores task data in `~/.lazy/<project-name>/`. You can customize this location by setting `storage.external_path` in `lazy.toml` to store data elsewhere — useful for backups or storing in a separate repository for safekeeping.
 
 ## Details
 
@@ -376,6 +374,16 @@ Human feedback on a task though often written by `lazy builder`. Reviews capture
 
 Reviews create a permanent record of human decisions, making the review history searchable for future reference.
 
+### Interactive review
+
+For smaller tasks, builder's review is fine, but it often involves back and forth between you and builder and without agent's insight into *exactly* why it has or hasn't done something. In those circumstances I vastly prefer interactive review which keeps the agent in read-only mode but allows asking questions and getting quick answers (as it works in low effort mode).
+
+```
+lazy review -i <task-id>
+```
+
+This allows you to read the agent's summary of the last turn, ask questions about parts of it (by splitting hunks similar to the way `git add -p` does) and provide direct feedback to the agent that it should take on the next turn.
+
 ## Key Commands
 
 Just run `lazy` and go through the commands. Or run `lazy builder` and skip learning the CLI incantations until you need them.
@@ -467,39 +475,6 @@ lazy shell task-id
 ```
 
 Note that in this case you will be shelling into the worktree on the **host** and not the agent's container. Same as `pair` this is an escape hatch for any issues with Docker: here you can build and run everything with your host tooling.
-
-### Continuous Review Loop
-
-```bash
-lazy loop
-```
-
-Iterates through all blocked tasks sequentially. For each task:
-1. Shows context (goal, recent diff, comments)
-2. Offers choices: give feedback, accept, reject, merge upstream, or skip
-3. Moves to the next blocked task
-
-It's very rudimentary but does the trick.
-
-For more details:
-
-```bash
-lazy loop --help
-```
-
-### TUI Review
-
-**Of course** `lazy` has TUI as well - we have everything **and** the kitchen sink. To review a task and all its descendants, run:
-
-```bash
-lazy review task-id
-```
-
-It looks like this:
-
-![review-tui](./images/review-tui.png)
-
-Just look at that design - feels like DOS days again!
 
 ### Remote Syncing
 
@@ -649,6 +624,19 @@ open -a Docker
 sudo systemctl start docker
 ```
 
+### Custom Dockerfile says "image not found: lazy-runner"
+
+If your project's `Dockerfile.lazy` starts with `FROM lazy-runner`, the base
+runner image must already exist locally. On a fresh machine it doesn't yet —
+prebuild it explicitly:
+
+```bash
+lazy system build lazy-runner
+```
+
+This bypasses the current project's `lazy.toml` and builds the base image
+directly. Add `--no-cache` to force a clean rebuild.
+
 ### "ANTHROPIC_API_KEY not set"
 
 Export your API key:
@@ -711,6 +699,7 @@ Coding is cheap, prompts are valuable, this will inject the original prompt plus
 - **Self-diagnosis**: Run `lazy doctor` to check installation, authentication, Docker, and driver configuration
 - **Command help**: `lazy <command> --help` for usage details
 - **System prompts**: `lazy system prompts` to see what instructions agents receive
+- **Prebuild base image**: `lazy system build lazy-runner` for projects whose `Dockerfile.lazy` uses `FROM lazy-runner`
 - **Issues**: Report bugs at [github.com/getlazy/lazy/issues](https://github.com/getlazy/lazy/issues)
 
 ## Links

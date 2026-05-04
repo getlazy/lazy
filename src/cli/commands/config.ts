@@ -23,11 +23,13 @@ import {
   getAutoReactSummary,
   readDailyBudget,
 } from '../../daemon/auto-react-budget';
+import { getOfflineStatus, setOfflineMode } from '../../utils/offline';
 import { theme } from '../theme';
 
 /** Known config keys and their allowed values. */
 const KNOWN_KEYS: Record<string, { values: string[]; description: string }> = {
   auto_react: { values: ['on', 'off'], description: 'Auto-triggered agent turns' },
+  offline: { values: ['on', 'off'], description: 'Offline mode (skip remote operations)' },
 };
 
 export async function commandConfig(args: string[]): Promise<void> {
@@ -85,6 +87,9 @@ async function configSet(args: string[]): Promise<void> {
     case 'auto_react':
       await setAutoReact(value, taskIdInput, parsed.flags);
       break;
+    case 'offline':
+      await setOffline(value);
+      break;
   }
 }
 
@@ -113,6 +118,9 @@ async function configGet(args: string[]): Promise<void> {
   switch (key) {
     case 'auto_react':
       await getAutoReact(taskIdInput);
+      break;
+    case 'offline':
+      await getOffline();
       break;
   }
 }
@@ -212,6 +220,50 @@ async function getAutoReact(taskIdInput: string | undefined): Promise<void> {
   }
 }
 
+// --- offline handlers ---
+
+async function setOffline(value: string): Promise<void> {
+  const root = requireLazyRoot();
+  const dataDir = join(root, '.lazy');
+
+  if (value === 'on') {
+    const status = await getOfflineStatus(dataDir);
+    if (status.enabled) {
+      console.log('Already in offline mode.');
+      return;
+    }
+    await setOfflineMode(dataDir, true);
+    console.log(theme.success('Offline mode enabled.'));
+    console.log('  The daemon will stop remote operations on the next tick.');
+    console.log(`\nRestore with: ${theme.command('lazy config set offline off')}`);
+  } else {
+    const status = await getOfflineStatus(dataDir);
+    if (!status.enabled) {
+      console.log('Already online.');
+      return;
+    }
+    await setOfflineMode(dataDir, false);
+    console.log(theme.success('Online mode restored.'));
+    console.log('  The daemon will sync on the next tick.');
+  }
+}
+
+async function getOffline(): Promise<void> {
+  const root = requireLazyRoot();
+  const dataDir = join(root, '.lazy');
+  const status = await getOfflineStatus(dataDir);
+  console.log(theme.label('Offline mode:'));
+  if (status.enabled) {
+    console.log(`  ${theme.error('ENABLED')}${status.enabled_at ? ` since ${status.enabled_at}` : ''}`);
+    if (status.configured_driver && status.configured_driver !== 'local') {
+      console.log(`  ${theme.label('Suspended driver:')} ${status.configured_driver}`);
+    }
+    console.log(`\nRestore with: ${theme.command('lazy system online')}`);
+  } else {
+    console.log(`  ${theme.status('off')}`);
+  }
+}
+
 export function configUsage(): void {
   console.log(`Usage: lazy config <set|get> <key> [value] [options]
 
@@ -223,6 +275,7 @@ Subcommands:
 
 Available keys:
   auto_react           Auto-triggered agent turns (on/off)
+  offline              Offline mode — skip all remote operations (on/off, global)
 
 Options:
   --task <id>          Apply to a specific task instead of globally
@@ -241,5 +294,8 @@ Examples:
   lazy config set auto_react on                         # Resume globally
   lazy config set auto_react on --task abc1             # Resume task abc1 (resets counters)
   lazy config get auto_react                            # Show global status
-  lazy config get auto_react --task abc1                # Show global + task status`);
+  lazy config get auto_react --task abc1                # Show global + task status
+  lazy config set offline on                            # Enable offline mode
+  lazy config set offline off                           # Disable offline mode
+  lazy config get offline                               # Show offline status`);
 }

@@ -300,6 +300,47 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
     expect(output.includes('not found') || output.includes('Task not found')).toBe(true);
   });
 
+  // Regression: lazy sync used to print "Upstream merge launched" but never
+  // transitioned the task out of its prior status, so the reconciler (which
+  // only processes working tasks) never saw the supervisor's response.
+  // Result: no turn was recorded and status stayed blocked. Silent no-op.
+  test('sync with upstream changes transitions task to working and records human turn', async () => {
+    const taskId = await createTask(ctx, 'Sync transitions to working', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    setTaskStatus(taskId, 'blocked');
+
+    // Introduce upstream changes so sync actually launches a merge.
+    ctx.git('checkout', 'main');
+    writeFileSync(join(ctx.root, 'upstream-change.txt'), 'upstream\n');
+    ctx.git('add', 'upstream-change.txt');
+    ctx.git('commit', '-m', 'upstream commit');
+    ctx.git('checkout', '-');
+
+    const result = await ctx.lazy(['sync', taskId]);
+    const output = result.stdout + result.stderr;
+    expect(output.includes('up to date')).toBe(false);
+
+    // Task must transition to 'working' — otherwise the reconciler will never
+    // process the supervisor's response and the sync becomes a silent no-op.
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
+    const entries = readdirSync(tasksDir);
+    const fullId = entries.find(e => e.startsWith(taskId));
+    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
+    const taskData = JSON.parse(readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8'));
+    expect(taskData.status).toBe('working');
+
+    // A human turn must exist documenting the sync request, so that the
+    // supervisor's completion response isn't dropped by the reconciler's
+    // idempotency check (which skips when the last turn is already 'agent').
+    const turnsData = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8'));
+    const lastTurn = turnsData.turns[turnsData.turns.length - 1];
+    expect(lastTurn.role).toBe('human');
+    expect(lastTurn.content).toContain('Upstream merge requested');
+  });
+
   test('sync help includes task-level sync documentation', async () => {
     const result = await ctx.lazy(['sync', '--help']);
     expectSuccess(result);

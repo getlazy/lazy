@@ -43,6 +43,13 @@ const agentPackaging = new ClaudeCodePackaging();
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
+/**
+ * Label applied to every lazy-launched container that identifies the project
+ * (lazy root path) it belongs to. Used to scope container discovery so that a
+ * command run in project A never enumerates or touches containers belonging
+ * to project B.
+ */
+export const PROJECT_LABEL = 'lazy.project';
 
 /**
  * Read-only MCP tools that should be pre-approved in the builder session.
@@ -63,15 +70,26 @@ const BUILDER_READ_ONLY_TOOLS = [
   'lazy_wait',
 ];
 
+/** Docker label key used to scope containers to a project root. */
+export const PROJECT_LABEL_KEY = 'lazy.project';
+
+export interface DockerRunnerOptions {
+  dockerAgentNoNetwork?: boolean;
+}
+
 export class DockerRunner implements Runner {
   readonly type: RunnerType;
   readonly runLabel = 'Container';
   protected readonly binary: string;
+  private options: DockerRunnerOptions;
+  private lazyRoot: string | undefined;
   protected _ollamaConfig?: OllamaConfig;
 
-  constructor(binary: string = 'docker', type: RunnerType = 'docker') {
+  constructor(binary: string = 'docker', type: RunnerType = 'docker', options?: DockerRunnerOptions, lazyRoot?: string) {
     this.binary = binary;
     this.type = type;
+    this.options = options ?? {};
+    this.lazyRoot = lazyRoot;
   }
 
   /** Set Ollama config for local model inference. */
@@ -164,8 +182,51 @@ export class DockerRunner implements Runner {
 
   discoverRunningRuns(): string[] {
     try {
+      // Query container names and their project labels in one call.
+      // Format: "name\tlabel" where label is empty for unlabeled (pre-label) containers.
       const result = spawnSync(
-        [this.binary, 'ps', '--filter', 'name=^lazy-', '--format', '{{.Names}}'],
+        [this.binary, 'ps', '--filter', 'name=^lazy-',
+         '--format', `{{.Names}}\t{{.Label "${PROJECT_LABEL_KEY}"}}`],
+        { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+      );
+      if (result.exitCode !== 0) return [];
+      const output = result.stdout.toString().trim();
+      if (!output) return [];
+
+      const lines = output.split('\n').filter(Boolean);
+      const names: string[] = [];
+
+      for (const line of lines) {
+        const [name, label] = line.split('\t');
+        if (!name) continue;
+
+        if (this.lazyRoot) {
+          // Project-scoped filtering: include containers that belong to this project
+          // (matching label) OR have no label at all (backward compat with pre-label containers).
+          if (label === this.lazyRoot || !label) {
+            names.push(name);
+          }
+        } else {
+          // No project root available — return all (legacy behavior).
+          names.push(name);
+        }
+      }
+
+      return names;
+    } catch {
+      return [];
+    }
+  }
+
+  discoverProjectBuilderRuns(projectRoot: string): string[] {
+    try {
+      const result = spawnSync(
+        [
+          this.binary, 'ps',
+          '--filter', 'name=^lazy-builder-',
+          '--filter', `label=${PROJECT_LABEL}=${projectRoot}`,
+          '--format', '{{.Names}}',
+        ],
         { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
       if (result.exitCode !== 0) return [];
@@ -401,6 +462,10 @@ export class DockerRunner implements Runner {
     const dockerArgs = [
       this.binary, 'run', '-it', '--init', '--rm',
       '--name', `lazy-builder-${builderId}`,
+      // Scope this container to the project. Other projects' `lazy upgrade`,
+      // discovery, and cleanup commands filter on this label to avoid
+      // cross-project interference (see discoverProjectBuilderRuns).
+      '--label', `${PROJECT_LABEL}=${lazyRoot}`,
       // Allow container to reach host TCP server via host.docker.internal
       // (built-in on macOS Docker Desktop; needs this flag on Linux)
       '--add-host=host.docker.internal:host-gateway',

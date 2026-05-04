@@ -4,9 +4,21 @@ import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, pars
 import { getCurrentSha, hasUncommittedChanges } from '../../git/operations';
 import { checkOrphanedChild } from '../orphan';
 import { isTerminalStatus } from '../../types';
+import type { Storage } from '../../storage';
+import type { Task } from '../../types';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
+import { loadConfig } from '../../config/loader';
+import { checkLock } from '../../utils/lock';
+import {
+  isAutoReactPaused,
+  getAutoReactPausedReason,
+  getAutoReactCount,
+  readDailyBudget,
+  checkBackoff,
+  type AutoReactTrigger,
+} from '../../daemon/auto-react-budget';
 import { runGit } from '../../utils/git';
 
 export async function commandStatus(args: string[]): Promise<void> {
@@ -65,10 +77,9 @@ export async function commandStatus(args: string[]): Promise<void> {
       if (isTerminalStatus(task.status)) {
         console.log(`\n  ${theme.label('Note:')} Worktree directory has been cleaned up (task is ${task.status})`);
       } else {
-        // For active/blocked tasks, missing worktree is an error
-        console.error('\n  ERROR: Worktree directory does not exist!');
+        // For active/blocked tasks, missing worktree is notable but not fatal
+        console.error('\n  ' + theme.error('WARNING:') + ' Worktree directory does not exist!');
         console.error('  The session cannot be resumed without the worktree.');
-        return;
       }
     }
 
@@ -145,6 +156,11 @@ export async function commandStatus(args: string[]): Promise<void> {
     const status = sess.outcome ?? (sess.ended_at ? 'ended' : task.status);
     console.log(`\n  ${theme.label('Session status:')} ${theme.status(status)}`);
 
+    // Auto-react diagnostics (only for blocked tasks)
+    if (task.status === 'blocked') {
+      await printAutoReactDiagnostics(storage, task, root, worktreePath, worktreeExists);
+    }
+
     // Suggestions
     if (!sess.ended_at) {
       const di = displayId(task);
@@ -158,6 +174,108 @@ export async function commandStatus(args: string[]): Promise<void> {
 
   } finally {
     await storage.close();
+  }
+}
+
+async function printAutoReactDiagnostics(
+  storage: Storage,
+  task: Task,
+  lazyRoot: string,
+  worktreePath: string,
+  worktreeExists: boolean,
+): Promise<void> {
+  const config = await loadConfig(lazyRoot);
+  const dataDir = join(lazyRoot, getDataDir(lazyRoot));
+  const { auto_react_max_retries, auto_react_backoff, auto_react_daily_budget } = config.daemon;
+
+  const triggers: AutoReactTrigger[] = ['ci_failure', 'upstream_sync', 'comment', 'child_completed', 'crash'];
+  const blockReasons: string[] = [];
+
+  console.log(`\n${theme.label('Auto-react:')}`);
+
+  // 1. Paused status
+  const paused = await isAutoReactPaused(storage, task.id);
+  if (paused) {
+    const reason = await getAutoReactPausedReason(storage, task.id);
+    console.log(`  ${theme.label('Paused:')}  ${theme.warning('yes')} — ${reason ?? 'unknown reason'}`);
+    blockReasons.push(reason ?? 'paused');
+  } else {
+    console.log(`  ${theme.label('Paused:')}  no`);
+  }
+
+  // 2. Per-trigger retry counts
+  const countsWithActivity: { trigger: AutoReactTrigger; count: number }[] = [];
+  for (const trigger of triggers) {
+    const count = await getAutoReactCount(storage, task.id, trigger);
+    if (count > 0) {
+      countsWithActivity.push({ trigger, count });
+    }
+  }
+
+  if (countsWithActivity.length > 0) {
+    console.log(`  ${theme.label('Retries:')}`);
+    for (const { trigger, count } of countsWithActivity) {
+      const exhausted = count >= auto_react_max_retries;
+      const label = trigger.replace(/_/g, ' ');
+      const countStr = `${count}/${auto_react_max_retries}`;
+      console.log(`    ${label}: ${exhausted ? theme.warning(countStr + ' (exhausted)') : countStr}`);
+      if (exhausted) {
+        blockReasons.push(`${label} retry limit reached`);
+      }
+    }
+  } else {
+    console.log(`  ${theme.label('Retries:')} none used (max ${auto_react_max_retries} per trigger)`);
+  }
+
+  // 3. Daily budget
+  const budget = await readDailyBudget(dataDir);
+  const budgetExhausted = budget.used >= auto_react_daily_budget;
+  const budgetStr = `${budget.used}/${auto_react_daily_budget}`;
+  if (budgetExhausted) {
+    console.log(`  ${theme.label('Daily budget:')} ${theme.warning(budgetStr + ' (exhausted)')}`);
+    blockReasons.push('daily budget exhausted');
+  } else {
+    console.log(`  ${theme.label('Daily budget:')} ${budgetStr}`);
+  }
+
+  // 4. Backoff (only show if any trigger has non-zero count)
+  if (auto_react_backoff !== 'none' && countsWithActivity.length > 0) {
+    const backoffParts: string[] = [];
+    for (const { trigger } of countsWithActivity) {
+      const backoff = await checkBackoff(storage, task.id, trigger, auto_react_backoff);
+      if (!backoff.allowed) {
+        const secs = Math.ceil(backoff.remainingMs / 1000);
+        const label = trigger.replace(/_/g, ' ');
+        backoffParts.push(`${label}: ${secs}s remaining`);
+        blockReasons.push(`backoff: ${label} (${secs}s)`);
+      }
+    }
+    if (backoffParts.length > 0) {
+      console.log(`  ${theme.label('Backoff:')}  ${theme.warning(backoffParts.join(', '))}`);
+    } else {
+      console.log(`  ${theme.label('Backoff:')}  clear`);
+    }
+  }
+
+  // 5. Worktree status
+  if (!worktreeExists) {
+    console.log(`  ${theme.label('Worktree:')} ${theme.warning('missing')}`);
+    blockReasons.push('worktree missing');
+  } else {
+    const lock = await checkLock(worktreePath);
+    if (lock) {
+      console.log(`  ${theme.label('Worktree:')} locked (${lock.command})`);
+      blockReasons.push('worktree locked');
+    } else {
+      console.log(`  ${theme.label('Worktree:')} ready`);
+    }
+  }
+
+  // 6. Overall verdict
+  if (blockReasons.length === 0) {
+    console.log(`  ${theme.label('Verdict:')}  ${theme.success('ready')}`);
+  } else {
+    console.log(`  ${theme.label('Verdict:')}  ${theme.warning('blocked')} (${blockReasons[0]})`);
   }
 }
 

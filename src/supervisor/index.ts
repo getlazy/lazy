@@ -35,6 +35,7 @@ import type {
   Command,
   StartCommand,
   UnblockCommand,
+  AskCommand,
   SyncCommand,
   StopCommand,
   SupervisorStatus,
@@ -52,6 +53,8 @@ import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
 import { allTools } from '../mcp/tools';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
+import { PROTOCOL_VERSION } from '../protocol/types';
+import { VERSION } from '../version';
 import { spawn, spawnSync } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { detectViolations } from './permissions';
@@ -95,6 +98,27 @@ function checkRequiredTools(runner: Runner): void {
 
 /** Exit code used in one-shot mode to signal that a stop command was received. */
 export const ONE_SHOT_STOP_EXIT_CODE = 42;
+
+/**
+ * Check whether the command's protocol_version matches the supervisor's own.
+ * Returns null on match, or an error message describing the mismatch.
+ *
+ * INVARIANT: The supervisor must refuse commands whose wire-protocol version
+ * does not match its own. This catches the case where a running container has
+ * an older/newer supervisor that doesn't understand the host's command shape
+ * or RPC signatures. Lazy versions (the package version) may differ freely as
+ * long as the protocol versions agree — the engineer commonly runs different
+ * lazy projects at different lazy versions on the same machine.
+ *
+ * v0.11 and earlier hosts don't send `protocol_version` at all. They land in
+ * the `undefined` branch and get the same "rebuild containers" error they
+ * would have under the previous lazy_version gate.
+ */
+export function checkProtocolVersion(commandVersion: number | undefined, supervisorVersion: number): string | null {
+  if (commandVersion === supervisorVersion) return null;
+  const got = commandVersion === undefined ? 'unknown' : String(commandVersion);
+  return `Protocol version mismatch (got ${got}, expected ${supervisorVersion}). Run \`lazy upgrade\` to rebuild containers.`;
+}
 
 /**
  * Main supervisor entry point. Blocks until a stop command is received
@@ -143,7 +167,9 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     const command = await waitForCommand(protocolDir, pollIntervalMs);
     if (!command) continue; // timeout (shouldn't happen with default 0 timeout)
 
-    const turnStartedAt = (command.type === 'start' || command.type === 'unblock') ? (command as StartCommand | UnblockCommand).turn_started_at : undefined;
+    const turnStartedAt = (command.type === 'start' || command.type === 'unblock' || command.type === 'ask')
+      ? (command as StartCommand | UnblockCommand | AskCommand).turn_started_at
+      : undefined;
     resetTimer(turnStartedAt);
     log(`[supervisor] Received command: ${command.type} for task ${command.task_id}`);
 
@@ -161,6 +187,30 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
         process.exit(ONE_SHOT_STOP_EXIT_CODE);
       }
       break;
+    }
+
+    // INVARIANT: Reject commands whose wire protocol doesn't match this supervisor.
+    // When the protocol changes between releases, an older supervisor running in a
+    // stale container can't safely execute commands written by a newer host (and
+    // vice versa). Refuse and tell the user to rebuild containers. The full lazy
+    // version is logged for debugging but is NOT part of the gate — different
+    // projects on one machine may run different lazy versions concurrently.
+    const cmd = command as StartCommand | UnblockCommand | SyncCommand;
+    const versionError = checkProtocolVersion(cmd.protocol_version, PROTOCOL_VERSION);
+    if (versionError) {
+      logError(`[supervisor] ${versionError} (supervisor lazy v${VERSION})`);
+      const versionErrorResponse: ErrorResponse = {
+        status: 'error',
+        error: versionError,
+        phase: 'reading_command',
+      };
+      writeResponse(protocolDir, versionErrorResponse);
+      log('[supervisor] Turn complete (protocol version mismatch).');
+      if (oneShot) {
+        log('[supervisor] One-shot mode: exiting with code 0 (turn done).');
+        break;
+      }
+      continue;
     }
 
     try {
@@ -217,6 +267,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   // Sync commands run only the merge phase — no agent work.
   if (command.type === 'sync') {
     await handleSyncCommand(command as SyncCommand, config, runner);
+    return;
+  }
+
+  // Ask commands run only the work + writing_response phases. No integration
+  // machinery (sync, merge, violation check, post-turn check) runs — this is
+  // a read-only Q&A turn owned end-to-end by the daemon.
+  if (command.type === 'ask') {
+    await handleAskCommand(command as AskCommand, config);
     return;
   }
 
@@ -297,8 +355,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const mergeSessionId = command.type === 'unblock'
         ? (command as UnblockCommand).agent_session_id
         : undefined;
-      const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, mergeSessionId);
-      allMergeConflicts.push(...conflicts);
+      const syncResult = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, mergeSessionId);
+      allMergeConflicts.push(...syncResult.conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       logError(`[supervisor] Pre-turn sync-with-upstream failed: ${errorMessage}`);
@@ -376,6 +434,10 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       agent.defaultWatchdogTimeoutMs(),
     );
 
+    const permissionMode = command.type === 'unblock'
+      ? (command as UnblockCommand).permission_mode
+      : undefined;
+
     const result = await runWork(
       agent,
       worktreePath,
@@ -387,6 +449,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       onRetryStateChange,
       undefined, // _executeOverride
       effectiveWatchdogMs,
+      cmd.effort,
+      permissionMode,
     );
 
     updatePhase(status, 'work_done', protocolDir);
@@ -406,10 +470,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const protectedPatterns = cmd.protected_patterns ?? [];
     const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
 
-    // Compute branch point SHA: the merge-base with the parent branch.
-    // Files created after this point were created by the task itself and are
+    // Compute branch point SHA: the point before the task created any files.
+    // Files not present at the branch point were created by the task itself and are
     // exempt from permission violations (they're not pre-existing files).
-    let branchPointSha: string | undefined;
+    //
+    // Primary: merge-base with parent branch (accounts for upstream merges).
+    // Fallback: cmd.branch_point_sha (the session's git_start_sha, always available).
+    let branchPointSha: string | undefined = cmd.branch_point_sha;
     if (cmd.parent_branch && protectedPatterns.length > 0) {
       const mergeBaseResult = await runGit(
         ['merge-base', cmd.parent_branch, 'HEAD'],
@@ -419,8 +486,11 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         branchPointSha = mergeBaseResult.stdout.trim();
         log(`[supervisor] Branch point SHA (merge-base with ${cmd.parent_branch}): ${branchPointSha.substring(0, 8)}`);
       } else {
-        log(`[supervisor] Could not compute merge-base with ${cmd.parent_branch} — all protected-pattern changes will be checked`);
+        log(`[supervisor] Could not compute merge-base with ${cmd.parent_branch} — using branch_point_sha fallback`);
       }
+    }
+    if (branchPointSha) {
+      log(`[supervisor] Using branch point SHA: ${branchPointSha.substring(0, 8)}${!cmd.parent_branch ? ' (from command)' : ''}`);
     }
 
     log(`[supervisor] Checking permissions: ${protectedPatterns.length} pattern(s) [${protectedPatterns.join(', ')}], diff ${startShaWork.substring(0, 8)}..${postWorkSha.substring(0, 8)}`);
@@ -440,6 +510,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         result.session_id,
         violations,
         cmd.model_id,
+        cmd.effort,
       );
       pushbackResponse = pushbackResult.response;
 
@@ -515,8 +586,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       }
 
       try {
-        const postTurnConflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, result.session_id);
-        allMergeConflicts.push(...postTurnConflicts);
+        const postTurnSync = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, result.session_id);
+        allMergeConflicts.push(...postTurnSync.conflicts);
         updatePhase(status, 'post_turn_sync_done', protocolDir);
       } catch (err) {
         // Post-turn sync failure is non-fatal — agent's work is already done
@@ -625,17 +696,44 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   // Merge upstream branch
   updatePhase(status, 'merge_and_fix', protocolDir);
 
-  const upstreamSha = await getBranchSha(worktreePath, cmd.parent_branch);
-  if (upstreamSha) {
-    status.upstream_merge_sha = upstreamSha;
-    writeStatus(protocolDir, status);
+  // Prefer the host-resolved SHA so the supervisor merges the exact commit
+  // the daemon saw. If the supervisor's own ref lookup disagrees, the
+  // warning below surfaces the mismatch — that warning is what will finally
+  // pin down the original silent no-op sync root cause if it ever recurs.
+  const commandUpstreamSha = cmd.upstream_sha;
+  const branchResolvedSha = await getBranchSha(worktreePath, cmd.parent_branch);
+  if (commandUpstreamSha) {
+    status.upstream_merge_sha = commandUpstreamSha;
+  } else if (branchResolvedSha) {
+    status.upstream_merge_sha = branchResolvedSha;
+  }
+  writeStatus(protocolDir, status);
+
+  if (commandUpstreamSha && branchResolvedSha && commandUpstreamSha !== branchResolvedSha) {
+    // Loud warning: the daemon and the supervisor disagree about what the
+    // parent branch points to. Per CLAUDE.md "errors are actionable", this
+    // mismatch must not be silent — it's the exact class of bug that caused
+    // the sync regression. We still merge the daemon's SHA (that's the one
+    // the user asked about), but we surface the disagreement.
+    logWarn(
+      `[supervisor] Upstream ref disagreement for ${cmd.parent_branch}: ` +
+      `daemon resolved ${commandUpstreamSha.substring(0, 8)} but container ` +
+      `sees ${branchResolvedSha.substring(0, 8)}. Merging daemon's SHA.`,
+    );
   }
 
+  let syncResult;
   try {
     // INVARIANT: Pass agent_session_id so conflict resolution reuses the existing
     // agent session (add-session-merge) instead of cold-starting a fresh one.
-    const conflicts = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, cmd.agent_session_id);
-    allMergeConflicts.push(...conflicts);
+    syncResult = await runSyncWithUpstream(
+      worktreePath,
+      cmd.parent_branch,
+      cmd.model_id,
+      cmd.agent_session_id,
+      commandUpstreamSha,
+    );
+    allMergeConflicts.push(...syncResult.conflicts);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     logError(`[supervisor] Sync merge failed: ${errorMessage}`);
@@ -649,7 +747,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
     return;
   }
 
-  const postMergeSha = await getHeadSha(worktreePath);
+  const postMergeSha = syncResult.postMergeSha;
   status.post_merge_sha = postMergeSha;
   updatePhase(status, 'merge_and_fix_done', protocolDir);
 
@@ -658,16 +756,114 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
 
   // Write completed response
   updatePhase(status, 'writing_response', protocolDir);
-  log(`[supervisor] Sync complete. Post-merge SHA: ${postMergeSha.substring(0, 8)}`);
+  log(`[supervisor] Sync complete. merged=${syncResult.merged} pre=${syncResult.preMergeSha.substring(0, 8)} post=${postMergeSha.substring(0, 8)} target=${syncResult.targetSha.substring(0, 8)}`);
+
+  // Build an honest result message — never claim "Sync merge completed
+  // successfully" when no merge actually happened (fix-sync-no-merge).
+  const resultMessage = syncResult.merged
+    ? (syncResult.conflicts.length > 0
+      ? `Merged ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)} with ${syncResult.conflicts.length} resolved conflict(s). HEAD: ${syncResult.preMergeSha.substring(0, 8)} → ${postMergeSha.substring(0, 8)}.`
+      : `Merged ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. HEAD: ${syncResult.preMergeSha.substring(0, 8)} → ${postMergeSha.substring(0, 8)}.`)
+    : `Already up to date: HEAD (${syncResult.preMergeSha.substring(0, 8)}) already contains ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. No merge performed.`;
 
   const response: CompletedResponse = {
     status: 'completed',
-    result: 'Sync merge completed successfully.',
+    result: resultMessage,
     session_id: '',
     usage: { input_tokens: 0, output_tokens: 0 },
     ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
   };
   writeResponse(protocolDir, response);
+}
+
+/**
+ * Handle an ask command: run the work phase in plan mode, write response, return.
+ *
+ * An ask is a read-only Q&A turn. It skips every integration phase — no
+ * sync, no merge, no violation detection, no post-turn check. The daemon
+ * waits synchronously for response.json, so it owns the response file;
+ * the CLI never polls.
+ */
+async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Promise<void> {
+  const { protocolDir, worktreePath } = config;
+
+  log(`[supervisor] Ask command for task ${cmd.task_id.substring(0, 8)} (effort=${cmd.effort ?? 'default'})`);
+
+  const status: SupervisorStatus = {
+    phase: 'work',
+    task_id: cmd.task_id,
+    command_type: 'ask',
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    pid: process.pid,
+  };
+  writeStatus(protocolDir, status);
+
+  try {
+    const agent = getAgent(cmd.agent_id ?? 'claude-code');
+    const effectiveWatchdogMs = resolveWatchdogTimeout(
+      cmd.watchdog_output_timeout_ms ?? 0,
+      agent.defaultWatchdogTimeoutMs(),
+    );
+
+    const onRetryStateChange = (retryState: RetryState | null) => {
+      if (retryState) {
+        status.phase = 'retrying';
+        status.retryCount = retryState.count;
+        status.errors = retryState.errors;
+        status.updated_at = new Date().toISOString();
+        writeStatus(protocolDir, status);
+      } else {
+        delete status.retryCount;
+        delete status.errors;
+      }
+    };
+
+    const agentStart = Date.now();
+    const result = await runWork(
+      agent,
+      worktreePath,
+      cmd.prompt,
+      cmd.system_prompt,
+      cmd.model_id,
+      cmd.agent_session_id,
+      protocolDir,
+      onRetryStateChange,
+      undefined,
+      effectiveWatchdogMs,
+      cmd.effort,
+      'plan',
+    );
+    const agentDurationMs = Date.now() - agentStart;
+
+    updatePhase(status, 'writing_response', protocolDir);
+    const response: CompletedResponse = {
+      status: 'completed',
+      result: result.result,
+      session_id: result.session_id,
+      usage: result.usage,
+      agent_duration_ms: agentDurationMs,
+    };
+    writeResponse(protocolDir, response);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logError(`[supervisor] Ask work phase failed: ${errorMessage}`);
+
+    const errorResponse: ErrorResponse = {
+      status: 'error',
+      error: `Work phase failed: ${errorMessage}`,
+      phase: 'work',
+    };
+    if (err instanceof CrashError) {
+      errorResponse.exit_code = err.exitCode;
+      errorResponse.stderr = err.stderr;
+      errorResponse.stdout_error = err.stdoutError;
+      errorResponse.duration_ms = err.durationMs;
+    } else if (err instanceof WatchdogTimeoutError) {
+      errorResponse.duration_ms = err.durationMs;
+    }
+    writeResponse(protocolDir, errorResponse);
+  }
 }
 
 // --- Helpers ---

@@ -88,26 +88,22 @@ describe('lazy accept idempotent transitions', () => {
     expectOutput(showAfterSecond, 'abandoned');
   });
 
-  test('close twice succeeds (idempotent closed → closed)', async () => {
-    const taskId = await createTask(ctx, 'Idempotent close test');
+  test('abandon twice fails (not idempotent)', async () => {
+    const taskId = await createTask(ctx, 'Double abandon test');
 
-    // First close
-    const firstClose = await ctx.lazy(['close', taskId, '--reason', 'First close']);
-    expectSuccess(firstClose);
+    // First abandon
+    const firstAbandon = await ctx.lazy(['abandon', taskId, '--reason', 'First abandon']);
+    expectSuccess(firstAbandon);
 
-    // Verify task is closed
+    // Verify task is abandoned
     const showAfterFirst = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfterFirst);
-    expectOutput(showAfterFirst, 'closed');
+    expectOutput(showAfterFirst, 'abandoned');
 
-    // Second close (should be idempotent - no error)
-    const secondClose = await ctx.lazy(['close', taskId, '--reason', 'Second close']);
-    expectSuccess(secondClose);
-
-    // Verify task is still closed
-    const showAfterSecond = await ctx.lazy(['show', taskId]);
-    expectSuccess(showAfterSecond);
-    expectOutput(showAfterSecond, 'closed');
+    // Second abandon should fail (already abandoned)
+    const secondAbandon = await ctx.lazy(['abandon', taskId, '--reason', 'Second abandon']);
+    expectFailure(secondAbandon);
+    expectError(secondAbandon, 'already abandoned');
   });
 
   test('transitioning from terminal to different terminal state fails', async () => {

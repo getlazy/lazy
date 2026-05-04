@@ -7,7 +7,6 @@
  *
  * Unix socket endpoints:
  *   GET  /daemon/status          — health check / status endpoint
- *   GET  /events/stream?task_id= — SSE event stream for supervisors
  *   POST /daemon/shutdown        — graceful shutdown
  *   POST /rpc/{command}          — CLI command pass-through
  *   POST /mcp/:taskId/:toolName  — MCP tool execution (agents in containers)
@@ -26,40 +25,36 @@
  */
 
 import { mkdirSync, existsSync, unlinkSync } from 'fs';
+import { unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
-import { getSocketPath } from './paths';
+import { getSocketPath, getStartupErrorPath } from './paths';
 import { writePid, generateToken, readToken, cleanupStaleFiles, acquireDaemonLock, releaseDaemonLock } from './lifecycle';
 import { handleRpc, RpcError, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
 import { handleMcpToolCall } from './mcp-routes';
 import { reconcileTasks } from '../utils/reconcile';
 import { createRunner } from '../runner';
 import { logger, LogLevel } from '../utils/logger';
+import { markLoggedToFile } from '../utils/logged-error';
 import { createWebRequestHandler, tryBindTcpPort } from '../server';
 import { getLogPath } from './paths';
 import { loadConfig } from '../config/loader';
 import { DEFAULT_WEB_PORT } from '../config/constants';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
-import { setDaemonContext, signalPendingRequest, clearPendingRequest, hasPendingRequests } from './context';
-import {
-  registerConnection,
-  removeConnection,
-  sendCatchupEvents,
-  stopAllConnections,
-  routeStateChangeEvents,
-  type StateChange,
-} from './events';
+import { setDaemonContext } from './context';
 import {
   createReconcileEventState,
   detectAndDeliverEvents,
   deliverStateChangeEvents,
   runBlockedTaskCatchup,
   type ReconcileEventState,
+  type StateChange,
 } from './auto-deliver';
 import { runAutoReact } from './auto-react';
 import { closeSignalDb, initSignalDb } from './signals';
 import { startSyncRetryLoop } from './sync-retry';
 import { createDriver } from '../remote';
 import { runSync, debugSyncLogger } from './remote-sync';
+import { isOfflineMode } from '../utils/offline';
 
 export interface DaemonServerOptions {
   /** Project root this daemon serves. Required — the daemon is per-project. */
@@ -76,6 +71,12 @@ export interface DaemonServerOptions {
   maxPortAttempts?: number;
   /** Disable web dashboard TCP binding entirely. For tests. */
   noWeb?: boolean;
+  /**
+   * Test-only: force web binding even when LAZY_TEST=1.
+   * Used exclusively to exercise the web-bind failure path in tests.
+   * Not part of the daemon's public contract.
+   */
+  _forceBindWebInTest?: boolean;
 }
 
 export interface RunningDaemon {
@@ -109,12 +110,25 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   const projectRoot = options.projectRoot;
 
-  // Configure logger: write to daemon.log via appendFileSync (supports rotation),
-  // suppress console to avoid duplicate writes (stdout is already redirected to
-  // daemon.log in background mode). Errors still go to console as a safety net.
+  // Configure logger: write to daemon.log via appendFileSync (supports rotation).
+  //
+  // In BACKGROUND mode (LAZY_DAEMON_BACKGROUND=1, set by auto-start.ts when
+  // spawning the detached child), stdout and stderr are redirected to
+  // daemon.log via O_APPEND. Anything written to console.* therefore also
+  // lands in daemon.log — without a timestamp — and causes duplicate entries
+  // whenever logger.* also echoes to console. Set consoleLevel to SILENT so
+  // the logger writes *only* to the file, giving a single timestamped entry
+  // per log call.
+  //
+  // In FOREGROUND mode (user ran `lazy daemon start --foreground` directly),
+  // stdout/stderr are the user's terminal. Keep consoleLevel at ERROR so the
+  // user sees errors on their terminal; the logger also writes them to the
+  // file with a timestamp for post-mortem debugging. The two destinations
+  // are different sinks so no duplication occurs.
   if (!process.env.LAZY_TEST) {
     logger.setLogFile(getLogPath(projectRoot));
-    logger.configure({ consoleLevel: LogLevel.ERROR });
+    const background = process.env.LAZY_DAEMON_BACKGROUND === '1';
+    logger.configure({ consoleLevel: background ? LogLevel.SILENT : LogLevel.ERROR });
     logger.enableRotation(10 * 1024 * 1024, 3); // 10MB, keep 3 rotated files
   }
 
@@ -159,6 +173,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   // Start sync retry loop (runs alongside reconcile on same interval)
   const stopSyncRetryLoop = startSyncRetryLoop(projectRoot, reconcileInterval);
+
+  // Start remote sync loop (independent from reconcile to avoid blocking task detection)
+  const stopSyncLoop = startDaemonSyncLoop(projectRoot);
 
   // Ensure daemon directory exists
   mkdirSync(dirname(socketPath), { recursive: true });
@@ -254,58 +271,6 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       }
     }
 
-    // GET /events/stream?task_id=<taskId> — SSE event stream for supervisors
-    if (url.pathname === '/events/stream' && req.method === 'GET') {
-      const taskId = url.searchParams.get('task_id');
-      if (!taskId) {
-        return Response.json({ error: 'Missing task_id query parameter' }, { status: 400 });
-      }
-
-      const reqProject = req.headers.get('x-lazy-project');
-      if (!reqProject) {
-        return Response.json({ error: 'Missing X-Lazy-Project header' }, { status: 400 });
-      }
-      if (reqProject !== projectRoot) {
-        return Response.json({ error: `Project mismatch: daemon serves ${projectRoot}, request is for ${reqProject}` }, { status: 400 });
-      }
-
-      const stream = new ReadableStream({
-        start(controller) {
-          // Register the SSE connection
-          registerConnection(taskId, controller);
-
-          // Send initial connected event
-          controller.enqueue(`event: connected\ndata: ${JSON.stringify({ task_id: taskId })}\n\n`);
-
-          // Run catchup asynchronously — don't block the stream setup
-          (async () => {
-            try {
-              const catchupStorage = await openProjectStorage(projectRoot);
-              try {
-                await sendCatchupEvents(catchupStorage, taskId, projectRoot);
-              } finally {
-                await catchupStorage.close();
-              }
-            } catch (err) {
-              logger.debug(`SSE catchup failed for ${taskId.substring(0, 8)}: ${err instanceof Error ? err.message : err}`);
-            }
-          })();
-        },
-        cancel() {
-          // Client disconnected
-          removeConnection(taskId);
-        },
-      });
-
-      return new Response(stream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-        },
-      });
-    }
-
     // POST /daemon/shutdown — graceful shutdown
     if (url.pathname === '/daemon/shutdown' && req.method === 'POST') {
       logger.info('Shutdown requested via RPC');
@@ -393,22 +358,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     idleTimeout: 120 as never,
 
     async fetch(req: Request): Promise<Response> {
-      // Signal that a request is waiting so the reconcile loop can yield
-      signalPendingRequest();
-      try {
-        // Auth check — all unix socket endpoints require bearer token
-        const authHeader = req.headers.get('authorization');
-        if (authHeader !== `Bearer ${token}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401 });
-        }
-
-        const daemonResponse = await handleDaemonRequest(req, false);
-        if (daemonResponse) return daemonResponse;
-
-        return Response.json({ error: 'Not found' }, { status: 404 });
-      } finally {
-        clearPendingRequest();
+      // Auth check — all unix socket endpoints require bearer token
+      const authHeader = req.headers.get('authorization');
+      if (authHeader !== `Bearer ${token}`) {
+        return Response.json({ error: 'Unauthorized' }, { status: 401 });
       }
+
+      const daemonResponse = await handleDaemonRequest(req, false);
+      if (daemonResponse) return daemonResponse;
+
+      return Response.json({ error: 'Not found' }, { status: 404 });
     },
   });
 
@@ -416,7 +375,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   let webServer: ReturnType<typeof Bun.serve> | undefined;
   let webPort: number | undefined;
 
-  if (!options.noWeb && !process.env.LAZY_TEST) {
+  const shouldBindWeb =
+    !options.noWeb && (options._forceBindWebInTest === true || !process.env.LAZY_TEST);
+
+  if (shouldBindWeb) {
     // Port priority: explicit option > project config > global default
     let configPort: number | undefined;
     try {
@@ -424,64 +386,173 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       configPort = config.server.port;
     } catch { /* config load failure shouldn't prevent web server startup */ }
     const desiredPort = options.webPort ?? configPort ?? DEFAULT_WEB_PORT;
+    const attempts = options.maxPortAttempts ?? 100;
 
-    // Use the daemon's shared storage instance for the web dashboard
-    const setupWebHandler = async () => {
-      const storage = await getOrCreateStorage();
-      return createWebRequestHandler(storage);
+    // Tear down partial startup state so a failed bind leaves nothing behind:
+    // no stale PID/socket/lock, no leaked timers, no dangling unix listener.
+    // After teardown, isDaemonRunning(projectRoot) returns false and the user
+    // can start a fresh daemon as soon as they free the conflicting port.
+    // Teardown contract: we are already throwing the primary bind-failure
+    // error to the caller, so individual cleanup step failures must not mask
+    // or replace that error. Each step is best-effort — if it fails, the
+    // worst case is a stale file or timer, which is strictly no worse than
+    // the pre-teardown state; the caller sees the hard failure and will not
+    // treat the daemon as running. We log failures at debug level so a
+    // persistent teardown bug is still discoverable without surfacing noise
+    // to the user on every failed start.
+    const safeStep = async (label: string, fn: () => unknown) => {
+      try {
+        await fn();
+      } catch (err) {
+        logger.debug(`teardown step '${label}' failed (ignored): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    const teardownPartialStart = async () => {
+      await safeStep('stopReconcileLoop', () => stopReconcileLoop());
+      await safeStep('stopSyncRetryLoop', () => stopSyncRetryLoop());
+      await safeStep('stopSyncLoop', () => stopSyncLoop());
+      await safeStep('closeSignalDb', () => closeSignalDb());
+      await safeStep('closeAllStorage', () => closeAllStorage());
+      await safeStep('server.stop', () => server.stop());
+      // The unix socket file we bound may not live at the default path
+      // (tests pass an explicit socketPath). Remove it explicitly before
+      // calling cleanupStaleFiles (which only touches default paths).
+      // ENOENT is expected here: the socket may have been cleaned up by
+      // server.stop() above, or never created if we teardown very early.
+      await safeStep('unlink socket', async () => {
+        try {
+          await unlink(socketPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+      });
+      await safeStep('cleanupStaleFiles', () => cleanupStaleFiles(projectRoot));
+      if (daemonLockFd !== null) {
+        await safeStep('releaseDaemonLock', () => releaseDaemonLock(daemonLockFd!));
+      }
     };
 
-    // Create handler immediately — the daemon is a long-lived process
-    let handlerPromise = setupWebHandler();
+    // Build a minimal TCP handler that can accept the bind BEFORE we touch
+    // storage. Storage initialization is expensive and async — if we kicked
+    // it off before bind and bind then failed, the in-flight promise would
+    // race our teardown and reopen storage after we closed it. Defer the
+    // real handler wiring until after bind succeeds; until then, refuse
+    // requests so any client hitting the port during startup sees 503.
+    // Bun.serve calls fetch() lazily so in practice this placeholder only
+    // runs if a request slips in during the narrow bind→wire-up window.
+    let webRequestHandler: (req: Request) => Promise<Response> = async () =>
+      Response.json({ error: 'Daemon starting' }, { status: 503 });
 
-    const webRequestHandler = async (req: Request) => {
+    const tcpHandler = async (req: Request): Promise<Response> => {
+      // Daemon routes on TCP — RPC requires auth, status does not
+      const url = new URL(req.url);
+
+      // /daemon/status is available without auth on TCP
+      if (url.pathname === '/daemon/status') {
+        const daemonResponse = await handleDaemonRequest(req, false);
+        if (daemonResponse) return daemonResponse;
+      }
+
+      // /mcp/*, /rpc/*, and /daemon/shutdown require auth on TCP
+      if (url.pathname.startsWith('/mcp/') || url.pathname.startsWith('/rpc/') || url.pathname === '/daemon/shutdown') {
+        const authHeader = req.headers.get('authorization');
+        if (authHeader !== `Bearer ${token}`) {
+          return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        }
+        const daemonResponse = await handleDaemonRequest(req, false);
+        if (daemonResponse) return daemonResponse;
+      }
+
+      // Web dashboard routes — no auth required
+      return webRequestHandler(req);
+    };
+
+    let bindResult: ReturnType<typeof tryBindTcpPort> = null;
+    let bindThrownError: unknown = null;
+    try {
+      bindResult = tryBindTcpPort(desiredPort, tcpHandler, attempts);
+    } catch (err) {
+      // tryBindTcpPort rethrows anything that isn't EADDRINUSE (e.g., EACCES
+      // on privileged ports, unexpected Bun.serve failures). Surface these
+      // with the same actionable messaging as the "all ports busy" case.
+      bindThrownError = err;
+    }
+
+    if (!bindResult) {
+      // INVARIANT: failing to bind the web port is a hard startup failure.
+      // Containers (builder, sandbox runners) call back via
+      // host.docker.internal:<webPort>, so a daemon without a reachable web
+      // port would leave container-based RPCs (e.g., getDaemonMcpConfig)
+      // throwing "Daemon context not initialized" — violating CLAUDE.md's
+      // "fail hard on remote failures" and "principle of least surprise".
+      const lastPort = desiredPort + attempts - 1;
+      const reason = bindThrownError
+        ? `bind error: ${bindThrownError instanceof Error ? bindThrownError.message : String(bindThrownError)}`
+        : `no free port in range ${desiredPort}–${lastPort} (tried ${attempts} port${attempts === 1 ? '' : 's'}, all busy)`;
+      const errorMessage =
+        `Daemon failed to bind web dashboard: ${reason}. ` +
+        `The daemon cannot start without a reachable TCP port — containers call back via host.docker.internal:<port>.\n` +
+        `\n` +
+        `To fix:\n` +
+        `  • Find what is holding the port: lsof -i :${desiredPort}\n` +
+        `  • Stop a colliding daemon: lazy daemon stop --project <other-project>\n` +
+        `  • Or pick a different port in lazy.toml:\n` +
+        `      [server]\n` +
+        `      port = <number>`;
+      // Log via logger.error BEFORE teardown and throw. Logger uses
+      // appendFileSync (O_APPEND), guaranteeing the message appears at the
+      // END of daemon.log in chronological order with earlier startup lines.
+      // This is the line users see via `tail daemon.log` — without it, the
+      // error is only visible via the top-level process.exit handler's
+      // console.error, which is easy to miss and was the direct cause of
+      // the reported "silent hang" symptom (log appeared frozen at
+      // "Daemon sync loop enabled" because the actual failure below was
+      // being written to stderr before the logger had a chance to flush it).
+      logger.error(errorMessage);
+      // Write the startup-error marker so the parent process (the CLI that
+      // spawned this detached daemon via startDaemonBackground) can read
+      // the actionable message after its readiness poll times out and
+      // surface it to the user's terminal. Without this, the user sees
+      // only the generic "Daemon did not start within 5 seconds" message
+      // and has to dig through daemon.log themselves. The parent cleared
+      // any stale marker before spawning, so its presence means "this
+      // child wrote it". Best-effort: if writing the marker fails, we
+      // still throw — the file-backed log remains the source of truth.
+      try {
+        await writeFile(getStartupErrorPath(projectRoot), errorMessage, { mode: 0o644 });
+      } catch (markerErr) {
+        logger.warn(`Failed to write startup-error marker: ${markerErr instanceof Error ? markerErr.message : String(markerErr)}`);
+      }
+      await teardownPartialStart();
+      // Mark the error so the top-level CLI catch in src/index.ts doesn't
+      // re-emit it. In background mode, console.* writes land back in
+      // daemon.log via O_APPEND — re-logging at the top level would add a
+      // second untimestamped copy of the same message.
+      throw markLoggedToFile(new Error(errorMessage));
+    }
+
+    webServer = bindResult.server;
+    const actualPort = webServer.port!;
+    webPort = actualPort;
+    boundWebPort = actualPort;
+    // Set daemon context so RPC handlers (e.g., task launcher) can access
+    // the daemon's own webPort and token without health checks.
+    setDaemonContext({ webPort: actualPort, token });
+
+    // Bind succeeded — now wire up the real web request handler. Storage
+    // initialization is kicked off eagerly so the first web request
+    // doesn't pay the cold-start cost, but we're past the bind failure
+    // window so there's no teardown race.
+    const handlerPromise = (async () => {
+      const storage = await getOrCreateStorage();
+      return createWebRequestHandler(storage);
+    })();
+    webRequestHandler = async (req: Request) => {
       const handler = await handlerPromise;
       return handler(req);
     };
 
-    const tcpHandler = async (req: Request): Promise<Response> => {
-      // Signal that a request is waiting so the reconcile loop can yield
-      signalPendingRequest();
-      try {
-        // Daemon routes on TCP — RPC requires auth, status does not
-        const url = new URL(req.url);
-
-        // /daemon/status is available without auth on TCP
-        if (url.pathname === '/daemon/status') {
-          const daemonResponse = await handleDaemonRequest(req, false);
-          if (daemonResponse) return daemonResponse;
-        }
-
-        // /mcp/*, /rpc/*, and /daemon/shutdown require auth on TCP
-        if (url.pathname.startsWith('/mcp/') || url.pathname.startsWith('/rpc/') || url.pathname === '/daemon/shutdown') {
-          const authHeader = req.headers.get('authorization');
-          if (authHeader !== `Bearer ${token}`) {
-            return Response.json({ error: 'Unauthorized' }, { status: 401 });
-          }
-          const daemonResponse = await handleDaemonRequest(req, false);
-          if (daemonResponse) return daemonResponse;
-        }
-
-        // Web dashboard routes — no auth required
-        return webRequestHandler(req);
-      } finally {
-        clearPendingRequest();
-      }
-    };
-
-    const bindResult = tryBindTcpPort(desiredPort, tcpHandler, options.maxPortAttempts);
-    if (bindResult) {
-      webServer = bindResult.server;
-      const actualPort = webServer.port!;
-      webPort = actualPort;
-      boundWebPort = actualPort;
-      // Set daemon context so RPC handlers (e.g., task launcher) can access
-      // the daemon's own webPort and token without health checks.
-      setDaemonContext({ webPort: actualPort, token });
-      logger.info(`Web dashboard: http://localhost:${webPort}`);
-    } else {
-      logger.warn(`Could not bind web dashboard to port ${desiredPort} (all ports busy)`);
-    }
+    logger.info(`Web dashboard: http://localhost:${webPort}`);
   }
 
   const result: RunningDaemon = {
@@ -544,7 +615,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
     stopReconcileLoop();
     stopSyncRetryLoop();
-    stopAllConnections();
+    stopSyncLoop();
     closeSignalDb();
     // Close all long-lived Storage instances
     closeAllStorage().catch(() => {});
@@ -620,9 +691,6 @@ function startDaemonReconcileLoop(
   // Event state tracked across reconcile ticks
   const eventState = createReconcileEventState();
 
-  // Timestamp of last upstream fetch (for rate limiting)
-  let lastUpstreamFetchAt = 0;
-
   /**
    * Run a reconcile phase with isolated error handling.
    * Each phase runs independently — a failure in one phase does not
@@ -680,37 +748,14 @@ function startDaemonReconcileLoop(
         logger.debug(`Failed to cache task IDs: ${err instanceof Error ? err.message : err}`);
       }
 
+      // --- Check offline mode once per tick ---
+      const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+
       // --- Critical path: detect finished tasks and transition states ---
-      // This must run before any network operations (push, auto-react) that
-      // could hang and block the tick. Previously, retryFailedPushes ran here
-      // and could stall the entire loop if a git push subprocess hung.
-
-      // Periodic remote sync: upstream fetch, detect external changes (merged/closed PRs),
-      // fetch comments, export branches, post turns/notes.
-      // Replaces the standalone `lazy sync` (no task ID) command.
-      // Only run if enough time has passed since last sync.
-      try {
-        const config = await loadConfig(projectRoot);
-        const syncInterval = config.server.sync_interval;
-        const now = Date.now();
-        const elapsed = (now - lastUpstreamFetchAt) / 1000; // seconds
-
-        if (syncInterval > 0 && elapsed >= syncInterval) {
-          const driver = createDriver(config);
-
-          // Skip if driver doesn't need remote sync (e.g., LocalDriver)
-          if (driver.needsSync) {
-            await runSync(projectRoot, storage, debugSyncLogger);
-            lastUpstreamFetchAt = now;
-          }
-        }
-      } catch (err) {
-        // Log non-critical errors (e.g., "no remote driver" for local repos)
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!msg.includes('Sync requires a remote driver')) {
-          logger.debug(`Remote sync error: ${msg}`);
-        }
-      }
+      // This must run before any network operations (push, sync, auto-react)
+      // that could hang and block the tick. Sync alone can take 2-3 minutes
+      // (pushing branches, fetching PR comments), and if it runs first the
+      // working-task sweep gets preempted by pending HTTP requests every tick.
 
       // Snapshot working tasks before reconciliation so we can detect
       // which ones transition to blocked/conflict (turn completed).
@@ -728,8 +773,7 @@ function startDaemonReconcileLoop(
       }
 
       await runPhase('reconcileTasks', async () => {
-        const scheduling = { shouldAbort: hasPendingRequests };
-        await reconcileTasks(storage, projectRoot, scheduling);
+        await reconcileTasks(storage, projectRoot);
       });
 
       // After reconciliation, detect state changes and route events + push branches.
@@ -739,7 +783,7 @@ function startDaemonReconcileLoop(
 
       await runPhase('detectStateChanges', async () => {
         for (const taskId of workingIds) {
-          if (stopped || hasPendingRequests()) break;
+          if (stopped) break;
           try {
             const branch = branchByTaskId.get(taskId);
 
@@ -756,8 +800,8 @@ function startDaemonReconcileLoop(
               });
             }
 
-            if (branch && (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted')) {
-              // Task completed a turn — push the branch
+            if (!offline && branch && (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted')) {
+              // Task completed a turn — push the branch (skip when offline)
               pushBranchAfterStateChange(projectRoot, branch).catch(err => {
                 const msg = err instanceof Error ? err.message : String(err);
                 logger.debug(`Background push failed for ${branch}: ${msg}`);
@@ -768,12 +812,10 @@ function startDaemonReconcileLoop(
           }
         }
 
-        // Route events via SSE for detected state changes
         if (stateChanges.length > 0) {
           for (const sc of stateChanges) {
             logger.info(`Task ${sc.taskId.substring(0, 8)} state change: working → ${sc.currentStatus}`);
           }
-          routeStateChangeEvents(storage, stateChanges);
         }
       });
 
@@ -785,30 +827,32 @@ function startDaemonReconcileLoop(
       }
 
       // Detect accepts and parent branch changes, deliver to blocked tasks
-      if (!hasPendingRequests()) {
-        await runPhase('detectAndDeliverEvents', async () => {
-          await detectAndDeliverEvents(storage, projectRoot, eventState);
-        });
-      }
+      await runPhase('detectAndDeliverEvents', async () => {
+        await detectAndDeliverEvents(storage, projectRoot, eventState);
+      });
 
       // Stateless catchup: check all blocked tasks for conditions that
       // require action, regardless of whether a transition was detected.
       // This is the safety net that survives daemon restarts — it checks
       // current git/task state rather than relying on in-memory diffs.
-      if (!hasPendingRequests()) {
-        await runPhase('runBlockedTaskCatchup', async () => {
-          await runBlockedTaskCatchup(storage, projectRoot);
-        });
-      }
+      await runPhase('runBlockedTaskCatchup', async () => {
+        await runBlockedTaskCatchup(storage, projectRoot);
+      });
 
       // --- Non-critical phases: network operations ---
       // These phases make network calls (git push, gh CLI) that can hang.
       // Subprocess-level timeouts (DEFAULT_SUBPROCESS_TIMEOUT_MS) kill hanging
       // processes, and phase isolation ensures failures don't cascade.
+      //
+      // Note: Remote sync (upstream fetch, PR comments, branch export) runs on
+      // its own independent loop — see startDaemonSyncLoop(). This keeps the
+      // reconcile tick fast and prevents slow network operations from blocking
+      // task state detection.
 
       // Retry any branches that failed to push on a previous tick.
       // Moved after reconcileTasks so a hanging push can't block task detection.
-      if (!hasPendingRequests()) {
+      // Skip entirely when offline — no point retrying network operations.
+      if (!offline) {
         await runPhase('retryFailedPushes', async () => {
           await retryFailedPushes(projectRoot);
         });
@@ -816,7 +860,7 @@ function startDaemonReconcileLoop(
 
       // Auto-react: check for CI failures and PR comments on blocked tasks.
       // Runs after reconciliation so newly-blocked tasks are included.
-      if (!stopped && !hasPendingRequests()) {
+      if (!stopped) {
         await runPhase('runAutoReact', async () => {
           const config = await loadConfig(projectRoot);
           const autoReactResult = await runAutoReact(storage, projectRoot, config);
@@ -867,5 +911,80 @@ function startDaemonReconcileLoop(
     stopped = true;
     clearTimeout(initialTimeout);
     clearInterval(intervalId);
+  };
+}
+
+/**
+ * Start an independent sync loop that runs remote operations
+ * (upstream fetch, PR comment fetching, branch export, CI checks)
+ * on its own timer, decoupled from the reconcile loop.
+ *
+ * This prevents slow network operations (which can take 2-3 minutes
+ * with many open PRs) from blocking task state detection. The reconcile
+ * loop stays fast (~seconds) while sync runs at its own pace.
+ */
+function startDaemonSyncLoop(projectRoot: string): () => void {
+  let syncing = false;
+  let stopped = false;
+
+  const doSync = async () => {
+    if (stopped) return;
+    if (syncing) {
+      logger.debug('Daemon sync: skipping tick, previous sync still running');
+      return;
+    }
+
+    syncing = true;
+    const syncStart = Date.now();
+    try {
+      const config = await loadConfig(projectRoot);
+      const syncInterval = config.server.sync_interval;
+
+      // sync_interval = 0 disables sync
+      if (syncInterval <= 0) return;
+
+      // Skip sync entirely when offline — no network noise.
+      if (await isOfflineMode(join(projectRoot, '.lazy'))) return;
+
+      const driver = createDriver(config);
+
+      // Skip if driver doesn't need remote sync (e.g., LocalDriver)
+      if (!driver.needsSync) return;
+
+      const storage = await getOrCreateStorage();
+      await runSync(projectRoot, storage, debugSyncLogger);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('Sync requires a remote driver')) {
+        logger.debug(`Daemon sync error: ${msg}`);
+      }
+    } finally {
+      const durationMs = Date.now() - syncStart;
+      logger.debug(`Daemon sync tick completed in ${durationMs}ms`);
+      syncing = false;
+    }
+  };
+
+  // First sync after a short delay (give the daemon time to fully initialize)
+  const initialTimeout = setTimeout(doSync, 5_000);
+
+  // Subsequent syncs: use the configured sync_interval.
+  // Default is 60s — we check config once and use that for the interval.
+  // If the user changes the config, they restart the daemon anyway.
+  let intervalId: ReturnType<typeof setInterval>;
+  loadConfig(projectRoot).then(config => {
+    const syncIntervalMs = (config.server.sync_interval || 60) * 1_000;
+    intervalId = setInterval(doSync, syncIntervalMs);
+    logger.debug(`Daemon sync loop enabled: every ${config.server.sync_interval || 60}s`);
+  }).catch(err => {
+    // Fallback to default interval if config loading fails
+    intervalId = setInterval(doSync, 60_000);
+    logger.debug(`Daemon sync loop enabled: every 60s (config load failed: ${err instanceof Error ? err.message : err})`);
+  });
+
+  return () => {
+    stopped = true;
+    clearTimeout(initialTimeout);
+    if (intervalId) clearInterval(intervalId);
   };
 }

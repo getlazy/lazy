@@ -4,7 +4,7 @@
  * Re-exports the key functions needed by CLI commands and auto-start.
  */
 
-export { getDaemonBaseDir, getDaemonDir, getPidPath, getSocketPath, getTokenPath, getLogPath, getDaemonLockPath, projectSlug } from './paths';
+export { getDaemonBaseDir, getDaemonDir, getPidPath, getSocketPath, getTokenPath, getLogPath, getDaemonLockPath, getStartupErrorPath, projectSlug } from './paths';
 export {
   checkDaemonHealth,
   isDaemonRunning,

@@ -616,6 +616,61 @@ describe('file permission violations', () => {
     expect(status).toBe('conflict');
   });
 
+  // INVARIANT: Files created by the task itself are exempt from permission violations,
+  // even when modified in a later turn. The branch_point_sha plumbing ensures that
+  // detectViolations can distinguish task-created files from pre-existing ones across turns.
+  test('no violation when file created in turn 1 is modified in turn 2', async () => {
+    // Enable permissions with test dir pattern
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["test/**/*.ts"]\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns for test dir');
+
+    const taskId = await createTask(ctx, 'Add and refine tests', 'Write tests then refine them');
+
+    // Turn 1: agent creates a brand new test file matching the protected pattern
+    const mockFilesTurn1 = JSON.stringify([
+      { path: 'test/feature.test.ts', content: 'describe("feature", () => {\n  test("works", () => { expect(true).toBe(true); });\n});\n' },
+    ]);
+
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesTurn1 } },
+    );
+    expectSuccess(startResult);
+
+    // Verify turn 1: no violations (file is new — pure addition)
+    let turns = readTurns(ctx.root, taskId);
+    let agentTurn = turns.find(t => t.role === 'agent');
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn!.violations).toBeUndefined();
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    // Turn 2: agent modifies the same file (changes existing lines — NOT a pure addition)
+    const mockFilesTurn2 = JSON.stringify([
+      { path: 'test/feature.test.ts', content: 'describe("feature", () => {\n  test("works correctly", () => { expect(1 + 1).toBe(2); });\n  test("handles edge case", () => { expect(null).toBeNull(); });\n});\n' },
+    ]);
+
+    const unblockResult = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'Refine the tests', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesTurn2 } },
+    );
+    expectSuccess(unblockResult);
+
+    // Verify turn 2: still no violations — the file was created by this task (not pre-existing).
+    // branch_point_sha ensures detectViolations exempts it even though it's a modification.
+    turns = readTurns(ctx.root, taskId);
+    const secondAgentTurn = turns.filter(t => t.role === 'agent')[1];
+    expect(secondAgentTurn).toBeDefined();
+    expect(secondAgentTurn!.violations).toBeUndefined();
+
+    // No violations → task stays in 'blocked', not 'conflict'
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+  });
+
   // INVARIANT: Violations are detected on unblock turns, not just start turns.
   // protected_patterns must be passed through unblock commands to the supervisor.
   test('detects violations on unblock turns', async () => {

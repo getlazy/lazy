@@ -9,7 +9,6 @@ import { repoHasCommits } from '../git/operations';
 import { detectRemote } from '../remote';
 import setupDockerfilePrompt from '../prompts/setup-dockerfile.md' with { type: 'text' };
 import { detectShell, getCompletionSetupCommand } from '../shell/detect';
-import { detectToolchain, isValidToolchain } from '../docker/toolchains';
 import { theme } from './theme';
 import { runGit } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
@@ -104,8 +103,6 @@ interface InitOptions {
   skipCompletionCheck?: boolean;
   /** Allow init to run without a TTY (for CI/testing). Uses defaults for all prompts. */
   nonInteractive?: boolean;
-  /** Override auto-detected toolchain (e.g., "rust", "node", "ruby-rails"). */
-  toolchain?: string;
 }
 
 /**
@@ -417,26 +414,10 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   });
   await storage.close();
 
-  // Detect or validate toolchain
-  let toolchain: string;
-  if (options.toolchain) {
-    if (!isValidToolchain(options.toolchain)) {
-      console.error(`Error: unknown toolchain "${options.toolchain}".`);
-      console.error('Available toolchains: base, bun, node, deno, rust, go, cpp, ruby-rails,');
-      console.error('  ruby-rails-rust, dotnet, python, python-ml, java, kotlin, swift');
-      process.exit(1);
-    }
-    toolchain = options.toolchain;
-    console.log(`Toolchain: ${toolchain} (from --toolchain flag)`);
-  } else {
-    toolchain = detectToolchain(targetDir);
-    console.log(`Toolchain: ${toolchain} (auto-detected)`);
-  }
-
   // Create default lazy.toml if it doesn't exist
   const configPath = join(targetDir, CONFIG_FILENAME);
   if (!existsSync(configPath)) {
-    const template = getDefaultConfigTemplate(storageChoice.backend, externalPathForStorage, toolchain, gitRemote);
+    const template = getDefaultConfigTemplate(storageChoice.backend, externalPathForStorage, gitRemote);
     writeFileSync(configPath, template);
     console.log(`Created ${CONFIG_FILENAME} with default configuration`);
   }

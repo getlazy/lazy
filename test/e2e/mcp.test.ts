@@ -120,11 +120,11 @@ describe('lazy-agent mcp', () => {
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).toEqual([
+      'lazy_abandon',
       'lazy_accept',
       'lazy_active',
       'lazy_blocked',
       'lazy_clone',
-      'lazy_close',
       'lazy_comment',
       'lazy_commit',
       'lazy_conversation_read',
@@ -136,7 +136,6 @@ describe('lazy-agent mcp', () => {
       'lazy_list',
       'lazy_propose',
       'lazy_redo',
-      'lazy_reject',
       'lazy_reopen',
       'lazy_resume',
       'lazy_search',

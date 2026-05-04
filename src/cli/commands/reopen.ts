@@ -66,9 +66,9 @@ export async function commandReopen(args: string[]): Promise<void> {
     // Resolve task
     const task = await resolveTaskOrExit(storage, taskId);
 
-    // Verify task is abandoned, closed, or complete
-    if (task.status !== 'abandoned' && task.status !== 'closed' && task.status !== 'complete') {
-      console.error(`Task ${displayId(task)} is ${task.status} — only abandoned, closed, or complete tasks can be reopened.`);
+    // Verify task is abandoned or complete
+    if (task.status !== 'abandoned' && task.status !== 'complete') {
+      console.error(`Task ${displayId(task)} is ${task.status} — only abandoned or complete tasks can be reopened.`);
       process.exit(1);
     }
 
@@ -104,7 +104,7 @@ export async function commandReopen(args: string[]): Promise<void> {
       }
     }
 
-    // Get session (closed tasks may not have one if they were never started)
+    // Get session (abandoned tasks may not have one if they were never started)
     const sess = await storage.getSessionByTaskId(task.id);
 
     // Check for orphaned child (parent accepted, branch gone) and retarget before recreating worktree
@@ -208,14 +208,14 @@ export async function commandReopen(args: string[]): Promise<void> {
 export function reopenUsage(): void {
   console.log(`Usage: lazy reopen <task_id> [--reason "reason text"]
 
-Reopen a previously rejected (abandoned), closed, or accepted (complete) task.
+Reopen a previously abandoned or accepted (complete) task.
 
 Restores the task to 'blocked' status and recreates the worktree.
 If the git branch still exists, it is reused; otherwise a fresh
 branch is created from main.
 
 Arguments:
-  <task_id>    ID of the abandoned, closed, or complete task to reopen
+  <task_id>    ID of the abandoned or complete task to reopen
 
 Options:
   --reason     Reason for reopening (required for complete tasks)
@@ -229,7 +229,7 @@ Interactive Mode:
   - For non-interactive use, provide --reason or pipe via stdin
 
 Notes:
-  - Only works on tasks with 'abandoned', 'closed', or 'complete' status
+  - Only works on tasks with 'abandoned' or 'complete' status
   - For complete tasks, a reason is required and recorded as a comment
   - Resets the session so the task can receive new feedback
   - For complete tasks, clears the old Claude session ID to start fresh

@@ -16,7 +16,8 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'github',
@@ -27,7 +28,7 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '', toolchain: '' },
+  docker: { dockerfile: '' },
   runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
@@ -293,5 +294,128 @@ describe('GitHubDriver markReadyForReview', () => {
     expect(baseIndex).toBeGreaterThan(-1);
     // Should fall back to "main", NOT "HEAD"
     expect(createCall![baseIndex + 1]).toBe('main');
+  });
+
+  // INVARIANT: When `gh pr create` fails, the driver must surface the stderr
+  // instead of silently logging a warning and returning empty metadata. The
+  // caller (acceptTask / submitTask) needs the real error to show the user.
+  test('propagates gh pr create stderr on failure', async () => {
+    const deps: DriverDeps = {
+      runGh: async (args) => {
+        if (args[0] === 'pr' && args[1] === 'create') {
+          return {
+            stdout: '',
+            stderr: 'HTTP 422: Validation Failed — Head sha can\'t be blank',
+            exitCode: 1,
+          };
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: async (args: string[]) => {
+        if (args[0] === 'remote' && args[1] === 'get-url') {
+          return ok('git@github.com:owner/repo.git');
+        }
+        return fail('unexpected git call');
+      },
+    };
+
+    const task = makeTask({ metadata: { remote_target_branch: 'main' } });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/gh pr create failed/);
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/Head sha can't be blank/);
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/main/);
+  });
+
+  // INVARIANT: Idempotency for the "mark ready" path is resolved by querying
+  // `gh pr view --json isDraft` rather than matching stderr substrings from a
+  // failed `gh pr ready`. Substring matching was re-introducing the same class
+  // of bug the main fix removes (English error strings are not a reliable
+  // idempotency check).
+  test('skips gh pr ready when PR is already non-draft (state check)', async () => {
+    const ghCalls: string[][] = [];
+    const deps: DriverDeps = {
+      runGh: async (args) => {
+        ghCalls.push([...args]);
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('isDraft')) {
+          return ok(JSON.stringify({ isDraft: false }));
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: async () => fail('unexpected git call'),
+    };
+
+    const task = makeTask({
+      metadata: { remote_target_branch: 'main', github_remote_ref_id: '42' },
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    const result = await driver.markReadyForReview(task);
+    expect(result).toEqual({});
+
+    // `gh pr ready` must not be called when the PR is already non-draft.
+    const readyCall = ghCalls.find(c => c[0] === 'pr' && c[1] === 'ready');
+    expect(readyCall).toBeUndefined();
+  });
+
+  // INVARIANT: When the PR is actually in draft, we call `gh pr ready`. Any
+  // failure from `gh pr ready` in that path is a real failure (not an
+  // idempotency artifact) and must propagate with the raw stderr.
+  test('propagates gh pr ready stderr when state check says PR is draft', async () => {
+    const deps: DriverDeps = {
+      runGh: async (args) => {
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('isDraft')) {
+          return ok(JSON.stringify({ isDraft: true }));
+        }
+        if (args[0] === 'pr' && args[1] === 'ready') {
+          return {
+            stdout: '',
+            stderr: 'HTTP 403: Resource not accessible by integration',
+            exitCode: 1,
+          };
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: async () => fail('unexpected git call'),
+    };
+
+    const task = makeTask({
+      metadata: { remote_target_branch: 'main', github_remote_ref_id: '42' },
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/gh pr ready failed/);
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/Resource not accessible/);
+  });
+
+  // INVARIANT: `gh pr view` failure is itself a real failure (auth, missing
+  // PR, network) and must propagate — silent fallback would hide real bugs.
+  test('propagates gh pr view failure before attempting gh pr ready', async () => {
+    const ghCalls: string[][] = [];
+    const deps: DriverDeps = {
+      runGh: async (args) => {
+        ghCalls.push([...args]);
+        if (args[0] === 'pr' && args[1] === 'view' && args.includes('isDraft')) {
+          return {
+            stdout: '',
+            stderr: 'HTTP 401: Bad credentials',
+            exitCode: 1,
+          };
+        }
+        return fail('unexpected gh call');
+      },
+      runGit: async () => fail('unexpected git call'),
+    };
+
+    const task = makeTask({
+      metadata: { remote_target_branch: 'main', github_remote_ref_id: '42' },
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/gh pr view failed/);
+    await expect(driver.markReadyForReview(task)).rejects.toThrow(/Bad credentials/);
+
+    // Must not call `gh pr ready` after the state check failed.
+    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'ready')).toBeUndefined();
   });
 });

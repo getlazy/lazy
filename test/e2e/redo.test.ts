@@ -25,10 +25,10 @@ describe('lazy redo', () => {
     expectOutput(result, 'Original task goal');
     expectOutput(result, 'backlog');
 
-    // Old task should be closed
+    // Old task should be abandoned
     const oldShow = await ctx.lazy(['show', taskId]);
     expectSuccess(oldShow);
-    expectOutput(oldShow, 'closed');
+    expectOutput(oldShow, 'abandoned');
 
     // New task should exist with same goal
     const newTaskId = extractTaskId(result.stdout.split('redo of')[0].split('\n').pop()!);
@@ -72,10 +72,10 @@ describe('lazy redo', () => {
     expectOutput(result, 'Closing task');
     expectOutput(result, 'redo of');
 
-    // Old task should be closed
+    // Old task should be abandoned
     const oldShow = await ctx.lazy(['show', taskId]);
     expectSuccess(oldShow);
-    expectOutput(oldShow, 'closed');
+    expectOutput(oldShow, 'abandoned');
   });
 
   test('redo and start immediately', async () => {

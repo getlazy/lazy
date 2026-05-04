@@ -32,6 +32,13 @@ export interface AutoReactBudgetEntry {
   tasksAtLimit: string[];
 }
 
+export interface AutoReactBudgetEntry {
+  project: string;
+  used: number;
+  limit: number;
+  tasksAtLimit: string[];
+}
+
 export interface DaemonStatus {
   running: boolean;
   pid?: number;

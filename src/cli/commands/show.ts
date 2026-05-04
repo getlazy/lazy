@@ -4,7 +4,6 @@ import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { theme } from '../theme';
 import { readPendingProposals, type Proposal } from './propose';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
-import { isBuiltinToolchainCode, readBuiltinToolchain, listBuiltinToolchains } from './toolchains-list';
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
@@ -407,43 +406,6 @@ export async function commandShow(args: string[]): Promise<void> {
     return;
   }
 
-  // Handle built-in toolchain codes (lazy-toolchain-* prefix)
-  if (isBuiltinToolchainCode(taskId)) {
-    const toolchain = readBuiltinToolchain(taskId);
-    if (!toolchain) {
-      const available = listBuiltinToolchains().map(t => t.code);
-      console.error(`No built-in toolchain found for '${taskId}'.`);
-      console.error(`\nAvailable toolchains: ${available.join(', ')}`);
-      console.error(`\nRun ${theme.command('lazy system toolchains')} to see all built-in toolchains.`);
-      process.exit(1);
-    }
-
-    if (jsonOutput) {
-      console.log(JSON.stringify({
-        type: 'toolchain',
-        code: taskId,
-        name: toolchain.name,
-        description: toolchain.description,
-        content: toolchain.content,
-      }));
-      return;
-    }
-
-    const outputLines: string[] = [];
-    outputLines.push(`${theme.label('Toolchain')} ${theme.taskId(toolchain.name)}`);
-    outputLines.push(`  ${theme.label('Description:')} ${toolchain.description}`);
-    outputLines.push(`  ${theme.label('Size:')} ${toolchain.content.length} chars, ${toolchain.content.split('\n').length} lines`);
-    outputLines.push(`\n${theme.separator('─── Dockerfile ───────────────────────────────────────────')}\n`);
-    outputLines.push(toolchain.content);
-
-    let output = outputLines.join('\n');
-    if (lineRange) {
-      output = sliceLines(output, lineRange);
-    }
-    console.log(output);
-    return;
-  }
-
   const showFull = parsed.flags.get('full') === true;
 
   // Resolve as a task via daemon RPC
@@ -474,6 +436,7 @@ export async function commandShow(args: string[]): Promise<void> {
       const paddedStatus = t.status.padEnd(12);
       options.push(`${shortId(t.id)}  ${paddedStatus}  ${t.goal}`);
     }
+
 
     // In TTY mode, offer interactive choice
     if (isTTY()) {
@@ -673,12 +636,11 @@ conversation transcript.
 If given a file path, renders the file in a scrollable TUI viewer.
 Markdown files (.md) are rendered with formatting.
 
-Also supports viewing built-in system prompts (lazy-prompt-*) and
-toolchain Dockerfiles (lazy-toolchain-*).
+Also supports viewing built-in system prompts (lazy-prompt-*).
 
 Arguments:
   <id>         Task ID, task code, conversation session ID, file path,
-               built-in prompt code, or toolchain code
+               or built-in prompt code
 
 Options:
   --full       Show complete turn and comment content instead of truncated preview
@@ -696,7 +658,6 @@ Examples:
   lazy show dddddddd                          # Show conversation by session ID prefix
   lazy show dddddddd --lines 1..100           # Show first 100 lines of conversation
   lazy show lazy-prompt-system-instructions   # View a built-in system prompt
-  lazy show lazy-toolchain-rust               # View a toolchain Dockerfile
   lazy show README.md                         # View a file in scrollable TUI
   lazy show src/index.ts                      # View a TypeScript file
   lazy show CLAUDE.md --lines 1..50           # Show first 50 lines of file`)

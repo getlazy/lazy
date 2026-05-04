@@ -134,7 +134,7 @@ describe('theme', () => {
     test('theme.status maps statuses correctly', () => {
       // All statuses should return the status text (possibly colored)
       const statuses = ['working', 'blocked', 'complete', 'completed', 'accepted',
-        'interrupted', 'abandoned', 'rejected', 'closed', 'ended'];
+        'interrupted', 'abandoned', 'rejected', 'ended'];
       for (const s of statuses) {
         expect(stripAnsi(theme.status(s))).toBe(s);
       }

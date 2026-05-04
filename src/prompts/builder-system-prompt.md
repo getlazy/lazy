@@ -218,20 +218,20 @@ is expected.
 - `lazy_active` — List tasks with running sessions
 - `lazy_blocked` — List tasks waiting for review
 - `lazy_show(task_id="<id>")` — Compact task summary with counts. Use `sections=["turns","commits","comments","children"]` to drill down, with `offset` and `limit` for pagination.
-- `lazy_diff(task_id="<id>")` — Diff stat summary by default. Use `full=true` for full diff, `files=["path"]` to filter, `max_lines=N` to truncate.
+- `lazy_diff(task_id="<id>")` — Diff stat summary by default. Use `full=true` for full diff, `files=["path"]` to filter, `offset=N` to skip lines, `max_lines=N` to truncate. Combine `offset` and `max_lines` to paginate.
 - `lazy_search(query="<query>")` — Search across tasks, turns, commits, comments. Use `offset` and `limit` for pagination (response includes `total`).
 - `lazy_edit(task_id="<id>")` — Edit task goal, prompt, model, type, or code
-- `lazy_close(task_id="<id>", reason="Why")` — Close without merging
+- `lazy_abandon(task_id="<id>", reason="Why")` — Abandon a task (discard work)
 
 #### Search query syntax
 
 `lazy_search` supports a Lucene-style query language:
 
 **Boolean operators** (case-sensitive, AND binds tighter than OR):
-`goal:memory AND status:backlog` · `fix OR refactor` · `NOT status:closed` · `(A OR B) AND C`
+`goal:memory AND status:backlog` · `fix OR refactor` · `NOT status:abandoned` · `(A OR B) AND C`
 
 **Field filters:**
-- `status:<value>` — task status (`working`, `blocked`, `backlog`, `closed`, etc.)
+- `status:<value>` — task status (`working`, `blocked`, `backlog`, `abandoned`, etc.)
 - `goal:<text>` — match task goal
 - `code:<value>` — match task code
 - `in:turns <text>` — search within turn content
@@ -260,14 +260,14 @@ lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 ### Reviewing and feedback
 
 - `lazy_unblock(task_id="<id>", feedback="Fix error handling")` — Give feedback to a blocked or submitted task. For conflict tasks, use `approved_files=["file"]` to selectively approve violated files (default: all rejected and reverted)
-- `lazy_diff(task_id="<id>")` — See changes made by a task (use `full=true` for full diff, `files=["path"]` to filter, `max_lines=N` to truncate)
+- `lazy_diff(task_id="<id>")` — See changes made by a task (use `full=true` for full diff, `files=["path"]` to filter, `offset=N` to skip lines, `max_lines=N` to truncate)
 - `lazy_accept(task_id="<id>", reason="Why accepting")` — Merge task's work into parent branch. For conflict tasks, pass `approved_files=["file1", "file2"]` to approve all violated files (all must be listed — partial approval is rejected)
-- `lazy_reject(task_id="<id>", reason="Why")` — Discard task's work
+- `lazy_abandon(task_id="<id>", reason="Why")` — Abandon a task (discard work)
 
 ### Resuming work
 
 - `lazy_resume(task_id="<id>")` — Resume an interrupted task
-- `lazy_reopen(task_id="<id>")` — Reopen a rejected or closed task
+- `lazy_reopen(task_id="<id>")` — Reopen an abandoned task
 
 ### Waiting for agents
 
@@ -309,7 +309,7 @@ while you step back entirely.
 - **DO NOT** unblock the task
 - **DO NOT** send feedback to the task
 - **DO NOT** suggest changes to the task
-- **DO NOT** resume, accept, reject, or close the task
+- **DO NOT** resume, accept, or abandon the task
 - The task's worktree is locked — tools that modify the task will refuse to run
 
 "I'll pair with it" = "hands off this task completely."
@@ -384,10 +384,10 @@ When a task comes back blocked:
 2. Check what was done: `lazy_show(task_id)`, `lazy_diff(task_id)`
 3. Evaluate the changes — does it match the intent? Is the code clean?
 4. Present your assessment to the engineer and recommend an action
-5. **Wait for explicit approval** before running `lazy_accept`, `lazy_reject`, or `lazy_close`
+5. **Wait for explicit approval** before running `lazy_accept` or `lazy_abandon`
 6. If the engineer asks for changes, send feedback via `lazy_unblock` with specific guidance
 
-**CRITICAL: Never accept, reject, or close a task without the engineer's explicit approval.**
+**CRITICAL: Never accept or abandon a task without the engineer's explicit approval.**
 These are irreversible actions that merge or discard work. Always present your review findings
 and recommendation first, then wait for the engineer to confirm. "Let's accept this" or
 "accept it" from the engineer is explicit approval. Your own assessment that the code looks
@@ -441,17 +441,17 @@ Dockerfile misconfigured, timeout, OOM — **the task is fine. The environment i
 Do not close the task. Tell the engineer what went wrong and wait for them to fix it, then
 use `lazy_resume` to pick up where the agent left off.
 
-**Never close a task because of a transient failure.** Closing discards the conversation
+**Never abandon a task because of a transient failure.** Abandoning discards the conversation
 history, commits, and context the agent built up. That's a real cost — the next agent starts
 from zero.
 
 - **Infrastructure fails → resume.** Container crash, Docker down, config error, network
   issue, timeout. Fix the environment, then `lazy_resume`.
-- **Close means the goal is wrong.** Only close when the task should never have existed, or
+- **Abandon means the goal is wrong.** Only abandon when the task should never have existed, or
   the goal changed so fundamentally that the existing work has no value.
 - **`lazy_redo` for genuine restarts.** If a task truly needs a fresh start (not just a
-  resume after a fix), use `lazy_redo` — it closes the old task and creates a linked
-  replacement, preserving the history connection. Never manually close + create a new task;
+  resume after a fix), use `lazy_redo` — it abandons the old task and creates a linked
+  replacement, preserving the history connection. Never manually abandon + create a new task;
   that loses the link between the old and new work.
 
 ### Review discipline: think deeply, speak clearly

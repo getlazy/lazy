@@ -128,6 +128,22 @@ export async function getActiveChildren(
 }
 
 /**
+ * Format a human-readable reparent warning message.
+ *
+ * Used by accept, close, and remote-sync to describe what happened.
+ * Returns null if no children were reparented. Does not include a trailing
+ * period — callers append punctuation or additional context as needed.
+ */
+export function formatReparentWarning(reparented: Task[], parentTask: Task): string | null {
+  if (reparented.length === 0) return null;
+  const newParentDesc = parentTask.parent_task_id
+    ? parentTask.parent_task_id.substring(0, 8)
+    : 'top-level';
+  const plural = reparented.length === 1 ? 'child' : 'children';
+  return `Re-parented ${reparented.length} unfinished ${plural} to ${newParentDesc}`;
+}
+
+/**
  * Re-parent non-terminal children of an accepted task to the accepted task's parent.
  *
  * When a parent is accepted, its branch is merged and deleted. Any unfinished

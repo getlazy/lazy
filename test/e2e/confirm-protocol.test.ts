@@ -190,10 +190,10 @@ describe('MCP confirmation protocol', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT: Reject always requires confirmation via the two-step MCP protocol.
-  // This prevents the builder from accidentally rejecting work instead of giving feedback.
-  test('lazy_reject requires confirmation (two-step)', async () => {
-    const taskShortId = await createTask(ctx, 'Task to reject', 'Do the work');
+  // INVARIANT: Abandon always requires confirmation via the two-step MCP protocol.
+  // This prevents the builder from accidentally abandoning work instead of giving feedback.
+  test('lazy_abandon requires confirmation (two-step)', async () => {
+    const taskShortId = await createTask(ctx, 'Task to abandon', 'Do the work');
     const startResult = await ctx.lazyMocked(
       ['start', taskShortId, '--yes'],
       MOCK_CLAUDE_SUCCESS,
@@ -206,7 +206,7 @@ describe('MCP confirmation protocol', () => {
       await session.initialize();
 
       // Step 1: call without confirmation code -> get error with guidance
-      const step1 = await session.callTool('lazy_reject', {
+      const step1 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'Wrong approach',
       });
@@ -214,14 +214,14 @@ describe('MCP confirmation protocol', () => {
       expect(step1._isError).toBe(true);
       const errorText = step1._errorText as string;
       expect(errorText).toContain('lazy_unblock');
-      const rejectCode = extractConfirmationCode(errorText);
-      expect(rejectCode).toMatch(/^rj-[0-9a-f]{4}$/);
+      const abandonCode = extractConfirmationCode(errorText);
+      expect(abandonCode).toMatch(/^ab-[0-9a-f]{4}$/);
 
       // Step 2: call with confirmation code -> executes (same process, shared pending map)
-      const step2 = await session.callTool('lazy_reject', {
+      const step2 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'Wrong approach',
-        confirmation_code: rejectCode,
+        confirmation_code: abandonCode,
       });
 
       expect(step2.output).toBeDefined();
@@ -245,7 +245,7 @@ describe('MCP confirmation protocol', () => {
       await session.initialize();
 
       // Step 1: get a confirmation code (returned in error)
-      const step1 = await session.callTool('lazy_reject', {
+      const step1 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'test',
       });
@@ -253,7 +253,7 @@ describe('MCP confirmation protocol', () => {
       const code = extractConfirmationCode(step1._errorText as string);
 
       // Step 2: use it once (succeeds)
-      const step2 = await session.callTool('lazy_reject', {
+      const step2 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'test',
         confirmation_code: code,
@@ -261,7 +261,7 @@ describe('MCP confirmation protocol', () => {
       expect(step2.output).toBeDefined();
 
       // Step 3: try to reuse the same code (fails — code was consumed)
-      const step3 = await session.callTool('lazy_reject', {
+      const step3 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'test',
         confirmation_code: code,
@@ -273,9 +273,9 @@ describe('MCP confirmation protocol', () => {
     }
   });
 
-  // INVARIANT: A reject code cannot be used to confirm an accept (cross-operation rejection).
+  // INVARIANT: An abandon code cannot be used to confirm an accept (cross-operation rejection).
   // Codes are scoped to (operation, taskId).
-  test('reject code cannot confirm accept', async () => {
+  test('abandon code cannot confirm accept', async () => {
     const taskShortId = await createTask(ctx, 'Task for cross-op test', 'Do the work');
     const startResult = await ctx.lazyMocked(
       ['start', taskShortId, '--yes'],
@@ -288,19 +288,19 @@ describe('MCP confirmation protocol', () => {
     try {
       await session.initialize();
 
-      // Get a reject confirmation code (returned in error)
-      const rejectStep = await session.callTool('lazy_reject', {
+      // Get an abandon confirmation code (returned in error)
+      const abandonStep = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'test',
       });
-      expect(rejectStep._isError).toBe(true);
-      const rejectCode = extractConfirmationCode(rejectStep._errorText as string);
-      expect(rejectCode).toMatch(/^rj-/);
+      expect(abandonStep._isError).toBe(true);
+      const abandonCode = extractConfirmationCode(abandonStep._errorText as string);
+      expect(abandonCode).toMatch(/^ab-/);
 
-      // Try to use the reject code for accept -> should fail
+      // Try to use the abandon code for accept -> should fail
       const acceptStep = await session.callTool('lazy_accept', {
         task_id: taskShortId,
-        confirmation_code: rejectCode,
+        confirmation_code: abandonCode,
       });
       expect(acceptStep._isError).toBe(true);
       expect(acceptStep._errorText).toContain('Invalid or expired confirmation code');
@@ -336,51 +336,51 @@ describe('MCP confirmation protocol', () => {
     }
   });
 
-  // INVARIANT: Close scales confirmation with commit count.
+  // INVARIANT: Abandon scales confirmation with commit count.
   // Tasks with no work are light; tasks with commits are stern.
-  test('close requires confirmation and scales with commits', async () => {
-    const taskShortId = await createTask(ctx, 'Empty task to close', 'Do the work');
+  test('abandon requires confirmation and scales with commits', async () => {
+    const taskShortId = await createTask(ctx, 'Empty task to abandon', 'Do the work');
 
     const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
     try {
       await session.initialize();
 
-      // Close a backlog task with no commits -> light level (returned as error)
-      const step1 = await session.callTool('lazy_close', {
+      // Abandon a backlog task with no commits -> light level (returned as error)
+      const step1 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'Not needed',
       });
 
       expect(step1._isError).toBe(true);
-      const closeCode = extractConfirmationCode(step1._errorText as string);
-      expect(closeCode).toMatch(/^cl-[0-9a-f]{4}$/);
+      const abandonCode = extractConfirmationCode(step1._errorText as string);
+      expect(abandonCode).toMatch(/^ab-[0-9a-f]{4}$/);
     } finally {
       await session.close();
     }
   });
 
-  // INVARIANT: Close can be confirmed with the returned code.
-  test('close confirmation code allows execution', async () => {
-    const taskShortId = await createTask(ctx, 'Task to close', 'Do the work');
+  // INVARIANT: Abandon can be confirmed with the returned code.
+  test('abandon confirmation code allows execution', async () => {
+    const taskShortId = await createTask(ctx, 'Task to abandon', 'Do the work');
 
     const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
     try {
       await session.initialize();
 
       // Step 1: get code (returned in error)
-      const step1 = await session.callTool('lazy_close', {
+      const step1 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'Done',
       });
       expect(step1._isError).toBe(true);
-      const closeCode = extractConfirmationCode(step1._errorText as string);
-      expect(closeCode).toMatch(/^cl-[0-9a-f]{4}$/);
+      const abandonCode = extractConfirmationCode(step1._errorText as string);
+      expect(abandonCode).toMatch(/^ab-[0-9a-f]{4}$/);
 
       // Step 2: use code to execute (same process, shared pending map)
-      const step2 = await session.callTool('lazy_close', {
+      const step2 = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'Done',
-        confirmation_code: closeCode,
+        confirmation_code: abandonCode,
       });
       expect(step2.output).toBeDefined();
     } finally {
@@ -458,9 +458,9 @@ describe('MCP confirmation protocol', () => {
   test('reopen requires confirmation', async () => {
     const taskShortId = await createTask(ctx, 'Task to reopen', 'Do the work');
 
-    // Close the task so it can be reopened
-    const closeResult = await ctx.lazy(['close', taskShortId, '--reason', 'test', '--yes']);
-    expect(closeResult.exitCode).toBe(0);
+    // Abandon the task so it can be reopened
+    const abandonResult = await ctx.lazy(['abandon', taskShortId, '--reason', 'test']);
+    expect(abandonResult.exitCode).toBe(0);
 
     const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
     try {
@@ -482,8 +482,8 @@ describe('MCP confirmation protocol', () => {
   test('reopen confirmation code allows execution', async () => {
     const taskShortId = await createTask(ctx, 'Task to reopen and confirm', 'Do the work');
 
-    const closeResult = await ctx.lazy(['close', taskShortId, '--reason', 'test', '--yes']);
-    expect(closeResult.exitCode).toBe(0);
+    const abandonResult = await ctx.lazy(['abandon', taskShortId, '--reason', 'test']);
+    expect(abandonResult.exitCode).toBe(0);
 
     const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
     try {
@@ -523,7 +523,7 @@ describe('MCP confirmation protocol', () => {
     const toolsResponse = responses.find(r => r.id === 2);
     const result = toolsResponse!.result as { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }> };
 
-    const confirmedTools = ['lazy_reject', 'lazy_close', 'lazy_accept', 'lazy_redo', 'lazy_reopen', 'lazy_create'];
+    const confirmedTools = ['lazy_abandon', 'lazy_accept', 'lazy_redo', 'lazy_reopen', 'lazy_create'];
 
     for (const toolName of confirmedTools) {
       const tool = result.tools.find(t => t.name === toolName);
@@ -555,21 +555,12 @@ describe('MCP confirmation protocol', () => {
     try {
       await session.initialize();
 
-      const rejectResult = await session.callTool('lazy_reject', {
+      const abandonResult = await session.callTool('lazy_abandon', {
         task_id: taskShortId,
         reason: 'test',
       });
-      expect(rejectResult._isError).toBe(true);
-      expect(extractConfirmationCode(rejectResult._errorText as string)).toMatch(/^rj-/);
-
-      // Test close prefix
-      const closeTaskId = await createTask(ctx, 'Close prefix test', 'Do the work');
-      const closeResult = await session.callTool('lazy_close', {
-        task_id: closeTaskId,
-        reason: 'test',
-      });
-      expect(closeResult._isError).toBe(true);
-      expect(extractConfirmationCode(closeResult._errorText as string)).toMatch(/^cl-/);
+      expect(abandonResult._isError).toBe(true);
+      expect(extractConfirmationCode(abandonResult._errorText as string)).toMatch(/^ab-/);
 
       // Test redo prefix
       const redoResult = await session.callTool('lazy_redo', {
@@ -578,9 +569,9 @@ describe('MCP confirmation protocol', () => {
       expect(redoResult._isError).toBe(true);
       expect(extractConfirmationCode(redoResult._errorText as string)).toMatch(/^rd-/);
 
-      // Test reopen prefix — close a task first
+      // Test reopen prefix — abandon a task first
       const reopenTaskId = await createTask(ctx, 'Reopen prefix test', 'Do the work');
-      await ctx.lazy(['close', reopenTaskId, '--reason', 'test', '--yes']);
+      await ctx.lazy(['abandon', reopenTaskId, '--reason', 'test']);
       const reopenResult = await session.callTool('lazy_reopen', {
         task_id: reopenTaskId,
       });

@@ -56,6 +56,7 @@ import { basename } from 'path';
 import { getHome } from '../utils/home';
 import { existsSync, mkdirSync } from 'fs';
 import { runGit } from '../utils/git';
+import { logger } from '../utils/logger';
 
 /**
  * Extract project name from git remote URL or directory name.
@@ -146,6 +147,18 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
 
         const projectName = await getProjectName(lazyRoot, gitRemote);
         externalPath = join(lazyDir, projectName);
+      }
+      // Detect stray literal-`~` directories left over from the pre-fix bug
+      // where unexpanded `~/...` paths were passed to mkdir. The data inside
+      // is orphan output — nothing reads from it — but we don't auto-clean,
+      // just warn so the user can remove it deliberately.
+      const strayTilde = join(lazyRoot, '~');
+      if (existsSync(strayTilde)) {
+        logger.warn(
+          `Detected a literal '~' directory at ${strayTilde}. ` +
+          `This is stale orphan output from an earlier tilde-expansion bug ` +
+          `and can be safely removed: rm -rf "${strayTilde}"`,
+        );
       }
       storage = new FileStorage(lazyRoot, { basePath: externalPath });
       break;

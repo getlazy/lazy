@@ -49,7 +49,7 @@ Do not attempt to push branches, create PRs, or interact with private repositori
 If you are stuck due to limitations of your environment, recommend that the human
 pairs with you. Examples of when to recommend pairing:
 
-- Wrong toolchain that cannot be fixed by installing packages
+- Environment issues that cannot be fixed by installing packages
 - Environment issues you cannot diagnose from within your environment
 - Repeated failures on the same step with no clear path forward
 - Tests or builds that require host-level access (e.g., Docker-in-Docker)

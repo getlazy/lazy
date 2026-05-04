@@ -23,6 +23,25 @@ export async function ensureImage(): Promise<string> {
   return 'lazy-runner';
 }
 
+/**
+ * Mock of `buildLazyRunnerImage` that records its options to
+ * `LAZY_MOCK_BUILD_LOG` (a file path) when set, so tests can verify that
+ * `--no-cache` and similar flags were passed through correctly.
+ */
+export async function buildLazyRunnerImage(
+  options: { binary?: string; noCache?: boolean } = {}
+): Promise<string> {
+  const logPath = process.env.LAZY_MOCK_BUILD_LOG;
+  if (logPath) {
+    const { appendFile } = await import('fs/promises');
+    await appendFile(
+      logPath,
+      JSON.stringify({ binary: options.binary ?? 'docker', noCache: options.noCache ?? false }) + '\n'
+    );
+  }
+  return 'lazy-runner';
+}
+
 export function resolveImageName(_lazyRoot: string): string {
   return 'lazy-runner';
 }
@@ -207,6 +226,7 @@ export async function launchSupervisorAsync(
     if (existsFs(commandPath)) {
       const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
       const patterns = cmd.protected_patterns as string[] | undefined;
+      const branchPointSha = cmd.branch_point_sha as string | undefined;
       if (patterns && patterns.length > 0 && preTurnSha !== 'unknown' && postWorkSha && preTurnSha !== postWorkSha) {
         const { detectViolations } = await import('../../src/supervisor/permissions');
         const detected = await detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);

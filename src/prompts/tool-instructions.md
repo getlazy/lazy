@@ -5,9 +5,9 @@ Available tools:
 
   Search query syntax — `lazy_search` supports a Lucene-style query language:
     Boolean operators (case-sensitive, AND binds tighter than OR):
-      goal:memory AND status:backlog · fix OR refactor · NOT status:closed · (A OR B) AND C
+      goal:memory AND status:backlog · fix OR refactor · NOT status:abandoned · (A OR B) AND C
     Field filters:
-      status:<value>     — task status (working, blocked, backlog, closed, etc.)
+      status:<value>     — task status (working, blocked, backlog, abandoned, etc.)
       goal:<text>        — match task goal
       code:<value>       — match task code
       in:turns <text>    — search within turn content

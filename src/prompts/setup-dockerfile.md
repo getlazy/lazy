@@ -6,6 +6,11 @@ Dockerfile.lazy that:
 3. Adds a layer that installs Claude Code: `bun install -g @anthropic-ai/claude-code@latest`
 4. Sets WORKDIR to /work
 
+Alternatively, if the project does not need a specific base image, Dockerfile.lazy
+can `FROM lazy-runner` to inherit the base runner image (which already includes
+git, bun, node, and claude-code). Users building the project on a fresh machine
+must first run `lazy system build lazy-runner` to prebuild that base image.
+
 Then update lazy.toml to set:
 ```toml
 [docker]

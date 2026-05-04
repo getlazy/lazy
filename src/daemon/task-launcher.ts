@@ -19,9 +19,9 @@
  */
 
 import { join } from 'path';
-import { stat, mkdir, copyFile, writeFile, rm } from 'fs/promises';
-import { getHome } from '../utils/home';
-import { pathExists, dirExists } from '../utils/fs';
+import { mkdir, writeFile } from 'fs/promises';
+import { pathExists } from '../utils/fs';
+import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import { createDriver } from '../remote';
@@ -40,14 +40,13 @@ import { logger } from '../utils/logger';
 import { getActor } from '../constants';
 import { runGit } from '../utils/git';
 import { RpcError } from './rpc-handlers';
+import { isOfflineMode } from '../utils/offline';
+import { resolveAndPersistEffort } from './effort';
 import type { StartCommand } from '../protocol';
-import type { SandboxConfig } from '../capture/claude';
 import type { Task, Storage } from '../storage';
 
 import goalContextStartText from '../prompts/goal-context-start.md' with { type: 'text' };
 import goalContextContinueText from '../prompts/goal-context-continue.md' with { type: 'text' };
-
-export const SANDBOX_DIR = '.lazy-task-sandbox';
 
 // --- Input/Output types ---
 
@@ -58,6 +57,8 @@ export interface StartTaskParams {
   forceLocal?: boolean;
   /** CLI has already prompted the user and confirmed orphan retargeting. */
   retargetOrphan?: boolean;
+  /** CLI `--effort` override. Persists on the task so resumes see the same value. */
+  effortOverride?: string;
 }
 
 export interface StartTaskResult {
@@ -132,26 +133,6 @@ async function buildLinkedTaskPreamble(worktreePath: string, branchName: string,
   }
 
   return lines.join('\n');
-}
-
-async function setupSandbox(worktreePath: string): Promise<SandboxConfig> {
-  const sandboxPath = join(worktreePath, SANDBOX_DIR);
-  const claudeDir = join(sandboxPath, '.claude');
-  await mkdir(claudeDir, { recursive: true });
-
-  const hostGitconfig = join(getHome(), '.gitconfig');
-  const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-  if (await dirExists(sandboxGitconfig)) {
-    await rm(sandboxGitconfig, { recursive: true });
-  }
-
-  if (await pathExists(hostGitconfig)) {
-    await copyFile(hostGitconfig, sandboxGitconfig);
-  } else {
-    await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
-  }
-
-  return { worktreePath, sandboxPath };
 }
 
 /**
@@ -284,7 +265,15 @@ export async function launchTask(
   runner.checkAvailability();
 
   const config = await loadConfig(projectRoot);
-  const driver = createDriver(config);
+
+  // --- Offline mode: auto-enable forceLocal and use local driver ---
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  if (offline) {
+    params.forceLocal = true;
+    warnings.push('Offline mode: starting from local HEAD (remote operations skipped)');
+  }
+
+  const driver = createDriver(config, undefined, { offline });
 
   // --- Session check ---
   const isLinkedTask = !!t.metadata?.import_source_url;
@@ -427,7 +416,7 @@ export async function launchTask(
 
     // --- Model resolution ---
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && t.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? t.model ?? config.models.default);
@@ -436,6 +425,8 @@ export async function launchTask(
     if (!t.model) {
       await storage.updateTaskModel(t.id, modelName);
     }
+
+    const effortValue = await resolveAndPersistEffort(t, params.effortOverride, config.agent.effort, storage);
 
     // --- Build prompts ---
     const existingComments = await storage.getTaskComments(t.id);
@@ -521,6 +512,7 @@ export async function launchTask(
       agent_id: t.agent_id,
       system_prompt: systemPrompt,
       model_id: modelId,
+      effort: effortValue,
       parent_branch: parentBranch ?? undefined,
       sync_before_work: false,
       sync_after_work: autoSyncAfterTurn,

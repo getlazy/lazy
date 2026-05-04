@@ -22,14 +22,11 @@ auto_commit_instructions = true
 path = ".lazy"
 
 [storage]
-# Storage backend: "external" (default) or "postgres"
+# Storage backend (default: "external")
 backend = "external"
-# Path for external storage (only used when backend = "external")
+# Path for external storage
 # Defaults to ~/.lazy/<project-name> if empty
 external_path = ""
-# Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase)
-# Only used when backend = "postgres"
-# postgres_ssl = false
 
 [git]
 # Default prefix for lazy branches (e.g., "lazy/abc123")
@@ -47,6 +44,18 @@ agent_id = "claude-code"
 # Default: 7200000 (2 hours) — kills agent if no output for that duration
 # Set to 0 to disable, or override with a different timeout
 # watchdog_output_timeout_ms = 7200000
+
+# Reasoning effort level passed to Claude Code via --effort for task agents.
+# Higher levels spend more tokens thinking before responding.
+# Valid levels: "low", "medium", "high", "xhigh", "max" (default: "medium")
+# effort = "medium"
+
+[builder]
+# Reasoning effort level passed to Claude Code via --effort for builder sessions
+# (i.e., `lazy builder`). Builder sessions default to "high" because they handle
+# orchestration and planning which benefit from more thinking.
+# Valid levels: "low", "medium", "high", "xhigh", "max" (default: "high")
+# effort = "high"
 
 [server]
 # Default port for the web dashboard server

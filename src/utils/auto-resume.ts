@@ -7,13 +7,12 @@
  */
 
 import { join } from 'path';
-import { stat, mkdir, copyFile, writeFile, readdir, readFile, rm } from 'fs/promises';
-import { getHome } from './home';
-import { pathExists, dirExists } from './fs';
+import { homedir } from 'os';
+import { readdir, readFile } from 'fs/promises';
+import { pathExists } from './fs';
+import { setupSandbox } from './sandbox';
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
-import { getAuthEnvVars } from '../capture/claude';
-import type { SandboxConfig } from '../capture/claude';
 import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
@@ -21,7 +20,6 @@ import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonC
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
-import { getDataDir } from '../cli/init';
 import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { getCurrentBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
 import { writeDaemonMcpConfig } from '../daemon/task-launcher';
@@ -31,8 +29,6 @@ import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
 import resumeContextText from '../prompts/resume-context.md' with { type: 'text' };
 import goalContextResumeText from '../prompts/goal-context-resume.md' with { type: 'text' };
-
-const SANDBOX_DIR = '.lazy-task-sandbox';
 
 /** Maximum consecutive interruptions before circuit breaker stops auto-resume */
 export const MAX_CONSECUTIVE_INTERRUPTIONS = 3;
@@ -155,29 +151,11 @@ export async function autoResumeTask(
     // that aren't on the project root's lazy.toml yet.
     const config = await loadConfig(lazyRoot, { cwd: worktreePath });
 
-    // Ensure sandbox exists
-    const sandboxPath = join(worktreePath, SANDBOX_DIR);
-    const claudeDir = join(sandboxPath, '.claude');
-    await mkdir(claudeDir, { recursive: true });
-
-    // Docker creates .gitconfig as a directory if the bind mount source doesn't exist.
-    // Remove the stale directory before copying the file.
-    const hostGitconfig = join(getHome(), '.gitconfig');
-    const sandboxGitconfig = join(sandboxPath, '.gitconfig');
-    if (await dirExists(sandboxGitconfig)) {
-      await rm(sandboxGitconfig, { recursive: true });
-    }
-
-    if (await pathExists(hostGitconfig)) {
-      await copyFile(hostGitconfig, sandboxGitconfig);
-    } else {
-      await writeFile(sandboxGitconfig, '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n');
-    }
-
-    const sandbox: SandboxConfig = { worktreePath, sandboxPath };
+    const sandbox = await setupSandbox(worktreePath);
+    const sandboxPath = sandbox.sandboxPath;
 
     // When Ollama is enabled for Claude Code, always use the Ollama model — task model
-    // names (e.g. "claude-opus-4-6") don't exist in Ollama's model registry.
+    // names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (task.model ?? config.models.default);
@@ -262,6 +240,7 @@ export async function autoResumeTask(
       agent_session_id: claudeSessionId ?? undefined,
       parent_branch: parentBranch,
       sync_before_work: syncBeforeWork,
+      branch_point_sha: session.git_start_sha,
       ...commonCommandFields(config),
     };
     writeCommand(protoDir, unblockCommand);
@@ -296,7 +275,7 @@ export async function autoResumeTask(
     if (runner.usesSandbox()) {
       createTmuxWatchSession(tmuxSessName, ['docker', 'logs', '-f', containerName]);
     } else {
-      const logFile = join(getHome(), '.lazy', 'logs', `${containerName}.log`);
+      const logFile = join(homedir(), '.lazy', 'logs', `${containerName}.log`);
       createTmuxWatchSession(tmuxSessName, ['tail', '-f', logFile]);
     }
 

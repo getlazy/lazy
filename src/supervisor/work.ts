@@ -81,6 +81,8 @@ async function executeAgent(
   modelId?: string,
   claudeSessionId?: string,
   watchdogTimeoutMs?: number,
+  effort?: string,
+  permissionMode?: 'plan' | 'default',
 ): Promise<WorkResult> {
   const claudeArgs = agent.buildExecArgs({
     prompt,
@@ -88,6 +90,8 @@ async function executeAgent(
     modelId,
     sessionId: claudeSessionId,
     dangerouslySkipPermissions: true,
+    effort,
+    permissionMode,
   });
 
   const launchTime = Date.now();
@@ -248,13 +252,15 @@ export async function runWork(
   claudeSessionId?: string,
   protocolDir?: string,
   onRetryStateChange?: (state: RetryState | null) => void,
-  _executeOverride?: (worktreePath: string, prompt: string, systemPrompt?: string, modelId?: string, claudeSessionId?: string) => Promise<WorkResult>,
+  _executeOverride?: (worktreePath: string, prompt: string, systemPrompt?: string, modelId?: string, claudeSessionId?: string, effort?: string, permissionMode?: 'plan' | 'default') => Promise<WorkResult>,
   watchdogTimeoutMs?: number,
+  effort?: string,
+  permissionMode?: 'plan' | 'default',
 ): Promise<WorkResult> {
   const execute = _executeOverride
     ? _executeOverride
-    : (wt: string, p: string, sp?: string, mid?: string, sid?: string) =>
-        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs);
+    : (wt: string, p: string, sp?: string, mid?: string, sid?: string, eff?: string, pm?: 'plan' | 'default') =>
+        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm);
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {
@@ -270,7 +276,7 @@ export async function runWork(
     const launchTime = Date.now();
 
     try {
-      const result = await execute(worktreePath, prompt, systemPrompt, modelId, currentSessionId);
+      const result = await execute(worktreePath, prompt, systemPrompt, modelId, currentSessionId, effort, permissionMode);
 
       // Success! Reset retry state
       if (retryState.count > 0) {

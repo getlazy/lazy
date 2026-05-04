@@ -25,7 +25,7 @@ import { isTerminalStatus } from '../types';
 import { removeLock } from '../utils/lock';
 import { protocolDir, removeProtocolDir } from '../protocol';
 import { getActor } from '../constants';
-import { reparentChildren } from '../cli/orphan';
+import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { emitSignal } from './signals';
 import type { Storage } from '../storage';
 
@@ -77,8 +77,13 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
-    // Check blocked, conflict, submitted, and merging tasks for external state changes
-    if (task.status !== 'blocked' && task.status !== 'conflict' && task.status !== 'submitted' && task.status !== 'merging') continue;
+    // Check all non-terminal tasks for external state changes.
+    // Previously this was an allowlist of blocked/conflict/submitted/merging, which
+    // missed working/interrupted tasks — causing reparent-on-merge to not fire
+    // when an MR was merged externally while the task was still working (e.g., crashed).
+    // Skip: terminal (already done), pairing (human is driving — wait for pairing to
+    // end, then the normal blocked → merging path handles it), backlog (no session/branch).
+    if (isTerminalStatus(task.status) || task.status === 'pairing' || task.status === 'backlog') continue;
 
     if (!driver.hasRemoteRef(task)) {
       // Submitted tasks without a remote ref are anomalous — the MR/PR was created
@@ -133,20 +138,19 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
           await storage.endSession(session.id, 'accepted');
         }
         // Transition through merging → complete to satisfy state machine.
-        // blocked/conflict/submitted can't transition directly to complete — must go through merging.
-        if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted') {
+        // Most statuses can't transition directly to complete — must go through merging.
+        // working/interrupted/pairing also need this path for externally merged MRs
+        // (e.g., task was working but crashed when MR was merged on the remote).
+        if (task.status !== 'merging' && task.status !== 'complete') {
           await storage.updateTaskStatus(task.id, 'merging', getActor());
         }
         await storage.updateTaskStatus(task.id, 'complete', getActor());
 
         // Re-parent unfinished children to the grandparent
         const reparented = await reparentChildren(task, storage);
-        if (reparented.length > 0) {
-          const newParentDesc = task.parent_task_id
-            ? task.parent_task_id.substring(0, 8)
-            : 'top-level';
-          const plural = reparented.length === 1 ? 'child' : 'children';
-          log.detail(`  Re-parented ${reparented.length} unfinished ${plural} of ${displayId(task)} to ${newParentDesc}`);
+        const reparentMsg = formatReparentWarning(reparented, task);
+        if (reparentMsg) {
+          log.detail(`  ${reparentMsg} of ${displayId(task)}.`);
         }
 
         // Clean up worktree, container, and protocol dir for completed merging tasks
@@ -171,7 +175,14 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
           await storage.createComment(task.id, 'Merge cancelled: PR/MR was closed on the remote while waiting for merge.', getActor());
         } else {
           log.detail(`  Remote ref closed externally → task ${theme.taskId(displayId(task))} closed`);
-          await storage.closeTask(task.id, 'Closed externally via remote', getActor());
+          await storage.abandonTask(task.id, 'Closed externally via remote', getActor());
+
+          // Re-parent unfinished children (same as accept path)
+          const closedReparented = await reparentChildren(task, storage);
+          const closedReparentMsg = formatReparentWarning(closedReparented, task);
+          if (closedReparentMsg) {
+            log.detail(`  ${closedReparentMsg} of ${displayId(task)}.`);
+          }
         }
         result.closed++;
       }

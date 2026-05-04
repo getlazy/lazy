@@ -29,6 +29,8 @@ import type {
   Actor,
   FileViolation,
   CommentSource,
+  HunkApproval,
+  HunkApprovalLineage,
 } from './types';
 import { isTerminalStatus, DEFAULT_TASK_TYPE, type TaskType } from '../types';
 import { assertValidTransition } from '../task-state-machine';
@@ -139,6 +141,15 @@ export class PostgresStorage implements Storage {
 
     if (version < 1) {
       await this.migrateToV1();
+    }
+    if (version < 2) {
+      await this.migrateToV2();
+    }
+    if (version < 3) {
+      await this.migrateToV3();
+    }
+    if (version < 4) {
+      await this.migrateToV4();
     }
   }
 
@@ -251,6 +262,16 @@ export class PostgresStorage implements Storage {
       await sql`
         DO $$ BEGIN
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS auto_triggered BOOLEAN DEFAULT FALSE;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+
+      // Migration: add turn_type column if missing (for existing databases).
+      // NULL/missing rows are treated as 'work' (the default) — no backfill
+      // needed; callers read with COALESCE when they need an explicit value.
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS turn_type TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
       `;
@@ -374,6 +395,73 @@ export class PostgresStorage implements Storage {
     });
   }
 
+  private async migrateToV2(): Promise<void> {
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+
+      // Rewrite legacy model aliases (apprentice/journeyman/master) to current names
+      await sql`UPDATE tasks SET model = 'haiku' WHERE model = 'apprentice'`;
+      await sql`UPDATE tasks SET model = 'sonnet' WHERE model = 'journeyman'`;
+      await sql`UPDATE tasks SET model = 'opus' WHERE model = 'master'`;
+      await sql`UPDATE turns SET model = 'haiku' WHERE model = 'apprentice'`;
+      await sql`UPDATE turns SET model = 'sonnet' WHERE model = 'journeyman'`;
+      await sql`UPDATE turns SET model = 'opus' WHERE model = 'master'`;
+
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (2, '1')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV3(): Promise<void> {
+    // Per-hunk approval state for `lazy review -i`. CASCADE on task_id
+    // auto-purges approvals when a task is deleted; UNIQUE(task_id, hunk_hash)
+    // enforces idempotent upserts.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+
+      await sql`
+        CREATE TABLE IF NOT EXISTS hunk_approvals (
+          id          TEXT PRIMARY KEY,
+          task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          hunk_hash   TEXT NOT NULL,
+          approved_by TEXT,
+          approved_at BIGINT NOT NULL,
+          UNIQUE(task_id, hunk_hash)
+        )
+      `;
+      await sql`
+        CREATE INDEX IF NOT EXISTS idx_hunk_approvals_task_id
+          ON hunk_approvals(task_id)
+      `;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (3, '2')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV4(): Promise<void> {
+    // Add split-lineage anchor columns to hunk_approvals so split-hunk
+    // approvals can survive re-runs. Existing rows (if any) had no
+    // lineage data — leaving these columns NULL on those rows is fine;
+    // they'll behave as before (whole-hunk approvals matched by hash).
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE hunk_approvals ADD COLUMN IF NOT EXISTS parent_file TEXT`;
+      await sql`ALTER TABLE hunk_approvals ADD COLUMN IF NOT EXISTS parent_lines TEXT`;
+      await sql`ALTER TABLE hunk_approvals ADD COLUMN IF NOT EXISTS split_path TEXT`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (4, '3')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
   async createTask(
     goal: string,
     parentTaskId?: string,
@@ -386,12 +474,12 @@ export class PostgresStorage implements Storage {
     if (code) {
       const conflicts = await this.sql`
         SELECT id, status FROM tasks
-        WHERE code = ${code} AND status NOT IN ('complete', 'abandoned', 'closed')
+        WHERE code = ${code} AND status NOT IN ('complete', 'abandoned')
         LIMIT 1
       `;
       if (conflicts.length > 0) {
         const c = conflicts[0];
-        throw new Error(`A task with code '${code}' already exists (${(c.id as string).slice(0, 8)}, status: ${c.status}). Choose a different code or close/reject the existing task first.`);
+        throw new Error(`A task with code '${code}' already exists (${(c.id as string).slice(0, 8)}, status: ${c.status}). Choose a different code or abandon the existing task first.`);
       }
     }
 
@@ -499,7 +587,7 @@ export class PostgresStorage implements Storage {
       ${options.pairingOnly ? this.sql`AND status = 'pairing'` : this.sql``}
       ${options.mergingOnly ? this.sql`AND status = 'merging'` : this.sql``}
       ${options.withSessionsOnly ? this.sql`AND EXISTS (SELECT 1 FROM sessions WHERE sessions.task_id = tasks.id)` : this.sql``}
-      ${options.nonTerminalOnly ? this.sql`AND status NOT IN ('complete', 'closed', 'abandoned')` : this.sql``}
+      ${options.nonTerminalOnly ? this.sql`AND status NOT IN ('complete', 'abandoned')` : this.sql``}
       ORDER BY created_at DESC
     `;
   }
@@ -558,21 +646,21 @@ export class PostgresStorage implements Storage {
     await this.sql`UPDATE tasks SET pending_sync = pending_sync + 1 WHERE id = ${taskId}`;
   }
 
-  async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {
+  async abandonTask(taskId: string, reason: string, actor?: Actor): Promise<void> {
     const [task] = await this.sql<{ status: TaskStatus }[]>`
       SELECT status FROM tasks WHERE id = ${taskId}
     `;
-    if (task) assertValidTransition(task.status, 'closed');
+    if (task) assertValidTransition(task.status, 'abandoned');
 
     const now = Date.now();
 
     await this.sql`
       UPDATE tasks
-      SET status = 'closed', close_reason = ${closeReason}, completed_at = ${now}
+      SET status = 'abandoned', close_reason = ${reason}, completed_at = ${now}
       WHERE id = ${taskId}
     `;
 
-    await this.recordStatusChange(taskId, 'closed', now, actor);
+    await this.recordStatusChange(taskId, 'abandoned', now, actor);
   }
 
   async reopenTask(taskId: string, actor?: Actor): Promise<void> {
@@ -793,12 +881,15 @@ export class PostgresStorage implements Storage {
     const id = randomUUID();
     const now = Date.now();
 
+    // Store NULL for the default 'work' so the column stays sparse — a
+    // future 'comment' or 'hook' variant gets its own string value.
+    const storedTurnType = options.turnType && options.turnType !== 'work' ? options.turnType : null;
     await this.sql`
       INSERT INTO turns (
         id, session_id, sequence, role, content, model, prompt,
         start_sha, end_sha, start_sha_work, end_sha_work,
         merge_conflicts, violations, usage, timestamp,
-        check_exit_code, check_output, auto_triggered
+        check_exit_code, check_output, auto_triggered, turn_type
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${options.content},
@@ -808,7 +899,7 @@ export class PostgresStorage implements Storage {
         ${options.violations ? JSON.stringify(options.violations) : null},
         ${options.usage ? JSON.stringify(options.usage) : null}, ${now},
         ${options.checkExitCode ?? null}, ${options.checkOutput ?? null},
-        ${options.autoTriggered ?? false}
+        ${options.autoTriggered ?? false}, ${storedTurnType}
       )
     `;
 
@@ -831,6 +922,7 @@ export class PostgresStorage implements Storage {
       ...(options.checkExitCode !== undefined ? { check_exit_code: options.checkExitCode } : {}),
       ...(options.checkOutput !== undefined ? { check_output: options.checkOutput } : {}),
       ...(options.autoTriggered ? { auto_triggered: true } : {}),
+      ...(storedTurnType ? { turn_type: storedTurnType } : {}),
     };
   }
 
@@ -988,6 +1080,42 @@ export class PostgresStorage implements Storage {
 
   async getTaskComments(taskId: string): Promise<Comment[]> {
     return this.sql<Comment[]>`SELECT * FROM comments WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+  }
+
+  async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
+    return this.sql<HunkApproval[]>`
+      SELECT * FROM hunk_approvals WHERE task_id = ${taskId} ORDER BY approved_at ASC
+    `;
+  }
+
+  async createHunkApproval(
+    taskId: string,
+    hunkHash: string,
+    actor?: Actor,
+    lineage?: HunkApprovalLineage,
+  ): Promise<HunkApproval> {
+    const id = randomUUID();
+    const now = Date.now();
+    // Upsert without races: ON CONFLICT DO NOTHING returns the new row, or
+    // nothing when an existing row already covers (task_id, hunk_hash). In
+    // the latter case we SELECT the existing row.
+    const inserted = await this.sql<HunkApproval[]>`
+      INSERT INTO hunk_approvals (
+        id, task_id, hunk_hash, approved_by, approved_at,
+        parent_file, parent_lines, split_path
+      )
+      VALUES (
+        ${id}, ${taskId}, ${hunkHash}, ${actor ?? null}, ${now},
+        ${lineage?.parent_file ?? null}, ${lineage?.parent_lines ?? null}, ${lineage?.split_path ?? null}
+      )
+      ON CONFLICT (task_id, hunk_hash) DO NOTHING
+      RETURNING *
+    `;
+    if (inserted.length > 0) return inserted[0];
+    const [existing] = await this.sql<HunkApproval[]>`
+      SELECT * FROM hunk_approvals WHERE task_id = ${taskId} AND hunk_hash = ${hunkHash}
+    `;
+    return existing;
   }
 
   async saveConversation(conversation: StoredConversation): Promise<void> {

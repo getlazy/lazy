@@ -27,6 +27,8 @@ export enum LogLevel {
   INFO = 1,
   WARN = 2,
   ERROR = 3,
+  /** Suppress all console output. File writes still occur at fileLevel. */
+  SILENT = 4,
 }
 
 interface LoggerConfig {

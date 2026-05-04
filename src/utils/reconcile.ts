@@ -24,13 +24,14 @@ import { checkLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
 import { tmuxSessionName, killTmuxWatchSession } from '../terminal';
+import { getDataDir } from '../cli/init';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import type { AutoReactTrigger } from '../daemon/auto-react-budget';
 import { loadConfig } from '../config/loader';
 import { runGit } from './git';
-import { reparentChildren } from '../cli/orphan';
+import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 
 /**
  * Grace period in milliseconds for newly-working tasks.
@@ -47,25 +48,31 @@ function getWorkingGracePeriodMs(): number {
 }
 
 
+/**
+ * Decide whether the stored agent_session_id should be replaced with the one
+ * the agent reported in the just-completed turn response.
+ *
+ * Rules:
+ *  - Empty/missing reported ID (e.g. sync-only turns with no agent call): skip.
+ *  - Reported ID matches what's stored: no-op.
+ *  - Otherwise (first turn with no stored ID, OR Claude Code rotated the session
+ *    ID via auto-compact / --resume fallback / cross-machine drift): update.
+ *
+ * Exported for unit testing.
+ */
+export function shouldReconcileAgentSessionId(
+  storedId: string | null,
+  reportedId: string | undefined,
+): boolean {
+  if (!reportedId) return false;
+  return reportedId !== storedId;
+}
+
 function shortId(id: string): string {
   return id.substring(0, 8);
 }
 
 // TERMINAL_STATUSES imported from ../types
-
-/**
- * Options for cooperative scheduling during reconciliation.
- * When the daemon is running, these allow HTTP requests to preempt the
- * reconcile loop so CLI/MCP commands are served promptly.
- */
-export interface ReconcileSchedulingOptions {
-  /**
-   * Returns true when an HTTP request is waiting. The reconcile loop
-   * checks this between steps and bails early if true — the remaining
-   * work will be picked up on the next reconcile tick.
-   */
-  shouldAbort?: () => boolean;
-}
 
 /**
  * Yield to the event loop so pending HTTP requests and microtasks get served.
@@ -89,19 +96,12 @@ function yieldToEventLoop(): Promise<void> {
 export async function reconcileTasks(
   storage: Storage,
   lazyRoot: string,
-  scheduling?: ReconcileSchedulingOptions,
 ): Promise<void> {
-  const shouldAbort = scheduling?.shouldAbort ?? (() => false);
-
   const runner = await createRunner(lazyRoot);
   // Primary sweep: reconcile working tasks
   const workingTasks = await storage.listTasksWithOptions({ workingOnly: true });
 
     for (const task of workingTasks) {
-      if (shouldAbort()) {
-        logger.debug('Reconcile aborted: HTTP request pending (during working task sweep)');
-        return;
-      }
       try {
         await reconcileTask(storage, task.id, lazyRoot, runner);
       } catch (err) {
@@ -111,50 +111,30 @@ export async function reconcileTasks(
       await yieldToEventLoop();
     }
 
-    if (shouldAbort()) {
-      logger.debug('Reconcile aborted: HTTP request pending (after working task sweep)');
-      return;
-    }
-
     // Sweep 2: process stale responses for interrupted tasks
     // This handles the race where the supervisor writes a new response AFTER
     // reconciliation already moved the task to interrupted.
     try {
-      await sweepInterruptedResponses(storage, lazyRoot, shouldAbort);
+      await sweepInterruptedResponses(storage, lazyRoot);
     } catch (err) {
       logger.warn(`Sweep interrupted responses failed: ${err instanceof Error ? err.message : err}`);
-    }
-
-    if (shouldAbort()) {
-      logger.debug('Reconcile aborted: HTTP request pending (after interrupted sweep)');
-      return;
     }
 
     // Sweep 3: clean up orphaned runs for terminal-state tasks
     // This catches containers/processes that survived a failed cleanup during accept/close/reject.
     try {
-      await sweepTerminalContainers(storage, lazyRoot, runner, shouldAbort);
+      await sweepTerminalContainers(storage, lazyRoot, runner);
     } catch (err) {
       logger.warn(`Sweep terminal containers failed: ${err instanceof Error ? err.message : err}`);
-    }
-
-    if (shouldAbort()) {
-      logger.debug('Reconcile aborted: HTTP request pending (after terminal sweep)');
-      return;
     }
 
     // Sweep 4: detect tasks whose branch was already merged into their target
     // This catches the zombie scenario where accept squash-merged the branch
     // but crashed before updating session/task metadata.
     try {
-      await sweepMergedBranches(storage, lazyRoot, shouldAbort);
+      await sweepMergedBranches(storage, lazyRoot);
     } catch (err) {
       logger.warn(`Sweep merged branches failed: ${err instanceof Error ? err.message : err}`);
-    }
-
-    if (shouldAbort()) {
-      logger.debug('Reconcile aborted: HTTP request pending (after merged branch sweep)');
-      return;
     }
 
     // Sweep 5: recover stale pairing states
@@ -167,12 +147,16 @@ export async function reconcileTasks(
       logger.warn(`Sweep stale pairing failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 6: migrate blocked tasks with no session to backlog
-    // This handles the one-time migration of unstarted tasks from blocked → backlog
+    // Sweep 6: recover backlog tasks that actually have committed work.
+    // The durable proof of work is the task's git branch — sessions and
+    // worktrees are local on-disk state that doesn't travel between machines.
+    // If a `backlog` task's branch has commits beyond its base, real work
+    // exists and the task belongs in `blocked` so it surfaces in
+    // `lazy blocked` and downstream commands can act on it.
     try {
-      await migrateBlockedToBacklog(storage);
+      await recoverBacklogWithCommits(storage, lazyRoot);
     } catch (err) {
-      logger.warn(`Migrate blocked to backlog failed: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`Recover backlog with commits failed: ${err instanceof Error ? err.message : err}`);
     }
 }
 
@@ -427,8 +411,12 @@ async function handleCompletedResponse(
 ): Promise<void> {
   const taskShortId = shortId(taskId);
 
-  // Update Claude session ID if we got one
-  if (response.session_id && !session.agent_session_id) {
+  // Reconcile Claude session ID with what the agent actually wrote.
+  // Claude Code rotates session IDs (auto-compact, --resume fallback, etc.)
+  // and machine switches can leave the stored ID pointing at a JSONL that
+  // doesn't exist in this sandbox. Always trust the ID the agent reported
+  // for the just-completed turn — that's the JSONL that exists right now.
+  if (shouldReconcileAgentSessionId(session.agent_session_id, response.session_id)) {
     await storage.updateSessionClaudeId(session.id, response.session_id);
   }
 
@@ -546,6 +534,14 @@ async function handleCompletedResponse(
   // Reset consecutive interruptions counter — a successful turn means the agent is healthy
   await storage.resetConsecutiveInterruptions(session.id);
 
+  // Reset auto-react counters — a successful turn means recovery worked
+  try {
+    const { resetAutoReactCounters } = await import('../daemon/auto-react-budget');
+    await resetAutoReactCounters(storage, taskId);
+  } catch {
+    // Non-critical — counters can accumulate but won't cause harm
+  }
+
   // Clean up protocol files for this turn (response consumed)
   consumeResponse(protoDir);
   clearStatus(protoDir);
@@ -643,14 +639,10 @@ async function handleErrorResponse(
  *
  * This sweep finds interrupted tasks that have a valid response.json and processes them.
  */
-async function sweepInterruptedResponses(storage: Storage, lazyRoot: string, shouldAbort: () => boolean = () => false): Promise<void> {
+async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Promise<void> {
   const interruptedTasks = await storage.listTasksWithOptions({ interruptedOnly: true });
 
   for (const task of interruptedTasks) {
-    if (shouldAbort()) {
-      logger.debug('Sweep interrupted responses aborted: HTTP request pending');
-      return;
-    }
     try {
       const session = await storage.getSessionByTaskId(task.id);
       if (!session) continue;
@@ -696,15 +688,11 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string, sho
  * fail. Since the reconciler previously only looked at working tasks, these containers
  * would run forever. This sweep finds and removes them.
  */
-async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runner: Runner, shouldAbort: () => boolean = () => false): Promise<void> {
+async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runner: Runner): Promise<void> {
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
     if (!TERMINAL_STATUSES.has(task.status)) continue;
-    if (shouldAbort()) {
-      logger.debug('Sweep terminal containers aborted: HTTP request pending');
-      return;
-    }
 
     try {
       const taskShortId = shortId(task.id);
@@ -744,7 +732,7 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
  *       on the target mentioning the task's short ID
  * 2. If merged → fix: set session outcome to "accepted", set ended_at, set task status to "complete"
  */
-async function sweepMergedBranches(storage: Storage, lazyRoot: string, shouldAbort: () => boolean = () => false): Promise<void> {
+async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<void> {
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
@@ -754,11 +742,6 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string, shouldAbo
     // A working task's branch may appear "merged" if it was just created
     // from the target and the agent hasn't committed yet.
     if (task.status === 'working') continue;
-
-    if (shouldAbort()) {
-      logger.debug('Sweep merged branches aborted: HTTP request pending');
-      return;
-    }
 
     try {
       const session = await storage.getSessionByTaskId(task.id);
@@ -814,13 +797,9 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string, shouldAbo
 
       // Re-parent unfinished children to the grandparent
       const reparented = await reparentChildren(task, storage);
-      if (reparented.length > 0) {
-        const taskShortId = shortIdHelper(task.id);
-        const newParentDesc = task.parent_task_id
-          ? task.parent_task_id.substring(0, 8)
-          : 'top-level';
-        const plural = reparented.length === 1 ? 'child' : 'children';
-        logger.info(`Re-parented ${reparented.length} unfinished ${plural} of ${taskShortId} to ${newParentDesc}`);
+      const reparentMsg = formatReparentWarning(reparented, task);
+      if (reparentMsg) {
+        logger.info(`${reparentMsg} of ${shortIdHelper(task.id)}.`);
       }
     } catch (err) {
       logger.debug(`Failed to check merged branch for task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
@@ -882,28 +861,61 @@ async function sweepStalePairing(storage: Storage, lazyRoot: string): Promise<vo
 }
 
 /**
- * Migrate blocked tasks with no session to backlog status.
- * This is a one-time migration to separate "unstarted" (backlog) from
- * "waiting for review" (blocked) tasks.
+ * Recover `backlog` tasks whose git branch already has committed work.
+ *
+ * Backlog means "never started — no work exists." But the durable proof of
+ * work is the task's git branch (sessions and worktrees are local on-disk
+ * state that doesn't travel between machines; branches do). A task can end
+ * up in `backlog` despite having real work in two known scenarios:
+ *
+ *   1. Historical bug: an over-aggressive `migrateBlockedToBacklog` sweep
+ *      (introduced in #33 as a one-time migration, removed in this fix)
+ *      demoted blocked-with-no-local-session tasks to backlog. Tasks where
+ *      the post-turn check exited non-zero hit this path and got stuck.
+ *   2. Machine move: a task's session blob lives only on the machine where
+ *      it ran, but the branch (with all its commits) travels with the repo.
+ *      A `backlog` task whose branch already has commits should be `blocked`.
+ *
+ * Recovery strategy: for each `backlog` task, check if `lazy/<ref>` exists
+ * and has any commits beyond `branched_from_sha`. If yes, transition to
+ * `blocked` so the task is recoverable via `lazy unblock` or `lazy resume`.
+ * The transition itself is validated by the canonical state-machine table
+ * in `src/task-state-machine.ts`.
  */
-async function migrateBlockedToBacklog(storage: Storage): Promise<void> {
+export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: string): Promise<void> {
   try {
-    const blockedTasks = await storage.listTasksWithOptions({ blockedOnly: true });
+    const backlogTasks = await storage.listTasksWithOptions({ backlogOnly: true });
 
-    for (const task of blockedTasks) {
+    for (const task of backlogTasks) {
       try {
-        const session = await storage.getSessionByTaskId(task.id);
-        // If a blocked task has no session, it never started — migrate to backlog
-        if (!session) {
-          const taskShortId = shortId(task.id);
-          logger.debug(`Task ${taskShortId}: migrating blocked (never started) → backlog`);
-          await storage.updateTaskStatus(task.id, 'backlog', 'system');
-        }
+        const taskShortId = shortId(task.id);
+
+        // We need a base SHA to ask "are there commits beyond it?". Without
+        // branched_from_sha (very old tasks), skip — we can't make a safe call.
+        if (!task.branched_from_sha) continue;
+
+        const tRef = await taskRefFromId(task.id, storage);
+        const branch = `lazy/${tRef}`;
+
+        // Single git call: count commits on the branch beyond the base.
+        // If the branch doesn't exist, rev-list exits non-zero and we skip.
+        // (We deliberately avoid a separate `branchExists` precheck — both for
+        // efficiency and because some tests globally mock that helper.)
+        const result = await runGit(
+          ['rev-list', '--count', `${task.branched_from_sha}..${branch}`],
+          { cwd: lazyRoot },
+        );
+        if (result.exitCode !== 0) continue;
+        const ahead = parseInt(result.stdout.trim(), 10) || 0;
+        if (ahead === 0) continue;
+
+        logger.warn(`Task ${taskShortId}: backlog task has ${ahead} commit(s) on ${branch}, recovering to blocked`);
+        await storage.updateTaskStatus(task.id, 'blocked', 'system');
       } catch (err) {
-        logger.debug(`Failed to migrate task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+        logger.debug(`Failed to check backlog recovery for ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
       }
     }
   } catch (err) {
-    logger.debug(`Failed to list blocked tasks for migration: ${err instanceof Error ? err.message : err}`);
+    logger.debug(`Failed to list backlog tasks for recovery: ${err instanceof Error ? err.message : err}`);
   }
 }

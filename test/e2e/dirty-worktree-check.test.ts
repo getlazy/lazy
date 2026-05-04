@@ -6,10 +6,10 @@ import { expectSuccess, expectFailure, expectOutput, expectError } from '../help
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
- * Tests that accept, reject, and close all refuse to proceed if the worktree
+ * Tests that accept and abandon both refuse to proceed if the worktree
  * has uncommitted changes. This is the hardest gate to prevent data loss.
  */
-describe('dirty worktree check — hard gate for accept/reject/close', () => {
+describe('dirty worktree check — hard gate for accept/abandon', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
@@ -58,11 +58,11 @@ describe('dirty worktree check — hard gate for accept/reject/close', () => {
     expectOutput(acceptResult, 'accepted');
   });
 
-  // ========== REJECT TESTS ==========
+  // ========== ABANDON TESTS ==========
 
-  test('reject refuses task with uncommitted changes in worktree', async () => {
+  test('abandon refuses task with uncommitted changes in worktree', async () => {
     // 1. Create and start a task
-    const taskId = await createTask(ctx, 'Reject test with dirty worktree', 'Some work');
+    const taskId = await createTask(ctx, 'Abandon test with dirty worktree', 'Some work');
 
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -74,74 +74,36 @@ describe('dirty worktree check — hard gate for accept/reject/close', () => {
     const worktreeFile = join(worktreePath, 'uncommitted.txt');
     writeFileSync(worktreeFile, 'uncommitted content\n');
 
-    // 3. Try to reject — should fail because worktree is dirty
-    const rejectResult = await ctx.lazy(['reject', taskId, '--reason', 'Test rejection', '--yes']);
-    expectFailure(rejectResult, 1);
-    expectError(rejectResult, 'uncommitted changes');
-    expectError(rejectResult, 'Commit or stash your changes');
+    // 3. Try to abandon — should fail because worktree is dirty
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Test abandon', '--yes']);
+    expectFailure(abandonResult, 1);
+    expectError(abandonResult, 'uncommitted changes');
+    expectError(abandonResult, 'Commit or stash your changes');
   });
 
-  test('reject succeeds when worktree is clean', async () => {
+  test('abandon succeeds when worktree is clean', async () => {
     // 1. Create and start a task
-    const taskId = await createTask(ctx, 'Reject test with clean worktree', 'Some work');
+    const taskId = await createTask(ctx, 'Abandon test with clean worktree', 'Some work');
 
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
 
-    // 2. Worktree should be clean — reject should succeed
-    const rejectResult = await ctx.lazy(['reject', taskId, '--reason', 'Test rejection', '--yes']);
-    expectSuccess(rejectResult);
-    expectOutput(rejectResult, 'rejected');
+    // 2. Worktree should be clean — abandon should succeed
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Test abandon', '--yes']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
   });
 
-  // ========== CLOSE TESTS ==========
-
-  test('close refuses task with uncommitted changes in worktree', async () => {
-    // 1. Create and start a task
-    const taskId = await createTask(ctx, 'Close test with dirty worktree', 'Some work');
-
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // 2. Make an uncommitted change in the worktree
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
-    const worktreeFile = join(worktreePath, 'uncommitted.txt');
-    writeFileSync(worktreeFile, 'uncommitted content\n');
-
-    // 3. Try to close — should fail because worktree is dirty
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Test close']);
-    expectFailure(closeResult, 1);
-    expectError(closeResult, 'uncommitted changes');
-    expectError(closeResult, 'Commit or stash your changes');
-  });
-
-  test('close succeeds when worktree is clean', async () => {
-    // 1. Create and start a task
-    const taskId = await createTask(ctx, 'Close test with clean worktree', 'Some work');
-
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // 2. Worktree should be clean — close should succeed
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Test close']);
-    expectSuccess(closeResult);
-    expectOutput(closeResult, 'closed');
-  });
-
-  test('close on task without session succeeds', async () => {
+  test('abandon on task without session succeeds', async () => {
     // 1. Create a task without starting it (no worktree)
-    const taskId = await createTask(ctx, 'Close test without session', 'Some work');
+    const taskId = await createTask(ctx, 'Abandon test without session', 'Some work');
 
-    // 2. Close should succeed (no worktree to check)
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Not started']);
-    expectSuccess(closeResult);
-    expectOutput(closeResult, 'closed');
+    // 2. Abandon should succeed (no worktree to check)
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Not started']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
   });
 
   // ========== EDGE CASES ==========

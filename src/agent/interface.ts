@@ -49,6 +49,14 @@ export interface Agent {
     modelId?: string;
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
+    /** Reasoning effort level passed as `--effort` (Claude Code only). */
+    effort?: string;
+    /**
+     * Permission mode for this invocation. When 'plan', the agent runs
+     * read-only (plan-only, no writes). Used by `lazy review -i` for Q&A.
+     * Agents that don't support plan mode should ignore this.
+     */
+    permissionMode?: 'plan' | 'default';
   }): string[];
 
   /**

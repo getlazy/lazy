@@ -28,8 +28,32 @@ const mockHasExternalApproval = process.env.LAZY_MOCK_HAS_EXTERNAL_APPROVAL === 
 // operations and would break tests without a real remote.
 const mockNeedsSync = process.env.LAZY_MOCK_NEEDS_SYNC === '1';
 
+/**
+ * Per-call gate file path. Tests running against a daemon can't pass
+ * `LAZY_MOCK_ACCEPT_GATES` per-test (the env reaches the CLI subprocess but
+ * NOT the long-running daemon). Instead, tests write gate JSON to this file
+ * and the mock re-reads it on every checkAcceptGates() call.
+ *
+ * Path: <LAZY_PROTOCOL_BASE>/mock-accept-gates.json (both daemon and tests
+ * share LAZY_PROTOCOL_BASE so they agree on the file location).
+ */
+function readGatesFromFile(): AcceptGateWarning[] | null {
+  const base = process.env.LAZY_PROTOCOL_BASE;
+  if (!base) return null;
+  try {
+    // Sync read is acceptable in test mocks (no event loop concerns).
+    const { readFileSync, existsSync } = require('fs');
+    const { join } = require('path');
+    const filePath = join(base, 'mock-accept-gates.json');
+    if (!existsSync(filePath)) return null;
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as AcceptGateWarning[];
+  } catch {
+    return null;
+  }
+}
+
 function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
-  const gateWarnings: AcceptGateWarning[] = mockAcceptGatesJson
+  const staticGateWarnings: AcceptGateWarning[] = mockAcceptGatesJson
     ? JSON.parse(mockAcceptGatesJson)
     : [];
 
@@ -58,7 +82,12 @@ function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
     validateAccept: () => null,
     isTargetBranchProtected: async () => mockProtectedBranch,
     hasExternalApproval: async () => mockHasExternalApproval,
-    checkAcceptGates: async () => gateWarnings,
+    checkAcceptGates: async () => {
+      // File overrides static env value — supports per-test injection in
+      // daemon-backed tests where env can't change after daemon startup.
+      const fileGates = readGatesFromFile();
+      return fileGates !== null ? fileGates : staticGateWarnings;
+    },
     resolveUpstreamRef: async (branch: string) => branch,
     fastForwardLocal: async () => ({ success: true }),
     fetchRemoteState: async () => {},

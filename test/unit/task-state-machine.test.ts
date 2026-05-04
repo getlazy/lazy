@@ -15,7 +15,7 @@ import type { TaskStatus } from '../../src/types';
 // All statuses that exist in the TaskStatus type
 const ALL_STATUSES: TaskStatus[] = [
   'backlog', 'working', 'blocked', 'conflict', 'pairing',
-  'interrupted', 'merging', 'zombie', 'complete', 'abandoned', 'closed',
+  'interrupted', 'merging', 'zombie', 'complete', 'abandoned',
 ];
 
 describe('task-state-machine', () => {
@@ -62,14 +62,16 @@ describe('task-state-machine', () => {
     expect(canTransition('conflict', 'working')).toBe(true);
   });
 
-  // INVARIANT: working can ONLY go to blocked, conflict, or interrupted
-  // (agent is running — no pairing, closed, or abandoned while agent runs)
+  // INVARIANT: working can go to blocked, conflict, interrupted, or merging.
+  // merging is needed for externally merged MRs detected by remote-sync
+  // (e.g., agent crashed but human merged the MR on the remote).
+  // Still cannot go to pairing, closed, abandoned, or directly to complete.
   test('working cannot transition to pairing, closed, or abandoned', () => {
     expect(canTransition('working', 'pairing')).toBe(false);
-    expect(canTransition('working', 'closed')).toBe(false);
     expect(canTransition('working', 'abandoned')).toBe(false);
     expect(canTransition('working', 'complete')).toBe(false);
-    expect(canTransition('working', 'merging')).toBe(false);
+    // working → merging is valid (external merge detection)
+    expect(canTransition('working', 'merging')).toBe(true);
   });
 
   // INVARIANT: blocked cannot go directly to complete (must go through merging)
@@ -79,16 +81,16 @@ describe('task-state-machine', () => {
     expect(canTransition('blocked', 'merging')).toBe(true);
   });
 
-  // INVARIANT: interrupted cannot be accepted (must unblock/review first)
-  test('interrupted cannot transition to merging or complete', () => {
-    expect(canTransition('interrupted', 'merging')).toBe(false);
+  // INVARIANT: interrupted can transition to merging (external merge detection)
+  // but not directly to complete (must go through merging first).
+  test('interrupted can transition to merging but not directly to complete', () => {
+    expect(canTransition('interrupted', 'merging')).toBe(true);
     expect(canTransition('interrupted', 'complete')).toBe(false);
   });
 
-  // INVARIANT: merging either succeeds or fails — no abandoning or closing mid-merge
-  test('merging cannot transition to abandoned or closed', () => {
+  // INVARIANT: merging either succeeds or fails — no abandoning mid-merge
+  test('merging cannot transition to abandoned', () => {
     expect(canTransition('merging', 'abandoned')).toBe(false);
-    expect(canTransition('merging', 'closed')).toBe(false);
     // But merging CAN go to complete or blocked
     expect(canTransition('merging', 'complete')).toBe(true);
     expect(canTransition('merging', 'blocked')).toBe(true);
@@ -151,8 +153,10 @@ describe('task-state-machine', () => {
     expect(() => assertValidTransition('backlog', 'merging')).toThrow();
     // conflict cannot go to complete (must unblock first)
     expect(() => assertValidTransition('conflict', 'complete')).toThrow();
-    // pairing cannot go to complete
+    // pairing cannot go to complete or merging — human is driving,
+    // must end pairing (→ blocked) first
     expect(() => assertValidTransition('pairing', 'complete')).toThrow();
+    expect(() => assertValidTransition('pairing', 'merging')).toThrow();
     // working cannot go to pairing
     expect(() => assertValidTransition('working', 'pairing')).toThrow();
     // blocked cannot go directly to complete
@@ -180,7 +184,7 @@ describe('task-state-machine', () => {
     test('terminal statuses cannot transition to zombie', () => {
       expect(() => assertValidTransition('complete', 'zombie', 'system')).toThrow(/terminal/);
       expect(() => assertValidTransition('abandoned', 'zombie', 'system')).toThrow(/terminal/);
-      expect(() => assertValidTransition('closed', 'zombie', 'system')).toThrow(/terminal/);
+      // 'closed' is no longer a valid TaskStatus — abandoned covers both
     });
 
     // INVARIANT: zombie can only go to complete
@@ -213,8 +217,6 @@ describe('task-state-machine', () => {
     test('isTerminalStatus identifies terminal statuses', () => {
       expect(isTerminalStatus('complete')).toBe(true);
       expect(isTerminalStatus('abandoned')).toBe(true);
-      expect(isTerminalStatus('closed')).toBe(true);
-
       expect(isTerminalStatus('working')).toBe(false);
       expect(isTerminalStatus('blocked')).toBe(false);
       expect(isTerminalStatus('conflict')).toBe(false);

@@ -40,6 +40,10 @@ describe('GitHubDriver 422 self-approval handling', () => {
     agent: {
       agent_id: 'test-agent',
       watchdog_output_timeout_ms: 0,
+      effort: 'medium',
+    },
+    builder: {
+      effort: 'high',
     },
     server: {
       port: 3000,
@@ -56,7 +60,6 @@ describe('GitHubDriver 422 self-approval handling', () => {
     },
     docker: {
       dockerfile: '',
-      toolchain: '',
     },
     runner: { type: 'docker' as const },
     documents: {

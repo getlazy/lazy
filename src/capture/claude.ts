@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'fs';
+import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir, homedir } from 'os';
+import { tmpdir } from 'os';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
@@ -10,10 +11,10 @@ import { loadConfig } from '../config/loader';
 import type { OllamaConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getEffectiveModel } from '../utils/ollama';
+import { isOfflineMode } from '../utils/offline';
 import { spawn, spawnSync } from '../utils/spawn';
+import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
 import { getHome } from '../utils/home';
-import { isValidToolchain, getToolchainDockerfileContent } from '../docker/toolchains';
-import type { ToolchainName } from '../docker/toolchains';
 
 // Embedded at build/compile time — the agent binary is bundled into the lazy executable.
 // In dev mode this resolves to the placeholder file on disk (which is empty/tiny).
@@ -42,10 +43,6 @@ const DOCKER_TIMEOUT_MS = 10_000;
 const _agent = new ClaudeCodeAgent();
 const _packaging = new ClaudeCodePackaging();
 
-/**
- * Default Dockerfile uses the base toolchain — no duplication.
- */
-const DEFAULT_DOCKERFILE = getToolchainDockerfileContent('base');
 
 export function checkDocker(binary: string = 'docker'): void {
   logger.debug(`Checking ${binary}...`);
@@ -91,28 +88,16 @@ async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null>
  *
  * Resolution order:
  * 1. Custom Dockerfile from [docker].dockerfile in lazy.toml
- * 2. Toolchain Dockerfile from [docker].toolchain in lazy.toml
- * 3. Embedded default Dockerfile
+ * 2. Embedded default Dockerfile (base image)
  *
  * The project's own Dockerfile is NEVER used automatically — it's for the
  * project, not for agent containers. Use `lazy init` to create a Dockerfile.lazy
  * based on the project's Dockerfile if needed.
  */
-async function getDockerfileContent(lazyRoot: string): Promise<{ content: string; isCustom: boolean; toolchain?: string }> {
+async function getDockerfileContent(lazyRoot: string): Promise<{ content: string; isCustom: boolean }> {
   const customPath = await resolveCustomDockerfile(lazyRoot);
   if (customPath) {
     return { content: readFileSync(customPath, 'utf-8'), isCustom: true };
-  }
-
-  // Check for toolchain config
-  const config = await loadConfig(lazyRoot);
-  const toolchainName = config.docker.toolchain;
-  if (toolchainName && isValidToolchain(toolchainName)) {
-    return {
-      content: getToolchainDockerfileContent(toolchainName as ToolchainName),
-      isCustom: false,
-      toolchain: toolchainName,
-    };
   }
 
   return { content: DEFAULT_DOCKERFILE, isCustom: false };
@@ -126,18 +111,13 @@ export async function calculateDockerfileHash(lazyRoot: string): Promise<string>
 /**
  * Determine the Docker image name to use.
  * Default behavior uses 'lazy-runner'. Custom Dockerfiles use 'lazy-custom-{hash}'.
- * Toolchain Dockerfiles use 'lazy-{toolchain}' to avoid conflicts.
  */
 export async function resolveImageName(lazyRoot: string): Promise<string> {
-  const { isCustom, content, toolchain } = await getDockerfileContent(lazyRoot);
+  const { isCustom, content } = await getDockerfileContent(lazyRoot);
 
   if (isCustom) {
     const hash = createHash('sha256').update(content).digest('hex').substring(0, 12);
     return `lazy-custom-${hash}`;
-  }
-
-  if (toolchain) {
-    return `lazy-${toolchain}`;
   }
 
   return IMAGE_NAME;
@@ -157,38 +137,51 @@ function getImageDockerfileHash(imageName: string, binary: string = 'docker'): s
   return hash || null;
 }
 
-async function buildImage(lazyRoot: string, imageName: string, currentHash: string, binary: string = 'docker'): Promise<void> {
-  logger.info(`Building ${imageName} container image...`);
-
-  const customPath = await resolveCustomDockerfile(lazyRoot);
-
-  let buildCwd: string;
-  let dockerfileName: string;
-
-  if (customPath) {
-    // Custom Dockerfile: build context is project root, Dockerfile path is the custom one
-    buildCwd = lazyRoot;
-    dockerfileName = customPath;
-    logger.debug(`Using custom Dockerfile: ${customPath}`);
-  } else {
-    // Write the resolved Dockerfile (toolchain or default) to a temp directory for the build.
-    // Never use the project's own Dockerfile — it's for the project, not agents.
-    const { content, toolchain } = await getDockerfileContent(lazyRoot);
-    const tempDir = join(tmpdir(), 'lazy-docker-build');
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'Dockerfile'), content);
-    buildCwd = tempDir;
-    dockerfileName = join(tempDir, 'Dockerfile');
-    if (toolchain) {
-      logger.debug(`Using toolchain Dockerfile: ${toolchain}`);
-    } else {
-      logger.debug('Using embedded default Dockerfile');
-    }
-  }
-
+/**
+ * List existing Docker images with the lazy Dockerfile hash label.
+ * Returns image names sorted by creation date (most recent first).
+ */
+async function listExistingLazyImages(binary: string = 'docker'): Promise<string[]> {
   const proc = spawn(
-    [binary, 'build', '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${currentHash}`, '-f', dockerfileName, '.'],
-    { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe' }
+    [binary, 'images', '--filter', `label=${DOCKERFILE_HASH_LABEL}`, '--format', '{{.Repository}}:{{.Tag}}'],
+    { stdout: 'pipe', stderr: 'ignore' }
+  );
+  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (exitCode !== 0) return [];
+  return stdout.trim().split('\n').filter(line => line && line !== '<none>:<none>');
+}
+
+/**
+ * Write Dockerfile content to a temp directory so `docker build -f` has a real
+ * file to read. Returns the build context directory and the Dockerfile path.
+ */
+async function writeDockerfileToTempDir(content: string): Promise<{ buildCwd: string; dockerfilePath: string }> {
+  const tempDir = join(tmpdir(), 'lazy-docker-build');
+  await mkdir(tempDir, { recursive: true });
+  const dockerfilePath = join(tempDir, 'Dockerfile');
+  await writeFile(dockerfilePath, content);
+  return { buildCwd: tempDir, dockerfilePath };
+}
+
+/**
+ * Run `docker build` with the given parameters. Shared by the config-driven
+ * builder (`buildImage`) and the explicit lazy-runner builder
+ * (`buildLazyRunnerImage`).
+ */
+async function runDockerBuild(
+  buildCwd: string,
+  dockerfilePath: string,
+  imageName: string,
+  hash: string,
+  binary: string,
+  noCache: boolean,
+): Promise<void> {
+  const proc = spawn(
+    [binary, 'build', ...(noCache ? ['--no-cache'] : []), '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${hash}`, '-f', dockerfilePath, '.'],
+    // Image builds download toolchains (bun, Claude Code, Playwright+Chromium) and
+    // can legitimately take many minutes. The default 60s subprocess timeout kills
+    // the build mid-download, surfacing as "Canceled: context canceled" (exit 130).
+    { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe', timeout: 20 * 60_000 }
   );
 
   const outputPromise = new Response(proc.stdout).text();
@@ -213,29 +206,119 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
   logger.debug('Container build completed successfully');
 }
 
+async function buildImage(lazyRoot: string, imageName: string, currentHash: string, binary: string = 'docker', noCache: boolean = false): Promise<void> {
+  logger.info(`Building ${imageName} container image...`);
+
+  const customPath = await resolveCustomDockerfile(lazyRoot);
+
+  let buildCwd: string;
+  let dockerfileName: string;
+
+  if (customPath) {
+    // Custom Dockerfile: build context is project root, Dockerfile path is the custom one
+    buildCwd = lazyRoot;
+    dockerfileName = customPath;
+    logger.debug(`Using custom Dockerfile: ${customPath}`);
+  } else {
+    // Write the resolved Dockerfile to a temp directory for the build.
+    // Never use the project's own Dockerfile — it's for the project, not agents.
+    const { content } = await getDockerfileContent(lazyRoot);
+    const temp = await writeDockerfileToTempDir(content);
+    buildCwd = temp.buildCwd;
+    dockerfileName = temp.dockerfilePath;
+    logger.debug('Using embedded default Dockerfile');
+  }
+
+  await runDockerBuild(buildCwd, dockerfileName, imageName, currentHash, binary, noCache);
+}
+
+/**
+ * Build the base lazy-runner image explicitly, bypassing all lazy.toml
+ * configuration. Used by `lazy system build lazy-runner` so custom Dockerfiles
+ * that layer on top of the base image (`FROM lazy-runner`) have something to
+ * build from on a fresh machine.
+ *
+ * Unlike `ensureImage`, this always builds — it does not check whether the
+ * image already exists or whether the Dockerfile hash has changed.
+ */
+export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean } = {}): Promise<string> {
+  const binary = options.binary ?? 'docker';
+  const noCache = options.noCache ?? false;
+
+  checkDocker(binary);
+
+  logger.info(`Building ${IMAGE_NAME} container image...`);
+  logger.debug('Using embedded default Dockerfile');
+
+  const hash = createHash('sha256').update(DEFAULT_DOCKERFILE).digest('hex');
+  const { buildCwd, dockerfilePath } = await writeDockerfileToTempDir(DEFAULT_DOCKERFILE);
+  await runDockerBuild(buildCwd, dockerfilePath, IMAGE_NAME, hash, binary, noCache);
+
+  return IMAGE_NAME;
+}
+
 /**
  * Ensure the Docker image is built and up to date.
  * Returns the image name to use for container creation.
+ *
+ * When offline and the build fails (e.g., can't pull base images), falls back
+ * to an existing lazy image if one is available. This lets users work offline
+ * with a previously-built image even if the Dockerfile has changed.
  */
-export async function ensureImage(binary: string = 'docker'): Promise<string> {
+export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean }): Promise<string> {
   checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
   const imageName = await resolveImageName(lazyRoot);
   const currentHash = await calculateDockerfileHash(lazyRoot);
   const imageHash = getImageDockerfileHash(imageName, binary);
+  const noCache = options?.noCache ?? false;
 
-  if (imageHash === null) {
-    logger.info('Container image not found.');
-    await buildImage(lazyRoot, imageName, currentHash, binary);
-  } else if (imageHash !== currentHash) {
-    logger.info('Dockerfile has changed, rebuilding image...');
-    await buildImage(lazyRoot, imageName, currentHash, binary);
-  } else {
+  if (imageHash === currentHash) {
     logger.debug('Container image is up to date ✓');
+    return imageName;
   }
 
-  return imageName;
+  // Image needs building (missing or outdated)
+  const buildReason = imageHash === null ? 'Container image not found.' : 'Dockerfile has changed, rebuilding image...';
+  logger.info(buildReason);
+
+  try {
+    await buildImage(lazyRoot, imageName, currentHash, binary, noCache);
+    return imageName;
+  } catch (buildErr) {
+    // If not offline, just propagate the build error
+    if (!(await isOfflineMode(join(lazyRoot, '.lazy')))) {
+      throw buildErr;
+    }
+
+    // Offline mode: try to fall back to an existing image
+    logger.warn(`Image build failed in offline mode: ${buildErr instanceof Error ? buildErr.message : buildErr}`);
+
+    // If the target image exists (just outdated), use it as-is
+    if (imageHash !== null) {
+      logger.warn(`Using existing image "${imageName}" (Dockerfile hash differs — image may be outdated).`);
+      return imageName;
+    }
+
+    // No target image — check for any other lazy images
+    const existing = await listExistingLazyImages(binary);
+    if (existing.length > 0) {
+      const fallback = existing[0]; // most recent
+      logger.warn(`Using fallback image "${fallback}" (originally wanted "${imageName}").`);
+      if (existing.length > 1) {
+        logger.info(`Other available lazy images: ${existing.slice(1).join(', ')}`);
+      }
+      return fallback;
+    }
+
+    // No images at all — actionable error
+    throw new Error(
+      `Cannot build Docker image while offline (no network access to pull base images), ` +
+      `and no existing lazy images found. Build the image while online first: ` +
+      `run \`lazy system online\`, then start a task to trigger the image build.`
+    );
+  }
 }
 
 
@@ -520,6 +603,7 @@ export async function runClaude(
   model?: string,
   binary: string = 'docker',
   ollamaConfig?: OllamaConfig,
+  effort?: string,
 ): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
@@ -536,6 +620,10 @@ export async function runClaude(
 
   if (effectiveModel) {
     claudeArgs.push('--model', effectiveModel);
+  }
+
+  if (effort) {
+    claudeArgs.push('--effort', effort);
   }
 
   logger.debug('Setting up sandbox...');
@@ -579,75 +667,6 @@ export async function runClaude(
   return JSON.parse(output) as AgentResponse;
 }
 
-export async function resumeClaude(
-  claudeSessionId: string,
-  prompt: string,
-  sandbox: SandboxConfig,
-  verbose: boolean = false,
-  debug: boolean = false,
-  model?: string,
-  binary: string = 'docker',
-  ollamaConfig?: OllamaConfig,
-): Promise<AgentResponse> {
-  const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary),
-    ensureAgentBinary(),
-  ]);
-
-  const effectiveModel = getEffectiveModel(model, ollamaConfig);
-
-  const claudeArgs = [
-    'claude', '-p', prompt,
-    '--resume', claudeSessionId,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (effectiveModel) {
-    claudeArgs.push('--model', effectiveModel);
-  }
-
-  logger.info('Resuming Claude Code session...');
-  logger.debug(`Claude session ID: ${claudeSessionId}`);
-
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
-
-  if (debug) {
-    console.log('[DEBUG] Running container command:', args.join(' '));
-  }
-
-  const proc = spawn(args, {
-    stdout: 'pipe',
-    stderr: verbose || debug ? 'inherit' : 'pipe',
-  });
-
-  const outputPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-
-  const [output, stderr, exitCode] = await Promise.all([
-    outputPromise,
-    stderrPromise,
-    proc.exited,
-  ]);
-
-  logger.stream('Claude stdout:\n' + output);
-  logger.stream('Claude stderr:\n' + stderr);
-
-  if (exitCode !== 0) {
-    if (!(verbose || debug) && stderr) {
-      const stderrLines = stderr.trim().split('\n');
-      const lastOutput = stderrLines.slice(-20).join('\n  ');
-      logger.error(`Claude Code exited with code ${exitCode}\n\nLast output:\n  ${lastOutput}`);
-    } else {
-      logger.error(`Claude Code exited with code ${exitCode}`);
-    }
-    throw new Error(`Claude exited with code ${exitCode}`);
-  }
-
-  logger.debug('Parsing Claude response...');
-  return JSON.parse(output) as AgentResponse;
-}
-
 /**
  * Extract TokenUsage from an AgentResponse
  */
@@ -658,151 +677,6 @@ export function extractTokenUsage(response: AgentResponse): TokenUsage {
     cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
     cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
   };
-}
-
-/**
- * Build Docker args for async (detached) execution.
- * No --rm flag, adds --name for status tracking, runs detached (-d).
- */
-function buildDockerArgsAsync(
-  containerName: string,
-  sandbox: SandboxConfig,
-  claudeArgs: string[],
-  agentBinaryPath: string,
-  imageName: string,
-  binary: string = 'docker',
-  ollamaConfig?: OllamaConfig,
-): string[] {
-  const authEnvVars = getAuthEnvVars(ollamaConfig);
-  const repoRoot = getLazyRoot();
-
-  return [
-    binary, 'run', '-d', '--init',
-    '--name', containerName,
-    // Allow container to reach host services (daemon MCP, Ollama, etc.)
-    '--add-host=host.docker.internal:host-gateway',
-    // Mount repo read-only so agent can read source but not modify the main tree.
-    // The worktree and .git dir are mounted read-write on top (more specific mount wins).
-    '-v', `${repoRoot}:${repoRoot}:ro`,
-    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
-    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
-    '-w', sandbox.worktreePath,
-    '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
-    '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
-    '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
-    '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
-    imageName,
-    ...claudeArgs,
-  ];
-}
-
-/**
- * Launch Claude Code in a detached Docker container.
- * Returns immediately after the container starts.
- */
-export async function launchClaudeAsync(
-  prompt: string,
-  sandbox: SandboxConfig,
-  containerName: string,
-  debug: boolean = false,
-  model?: string,
-  binary: string = 'docker',
-  ollamaConfig?: OllamaConfig,
-): Promise<void> {
-  const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary),
-    ensureAgentBinary(),
-  ]);
-
-  const effectiveModel = getEffectiveModel(model, ollamaConfig);
-
-  const claudeArgs = [
-    'claude', '-p', prompt,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (effectiveModel) {
-    claudeArgs.push('--model', effectiveModel);
-  }
-
-  logger.debug('Setting up sandbox for async launch...');
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
-
-  if (debug) {
-    console.log('[DEBUG] Running container command:', args.join(' '));
-  }
-
-  logger.info('Launching Claude Code (async)...');
-
-  const result = spawnSync(args, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-
-  if (result.exitCode !== 0) {
-    const stderr = result.stderr.toString().trim();
-    logger.error(`Failed to launch container: ${stderr}`);
-    throw new Error(`Failed to launch container: ${stderr}`);
-  }
-
-  logger.debug(`Container ${containerName} launched`);
-}
-
-/**
- * Resume Claude Code in a detached Docker container.
- * Returns immediately after the container starts.
- */
-export async function resumeClaudeAsync(
-  claudeSessionId: string,
-  prompt: string,
-  sandbox: SandboxConfig,
-  containerName: string,
-  debug: boolean = false,
-  model?: string,
-  binary: string = 'docker',
-  ollamaConfig?: OllamaConfig,
-): Promise<void> {
-  const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary),
-    ensureAgentBinary(),
-  ]);
-
-  const effectiveModel = getEffectiveModel(model, ollamaConfig);
-
-  const claudeArgs = [
-    'claude', '-p', prompt,
-    '--resume', claudeSessionId,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (effectiveModel) {
-    claudeArgs.push('--model', effectiveModel);
-  }
-
-  logger.info('Launching Claude Code resume (async)...');
-  logger.debug(`Claude session ID: ${claudeSessionId}`);
-
-  const args = buildDockerArgsAsync(containerName, sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
-
-  if (debug) {
-    console.log('[DEBUG] Running container command:', args.join(' '));
-  }
-
-  const result = spawnSync(args, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-
-  if (result.exitCode !== 0) {
-    const stderr = result.stderr.toString().trim();
-    logger.error(`Failed to launch container: ${stderr}`);
-    throw new Error(`Failed to launch container: ${stderr}`);
-  }
-
-  logger.debug(`Container ${containerName} launched for resume`);
 }
 
 /**
@@ -1046,6 +920,10 @@ export async function launchSupervisorAsync(
   const args = [
     binary, 'run', '-d', '--init',
     '--name', containerName,
+    // Scope this container to the project so cross-project commands
+    // (e.g. `lazy upgrade`) can filter on the label. Kept in sync with
+    // PROJECT_LABEL in src/runner/docker-runner.ts.
+    '--label', `lazy.project=${repoRoot}`,
     // Allow container to reach host services (daemon MCP, Ollama, etc.)
     '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only; worktree, .git, and protocol dir are mounted read-write on top.

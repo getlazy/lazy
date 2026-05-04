@@ -136,7 +136,7 @@ describeWithPg('PostgresStorage', () => {
   test('listTasksWithOptions nonTerminalOnly excludes closed tasks', async () => {
     const t1 = await storage.createTask('Open task');
     const t2 = await storage.createTask('Closed task');
-    await storage.closeTask(t2.id, 'done');
+    await storage.abandonTask(t2.id, 'done');
 
     const nonTerminal = await storage.listTasksWithOptions({ nonTerminalOnly: true });
     expect(nonTerminal).toHaveLength(1);
@@ -160,19 +160,19 @@ describeWithPg('PostgresStorage', () => {
     expect(history[1].actor).toBe('system');
   });
 
-  test('closeTask sets status, reason, and completed_at', async () => {
+  test('abandonTask sets status, reason, and completed_at', async () => {
     const task = await storage.createTask('Test task');
-    await storage.closeTask(task.id, 'no longer needed', 'human');
+    await storage.abandonTask(task.id, 'no longer needed', 'human');
 
     const fetched = await storage.getTask(task.id);
-    expect(fetched!.status).toBe('closed');
+    expect(fetched!.status).toBe('abandoned');
     expect(fetched!.close_reason).toBe('no longer needed');
     expect(typeof fetched!.completed_at).toBe('number');
   });
 
   test('reopenTask resets status', async () => {
     const task = await storage.createTask('Test task');
-    await storage.closeTask(task.id, 'mistake');
+    await storage.abandonTask(task.id, 'mistake');
     await storage.reopenTask(task.id, 'human');
 
     const fetched = await storage.getTask(task.id);
@@ -528,16 +528,16 @@ describeWithPg('PostgresStorage', () => {
     const task = await storage.createTask('Test task');
     await storage.updateTaskStatus(task.id, 'working', 'system');
     await storage.updateTaskStatus(task.id, 'blocked', 'builder');
-    await storage.closeTask(task.id, 'done', 'human');
+    await storage.abandonTask(task.id, 'done', 'human');
 
     const history = await storage.getStatusHistory(task.id);
-    expect(history).toHaveLength(4); // backlog + working + blocked + closed
+    expect(history).toHaveLength(4); // backlog + working + blocked + abandoned
     expect(history[0].status).toBe('backlog');
     expect(history[1].status).toBe('working');
     expect(history[1].actor).toBe('system');
     expect(history[2].status).toBe('blocked');
     expect(history[2].actor).toBe('builder');
-    expect(history[3].status).toBe('closed');
+    expect(history[3].status).toBe('abandoned');
     expect(history[3].actor).toBe('human');
 
     // Timestamps must be numbers (BIGINT parser)

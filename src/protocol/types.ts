@@ -12,18 +12,37 @@
 
 import type { TokenUsage, MergeConflict, FileViolation } from '../types';
 
+/**
+ * Wire-protocol version between host CLI/daemon and supervisor.
+ *
+ * Bump when ANY of:
+ *   - Start/Unblock/Sync (or other supervisor) command shape changes incompatibly
+ *   - RPC method signatures between CLI/daemon/supervisor change
+ *   - Supervisor↔daemon wire format changes
+ *
+ * The supervisor refuses commands whose `protocol_version` doesn't match this
+ * constant. Lazy version (the package version) is allowed to drift between
+ * client and supervisor as long as the protocol matches — different projects
+ * on one machine may run different lazy versions concurrently.
+ *
+ * Integer only. Protocols either match or they don't; no semver, no ranges.
+ */
+export const PROTOCOL_VERSION = 1;
+
 // --- Command (host → supervisor) ---
 
-export type CommandType = 'start' | 'unblock' | 'sync' | 'stop';
+export type CommandType = 'start' | 'unblock' | 'ask' | 'sync' | 'stop';
 
 export interface StartCommand {
   type: 'start';
   task_id: string;
   goal: string;
   prompt: string;
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
+  effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
   sync_before_work?: boolean;  // if true, sync upstream before work phase (default: false for start)
   sync_after_work?: boolean;   // if true, sync upstream after work phase
@@ -32,6 +51,7 @@ export interface StartCommand {
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
+  branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
 }
@@ -41,20 +61,61 @@ export interface UnblockCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
+  effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
   agent_session_id?: string;  // resume existing agent session
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
   sync_before_work?: boolean;  // if true, sync upstream before work phase
   sync_after_work?: boolean;   // if true, sync upstream after work phase
   remote_branch?: string;      // remote tracking ref to merge (e.g., "origin/lazy/abc12345") — sync-with-remote phase
 
+  /**
+   * Agent permission mode for this turn. When 'plan', the agent runs read-only
+   * (no writes, no commits) — used by `lazy review -i` for Q&A against the
+   * agent's session. Omitted/undefined means the default (unconstrained) mode.
+   */
+  permission_mode?: 'plan' | 'default';
+
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
+  branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+}
+
+/**
+ * Ask command — a read-only "ask turn" against an existing agent session.
+ *
+ * Used by `lazy review -i` so a reviewer can ask questions of the agent while
+ * walking a task's diff. Semantically distinct from Unblock:
+ *   - Read-only: plan mode always, no writes, no commits.
+ *   - No integration machinery: skips sync_with_remote, merge_and_fix,
+ *     post_turn_check, post_turn_sync, violation detection. Only `work` +
+ *     `writing_response` phases run.
+ *   - Daemon-owned response: the daemon waits synchronously for response.json
+ *     and returns the answer in the RPC result, so the CLI doesn't poll and
+ *     can't race the reconciler.
+ *
+ * Always resumes an existing session — an ask without a prior session has no
+ * meaning for review.
+ */
+export interface AskCommand {
+  type: 'ask';
+  task_id: string;
+  goal: string;
+  prompt: string;
+  agent_id?: string;
+  system_prompt?: string;
+  model_id?: string;
+  effort?: string;
+  agent_session_id?: string;  // always set by the daemon — asks always resume
+
+  turn_started_at?: string;
+  watchdog_output_timeout_ms?: number;
 }
 
 /**
@@ -67,7 +128,17 @@ export interface UnblockCommand {
 export interface SyncCommand {
   type: 'sync';
   task_id: string;
-  parent_branch: string;       // upstream branch to merge
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
+  parent_branch: string;       // upstream branch to merge (for display/logging)
+  /**
+   * SHA of the upstream branch resolved on the host at the moment the sync
+   * was dispatched. When present, the supervisor merges this exact commit
+   * rather than re-resolving `parent_branch`. Pinning the merge target to
+   * the same SHA the daemon saw prevents any ref-state drift between the
+   * moment the daemon decides to sync and the moment the supervisor runs
+   * the merge. Fixes the silent no-op sync regression (see fix-sync-no-merge).
+   */
+  upstream_sha?: string;
   agent_session_id?: string;   // existing agent session for conflict resolution
   model_id?: string;           // model for conflict resolution (if needed)
 }
@@ -78,7 +149,7 @@ export interface StopCommand {
   reason?: string;
 }
 
-export type Command = StartCommand | UnblockCommand | SyncCommand | StopCommand;
+export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand;
 
 // --- Response (supervisor → host) ---
 
@@ -104,6 +175,12 @@ export interface CompletedResponse {
   check_exit_code?: number;
   /** Captured stderr output from the post-turn check command (truncated to last 200 lines) */
   check_output?: string;
+  /**
+   * Wall-clock duration (ms) of the agent process itself — measured inside
+   * the supervisor around the `work` phase. Used by LAZY_VERBOSE telemetry
+   * to break ask-turn latency into agent vs supervisor vs daemon vs rpc.
+   */
+  agent_duration_ms?: number;
 }
 
 export interface ErrorResponse {

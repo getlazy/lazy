@@ -1,8 +1,10 @@
 import { join, resolve, isAbsolute, dirname, basename } from 'path';
 import type { LazyConfig, ResolvedConfig, StorageBackendConfig } from './types';
+import { VALID_EFFORT_LEVELS } from './types';
 import { listAgents } from '../agent/registry';
 import { DEFAULT_WEB_PORT } from './constants';
 import { pathExists, readFile } from '../utils/fs';
+import { expandTilde } from '../utils/home';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -64,6 +66,10 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   agent: {
     agent_id: 'claude-code',
     watchdog_output_timeout_ms: 7200000,
+    effort: 'medium',
+  },
+  builder: {
+    effort: 'high',
   },
   server: {
     port: DEFAULT_WEB_PORT,
@@ -80,7 +86,6 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   docker: {
     dockerfile: '',
-    toolchain: '',
   },
   runner: {
     type: 'docker',
@@ -260,6 +265,15 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
   // Cast to satisfy DeepPartial<ResolvedConfig> which expects { type: RunnerType }.
   const config = deepMerge(DEFAULT_CONFIG, parsed as DeepPartial<ResolvedConfig>);
 
+  // Expand leading `~/` in user-configured paths. Lazy accepts `~/...` as a
+  // valid value in lazy.toml, but downstream consumers pass the string to
+  // mkdir/writeFile/join, which do not expand tildes. Without this step, a
+  // configured `external_path = "~/.lazy/foo"` creates a literal `~` directory
+  // under the process cwd.
+  if (config.storage.external_path) {
+    config.storage.external_path = expandTilde(config.storage.external_path);
+  }
+
   // Merge user-specified protected patterns with built-in defaults (additive)
   if (parsed.permissions?.protected) {
     const userPatterns = parsed.permissions.protected;
@@ -273,6 +287,20 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     throw new Error(
       `Unknown agent "${config.agent.agent_id}" in lazy.toml [agent] section. ` +
       `Valid agents: ${validAgents.join(', ')}`
+    );
+  }
+
+  // Validate effort levels
+  if (!VALID_EFFORT_LEVELS.includes(config.agent.effort)) {
+    throw new Error(
+      `Invalid effort level "${config.agent.effort}" in lazy.toml [agent] section. ` +
+      `Valid levels: ${VALID_EFFORT_LEVELS.join(', ')}`
+    );
+  }
+  if (!VALID_EFFORT_LEVELS.includes(config.builder.effort)) {
+    throw new Error(
+      `Invalid effort level "${config.builder.effort}" in lazy.toml [builder] section. ` +
+      `Valid levels: ${VALID_EFFORT_LEVELS.join(', ')}`
     );
   }
 
@@ -314,10 +342,9 @@ export async function hasExplicitModelConfig(lazyRoot: string): Promise<boolean>
 /**
  * Get a default lazy.toml template content
  */
-export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, storagePath?: string, toolchain?: string, gitRemote?: string): string {
+export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, storagePath?: string, gitRemote?: string): string {
   const backend = storageBackend || 'external';
   const pathLine = storagePath ? `external_path = "${storagePath}"` : 'external_path = ""';
-  const toolchainValue = toolchain || '';
   const remoteName = gitRemote || 'origin';
 
   return `# lazy.toml - Configuration for lazy
@@ -326,7 +353,7 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 
 [models]
 # Default model for sessions — use raw model IDs (e.g., "claude-sonnet-4-5-20250929",
-# "claude-opus-4-6", "qwen3.5:35b-a3b-coding-nvfp4")
+# "claude-opus-4-7", "qwen3.5:35b-a3b-coding-nvfp4")
 default = "claude-sonnet-4-5-20250929"
 
 [session]
@@ -361,6 +388,16 @@ shortid_length = 8
 [agent]
 # Default agent type to use for sessions
 agent_id = "claude-code"
+# Reasoning effort level passed to Claude Code via --effort for task agents.
+# Higher levels spend more tokens thinking before responding.
+# Valid levels: "low", "medium", "high", "xhigh", "max" (default: "medium")
+# effort = "medium"
+
+[builder]
+# Reasoning effort level passed to Claude Code via --effort for builder sessions.
+# Builder sessions default to "high" because they handle orchestration and planning.
+# Valid levels: "low", "medium", "high", "xhigh", "max" (default: "high")
+# effort = "high"
 
 [server]
 # Default port for the web dashboard server
@@ -392,13 +429,9 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]
-# Auto-detected or manually set toolchain (e.g., "node", "rust", "ruby-rails")
-# Determines which built-in Dockerfile to use for agent containers.
-# See available toolchains: base, bun, node, deno, rust, go, cpp, ruby-rails,
-# ruby-rails-rust, dotnet, python, python-ml, java, kotlin, swift
-toolchain = "${toolchainValue}"
-# Path to custom Dockerfile (relative to project root, empty = use built-in default)
-# When set, overrides the toolchain Dockerfile.
+# Path to custom Dockerfile (relative to project root)
+# If empty, uses the base image (Ubuntu with Claude Code + passwordless sudo).
+# Agents install what they need via apt-get.
 dockerfile = ""
 
 [features]

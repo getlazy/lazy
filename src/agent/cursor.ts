@@ -39,6 +39,7 @@ export class CursorAgent implements Agent {
     modelId?: string;
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
+    effort?: string;
   }): string[] {
     // Cursor CLI uses 'agent' binary with --print for headless mode.
     // No --append-system-prompt — prepend system prompt to user prompt instead.

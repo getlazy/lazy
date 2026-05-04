@@ -6,7 +6,7 @@ import type { Task } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { logger } from '../../utils/logger';
 
-const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
+const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
 import reworkContextTemplate from '../../prompts/rework-context.md' with { type: 'text' };
 
@@ -121,8 +121,8 @@ export async function commandRework(args: string[]): Promise<void> {
     // Validate: task must be in 'complete' (accepted) status
     if (originalTask.status !== 'complete') {
       console.error(`Task ${displayId(originalTask)} is ${originalTask.status}, not complete (accepted).`);
-      if (originalTask.status === 'abandoned' || originalTask.status === 'closed') {
-        console.error(`Use \`lazy reopen ${displayId(originalTask)}\` to reopen rejected/closed tasks.`);
+      if (originalTask.status === 'abandoned') {
+        console.error(`Use \`lazy reopen ${displayId(originalTask)}\` to reopen abandoned tasks.`);
       } else if (originalTask.status === 'blocked' || originalTask.status === 'conflict') {
         console.error(`Use \`lazy unblock ${displayId(originalTask)}\` to continue blocked tasks.`);
       } else {
@@ -296,7 +296,7 @@ Examples:
   lazy rework fix-auth
   lazy rework fix-auth --goal "Fix token expiry edge case"
   lazy rework fix-auth --prompt "The refresh token logic doesn't handle expired sessions"
-  lazy rework abc12345 --code rework-fix-auth --model claude-opus-4-6
+  lazy rework abc12345 --code rework-fix-auth --model opus
   lazy rework fix-auth --parent release-v2
   echo "Fix the race condition in auth" | lazy rework fix-auth`);
 }

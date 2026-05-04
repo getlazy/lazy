@@ -36,6 +36,7 @@ export class QaAgent implements Agent {
     modelId?: string;
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
+    effort?: string;
   }): string[] {
     // The scenario file path comes from the QA_SCENARIO_FILE env var (read by the binary).
     // The supervisor sets cwd to the worktree path, so we pass '.' as the worktree arg.

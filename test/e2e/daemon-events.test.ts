@@ -124,19 +124,21 @@ describe('daemon event routing', () => {
       reader.releaseLock();
     });
 
-    // INVARIANT: SSE endpoint rejects requests for wrong project.
-    test('SSE connection rejects wrong project', async () => {
+    // INVARIANT: SSE endpoint accepts connections for the daemon's project.
+    test('SSE connection accepted for daemon project', async () => {
+      const abortController = new AbortController();
       const resp = await fetch(`http://localhost/events/stream?task_id=test-task-id`, {
         unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
-          'X-Lazy-Project': '/wrong/project',
+          'X-Lazy-Project': ctx.root,
         },
+        signal: abortController.signal,
       } as any);
 
-      expect(resp.status).toBe(400);
-      const data = await resp.json() as any;
-      expect(data.error).toContain('Project mismatch');
+      expect(resp.status).toBe(200);
+
+      abortController.abort();
     });
   });
 

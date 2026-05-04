@@ -86,6 +86,29 @@ const result = spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe
 const result = Bun.spawnSync(['git', 'status'], { cwd, stdout: 'pipe', stderr: 'pipe' });
 ```
 
+### Never use sync filesystem calls
+
+**Always use async filesystem operations** (`fs/promises`) unless you have a specific reason why async won't work. Sync calls (`readFileSync`, `writeFileSync`, `existsSync`, `readdirSync`, `statSync`, etc.) block the entire event loop — no HTTP requests, no timers, no other I/O can proceed until they complete. Even in code that "doesn't matter" today, sync calls become a problem when that code gets called from an async context later.
+
+**Async is the default. Sync requires justification.**
+
+```typescript
+// Good — async, doesn't block the event loop
+import { readFile, stat, readdir } from 'fs/promises';
+const content = await readFile(filePath, 'utf-8');
+
+// Bad — blocks the event loop, starves other work
+import { readFileSync, statSync } from 'fs';
+const content = readFileSync(filePath, 'utf-8');
+```
+
+Sync calls are acceptable **only** in:
+- CLI startup/init code that runs once before the event loop matters
+- Process exit handlers where async isn't reliable
+- Test setup/teardown
+
+Any sync call outside these cases needs a comment explaining why async isn't viable. This is not optional — sync calls in the daemon have caused real production issues (reconciler starvation, blocked HTTP handlers), and sync calls elsewhere have a habit of migrating into hot paths without anyone noticing.
+
 ### Fail hard on remote failures — no silent fallbacks
 
 Remote operations (push, fetch, MR/PR creation) must retry up to 3 attempts with progressive backoff (2s, 4s). If all retries fail, the operation FAILS — no silent fallback to local-only behavior. Use `withRemoteRetry()` from `src/utils/retry.ts` to wrap remote operations in drivers.
@@ -176,14 +199,15 @@ try {
   // fall through
 }
 
-// Good — distinguishes missing file from broken file
-if (!existsSync(configPath)) {
-  // No config file — fall through to other resolution methods
-} else {
-  try {
-    const config = parseToml(readFileSync(configPath, 'utf-8'));
-    return config.agent?.qa?.scenario_file;
-  } catch (err) {
+// Good — async, distinguishes missing file from broken file
+try {
+  const raw = await readFile(configPath, 'utf-8');
+  const config = parseToml(raw);
+  return config.agent?.qa?.scenario_file;
+} catch (err) {
+  if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+    // No config file — fall through to other resolution methods
+  } else {
     throw new Error(`Failed to parse ${configPath}: ${err.message}`);
   }
 }

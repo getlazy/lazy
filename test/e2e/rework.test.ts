@@ -291,11 +291,11 @@ describe('lazy rework', () => {
   // INVARIANT: --parent rejects terminal parent tasks (consistent with lazy create).
   // Terminal tasks cannot receive new child tasks.
   test('rework fails when --parent points to terminal task', async () => {
-    // Create and close a potential parent
-    const parentResult = await ctx.lazy(['create', '--goal', 'Closed parent', '--code', 'closed-par']);
+    // Create and abandon a potential parent
+    const parentResult = await ctx.lazy(['create', '--goal', 'Abandoned parent', '--code', 'abandoned-par']);
     expectSuccess(parentResult);
     const parentId = extractTaskId(parentResult.stdout);
-    await ctx.lazy(['close', parentId, '--reason', 'Done']);
+    await ctx.lazy(['abandon', parentId, '--reason', 'Done']);
 
     // Create and accept a task to rework
     const taskId = await createTask(ctx, 'Task to rework', 'Work');
@@ -304,11 +304,11 @@ describe('lazy rework', () => {
     });
     await ctx.lazy(['accept', taskId]);
 
-    // Rework with --parent pointing to closed task
-    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--parent', 'closed-par']);
+    // Rework with --parent pointing to abandoned task
+    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--parent', 'abandoned-par']);
     expectFailure(result);
     expectError(result, 'Cannot use task');
-    expectError(result, 'closed');
+    expectError(result, 'abandoned');
   });
 
   // INVARIANT: rework without --parent on a parentless task creates a parentless rework.

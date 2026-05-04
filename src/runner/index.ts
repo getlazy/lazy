@@ -9,6 +9,8 @@
  */
 
 export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck } from './types';
+export type { DockerRunnerOptions } from './docker-runner';
+export { PROJECT_LABEL_KEY } from './docker-runner';
 
 import type { Runner } from './types';
 import type { RunnerType } from '../config/types';
@@ -37,17 +39,17 @@ export async function createRunner(lazyRoot: string): Promise<Runner> {
 
   switch (config.runner.type) {
     case 'docker': {
-      const runner = new DockerRunner('docker', 'docker');
+      const runner = new DockerRunner('docker', 'docker', undefined, lazyRoot);
       if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
       return runner;
     }
     case 'podman': {
-      const runner = new PodmanRunner();
+      const runner = new PodmanRunner(undefined, lazyRoot);
       if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
       return runner;
     }
     case 'dangerously-host-process-without-any-isolation': {
-      const runner = new HostProcessRunner();
+      const runner = new HostProcessRunner(lazyRoot);
       if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
       return runner;
     }

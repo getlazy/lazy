@@ -18,6 +18,7 @@ import type { MergeConflict } from '../types';
 import { log, logError } from './log';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
+import { hasUpstreamChanges } from '../git/operations';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
 import mergeConflictResolutionResumeTemplate from '../prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
 import remoteBranchMergeTemplate from '../prompts/remote-branch-merge.md' with { type: 'text' };
@@ -59,14 +60,33 @@ export function buildMergeClaudeArgs(
 }
 
 /**
+ * Result of the sync-with-upstream phase.
+ * `merged: false` means there was nothing to merge (HEAD already contains
+ * the target). Callers MUST distinguish this from a real merge when
+ * reporting to the user — conflating the two caused the silent no-op
+ * sync regression (fix-sync-no-merge).
+ */
+export interface SyncWithUpstreamResult {
+  merged: boolean;
+  preMergeSha: string;
+  postMergeSha: string;
+  /** SHA of the commit that was merged (or checked for reachability). */
+  targetSha: string;
+  conflicts: MergeConflict[];
+}
+
+/**
  * Run the sync-with-upstream phase (merge upstream and resolve conflicts).
  * @param worktreePath Working directory (the task's worktree)
- * @param parentBranch Branch to merge from
+ * @param parentBranch Branch to merge from (used for the merge commit message and logs)
  * @param modelId Optional model override
  * @param agentSessionId Optional existing agent session ID — when provided, conflict
  *   resolution uses `claude --resume` so the agent has full context from prior work.
  *   Falls back to standalone `claude -p` if resume fails or is not provided.
- * @returns Array of merge conflicts captured before resolution (empty if clean merge)
+ * @param upstreamSha Optional SHA of the upstream ref resolved on the host before
+ *   the supervisor was launched. When provided, the merge target is this SHA —
+ *   not the ref — which avoids host/container ref-resolution discrepancies.
+ * @returns Structured result describing whether a merge actually happened.
  * @throws If merge fails and cannot be resolved
  */
 export async function runSyncWithUpstream(
@@ -74,25 +94,61 @@ export async function runSyncWithUpstream(
   parentBranch: string,
   modelId?: string,
   agentSessionId?: string,
-): Promise<MergeConflict[]> {
-  log(`[merge] Merging ${parentBranch} into current branch...`);
+  upstreamSha?: string,
+): Promise<SyncWithUpstreamResult> {
+  const target = upstreamSha ?? parentBranch;
+  const targetLabel = upstreamSha
+    ? `${parentBranch} @ ${upstreamSha.substring(0, 8)}`
+    : parentBranch;
+  log(`[merge] Merging ${targetLabel} into current branch...`);
 
-  // Check if parent branch has changes to merge
-  const hasChanges = await checkUpstreamChanges(parentBranch, worktreePath);
+  const preMergeSha = await getHeadSha(worktreePath);
+  log(`[merge] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
+
+  // Resolve the target to a concrete SHA so the response can report it honestly.
+  // --verify ensures an unknown object fails hard instead of echoing the input.
+  const resolvedTargetResult = await runGit(
+    ['rev-parse', '--verify', `${target}^{commit}`],
+    { cwd: worktreePath },
+  );
+  if (resolvedTargetResult.exitCode !== 0) {
+    throw new Error(
+      `Failed to resolve merge target ${target} in ${worktreePath}: ${resolvedTargetResult.stderr || 'unknown error'}`,
+    );
+  }
+  const resolvedTargetSha = resolvedTargetResult.stdout.trim();
+
+  // Check if the target has commits not reachable from HEAD. The shared
+  // hasUpstreamChanges surfaces git errors (per CLAUDE.md "never swallow
+  // errors") instead of quietly returning false on rev-list failure.
+  const hasChanges = await hasUpstreamChanges(resolvedTargetSha, worktreePath);
   if (!hasChanges) {
-    log('[merge] No upstream changes to merge.');
-    return [];
+    log(`[merge] No upstream changes to merge: HEAD (${preMergeSha.substring(0, 8)}) already contains ${resolvedTargetSha.substring(0, 8)}.`);
+    return {
+      merged: false,
+      preMergeSha,
+      postMergeSha: preMergeSha,
+      targetSha: resolvedTargetSha,
+      conflicts: [],
+    };
   }
 
   // Attempt a clean merge first
   const mergeResult = await runGit(
-    ['merge', parentBranch, '--no-ff', '-m', `Merge ${parentBranch}`],
+    ['merge', target, '--no-ff', '-m', `Merge ${parentBranch}`],
     { cwd: worktreePath },
   );
 
   if (mergeResult.exitCode === 0) {
-    log('[merge] Clean merge succeeded.');
-    return [];
+    const postMergeSha = await getHeadSha(worktreePath);
+    log(`[merge] Clean merge succeeded. Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
+    return {
+      merged: true,
+      preMergeSha,
+      postMergeSha,
+      targetSha: resolvedTargetSha,
+      conflicts: [],
+    };
   }
 
   // Merge has conflicts — capture conflicted files before aborting
@@ -110,10 +166,6 @@ export async function runSyncWithUpstream(
     const prompt = shouldResume ? resumePrompt : standalonePrompt;
     return buildMergeClaudeArgs(prompt, modelId, agentSessionId, shouldResume);
   }
-
-  // Record HEAD before Claude runs so we can verify it advanced
-  const preMergeSha = await getHeadSha(worktreePath);
-  log(`[merge] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
 
   // Track whether we should try resuming. Start with resume if session exists.
   let useResume = !!agentSessionId;
@@ -199,7 +251,13 @@ export async function runSyncWithUpstream(
 
     log(`[merge] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
     log('[merge] Merge-and-fix completed successfully.');
-    return conflicts;
+    return {
+      merged: true,
+      preMergeSha,
+      postMergeSha,
+      targetSha: resolvedTargetSha,
+      conflicts,
+    };
   }
 
   // All retries exhausted
@@ -453,21 +511,3 @@ export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
   return false;
 }
 
-async function checkUpstreamChanges(parentBranch: string, cwd: string): Promise<boolean> {
-  const currentBranch = await runGit(
-    ['rev-parse', '--abbrev-ref', 'HEAD'],
-    { cwd },
-  );
-
-  if (currentBranch.exitCode !== 0) return false;
-
-  const result = await runGit(
-    ['rev-list', '--count', `${currentBranch.stdout}..${parentBranch}`],
-    { cwd },
-  );
-
-  if (result.exitCode !== 0) return false;
-
-  const count = parseInt(result.stdout, 10);
-  return count > 0;
-}

@@ -193,6 +193,14 @@ async function daemonStatus(args: string[]): Promise<void> {
     console.log(`  Socket:  ${status.socketPath}`);
     if (status.webPort) {
       console.log(`  Web:     http://localhost:${status.webPort}`);
+    } else {
+      // INVARIANT: always surface the web-port state. Post-fix, the daemon
+      // refuses to start when web binding fails, so this branch is only
+      // reachable against a daemon built before that fix — but silently
+      // omitting the Web line made the "degraded" mode invisible (see the
+      // original "Daemon context not initialized" bug) and must never
+      // regress.
+      console.log('  Web:     not bound (degraded — restart after freeing the port)');
     }
     if (status.uptime !== undefined) {
       console.log(`  Uptime:  ${formatDuration(status.uptime)}`);

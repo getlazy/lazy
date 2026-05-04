@@ -25,10 +25,12 @@ import { getKnownFeatures, getUnknownFlags, isFeatureEnabled } from '../../utils
 import { createDriver } from '../../remote';
 import type { ResolvedConfig } from '../../config/types';
 import type { RepositoryDriver } from '../../remote';
+import { getOfflineStatus } from '../../utils/offline';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../../shell/detect';
 import type { ShellInfo } from '../../shell/detect';
 import { spawnSync } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
+import { which } from 'bun';
 
 // ── types ────────────────────────────────────────────────────────────────
 
@@ -563,6 +565,17 @@ function checkCompletionsInstalled(shell: ShellInfo): CheckResult {
   };
 }
 
+function checkTmux(): CheckResult {
+  if (which('tmux')) {
+    return { ok: true, label: 'tmux installed' };
+  }
+  return {
+    ok: true,
+    label: 'tmux (optional)',
+    warning: 'tmux not installed. Recommended for terminal multiplexing.',
+  };
+}
+
 function checkFeatureFlags(config: ResolvedConfig): CheckResult {
   const vanilla = process.env.LAZY_VANILLA === '1';
   const allEnabled = config.features.all === true;
@@ -777,9 +790,20 @@ export async function commandDoctor(args: string[]): Promise<void> {
   // Parse flags
   const parsed = parseFlags(args, [
     { name: 'no-resume', takesValue: false },
+    { name: 'dry-run', takesValue: false },
+    { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'doctor');
 
   const noResume = parsed.flags.get('no-resume') === true;
+  const dryRun = parsed.flags.get('dry-run') === true;
+  const yes = parsed.flags.get('yes') === true;
+
+  // If a positional argument is provided, run task-specific diagnostics
+  if (parsed.positional.length > 0) {
+    const { commandDoctorTask } = await import('./doctor-task');
+    await commandDoctorTask(parsed.positional[0], { dryRun, yes });
+    return;
+  }
 
   const results: CheckResult[] = [];
 
@@ -822,6 +846,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
   const { result: shellResult, shell } = await checkShellDetected();
   results.push(shellResult);
   results.push(checkCompletionsInstalled(shell));
+  results.push(checkTmux());
 
   // Container-dependent checks only run if the runner's own diagnostics all passed
   const runnerDiagnosticsOk = runner
@@ -830,6 +855,19 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
   if (root) {
     results.push(await checkDataDir(root));
+
+    // Offline mode status
+    const offlineStatus = await getOfflineStatus(join(root, '.lazy'));
+    if (offlineStatus.enabled) {
+      results.push({
+        ok: true,
+        label: 'Offline mode',
+        warning: `ENABLED since ${offlineStatus.enabled_at ?? 'unknown'}${offlineStatus.configured_driver ? ` (${offlineStatus.configured_driver} driver suspended)` : ''}. Run 'lazy system online' to restore remote operations.`,
+      });
+    } else {
+      results.push({ ok: true, label: 'Offline mode: off' });
+    }
+
     results.push(await checkPostgresConnectivity(config!));
 
     // Container-dependent checks (Docker or Podman) — only if runtime is healthy
@@ -961,18 +999,22 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
 export function doctorUsage(): void {
   console.log(`Usage: lazy doctor [--no-resume]
+       lazy doctor <task-id> [--dry-run] [--yes]
 
-Check the health of your lazy installation and report any issues.
+Check the health of your lazy installation, or diagnose a specific task.
 
 Options:
   --no-resume   Report crashed containers without auto-resuming interrupted tasks
+  --dry-run     Show task issues without offering fixes (task mode only)
+  --yes, -y     Apply all fixes without prompting (task mode only)
 
-Checks performed:
+Project-level checks (no task ID):
   - Git installed and functional
   - Repository has at least one commit
   - Docker installed and daemon running
   - Anthropic API key or OAuth token configured
   - Shell detected and completions installed
+  - tmux installed (soft recommendation)
   - Data directory structure valid
   - Container image exists and up to date
   - No stale locks or orphaned containers
@@ -983,6 +1025,14 @@ Checks performed:
   - Unknown or deprecated config options in lazy.toml
   - Remote driver health checks
   - Feature flags status and unknown flag warnings
+
+Task-level checks (with task ID):
+  - Stale parent (parent task is complete but child still points to it)
+  - Missing local branch (session has a branch but it's gone locally)
+  - Missing worktree (non-terminal task with no worktree directory)
+  - Local/remote branch divergence
+  - Status mismatch (task has work but status is still backlog)
+  - Orphaned worktree (directory exists but not registered in git)
 
 Exit code is 0 if all checks pass, 1 if any issues are found.`);
 }

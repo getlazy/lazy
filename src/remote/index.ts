@@ -9,15 +9,27 @@ import { LocalDriver } from './local-driver';
 import { GitHubDriver, detectGitHub } from './github-driver';
 import { GitLabDriver, detectGitLab } from './gitlab-driver';
 
+export interface CreateDriverOptions {
+  /** When true, return LocalDriver regardless of config — for offline mode. */
+  offline?: boolean;
+}
+
 /**
  * Create the appropriate RepositoryDriver based on the resolved config.
  * Defaults to LocalDriver when remote.driver is 'local' or unrecognized.
+ *
+ * When `options.offline` is true, always returns a LocalDriver — all remote
+ * operations become no-ops so the user can work without network access.
  *
  * @param context Optional context providing storage access. When provided,
  *   the driver can check task state (e.g., skip fast-forwarding worktrees
  *   that belong to working tasks).
  */
-export function createDriver(config: ResolvedConfig, context?: DriverContext): RepositoryDriver {
+export function createDriver(config: ResolvedConfig, context?: DriverContext, options?: CreateDriverOptions): RepositoryDriver {
+  if (options?.offline) {
+    return new LocalDriver(context);
+  }
+
   switch (config.remote.driver) {
     case 'local':
       return new LocalDriver(context);

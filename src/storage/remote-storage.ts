@@ -31,7 +31,7 @@ import type {
   StoredConversation,
   StatusChange,
 } from './types';
-import type { Actor, CommentSource, FileViolation } from '../types';
+import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage } from '../types';
 
 export class RemoteStorage implements Storage {
   constructor(
@@ -131,8 +131,8 @@ export class RemoteStorage implements Storage {
     await this.call('incrementTaskPendingSync', { taskId });
   }
 
-  async closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void> {
-    await this.call('closeTask', { taskId, closeReason, actor });
+  async abandonTask(taskId: string, reason: string, actor?: Actor): Promise<void> {
+    await this.call('abandonTask', { taskId, reason, actor });
   }
 
   async reopenTask(taskId: string, actor?: Actor): Promise<void> {
@@ -299,6 +299,21 @@ export class RemoteStorage implements Storage {
 
   async getTaskComments(taskId: string): Promise<Comment[]> {
     return this.call<Comment[]>('getTaskComments', { taskId });
+  }
+
+  // --- Hunk Approvals ---
+
+  async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
+    return this.call<HunkApproval[]>('listHunkApprovals', { taskId });
+  }
+
+  async createHunkApproval(
+    taskId: string,
+    hunkHash: string,
+    actor?: Actor,
+    lineage?: HunkApprovalLineage,
+  ): Promise<HunkApproval> {
+    return this.call<HunkApproval>('createHunkApproval', { taskId, hunkHash, actor, lineage });
   }
 
   // --- Conversations ---

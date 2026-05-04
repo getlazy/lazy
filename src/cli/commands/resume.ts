@@ -3,6 +3,7 @@ import { followContainer } from './shared';
 import { protocolDir as getProtocolDir } from '../../protocol';
 
 import { queryResumeTask } from '../../daemon/rpc-fallback';
+import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
 
@@ -14,6 +15,7 @@ export async function commandResume(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'follow', takesValue: false },
     { name: 'model', takesValue: true },
+    { name: 'effort', takesValue: true },
 
   ], 'resume');
 
@@ -32,6 +34,17 @@ export async function commandResume(args: string[]): Promise<void> {
     modelOverride = validateModel(modelValue);
   }
 
+  // Parse --effort flag
+  let effortOverride: EffortLevel | undefined;
+  const effortValue = parsed.flags.get('effort') as string | undefined;
+  if (effortValue !== undefined) {
+    if (!VALID_EFFORT_LEVELS.includes(effortValue as EffortLevel)) {
+      console.error(`Invalid effort '${effortValue}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
+      process.exit(1);
+    }
+    effortOverride = effortValue as EffortLevel;
+  }
+
   const root = requireLazyRoot();
 
   // --- Delegate to daemon RPC ---
@@ -39,6 +52,7 @@ export async function commandResume(args: string[]): Promise<void> {
     const result = await queryResumeTask({
       taskId,
       modelOverride,
+      effortOverride,
     });
 
     // Print warnings
@@ -78,7 +92,7 @@ export async function commandResume(args: string[]): Promise<void> {
 }
 
 export function resumeUsage(): void {
-  console.log(`Usage: lazy resume <task_id> [--model <model>] [--follow]
+  console.log(`Usage: lazy resume <task_id> [--model <model>] [--effort <level>] [--follow]
 
 Resume an interrupted task. Writes a command for the supervisor and launches
 a container if needed.
@@ -95,11 +109,12 @@ Arguments:
   <task_id>    ID of the interrupted task to resume
 
 Options:
-  --model <model>    Override model for this session (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
   --follow           Wait for the agent to finish, streaming output in real time
 
 Examples:
   lazy resume abc12345
-  lazy resume abc1 --model claude-opus-4-6
+  lazy resume abc1 --model opus
   lazy resume abc1 --follow              # Wait for completion`);
 }

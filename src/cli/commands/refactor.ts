@@ -4,7 +4,7 @@ import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 
 import refactorConstraints from '../../prompts/refactor-constraints.md' with { type: 'text' };
 
-const TERMINAL_STATUSES = ['complete', 'abandoned', 'closed'];
+const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
 export async function commandRefactor(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -139,7 +139,7 @@ Enforces: no behavior changes, one step per commit, tests pass after each step.
 Options:
   --goal <goal>      Refactoring goal (what to refactor and why)
   --prompt <text>    Additional instructions for the refactoring agent
-  --model <model>    Set model for this task (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --code <code>      Human-readable code (e.g. "refactor-auth", "refactor-storage")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

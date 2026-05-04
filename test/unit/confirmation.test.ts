@@ -10,14 +10,12 @@ import {
 } from '../../src/mcp/confirmation';
 import {
   acceptConfirmationLevel,
-  rejectConfirmationLevel,
-  closeConfirmationLevel,
+  abandonConfirmationLevel,
   redoConfirmationLevel,
   reopenConfirmationLevel,
   createConfirmationLevel,
   gatherAcceptContext,
-  gatherRejectContext,
-  gatherCloseContext,
+  gatherAbandonContext,
   gatherRedoContext,
   gatherReopenContext,
   gatherCreateParentWarningContext,
@@ -35,8 +33,7 @@ describe('generateCode', () => {
   });
 
   test('uses the provided verb prefix', () => {
-    expect(generateCode('rj')).toMatch(/^rj-/);
-    expect(generateCode('cl')).toMatch(/^cl-/);
+    expect(generateCode('ab')).toMatch(/^ab-/);
     expect(generateCode('rd')).toMatch(/^rd-/);
   });
 
@@ -218,28 +215,22 @@ describe('acceptConfirmationLevel', () => {
   });
 });
 
-// INVARIANT: Reject is always stern — rejection wastes work and pollutes task codes.
-describe('rejectConfirmationLevel', () => {
-  test('always returns stern', () => {
-    expect(rejectConfirmationLevel()).toBe('stern');
-  });
-});
-
-describe('closeConfirmationLevel', () => {
+// INVARIANT: Abandon scales confirmation with commit count and task state.
+describe('abandonConfirmationLevel', () => {
   test('returns light for backlog task with no commits', () => {
-    expect(closeConfirmationLevel({ status: 'backlog' }, 0)).toBe('light');
+    expect(abandonConfirmationLevel({ status: 'backlog' }, 0)).toBe('light');
   });
 
   test('returns standard for non-backlog task with no commits', () => {
-    expect(closeConfirmationLevel({ status: 'working' }, 0)).toBe('standard');
-    expect(closeConfirmationLevel({ status: 'blocked' }, 0)).toBe('standard');
+    expect(abandonConfirmationLevel({ status: 'working' }, 0)).toBe('standard');
+    expect(abandonConfirmationLevel({ status: 'blocked' }, 0)).toBe('standard');
   });
 
   // INVARIANT: Tasks with commits require stern confirmation because work would be lost.
   test('returns stern when task has commits', () => {
-    expect(closeConfirmationLevel({ status: 'working' }, 1)).toBe('stern');
-    expect(closeConfirmationLevel({ status: 'backlog' }, 3)).toBe('stern');
-    expect(closeConfirmationLevel({ status: 'blocked' }, 10)).toBe('stern');
+    expect(abandonConfirmationLevel({ status: 'working' }, 1)).toBe('stern');
+    expect(abandonConfirmationLevel({ status: 'backlog' }, 3)).toBe('stern');
+    expect(abandonConfirmationLevel({ status: 'blocked' }, 10)).toBe('stern');
   });
 });
 
@@ -258,7 +249,7 @@ describe('redoConfirmationLevel', () => {
 
 describe('reopenConfirmationLevel', () => {
   test('returns light for non-complete tasks', () => {
-    expect(reopenConfirmationLevel({ status: 'closed' })).toBe('light');
+    expect(reopenConfirmationLevel({ status: 'abandoned' })).toBe('light');
     expect(reopenConfirmationLevel({ status: 'abandoned' })).toBe('light');
   });
 
@@ -491,19 +482,12 @@ describe('context-gathering functions', () => {
     expect(ctx.confirmation_code).toBe('ac-1234');
   });
 
-  test('gatherRejectContext produces correct fields', () => {
-    const ctx = gatherRejectContext(task, 5, 300, 'rj-abcd');
+  test('gatherAbandonContext produces correct fields', () => {
+    const ctx = gatherAbandonContext(task, 5, 300, 'ab-abcd');
     expect(ctx.task_code).toBe('my-task');
     expect(ctx.commit_count).toBe(5);
     expect(ctx.lines_changed).toBe(300);
-    expect(ctx.confirmation_code).toBe('rj-abcd');
-  });
-
-  test('gatherCloseContext produces correct fields', () => {
-    const ctx = gatherCloseContext(task, 2, 150, 'cl-1111');
-    expect(ctx.task_code).toBe('my-task');
-    expect(ctx.commit_count).toBe(2);
-    expect(ctx.lines_changed).toBe(150);
+    expect(ctx.confirmation_code).toBe('ab-abcd');
   });
 
   test('gatherRedoContext produces correct fields', () => {
@@ -533,7 +517,7 @@ describe('context-gathering functions', () => {
 
   test('falls back to task id prefix when code is null', () => {
     const noCodeTask = { id: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff', code: null } as Task;
-    const ctx = gatherRejectContext(noCodeTask, 1, 10, 'rj-0000');
+    const ctx = gatherAbandonContext(noCodeTask, 1, 10, 'ab-0000');
     expect(ctx.task_code).toBe('bbbbbbbb');
   });
 });

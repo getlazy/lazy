@@ -150,7 +150,7 @@ function sortTasks(
  * Data points:
  * - backlog: snapshot of backlog size at end of day (tasks in backlog status)
  * - completed: count of tasks accepted that day
- * - closed: count of tasks closed/rejected that day
+ * - closed: count of tasks abandoned that day
  */
 function buildChartData(
   allTasks: Task[],
@@ -207,7 +207,7 @@ function buildChartData(
         if (completedDate === dateStr) {
           if (task.status === 'complete') {
             point.completed++;
-          } else if (task.status === 'closed' || task.status === 'abandoned') {
+          } else if (task.status === 'abandoned') {
             point.closed++;
           }
         }
@@ -310,7 +310,7 @@ async function handleDashboard(storage: Storage): Promise<Response> {
         break;
       case 'interrupted': interruptedCount++; break;
       case 'complete': completedCount++; break;
-      case 'abandoned': case 'closed': completedCount++; break;
+      case 'abandoned': completedCount++; break;
       default: break; // backlog and any other statuses
     }
     if (session?.total_usage) {

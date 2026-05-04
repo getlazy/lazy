@@ -291,14 +291,38 @@ export class GitHubDriver implements RepositoryDriver {
     const existingPrNumber = this.prNumber(task);
 
     if (existingPrNumber) {
-      // PR exists — undraft it
+      // PR exists — check draft state explicitly before calling `gh pr ready`.
+      // Substring-matching stderr for idempotency is fragile ("already" matches
+      // unrelated failures). If the PR isn't a draft, nothing to do. If
+      // anything fails, propagate — silent fallback is what this fix removes.
+      const viewResult = await this.gh(['pr', 'view', existingPrNumber, '--json', 'isDraft']);
+      if (viewResult.exitCode !== 0) {
+        throw new Error(
+          `gh pr view failed (exit ${viewResult.exitCode}) for PR #${existingPrNumber}: ${viewResult.stderr.trim()}`
+        );
+      }
+
+      let isDraft: boolean;
+      try {
+        isDraft = JSON.parse(viewResult.stdout).isDraft === true;
+      } catch (err) {
+        throw new Error(
+          `gh pr view returned unparseable JSON for PR #${existingPrNumber}: ${err instanceof Error ? err.message : err}`
+        );
+      }
+
+      if (!isDraft) {
+        logger.debug(`PR #${existingPrNumber} is already non-draft — nothing to do`);
+        return {};
+      }
+
       const readyResult = await this.gh(['pr', 'ready', existingPrNumber]);
       if (readyResult.exitCode !== 0) {
-        // Non-fatal: PR may already be non-draft, or repo may not use drafts
-        logger.debug(`Failed to mark PR #${existingPrNumber} ready (non-fatal): ${readyResult.stderr}`);
-      } else {
-        logger.info(`Marked PR #${existingPrNumber} as ready for review`);
+        throw new Error(
+          `gh pr ready failed (exit ${readyResult.exitCode}) for PR #${existingPrNumber}: ${readyResult.stderr.trim()}`
+        );
       }
+      logger.info(`Marked PR #${existingPrNumber} as ready for review`);
       return {};
     }
 
@@ -308,12 +332,11 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
     if (!targetBranch || targetBranch.trim() === '') {
-      logger.error(`markReadyForReview: targetBranch is empty. Task metadata: ${JSON.stringify({
+      const metaDump = JSON.stringify({
         remote_target_branch: task.metadata?.remote_target_branch,
         github_pr_target_branch: task.metadata?.github_pr_target_branch,
-      })}`);
-      logger.warn('Failed to create PR: target branch is empty');
-      return {};
+      });
+      throw new Error(`Cannot create PR for branch ${branchName}: target branch is empty. Task metadata: ${metaDump}`);
     }
 
     logger.debug(`markReadyForReview: branchName=${branchName}, targetBranch=${targetBranch}`);
@@ -350,8 +373,9 @@ export class GitHubDriver implements RepositoryDriver {
     const createResult = await this.gh(createArgs);
 
     if (createResult.exitCode !== 0) {
-      logger.warn(`Failed to create PR (non-fatal): ${createResult.stderr}`);
-      return {};
+      throw new Error(
+        `gh pr create failed (exit ${createResult.exitCode}) for branch ${branchName} -> ${targetBranch}: ${createResult.stderr.trim()}`
+      );
     }
 
     const prUrl = createResult.stdout.trim();
@@ -559,7 +583,7 @@ export class GitHubDriver implements RepositoryDriver {
     if (failed.length > 0) {
       return {
         status: 'failed',
-        failed: failed.map(c => ({ name: c.name, url: c.detailUrl })),
+        failed: failed.map(c => ({ name: c.name, url: c.link })),
       };
     }
 
@@ -599,7 +623,7 @@ export class GitHubDriver implements RepositoryDriver {
         if (failed.length > 0) {
           return {
             passed: false,
-            failed: failed.map(c => ({ name: c.name, url: c.detailUrl })),
+            failed: failed.map(c => ({ name: c.name, url: c.link })),
           };
         }
         return { passed: true };
@@ -609,7 +633,7 @@ export class GitHubDriver implements RepositoryDriver {
       if (Date.now() - startTime >= timeout) {
         return {
           passed: false,
-          failed: pending.map(c => ({ name: c.name, url: c.detailUrl })),
+          failed: pending.map(c => ({ name: c.name, url: c.link })),
           timedOut: true,
         };
       }
@@ -625,12 +649,12 @@ export class GitHubDriver implements RepositoryDriver {
 
   /**
    * Get the current status of all PR checks.
-   * Returns an array of check objects with name, state, bucket, and detailUrl.
+   * Returns an array of check objects with name, state, bucket, and link.
    */
-  private async getPRChecks(prNumber: string): Promise<Array<{ name: string; state: string; bucket: string; detailUrl?: string }>> {
+  private async getPRChecks(prNumber: string): Promise<Array<{ name: string; state: string; bucket: string; link?: string }>> {
     const result = await this.gh([
       'pr', 'checks', prNumber,
-      '--json', 'name,state,bucket,detailUrl',
+      '--json', 'name,state,bucket,link',
     ]);
 
     if (result.exitCode !== 0) {
@@ -646,7 +670,14 @@ export class GitHubDriver implements RepositoryDriver {
     }
   }
 
-  async getFailedCIJobs(task: Task): Promise<CIJobFailure[]> {
+  async getFailedCIJobs(task: Task, branchName?: string): Promise<CIJobFailure[]> {
+    // Try branch-based lookup first (works without a PR)
+    if (branchName) {
+      const branchFailed = await this.getBranchFailedChecks(branchName);
+      if (branchFailed.length > 0) return this.fetchCheckLogs(branchFailed);
+    }
+
+    // Fall back to PR-based lookup
     const prNumber = this.prNumber(task);
 
     // If there's a PR, use PR-based check status (most precise).
@@ -658,18 +689,26 @@ export class GitHubDriver implements RepositoryDriver {
 
     if (failed.length === 0) return [];
 
+    return this.fetchCheckLogs(failed);
+  }
+
+  /**
+   * Fetch logs for a list of failed checks. Each check needs a name and optional link.
+   * Returns CIJobFailure objects with truncated log output where available.
+   */
+  private async fetchCheckLogs(checks: Array<{ name: string; link?: string }>): Promise<CIJobFailure[]> {
     const results: CIJobFailure[] = [];
 
-    for (const check of failed) {
+    for (const check of checks) {
       const failure: CIJobFailure = {
         name: check.name,
-        url: check.detailUrl,
+        url: check.link,
       };
 
       // Try to fetch logs for GitHub Actions jobs.
-      // detailUrl format: https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
-      if (check.detailUrl) {
-        const jobMatch = check.detailUrl.match(/\/actions\/runs\/\d+\/job\/(\d+)/);
+      // link format: https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
+      if (check.link) {
+        const jobMatch = check.link.match(/\/actions\/runs\/\d+\/job\/(\d+)/);
         if (jobMatch) {
           const jobId = jobMatch[1];
           try {
@@ -697,7 +736,7 @@ export class GitHubDriver implements RepositoryDriver {
    * Uses `gh run list --branch <branch>` to find the latest workflow run,
    * then checks for failed jobs. This enables CI auto-react before a PR exists.
    */
-  private async getBranchFailedChecks(branch: string): Promise<Array<{ name: string; bucket: string; detailUrl?: string }>> {
+  private async getBranchFailedChecks(branch: string): Promise<Array<{ name: string; bucket: string; link?: string }>> {
     // Get the most recent workflow run for the branch.
     // Must pass --repo explicitly because the git remote URL may have embedded
     // credentials (x-access-token:TOKEN@github.com) which gh doesn't recognize.
@@ -745,7 +784,7 @@ export class GitHubDriver implements RepositoryDriver {
       const jobs: Array<{ name: string; conclusion: string; url?: string }> = data.jobs ?? [];
       return jobs
         .filter(j => j.conclusion === 'failure')
-        .map(j => ({ name: j.name, bucket: 'fail', detailUrl: j.url }));
+        .map(j => ({ name: j.name, bucket: 'fail', link: j.url }));
     } catch {
       logger.debug(`getBranchFailedChecks: failed to parse jobs for run ${run.databaseId}`);
       return [];

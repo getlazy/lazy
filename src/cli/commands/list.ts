@@ -36,7 +36,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
     }
 
     // Check for crashed run (non-terminal tasks with dead runs)
-    if (session && !['complete', 'abandoned', 'closed'].includes(task.status)) {
+    if (session && !['complete', 'abandoned'].includes(task.status)) {
       const tRef = taskRef(task);
       const cn = session.container_name ?? runner.runNameForTask(tRef);
       const info = runner.getRunInfo(cn);

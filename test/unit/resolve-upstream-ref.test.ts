@@ -23,7 +23,8 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'github',
@@ -34,7 +35,7 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '', toolchain: '' },
+  docker: { dockerfile: '' },
   runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},

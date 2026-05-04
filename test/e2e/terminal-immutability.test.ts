@@ -14,19 +14,19 @@ describe('terminal task immutability', () => {
     await ctx.cleanup();
   });
 
-  // --- closeTask rejects already-closed tasks ---
+  // --- abandonTask rejects already-abandoned tasks ---
 
-  test('cannot close a closed task again', async () => {
-    const taskId = await createTask(ctx, 'Close once');
-    await ctx.lazy(['close', taskId, '--reason', 'First close']);
+  test('cannot abandon an already-abandoned task', async () => {
+    const taskId = await createTask(ctx, 'Abandon once');
+    await ctx.lazy(['abandon', taskId, '--reason', 'First abandon']);
 
-    const result = await ctx.lazy(['close', taskId, '--reason', 'Second close']);
+    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Second abandon']);
     expectFailure(result);
-    expectError(result, 'already closed');
+    expectError(result, 'already abandoned');
   });
 
-  test('cannot close a completed task', async () => {
-    const taskId = await createTask(ctx, 'Accept then close', 'Do the work');
+  test('cannot abandon a completed task', async () => {
+    const taskId = await createTask(ctx, 'Accept then abandon', 'Do the work');
 
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -34,32 +34,18 @@ describe('terminal task immutability', () => {
 
     await ctx.lazy(['accept', taskId]);
 
-    const result = await ctx.lazy(['close', taskId, '--reason', 'Try to close completed']);
+    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Try to abandon completed']);
     expectFailure(result);
     expectError(result, 'already complete');
   });
 
-  test('cannot close a rejected/abandoned task', async () => {
-    const taskId = await createTask(ctx, 'Reject then close', 'Do the work');
+  // --- metadata and comments still work on abandoned tasks ---
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+  test('can add comment to abandoned task', async () => {
+    const taskId = await createTask(ctx, 'Abandoned with comment');
+    await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
 
-    await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Not good']);
-
-    const result = await ctx.lazy(['close', taskId, '--reason', 'Try to close rejected']);
-    expectFailure(result);
-    expectError(result, 'already abandoned');
-  });
-
-  // --- metadata and comments still work on closed tasks ---
-
-  test('can add comment to closed task', async () => {
-    const taskId = await createTask(ctx, 'Closed with comment');
-    await ctx.lazy(['close', taskId, '--reason', 'Done']);
-
-    const result = await ctx.lazy(['comment', taskId, '--message', 'Annotation on closed task']);
+    const result = await ctx.lazy(['comment', taskId, '--message', 'Annotation on abandoned task']);
     expectSuccess(result);
   });
 
@@ -78,23 +64,23 @@ describe('terminal task immutability', () => {
 
   // --- edit blocked on terminal tasks ---
 
-  test('cannot edit goal of closed task', async () => {
-    const taskId = await createTask(ctx, 'Edit closed goal');
-    await ctx.lazy(['close', taskId, '--reason', 'Done']);
+  test('cannot edit goal of abandoned task', async () => {
+    const taskId = await createTask(ctx, 'Edit abandoned goal');
+    await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
 
     const result = await ctx.lazy(['edit', taskId, '--goal', 'New goal']);
     expectFailure(result);
-    expectError(result, 'already closed');
+    expectError(result, 'already abandoned');
   });
 
-  // --- close reason is preserved (first close wins) ---
+  // --- abandon reason is preserved (first abandon wins) ---
 
-  test('close reason from first close is preserved', async () => {
-    const taskId = await createTask(ctx, 'Preserve close reason');
-    await ctx.lazy(['close', taskId, '--reason', 'Original reason']);
+  test('abandon reason from first abandon is preserved', async () => {
+    const taskId = await createTask(ctx, 'Preserve abandon reason');
+    await ctx.lazy(['abandon', taskId, '--reason', 'Original reason']);
 
-    // Second close attempt fails
-    await ctx.lazy(['close', taskId, '--reason', 'Overwrite attempt']);
+    // Second abandon attempt fails
+    await ctx.lazy(['abandon', taskId, '--reason', 'Overwrite attempt']);
 
     // Verify original reason persists
     const showResult = await ctx.lazy(['show', taskId]);

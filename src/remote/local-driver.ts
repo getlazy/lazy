@@ -211,7 +211,7 @@ export class LocalDriver implements RepositoryDriver {
     return 'remote_ci_failure_synced';
   }
 
-  async getFailedCIJobs(_task: Task): Promise<import('./driver').CIJobFailure[]> {
+  async getFailedCIJobs(_task: Task, _branchName?: string): Promise<import('./driver').CIJobFailure[]> {
     return [];
   }
 

@@ -1,3 +1,10 @@
+/**
+ * `lazy start` command — thin CLI client.
+ *
+ * Handles: flag parsing, task validation, interactive prompts, UI output.
+ * Delegates: all launch orchestration to daemon via `queryStartTask` RPC.
+ */
+
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, resolveTaskOrExit, getWorktreePath } from '../helpers';
 import { getRemoteDefaultBranch } from '../../git/operations';
@@ -8,9 +15,11 @@ import { protocolDir as getProtocolDir } from '../../protocol';
 
 import { listAgents } from '../../agent/registry';
 import { queryStartTask } from '../../daemon/rpc-fallback';
+import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
 import { formatMarkdown } from '../../utils/markdown';
+
 
 export async function commandStart(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -20,6 +29,7 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
+    { name: 'effort', takesValue: true },
 
   ], 'start');
 
@@ -34,6 +44,17 @@ export async function commandStart(args: string[]): Promise<void> {
     modelOverride = validateModel(modelValue);
   }
 
+  // Parse --effort flag (overrides task metadata and config for this session onward)
+  let effortOverride: EffortLevel | undefined;
+  const effortValue = parsed.flags.get('effort') as string | undefined;
+  if (effortValue !== undefined) {
+    if (!VALID_EFFORT_LEVELS.includes(effortValue as EffortLevel)) {
+      console.error(`Invalid effort '${effortValue}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
+      process.exit(1);
+    }
+    effortOverride = effortValue as EffortLevel;
+  }
+
   // Parse --agent flag
   const agentFlag = parsed.flags.get('agent') as string | undefined;
   let agentId: string | undefined;
@@ -46,7 +67,7 @@ export async function commandStart(args: string[]): Promise<void> {
     agentId = agentFlag;
   }
 
-  // Require task ID as the first positional argument
+  // Require task ID
   const taskId = parsed.positional[0];
   if (!taskId) {
     console.error('Error: Task ID is required.');
@@ -168,6 +189,7 @@ export async function commandStart(args: string[]): Promise<void> {
       agentId,
       forceLocal,
       retargetOrphan,
+      effortOverride,
     });
 
     // Print warnings
@@ -212,10 +234,10 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--effort <level>] [--follow] [--yes] [--force-local]
 
-Start an existing task. Creates a worktree, launches a supervisor container, and writes a start command.
-The supervisor manages the agent lifecycle (sync-with-upstream, work phases).
+Start an existing task. The daemon handles worktree creation, agent launch,
+and lifecycle management.
 
 To create a new task, use 'lazy create' first, then start it with this command.
 
@@ -226,8 +248,10 @@ Arguments:
   <task_id>          ID of the task to start (short hex prefix or task code)
 
 Options:
-  --model <model>    Override model for this session (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --agent <agent_id> Agent to use for this task (default: from task or lazy.toml)
+  --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
+                     Persists on the task so resumes use the same value.
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompts
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)

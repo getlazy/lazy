@@ -331,7 +331,7 @@ describe('reconciliation sweep: terminal task containers', () => {
   test('reconciliation handles multiple terminal-state tasks', async () => {
     // Create several tasks in different terminal states
     const taskIds: string[] = [];
-    for (const goal of ['Complete task', 'Abandoned task', 'Closed task']) {
+    for (const goal of ['Complete task', 'Abandoned task 1', 'Abandoned task 2']) {
       const id = await createTask(ctx, goal, 'Do work');
       await ctx.lazyMocked(['start', id, '--yes'], MOCK_CLAUDE_SUCCESS, {
         env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -343,7 +343,7 @@ describe('reconciliation sweep: terminal task containers', () => {
     await runReconcile(ctx.root);
 
     // Set each to a different terminal state
-    const statuses = ['complete', 'abandoned', 'closed'];
+    const statuses = ['complete', 'abandoned', 'abandoned'];
     for (let i = 0; i < taskIds.length; i++) {
       const fullId = findFullTaskId(ctx.root, taskIds[i]);
       setTaskStatus(ctx.root, fullId, statuses[i]);

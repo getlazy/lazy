@@ -13,7 +13,7 @@ import type { TaskStatus } from './types';
 // ---------------------------------------------------------------------------
 
 /** Task statuses that represent a finished task. Once a task reaches one of these statuses, its core fields are frozen. */
-export const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['complete', 'abandoned', 'closed']);
+export const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['complete', 'abandoned']);
 
 /** Returns true if the given status is a terminal (finished) state. */
 export function isTerminalStatus(status: TaskStatus): boolean {
@@ -38,7 +38,7 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * Every valid (from → to) transition in the system.
  *
  * Evidence-based: derived from every call to updateTaskStatus, reopenTask,
- * and closeTask across CLI commands, reconciler, and auto-resume.
+ * and abandonTask across CLI commands, reconciler, and auto-resume.
  *
  * Key transitions by command/system:
  *   start:       backlog → working
@@ -46,31 +46,30 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  *                working → conflict (turn completes with violations)
  *                working → interrupted (container stopped/crashed)
  *                pairing → blocked (stale pairing sweep)
- *                blocked → backlog (migration: never-started tasks)
+ *                backlog → blocked (recover task whose branch already has commits)
  *   auto-resume: interrupted → working
  *   unblock:     blocked/conflict → working, merging → blocked
  *   submit:      blocked/conflict → submitted (creates PR, ready for review)
  *   accept:      blocked/conflict/submitted → merging → complete, merging → blocked (checks fail)
- *   reject:      blocked/interrupted/submitted → abandoned
- *   close:       blocked/conflict/interrupted/submitted/backlog → closed
+ *   remote-sync: working/interrupted → merging → complete (externally merged MR)
+ *   abandon:     blocked/conflict/interrupted/submitted/backlog → abandoned
  *   pair:        blocked/conflict/interrupted/submitted → pairing, pairing → blocked
  *   resume:      interrupted → working
- *   reopen:      complete/abandoned/closed → blocked (with session) or backlog (no session)
+ *   reopen:      complete/abandoned → blocked (with session) or backlog (no session)
  *   zombie:      any non-terminal → zombie (system only), zombie → complete
  */
 export const VALID_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
-  backlog:     ['working', 'closed'],
-  working:     ['blocked', 'conflict', 'interrupted'],
-  blocked:     ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'closed', 'backlog'],
-  conflict:    ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'closed'],
-  interrupted: ['working', 'pairing', 'abandoned', 'closed'],
-  submitted:   ['working', 'merging', 'pairing', 'abandoned', 'closed'],
+  backlog:     ['working', 'blocked', 'abandoned'],
+  working:     ['blocked', 'conflict', 'interrupted', 'merging'],
+  blocked:     ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'backlog'],
+  conflict:    ['working', 'submitted', 'merging', 'pairing', 'abandoned'],
+  interrupted: ['working', 'merging', 'pairing', 'abandoned'],
+  submitted:   ['working', 'merging', 'pairing', 'abandoned'],
   pairing:     ['blocked'],
   merging:     ['complete', 'blocked'],
   zombie:      ['complete'],
   complete:    ['blocked', 'backlog'],
   abandoned:   ['blocked', 'backlog'],
-  closed:      ['blocked', 'backlog'],
 };
 
 // ---------------------------------------------------------------------------

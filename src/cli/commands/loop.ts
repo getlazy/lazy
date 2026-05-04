@@ -1,7 +1,7 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, validateModel, parseFlags, formatDate, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
 import { promptChoice } from '../editor';
 import { commandAccept } from './accept';
-import { commandReject } from './reject';
+import { commandAbandon } from './abandon';
 import { commandUnblock } from './unblock';
 import { showTaskContext, runFeedbackFlow, syncTaskFromRemote } from './shared';
 import { commandSyncTask } from './sync';
@@ -174,7 +174,7 @@ async function handleInterruptedTasks(
     console.log('');
     const menuOptions = [
       'Resume (restart agent)',
-      'Close (abandon task)',
+      'Abandon task',
       'Skip (decide later)',
     ];
 
@@ -201,11 +201,11 @@ async function handleInterruptedTasks(
     }
 
     if (choice === 1) {
-      // Close — mark as closed/abandoned and clean up
-      console.log('Closing task...');
+      // Abandon — mark as abandoned and clean up
+      console.log('Abandoning task...');
       try {
-        // Mark as closed with reason
-        await storage.closeTask(task.id, 'Abandoned due to interruption', getActor());
+        // Mark as abandoned with reason
+        await storage.abandonTask(task.id, 'Abandoned due to interruption', getActor());
 
         // Clean up worktree and branch
         try {
@@ -222,9 +222,9 @@ async function handleInterruptedTasks(
           console.error(`Warning: could not clean up container: ${err instanceof Error ? err.message : err}`);
         }
 
-        console.log(`Task ${taskDisplayId} closed.`);
+        console.log(`Task ${taskDisplayId} abandoned.`);
       } catch (err) {
-        console.error(`Error closing task: ${err instanceof Error ? err.message : err}`);
+        console.error(`Error abandoning task: ${err instanceof Error ? err.message : err}`);
       }
 
       skippedIds.add(task.id);
@@ -431,14 +431,14 @@ export async function commandLoop(args: string[]): Promise<void> {
         ? [
             'Give feedback - includes unseen comments (recommended)',
             `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
-            'Reject (discard work)',
+            'Abandon (discard work)',
             'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ]
         : [
             'Give feedback (open editor)',
             'Accept (merge work)',
-            'Reject (discard work)',
+            'Abandon (discard work)',
             'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ];
@@ -452,7 +452,7 @@ export async function commandLoop(args: string[]): Promise<void> {
         continue;
       }
 
-      // Close storage before delegating to accept/reject (they open their own)
+      // Close storage before delegating to accept/abandon (they open their own)
       await storage.close();
 
       switch (choice) {
@@ -461,8 +461,8 @@ export async function commandLoop(args: string[]): Promise<void> {
           await commandAccept([taskShortId]);
           break;
         case 2:
-          // Reject
-          await commandReject([taskShortId]);
+          // Abandon
+          await commandAbandon([taskShortId]);
           break;
         case 3:
           // Merge upstream via lazy sync
@@ -504,11 +504,11 @@ remain, enters a follow mode that shows active tasks and polls for new blocked
 tasks every 3 seconds. Ctrl+C exits at any time.
 
 Options:
-  --model <model>   Override model for feedback turns (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --follow          Wait for agent after giving feedback
 
 Examples:
   lazy loop                          # Review all blocked tasks
-  lazy loop --model claude-opus-4-6             # Use opus for feedback turns
+  lazy loop --model opus                        # Use opus for feedback turns
   lazy loop --follow                 # Wait for agent after giving feedback`);
 }

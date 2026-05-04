@@ -18,8 +18,7 @@ import {
   commandShell, shellUsage,
   commandPair, pairUsage,
   commandAccept, acceptUsage,
-  commandReject, rejectUsage,
-  commandClose, closeUsage,
+  commandAbandon, abandonUsage,
   commandSearch, searchUsage,
   commandComment, commentUsage,
   commandLink, linkUsage,
@@ -50,6 +49,7 @@ import {
   commandConfig, configUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
+import { isLoggedToFile } from './utils/logged-error';
 
 
 import { VERSION } from './version';
@@ -88,6 +88,9 @@ Working on Tasks:
 
 System:
   system prompts         List built-in system prompt templates
+  system build <name>    Prebuild a lazy system image (e.g., lazy-runner)
+  system offline         Enable offline mode (skip all remote operations)
+  system online          Disable offline mode (restore remote operations)
 
 Inspect:
   diff <task_id>         Show changes made by task
@@ -95,11 +98,10 @@ Inspect:
   shell <task_id>        Open shell in task's worktree
   pair <task_id>         Pair program with Claude in task's worktree
   accept <task_id>       Merge task's work
-  reject <task_id>       Discard task's work
+  abandon <task_id>      Abandon a task (discard work)
   revert <task_id>       Undo an accepted task (create revert task)
   rework <task_id>       Create follow-up task for accepted work that needs changes
-  close <task_id>        Close task without work
-  redo <task_id>         Close stale task and restart fresh on current main
+  redo <task_id>         Abandon stale task and restart fresh on current main
 
 Proposals:
   propose                Propose a follow-up task
@@ -144,25 +146,14 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
       const skipRemoteCheck = args.includes('--skip-remote-check') || args.includes('--skip-github-check');
       const skipCompletionCheck = args.includes('--skip-completion-check');
       const nonInteractive = args.includes('--non-interactive');
-      // Extract --toolchain value (--toolchain <name>)
-      let toolchain: string | undefined;
-      const toolchainIdx = args.indexOf('--toolchain');
-      if (toolchainIdx !== -1 && toolchainIdx + 1 < args.length) {
-        toolchain = args[toolchainIdx + 1];
-      }
-      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive, toolchain });
+      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive });
     },
     usage: () => {
-      console.log('Usage: lazy init [--toolchain <name>] [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
+      console.log('Usage: lazy init [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
       console.log('Initialize lazy in the current git repository.\n');
       console.log('Requires an interactive terminal to display warnings and instructions.\n');
       console.log('If a supported remote (GitHub, etc.) is detected, offers to configure it.\n');
-      console.log('Auto-detects project toolchain and configures the appropriate Docker image.\n');
       console.log('Options:');
-      console.log('  --toolchain <name>        Override auto-detected toolchain');
-      console.log('                            Available: base, bun, node, deno, rust, go, cpp,');
-      console.log('                            ruby-rails, ruby-rails-rust, dotnet, python,');
-      console.log('                            python-ml, java, kotlin, swift');
       console.log('  --skip-auth-check         Skip authentication check during init');
       console.log('  --skip-remote-check       Skip remote driver detection during init');
       console.log('  --skip-github-check       Alias for --skip-remote-check');
@@ -192,9 +183,10 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'shell':    { run: commandShell, usage: shellUsage },
   'pair':     { run: commandPair, usage: pairUsage },
   'accept':   { run: commandAccept, usage: acceptUsage },
-  'reject':   { run: commandReject, usage: rejectUsage },
+  'abandon':  { run: commandAbandon, usage: abandonUsage },
+  'reject':   { run: commandAbandon, usage: abandonUsage },  // backward compat alias
+  'close':    { run: commandAbandon, usage: abandonUsage },   // backward compat alias
   'revert':   { run: commandRevert, usage: revertUsage },
-  'close':    { run: commandClose, usage: closeUsage },
   'wait':     { run: commandWait, usage: waitUsage },
   'builder':  { run: commandBuilder, usage: builderUsage },
   'doctor':   { run: commandDoctor, usage: doctorUsage },
@@ -220,8 +212,7 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
 
 // All valid command names for fuzzy matching (excludes aliases like ls/tasks/view
 // to avoid confusing suggestions — we match against canonical names only)
-const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view');
-
+const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view' && c !== 'reject' && c !== 'close');
 
 
 async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
@@ -289,7 +280,7 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
 const legacyCommands: Record<string, string> = {
   'pending': 'Error: `lazy pending` has been removed. All tasks are started immediately. Use: lazy list',
   'task': 'Error: `lazy task` has been removed. Use: lazy start, lazy edit, lazy list, lazy show',
-  'session': 'Error: `lazy session` has been removed. Use: lazy start, lazy unblock, lazy accept, lazy reject',
+  'session': 'Error: `lazy session` has been removed. Use: lazy start, lazy unblock, lazy accept, lazy abandon',
 };
 
 // Hidden internal commands: bypass auto-init, reconciliation, and help.
@@ -303,8 +294,29 @@ if (command && hiddenCommands[command]) {
 const skipAutoInit = ['init', 'completion'];
 const isHelpOrVersion = !command || command === '--help' || command === '-h' || command === '--version' || command === '-V';
 
+// Filesystem preflight: fail fast with a clear error when the terminal lacks
+// permission to read/write the directories lazy needs (macOS TCC, Unix perms,
+// read-only mounts). Must run before findLazyRoot() is trusted — findLazyRoot
+// uses existsSync which returns false on EACCES, so a permission problem
+// would otherwise surface as "not in a lazy project" instead of the real
+// cause. Skipped for help/version/completion and in test mode.
+let cachedLazyRoot: string | null = null;
+let cachedLazyRootComputed = false;
+function resolveLazyRoot(): string | null {
+  if (!cachedLazyRootComputed) {
+    cachedLazyRoot = findLazyRoot();
+    cachedLazyRootComputed = true;
+  }
+  return cachedLazyRoot;
+}
+
+if (!isHelpOrVersion && command !== 'completion' && process.env.LAZY_TEST !== '1') {
+  const { runPreflight } = await import('./cli/preflight');
+  await runPreflight(resolveLazyRoot());
+}
+
 if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
-  const lazyRoot = findLazyRoot();
+  const lazyRoot = resolveLazyRoot();
   if (!lazyRoot) {
     const gitRoot = findGitRoot();
     if (gitRoot && isTTY()) {
@@ -326,7 +338,9 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
 // ensureDaemon() throws if it can't start. Skips for daemon, init, completion, help.
 if (!isHelpOrVersion) {
   const { ensureDaemon } = await import('./daemon/auto-start');
-  const root = findLazyRoot();
+  // Reuse the cached lazy root if we found one earlier; otherwise re-probe —
+  // auto-init may have just created .lazy/ and the cached null is now stale.
+  const root = cachedLazyRoot ?? findLazyRoot();
   if (root) {
     await ensureDaemon(command, root);
   }
@@ -363,11 +377,27 @@ try {
     }
   }
 } catch (err) {
-  // Catch config loading errors and other unhandled errors gracefully
-  if (err instanceof Error) {
-    console.error(`Error: ${err.message}`);
-  } else {
-    console.error(`Error: ${err}`);
+  // Catch config loading errors and other unhandled errors gracefully.
+  //
+  // In the detached daemon child (LAZY_DAEMON_BACKGROUND=1), stdout/stderr
+  // are redirected to daemon.log via O_APPEND. A bare console.error here
+  // would land an *untimestamped* duplicate of the same message the child
+  // already wrote through the logger — that was the third copy users saw
+  // in daemon.log after a bind failure. Two guards:
+  //   1. Errors that have already been written to the log file at the
+  //      throw site mark themselves with `loggedToFile` so we skip the
+  //      duplicate write here.
+  //   2. For un-logged errors in background mode, route through the
+  //      logger so the message gets a timestamp and `[ERROR]` prefix
+  //      instead of being dumped raw onto stderr → daemon.log.
+  const message = err instanceof Error ? err.message : String(err);
+  if (!isLoggedToFile(err)) {
+    if (process.env.LAZY_DAEMON_BACKGROUND === '1') {
+      const { logger } = await import('./utils/logger');
+      logger.error(`Unhandled error: ${message}`);
+    } else {
+      console.error(`Error: ${message}`);
+    }
   }
   process.exit(1);
 }

@@ -43,13 +43,12 @@ describe('lazy system prompts', () => {
     expectOutput(result, 'lazy-prompt-system-instructions');
   });
 
-  test('system --help shows usage with prompts and toolchains', async () => {
+  test('system --help shows usage with prompts', async () => {
     const result = await ctx.lazy(['system', '--help']);
 
     expectSuccess(result);
     expectOutput(result, 'Usage: lazy system');
     expectOutput(result, 'prompts');
-    expectOutput(result, 'toolchains');
   });
 
   test('system without subcommand shows usage and fails', async () => {
@@ -63,60 +62,6 @@ describe('lazy system prompts', () => {
 
     expectFailure(result);
     expectError(result, 'Unknown subcommand');
-  });
-});
-
-describe('lazy system toolchains', () => {
-  let ctx: TestContext;
-
-  beforeEach(async () => {
-    ctx = await setupTestLazy();
-  });
-
-  afterEach(async () => {
-    await ctx.cleanup();
-  });
-
-  test('lists built-in toolchains', async () => {
-    const result = await ctx.lazy(['system', 'toolchains']);
-
-    expectSuccess(result);
-    expectOutput(result, 'Built-in Toolchains');
-    expectOutput(result, 'lazy-toolchain-base');
-    expectOutput(result, 'lazy-toolchain-bun');
-    expectOutput(result, 'lazy-toolchain-node');
-    expectOutput(result, 'lazy-toolchain-rust');
-    expectOutput(result, 'lazy-toolchain-python');
-  });
-
-  test('lists all expected toolchain codes', async () => {
-    const result = await ctx.lazy(['system', 'toolchains']);
-
-    expectSuccess(result);
-    expectOutput(result, 'lazy-toolchain-base');
-    expectOutput(result, 'lazy-toolchain-bun');
-    expectOutput(result, 'lazy-toolchain-node');
-    expectOutput(result, 'lazy-toolchain-deno');
-    expectOutput(result, 'lazy-toolchain-rust');
-    expectOutput(result, 'lazy-toolchain-go');
-    expectOutput(result, 'lazy-toolchain-cpp');
-    expectOutput(result, 'lazy-toolchain-ruby-rails');
-    expectOutput(result, 'lazy-toolchain-ruby-rails-rust');
-    expectOutput(result, 'lazy-toolchain-dotnet');
-    expectOutput(result, 'lazy-toolchain-python');
-    expectOutput(result, 'lazy-toolchain-python-ml');
-    expectOutput(result, 'lazy-toolchain-java');
-    expectOutput(result, 'lazy-toolchain-kotlin');
-    expectOutput(result, 'lazy-toolchain-swift');
-  });
-
-  test('shows descriptions for toolchains', async () => {
-    const result = await ctx.lazy(['system', 'toolchains']);
-
-    expectSuccess(result);
-    expectOutput(result, 'Minimal dev container');
-    expectOutput(result, 'Bun runtime');
-    expectOutput(result, 'Rust via rustup');
   });
 });
 
@@ -168,47 +113,6 @@ describe('lazy show <builtin-prompt>', () => {
     expectError(result, 'lazy-prompt-nonexistent-prompt');
     // Should suggest the command to see available prompts
     expectError(result, 'lazy system prompts');
-  });
-});
-
-describe('lazy show <builtin-toolchain>', () => {
-  let ctx: TestContext;
-
-  beforeEach(async () => {
-    ctx = await setupTestLazy();
-  });
-
-  afterEach(async () => {
-    await ctx.cleanup();
-  });
-
-  test('shows a toolchain Dockerfile by code', async () => {
-    const result = await ctx.lazy(['show', 'lazy-toolchain-rust']);
-
-    expectSuccess(result);
-    expectOutput(result, 'Toolchain');
-    expectOutput(result, 'rust');
-    expectOutput(result, 'Rust via rustup');
-    expectOutput(result, 'Dockerfile');
-    expectOutput(result, 'FROM');
-  });
-
-  test('shows the base toolchain', async () => {
-    const result = await ctx.lazy(['show', 'lazy-toolchain-base']);
-
-    expectSuccess(result);
-    expectOutput(result, 'Toolchain');
-    expectOutput(result, 'base');
-    expectOutput(result, 'Minimal dev container');
-  });
-
-  test('fails for non-existent toolchain', async () => {
-    const result = await ctx.lazy(['show', 'lazy-toolchain-nonexistent']);
-
-    expectFailure(result);
-    expectError(result, 'No built-in toolchain found');
-    expectError(result, 'lazy-toolchain-nonexistent');
-    expectError(result, 'lazy system toolchains');
   });
 });
 

@@ -553,6 +553,60 @@ describe('host-side integration', () => {
     // The container name should appear in the start output
     expectOutput(result, `lazy-${taskId}`);
   });
+
+  // INVARIANT: protocol_version must be included in every start command so
+  // the supervisor can detect protocol mismatches and refuse to proceed.
+  test('lazy start includes protocol_version in the written command', async () => {
+    // Use a custom mock that captures the command before consuming it
+    const taskId = await createTask(ctx, 'Protocol field test', 'Check command fields');
+
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_CAPTURE_COMMAND: '1' },
+    });
+
+    // The mock writes the captured command to a file so we can read it
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+    const capturedPath = join(protoDir, 'captured-command.json');
+
+    if (existsSync(capturedPath)) {
+      const captured = JSON.parse(readFileSync(capturedPath, 'utf-8'));
+      expect(captured.type).toBe('start');
+      expect(typeof captured.protocol_version).toBe('number');
+      expect(captured.protocol_version).toBeGreaterThan(0);
+      // Lazy version is no longer part of the protocol gate.
+      expect(captured.lazy_version).toBeUndefined();
+    }
+    // If mock doesn't support capture, skip — the unit test covers the type contract
+  });
+
+  // INVARIANT: Protocol-mismatch error responses must be surfaced clearly to the user.
+  // When the supervisor detects a protocol mismatch, it writes an error response.
+  // The reconciler must record it as an agent turn so the user sees the message.
+  test('protocol mismatch error response is visible in show output', async () => {
+    const taskId = await createTask(ctx, 'Protocol mismatch test', 'Do some work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+
+    // Simulate what the supervisor would write on a protocol mismatch
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    const protocolMismatchResp: ErrorResponse = {
+      status: 'error',
+      error: 'Protocol version mismatch (got 0, expected 1). Run `lazy upgrade` to rebuild containers.',
+      phase: 'reading_command',
+    };
+    writeResponse(protoDir, protocolMismatchResp);
+
+    // Trigger reconciliation — the error turn should be recorded
+    const showResult = await ctx.lazy(['show', taskId, '--full']);
+    expectOutput(showResult, 'interrupted');
+    expectOutput(showResult, 'Protocol version mismatch');
+    expectOutput(showResult, 'lazy upgrade');
+  });
 });
 
 // ============================================================

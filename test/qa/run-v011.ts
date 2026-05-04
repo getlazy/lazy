@@ -319,7 +319,7 @@ async function testHappyPath(config: DriverConfig): Promise<TestResult> {
 
     // Verify task is in terminal state
     const finalShow = await execLazy(config, ['show', 'test-happy']);
-    if (!finalShow.stdout.includes('complete') && !finalShow.stdout.includes('closed')) {
+    if (!finalShow.stdout.includes('complete') && !finalShow.stdout.includes('abandoned')) {
       logInfo(`Final status: ${finalShow.stdout.slice(0, 200)}`);
       // Accept may leave it in 'merging' or 'complete' depending on config
     }

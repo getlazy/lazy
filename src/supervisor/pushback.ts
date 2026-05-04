@@ -37,6 +37,7 @@ export async function runPermissionPushback(
   sessionId: string,
   violations: FileViolation[],
   modelId?: string,
+  effort?: string,
 ): Promise<PushbackResult> {
   const fileList = violations.map(v => `  - ${v.file}`).join('\n');
   const prompt = permissionPushbackTemplate
@@ -50,6 +51,7 @@ export async function runPermissionPushback(
     sessionId,
     dangerouslySkipPermissions: true,
     modelId,
+    effort,
   });
 
   const { stdout, stderr, exitCode } = await execWithWatchdog(claudeArgs, {

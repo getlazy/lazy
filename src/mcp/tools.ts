@@ -18,7 +18,7 @@ import type { McpTool, McpToolHandler } from './types';
 
 
 // Re-use storage and helpers from existing CLI infrastructure
-import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH } from '../cli/helpers';
+import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef } from '../cli/helpers';
 import type { Storage } from '../storage';
 import type { Proposal } from '../cli/commands/propose';
 import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
@@ -27,15 +27,17 @@ import { queryWait } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
 import {
+  abandonConfirmationLevel,
+  acceptConfirmationLevel,
   rejectConfirmationLevel,
   closeConfirmationLevel,
-  acceptConfirmationLevel,
   redoConfirmationLevel,
   reopenConfirmationLevel,
   createConfirmationLevel,
+  gatherAbandonContext,
+  gatherAcceptContext,
   gatherRejectContext,
   gatherCloseContext,
-  gatherAcceptContext,
   gatherRedoContext,
   gatherReopenContext,
   gatherCreateParentWarningContext,
@@ -437,7 +439,7 @@ export const createTool: McpTool = {
       },
       model: {
         type: 'string',
-        description: 'Model ID to use for this task (e.g., claude-sonnet-4-5-20250929, claude-opus-4-6)',
+        description: 'Model ID to use for this task (e.g., opus, sonnet, claude-sonnet-4-5-20250929)',
 
       },
       type: {
@@ -1031,7 +1033,7 @@ export function createConversationReadHandler(ctx: McpToolContext): McpToolHandl
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_reject, lazy_close, lazy_submit
+// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_abandon, lazy_reject, lazy_close, lazy_submit
 //
 // IMPORTANT: These handlers call daemon lifecycle functions DIRECTLY — never
 // spawn lazy CLI as a subprocess. Spawning lazy from within the daemon causes
@@ -1062,7 +1064,9 @@ async function computeDiffCwdAndRange(
   storagePath: string,
   lazyRoot: string,
 ): Promise<{ cwd: string; diffRange: string }> {
-  const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
+  // Worktrees live under <projectRoot>/.lazy/worktrees/, NOT under the storage path.
+  const tRef = session.git_branch.replace('lazy/', '');
+  const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
   const cwd = (await pathExists(worktreePath)) ? worktreePath : lazyRoot;
 
   // Use the task's branch name explicitly instead of HEAD. When cwd falls
@@ -1414,13 +1418,112 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
   };
 }
 
+// --- lazy_abandon ---
+
+export const abandonTool: McpTool = {
+  name: 'lazy_abandon',
+  description:
+    'Abandon a task — discard its work and mark it as abandoned. ' +
+    'The task\'s worktree is cleaned up but the branch is preserved. ' +
+    'A reason is required to explain why the task is being abandoned.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+      reason: {
+        type: 'string',
+        description: 'Reason for abandoning (required)',
+        minLength: 1,
+      },
+      confirmation_code: {
+        type: 'string',
+        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
+      },
+      accept_dirty_worktree: {
+        type: 'boolean',
+        description: 'Allow abandoning even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
+      },
+    },
+    required: ['task_id', 'reason'],
+  },
+};
+
+export function createAbandonHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+    const reason = args.reason as string | undefined;
+    const confirmationCode = args.confirmation_code as string | undefined;
+    const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
+
+    const storage = await getStorage(ctx);
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+
+      // Step 2: validate confirmation code and execute
+      if (confirmationCode) {
+        if (!validateCode(confirmationCode, 'abandon', task.id)) {
+          throw new Error('Invalid or expired confirmation code. Call lazy_abandon without a code to get a new one.');
+        }
+
+        const root = requireLazyRoot();
+        const params: CloseTaskParams = {
+          taskId,
+          reason: reason || '',
+          acceptDirtyWorktree,
+        };
+
+        const result = await closeTask(root, params);
+
+        return {
+          output: `Closed task ${result.displayId} (${result.branchName})`,
+          taskId: result.taskId,
+          displayId: result.displayId,
+          branchName: result.branchName,
+        };
+      }
+
+      // Step 1: evaluate confirmation level
+      const session = await storage.getSessionByTaskId(task.id);
+      let commitCount = 0;
+      let linesChanged = 0;
+      if (session) {
+        const commits = await storage.getSessionCommits(session.id);
+        commitCount = commits.length;
+        linesChanged = await getDiffLinesChanged(task, session, storage);
+      }
+
+      const level = abandonConfirmationLevel(task, commitCount);
+
+      const code = generateCode('ab');
+      storePending({ code, operation: 'abandon', taskId: task.id, createdAt: Date.now() });
+
+      const context = gatherAbandonContext(task, commitCount, linesChanged, code);
+      const templateName = `abandon-${level}` as const;
+      const guidance = renderGuidance(templateName, context);
+
+      throw new Error(guidance);
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
 // --- lazy_reject ---
 
 export const rejectTool: McpTool = {
   name: 'lazy_reject',
   description:
-    'Reject a task\'s work and send it back for rework. Optionally provide ' +
-    'a reason that will be shown to the agent on the next turn.',
+    'Reject a task\'s work and send it back for rework. Discards all agent ' +
+    'work and resets the task. The agent will need to restart from scratch. ' +
+    'Use when the fundamental approach is wrong and feedback alone won\'t help.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1848,7 +1951,8 @@ export const diffTool: McpTool = {
   description:
     'Show changes made by a task. Returns a diff stat summary by default, ' +
     'or the full diff with "full" flag. Use "files" to filter to specific ' +
-    'paths and "max_lines" to truncate output.',
+    'paths, "offset" to skip lines, and "max_lines" to truncate output. ' +
+    'Combine offset and max_lines to paginate through large diffs.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1866,6 +1970,10 @@ export const diffTool: McpTool = {
         items: { type: 'string' },
         description: 'Filter diff to specific file paths only',
       },
+      offset: {
+        type: 'number',
+        description: 'Skip first N lines of diff output before applying max_lines (default: 0)',
+      },
       max_lines: {
         type: 'number',
         description: 'Truncate diff output to N lines. Response includes truncated flag and total_lines.',
@@ -1880,6 +1988,7 @@ export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
     const taskIdInput = args.task_id as string;
     const full = args.full as boolean | undefined;
     const files = args.files as string[] | undefined;
+    const offset = (args.offset as number | undefined) ?? 0;
     const maxLines = args.max_lines as number | undefined;
 
     const storage = await getStorage(ctx);
@@ -1896,10 +2005,11 @@ export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task ${taskIdInput} has no session (not started yet)`);
       }
 
-      // Find the task's worktree by convention; fall back to main repo if worktree is gone
+      // Find the task's worktree; fall back to main repo if worktree is gone.
+      // Worktrees live under <projectRoot>/.lazy/worktrees/, NOT under the storage path.
       const lazyRoot = requireLazyRoot();
-      const storagePath = storage.getStoragePath();
-      const worktreePath = join(storagePath, 'worktrees', session.git_branch.replace('lazy/', ''));
+      const tRef = session.git_branch.replace('lazy/', '');
+      const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
       const worktreeExists = await pathExists(worktreePath);
       const diffCwd = worktreeExists ? worktreePath : lazyRoot;
       if (!worktreeExists) {
@@ -1969,15 +2079,25 @@ export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
         full: !!full,
       };
 
-      // Apply max_lines truncation
-      if (maxLines !== undefined && maxLines > 0) {
+      // Apply offset and max_lines pagination
+      if (offset > 0 || (maxLines !== undefined && maxLines > 0)) {
         const lines = diffOutput.split('\n');
         result.total_lines = lines.length;
-        if (lines.length > maxLines) {
-          diffOutput = lines.slice(0, maxLines).join('\n');
+
+        // Skip first N lines
+        const remaining = lines.slice(Math.min(offset, lines.length));
+
+        // Then apply max_lines cap
+        if (maxLines !== undefined && maxLines > 0 && remaining.length > maxLines) {
+          diffOutput = remaining.slice(0, maxLines).join('\n');
           result.truncated = true;
         } else {
+          diffOutput = remaining.join('\n');
           result.truncated = false;
+        }
+
+        if (offset > 0) {
+          result.offset = offset;
         }
       }
 
@@ -2096,7 +2216,7 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
       const task = resolved.task;
 
       // Check terminal status
-      const terminalStatuses = new Set(['complete', 'abandoned', 'closed']);
+      const terminalStatuses = new Set(['complete', 'abandoned']);
       if (terminalStatuses.has(task.status)) {
         throw new Error(`Cannot edit task in ${task.status} status`);
       }
@@ -2298,7 +2418,7 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
       }
       const task = resolved.task;
 
-      const terminalStatuses = new Set(['complete', 'abandoned', 'closed']);
+      const terminalStatuses = new Set(['complete', 'abandoned']);
       if (!terminalStatuses.has(task.status)) {
         throw new Error(`Task is in ${task.status} status — can only reopen terminal tasks`);
       }
@@ -2414,12 +2534,9 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
       }
       const oldTask = resolved.task;
 
-      // Cannot redo completed (merged) or closed tasks
+      // Cannot redo completed (merged) tasks
       if (oldTask.status === 'complete') {
         throw new Error('Cannot redo a completed (merged) task');
-      }
-      if (oldTask.status === 'closed') {
-        throw new Error('Cannot redo a closed task');
       }
 
       // Step 2: validate confirmation code and execute
@@ -2461,9 +2578,8 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
         // Link new task to old via metadata
         await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
 
-        // Close the old task
-        await storage.closeTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, 'builder');
-        await storage.updateTaskStatus(oldTask.id, 'closed', 'builder');
+        // Abandon the old task
+        await storage.abandonTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, 'builder');
 
         return {
           old_task_id: shortId(oldTask.id),
@@ -2563,6 +2679,7 @@ export const allTools: McpTool[] = [
   startTool,
   unblockTool,
   acceptTool,
+  abandonTool,
   rejectTool,
   closeTool,
   submitTool,
@@ -2597,6 +2714,7 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_start', createStartHandler(ctx));
   handlers.set('lazy_unblock', createUnblockHandler(ctx));
   handlers.set('lazy_accept', createAcceptHandler(ctx));
+  handlers.set('lazy_abandon', createAbandonHandler(ctx));
   handlers.set('lazy_reject', createRejectHandler(ctx));
   handlers.set('lazy_close', createCloseHandler(ctx));
   handlers.set('lazy_submit', createSubmitHandler(ctx));

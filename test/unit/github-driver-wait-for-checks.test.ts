@@ -21,7 +21,8 @@ describe('GitHubDriver waitForChecks', () => {
     storage: { backend: 'external', external_path: '', postgres_ssl: false },
     git: { default_branch_prefix: 'lazy' },
     output: { shortid_length: 8 },
-    agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
+    agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+    builder: { effort: 'high' },
     server: { port: 3000, sync_interval: 1000 },
     remote: {
       driver: 'github',
@@ -32,7 +33,7 @@ describe('GitHubDriver waitForChecks', () => {
       gitlab_auto_push: true,
       gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     },
-    docker: { dockerfile: '', toolchain: '' },
+    docker: { dockerfile: '' },
     runner: { type: 'docker' as const },
     documents: { path: '' },
     features: {},
@@ -77,8 +78,8 @@ describe('GitHubDriver waitForChecks', () => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
-              { name: 'typecheck', state: 'SUCCESS', bucket: 'pass', detailUrl: 'https://example.com/1' },
-              { name: 'tests', state: 'SUCCESS', bucket: 'pass', detailUrl: 'https://example.com/2' },
+              { name: 'typecheck', state: 'SUCCESS', bucket: 'pass', link: 'https://example.com/1' },
+              { name: 'tests', state: 'SUCCESS', bucket: 'pass', link: 'https://example.com/2' },
             ]),
             stderr: '',
             exitCode: 0,
@@ -102,8 +103,8 @@ describe('GitHubDriver waitForChecks', () => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
-              { name: 'typecheck', state: 'SUCCESS', bucket: 'pass', detailUrl: 'https://example.com/1' },
-              { name: 'tests', state: 'FAILURE', bucket: 'fail', detailUrl: 'https://example.com/2' },
+              { name: 'typecheck', state: 'SUCCESS', bucket: 'pass', link: 'https://example.com/1' },
+              { name: 'tests', state: 'FAILURE', bucket: 'fail', link: 'https://example.com/2' },
             ]),
             stderr: '',
             exitCode: 0,
@@ -213,7 +214,7 @@ describe('GitHubDriver waitForChecks', () => {
         if (args[0] === 'pr' && args[1] === 'checks') {
           return {
             stdout: JSON.stringify([
-              { name: 'slow-check', state: 'IN_PROGRESS', bucket: 'pending', detailUrl: 'https://example.com/slow' },
+              { name: 'slow-check', state: 'IN_PROGRESS', bucket: 'pending', link: 'https://example.com/slow' },
             ]),
             stderr: '',
             exitCode: 0,
@@ -266,7 +267,7 @@ describe('GitHubDriver waitForChecks', () => {
           return {
             stdout: JSON.stringify([
               { name: 'typecheck', state: 'SUCCESS', bucket: 'pass' },
-              { name: 'tests', state: 'FAILURE', bucket: 'fail', detailUrl: 'https://example.com/fail' },
+              { name: 'tests', state: 'FAILURE', bucket: 'fail', link: 'https://example.com/fail' },
               { name: 'lint', state: 'SUCCESS', bucket: 'pass' },
             ]),
             stderr: '',

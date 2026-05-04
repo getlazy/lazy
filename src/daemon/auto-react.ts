@@ -9,8 +9,8 @@
  * PR comment auto-react, which requires direct driver interaction for comment
  * fetching and dedup that doesn't fit the signal model.
  *
- * Uses the budget system (auto-react-budget.ts) for rate limiting and the
- * event router (events.ts) for SSE notification.
+ * Uses the budget system (auto-react-budget.ts) for rate limiting. Auto-react
+ * results are observable via task state and signal delivery.
  *
  * Auto-react NEVER auto-accepts. It only auto-unblocks, giving the agent
  * another turn to address the signal.
@@ -27,7 +27,6 @@ import {
   recordAutoReact,
   type AutoReactTrigger,
 } from './auto-react-budget';
-import { sendEvent } from './events';
 import { autoUnblockTask } from './auto-deliver';
 import { logger } from '../utils/logger';
 // --- Metadata keys for tracking auto-react state ---
@@ -222,7 +221,6 @@ async function checkPRComments(
   const decision = await shouldAutoReact(storage, task.id, 'comment', config, dataDir);
   if (!decision.allowed) {
     logger.info(`Auto-react: PR comment for task ${taskShortId} blocked by budget: ${decision.reason}`);
-    emitBudgetExhaustedEvent(task.id, 'comment', decision.reason || 'Budget exhausted');
     return 'budget_exhausted';
   }
 
@@ -252,17 +250,6 @@ async function checkPRComments(
     await storage.updateTaskMetadata(task.id, driver.commentSyncedAtKey(), latestDate.toISOString());
 
     logger.info(`Auto-react: auto-unblocked task ${taskShortId} for ${newComments.length} new PR comment(s)`);
-
-    // Emit event for SSE subscribers
-    sendEvent(task.id, {
-      type: 'auto-react.comment',
-      source_task_id: task.id,
-      payload: {
-        auto_react: true,
-        trigger: 'comment',
-        comment_count: newComments.length,
-      },
-    });
 
     return 'unblocked';
   }
@@ -332,21 +319,4 @@ function formatCommentFeedback(comments: RemoteComment[]): string {
   }
 
   return parts.join('\n');
-}
-
-// --- Event emission ---
-
-/**
- * Emit a budget-exhausted event so SSE subscribers know auto-react was blocked.
- */
-function emitBudgetExhaustedEvent(taskId: string, trigger: AutoReactTrigger, reason: string): void {
-  sendEvent(taskId, {
-    type: 'auto-react.budget_exhausted',
-    source_task_id: taskId,
-    payload: {
-      auto_react_blocked: true,
-      trigger,
-      reason,
-    },
-  });
 }

@@ -174,7 +174,7 @@ Arguments:
 Options:
   --goal <goal>      Goal for the variant (default: parent goal + "(variant)")
   --prompt <text>    Prompt for the variant (default: inherit parent's prompt)
-  --model <model>    Override model for the variant (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Override model for the variant (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --code <code>      Set a human-readable code for the variant task
   --yes              Skip confirmation prompt when starting the variant task
 

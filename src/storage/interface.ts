@@ -20,6 +20,7 @@ import type {
   TaskStatus,
   SessionOutcome,
   TurnRole,
+  TurnType,
   TokenUsage,
   WorktreeSnapshot,
   TaskTreeNode,
@@ -29,6 +30,8 @@ import type {
   StatusChange,
   Actor,
   CommentSource,
+  HunkApproval,
+  HunkApprovalLineage,
 } from './types';
 
 /**
@@ -56,6 +59,11 @@ export interface CreateTurnOptions {
   checkOutput?: string;
   /** Whether this turn was auto-triggered (CI failure, comment, upstream sync, crash) vs human-triggered */
   autoTriggered?: boolean;
+  /**
+   * Turn category. Defaults to 'work' (substantive task-advancing turn) when
+   * omitted. Use 'ask' for read-only Q&A exchanges (e.g. `lazy review -i`).
+   */
+  turnType?: TurnType;
 }
 
 export interface Storage {
@@ -168,9 +176,9 @@ export interface Storage {
   incrementTaskPendingSync(taskId: string): Promise<void>;
 
   /**
-   * Close a task with a reason
+   * Abandon a task with a reason. Sets status to 'abandoned' and records the reason.
    */
-  closeTask(taskId: string, closeReason: string, actor?: Actor): Promise<void>;
+  abandonTask(taskId: string, reason: string, actor?: Actor): Promise<void>;
 
   /**
    * Reopen an abandoned task: reset status to 'blocked' and clear completed_at
@@ -392,6 +400,25 @@ export interface Storage {
    * Get all comments for a task
    */
   getTaskComments(taskId: string): Promise<Comment[]>;
+
+  // --- Hunk Approvals (per-hunk "reviewed" state for `lazy review -i`) ---
+
+  /**
+   * List all hunk approvals for a task. The reviewer loads these at
+   * startup to seed which hunks should be skipped in n/p navigation.
+   */
+  listHunkApprovals(taskId: string): Promise<HunkApproval[]>;
+
+  /**
+   * Persist a hunk approval. Idempotent on (task_id, hunk_hash) — if
+   * the same hunk is approved twice, returns the existing record.
+   */
+  createHunkApproval(
+    taskId: string,
+    hunkHash: string,
+    actor?: Actor,
+    lineage?: HunkApprovalLineage,
+  ): Promise<HunkApproval>;
 
   // --- Conversations ---
 

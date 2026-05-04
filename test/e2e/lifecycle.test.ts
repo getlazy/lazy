@@ -41,17 +41,17 @@ describe('full task lifecycle', () => {
     expectOutput(showResult, 'complete');
   });
 
-  test('create -> start -> reject with --reason', async () => {
-    const taskId = await createTask(ctx, 'Reject test', 'Try feature Y');
+  test('create -> start -> abandon with --reason', async () => {
+    const taskId = await createTask(ctx, 'Abandon test', 'Try feature Y');
 
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // reject now requires --reason flag and --yes to skip interactive confirmation
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Incorrect approach, needs redesign']);
-    expectSuccess(rejectResult);
-    expectOutput(rejectResult, 'rejected');
+    // abandon requires --reason flag and --yes to skip interactive confirmation
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--yes', '--reason', 'Incorrect approach, needs redesign']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
 
     // Verify task is abandoned and reason is stored as a note
     const showResult = await ctx.lazy(['show', taskId]);
@@ -59,28 +59,28 @@ describe('full task lifecycle', () => {
     expectOutput(showResult, 'Incorrect approach, needs redesign');
   });
 
-  test('reject without --reason in non-TTY fails', async () => {
-    const taskId = await createTask(ctx, 'Reject no reason', 'Try feature Z');
+  test('abandon without --reason in non-TTY fails', async () => {
+    const taskId = await createTask(ctx, 'Abandon no reason', 'Try feature Z');
 
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // reject without --reason should fail in non-TTY context
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes']);
-    expectFailure(rejectResult, 1);
-    expectError(rejectResult, 'Rejection reason is required');
+    // abandon without --reason should fail in non-TTY context
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--yes']);
+    expectFailure(abandonResult, 1);
+    expectError(abandonResult, '--reason is required when using --yes flag');
   });
 
-  test('create -> close (no session)', async () => {
-    const taskId = await createTask(ctx, 'Close test', 'Something');
+  test('create -> abandon (no session)', async () => {
+    const taskId = await createTask(ctx, 'Abandon test', 'Something');
 
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'No longer needed']);
-    expectSuccess(closeResult);
-    expectOutput(closeResult, 'closed');
+    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'No longer needed']);
+    expectSuccess(abandonResult);
+    expectOutput(abandonResult, 'abandoned');
 
     const showResult = await ctx.lazy(['show', taskId]);
-    expectOutput(showResult, 'closed');
+    expectOutput(showResult, 'abandoned');
     expectOutput(showResult, 'No longer needed');
   });
 

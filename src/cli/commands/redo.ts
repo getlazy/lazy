@@ -126,13 +126,6 @@ export async function commandRedo(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Validate: can't redo a task already closed
-    if (oldTask.status === 'closed') {
-      console.error(`Task ${displayId(oldTask)} is already closed.`);
-      console.error(`To restart this work, create a new task with the same goal.`);
-      process.exit(1);
-    }
-
     // Check worktree for uncommitted changes
     const worktreePath = getWorktreePath(root, oldTask);
     if (existsSync(worktreePath) && (await hasUncommittedChanges(worktreePath))) {
@@ -217,10 +210,10 @@ export async function commandRedo(args: string[]): Promise<void> {
     // Set redo_of metadata to link back to old task
     await storage.updateTaskMetadata(newTask.id, 'redo_of', oldTask.id);
 
-    // --- Now close old task (single call, with correct reason) ---
-    console.log(`Closing task ${theme.taskId(displayId(oldTask))}...`);
+    // --- Now abandon old task (single call, with correct reason) ---
+    console.log(`Abandoning task ${theme.taskId(displayId(oldTask))}...`);
 
-    await storage.closeTask(oldTask.id, `Redone as ${displayId(newTask)}`, getActor());
+    await storage.abandonTask(oldTask.id, `Redone as ${displayId(newTask)}`, getActor());
 
     // Clean up container and worktree
     if (sess) {
@@ -275,7 +268,7 @@ Arguments:
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (raw model ID, e.g. claude-sonnet-4-5-20250929)
+  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
 
@@ -295,5 +288,5 @@ Examples:
   lazy redo abc123                        # Redo task, start immediately
   lazy redo abc123 --no-start             # Redo but keep in backlog
   lazy redo abc123 --prompt "Updated requirements"  # Redo with new prompt
-  lazy redo fix-auth --model claude-opus-4-6         # Redo with different model`);
+  lazy redo fix-auth --model opus                    # Redo with different model`);
 }

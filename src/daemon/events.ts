@@ -347,7 +347,7 @@ export async function isParentBranchAhead(
   const parentRef = taskRef(parentTask);
   const parentBranch = `lazy/${parentRef}`;
 
-  if (!await branchExists(parentBranch, lazyRoot) || !await branchExists(session.git_branch, lazyRoot)) {
+  if (!branchExists(parentBranch, lazyRoot) || !branchExists(session.git_branch, lazyRoot)) {
     return { ahead: false, parentTip: null };
   }
 

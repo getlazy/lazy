@@ -16,7 +16,8 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0 },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
     driver: 'github',
@@ -27,7 +28,7 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '', toolchain: '' },
+  docker: { dockerfile: '' },
   runner: { type: 'docker' as const },
   documents: { path: '' },
   features: {},
@@ -234,7 +235,7 @@ describe('GitHubDriver merge', () => {
       }
       // gh pr checks --json (pending checks detected)
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }])));
+        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', link: null }])));
       }
       if (args[0] === 'pr' && args[1] === 'create') {
         return Promise.resolve(ok('https://github.com/o/r/pull/99'));
@@ -347,7 +348,7 @@ describe('GitHubDriver merge', () => {
       }
       // Pre-merge CI check: pending checks detected
       if (args[0] === 'pr' && args[1] === 'checks') {
-        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null }])));
+        return Promise.resolve(ok(JSON.stringify([{ name: 'ci/build', state: 'PENDING', bucket: 'pending', link: null }])));
       }
       return Promise.resolve(fail('unexpected'));
     });
@@ -381,7 +382,7 @@ describe('GitHubDriver merge', () => {
       // Pre-merge CI check: return failed checks
       if (args[0] === 'pr' && args[1] === 'checks') {
         return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'FAILURE', bucket: 'fail', detailUrl: 'https://example.com/1' },
+          { name: 'ci/build', state: 'FAILURE', bucket: 'fail', link: 'https://example.com/1' },
         ])));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
@@ -420,7 +421,7 @@ describe('GitHubDriver merge', () => {
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
         return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'PENDING', bucket: 'pending', detailUrl: null },
+          { name: 'ci/build', state: 'PENDING', bucket: 'pending', link: null },
         ])));
       }
       if (args[0] === 'pr' && args[1] === 'merge') {
@@ -458,7 +459,7 @@ describe('GitHubDriver merge', () => {
       // CI checks pass
       if (args[0] === 'pr' && args[1] === 'checks') {
         return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', link: null },
         ])));
       }
       // Review decision: not approved
@@ -498,7 +499,7 @@ describe('GitHubDriver merge', () => {
       }
       if (args[0] === 'pr' && args[1] === 'checks') {
         return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', detailUrl: null },
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', link: null },
         ])));
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
