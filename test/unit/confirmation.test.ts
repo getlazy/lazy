@@ -284,10 +284,10 @@ describe('createConfirmationLevel', () => {
     expect(createConfirmationLevel('main', [])).toBe('none');
   });
 
-  // INVARIANT: Light confirmation when creating under main with active tasks that have no children.
-  // Gentle nudge — the project might not use parent-child hierarchy.
-  test('returns light when parent is main and active tasks exist without children', () => {
-    expect(createConfirmationLevel('main', [{ task: activeTask, childCount: 0 }])).toBe('light');
+  // INVARIANT: Singleton tasks (no non-terminal subtasks) do NOT trigger a warning.
+  // Only push back when the project demonstrably uses parent-child hierarchy with live subtasks.
+  test('returns none when parent is main and active tasks are singletons (no active children)', () => {
+    expect(createConfirmationLevel('main', [{ task: activeTask, childCount: 0 }])).toBe('none');
   });
 
   // INVARIANT: Stern confirmation when creating under main and active tasks have children.

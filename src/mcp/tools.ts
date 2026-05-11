@@ -489,11 +489,13 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
       // Filter out backlog — those aren't "active" in the sense that matters here
       const activeTasks = nonTerminalTasks.filter((t) => t.status !== 'backlog');
 
-      // For each active task, check if it has children (indicating parent-child hierarchy)
+      // For each active task, count only non-terminal children (ongoing or backlog).
+      // A task with only completed/abandoned subtasks is effectively a singleton.
       const activeTasksWithChildCounts: Array<{ task: typeof activeTasks[0]; childCount: number }> = [];
       for (const task of activeTasks) {
         const children = await storage.getChildTasks(task.id);
-        activeTasksWithChildCounts.push({ task, childCount: children.length });
+        const activeChildren = children.filter((c) => c.status !== 'complete' && c.status !== 'abandoned');
+        activeTasksWithChildCounts.push({ task, childCount: activeChildren.length });
       }
 
       const level = createConfirmationLevel(

@@ -96,19 +96,17 @@ export function reopenConfirmationLevel(
 /**
  * Create scales with how clearly the project uses parent-child hierarchy.
  * - No parent specified or parent is not main -> none (explicit parent choice)
- * - Parent is main, no active tasks -> none (standalone work is fine)
- * - Parent is main, active tasks exist but none have children -> light (gentle nudge)
- * - Parent is main, active tasks with children exist -> stern (almost certainly a mistake)
+ * - Parent is main, no active tasks with active/backlog subtasks -> none (singletons are fine)
+ * - Parent is main, any active task has non-terminal subtasks -> stern (almost certainly a mistake)
  */
 export function createConfirmationLevel(
   parentId: string | undefined,
   activeTasks: Array<{ task: Task; childCount: number }>,
 ): ConfirmationLevel {
   if (!parentId || parentId !== 'main') return 'none';
-  if (activeTasks.length === 0) return 'none';
   const withChildren = activeTasks.filter((t) => t.childCount > 0);
   if (withChildren.length > 0) return 'stern';
-  return 'light';
+  return 'none';
 }
 
 // --- Context types for template rendering ---

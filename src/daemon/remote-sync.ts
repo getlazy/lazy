@@ -221,8 +221,16 @@ async function exportTasks(storage: Storage, root: string, driver: RepositoryDri
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
-    // Only export tasks that have sessions (i.e., work has been done)
-    if (task.status !== 'blocked' && task.status !== 'conflict' && task.status !== 'submitted') continue;
+    // Only export tasks that have sessions (i.e., work has been done).
+    // Includes 'pairing' so commits made during a pairing session get pushed
+    // promptly rather than waiting for the session to end.
+    if (
+      task.status !== 'blocked' &&
+      task.status !== 'conflict' &&
+      task.status !== 'submitted' &&
+      task.status !== 'pairing'
+    )
+      continue;
 
     const session = await storage.getSessionByTaskId(task.id);
     if (!session?.git_branch) continue;

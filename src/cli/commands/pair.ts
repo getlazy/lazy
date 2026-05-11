@@ -15,6 +15,8 @@ import {
 } from '../../utils/pairing-lock';
 import { runClaude, hasAuthEnv } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
+import { createDriver } from '../../remote';
+import { isOfflineMode } from '../../utils/offline';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
@@ -565,6 +567,22 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     // --- Post-pairing: capture what happened ---
+
+    // Best-effort push of the task branch so commits from the pairing session
+    // reach the remote immediately, rather than waiting for the next sync tick.
+    // Failures here MUST NOT block commit recording or turn creation below.
+    if (sess.git_branch) {
+      try {
+        const offline = await isOfflineMode(join(root, '.lazy'));
+        if (!offline) {
+          const config = await loadConfig(root);
+          const driver = createDriver(config);
+          await driver.pushBranch(sess.git_branch);
+        }
+      } catch (err) {
+        logger.warn(`Failed to push branch ${sess.git_branch} after pairing (non-fatal): ${err instanceof Error ? err.message : err}`);
+      }
+    }
 
     // Detect new commits since pairing started
     let newCommits: { sha: string; message: string }[] = [];

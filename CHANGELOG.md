@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.1028] - 2026-05-11 - Lifecycle visibility
+
+Lazy v0.13 sharpens visibility into stuck task lifecycles and tightens the daemon-required model.
+
+### Changed
+
+- **Ask timeout caps at 110s with an actionable 504** — when a supervisor is hung, an ask now returns a 504 with a recovery hint instead of an opaque transport timeout. Behavior change: asks previously could hang up to 10 minutes; they now cap at 110s
+- **Reconciler failures surface in `daemon.log`** — per-task reconcile failures are logged at `warn` level (was `debug`) so they're visible without bumping log verbosity
+- **Daemon-required model is structurally enforced** — the in-process RPC bypass is gone. Production behavior is unchanged from v0.12, but there is no longer a code path that pretends to work without the daemon
+
+### Fixed
+
+- **`lazy show` warns when auto-resume has given up** — when the auto-resume circuit breaker has tripped on a task, `lazy show <task>` now flags it and points to `lazy resume <task>` to recover manually, instead of leaving the task silently stuck
+- **`lazy_create` no longer pushes back on singleton tasks** — the parent-selection warning now fires only when an active task has at least one non-terminal subtask, indicating the project uses parent-child hierarchy. Tasks with no live subtasks are treated as singletons and create without any prompt
+
 ## [0.12.1023] - 2026-05-04 - Sync, Abandon, and Cleanup
 
 Lazy v0.12 sharpens the workflow: sync is now its own operation, close/reject collapse into a single `abandon` command, toolchains are gone, and the daemon hardens around version safety and project isolation. Offline behavior, interactive review, watch, and a new `lazy doctor <task-id>` round out the release.

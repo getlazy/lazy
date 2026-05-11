@@ -4,7 +4,7 @@
 
 * A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (`builder` mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
 * A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
-* An [software development lifecycle](#the-task-manager) tool integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
+* A [software development lifecycle](#the-task-manager) tool integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
 
 `lazy` is thus [my](https://github.com/ierceg) attempt to raise the abstraction on three different fronts at the same time:
 
@@ -318,6 +318,14 @@ Agents are harnessed into a deterministic turn lifecycle. On every turn, the age
 * Merge upstream changes (changes on the branch of the parent task) and resolve conflicts
 * Work on the prompt as they see fit, fully autonomously, committing as they go along
 * Stop their turn by leaving the summary of their work
+* Prompted back into action if they have violated protected paths.
+
+Within lifecycle harnessing, `lazy` pushes back against builder and agent actions:
+
+* When builder is creating a new task, `lazy` will ask it to confirm the parent of the task if there are ongoing tasks with ongoing or backlog sub-tasks. This avoids builder creating tasks on main that should really go under a specific parent task.
+* When builder is accepting a task, `lazy` triggers progressively stronger push back to confirm that the acceptance is only coming after builder has reviewed the task.
+* When accepting agent's work, `lazy` will block if there are uncommitted changes on the worktree.
+* There is a cap on auto-triggered turns so that agents don't go and spend too much tokens spinning their wheels before a human is involved.
 
 ### Task
 
