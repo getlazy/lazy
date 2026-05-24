@@ -45,14 +45,46 @@ export function renderMarkdown(markdown: string): string {
   const lines = markdown.split('\n');
   const output: string[] = [];
   let i = 0;
-  let inList = false;
-  let listType: 'ul' | 'ol' = 'ul';
+
+  // List nesting stack. Each entry is one open <ul>/<ol>; deeper indent
+  // pushes, shallower indent pops. Two-space indent steps are the typical
+  // markdown convention (and what our prompts ask the model to produce).
+  const listStack: Array<{ indent: number; type: 'ul' | 'ol' }> = [];
 
   function closeList(): void {
-    if (inList) {
-      output.push(listType === 'ul' ? '</ul>' : '</ol>');
-      inList = false;
+    while (listStack.length > 0) {
+      const top = listStack.pop()!;
+      output.push(top.type === 'ul' ? '</ul>' : '</ol>');
     }
+  }
+
+  function openListLevel(indent: number, type: 'ul' | 'ol'): void {
+    output.push(type === 'ul' ? '<ul>' : '<ol>');
+    listStack.push({ indent, type });
+  }
+
+  function adjustListsTo(indent: number, type: 'ul' | 'ol'): void {
+    // Pop any deeper levels — we've outdented.
+    while (listStack.length > 0 && listStack[listStack.length - 1].indent > indent) {
+      const top = listStack.pop()!;
+      output.push(top.type === 'ul' ? '</ul>' : '</ol>');
+    }
+    const top = listStack[listStack.length - 1];
+    if (!top) {
+      openListLevel(indent, type);
+      return;
+    }
+    if (top.indent === indent) {
+      // Same level — if the type differs, swap by closing+reopening.
+      if (top.type !== type) {
+        output.push(top.type === 'ul' ? '</ul>' : '</ol>');
+        listStack.pop();
+        openListLevel(indent, type);
+      }
+      return;
+    }
+    // top.indent < indent → deeper nesting, open a new level.
+    openListLevel(indent, type);
   }
 
   while (i < lines.length) {
@@ -104,29 +136,21 @@ export function renderMarkdown(markdown: string): string {
       continue;
     }
 
-    // Unordered list
+    // Unordered list (indent-aware nesting via the listStack helper)
     const ulMatch = line.match(/^(\s*)[-*+]\s+(.*)$/);
     if (ulMatch) {
-      if (!inList || listType !== 'ul') {
-        closeList();
-        output.push('<ul>');
-        inList = true;
-        listType = 'ul';
-      }
+      const indent = ulMatch[1].length;
+      adjustListsTo(indent, 'ul');
       output.push(`<li>${renderInline(ulMatch[2])}</li>`);
       i++;
       continue;
     }
 
-    // Ordered list
+    // Ordered list (same nesting story as unordered)
     const olMatch = line.match(/^(\s*)\d+\.\s+(.*)$/);
     if (olMatch) {
-      if (!inList || listType !== 'ol') {
-        closeList();
-        output.push('<ol>');
-        inList = true;
-        listType = 'ol';
-      }
+      const indent = olMatch[1].length;
+      adjustListsTo(indent, 'ol');
       output.push(`<li>${renderInline(olMatch[2])}</li>`);
       i++;
       continue;

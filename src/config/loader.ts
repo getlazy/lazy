@@ -66,6 +66,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   agent: {
     agent_id: 'claude-code',
     watchdog_output_timeout_ms: 7200000,
+    graceful_exit_timeout_ms: 60000,
     effort: 'medium',
   },
   builder: {
@@ -157,18 +158,25 @@ function deepMerge<T>(target: T, source: DeepPartial<T>): T {
 }
 
 /**
+ * Resolve the path to the lazy.toml that would be loaded for the given root.
+ * Honors LAZY_CONFIG (absolute path or filename) and the search-upwards
+ * convention used by loadConfig. Does NOT check whether the file exists.
+ */
+export async function resolveConfigPath(lazyRoot: string, startDir?: string): Promise<string> {
+  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
+    return process.env.LAZY_CONFIG;
+  }
+  const configDir = await findConfigDir(lazyRoot, startDir);
+  return join(configDir, CONFIG_FILENAME);
+}
+
+/**
  * Load and parse lazy.toml, returning the raw (un-merged) TOML object.
  * Returns null if no config file exists or parsing fails.
  * Used by doctor to detect unknown/deprecated keys.
  */
 export async function loadRawConfig(lazyRoot: string): Promise<Record<string, unknown> | null> {
-  let configPath: string;
-  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
-    configPath = process.env.LAZY_CONFIG;
-  } else {
-    const configDir = await findConfigDir(lazyRoot);
-    configPath = join(configDir, CONFIG_FILENAME);
-  }
+  const configPath = await resolveConfigPath(lazyRoot);
   if (!(await pathExists(configPath))) return null;
 
   try {
@@ -347,7 +355,9 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
   const pathLine = storagePath ? `external_path = "${storagePath}"` : 'external_path = ""';
   const remoteName = gitRemote || 'origin';
 
-  return `# lazy.toml - Configuration for lazy
+  return `# Lazy configuration
+# Documentation: https://gitlab.com/getlazy/lazy/-/blob/main/docs/lazy-toml.md
+#
 # Override the config filename with the LAZY_CONFIG environment variable
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
@@ -392,6 +402,10 @@ agent_id = "claude-code"
 # Higher levels spend more tokens thinking before responding.
 # Valid levels: "low", "medium", "high", "xhigh", "max" (default: "medium")
 # effort = "medium"
+# Max time (ms) to wait for the agent process to exit after it signals
+# end-of-turn via lazy_commit. Bounds how long we wait for claude -p's
+# plumbing to wind down once the agent considers itself done. 0 disables.
+# graceful_exit_timeout_ms = 60000
 
 [builder]
 # Reasoning effort level passed to Claude Code via --effort for builder sessions.

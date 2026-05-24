@@ -97,7 +97,8 @@ Full-screen mode navigation:
 Actions (use CLI after exiting review):
   lazy unblock <task_id>                 Give feedback
   lazy accept <task_id>                  Accept the task
-  lazy abandon <task_id>                 Abandon the task
+  lazy close <task_id>                   Close the task (no session needed)
+  lazy reject <task_id>                  Reject the task (closes PR with reject review)
   lazy sync <task_id>                    Merge upstream changes
 
 Examples:

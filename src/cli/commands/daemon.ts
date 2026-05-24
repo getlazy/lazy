@@ -6,6 +6,7 @@
  *   lazy daemon stop      — graceful shutdown via socket RPC
  *   lazy daemon restart   — stop + start
  *   lazy daemon status    — show PID, uptime, socket path
+ *   lazy daemon logs      — tail the daemon log file
  *
  * Per-project: each project gets its own daemon process. Commands must be
  * run inside a lazy project directory (error otherwise).
@@ -245,7 +246,7 @@ Subcommands:
   stop        Stop the daemon gracefully
   restart     Restart the daemon
   status      Show daemon status and web dashboard URL
-  logs        Tail the daemon log file (same as \`lazy logs\`)
+  logs        Tail the daemon log file (primary debugging tool)
 
 Start options:
   --foreground    Run in foreground (don't detach)

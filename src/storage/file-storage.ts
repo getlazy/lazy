@@ -303,6 +303,9 @@ export class FileStorage implements Storage {
     if (raw.auto_resumed === undefined) {
       raw.auto_resumed = false;
     }
+    if (raw.user_stopped === undefined) {
+      raw.user_stopped = false;
+    }
 
     // Migrate claude_session_id to agent_session_id (backward compat)
     if (raw.agent_session_id === undefined && raw.claude_session_id !== undefined) {
@@ -1108,6 +1111,7 @@ export class FileStorage implements Storage {
         interrupt_logs: null,
         consecutive_interruptions: 0,
         auto_resumed: false,
+        user_stopped: false,
         upstream_merge_sha: null,
       };
 
@@ -1298,6 +1302,8 @@ export class FileStorage implements Storage {
 
       session.consecutive_interruptions = 0;
       session.auto_resumed = false;
+      // Manual resume/unblock re-arms auto-resume: clear the user-stop gate.
+      session.user_stopped = false;
 
       await this.atomicWriteTask(taskId, { 'session.json': session });
     });
@@ -1312,6 +1318,20 @@ export class FileStorage implements Storage {
       if (!session) return;
 
       session.auto_resumed = autoResumed;
+
+      await this.atomicWriteTask(taskId, { 'session.json': session });
+    });
+  }
+
+  async setUserStopped(sessionId: string, userStopped: boolean): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) return;
+
+      const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
+      if (!session) return;
+
+      session.user_stopped = userStopped;
 
       await this.atomicWriteTask(taskId, { 'session.json': session });
     });

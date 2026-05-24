@@ -1,7 +1,7 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, validateModel, parseFlags, formatDate, taskRef, getWorktreePath, getBranchNameFromId } from '../helpers';
 import { promptChoice } from '../editor';
 import { commandAccept } from './accept';
-import { commandAbandon } from './abandon';
+import { commandReject } from './reject';
 import { commandUnblock } from './unblock';
 import { showTaskContext, runFeedbackFlow, syncTaskFromRemote } from './shared';
 import { commandSyncTask } from './sync';
@@ -15,7 +15,6 @@ import { ActivityMonitor } from '../activity-monitor';
 
 import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
 import { getActor } from '../../constants';
-import { createTerminal } from '../../terminal';
 
 /** Maximum number of recent activity lines to display in the polling view. */
 const MAX_ACTIVITY_LINES = 10;
@@ -174,7 +173,7 @@ async function handleInterruptedTasks(
     console.log('');
     const menuOptions = [
       'Resume (restart agent)',
-      'Abandon task',
+      'Reject task',
       'Skip (decide later)',
     ];
 
@@ -247,11 +246,6 @@ export async function commandLoop(args: string[]): Promise<void> {
     console.error('lazy loop requires an interactive terminal.');
     process.exit(1);
   }
-
-  // Set terminal window title
-  const terminal = createTerminal();
-  terminal.setActivity('lazy loop');
-  process.on('exit', () => terminal.restoreTitle());
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -431,14 +425,14 @@ export async function commandLoop(args: string[]): Promise<void> {
         ? [
             'Give feedback - includes unseen comments (recommended)',
             `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
-            'Abandon (discard work)',
+            'Reject (discard work)',
             'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ]
         : [
             'Give feedback (open editor)',
             'Accept (merge work)',
-            'Abandon (discard work)',
+            'Reject (discard work)',
             'Sync upstream (lazy sync)',
             'Skip (move to next task)',
           ];
@@ -461,8 +455,8 @@ export async function commandLoop(args: string[]): Promise<void> {
           await commandAccept([taskShortId]);
           break;
         case 2:
-          // Abandon
-          await commandAbandon([taskShortId]);
+          // Reject
+          await commandReject([taskShortId]);
           break;
         case 3:
           // Merge upstream via lazy sync

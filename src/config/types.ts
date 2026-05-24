@@ -43,6 +43,11 @@ export interface LazyConfig {
     agent_id?: string;
     /** Kill agent process if no output for this many ms. 0 = use agent default. */
     watchdog_output_timeout_ms?: number;
+    /**
+     * Max time to wait for the agent process to exit after it signals end-of-turn
+     * (lazy_commit). 0 = disabled. Default 60000 (60s).
+     */
+    graceful_exit_timeout_ms?: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
     effort?: EffortLevel;
   };
@@ -136,6 +141,11 @@ export interface ResolvedConfig {
     agent_id: string;
     /** Kill agent process if no output for this many ms. 0 = use agent default. */
     watchdog_output_timeout_ms: number;
+    /**
+     * Max time to wait for the agent process to exit after it signals end-of-turn
+     * (lazy_commit). 0 = disabled.
+     */
+    graceful_exit_timeout_ms: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
     effort: EffortLevel;
   };

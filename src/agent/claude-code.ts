@@ -11,6 +11,20 @@ import { getHome } from '../utils/home';
 import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
 
+/**
+ * Tools disallowed for the agent in ask/plan mode (read-only Q&A turns).
+ *
+ * Why hard-coded: these are Claude Code's built-in write-capable tool names —
+ * they don't drift per-project. Read-only built-ins (Read, Grep, LS) stay
+ * available so the agent can look up code while answering.
+ *
+ * Why not `--permission-mode plan`: plan mode triggers Claude Code's interactive
+ * `ExitPlanMode` prompt when the model attempts a write tool. `claude -p` is
+ * non-interactive, so the prompt has no human to answer and the agent stalls.
+ * Using `--disallowedTools` blocks writes outright with no interactive step.
+ */
+const DISALLOWED_TOOLS_IN_PLAN_MODE = 'Bash Write Edit';
+
 export class ClaudeCodeAgent implements Agent {
   readonly id = 'claude-code';
 
@@ -43,10 +57,14 @@ export class ClaudeCodeAgent implements Agent {
   }): string[] {
     const args = ['claude', '-p', opts.prompt, '--output-format', 'json'];
 
-    // Plan mode cannot be combined with --dangerously-skip-permissions (claude
-    // rejects the combination). When the caller asks for plan, honor that.
+    // For plan/ask mode, block write tools via --disallowedTools instead of
+    // --permission-mode plan. Plan mode triggers an interactive ExitPlanMode
+    // prompt that `claude -p` cannot answer, causing stalls.
     if (opts.permissionMode === 'plan') {
-      args.push('--permission-mode', 'plan');
+      args.push('--disallowedTools', DISALLOWED_TOOLS_IN_PLAN_MODE);
+      if (opts.dangerouslySkipPermissions) {
+        args.push('--dangerously-skip-permissions');
+      }
     } else if (opts.dangerouslySkipPermissions) {
       args.push('--dangerously-skip-permissions');
     }

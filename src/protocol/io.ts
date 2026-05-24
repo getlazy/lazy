@@ -35,6 +35,7 @@ export function commonCommandFields(config: ResolvedConfig): {
   protocol_version: number;
   turn_started_at: string;
   watchdog_output_timeout_ms?: number;
+  graceful_exit_timeout_ms?: number;
   protected_patterns: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
@@ -45,6 +46,9 @@ export function commonCommandFields(config: ResolvedConfig): {
     ...(config.agent.watchdog_output_timeout_ms !== 0 && {
       watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
     }),
+    // graceful_exit_timeout_ms is included even when 0 (disabled) so the
+    // supervisor sees the explicit opt-out instead of falling back to a default.
+    graceful_exit_timeout_ms: config.agent.graceful_exit_timeout_ms,
     protected_patterns: config.permissions.protected,
     ...(config.checks.post_turn !== '' && {
       post_turn_check: config.checks.post_turn,

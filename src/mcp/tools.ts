@@ -15,6 +15,29 @@ import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
 import { pathExists, ensureDir, writeFile } from '../utils/fs';
 import type { McpTool, McpToolHandler } from './types';
+import { protocolDir as taskProtocolDir } from '../protocol/io';
+import { writeTurnEndSignal } from '../protocol/turn-end-signal';
+
+/**
+ * Ask-mode read-only guard for write-capable MCP tools.
+ *
+ * When the supervisor runs an ask turn, it sets LAZY_MCP_READ_ONLY=1 on the
+ * agent process so MCP write tools (lazy_commit, lazy_propose, lazy_comment)
+ * reject any attempted call. This is the last line of defense if the agent
+ * ignores the system prompt and the --disallowedTools lockdown.
+ *
+ * The error message must be actionable — tell the agent what to do instead
+ * (write the answer as text) so a competent model corrects course in the
+ * same turn.
+ */
+function rejectIfReadOnly(toolName: string): void {
+  if (process.env.LAZY_MCP_READ_ONLY === '1') {
+    throw new Error(
+      `${toolName} is not available in ask mode — your final message is the answer. ` +
+      `Write it directly as text; do not call any tools.`,
+    );
+  }
+}
 
 
 // Re-use storage and helpers from existing CLI infrastructure
@@ -27,14 +50,12 @@ import { queryWait } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
 import {
-  abandonConfirmationLevel,
   acceptConfirmationLevel,
   rejectConfirmationLevel,
   closeConfirmationLevel,
   redoConfirmationLevel,
   reopenConfirmationLevel,
   createConfirmationLevel,
-  gatherAbandonContext,
   gatherAcceptContext,
   gatherRejectContext,
   gatherCloseContext,
@@ -49,15 +70,19 @@ import {
 import { launchTask, type StartTaskParams } from '../daemon/task-launcher';
 import {
   launchUnblockTask,
+  launchAskTask,
   rejectTask,
   closeTask,
+  stopTask,
   acceptTaskPreflight,
   acceptTask,
   syncTask,
   submitTask,
   type UnblockTaskParams,
+  type AskTaskParams,
   type RejectTaskParams,
   type CloseTaskParams,
+  type StopTaskParams,
   type AcceptTaskPreflightParams,
   type AcceptTaskParams,
   type SyncTaskParams,
@@ -591,6 +616,7 @@ export const commentTool: McpTool = {
 
 export function createCommentHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    rejectIfReadOnly('lazy_comment');
     const message = args.message as string;
     const taskIdInput = args.task_id as string | undefined;
 
@@ -660,6 +686,7 @@ export const proposeTool: McpTool = {
 
 export function createProposeHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    rejectIfReadOnly('lazy_propose');
     if (!ctx.taskId) {
       throw new Error('lazy_propose requires a task context. This tool is not available in builder mode.');
     }
@@ -730,6 +757,7 @@ export const commitTool: McpTool = {
 
 export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    rejectIfReadOnly('lazy_commit');
     if (!ctx.taskId) {
       throw new Error('lazy_commit requires a task context. This tool is not available in builder mode.');
     }
@@ -775,6 +803,25 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     // Count files changed from diffstat (last line is summary)
     const diffLines = diffStat.split('\n');
     const filesChanged = Math.max(0, diffLines.length - 1);
+
+    // Signal end-of-turn to the supervisor. lazy_commit is the de-facto
+    // end-of-turn tool today: the prompt mandates committing as the agent's
+    // last action. The supervisor watches this marker and kills claude -p if
+    // it doesn't exit within graceful_exit_timeout_ms after this point —
+    // bounded waiting for plumbing to wind down once the agent considers
+    // itself done. See src/protocol/turn-end-signal.ts and the watchdog.
+    //
+    // Best-effort: a marker write failure must NOT fail the commit (the
+    // commit already landed). Log loudly so the supervisor-side timeout, if
+    // it never fires, is debuggable.
+    try {
+      await writeTurnEndSignal(taskProtocolDir(ctx.taskId), {
+        commit_sha: sha,
+        written_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.warn(`lazy_commit: failed to write end-of-turn signal: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     return {
       committed: true,
@@ -1035,7 +1082,7 @@ export function createConversationReadHandler(ctx: McpToolContext): McpToolHandl
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_abandon, lazy_reject, lazy_close, lazy_submit
+// Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_reject, lazy_close, lazy_submit
 //
 // IMPORTANT: These handlers call daemon lifecycle functions DIRECTLY — never
 // spawn lazy CLI as a subprocess. Spawning lazy from within the daemon causes
@@ -1289,6 +1336,103 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
   };
 }
 
+// --- lazy_ask ---
+
+export const askTool: McpTool = {
+  name: 'lazy_ask',
+  description:
+    'Ask a blocked task\'s agent a free-form question and get its answer back. ' +
+    'Read-only: resumes the agent\'s session in plan mode — does NOT unblock the task, ' +
+    'commit, or modify the worktree. Synchronous: blocks until the agent responds. ' +
+    'The task must be in \'blocked\' status and have an existing agent session. ' +
+    'Uses the same mechanism as `lazy review -i`\'s ask (`a`) action. ' +
+    'Prefer this over re-reading the diff when you need the agent\'s intent or reasoning rather than facts.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+      message: {
+        type: 'string',
+        description: 'The question to ask the agent',
+        minLength: 1,
+      },
+      effort: {
+        type: 'string',
+        description: 'Reasoning effort override for this turn (optional)',
+      },
+    },
+    required: ['task_id', 'message'],
+  },
+};
+
+export function createAskHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+    const message = args.message as string;
+    const effort = args.effort as string | undefined;
+
+    // Pre-flight: resolve task + session via the MCP storage so callers get
+    // clean, actionable errors before we hand off to the daemon-only path.
+    // (launchAskTask performs the same checks and is authoritative, but its
+    // storage handle requires the daemon process — mirroring lazy_unblock,
+    // we surface the obvious failures up front.)
+    const storage = await getStorage(ctx);
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+      const sess = await storage.getSessionByTaskId(task.id);
+      if (!sess) {
+        throw new Error(
+          `Task ${shortId(task.id)} has no session. Start it first with: lazy start ${shortId(task.id)}`,
+        );
+      }
+      if (sess.ended_at) {
+        throw new Error(
+          `Task ${shortId(task.id)} session has ended. Create a variant with: lazy branch ${shortId(task.id)}`,
+        );
+      }
+      if (!sess.agent_session_id) {
+        throw new Error(
+          `Task ${shortId(task.id)} has no agent session to resume — cannot ask until the agent has run at least once.`,
+        );
+      }
+      if (task.status !== 'blocked') {
+        throw new Error(
+          `Task ${shortId(task.id)} is '${task.status}', not 'blocked'. ` +
+          `Ask only runs against a blocked task — wait until the agent is paused for review.`,
+        );
+      }
+    } finally {
+      await storage.close();
+    }
+
+    const root = requireLazyRoot();
+    const params: AskTaskParams = {
+      taskId,
+      message,
+      effortOverride: effort,
+    };
+
+    const result = await launchAskTask(root, params);
+
+    return {
+      answer: result.answer,
+      sessionId: result.sessionId,
+      turnNumber: result.turnNumber,
+      usage: result.usage,
+      warnings: result.warnings,
+      timings: result.timings,
+    };
+  };
+}
+
 // --- lazy_accept ---
 
 export const acceptTool: McpTool = {
@@ -1327,7 +1471,7 @@ async function executeAccept(
   taskId: string,
   reason: string | undefined,
   approvedFiles: string[] | undefined,
-): Promise<{ output: string; status: string; prUrl?: string }> {
+): Promise<{ output: string; status: string; prUrl?: string; warnings: string[] }> {
   const root = requireLazyRoot();
   const params: AcceptTaskParams = {
     taskId,
@@ -1346,6 +1490,7 @@ async function executeAccept(
     output: statusMsg,
     status: result.status,
     prUrl: result.prUrl,
+    warnings: result.warnings,
   };
 }
 
@@ -1370,8 +1515,28 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_accept without a code to get a new one.');
         }
 
+        // Idempotency: if the merge has already landed (either by a prior
+        // accept call that succeeded after a race, or by the remote-sync
+        // reconciler), return a clear "already merged" response instead of
+        // letting acceptTask's preflight throw an opaque "already accepted"
+        // error or its state-machine throw "Invalid status transition".
+        const existingSession = await storage.getSessionByTaskId(task.id);
+        if (task.status === 'complete' && existingSession?.outcome === 'accepted') {
+          return {
+            output: `Task ${task.code ?? task.id.substring(0, 8)} was already accepted and merged (idempotent no-op).`,
+            status: 'merged',
+            warnings: [],
+          };
+        }
+
         return await executeAccept(taskId, reason, approvedFiles);
       }
+
+      // INVARIANT: The preview call (no confirmation_code) must not mutate
+      // task status, session outcome, branch refs, or merge state. The
+      // confirmation code is the user's authorization gate; anything that
+      // fires before the user types it is a bug. Only in-memory pending-
+      // confirmation tracking is acceptable here.
 
       // Step 1: evaluate confirmation level based on diff size
       const session = await storage.getSessionByTaskId(task.id);
@@ -1420,112 +1585,14 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
   };
 }
 
-// --- lazy_abandon ---
-
-export const abandonTool: McpTool = {
-  name: 'lazy_abandon',
-  description:
-    'Abandon a task — discard its work and mark it as abandoned. ' +
-    'The task\'s worktree is cleaned up but the branch is preserved. ' +
-    'A reason is required to explain why the task is being abandoned.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      task_id: {
-        type: 'string',
-        description: 'Task ID (short hex prefix or task code)',
-        minLength: 1,
-      },
-      reason: {
-        type: 'string',
-        description: 'Reason for abandoning (required)',
-        minLength: 1,
-      },
-      confirmation_code: {
-        type: 'string',
-        description: 'Confirmation code from a previous call. If omitted, returns guidance and a code instead of executing.',
-      },
-      accept_dirty_worktree: {
-        type: 'boolean',
-        description: 'Allow abandoning even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
-      },
-    },
-    required: ['task_id', 'reason'],
-  },
-};
-
-export function createAbandonHandler(ctx: McpToolContext): McpToolHandler {
-  return async (args) => {
-    const taskId = args.task_id as string;
-    const reason = args.reason as string | undefined;
-    const confirmationCode = args.confirmation_code as string | undefined;
-    const acceptDirtyWorktree = args.accept_dirty_worktree as boolean | undefined;
-
-    const storage = await getStorage(ctx);
-    try {
-      const resolved = await storage.resolveTask(taskId);
-      if (!resolved.task) {
-        throw new Error(`Task not found: ${taskId}`);
-      }
-      const task = resolved.task;
-
-      // Step 2: validate confirmation code and execute
-      if (confirmationCode) {
-        if (!validateCode(confirmationCode, 'abandon', task.id)) {
-          throw new Error('Invalid or expired confirmation code. Call lazy_abandon without a code to get a new one.');
-        }
-
-        const root = requireLazyRoot();
-        const params: CloseTaskParams = {
-          taskId,
-          reason: reason || '',
-          acceptDirtyWorktree,
-        };
-
-        const result = await closeTask(root, params);
-
-        return {
-          output: `Closed task ${result.displayId} (${result.branchName})`,
-          taskId: result.taskId,
-          displayId: result.displayId,
-          branchName: result.branchName,
-        };
-      }
-
-      // Step 1: evaluate confirmation level
-      const session = await storage.getSessionByTaskId(task.id);
-      let commitCount = 0;
-      let linesChanged = 0;
-      if (session) {
-        const commits = await storage.getSessionCommits(session.id);
-        commitCount = commits.length;
-        linesChanged = await getDiffLinesChanged(task, session, storage);
-      }
-
-      const level = abandonConfirmationLevel(task, commitCount);
-
-      const code = generateCode('ab');
-      storePending({ code, operation: 'abandon', taskId: task.id, createdAt: Date.now() });
-
-      const context = gatherAbandonContext(task, commitCount, linesChanged, code);
-      const templateName = `abandon-${level}` as const;
-      const guidance = renderGuidance(templateName, context);
-
-      throw new Error(guidance);
-    } finally {
-      await storage.close();
-    }
-  };
-}
-
 // --- lazy_reject ---
 
 export const rejectTool: McpTool = {
   name: 'lazy_reject',
   description:
-    'Reject a task\'s work and send it back for rework. Discards all agent ' +
-    'work and resets the task. The agent will need to restart from scratch. ' +
-    'Use when the fundamental approach is wrong and feedback alone won\'t help.',
+    'Reject a task\'s work and close its PR with a reject review. The task\'s session ends with outcome \'rejected\', ' +
+    'the worktree is cleaned up, and the branch is preserved. ' +
+    'Requires an active session — for closing a task that hasn\'t been worked on, use lazy_close.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1622,8 +1689,9 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
 export const closeTool: McpTool = {
   name: 'lazy_close',
   description:
-    'Close (abandon) a task. The task\'s branch and worktree are cleaned up. ' +
-    'A reason is required to explain why the task is being closed.',
+    'Close a task — stop work and mark it as abandoned. Worktree is cleaned up but the branch is preserved. ' +
+    'A reason is required. Does not require an active session — works on backlog tasks. ' +
+    'For closing a task whose work you\'ve reviewed and want to reject (with PR cleanup), use lazy_reject.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1714,6 +1782,67 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
   };
 }
 
+// --- lazy_stop ---
+
+export const stopTool: McpTool = {
+  name: 'lazy_stop',
+  description:
+    'Halt a running task without auto-resume. The task transitions to ' +
+    '\'blocked\', a human turn note records the stop reason, and a user-stopped ' +
+    'flag prevents the reconciler from auto-resuming. Only \'working\' tasks can be ' +
+    'stopped — use lazy_close or lazy_unblock for other statuses. ' +
+    'To re-arm auto-resume and continue, call lazy_unblock. ' +
+    'Use only when the agent is on the wrong path and you need time to think before redirecting; for routine pause, let it block naturally.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+      reason: {
+        type: 'string',
+        description: 'Why the task is being stopped (required, non-empty). Recorded as a human turn and surfaced in lazy_show.',
+        minLength: 1,
+      },
+    },
+    required: ['task_id', 'reason'],
+  },
+};
+
+export function createStopHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+    const reason = args.reason as string | undefined;
+
+    if (!reason || !reason.trim()) {
+      throw new Error('lazy_stop requires a non-empty `reason`.');
+    }
+
+    const storage = await getStorage(ctx);
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+    } finally {
+      await storage.close();
+    }
+
+    const root = requireLazyRoot();
+    const params: StopTaskParams = { taskId, reason: reason.trim() };
+    const result = await stopTask(root, params);
+
+    return {
+      output: `Stopped task ${result.displayId}: ${result.reason}`,
+      taskId: result.taskId,
+      displayId: result.displayId,
+      reason: result.reason,
+    };
+  };
+}
+
 // --- lazy_submit ---
 
 export const submitTool: McpTool = {
@@ -1760,6 +1889,7 @@ export function createSubmitHandler(ctx: McpToolContext): McpToolHandler {
 export const resumeTool: McpTool = {
   name: 'lazy_resume',
   description:
+    '[Deprecated — use lazy_unblock with empty feedback instead.] ' +
     'Resume a blocked task without providing new feedback. Re-launches the ' +
     'agent with the existing prompt and context.',
   inputSchema: {
@@ -2656,6 +2786,7 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
       taskId: result.taskId,
       displayId: result.displayId,
       status: result.status,
+      warnings: result.warnings,
     };
   };
 }
@@ -2680,10 +2811,11 @@ export const allTools: McpTool[] = [
   conversationReadTool,
   startTool,
   unblockTool,
+  askTool,
   acceptTool,
-  abandonTool,
   rejectTool,
   closeTool,
+  stopTool,
   submitTool,
   resumeTool,
   listTool,
@@ -2715,10 +2847,11 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_conversation_read', createConversationReadHandler(ctx));
   handlers.set('lazy_start', createStartHandler(ctx));
   handlers.set('lazy_unblock', createUnblockHandler(ctx));
+  handlers.set('lazy_ask', createAskHandler(ctx));
   handlers.set('lazy_accept', createAcceptHandler(ctx));
-  handlers.set('lazy_abandon', createAbandonHandler(ctx));
   handlers.set('lazy_reject', createRejectHandler(ctx));
   handlers.set('lazy_close', createCloseHandler(ctx));
+  handlers.set('lazy_stop', createStopHandler(ctx));
   handlers.set('lazy_submit', createSubmitHandler(ctx));
   handlers.set('lazy_resume', createResumeHandler(ctx));
   handlers.set('lazy_list', createListHandler(ctx));

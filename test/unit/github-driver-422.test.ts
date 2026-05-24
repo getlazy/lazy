@@ -39,7 +39,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     },
     agent: {
       agent_id: 'test-agent',
-      watchdog_output_timeout_ms: 0,
+      watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0,
       effort: 'medium',
     },
     builder: {

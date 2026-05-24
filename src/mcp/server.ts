@@ -37,9 +37,11 @@ interface JsonRpcNotification {
 export class McpServer {
   private tools = new Map<string, { definition: McpTool; handler: McpToolHandler }>();
   private serverInfo: { name: string; version: string };
+  private instructions?: string;
 
-  constructor(info: { name: string; version: string }) {
+  constructor(info: { name: string; version: string }, options?: { instructions?: string }) {
     this.serverInfo = info;
+    this.instructions = options?.instructions;
   }
 
   /**
@@ -121,6 +123,7 @@ export class McpServer {
               tools: {},
             },
             serverInfo: this.serverInfo,
+            ...(this.instructions ? { instructions: this.instructions } : {}),
           },
         });
         break;

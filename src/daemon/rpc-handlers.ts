@@ -29,7 +29,7 @@ import { getDiffStat, getDiffFull, getCurrentBranch, branchExists, recoverMissin
 import { getNewNotesSince } from '../cli/commands/shared';
 import { getWorktreePath, getBranchNameFromId, displayId, formatDate } from '../cli/helpers';
 import { launchTask, writeDaemonMcpConfig, type StartTaskParams } from './task-launcher';
-import { launchUnblockTask, launchAskTask, rejectTask, closeTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
+import { launchUnblockTask, launchAskTask, rejectTask, closeTask, stopTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type StopTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
 import type { Comment } from '../types';
 import { logger } from '../utils/logger';
 
@@ -147,8 +147,8 @@ export async function handleRpc(
     case 'acceptTaskPreflight': return handleAcceptTaskPreflight(projectRoot, params);
     case 'acceptTask': return handleAcceptTask(projectRoot, params);
     case 'rejectTask': return handleRejectTask(projectRoot, params);
-    case 'abandonTask': return handleAbandonTask(projectRoot, params);
     case 'closeTask': return handleCloseTask(projectRoot, params);
+    case 'stopTask': return handleStopTask(projectRoot, params);
     case 'submitTask': return handleSubmitTask(projectRoot, params);
     case 'resumeTask': return handleResumeTask(projectRoot, params);
     case 'syncTask': return handleSyncTask(projectRoot, params);
@@ -247,6 +247,8 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     parent: data.parent,
     retryStatus: data.retryStatus,
     orphanStatus: data.orphanStatus,
+    autoReactStatus: data.autoReactStatus,
+    supervisorStatus: data.supervisorStatus,
   };
 }
 
@@ -647,23 +649,20 @@ export async function handleCloseTask(projectRoot: string, params: Record<string
   return closeTask(projectRoot, closeParams);
 }
 
-// --- Abandon Task ---
+// --- Stop Task ---
 
-export async function handleAbandonTask(projectRoot: string, params: Record<string, unknown>) {
-  const abandonParams: CloseTaskParams = {
+export async function handleStopTask(projectRoot: string, params: Record<string, unknown>) {
+  const stopParams: StopTaskParams = {
     taskId: params.taskId as string,
     reason: params.reason as string,
-    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
   };
-
-  if (!abandonParams.taskId) {
+  if (!stopParams.taskId) {
     throw new RpcError(400, 'taskId is required');
   }
-  if (!abandonParams.reason) {
+  if (!stopParams.reason || !stopParams.reason.trim()) {
     throw new RpcError(400, 'reason is required');
   }
-
-  return closeTask(projectRoot, abandonParams);
+  return stopTask(projectRoot, stopParams);
 }
 
 // --- Submit Task ---
@@ -801,6 +800,7 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   recordInterrupt: (s, a) => s.recordInterrupt(a.sessionId as string, a.diagnostics as any),
   resetConsecutiveInterruptions: (s, a) => s.resetConsecutiveInterruptions(a.sessionId as string),
   setAutoResumed: (s, a) => s.setAutoResumed(a.sessionId as string, a.autoResumed as boolean),
+  setUserStopped: (s, a) => s.setUserStopped(a.sessionId as string, a.userStopped as boolean),
 
   // Turns
   createTurn: (s, a) => s.createTurn(a.options as any),

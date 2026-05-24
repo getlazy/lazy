@@ -127,6 +127,100 @@ export async function runClaude(
   return getMockResponse();
 }
 
+/**
+ * Mock for `runClaudeOneshot` used by `lazy report`'s map-reduce.
+ *
+ * The real command makes N+1 calls: one per task or non-lazy commit
+ * (map phase), then one reduce. To let tests verify map+reduce wiring,
+ * the mock inspects the prompt's stage marker:
+ *
+ *   <!-- LAZY_REPORT_STAGE: task   -->  → return `[map:task:<code>]`
+ *   <!-- LAZY_REPORT_STAGE: commit -->  → return `[map:commit:<sha7>]`
+ *   <!-- LAZY_REPORT_STAGE: reduce -->  → return a synthesized three-section
+ *       markdown whose lead tier echoes every unit summary the reduce saw,
+ *       so tests can grep stdout for the expected `[map:task:*]` /
+ *       `[map:commit:*]` markers. If `LAZY_MOCK_CLAUDE_RESPONSE` is set,
+ *       its `result` overrides this synthesis (lets older tests pin the
+ *       final body verbatim).
+ *
+ * Two extra knobs for new tests:
+ *   LAZY_MOCK_FAIL_KEYWORD       — if the prompt contains this substring,
+ *                                   the mock throws (simulates a map
+ *                                   failure that the reduce must survive).
+ *   No marker present            — falls through to the default
+ *                                   `LAZY_MOCK_CLAUDE_RESPONSE` behavior,
+ *                                   matching the non-report callers.
+ */
+export async function runClaudeOneshot(
+  prompt: string,
+  _model?: string,
+): Promise<AgentResponse> {
+  // Only fail at map stages — the reduce prompt may legitimately echo the
+  // failure keyword in the failed-units list, and we don't want that to
+  // cascade into a reduce failure too.
+  const failKw = process.env.LAZY_MOCK_FAIL_KEYWORD;
+  const isMap = prompt.includes('LAZY_REPORT_STAGE: task') || prompt.includes('LAZY_REPORT_STAGE: commit');
+  if (failKw && isMap && prompt.includes(failKw)) {
+    throw new Error(`mock claude failure (sentinel matched)`);
+  }
+
+  if (prompt.includes('LAZY_REPORT_STAGE: task')) {
+    // Extract the task display id from the bundle header
+    // `### Task <code> — <goal>`.
+    const m = prompt.match(/### Task ([^\s—]+)/);
+    const code = m ? m[1] : 'unknown';
+    return {
+      result: `[map:task:${code}] mocked lead-tier summary for task ${code}.`,
+      session_id: `mock-task-${code}`,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  }
+
+  if (prompt.includes('LAZY_REPORT_STAGE: commit')) {
+    // Extract the short SHA from `### Commit <sha7> on main`.
+    const m = prompt.match(/### Commit ([0-9a-f]{7,40}) on main/);
+    const sha = m ? m[1].slice(0, 7) : 'unknown';
+    return {
+      result: `[map:commit:${sha}] mocked lead-tier summary for commit ${sha}.`,
+      session_id: `mock-commit-${sha}`,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  }
+
+  if (prompt.includes('LAZY_REPORT_STAGE: reduce')) {
+    // Always synthesize for the reduce stage — tests that need the
+    // synthesized body to be observable shouldn't have to fight the
+    // harness's default `LAZY_MOCK_CLAUDE_RESPONSE`. The synthesis
+    // echoes every `[map:...]` marker from the units block so tests
+    // can verify map outputs flow into the reduce input.
+    const markers = Array.from(prompt.matchAll(/\[map:(task|commit):([^\]]+)\]/g))
+      .map(mm => `[map:${mm[1]}:${mm[2]}]`);
+    const leadBody = markers.length > 0
+      ? markers.map(m => `- ${m}`).join('\n')
+      : 'Nothing of note in this window.';
+    const result = [
+      '## Brief',
+      '',
+      `Mocked digest covering ${markers.length} unit(s).`,
+      '',
+      '## For the engineering manager',
+      '',
+      '- Mocked manager-tier bullet.',
+      '',
+      '## For the engineering lead',
+      '',
+      leadBody,
+    ].join('\n');
+    return {
+      result,
+      session_id: 'mock-reduce',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  }
+
+  return getMockResponse();
+}
+
 export async function resumeClaude(
   claudeSessionId: string,
   prompt: string,

@@ -141,6 +141,13 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = `${status} [CRASHED]`;
   }
 
+  // Indicate user-stopped interrupted tasks (parallel to [CRASHED]).
+  // [STOPPED] means the reconciler will NOT auto-resume; a manual
+  // resume/unblock is required.
+  if (task.status === 'interrupted' && sess?.user_stopped) {
+    status = `${status} [STOPPED]`;
+  }
+
   // Add auto-react paused indicator
   if (task.metadata?.auto_react_paused === 'true') {
     status = `${status} [AUTO-REACT PAUSED]`;

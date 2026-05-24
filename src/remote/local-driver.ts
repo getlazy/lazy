@@ -21,6 +21,7 @@ import type {
 } from './driver';
 import type { Task } from '../types';
 import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch } from '../git/operations';
+import { runGit } from '../utils/git';
 
 export class LocalDriver implements RepositoryDriver {
   needsSync = false;
@@ -48,13 +49,41 @@ export class LocalDriver implements RepositoryDriver {
       };
     }
 
+    // Capture the parent branch HEAD before the squash so we can verify the merge
+    // actually produced a commit. The accept flow deletes the source branch after
+    // merge() returns success — if the squash silently produces no commit (e.g.,
+    // a future regression of the missing-`await` bug that lost 8 task branches),
+    // we MUST return failed so the caller skips cleanup and preserves the work.
+    const preSquashShaResult = await runGit(['rev-parse', '--verify', targetBranch], { cwd: root });
+    if (preSquashShaResult.exitCode !== 0) {
+      return {
+        status: 'failed',
+        error: `Failed to resolve ${targetBranch} before merge: ${preSquashShaResult.stderr || 'unknown error'}`,
+      };
+    }
+    const preSquashSha = preSquashShaResult.stdout.trim();
+
     // Perform the squash merge — local merges are always immediate, never pending
     try {
-      squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root);
+      await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root);
     } catch (err) {
       return {
         status: 'failed',
         error: `Merge failed: ${err instanceof Error ? err.message : err}`,
+      };
+    }
+
+    const postSquashShaResult = await runGit(['rev-parse', '--verify', targetBranch], { cwd: root });
+    if (postSquashShaResult.exitCode !== 0) {
+      return {
+        status: 'failed',
+        error: `Failed to verify merge into ${targetBranch}: ${postSquashShaResult.stderr || 'unknown error'}`,
+      };
+    }
+    if (postSquashShaResult.stdout.trim() === preSquashSha) {
+      return {
+        status: 'failed',
+        error: `squash merge produced no commit on ${targetBranch} — source branch not deleted, worktree preserved`,
       };
     }
 

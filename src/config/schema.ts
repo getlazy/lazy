@@ -6,6 +6,9 @@
  *
  * The 'features' section is excluded because it accepts arbitrary keys.
  * The 'remote' section's valid keys are extended at runtime by the driver.
+ *
+ * When you add, rename, or remove a key here, also update
+ * docs/lazy-toml.md so the user-facing reference stays in sync.
  */
 
 /**
@@ -24,10 +27,10 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   storage: ['backend', 'external_path', 'postgres_ssl'],
   git: ['default_branch_prefix'],
   output: ['shortid_length'],
-  agent: ['agent_id'],
+  agent: ['agent_id', 'watchdog_output_timeout_ms', 'graceful_exit_timeout_ms', 'effort'],
   server: ['port', 'sync_interval'],
   remote: [
-    'driver', 'git_remote',
+    'driver', 'git_remote', 'auto_approve',
     // Driver-specific keys are also valid at the schema level — a user may
     // configure GitHub keys while temporarily using the local driver, and we
     // should not warn about them. Drivers extend this list at runtime too.

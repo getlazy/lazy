@@ -69,6 +69,12 @@ I'm stuck because [specific reason]. This requires [host-level access / tools I 
 Do not struggle silently through repeated failures. If you've tried 2-3 approaches and the
 problem is environmental, recommend pairing immediately.
 
+**Before recommending pairing for a missing tool, try installing it.** Your runner-specific
+instructions (e.g. Docker agent instructions) describe how — typically `sudo apt-get update
+&& sudo apt-get install -y <package>`. Missing compilers, linters, test runners, and other
+packages are usually a one-command fix, not a reason to block. Only recommend pairing when
+installation actually fails or the missing capability genuinely requires host access.
+
 Guidelines for your summary response:
 Your final response should include context about your decision-making process, not just the outcome:
 - What worked: Successful approaches and why they succeeded

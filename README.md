@@ -49,6 +49,13 @@ lazy accept <task-id>
 
 # Or reject if it's not right
 lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
+
+# Or close it if you don't even want to do it
+lazy close <task-id> --reason "Won't do"
+
+# Sometimes you will want to stop the task and give it new direction
+lazy stop <task-id> --reason "We need to pivot"
+lazy unblock <task-id> --reason "New direction to pivot to"
 ```
 
 ## Core components
@@ -340,7 +347,7 @@ A unit of work consists of a **goal** (one-line description) and **prompt** (det
 - `abandoned` — Rejected and closed
 - `closed` — Closed without work (cancelled)
 
-Tasks can have child tasks (created via branching or proposals) for exploring alternatives or follow-up work. These child tasks naturally merge into parent's branch.
+Tasks can have child tasks (created via branching or proposals) for exploring alternatives or follow-up work. These child tasks naturally merge into parent's branch. They also naturally merge advances from their parent's branch (`sync` in `lazy`'s parlance)
 
 #### Task Lifecycle Flow
 
@@ -408,6 +415,43 @@ Run `lazy doctor` to validate your configuration.
 
 ## Advanced Features
 
+### Search and Context Retrieval
+
+One of the main features of `lazy` is the ability to search over what was said *and* done between the engineer and builders and dedicated task agents:
+
+```bash
+lazy search "error handling"
+```
+
+Searches all tasks, turns, commits, comments, and imported conversations. Agents use `lazy_search` to find rationale from past work when making decisions.
+
+```bash
+lazy search "code:a-task"
+```
+
+Searches for all the tasks with `a-task` code. Codes are not unique so lazy will offer to disambiguate.
+
+For more details:
+
+```bash
+lazy search --help
+```
+
+### Reports
+
+Usually I work on multiple initiatives within the same project and my knowledge is usually more shallow than engineering level. Hence I act more either as a lead engineer or engineering manager and `lazy report` allows me to deliberately pass over the details one more time by going over the lazy tasks *and* independent commits and summarizing them ()
+
+```bash
+# To generate report and dump it as Markdown into stdout
+lazy report
+# To generate and open a PDF
+lazy report --pdf
+# To generate a PDF and save it as a file to share with others
+lazy report --pdf --out <path-to-pdf>
+```
+
+An example of the output can be found [here](docs/lazy-report-example-20260523.md).
+
 ### Collaborative Pairing
 
 ```bash
@@ -426,6 +470,63 @@ This is rarely needed as you usually want to unblock with review and move on. Bu
 #### Taskless pairing
 
 As I mentioned before, when you are working on a set of very, very small tasks, the turn based "lazy-ness" is... not great. At those times you are doing a lot of back and forth and you don't want to just delegate: you want to be hands-on. For those moments, `lazy pair` can be invoked without any task ID, right on the branch that you want to be modifying, and it will start a new conversation that will be captured, just like any other `lazy` conversation, but without any task to anchor on.
+
+### Watching the Journey
+
+Sometimes I want to see what is going on with the agent - is it stuck or working?
+
+```bash
+lazy watch <task-id>
+```
+
+That shows both agent output and `lazy`'s agent supervisor output which drives the external harness:
+
+```
+▷ You are continuing to work on a task with an explicit goal of: Test stop semantics — explore the codebase verbosely so the human can issue lazy stop and verify the new blocked-not-interrupted behavior
+
+I reviewed your last response and made edits to indicate what should change.
+Here is a unified diff of my edits (- = remove/wrong, + = add/correct):
+
+```diff
+I reviewed your last response and made edits to indicate what should change.
+Here is a unified diff of my edits (- = remove/wrong, + = add/correct):
+
+```diff
+Index: agent-response
+===================================================================
+--- agent-response
++++ agent-response
+@@ -1,1 +1,3 @@
+ Waiting ~3 minutes. Issue `lazy stop <task>` now to verify the task transitions to `blocked` (not `interrupted`), shows the `[STOPPED]` chip in `lazy list`, and `User-stopped: yes` in `lazy show`.
++
++You didn't wait - you can you just run a bash script to wait?
+
+```
+
+Please apply these changes to your approach and continue working.
+
+───  Response ───────────────────────────────────────────────
+Running a blocking wait so the process is genuinely busy while you issue `lazy stop`.
+────────────────────────────────────────────────────────────
+
+▶ Bash for i in $(seq 1 18); do echo "waiting... ${i}0s elapsed"; sleep 10; done; ec...
+Supervisor: phase=work (7s)
+Supervisor: phase=work (12s)
+```
+
+### Correcting the Course
+
+Other times I will want to correct the course of a that was maybe started by chance or that is not going where it should go:
+
+```bash
+lazy stop <task-id>
+```
+
+#### Re `watch` and `stop` in spite of `lazy`'s asynchronous paradigm
+
+I consider the use of these actions a smell because it goes directly against the async first nature of `lazy`. So why even build them? I didn't at first but over time it became clear that for it's useful to sometimes observe the agent in its work, mostly for troubleshooting but sometimes things are taking much longer and I start to wonder. As for `stop`, honestly I rarely if ever want to change the direction for the agent: I think we are better off, all told, if we don't micromanage but again follow the async model. But rarely but sometimes the agent was started by the builder onto a truly wrong path or at the wrong time or something has gone astray e.g. same as with `watch` you want to observe it and sometimes, just sometimes you want to stop the agent.
+
+So occasionally useful but if you find yourself using them more than a few times a week, I would the model, effort, how well prompts are written and so on. And of course, I would love to hear about it.
 
 ### Confirmation Protocol
 
@@ -520,26 +621,6 @@ Comment sync brings PR/MR review comments into the agent's context, so external 
 | `gitlab` | Squash merge (GitLab API) | MR on first turn | MR notes ↔ agent turns | GitLab CI | `glab` |
 
 Run `lazy doctor` to verify your driver setup and authentication.
-
-### Search and Context Retrieval
-
-```bash
-lazy search "error handling"
-```
-
-Searches all tasks, turns, commits, comments, and imported conversations. Agents use `lazy_search` to find rationale from past work when making decisions.
-
-```bash
-lazy search "code:a-task"
-```
-
-Searches for all the tasks with `a-task` code. Codes are not unique so lazy will offer to disambiguate.
-
-For more details:
-
-```bash
-lazy search --help
-```
 
 ### Upgrading
 
@@ -664,23 +745,6 @@ export ANTHROPIC_API_KEY="your-key-here"
 # Option 2: Claude Code OAuth token
 claude setup-token
 # Then set CLAUDE_CODE_OAUTH_TOKEN
-```
-
-### Task stuck in "working" state
-
-If a container crashes or is killed, the task may show as `working`. Use:
-
-```bash
-lazy resume <task-id>
-```
-
-Unless the container has been deleted, `lazy` will resume the agent's session.
-
-Or check status and manually reconcile:
-
-```bash
-lazy status <task-id>
-lazy doctor  # Checks for stale containers
 ```
 
 ### Merge conflicts during accept

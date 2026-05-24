@@ -9,21 +9,6 @@ describe('VanillaTerminalDriver', () => {
     expect(driver.isRich).toBe(false);
   });
 
-  // INVARIANT: VanillaTerminalDriver must be truly no-op.
-  // Zero overhead when not in tmux.
-  test('setActivity is a no-op', () => {
-    const driver = new VanillaTerminalDriver();
-    // Should not throw
-    driver.setActivity('lazy builder');
-    driver.setActivity('lazy pair fix-auth');
-  });
-
-  test('restoreTitle is a no-op', () => {
-    const driver = new VanillaTerminalDriver();
-    // Should not throw
-    driver.restoreTitle();
-  });
-
   test('watchTask returns error about tmux requirement', async () => {
     const driver = new VanillaTerminalDriver();
     const result = await driver.watchTask('lazy-abc12345');
@@ -36,29 +21,6 @@ describe('TmuxDriver', () => {
   test('isRich is true', () => {
     const driver = new TmuxDriver();
     expect(driver.isRich).toBe(true);
-  });
-
-  // Note: TmuxDriver methods shell out to tmux, so we can't fully test them
-  // without tmux installed. We verify the class shape and that methods don't
-  // crash when tmux is not available (they swallow errors by design).
-
-  test('setActivity swallows errors when tmux is not available', () => {
-    const driver = new TmuxDriver();
-    // Should not throw even if tmux binary is not found
-    driver.setActivity('lazy builder');
-  });
-
-  test('restoreTitle is a no-op when no activity was set', () => {
-    const driver = new TmuxDriver();
-    // Should not throw — no saved state to restore
-    driver.restoreTitle();
-  });
-
-  test('restoreTitle swallows errors after setActivity', () => {
-    const driver = new TmuxDriver();
-    driver.setActivity('test');
-    // Should not throw even if tmux commands fail
-    driver.restoreTitle();
   });
 
   test('watchTask returns error when session does not exist', async () => {

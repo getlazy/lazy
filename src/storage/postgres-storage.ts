@@ -204,12 +204,21 @@ export class PostgresStorage implements Storage {
           interrupt_logs TEXT,
           consecutive_interruptions INTEGER NOT NULL DEFAULT 0,
           auto_resumed BOOLEAN NOT NULL DEFAULT FALSE,
+          user_stopped BOOLEAN NOT NULL DEFAULT FALSE,
           started_at BIGINT NOT NULL,
           ended_at BIGINT
         )
       `;
 
       await sql`CREATE INDEX IF NOT EXISTS idx_sessions_task_id ON sessions(task_id)`;
+
+      // Migration: add user_stopped column if missing (for existing databases)
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_stopped BOOLEAN NOT NULL DEFAULT FALSE;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
 
       // Turns table
       await sql`
@@ -774,6 +783,7 @@ export class PostgresStorage implements Storage {
       interrupt_logs: null,
       consecutive_interruptions: 0,
       auto_resumed: false,
+      user_stopped: false,
       started_at: now,
       ended_at: null,
     };
@@ -870,11 +880,17 @@ export class PostgresStorage implements Storage {
   }
 
   async resetConsecutiveInterruptions(sessionId: string): Promise<void> {
-    await this.sql`UPDATE sessions SET consecutive_interruptions = 0 WHERE id = ${sessionId}`;
+    // Manual resume/unblock re-arms auto-resume: clear the user-stop gate
+    // and auto_resumed flag alongside the counter (mirrors FileStorage).
+    await this.sql`UPDATE sessions SET consecutive_interruptions = 0, auto_resumed = FALSE, user_stopped = FALSE WHERE id = ${sessionId}`;
   }
 
   async setAutoResumed(sessionId: string, autoResumed: boolean): Promise<void> {
     await this.sql`UPDATE sessions SET auto_resumed = ${autoResumed} WHERE id = ${sessionId}`;
+  }
+
+  async setUserStopped(sessionId: string, userStopped: boolean): Promise<void> {
+    await this.sql`UPDATE sessions SET user_stopped = ${userStopped} WHERE id = ${sessionId}`;
   }
 
   async createTurn(options: CreateTurnOptions): Promise<Turn> {

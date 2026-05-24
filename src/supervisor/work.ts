@@ -14,9 +14,11 @@ import type { RetryError } from '../protocol/types';
 import { hasCommand } from '../protocol/io';
 import { log, logError } from './log';
 import type { Agent } from '../agent/interface';
-import { execWithWatchdog, WatchdogTimeoutError } from './watchdog';
+import { execWithWatchdog, WatchdogTimeoutError, GracefulExitTimeoutError } from './watchdog';
+import { clearTurnEndSignal, turnEndSignalPath } from '../protocol/turn-end-signal';
+import { findLatestSessionFile } from '../agent/session-discovery';
 
-export { WatchdogTimeoutError };
+export { WatchdogTimeoutError, GracefulExitTimeoutError };
 
 export interface WorkResult {
   result: string;
@@ -83,6 +85,8 @@ async function executeAgent(
   watchdogTimeoutMs?: number,
   effort?: string,
   permissionMode?: 'plan' | 'default',
+  protocolDir?: string,
+  gracefulExitTimeoutMs?: number,
 ): Promise<WorkResult> {
   const claudeArgs = agent.buildExecArgs({
     prompt,
@@ -96,13 +100,23 @@ async function executeAgent(
 
   const launchTime = Date.now();
   const effectiveTimeout = watchdogTimeoutMs ?? 0;
+  const effectiveGracefulMs = gracefulExitTimeoutMs ?? 0;
+  const markerPath = protocolDir ? turnEndSignalPath(protocolDir) : undefined;
 
-  const { stdout: output, stderr, exitCode, killedByWatchdog } = await execWithWatchdog(
+  // Clear any stale end-of-turn marker from a previous turn so the
+  // graceful-exit watcher doesn't fire on startup.
+  if (protocolDir) {
+    await clearTurnEndSignal(protocolDir);
+  }
+
+  const { stdout: output, stderr, exitCode, killedByWatchdog, killedByGracefulExit, gracefulExitElapsedMs } = await execWithWatchdog(
     claudeArgs,
     {
       cwd: worktreePath,
       env: process.env as Record<string, string>,
       timeoutMs: effectiveTimeout,
+      gracefulExitMarkerPath: markerPath,
+      gracefulExitTimeoutMs: effectiveGracefulMs,
     },
   );
 
@@ -111,6 +125,21 @@ async function executeAgent(
   // Watchdog kill is a specific non-retriable error
   if (killedByWatchdog) {
     throw new WatchdogTimeoutError(effectiveTimeout, runtime);
+  }
+
+  if (killedByGracefulExit) {
+    const recoveredSessionId = await recoverSessionIdForGracefulExit(
+      worktreePath,
+      claudeSessionId,
+      launchTime,
+    );
+    throw new GracefulExitTimeoutError({
+      timeoutMs: effectiveGracefulMs,
+      durationMs: runtime,
+      elapsedSinceSignalMs: gracefulExitElapsedMs ?? effectiveGracefulMs,
+      markerPath: markerPath ?? '',
+      sessionId: recoveredSessionId,
+    });
   }
 
   if (exitCode !== 0) {
@@ -164,6 +193,44 @@ async function executeAgent(
       stdoutError: output.substring(0, 500),
       durationMs: Date.now() - launchTime,
     });
+  }
+}
+
+/**
+ * Recover the Claude session id after a graceful-exit kill, so the human can
+ * `lazy unblock` to resume the conversation instead of orphaning it.
+ *
+ * INVARIANT: GracefulExitTimeoutError must carry session_id whenever it is
+ * recoverable. Two paths:
+ *
+ *   1. Resumed turn — the daemon already passed `agent_session_id` to the
+ *      supervisor, which forwarded it as `--resume`. We have it locally.
+ *   2. Fresh first turn — Claude writes
+ *      `<worktree>/.lazy-task-sandbox/.claude/projects/<encoded>/<session-id>.jsonl`
+ *      from the moment it starts (same path `lazy watch` discovers). Pick the
+ *      file modified after `launchTime` so we ignore stale sessions from
+ *      previous turns.
+ *
+ * Returns undefined only when neither path yields anything (e.g. claude died
+ * before writing any jsonl). The caller logs that case so it is debuggable.
+ */
+export async function recoverSessionIdForGracefulExit(
+  worktreePath: string,
+  claudeSessionId: string | undefined,
+  launchTime: number,
+): Promise<string | undefined> {
+  if (claudeSessionId) return claudeSessionId;
+  try {
+    const info = await findLatestSessionFile(worktreePath, launchTime);
+    if (info) {
+      log(`[work] Recovered session id ${info.sessionId.substring(0, 8)} from ${info.path} after graceful-exit kill.`);
+      return info.sessionId;
+    }
+    log('[work] No JSONL session file found in worktree after graceful-exit kill — response will omit session_id (agent likely died before writing).');
+    return undefined;
+  } catch (err) {
+    log(`[work] Failed to discover session id after graceful-exit kill: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
   }
 }
 
@@ -256,11 +323,12 @@ export async function runWork(
   watchdogTimeoutMs?: number,
   effort?: string,
   permissionMode?: 'plan' | 'default',
+  gracefulExitTimeoutMs?: number,
 ): Promise<WorkResult> {
   const execute = _executeOverride
     ? _executeOverride
     : (wt: string, p: string, sp?: string, mid?: string, sid?: string, eff?: string, pm?: 'plan' | 'default') =>
-        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm);
+        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm, protocolDir, gracefulExitTimeoutMs);
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {
@@ -301,6 +369,14 @@ export async function runWork(
       // hung (no output for the configured timeout). Retrying would likely
       // just hang again. Surface the error so the turn is marked as failed.
       if (err instanceof WatchdogTimeoutError) {
+        throw err;
+      }
+
+      // INVARIANT: Graceful-exit kills are never retried. The agent had
+      // signalled end-of-turn (lazy_commit) — its work is already on disk.
+      // Re-running the agent would either redo committed work or hang on the
+      // same stuck tool call that caused the kill in the first place.
+      if (err instanceof GracefulExitTimeoutError) {
         throw err;
       }
 

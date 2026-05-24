@@ -7,7 +7,7 @@ import { runGit } from '../../utils/git';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
 import { showTaskContext, runFeedbackFlow, getEditorFeedback, syncTaskFromRemote, getNewNotesSince } from './shared';
 import { commandAccept } from './accept';
-import { commandAbandon } from './abandon';
+import { commandReject } from './reject';
 import { commandRedo } from './redo';
 import { readPendingProposals, updateProposalStatus, type Proposal } from './propose';
 import { commandCreate } from './create';
@@ -265,14 +265,14 @@ export async function commandUnblock(args: string[]): Promise<void> {
           ? [
               'Give feedback - includes unseen comments (recommended)',
               `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
-              'Abandon (discard work)',
+              'Reject (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
               ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ]
           : [
               'Give feedback (open editor)',
               'Accept (merge work)',
-              'Abandon (discard work)',
+              'Reject (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
               ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ];
@@ -301,7 +301,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
             await commandAccept([taskShortId]);
             return;
           case 2:
-            await commandAbandon([taskShortId]);
+            await commandReject([taskShortId]);
             return;
           default:
             break;

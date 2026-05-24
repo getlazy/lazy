@@ -1,19 +1,13 @@
 /**
- * Terminal abstraction for managing window titles and observing agent sessions.
+ * Terminal abstraction for observing agent sessions.
  *
  * Implementations:
- * - TmuxDriver: renames tmux windows to reflect activity, supports read-only watching
+ * - TmuxDriver: supports read-only watching of agent sessions inside tmux
  * - VanillaTerminalDriver: no-op fallback for non-tmux environments
  */
 
 export interface Terminal {
-  /** Set the terminal/window title for the current activity (e.g. "lazy builder") */
-  setActivity(activity: string): void;
-
-  /** Restore the previous window title (call on exit/cleanup) */
-  restoreTitle(): void;
-
-  /** Whether this terminal supports rich features (tmux window naming, watching) */
+  /** Whether this terminal supports rich features (e.g. tmux session watching) */
   readonly isRich: boolean;
 
   /**

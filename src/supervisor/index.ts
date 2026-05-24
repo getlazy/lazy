@@ -45,7 +45,9 @@ import type {
 } from '../protocol/types';
 import type { MergeConflict } from '../types';
 import { runSyncWithUpstream, runSyncWithRemote, hasMergeInProgress, hasUnmergedFiles, abortMergeIfInProgress } from './merge';
-import { runWork, CrashError, WatchdogTimeoutError, type RetryState } from './work';
+import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, type RetryState } from './work';
+import askSystemPrompt from '../prompts/ask-system-prompt.md' with { type: 'text' };
+import { runPostTurnCheck } from './post-turn-check';
 import { resolveWatchdogTimeout } from './watchdog';
 import { getAgent } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
@@ -290,12 +292,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   log(`[supervisor] Pre-turn SHA: ${preTurnSha.substring(0, 8)}`);
 
   // Initialize status
+  const initialNow = new Date().toISOString();
   const status: SupervisorStatus = {
     phase: 'reading_command',
     task_id: cmd.task_id,
     command_type: cmd.type,
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: initialNow,
+    updated_at: initialNow,
+    phase_started_at: initialNow,
     pre_turn_sha: preTurnSha,
     pid: process.pid,
   };
@@ -411,10 +415,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const onRetryStateChange = (retryState: RetryState | null) => {
       if (retryState) {
         // Entering or updating retry state
+        const retryNow = new Date().toISOString();
+        if (status.phase !== 'retrying') {
+          status.phase_started_at = retryNow;
+        }
         status.phase = 'retrying';
         status.retryCount = retryState.count;
         status.errors = retryState.errors;
-        status.updated_at = new Date().toISOString();
+        status.updated_at = retryNow;
         writeStatus(protocolDir, status);
         log(`[supervisor] Phase: retrying (attempt ${retryState.count})`);
       } else {
@@ -451,6 +459,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       effectiveWatchdogMs,
       cmd.effort,
       permissionMode,
+      cmd.graceful_exit_timeout_ms,
     );
 
     updatePhase(status, 'work_done', protocolDir);
@@ -539,31 +548,27 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       log(`[supervisor] Running post-turn check (timeout: ${timeoutSecs}s)`);
       updatePhase(status, 'post_turn_check', protocolDir);
       try {
-        const proc = spawn(['sh', '-c', cmd.post_turn_check], {
-          cwd: worktreePath,
-          stdout: 'pipe',
-          stderr: 'pipe',
-          timeout: 0, // Long-running: post_turn_timeout in lazy.toml controls this (default 300s)
-        });
-
-        // Race the process against the timeout
-        const timeoutMs = timeoutSecs * 1000;
-        const timeout = new Promise<'timeout'>(resolve =>
-          setTimeout(() => resolve('timeout'), timeoutMs),
+        const result = await runPostTurnCheck(
+          cmd.post_turn_check,
+          worktreePath,
+          timeoutSecs * 1000,
         );
-        const exited = proc.exited.then(() => 'exited' as const);
-        const winner = await Promise.race([exited, timeout]);
-
-        if (winner === 'timeout') {
-          proc.kill();
-          checkExitCode = -2;
-          checkOutput = `Post-turn check timed out after ${timeoutSecs}s`;
-          logWarn(`[supervisor] Post-turn check timed out after ${timeoutSecs}s`);
+        checkExitCode = result.exitCode;
+        const truncatedStderr = truncateLog(result.stderr);
+        if (result.timedOut) {
+          checkOutput =
+            `Post-turn check timed out after ${timeoutSecs}s ` +
+            `(killed with ${result.killSignal ?? 'SIGTERM'} after ${result.elapsedMs}ms)\n\n` +
+            `--- stderr at timeout ---\n${truncatedStderr}`;
+          logWarn(
+            `[supervisor] Post-turn check timed out after ${timeoutSecs}s ` +
+              `(killSignal=${result.killSignal}, elapsedMs=${result.elapsedMs})`,
+          );
         } else {
-          checkExitCode = proc.exitCode ?? undefined;
-          const stderr = await new Response(proc.stderr).text();
-          checkOutput = truncateLog(stderr);
-          log(`[supervisor] Post-turn check exited with code ${checkExitCode}`);
+          checkOutput = truncatedStderr;
+          log(
+            `[supervisor] Post-turn check exited with code ${checkExitCode} (elapsedMs=${result.elapsedMs})`,
+          );
         }
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -642,6 +647,18 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       errorResponse.duration_ms = err.durationMs;
     } else if (err instanceof WatchdogTimeoutError) {
       errorResponse.duration_ms = err.durationMs;
+    } else if (err instanceof GracefulExitTimeoutError) {
+      // The agent already committed its work — the marker that triggered this
+      // kill is written by lazy_commit. The commit is preserved in git either
+      // way. The agent's JSON response (summary) is lost, but the session_id
+      // is recovered when possible (resume case or jsonl tail) so the human
+      // can `lazy unblock` to resume the conversation cleanly.
+      errorResponse.duration_ms = err.durationMs;
+      if (err.sessionId) {
+        errorResponse.session_id = err.sessionId;
+      } else {
+        logWarn('[supervisor] GracefulExitTimeoutError: no session_id recovered — agent likely died before writing any JSONL.');
+      }
     }
 
     writeResponse(protocolDir, errorResponse);
@@ -661,12 +678,14 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   const preTurnSha = await getHeadSha(worktreePath);
   log(`[supervisor] Sync command: pre-turn SHA ${preTurnSha.substring(0, 8)}, parent_branch=${cmd.parent_branch}`);
 
+  const syncNow = new Date().toISOString();
   const status: SupervisorStatus = {
     phase: 'reading_command',
     task_id: cmd.task_id,
     command_type: 'sync',
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: syncNow,
+    updated_at: syncNow,
+    phase_started_at: syncNow,
     pre_turn_sha: preTurnSha,
     pid: process.pid,
   };
@@ -789,12 +808,14 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Prom
 
   log(`[supervisor] Ask command for task ${cmd.task_id.substring(0, 8)} (effort=${cmd.effort ?? 'default'})`);
 
+  const askNow = new Date().toISOString();
   const status: SupervisorStatus = {
     phase: 'work',
     task_id: cmd.task_id,
     command_type: 'ask',
-    started_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    started_at: askNow,
+    updated_at: askNow,
+    phase_started_at: askNow,
     pid: process.pid,
   };
   writeStatus(protocolDir, status);
@@ -808,10 +829,14 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Prom
 
     const onRetryStateChange = (retryState: RetryState | null) => {
       if (retryState) {
+        const retryNow = new Date().toISOString();
+        if (status.phase !== 'retrying') {
+          status.phase_started_at = retryNow;
+        }
         status.phase = 'retrying';
         status.retryCount = retryState.count;
         status.errors = retryState.errors;
-        status.updated_at = new Date().toISOString();
+        status.updated_at = retryNow;
         writeStatus(protocolDir, status);
       } else {
         delete status.retryCount;
@@ -819,12 +844,23 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Prom
       }
     };
 
+    // Ask mode locks down write tools at three layers (defense in depth):
+    //   1. --disallowedTools Bash/Write/Edit (see ClaudeCodeAgent.buildExecArgs)
+    //   2. LAZY_MCP_READ_ONLY=1 env var — write MCP tools (lazy_commit,
+    //      lazy_propose, lazy_comment) reject any call. The PID-1 wrapper
+    //      restarts the supervisor per turn, so this env override is per-turn.
+    //   3. Stern ask-system-prompt steering the agent to answer in text only.
+    process.env.LAZY_MCP_READ_ONLY = '1';
+    const askPrompt = cmd.system_prompt
+      ? `${askSystemPrompt}\n\n---\n\n${cmd.system_prompt}`
+      : askSystemPrompt;
+
     const agentStart = Date.now();
     const result = await runWork(
       agent,
       worktreePath,
       cmd.prompt,
-      cmd.system_prompt,
+      askPrompt,
       cmd.model_id,
       cmd.agent_session_id,
       protocolDir,
@@ -869,8 +905,10 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Prom
 // --- Helpers ---
 
 function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: string): void {
+  const now = new Date().toISOString();
   status.phase = phase;
-  status.updated_at = new Date().toISOString();
+  status.updated_at = now;
+  status.phase_started_at = now;
   writeStatus(dir, status);
   log(`[supervisor] Phase: ${phase}`);
 }

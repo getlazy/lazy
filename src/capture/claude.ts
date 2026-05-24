@@ -668,6 +668,48 @@ export async function runClaude(
 }
 
 /**
+ * Run a one-shot Claude Code prompt directly on the host (no Docker / sandbox).
+ *
+ * Used by lightweight CLI commands that only need a single LLM call and don't
+ * need a worktree, sandbox, or session continuity (e.g. `lazy report`).
+ * Authentication comes from the same env vars as the agent runner.
+ */
+export async function runClaudeOneshot(
+  prompt: string,
+  model?: string,
+): Promise<AgentResponse> {
+  // Validate auth up front so the failure mode is a clean error, not a cryptic
+  // Claude CLI exit. Throws if no token / API key is available.
+  _agent.getAuthEnvVars();
+
+  const args = ['claude', '-p', prompt, '--output-format', 'json'];
+  if (model) {
+    args.push('--model', model);
+  }
+  // No progress log here — callers fire N+ of these and own the messaging
+  // (see e.g. `lazy report`'s map-reduce, which logs per-unit progress).
+
+  const proc = spawn(args, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: 0,
+  });
+
+  const [output, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  if (exitCode !== 0) {
+    const tail = stderr.trim().split('\n').slice(-20).join('\n  ');
+    throw new Error(`Claude Code exited with code ${exitCode}${tail ? `\n\nLast output:\n  ${tail}` : ''}`);
+  }
+
+  return JSON.parse(output) as AgentResponse;
+}
+
+/**
  * Extract TokenUsage from an AgentResponse
  */
 export function extractTokenUsage(response: AgentResponse): TokenUsage {

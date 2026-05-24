@@ -1,13 +1,15 @@
 import { requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines } from '../helpers';
 import { queryTaskShow, type ShowResult } from '../../daemon/rpc-fallback';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
-import { theme } from '../theme';
+import { theme, dim } from '../theme';
+import { renderStatusHeader } from '../status-header';
 import { readPendingProposals, type Proposal } from './propose';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
 import type { Task, Session, Turn, Commit, Comment } from '../../types';
+import type { SupervisorStatus } from '../../protocol/types';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
@@ -30,6 +32,8 @@ export interface TaskShowData {
   retryStatus: { retryCount: number; errors: { count: number; message: string; firstSeen: string; lastSeen: string }[] } | null;
   orphanStatus: OrphanCheckResult | null;
   autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
+  /** Supervisor status snapshot for working tasks (null when task is not working or status file is missing). */
+  supervisorStatus: SupervisorStatus | null;
 }
 
 /**
@@ -40,9 +44,11 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   const children = await storage.getChildTasks(task.id);
 
   let retryStatus: TaskShowData['retryStatus'] = null;
+  let supervisorStatus: SupervisorStatus | null = null;
   if (task.status === 'working' && sess) {
     const protoDir = getProtocolDir(task.id);
     const status = readStatus(protoDir);
+    supervisorStatus = status;
     if (status?.phase === 'retrying') {
       retryStatus = {
         retryCount: status.retryCount ?? 0,
@@ -80,7 +86,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus };
+  return { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus };
 }
 
 /**
@@ -88,8 +94,14 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * Used by both the show command (for display) and the search command (for line number computation).
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean): string[] {
-  const { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus } = data;
+  const { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus } = data;
   const outputLines: string[] = [];
+
+  // Supervisor status header (only for working tasks with a status file)
+  if (task.status === 'working' && supervisorStatus) {
+    outputLines.push(dim(renderStatusHeader(supervisorStatus)));
+    outputLines.push('');
+  }
 
   // Task info
   outputLines.push(`Task ${theme.taskId(displayId(task))}`);
@@ -164,6 +176,9 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
       outputLines.push(`    ${theme.label('Consecutive:')} ${sess.consecutive_interruptions}`);
       if (sess.auto_resumed) {
         outputLines.push(`    ${theme.label('Auto-resumed:')} yes`);
+      }
+      if (sess.user_stopped) {
+        outputLines.push(`    ${theme.label('User-stopped:')} yes (reconciler will not auto-resume)`);
       }
       if (showFull && sess.interrupt_logs) {
         outputLines.push(`    ${theme.label('Logs (last 50 lines):')}`);

@@ -25,7 +25,6 @@ import { getProjectName } from '../../storage';
 import { theme } from '../theme';
 import { createRunner, type Runner } from '../../runner';
 import { generateBuilderConfig } from '../../builder/server';
-import { createTerminal } from '../../terminal';
 import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
@@ -315,12 +314,6 @@ export async function commandBuilder(args: string[]): Promise<void> {
     ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
     '--effort', builderEffort,
   ];
-
-  // Set terminal window title to reflect activity
-  const terminal = createTerminal();
-  terminal.setActivity('lazy builder');
-  const restoreTerminal = () => terminal.restoreTitle();
-  process.on('exit', restoreTerminal);
 
   let exitCode: number;
   let sessionId: string | null = null;

@@ -31,7 +31,7 @@ import { getAgent } from '../agent/registry';
 import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, writeCommand, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus } from '../protocol';
+import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus } from '../protocol';
 import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
@@ -315,6 +315,14 @@ export async function launchUnblockTask(
     await resetAutoReactCounters(storage, task.id);
   } catch {
     // Counter reset is best-effort — task unblock must proceed even if budget tracking fails
+  }
+
+  // Manual unblock re-arms auto-resume: clear circuit breaker and user-stop gate.
+  // (resetConsecutiveInterruptions also clears session.user_stopped.)
+  try {
+    await storage.resetConsecutiveInterruptions(sess.id);
+  } catch {
+    // Counter reset is best-effort.
   }
 
   // --- Launch feedback turn ---
@@ -766,10 +774,7 @@ export async function launchAskTask(
       model_id: modelName,
       effort: effortValue,
       agent_session_id: sess.agent_session_id,
-      turn_started_at: new Date().toISOString(),
-      ...(config.agent.watchdog_output_timeout_ms !== 0 && {
-        watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
-      }),
+      ...commonCommandFields(config),
     };
     writeCommand(protoDir, askCommand);
 
@@ -1246,7 +1251,7 @@ export async function acceptTaskPreflight(
     await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'accept');
   }
   if (sess.outcome === 'accepted') {
-    throw new RpcError(409, `Task ${displayId(task)} was already accepted.`);
+    throw new RpcError(409, `Task ${displayId(task)} was already accepted (the merge has landed). Run 'lazy show ${displayId(task)}' to verify, or 'lazy reopen ${displayId(task)}' if you need to work on it further.`);
   }
   if (sess.ended_at) {
     throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
@@ -1331,8 +1336,11 @@ export async function acceptTaskPreflight(
   }
 
   // --- Branch sync validation (root tasks with remote driver) ---
+  // Skip in offline mode — there's no remote to validate against, and the
+  // accept will go through LocalDriver anyway.
   if (!isChildTask) {
-    const driver = createDriver(config);
+    const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+    const driver = createDriver(config, undefined, { offline });
     if (driver.needsSync) {
       const syncCheck = await validateBranchInSyncWithRemote(mergeTargetBranch, config.remote.git_remote, projectRoot);
       if (!syncCheck.inSync) {
@@ -1406,7 +1414,20 @@ export async function acceptTask(
   const offline = await isOfflineMode(join(projectRoot, '.lazy'));
   const driver = createDriver(config, undefined, { offline });
   if (offline) {
-    warnings.push('Offline mode: using local merge (remote operations skipped)');
+    const configuredDriver = config.remote.driver;
+    if (configuredDriver === 'gitlab' || configuredDriver === 'github') {
+      const isGitlab = configuredDriver === 'gitlab';
+      const prKind = isGitlab ? 'an MR on GitLab' : 'a PR on GitHub';
+      const refKind = isGitlab ? 'MR' : 'PR';
+      warnings.push(
+        `Warning: lazy is in offline mode. This accept will NOT create ${prKind} — ` +
+        `it will squash-merge locally and push directly. Run \`lazy accept\` again after ` +
+        `going online to create the ${refKind}, or set [remote] driver = "local" in ` +
+        `lazy.toml if this is intentional.`,
+      );
+    } else {
+      warnings.push('Offline mode: using local merge (remote operations skipped)');
+    }
   }
 
   // --- Step 1: Pre-flight validation ---
@@ -1743,9 +1764,20 @@ export async function acceptTask(
     warnings.push(`Review warning: ${reviewWarning}`);
   }
 
-  // Transition: merging → complete
-  await storage.updateTaskStatus(task.id, 'merging', getActor());
-  await storage.updateTaskStatus(task.id, 'complete', getActor());
+  // Transition: → merging → complete
+  // Race: the remote-sync reconciler can observe the just-merged MR/PR and
+  // transition the task to `complete` before we get here. Re-read the task
+  // and skip transitions already applied. Without this guard the user sees
+  // an opaque "Invalid status transition: 'complete' → 'merging'" even though
+  // the merge succeeded.
+  const currentForFinalize = await storage.getTask(task.id);
+  const currentStatus = currentForFinalize?.status ?? task.status;
+  if (currentStatus !== 'complete') {
+    if (currentStatus !== 'merging') {
+      await storage.updateTaskStatus(task.id, 'merging', getActor());
+    }
+    await storage.updateTaskStatus(task.id, 'complete', getActor());
+  }
 
   // --- Step 8: Cleanup and reparent children ---
   const reparented = await reparentChildren(task, storage);
@@ -1882,6 +1914,12 @@ export async function syncTask(
   // --- Attempt to fetch upstream ref ---
   const config = await loadConfig(projectRoot, { cwd: worktreePath });
   const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  if (offline && (config.remote.driver === 'gitlab' || config.remote.driver === 'github')) {
+    warnings.push(
+      'lazy is in offline mode. Sync will merge upstream changes from the local ' +
+      'branch only — no remote fetch will be performed.',
+    );
+  }
   let resolvedParentBranch = parentBranch;
   try {
     const driver = createDriver(config, undefined, { offline });
@@ -2318,13 +2356,17 @@ export async function resumeTask(
   const task = result.task;
 
   // --- Status validation ---
-  if (task.status !== 'interrupted') {
-    if (task.status === 'blocked' || task.status === 'conflict') {
-      throw new RpcError(409, `Task ${displayId(task)} is not interrupted (status: ${task.status}). Use 'lazy unblock ${displayId(task)}' to continue.`);
-    } else if (task.status === 'working') {
+  // `lazy resume` is deprecated in favor of `lazy unblock`. After unifying
+  // `lazy stop` to transition tasks to 'blocked' (with user_stopped=true)
+  // rather than 'interrupted', resume must also accept blocked-by-stop tasks
+  // so the alias keeps working. Other statuses still reject.
+  if (task.status !== 'interrupted' && task.status !== 'blocked') {
+    if (task.status === 'working') {
       throw new RpcError(409, `Task ${displayId(task)} is still working. Use 'lazy blocked' to check when it finishes.`);
+    } else if (task.status === 'conflict') {
+      throw new RpcError(409, `Task ${displayId(task)} is in conflict. Use 'lazy unblock ${displayId(task)}' to resolve.`);
     } else {
-      throw new RpcError(409, `Task ${displayId(task)} is not interrupted (status: ${task.status}).`);
+      throw new RpcError(409, `Task ${displayId(task)} cannot be resumed (status: ${task.status}).`);
     }
   }
 
@@ -2503,4 +2545,138 @@ export async function resumeTask(
   } finally {
     await removeLock(worktreePath);
   }
+}
+
+// =====================================================================
+// Stop Task
+// =====================================================================
+
+export interface StopTaskParams {
+  taskId: string;
+  reason: string;
+}
+
+export interface StopTaskResult {
+  taskId: string;
+  displayId: string;
+  reason: string;
+}
+
+/**
+ * Halt a running task without auto-resume.
+ *
+ * Save first, act second: the user_stopped gate and human turn are persisted
+ * BEFORE stopping the supervisor. If we crash mid-way, the reconciler will
+ * not auto-resume because the gate is already set.
+ */
+export async function stopTask(
+  projectRoot: string,
+  params: StopTaskParams,
+): Promise<StopTaskResult> {
+  if (!params.reason || !params.reason.trim()) {
+    throw new RpcError(400, 'reason is required');
+  }
+  const reason = params.reason.trim();
+
+  const storage = await getOrCreateStorage();
+
+  const resolved = await storage.resolveTask(params.taskId);
+  if (!resolved.task) {
+    if (resolved.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = resolved.task;
+
+  if (task.status !== 'working') {
+    throw new RpcError(
+      409,
+      `Task ${displayId(task)} is ${task.status}, not working. ` +
+      `Only running tasks can be stopped. ` +
+      `To close a task that is not running, use \`lazy close\`.`,
+    );
+  }
+
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess) {
+    throw new RpcError(400, `Task ${displayId(task)} has no session.`);
+  }
+  if (sess.ended_at) {
+    throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
+  }
+
+  // SAVE FIRST: persist the user's intent before halting the runner.
+  const turnSeq = await storage.getNextTurnSequence(sess.id);
+  await storage.createTurn({
+    sessionId: sess.id,
+    sequence: turnSeq,
+    role: 'human',
+    content: `[built-in] Stopped by user: ${reason}`,
+    actor: getActor(),
+  });
+  await storage.setUserStopped(sess.id, true);
+
+  // Now halt the supervisor and transition.
+  const runner = await createRunner(projectRoot);
+  const containerName = sess.container_name ?? runner.runNameForTask(taskRef(task));
+  runner.stopRun(containerName);
+
+  // INVARIANT: lazy stop writes an ErrorResponse to response.json uniformly
+  // regardless of command_type. This unblocks any in-flight daemon RPC waiting
+  // on response.json (e.g. launchAskTask polling for an ask answer) — its poll
+  // wakes within its interval and returns a clean RPC error to the caller
+  // instead of hitting the long ask/turn timeout. For work/sync turns nobody
+  // is waiting on response.json, so the file is just there for posterity.
+  //
+  // Ordering: the write happens AFTER stopRun so the supervisor's death cannot
+  // race our write. A dying supervisor may also attempt a response.json write
+  // from its catch blocks; our post-kill write is authoritative and overwrites
+  // any partial state — correct, because "human stopped me" is truer than
+  // whatever the dying supervisor saw.
+  const protoDir = getProtocolDir(task.id);
+  const stopResponse: ErrorResponse = {
+    status: 'error',
+    error: `Stopped by user: ${reason}`,
+    phase: 'work',
+  };
+  try {
+    writeResponse(protoDir, stopResponse);
+  } catch (err) {
+    // The write itself failing is unexpected (atomic temp+rename to a dir we
+    // own). Log loudly but don't fail the stop — the supervisor is already
+    // dead; the task transition below is the load-bearing effect.
+    logger.warn(`[stop] failed to write ErrorResponse to ${protoDir}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Unify with `lazy unblock`: stopped tasks become 'blocked' (with
+  // user_stopped=true), not 'interrupted'. The `[STOPPED]` chip and the
+  // reconciler's auto-resume guard both key on user_stopped, not status —
+  // see shouldSkipAutoResumeForUserStop in src/utils/reconcile.ts.
+  // 'interrupted' is reserved for ungraceful interruptions (crash, watchdog
+  // kill, supervisor died) which should auto-resume.
+  await storage.updateTaskStatus(task.id, 'blocked', getActor());
+  await storage.recordInterrupt(sess.id, {
+    reason: `Stopped by user: ${reason}`,
+    exit_code: null,
+    logs: null,
+  });
+  await storage.updateSessionContainerName(sess.id, null);
+
+  try {
+    runner.removeRun(containerName);
+  } catch {
+    // Best-effort — the reconciler also sweeps orphaned runs.
+  }
+  try {
+    clearStatus(protoDir);
+  } catch {
+    // Best-effort — protocol files are not user-visible.
+  }
+
+  return {
+    taskId: task.id,
+    displayId: displayId(task),
+    reason,
+  };
 }

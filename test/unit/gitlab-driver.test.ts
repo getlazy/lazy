@@ -18,7 +18,7 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0, effort: 'medium' },
   builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {
@@ -718,8 +718,10 @@ describe('GitLabDriver', () => {
           if (!glCalls.some(c => c[0] === 'mr' && c[1] === 'create')) {
             return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'closed' }));
           }
-          // After create: getMRNumber, approval check, and body fetch calls
-          return ok(JSON.stringify({ iid: 99 }));
+          // After merge command: post-merge state verification expects 'merged'.
+          const mergeWasCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          const state = mergeWasCalled ? 'merged' : 'opened';
+          return ok(JSON.stringify({ iid: 99, state }));
         }
         if (args[0] === 'mr' && args[1] === 'create') {
           return ok('https://gitlab.com/o/r/-/merge_requests/99');
@@ -963,6 +965,82 @@ describe('GitLabDriver', () => {
       if (result.status === 'pending') {
         expect(result.reason).toContain('Auto-merge');
       }
+    });
+
+    // INVARIANT: `glab mr merge --auto-merge` succeeding does NOT mean the merge
+    // happened — it may only mean GitLab accepted the merge request and queued
+    // auto-merge. The driver MUST verify the post-merge MR state via the API
+    // before reporting 'merged'. If the verification API call fails (network,
+    // throttle, auth), the driver MUST fail — silently returning 'merged' when
+    // we cannot confirm causes the orchestrator to delete branches and report
+    // success for merges that never landed. See CLAUDE.md: "Fail hard on remote
+    // failures — no silent fallbacks."
+    test('fails when glab mr merge succeeds but post-merge state verification (mr view) fails', async () => {
+      const glCalls: string[][] = [];
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          // Pre-merge findExistingMR succeeds; post-merge verification fails
+          const mergeWasCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          if (mergeWasCalled) {
+            return fail('GitLab API: 502 Bad Gateway');
+          }
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: 'opened' }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          return ok(); // glab CLI returns success (auto-merge queued)
+        }
+        return fail('unexpected');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const result = await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      // Without post-merge verification we cannot confirm the merge — must fail,
+      // not silently return 'merged'.
+      expect(result.status).toBe('failed');
+    });
+
+    // INVARIANT: If the post-merge MR state is anything other than 'merged' or
+    // 'opened' (e.g., the MR was closed externally between merge and verify),
+    // the driver MUST NOT report 'merged'. The merge did not happen.
+    test('fails when glab mr merge succeeds but post-merge MR state is closed', async () => {
+      const glCalls: string[][] = [];
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) {
+          return ok(JSON.stringify([]));
+        }
+        if (args[0] === 'mr' && args[1] === 'view') {
+          const mergeWasCalled = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          const state = mergeWasCalled ? 'closed' : 'opened';
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') {
+          return ok();
+        }
+        return fail('unexpected');
+      });
+
+      const driver = new GitLabDriver(mockConfig, deps);
+      const result = await driver.merge({
+        sourceBranch: 'lazy/test1234',
+        targetBranch: 'main',
+        task: makeTask(),
+        taskShortId: 'test1234',
+        root: '/tmp/test',
+      });
+
+      expect(result.status).toBe('failed');
     });
 
     // INVARIANT: every successful accept must set auto-merge on the MR,

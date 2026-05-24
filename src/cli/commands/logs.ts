@@ -1,14 +1,12 @@
 /**
- * `lazy logs` command
+ * `lazy daemon logs` command.
  *
  * Tails the daemon log file. Primary debugging tool.
  *
- *   lazy logs                 — tail -f the daemon log (last 50 lines, then follow)
- *   lazy logs -n 100          — show last 100 lines then follow
- *   lazy logs --no-follow     — show recent lines and exit
- *   lazy logs <task>          — filter to lines mentioning this task (by short ID or code)
- *
- * Also available as `lazy daemon logs`.
+ *   lazy daemon logs                 — tail -f the daemon log (last 50 lines, then follow)
+ *   lazy daemon logs -n 100          — show last 100 lines then follow
+ *   lazy daemon logs --no-follow     — show recent lines and exit
+ *   lazy daemon logs <task>          — filter to lines mentioning this task (by short ID or code)
  */
 
 import { existsSync, statSync, openSync, readSync, closeSync } from 'fs';
@@ -52,6 +50,13 @@ export async function commandLogs(args: string[]): Promise<void> {
   // Used as a plain substring match against log lines — works with
   // short IDs (abc12345), task codes (fix-auth), or any string.
   const filterPattern = parsed.positional[0] ?? null;
+
+  // Header so it's obvious what's being tailed.
+  console.error(`Tailing lazy daemon log: ${logPath}`);
+  if (filterPattern) {
+    console.error(`Filter: ${filterPattern}`);
+  }
+  console.error('---');
 
   // Read last N lines from the log file
   const lines = tailLines(logPath, numLines);
@@ -175,7 +180,7 @@ async function followLog(filePath: string, filterPattern: string | null): Promis
 }
 
 export function logsUsage(): void {
-  console.log(`Usage: lazy logs [options] [<task>]
+  console.log(`Usage: lazy daemon logs [options] [<task>]
 
 Tail the daemon log file. Primary debugging tool.
 
@@ -190,10 +195,10 @@ Options:
   --project PATH      Explicit project root (default: auto-detect)
 
 Examples:
-  lazy logs                    # Tail daemon log (last 50 lines + follow)
-  lazy logs -n 100             # Show last 100 lines + follow
-  lazy logs --no-follow        # Show last 50 lines and exit
-  lazy logs abc12345           # Filter to task abc12345
-  lazy logs fix-auth           # Filter to task code fix-auth
-  lazy logs -n 200 abc12345    # Last 200 lines for task abc12345`);
+  lazy daemon logs                    # Tail daemon log (last 50 lines + follow)
+  lazy daemon logs -n 100             # Show last 100 lines + follow
+  lazy daemon logs --no-follow        # Show last 50 lines and exit
+  lazy daemon logs abc12345           # Filter to task abc12345
+  lazy daemon logs fix-auth           # Filter to task code fix-auth
+  lazy daemon logs -n 200 abc12345    # Last 200 lines for task abc12345`);
 }

@@ -60,6 +60,21 @@ function getWorkingGracePeriodMs(): number {
  *
  * Exported for unit testing.
  */
+/**
+ * Reconciler gate for `lazy stop`: when a session was explicitly stopped by a
+ * user (or builder), the reconciler must NOT auto-resume it. A crash-interrupted
+ * session (user_stopped !== true) continues through auto-resume as usual.
+ *
+ * Exported for unit testing — `maybeAutoResume` calls this and returns early
+ * when it returns true. Manual `lazy resume` / `lazy unblock` clears the flag
+ * via `resetConsecutiveInterruptions`, re-arming auto-resume.
+ */
+export function shouldSkipAutoResumeForUserStop(
+  session: { user_stopped?: boolean },
+): boolean {
+  return session.user_stopped === true;
+}
+
 export function shouldReconcileAgentSessionId(
   storedId: string | null,
   reportedId: string | undefined,
@@ -289,6 +304,15 @@ async function maybeAutoResume(
   // Don't auto-resume if session has ended
   if (session.ended_at) {
     logger.debug(`Task ${taskShortId}: session ended, skipping auto-resume`);
+    return;
+  }
+
+  // INVARIANT: A user-initiated `lazy stop` must NOT be undone by the reconciler.
+  // Crash-interrupted sessions (user_stopped=false) continue through auto-resume
+  // as before; only an explicit human/builder stop sets this flag, and it is
+  // cleared by manual resume/unblock (resetConsecutiveInterruptions).
+  if (shouldSkipAutoResumeForUserStop(session)) {
+    logger.debug(`Task ${taskShortId}: user-stopped, skipping auto-resume`);
     return;
   }
 

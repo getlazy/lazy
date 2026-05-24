@@ -29,7 +29,6 @@ import {
   handleAcceptTask,
   handleRejectTask,
   handleCloseTask,
-  handleAbandonTask,
   handleSyncTask,
   handleResumeTask,
   handleGetDaemonMcpConfig,
@@ -463,30 +462,27 @@ export async function queryCloseTask(params: {
   return await handleCloseTask(root, params) as CloseTaskRpcResult;
 }
 
-// --- Abandon Task ---
+// --- Stop Task ---
 
-export interface AbandonTaskRpcResult {
+export interface StopTaskRpcResult {
   taskId: string;
   displayId: string;
-  branchName: string | null;
-  parentTaskId: string | null;
-  warnings: string[];
+  reason: string;
 }
 
-export async function queryAbandonTask(params: {
+export async function queryStopTask(params: {
   taskId: string;
   reason: string;
-  acceptDirtyWorktree?: boolean;
-}): Promise<AbandonTaskRpcResult> {
-  const rpc = await tryRpc<AbandonTaskRpcResult>('abandonTask', {
+}): Promise<StopTaskRpcResult> {
+  const rpc = await tryRpc<StopTaskRpcResult>('stopTask', {
     taskId: params.taskId,
     reason: params.reason,
-    acceptDirtyWorktree: params.acceptDirtyWorktree,
   });
   if (rpc) return rpc;
 
   const root = requireLazyRoot();
-  return await handleAbandonTask(root, params) as AbandonTaskRpcResult;
+  const { handleStopTask } = await import('./rpc-handlers');
+  return await handleStopTask(root, params) as StopTaskRpcResult;
 }
 
 // --- Submit Task ---

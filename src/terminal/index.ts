@@ -4,7 +4,7 @@
  * Usage:
  *   import { createTerminal } from '../terminal';
  *   const terminal = createTerminal();
- *   terminal.setActivity('lazy builder');
+ *   await terminal.watchTask(sessionName);
  */
 
 export type { Terminal, WatchResult } from './interface';

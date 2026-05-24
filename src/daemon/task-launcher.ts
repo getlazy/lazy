@@ -270,7 +270,15 @@ export async function launchTask(
   const offline = await isOfflineMode(join(projectRoot, '.lazy'));
   if (offline) {
     params.forceLocal = true;
-    warnings.push('Offline mode: starting from local HEAD (remote operations skipped)');
+    if (config.remote.driver === 'gitlab' || config.remote.driver === 'github') {
+      warnings.push(
+        'Note: lazy is in offline mode. Accepts will not create ' +
+        `${config.remote.driver === 'gitlab' ? 'MRs' : 'PRs'}, and remote sync will be ` +
+        'skipped. Run `lazy system online` to restore remote operations.',
+      );
+    } else {
+      warnings.push('Offline mode: starting from local HEAD (remote operations skipped)');
+    }
   }
 
   const driver = createDriver(config, undefined, { offline });

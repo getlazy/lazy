@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.14.1037] - 2026-05-23 - Control, visibility, and safety
+
+Lazy v0.14 broadens what you can do (new `lazy report`, `lazy stop`, and `lazy_ask`), tightens how you do it (`lazy close` and `lazy reject` restored as distinct commands, `lazy watch` reworked as a unified timeline, builder discipline polish), and hardens the rough edges (safer accept, GitLab-driver verification, idempotent confirmation, ask-mode lockdown, post-turn-check no-hang).
+
+### New commands
+
+- **`lazy report`** — LLM-summarized markdown digest of recent activity. Covers ALL main-branch activity in the window — both lazy-managed work AND direct (non-lazy) commits by collaborators not using lazy. Default window is the last 24 hours; widen with `--start -3d` (or any relative offset / ISO timestamp) and bound with `--end`. Internally runs a map-reduce of LLM calls — one per lazy task with activity, one per non-lazy commit, then a final reduce — and emits a three-section digest (brief, manager tier, lead tier) where the lead tier clusters work thematically and distinguishes lazy-managed from non-lazy contributions
+- **`lazy stop <task>` and `lazy_stop` MCP tool** — halt a running task without triggering auto-resume. The task transitions to `blocked` with a `user_stopped` flag the reconciler respects; re-engage with `lazy unblock` (with or without `--message`). For tasks in the middle of an `ask`, stop also writes a clean `ErrorResponse` to the protocol directory so the caller's RPC returns immediately instead of waiting out the full ask timeout
+- **`lazy_ask` MCP tool** — builder-side read-only conversation with a blocked task's agent. Ask a stuck task questions from the builder without unblocking it or losing its session context. Hardened against misbehavior: `Bash`, `Write`, and `Edit` are explicitly disallowed, the in-container MCP server runs with `LAZY_MCP_READ_ONLY=1` (write-capable lazy tools like `lazy_commit`, `lazy_propose`, `lazy_comment` return errors), and a dedicated ask system prompt makes "your final message is the answer" non-negotiable
+
+### Changed
+
+- **`lazy close` and `lazy reject` restored as distinct commands; `lazy abandon` retired** — `lazy close` stops a task without requiring a session (works on backlog tasks); `lazy reject` requires an active session and closes its PR with a reject review. The combined `lazy abandon` verb introduced in v0.12 is gone — having two verbs maps to the two distinct workflows users actually have
+- **`lazy resume` deprecated** — after the `lazy stop` change above, `resume` is structurally equivalent to `lazy unblock` with no message. The command and the `lazy_resume` MCP tool still work as aliases that route into unblock, but they print a one-line deprecation notice and will be removed in a future release. The builder system prompt no longer references `lazy_resume` as a canonical tool
+- **`lazy watch` reworked as a unified timeline** — tails supervisor + agent streams into a single chronological view with live subprocess output and a phase header, instead of two competing streams. Works on any agent runner (Docker, host-process) without tmux
+- **Top-level `lazy logs` removed** — the canonical form is `lazy daemon logs`. No alias, no deprecation passthrough — `lazy logs` simply doesn't exist anymore. Per-task agent/supervisor logs continue to flow through `lazy show <task>` and `lazy watch`
+- **Tmux window-title auto-renaming dropped** — lazy no longer writes its own labels into the user's tmux window title. The previous behavior overwrote whatever the user had set and never restored it
+- **Offline-mode warnings on accept, sync, and builder startup** — when lazy is in offline mode, `lazy accept` warns that no MR/PR will be created (still proceeds with a local squash-merge), `lazy sync` warns the merge is local-only, and the builder prints a one-time notice at session start. The `lazy_accept` MCP tool response carries the warning in `warnings[]`. Surfacing, not blocking — the human decides whether offline behavior is intentional
+- **Builder system prompt polish** — builders are now coached on `ScheduleWakeup` for follow-up work, `lazy_wait` discipline (don't busy-wait, use the tool), and that they have passwordless `sudo` and can install packages themselves rather than blocking. These are prompt-only changes but they noticeably tighten builder behavior
+
+### Added
+
+- **Graceful-exit timeout for `claude -p`** — a 60s timer kills the child process if it hangs after the end-of-turn signal. Previously a hung `claude -p` could lock up a turn indefinitely. Configurable via `[agent].graceful_exit_timeout_ms` in `lazy.toml`
+- **`docs/lazy-toml.md` reference docs** — comprehensive schema-grounded reference for every `lazy.toml` key. The generated `lazy.toml` header now embeds a URL pointing at this doc, and the schema parser has a comment reminding contributors to keep the doc in sync when adding keys
+- **`lazy.toml` path validation in preflight** — paths configured in `lazy.toml` (and persisted paths in task state) are validated at startup with actionable errors when a configured directory is missing, stale, or unwritable. Replaces mysterious downstream failures with a single error that points at the offending key
+
+### Fixed
+
+- **Subagent MCP blindness** — the lazy MCP server's `initialize` response now includes an `instructions` field listing the available `lazy_*` tools and what each does. Claude Code injects this into the system prompt for every connected session — including subagents spawned via the Task tool — so subagents now know what lazy is and which tools to use. Previously subagents had the tools available but no context on them
+- **Safer `lazy accept`** — verifies the squash merge actually landed on the parent branch before deleting the source branch. Previously, a silent merge failure (e.g., from a buggy driver path) would proceed to delete the source, losing the commits. This was the root cause of the v0.14-era "missing accepted children" incident that took a `recover-v014-branches` task to repair from dangling reflog commits
+- **GitLab driver silent-accept** — `lazy accept` on a GitLab project no longer reports success when `glab mr merge` skipped the MR (e.g., the merge wasn't actually performed). The driver now waits and verifies the merge landed on the remote before reporting success or cleaning up
+- **Post-turn-check no longer hangs** — the supervisor's post-turn check (which validates a turn completed correctly) previously hung indefinitely when `claude -p` ignored `SIGTERM` after the end-of-turn signal — the 600s safety timeout didn't fire on stuck verbose children. New post-turn-check module enforces the timeout and surfaces the hang as an interruption instead
+- **`lazy_accept` confirmation flow is now idempotent** — when a large diff triggers the confirmation protocol, the preview call no longer mutates state. A second call that supplies the confirmation token completes cleanly instead of erroring out because the side-effect had already been recorded
+- **`lazy_ask` MCP command rejected for missing protocol_version** — `AskCommand` now uses `commonCommandFields` so the protocol_version is populated. Previously the supervisor's protocol-version gate rejected every `lazy_ask` call with a "missing field" error
+- **`lazy_create` no longer pushes back on singleton tasks** *(carried in from main as part of v0.13.1028 reconciliation)* — the parent-selection warning fires only when an active task has at least one non-terminal subtask, indicating the project uses parent-child hierarchy. Tasks with no live subtasks are treated as singletons and create without any prompt
+
 ## [0.13.1028] - 2026-05-11 - Lifecycle visibility
 
 Lazy v0.13 sharpens visibility into stuck task lifecycles and tightens the daemon-required model.
@@ -15,16 +51,16 @@ Lazy v0.13 sharpens visibility into stuck task lifecycles and tightens the daemo
 - **`lazy show` warns when auto-resume has given up** — when the auto-resume circuit breaker has tripped on a task, `lazy show <task>` now flags it and points to `lazy resume <task>` to recover manually, instead of leaving the task silently stuck
 - **`lazy_create` no longer pushes back on singleton tasks** — the parent-selection warning now fires only when an active task has at least one non-terminal subtask, indicating the project uses parent-child hierarchy. Tasks with no live subtasks are treated as singletons and create without any prompt
 
-## [0.12.1023] - 2026-05-04 - Sync, Abandon, and Cleanup
+## [0.12.1023] - 2026-05-04 - Sync, and Cleanup
 
-Lazy v0.12 sharpens the workflow: sync is now its own operation, close/reject collapse into a single `abandon` command, toolchains are gone, and the daemon hardens around version safety and project isolation. Offline behavior, interactive review, watch, and a new `lazy doctor <task-id>` round out the release.
+Lazy v0.12 sharpens the workflow: sync is now its own operation, toolchains are gone, and the daemon hardens around version safety and project isolation. Offline behavior, interactive review, watch, and a new `lazy doctor <task-id>` round out the release.
 
 ### New commands
 
 - **`lazy review -i`** — interactive per-hunk review with inline Q&A against the agent's session. Approve, reject, split, or ask the agent about a hunk without leaving the review TUI. Approvals persist across re-runs so split-hunk decisions aren't lost
 - **`lazy watch`** — rewritten as a direct JSONL conversation renderer. Reads the agent's session log and prints full thinking, tool calls, and tool results in real time. Works on any agent runner (Docker, host-process) without tmux
 - **`lazy sync <task>`** — standalone upstream merge for a task branch. Decoupled from unblock so feedback delivery has zero network dependencies. The daemon retries failed syncs with progressive backoff; a real unblock preempts but never cancels a pending sync
-- **`lazy abandon`** — replaces both `lazy close` and `lazy reject`. One verb to create, one to start, one to abandon, one to accept. `lazy close` and `lazy reject` are kept as aliases for backward compatibility. The `closed` task status is retired — tasks are `abandoned` when discarded, regardless of whether work was done
+- **Internal task state renamed `closed → abandoned`** (storage-level only). `lazy close` and `lazy reject` remain distinct user-facing commands: `lazy close` stops a task without requiring a session (works on backlog tasks); `lazy reject` requires an active session and closes its PR with a reject review
 - **`lazy doctor <task-id>`** — task-level diagnostics and repair. Detects stale parents (parent already complete/accepted), missing local branches, missing worktrees, local/remote divergence, status mismatches, and orphaned worktrees. Interactive by default, with `--yes` to apply fixes automatically and `--dry-run` to report only
 - **`lazy system offline`** / **`lazy system online`** — toggle offline mode for a project. When offline, lazy skips remote pushes/fetches, starts tasks from local HEAD, accepts via local squash merge, and blocks submit with a clear error. The daemon stops sync/push background work on the next tick. Equivalent to `lazy config set offline on`/`off`
 - **`lazy system build lazy-runner`** — explicitly prebuild the base runner Docker image so the first task launch isn't blocked on a cold image build
@@ -42,7 +78,7 @@ Lazy v0.12 sharpens the workflow: sync is now its own operation, close/reject co
 - **Reconciler concurrency and pacing** — the daemon reconciler issues up to 5 concurrent remote requests instead of serializing, and the tick interval moved from 5s to 30s. Faster end-to-end signal propagation with less idle traffic
 - **Builder containers scoped to project** — builder containers are labeled with the project root and filtered on discovery. `lazy upgrade` in one project no longer stops builder containers belonging to other projects
 - **`lazy upgrade --wait`** — waits for all working tasks to reach a blocked/terminal state before upgrading, instead of killing them. Interactive prompt now offers three options when working containers exist: kill now, wait, or cancel
-- **Updated shell completion** — `lazy` shell completion includes all verbs added in v0.11/v0.12 (`abandon`, `sync`, `doctor`, `submit`, `system`, etc.)
+- **Updated shell completion** — `lazy` shell completion includes all verbs added in v0.11/v0.12 (`sync`, `doctor`, `submit`, `system`, etc.)
 
 ### Added
 

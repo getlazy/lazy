@@ -76,6 +76,13 @@ export interface Session {
   consecutive_interruptions: number;
   /** Whether the current working session was auto-resumed by the reconciler */
   auto_resumed: boolean;
+  /**
+   * Whether the user explicitly stopped this session via `lazy stop` / `lazy_stop`.
+   * When true, the reconciler will not auto-resume the interrupted task — a manual
+   * `lazy resume` / `lazy unblock` is required. Cleared by resetConsecutiveInterruptions
+   * (i.e. on manual resume/unblock or successful turn).
+   */
+  user_stopped: boolean;
   /** SHA of the upstream branch at the time of last merge (for accurate diff scope) */
   upstream_merge_sha: string | null;
 }

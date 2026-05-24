@@ -18,7 +18,9 @@ import {
   commandShell, shellUsage,
   commandPair, pairUsage,
   commandAccept, acceptUsage,
-  commandAbandon, abandonUsage,
+  commandClose, closeUsage,
+  commandReject, rejectUsage,
+  commandStop, stopUsage,
   commandSearch, searchUsage,
   commandComment, commentUsage,
   commandLink, linkUsage,
@@ -44,9 +46,9 @@ import {
   commandFix, fixUsage,
   commandRework, reworkUsage,
   commandDaemon, daemonUsage,
-  commandLogs, logsUsage,
   commandWatch, watchUsage,
   commandConfig, configUsage,
+  commandReport, reportUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
 import { isLoggedToFile } from './utils/logged-error';
@@ -75,6 +77,7 @@ Task Management:
   blocked                List blocked tasks (waiting for user)
   show <task_id>         Show task details
   search <query>         Search tasks, prompts, turns, commits, comments
+  report                 LLM-summarized markdown digest of recent activity
 
 Working on Tasks:
   review <task_id>       TUI review: full-screen artifact browser
@@ -98,7 +101,8 @@ Inspect:
   shell <task_id>        Open shell in task's worktree
   pair <task_id>         Pair program with Claude in task's worktree
   accept <task_id>       Merge task's work
-  abandon <task_id>      Abandon a task (discard work)
+  close <task_id>        Close a task (no session required)
+  reject <task_id>       Reject a task's work and close its PR
   revert <task_id>       Undo an accepted task (create revert task)
   rework <task_id>       Create follow-up task for accepted work that needs changes
   redo <task_id>         Abandon stale task and restart fresh on current main
@@ -120,7 +124,7 @@ Daemon:
   daemon stop            Stop the daemon gracefully
   daemon restart         Restart the daemon
   daemon status          Show daemon status and web URL
-  logs                   Tail daemon log file (primary debugging tool)
+  daemon logs            Tail daemon log file (primary debugging tool)
   server                 Start daemon and show web dashboard URL
   config set/get         Runtime config toggles (e.g., auto_react on/off)
 
@@ -183,9 +187,9 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'shell':    { run: commandShell, usage: shellUsage },
   'pair':     { run: commandPair, usage: pairUsage },
   'accept':   { run: commandAccept, usage: acceptUsage },
-  'abandon':  { run: commandAbandon, usage: abandonUsage },
-  'reject':   { run: commandAbandon, usage: abandonUsage },  // backward compat alias
-  'close':    { run: commandAbandon, usage: abandonUsage },   // backward compat alias
+  'close':    { run: commandClose, usage: closeUsage },
+  'reject':   { run: commandReject, usage: rejectUsage },
+  'stop':     { run: commandStop, usage: stopUsage },
   'revert':   { run: commandRevert, usage: revertUsage },
   'wait':     { run: commandWait, usage: waitUsage },
   'builder':  { run: commandBuilder, usage: builderUsage },
@@ -205,14 +209,14 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'fix':      { run: commandFix, usage: fixUsage },
   'rework':   { run: commandRework, usage: reworkUsage },
   'daemon':   { run: commandDaemon, usage: daemonUsage },
-  'logs':     { run: commandLogs, usage: logsUsage },
   'watch':    { run: commandWatch, usage: watchUsage },
   'config':   { run: commandConfig, usage: configUsage },
+  'report':   { run: commandReport, usage: reportUsage },
 };
 
 // All valid command names for fuzzy matching (excludes aliases like ls/tasks/view
 // to avoid confusing suggestions — we match against canonical names only)
-const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view' && c !== 'reject' && c !== 'close');
+const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view');
 
 
 async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
@@ -280,7 +284,8 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
 const legacyCommands: Record<string, string> = {
   'pending': 'Error: `lazy pending` has been removed. All tasks are started immediately. Use: lazy list',
   'task': 'Error: `lazy task` has been removed. Use: lazy start, lazy edit, lazy list, lazy show',
-  'session': 'Error: `lazy session` has been removed. Use: lazy start, lazy unblock, lazy accept, lazy abandon',
+  'session': 'Error: `lazy session` has been removed. Use: lazy start, lazy unblock, lazy accept, lazy close, lazy reject',
+  'abandon': 'Error: `lazy abandon` has been removed. Use `lazy close` (no session required) or `lazy reject` (closes PR with reject review).',
 };
 
 // Hidden internal commands: bypass auto-init, reconciliation, and help.
@@ -313,6 +318,8 @@ function resolveLazyRoot(): string | null {
 if (!isHelpOrVersion && command !== 'completion' && process.env.LAZY_TEST !== '1') {
   const { runPreflight } = await import('./cli/preflight');
   await runPreflight(resolveLazyRoot());
+  const { validateConfigPaths } = await import('./cli/config-path-validation');
+  await validateConfigPaths(resolveLazyRoot());
 }
 
 if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {

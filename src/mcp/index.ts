@@ -18,16 +18,17 @@ export { allTools, createAllHandlers, type McpToolContext } from './tools';
 
 import { McpServer } from './server';
 import { allTools, createAllHandlers, type McpToolContext } from './tools';
+import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
 
 /**
  * Start the MCP server with the given task context.
  * This is a long-running process that reads from stdin and writes to stdout.
  */
 export async function startMcpServer(ctx: McpToolContext): Promise<void> {
-  const server = new McpServer({
-    name: 'lazy',
-    version: '0.8.0',
-  });
+  const server = new McpServer(
+    { name: 'lazy', version: '0.8.0' },
+    { instructions: mcpServerInstructions },
+  );
 
   // Register all tools
   const handlers = createAllHandlers(ctx);
@@ -62,10 +63,10 @@ export async function startMcpServerDaemonProxy(daemonConfigPath: string, taskId
     config.taskId = taskIdOverride;
   }
 
-  const server = new McpServer({
-    name: 'lazy',
-    version: '0.8.0',
-  });
+  const server = new McpServer(
+    { name: 'lazy', version: '0.8.0' },
+    { instructions: mcpServerInstructions },
+  );
 
   // Create proxy handlers for all tools
   const toolNames = allTools.map(t => t.name);
@@ -93,10 +94,10 @@ export async function startMcpServerProxy(builderConfigPath: string): Promise<vo
   const { readBuilderConfig, createAllProxyHandlers } = await import('../builder/client');
   const config = readBuilderConfig(builderConfigPath);
 
-  const server = new McpServer({
-    name: 'lazy',
-    version: '0.8.0',
-  });
+  const server = new McpServer(
+    { name: 'lazy', version: '0.8.0' },
+    { instructions: mcpServerInstructions },
+  );
 
   // Create proxy handlers for all tools
   const toolNames = allTools.map(t => t.name);

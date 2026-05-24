@@ -217,6 +217,10 @@ export class RemoteStorage implements Storage {
     await this.call('setAutoResumed', { sessionId, autoResumed });
   }
 
+  async setUserStopped(sessionId: string, userStopped: boolean): Promise<void> {
+    await this.call('setUserStopped', { sessionId, userStopped });
+  }
+
   // --- Turns ---
 
   async createTurn(options: CreateTurnOptions): Promise<Turn> {

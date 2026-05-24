@@ -476,24 +476,47 @@ export class GitLabDriver implements RepositoryDriver {
       };
     }
 
-    // glab mr merge succeeded — check if it actually merged or set auto-merge.
-    // glab sets auto-merge when pipeline is running and the project supports it.
-    if (mrIid) {
-      const postMergeState = await this.getPRState(task);
-      if (postMergeState === 'MERGED') {
-        return { status: 'merged', metadata: updatedMetadata };
-      }
-      if (postMergeState === 'OPEN') {
-        // MR is still open — auto-merge was likely set
-        return {
-          status: 'pending',
-          reason: 'Auto-merge set, waiting for pipeline',
-          metadata: updatedMetadata,
-        };
-      }
+    // glab mr merge succeeded — but that does NOT mean the merge actually
+    // happened. With `--auto-merge`, glab returns success when GitLab accepts
+    // the request and queues "merge when pipeline succeeds". We MUST verify
+    // the post-merge MR state via the API before reporting 'merged'.
+    // INVARIANT: never silently return 'merged' without confirming the merge.
+    // See CLAUDE.md: "Fail hard on remote failures — no silent fallbacks".
+    if (!mrIid) {
+      // Reaching here without an MR IID means MR creation/lookup silently
+      // produced no identifier. We cannot verify a merge we cannot identify.
+      return {
+        status: 'failed',
+        error: 'glab mr merge reported success but no MR IID is available to verify the merge state. Refusing to report a merge we cannot confirm.',
+        metadata: updatedMetadata,
+      };
     }
 
-    return { status: 'merged', metadata: updatedMetadata };
+    const postMergeState = await this.getPRState(task);
+    if (postMergeState === 'MERGED') {
+      return { status: 'merged', metadata: updatedMetadata };
+    }
+    if (postMergeState === 'OPEN') {
+      // MR is still open — auto-merge was queued (will merge when pipeline passes).
+      return {
+        status: 'pending',
+        reason: 'Auto-merge set, waiting for pipeline',
+        metadata: updatedMetadata,
+      };
+    }
+    if (postMergeState === 'CLOSED') {
+      return {
+        status: 'failed',
+        error: `glab mr merge reported success but MR !${mrIid} is in CLOSED state — the merge did not happen. Reopen the MR and retry, or investigate why the MR was closed.`,
+        metadata: updatedMetadata,
+      };
+    }
+    // getPRState returned null — API call failed or response was unparseable.
+    return {
+      status: 'failed',
+      error: `glab mr merge reported success but post-merge state verification failed for MR !${mrIid}. Cannot confirm the merge landed. Retry \`lazy accept\` once GitLab is reachable.`,
+      metadata: updatedMetadata,
+    };
   }
 
   async getChecksStatus(task: Task): Promise<ChecksStatusResult> {

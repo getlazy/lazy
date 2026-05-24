@@ -100,6 +100,14 @@ describe('lazy-agent mcp', () => {
 
     const serverInfo = result.serverInfo as Record<string, string>;
     expect(serverInfo.name).toBe('lazy');
+
+    // INVARIANT: initialize must return `instructions` so Claude Code injects
+    // lazy MCP context into every session — including subagents spawned via the
+    // Task tool, which would otherwise have no idea what lazy is or how to use
+    // its tools.
+    expect(typeof result.instructions).toBe('string');
+    expect((result.instructions as string).length).toBeGreaterThan(0);
+    expect(result.instructions as string).toContain('lazy_search');
   });
 
   test('lists all tools', async () => {
@@ -120,9 +128,9 @@ describe('lazy-agent mcp', () => {
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).toEqual([
-      'lazy_abandon',
       'lazy_accept',
       'lazy_active',
+      'lazy_ask',
       'lazy_blocked',
       'lazy_clone',
       'lazy_comment',

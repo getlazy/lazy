@@ -1,63 +1,43 @@
 /**
- * lazy watch — Real-time JSONL conversation renderer.
+ * lazy watch — Unified task timeline.
  *
- * Reads the agent's JSONL session log and renders the full conversation
- * (thinking blocks, tool calls, tool results, assistant responses) directly
- * in the user's terminal. No tmux involvement.
+ * `lazy watch` follows the *task*, not the agent. The supervisor and the
+ * agent are both parts of the task: this command tails the supervisor's
+ * stdout (phase transitions, merges, post-turn check output) and the agent
+ * JSONL session log together so the user sees whichever side is currently
+ * driving — pre-turn merge, agent thinking, post-turn check, retries, etc.
+ *
+ * Layout per refresh:
+ *   - A one-line supervisor header (phase + elapsed) re-printed every 5s.
+ *   - Supervisor stdout lines streamed as they arrive (dim, prefixed `sup>`).
+ *   - Agent JSONL entries rendered via the existing pretty renderer.
+ *
+ * The two streams are printed as they arrive (no time-merge) — supervisor
+ * lines stand out visually via dim() so they don't compete with the
+ * formatted agent output.
  */
 
-import { access, readdir, stat, open } from 'fs/promises';
-import { join } from 'path';
+import { open, stat } from 'fs/promises';
 import {
-  requireStorage, requireLazyRoot, displayId, parseFlags,
+  requireStorage, requireLazyRoot, displayId, parseFlags, taskRef,
   resolveTaskOrExit, getWorktreePath,
 } from '../helpers';
 import { theme, dim } from '../theme';
-import { encodeProjectPath } from '../../import/claude-code-logs';
+import { findLatestSessionFile } from '../../agent/session-discovery';
 import { renderEntry, type RawLogEntry } from '../watch-renderer';
+import { createRunner } from '../../runner';
+import type { FollowHandle } from '../../runner/types';
+import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
+import { renderStatusHeader } from '../status-header';
 
-const SANDBOX_DIR = '.lazy-task-sandbox';
 const POLL_INTERVAL_MS = 500;
 const STATUS_CHECK_INTERVAL_MS = 5000;
 
 // ── Session file discovery ──────────────────────────────────────────────
 
 async function findSessionFile(worktreePath: string): Promise<string | null> {
-  const encodedPath = encodeProjectPath(worktreePath);
-  const projectDir = join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encodedPath);
-
-  try {
-    await access(projectDir);
-  } catch {
-    // Project directory doesn't exist yet — agent hasn't started writing logs
-    return null;
-  }
-
-  let latestFile: string | null = null;
-  let latestMtime = 0;
-
-  try {
-    const entries = await readdir(projectDir);
-    for (const entry of entries) {
-      if (!entry.endsWith('.jsonl')) continue;
-      const fullPath = join(projectDir, entry);
-      try {
-        const st = await stat(fullPath);
-        if (st.mtimeMs > latestMtime) {
-          latestMtime = st.mtimeMs;
-          latestFile = fullPath;
-        }
-      } catch {
-        // File may have been deleted or renamed between readdir and stat
-        // (agent rotates session files). Safe to skip — next poll will pick it up.
-      }
-    }
-  } catch {
-    // Directory was removed between access() and readdir() — rare race condition
-    // during agent restart. Safe to return null and retry on next poll.
-  }
-
-  return latestFile;
+  const info = await findLatestSessionFile(worktreePath);
+  return info?.path ?? null;
 }
 
 // ── Main command ────────────────────────────────────────────────────────
@@ -66,7 +46,6 @@ export async function commandWatch(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [], 'watch');
 
   if (parsed.positional.length === 0) {
-    // No task specified — find all working tasks and let user pick
     const storage = await requireStorage();
     try {
       const tasks = await storage.listTasksWithOptions({ workingOnly: true });
@@ -77,12 +56,10 @@ export async function commandWatch(args: string[]): Promise<void> {
       }
 
       if (tasks.length === 1) {
-        const task = tasks[0];
-        await doWatch(storage, task);
+        await doWatch(storage, tasks[0]);
         return;
       }
 
-      // Multiple working tasks — list them
       console.log('Multiple tasks are running. Specify which one to watch:\n');
       for (const task of tasks) {
         console.log(`  lazy watch ${displayId(task)}    # ${task.goal}`);
@@ -116,40 +93,73 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
   const root = requireLazyRoot();
   const worktreePath = getWorktreePath(root, task);
   const display = displayId(task);
+  const protoDir = getProtocolDir(task.id);
 
   console.log(`Watching task ${theme.taskId(display)}...\n`);
 
-  // Wait for session file to appear
-  let sessionFile = await findSessionFile(worktreePath);
-  if (!sessionFile) {
-    process.stdout.write(dim('Waiting for agent to start...'));
-    while (!sessionFile) {
-      // Check if task is still working
-      const current = await storage.getTask(task.id);
-      if (!current || current.status !== 'working') {
-        console.log('');
-        console.log(`\nTask ${theme.taskId(display)} is no longer running (status: ${current?.status ?? 'unknown'}).`);
-        return;
-      }
+  // Print initial header (if status.json exists)
+  printHeader(protoDir);
 
-      await sleep(POLL_INTERVAL_MS);
-      sessionFile = await findSessionFile(worktreePath);
-    }
-    // Clear the waiting message
-    process.stdout.write('\r' + ' '.repeat(40) + '\r');
+  // Start tailing supervisor stdout via the runner
+  let followHandle: FollowHandle | null = null;
+  try {
+    const runner = await createRunner(root);
+    const session = await storage.getSessionByTaskId(task.id);
+    const runName = session?.container_name ?? runner.runNameForTask(taskRef(task));
+    followHandle = runner.followOutput(runName);
+  } catch {
+    // Runner unavailable (e.g. Docker not running) — agent stream still works.
   }
 
-  // Replay existing content then tail for new entries
+  let supervisorReaderDone = false;
+  if (followHandle?.stdout) {
+    const stdout = followHandle.stdout;
+    void (async () => {
+      const reader = stdout.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            process.stdout.write(dim(`sup> ${line}`) + '\n');
+          }
+        }
+        if (buffer.trim()) {
+          process.stdout.write(dim(`sup> ${buffer}`) + '\n');
+        }
+      } catch {
+        // Stream ended — normal on supervisor exit.
+      } finally {
+        supervisorReaderDone = true;
+      }
+    })();
+  } else {
+    supervisorReaderDone = true;
+  }
+
+  // Wait for the agent's JSONL session file to appear (best effort — task
+  // may be in pre-turn phases where the agent has not started yet).
+  let sessionFile = await findSessionFile(worktreePath);
+
   let lastFileSize = 0;
   let lastStatusCheck = Date.now();
+  let lastHeaderPrint = Date.now();
   let currentSessionFile = sessionFile;
-  // Buffer for incomplete lines split across reads
   let partialLine = '';
 
-  // Handle Ctrl-C gracefully
   let running = true;
+  const stopFollowing = () => {
+    try { followHandle?.process.kill(); } catch { /* best effort */ }
+  };
   const onSigint = () => {
     running = false;
+    stopFollowing();
     console.log(dim('\n\nStopped watching.'));
     process.exit(0);
   };
@@ -157,7 +167,6 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
 
   try {
     while (running) {
-      // Check for new or changed session file
       const newSessionFile = await findSessionFile(worktreePath);
       if (newSessionFile && newSessionFile !== currentSessionFile) {
         currentSessionFile = newSessionFile;
@@ -166,27 +175,22 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
       }
 
       if (currentSessionFile) {
-        // Check for new content by stat-ing the file
         let fileSize: number;
         try {
           const st = await stat(currentSessionFile);
           fileSize = st.size;
         } catch {
-          // File may have been rotated or deleted mid-poll — retry next tick
           await sleep(POLL_INTERVAL_MS);
           continue;
         }
 
         if (fileSize > lastFileSize) {
-          // Read only the new bytes since the last read
           const newBytes = await readTail(currentSessionFile, lastFileSize, fileSize);
           lastFileSize = fileSize;
 
           if (newBytes) {
-            // Prepend any leftover partial line from the previous read
             const chunk = partialLine + newBytes;
             const lines = chunk.split('\n');
-            // The last element may be a partial line (no trailing newline yet)
             partialLine = lines.pop() ?? '';
 
             for (const line of lines) {
@@ -195,27 +199,32 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
                 const entry = JSON.parse(line) as RawLogEntry;
                 renderEntry(entry);
               } catch {
-                // Malformed JSON line — agent may be mid-write. The line is lost
-                // (we already advanced past it), but this is rare and non-critical.
+                // Malformed JSON — agent may be mid-write. Skip.
               }
             }
           }
         }
       }
 
-      // Periodically check if task is still working
       const now = Date.now();
+
+      // Refresh header every 5s alongside the status check
+      if (now - lastHeaderPrint >= STATUS_CHECK_INTERVAL_MS) {
+        lastHeaderPrint = now;
+        printHeader(protoDir);
+      }
+
       if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
         lastStatusCheck = now;
         try {
           const current = await storage.getTask(task.id);
           if (!current || current.status !== 'working') {
+            stopFollowing();
             console.log(dim(`\n\nTask ${display} is no longer running (status: ${current?.status ?? 'unknown'}).`));
             return;
           }
         } catch {
-          // Storage query failed (e.g. DB locked) — non-fatal, keep watching.
-          // The next status check in 5s will retry.
+          // Storage query failed — non-fatal, retry next tick.
         }
       }
 
@@ -223,13 +232,17 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
     }
   } finally {
     process.removeListener('SIGINT', onSigint);
+    stopFollowing();
+    // Reference to avoid unused-variable warning; reader runs detached.
+    void supervisorReaderDone;
   }
 }
 
-/**
- * Read bytes from a file between `start` and `end` offsets.
- * Returns the decoded UTF-8 string, or null if the read fails.
- */
+function printHeader(protoDir: string): void {
+  const status = readStatus(protoDir);
+  process.stdout.write(dim(renderStatusHeader(status)) + '\n');
+}
+
 async function readTail(filePath: string, start: number, end: number): Promise<string | null> {
   let fh;
   try {
@@ -238,8 +251,6 @@ async function readTail(filePath: string, start: number, end: number): Promise<s
     const { bytesRead } = await fh.read(buf, 0, end - start, start);
     return buf.toString('utf-8', 0, bytesRead);
   } catch {
-    // File may have been truncated or rotated between stat and read.
-    // Safe to return null — next poll will detect the new file via findSessionFile.
     return null;
   } finally {
     await fh?.close();
@@ -253,19 +264,19 @@ function sleep(ms: number): Promise<void> {
 export function watchUsage(): void {
   console.log(`Usage: lazy watch [<task-code>]
 
-Watch an agent working on a task in real-time.
+Watch a task in real-time as a unified timeline.
 
-Renders the agent's full conversation from its JSONL session log directly
-in your terminal — thinking blocks, tool calls with inputs, tool results,
-and assistant responses. No tmux required.
+Tails both the supervisor's stdout (pre-turn merges, post-turn check output,
+phase transitions, retries) and the agent's JSONL session log, printing each
+stream as lines arrive. A one-line status header above the stream shows the
+current supervisor phase and how long it has been running; it refreshes
+every 5 seconds.
 
 Arguments:
   <task-code>    Task to watch (code or short ID). If omitted and only one
                  task is running, watches that task automatically.
 
-The command replays the conversation from the beginning (so you can scroll
-back) then tails for new entries. Exits when the task leaves 'working'
-status or you press Ctrl-C.
+Exits when the task leaves 'working' status or you press Ctrl-C.
 
 Examples:
   lazy watch fix-auth      # Watch a specific task

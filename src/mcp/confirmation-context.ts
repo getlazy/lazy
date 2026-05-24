@@ -57,21 +57,6 @@ export function closeConfirmationLevel(
 }
 
 /**
- * Abandon scales with work invested.
- * - No commits and backlog status -> light
- * - Has commits -> stern
- * - Otherwise -> standard
- */
-export function abandonConfirmationLevel(
-  task: Pick<Task, 'status'>,
-  commitCount: number,
-): ConfirmationLevel {
-  if (commitCount === 0 && task.status === 'backlog') return 'light';
-  if (commitCount > 0) return 'stern';
-  return 'standard';
-}
-
-/**
  * Redo scales with old task history.
  * - Many commits (>5) -> stern
  * - Otherwise -> standard
@@ -133,15 +118,6 @@ export interface RejectContext {
 }
 
 export interface CloseContext {
-  [key: string]: string | number;
-  task_code: string;
-  task_id: string;
-  commit_count: number;
-  lines_changed: number;
-  confirmation_code: string;
-}
-
-export interface AbandonContext {
   [key: string]: string | number;
   task_code: string;
   task_id: string;
@@ -224,21 +200,6 @@ export function gatherCloseContext(
   linesChanged: number,
   confirmationCode: string,
 ): CloseContext {
-  return {
-    task_code: task.code ?? task.id.slice(0, 8),
-    task_id: task.id.slice(0, 8),
-    commit_count: commitCount,
-    lines_changed: linesChanged,
-    confirmation_code: confirmationCode,
-  };
-}
-
-export function gatherAbandonContext(
-  task: Pick<Task, 'code' | 'id'>,
-  commitCount: number,
-  linesChanged: number,
-  confirmationCode: string,
-): AbandonContext {
   return {
     task_code: task.code ?? task.id.slice(0, 8),
     task_id: task.id.slice(0, 8),

@@ -10,12 +10,10 @@ import {
 } from '../../src/mcp/confirmation';
 import {
   acceptConfirmationLevel,
-  abandonConfirmationLevel,
   redoConfirmationLevel,
   reopenConfirmationLevel,
   createConfirmationLevel,
   gatherAcceptContext,
-  gatherAbandonContext,
   gatherRedoContext,
   gatherReopenContext,
   gatherCreateParentWarningContext,
@@ -212,25 +210,6 @@ describe('acceptConfirmationLevel', () => {
 
   test('boundary: 501 lines is stern', () => {
     expect(acceptConfirmationLevel({ filesChanged: 3, linesAdded: 300, linesRemoved: 201 })).toBe('stern');
-  });
-});
-
-// INVARIANT: Abandon scales confirmation with commit count and task state.
-describe('abandonConfirmationLevel', () => {
-  test('returns light for backlog task with no commits', () => {
-    expect(abandonConfirmationLevel({ status: 'backlog' }, 0)).toBe('light');
-  });
-
-  test('returns standard for non-backlog task with no commits', () => {
-    expect(abandonConfirmationLevel({ status: 'working' }, 0)).toBe('standard');
-    expect(abandonConfirmationLevel({ status: 'blocked' }, 0)).toBe('standard');
-  });
-
-  // INVARIANT: Tasks with commits require stern confirmation because work would be lost.
-  test('returns stern when task has commits', () => {
-    expect(abandonConfirmationLevel({ status: 'working' }, 1)).toBe('stern');
-    expect(abandonConfirmationLevel({ status: 'backlog' }, 3)).toBe('stern');
-    expect(abandonConfirmationLevel({ status: 'blocked' }, 10)).toBe('stern');
   });
 });
 
@@ -482,14 +461,6 @@ describe('context-gathering functions', () => {
     expect(ctx.confirmation_code).toBe('ac-1234');
   });
 
-  test('gatherAbandonContext produces correct fields', () => {
-    const ctx = gatherAbandonContext(task, 5, 300, 'ab-abcd');
-    expect(ctx.task_code).toBe('my-task');
-    expect(ctx.commit_count).toBe(5);
-    expect(ctx.lines_changed).toBe(300);
-    expect(ctx.confirmation_code).toBe('ab-abcd');
-  });
-
   test('gatherRedoContext produces correct fields', () => {
     const ctx = gatherRedoContext(task, 7, 'rd-2222');
     expect(ctx.task_code).toBe('my-task');
@@ -517,7 +488,7 @@ describe('context-gathering functions', () => {
 
   test('falls back to task id prefix when code is null', () => {
     const noCodeTask = { id: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff', code: null } as Task;
-    const ctx = gatherAbandonContext(noCodeTask, 1, 10, 'ab-0000');
+    const ctx = gatherRedoContext(noCodeTask, 1, 'rd-0000');
     expect(ctx.task_code).toBe('bbbbbbbb');
   });
 });

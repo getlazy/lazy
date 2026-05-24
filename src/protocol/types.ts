@@ -50,6 +50,7 @@ export interface StartCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
+  graceful_exit_timeout_ms?: number;   // kill process this many ms after lazy_commit returns if it hasn't exited (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
@@ -81,6 +82,7 @@ export interface UnblockCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
+  graceful_exit_timeout_ms?: number;   // kill process this many ms after lazy_commit returns if it hasn't exited (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
@@ -108,6 +110,7 @@ export interface AskCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;
   system_prompt?: string;
   model_id?: string;
@@ -116,6 +119,13 @@ export interface AskCommand {
 
   turn_started_at?: string;
   watchdog_output_timeout_ms?: number;
+  // The remaining fields are added by `commonCommandFields` but are no-ops on
+  // the ask path (read-only plan mode — no commits, no checks, no violation
+  // detection). They are accepted so every command builder can share one
+  // helper.
+  protected_patterns?: string[];
+  post_turn_check?: string;
+  post_turn_timeout?: number;
 }
 
 /**
@@ -195,6 +205,12 @@ export interface ErrorResponse {
   stdout_error?: string;
   /** How long the agent ran before crashing (ms) */
   duration_ms?: number;
+  /**
+   * Claude session id, when recoverable. Set by the supervisor on
+   * GracefulExitTimeoutError so the human can `lazy unblock` after the kill
+   * and pick up the conversation cleanly instead of orphaning it.
+   */
+  session_id?: string;
 }
 
 export type Response = CompletedResponse | ErrorResponse;
@@ -232,6 +248,12 @@ export interface SupervisorStatus {
   command_type: CommandType;
   started_at: string;
   updated_at: string;
+  /** ISO timestamp when the current phase was entered — used by watch/show header for elapsed-in-phase display. */
+  phase_started_at?: string;
+  /** Currently running subprocess command (e.g., "cargo build") — rendered by watch/show header when set. */
+  current_command?: string;
+  /** ISO timestamp when the current subprocess command started — used for elapsed-in-command display. */
+  current_command_started_at?: string;
   /** SHA of HEAD before this turn started (for deterministic turn diff) */
   pre_turn_sha?: string;
   /** SHA of HEAD after sync-with-remote phase completed (merged origin/<branch>) */

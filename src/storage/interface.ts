@@ -292,6 +292,13 @@ export interface Storage {
    */
   setAutoResumed(sessionId: string, autoResumed: boolean): Promise<void>;
 
+  /**
+   * Set the user_stopped flag on a session.
+   * When true, the reconciler will not auto-resume the interrupted task —
+   * a manual resume/unblock is required. Cleared by resetConsecutiveInterruptions.
+   */
+  setUserStopped(sessionId: string, userStopped: boolean): Promise<void>;
+
   // --- Turns ---
 
   /**

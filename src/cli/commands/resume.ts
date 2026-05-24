@@ -11,6 +11,11 @@ import { theme } from '../theme';
 export { buildSystemPromptForResume, buildResumePrompt } from '../../daemon/task-lifecycle';
 
 export async function commandResume(args: string[]): Promise<void> {
+  // Deprecation notice: `lazy resume` is structurally `lazy unblock` with no
+  // message after the stop→blocked unification. Keep the alias working but
+  // steer users toward `lazy unblock`.
+  console.error(`[deprecated] 'lazy resume' is deprecated. Use 'lazy unblock <task>' (with no --message) instead. This alias will be removed in a future release.`);
+
   // Parse and validate flags
   const parsed = parseFlags(args, [
     { name: 'follow', takesValue: false },

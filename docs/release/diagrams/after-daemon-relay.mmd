@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant CI
+    participant Daemon
+    participant Agent A
+    participant Agent B
+
+    Agent A->>Daemon: Turn complete (blocked)
+    CI->>Daemon: Build failed (via sync)
+    Daemon->>Daemon: Budget check: OK
+    Daemon->>Agent A: Auto-unblock with CI context
+    Agent A->>Daemon: Fixed, turn complete
+    Daemon->>Daemon: Detect state change
+    Daemon->>Agent B: SSE: upstream.updated
+    Agent B->>Agent B: Auto-sync with parent

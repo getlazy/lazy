@@ -19,7 +19,7 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, effort: 'medium' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0, effort: 'medium' },
   builder: { effort: 'high' },
   server: { port: 3000, sync_interval: 1000 },
   remote: {

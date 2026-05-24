@@ -22,7 +22,6 @@ import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { getActor } from '../../constants';
 import { spawnSync, spawn } from '../../utils/spawn';
-import { createTerminal } from '../../terminal';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -415,12 +414,6 @@ export async function commandPair(args: string[]): Promise<void> {
     // Store pairing metadata for reconciliation (stale pairing detection)
     await storage.updateTaskMetadata(task.id, 'pairing_pid', String(process.pid));
     await storage.updateTaskMetadata(task.id, 'pairing_started_at', new Date().toISOString());
-
-    // Set terminal window title
-    const terminal = createTerminal();
-    terminal.setActivity(`lazy pair ${displayId(task)}`);
-    const restoreTerminal = () => terminal.restoreTitle();
-    process.on('exit', restoreTerminal);
 
     console.log(`\nPairing on task ${theme.taskId(taskShortId)}: ${task.goal}`);
     console.log(`  ${theme.label('Branch:')}    ${sess.git_branch}`);
