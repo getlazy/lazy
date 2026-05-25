@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.1040] - 2026-05-24 - Chat with agents from finished tasks
+
+### New commands
+
+- **`lazy chat <task>`** — reopen a finished task's agent session for an interactive, read-only conversation. Rehydrates the raw Claude Code session JSONL captured on close (accept/reject/close/abandon) into `~/.claude/projects/`, resumes it with `claude --resume` locked to read-only (plan mode + `Bash`/`Write`/`Edit` disallowed), and writes the extended session back to storage when the chat ends so the conversation persists across invocations. Talk to the agent about what it did and why — without any ability to mutate the repo or task state. Defaults to `--effort medium` (a retrospective chat is lightweight; faster/cheaper than the inherited high/xhigh task defaults); override with `--effort <low|medium|high|xhigh|max>`
+
 ## [0.14.1037] - 2026-05-23 - Control, visibility, and safety
 
 Lazy v0.14 broadens what you can do (new `lazy report`, `lazy stop`, and `lazy_ask`), tightens how you do it (`lazy close` and `lazy reject` restored as distinct commands, `lazy watch` reworked as a unified timeline, builder discipline polish), and hardens the rough edges (safer accept, GitLab-driver verification, idempotent confirmation, ask-mode lockdown, post-turn-check no-hang).

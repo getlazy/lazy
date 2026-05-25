@@ -236,3 +236,22 @@ export interface StoredSubagent {
   agentId: string;
   messages: StoredMessage[];
 }
+
+// --- Agent session log (raw Claude Code JSONL) ---
+
+/**
+ * The raw, byte-for-byte Claude Code session JSONL captured for a task before
+ * its worktree is cleaned up. Unlike StoredConversation (a parsed, searchable
+ * representation), this preserves the exact transcript so the session can be
+ * rehydrated and resumed via `claude --resume <sessionId>`.
+ */
+export interface AgentSessionLog {
+  /** Lazy task ID this session belongs to */
+  taskId: string;
+  /** Claude Code session UUID (the JSONL filename minus `.jsonl`) */
+  sessionId: string;
+  /** When the log was captured (unix ms) */
+  capturedAt: number;
+  /** Raw JSONL content, byte-for-byte */
+  content: string;
+}

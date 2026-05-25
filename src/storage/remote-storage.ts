@@ -29,6 +29,7 @@ import type {
   ListTasksOptions,
   SearchResult,
   StoredConversation,
+  AgentSessionLog,
   StatusChange,
 } from './types';
 import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage } from '../types';
@@ -336,6 +337,16 @@ export class RemoteStorage implements Storage {
 
   async isConversationImported(sessionId: string): Promise<boolean> {
     return this.call<boolean>('isConversationImported', { sessionId });
+  }
+
+  // --- Agent Session Logs ---
+
+  async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
+    await this.call('saveAgentSessionLog', { taskId, sessionId, content });
+  }
+
+  async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
+    return this.call<AgentSessionLog | null>('getAgentSessionLog', { taskId });
   }
 
   // --- Status History ---

@@ -1041,9 +1041,10 @@ export async function rejectTask(
     logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
   }
 
-  // Clean up lock and worktree (preserve branch)
+  // Clean up lock and worktree (preserve branch). cleanupWorktree captures the
+  // raw agent session JSONL before teardown.
   await removeLock(worktreePath);
-  await cleanupWorktree(worktreePath, projectRoot);
+  await cleanupWorktree(worktreePath, projectRoot, storage, task.id, sess.agent_session_id);
 
   // Clean up protocol dir
   removeProtocolDir(getProtocolDir(task.id));
@@ -1148,7 +1149,7 @@ export async function closeTask(
     }
 
     await removeLock(worktreePath);
-    await cleanupWorktree(worktreePath, projectRoot);
+    await cleanupWorktree(worktreePath, projectRoot, storage, task.id, sess.agent_session_id);
   }
 
   // Clean up protocol dir
@@ -1492,7 +1493,7 @@ export async function acceptTask(
 
       await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
       await removeLock(worktreePath);
-      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
       removeProtocolDir(getProtocolDir(task.id));
 
       const prUrl = await driver.getTaskUrl(task);
@@ -1577,7 +1578,7 @@ export async function acceptTask(
 
       await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
       await removeLock(worktreePath);
-      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
       removeProtocolDir(getProtocolDir(task.id));
 
       const prUrl = await driver.getTaskUrl(task);
@@ -1793,7 +1794,7 @@ export async function acceptTask(
 
   await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
   await removeLock(worktreePath);
-  await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot);
+  await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
   removeProtocolDir(getProtocolDir(task.id));
 
   const prUrl = await driver.getTaskUrl(task);

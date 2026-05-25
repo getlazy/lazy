@@ -1,8 +1,8 @@
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, taskRef, getWorktreePath, MAX_TASK_CODE_LENGTH } from '../helpers';
-import { removeWorktree, deleteBranch, getDiffStat, hasUncommittedChanges } from '../../git/operations';
-import { cleanupTaskContainer } from './shared';
+import { getDiffStat, hasUncommittedChanges } from '../../git/operations';
+import { cleanupTaskContainer, cleanupWorktreeAndBranch } from './shared';
 import { commandStart } from './start';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
@@ -13,26 +13,7 @@ import type { Storage } from '../../storage/interface';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
-import { spawnSync } from '../../utils/spawn';
-import { runGit } from '../../utils/git';
 import { escapeRegex } from '../../utils/regex';
-
-async function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): Promise<void> {
-  if (existsSync(worktreePath)) {
-    try {
-      await removeWorktree(worktreePath, root);
-    } catch {
-      // Worktree may be corrupted. Fall back to manual removal + prune.
-      spawnSync(['rm', '-rf', worktreePath]);
-      runGit(['worktree', 'prune'], { cwd: root });
-    }
-  }
-  try {
-    await deleteBranch(branch, root);
-  } catch {
-    // Branch may already be gone
-  }
-}
 
 /**
  * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
@@ -227,7 +208,7 @@ export async function commandRedo(args: string[]): Promise<void> {
         logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
       }
 
-      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
+      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root, storage, oldTask.id, sess.agent_session_id);
     }
 
     newTaskShortId = shortId(newTask.id);

@@ -208,7 +208,7 @@ async function handleInterruptedTasks(
 
         // Clean up worktree and branch
         try {
-          await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root);
+          await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root, storage, task.id, sess.agent_session_id);
         } catch (err) {
           // Log but don't fail — partial cleanup is acceptable
           console.error(`Warning: could not fully clean up worktree: ${err instanceof Error ? err.message : err}`);

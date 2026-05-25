@@ -44,6 +44,10 @@ lazy review -i <task-id>
 # with the agent, use `lazy pair` to the agent's session but now with you in control
 lazy pair <task-id>
 
+# And if the tasks has ended, you can still go back and chat with the agent to
+# ask it questions and get more information on the reasoning.
+lazy chat <finished-task-id>
+
 # Accept and merge to main
 lazy accept <task-id>
 
@@ -171,6 +175,17 @@ All `builder` and autonomous agent sessions run in isolated containers with only
 The process isolation is necessary as `lazy` runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the `builder` agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
 
 The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run `lazy` on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running `lazy` on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
+
+#### My MO for polishing
+
+When I have very complex task (e.g. preparing a release or a novel CLI surface that I am not yet sure about) that I need to polish I will:
+
+* Split terminal into three vertical screens
+* Run the builder on the left side
+* Pair with the task on the middle
+* Shell into the task's worktree and test it on the right side
+
+This way I focus on switching between testing and pairing and occasionally switching to builder either for filing new tasks or subtasks that I may want to do beyond the polishing effort.
 
 ### The task manager
 
@@ -527,6 +542,16 @@ lazy stop <task-id>
 I consider the use of these actions a smell because it goes directly against the async first nature of `lazy`. So why even build them? I didn't at first but over time it became clear that for it's useful to sometimes observe the agent in its work, mostly for troubleshooting but sometimes things are taking much longer and I start to wonder. As for `stop`, honestly I rarely if ever want to change the direction for the agent: I think we are better off, all told, if we don't micromanage but again follow the async model. But rarely but sometimes the agent was started by the builder onto a truly wrong path or at the wrong time or something has gone astray e.g. same as with `watch` you want to observe it and sometimes, just sometimes you want to stop the agent.
 
 So occasionally useful but if you find yourself using them more than a few times a week, I would the model, effort, how well prompts are written and so on. And of course, I would love to hear about it.
+
+### Historic Context
+
+I occasionally want to go back to the closed tasks and, similar to pairing, chat directly with the agent that performed the work:
+
+```bash
+lazy chat <finished-task-id>
+```
+
+In this mode, there is no worktree and agent itself is running in plannig mode, without access to things like bash and so on, and on a lower effort level by default (which you can override with `--effort`). This is useful to ask questions and understand more of the context and not to perform work, obviously, as the task has already been closed.
 
 ### Confirmation Protocol
 

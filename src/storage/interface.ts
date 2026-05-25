@@ -27,6 +27,7 @@ import type {
   ListTasksOptions,
   SearchResult,
   StoredConversation,
+  AgentSessionLog,
   StatusChange,
   Actor,
   CommentSource,
@@ -448,6 +449,21 @@ export interface Storage {
    * Check if a conversation has been imported
    */
   isConversationImported(sessionId: string): Promise<boolean>;
+
+  // --- Agent Session Logs (raw Claude Code JSONL) ---
+
+  /**
+   * Save (create or overwrite) the raw agent session JSONL for a task.
+   * Stored byte-for-byte and keyed by task so it survives worktree cleanup
+   * and can later be rehydrated for `claude --resume <sessionId>`.
+   */
+  saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void>;
+
+  /**
+   * Load the raw agent session log previously captured for a task, or null
+   * if none has been captured (e.g. the task never ran an agent turn).
+   */
+  getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null>;
 
   // --- Status History ---
 

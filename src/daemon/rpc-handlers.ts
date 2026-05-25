@@ -842,6 +842,10 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   listConversations: (s) => s.listConversations(),
   isConversationImported: (s, a) => s.isConversationImported(a.sessionId as string),
 
+  // Agent session logs (raw Claude Code JSONL)
+  saveAgentSessionLog: (s, a) => s.saveAgentSessionLog(a.taskId as string, a.sessionId as string, a.content as string),
+  getAgentSessionLog: (s, a) => s.getAgentSessionLog(a.taskId as string),
+
   // Status History
   getStatusHistory: (s, a) => s.getStatusHistory(a.taskId as string),
 

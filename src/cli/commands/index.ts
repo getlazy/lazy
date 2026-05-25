@@ -13,6 +13,7 @@ export { commandStatus, statusUsage } from './status';
 export { commandDiff, diffUsage } from './diff';
 export { commandShell, shellUsage } from './shell';
 export { commandPair, pairUsage } from './pair';
+export { commandChat, chatUsage } from './chat';
 export { commandAccept, acceptUsage } from './accept';
 export { commandClose, closeUsage } from './close';
 export { commandReject, rejectUsage } from './reject';

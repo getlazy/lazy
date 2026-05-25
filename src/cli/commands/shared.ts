@@ -15,6 +15,7 @@ import { loadConfig } from '../../config/loader';
 import { openEditor, readStdin, removeRecoveryFile, requireTTY } from '../editor';
 import { buildEditorContentWithDiff, buildFreeformEditorContentWithNotes, extractFeedbackFromDiff, stripCommentLines, getTurnDiff } from '../../utils/diff';
 import { logger } from '../../utils/logger';
+import { captureAgentSessionLog } from '../../import/capture-agent-session-log';
 import type { Storage } from '../../storage';
 import { requireStorage, shortId, displayId, getBranchNameFromId } from '../helpers';
 import { isTerminalStatus } from '../../types';
@@ -189,8 +190,28 @@ export function buildPromptWithInstructions(userPrompt: string, goal: string, pa
 /**
  * Remove a task's worktree only (preserve the branch for recovery).
  * Falls back to manual cleanup if git worktree remove fails.
+ *
+ * This is the single chokepoint for worktree teardown — every close form
+ * (accept/reject/close/abandon, redo, loop-interruption, remote-sync) routes
+ * through here, directly or via cleanupWorktreeAndBranch. We capture the raw
+ * agent session JSONL FIRST, before removeWorktree, because the sandbox copy
+ * lives inside the worktree (`<worktree>/.lazy-task-sandbox/...`) and is
+ * destroyed with it. The capture context (storage/taskId/sessionId) is
+ * REQUIRED so the type checker forces every caller — current and future — to
+ * supply it; this is what prevents teardown paths from silently dropping the
+ * session log again.
  */
-export async function cleanupWorktree(worktreePath: string, root: string): Promise<void> {
+export async function cleanupWorktree(
+  worktreePath: string,
+  root: string,
+  storage: Storage,
+  taskId: string,
+  sessionId: string | null,
+): Promise<void> {
+  // Capture before teardown — ordering is load-bearing (sandbox JSONL is
+  // inside the worktree). Best-effort: never throws, so cleanup can't break.
+  await captureAgentSessionLog(storage, taskId, sessionId, worktreePath);
+
   if (existsSync(worktreePath)) {
     console.log('Removing worktree...');
     try {
@@ -208,9 +229,18 @@ export async function cleanupWorktree(worktreePath: string, root: string): Promi
 /**
  * Remove a task's worktree and delete its branch.
  * Falls back to manual cleanup if git worktree remove fails.
+ *
+ * Delegates worktree teardown (and the session-log capture) to cleanupWorktree.
  */
-export async function cleanupWorktreeAndBranch(worktreePath: string, branch: string, root: string): Promise<void> {
-  await cleanupWorktree(worktreePath, root);
+export async function cleanupWorktreeAndBranch(
+  worktreePath: string,
+  branch: string,
+  root: string,
+  storage: Storage,
+  taskId: string,
+  sessionId: string | null,
+): Promise<void> {
+  await cleanupWorktree(worktreePath, root, storage, taskId, sessionId);
   try {
     await deleteBranch(branch, root);
   } catch {

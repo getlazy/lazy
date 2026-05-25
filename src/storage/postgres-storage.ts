@@ -25,6 +25,7 @@ import type {
   ListTasksOptions,
   SearchResult,
   StoredConversation,
+  AgentSessionLog,
   StatusChange,
   Actor,
   FileViolation,
@@ -150,6 +151,9 @@ export class PostgresStorage implements Storage {
     }
     if (version < 4) {
       await this.migrateToV4();
+    }
+    if (version < 5) {
+      await this.migrateToV5();
     }
   }
 
@@ -466,6 +470,29 @@ export class PostgresStorage implements Storage {
       await sql`
         INSERT INTO schema_version (version, migrated_from)
         VALUES (4, '3')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV5(): Promise<void> {
+    // Raw Claude Code session JSONL, keyed by task. One row per task (1:1 with
+    // the latest captured session). CASCADE purges the log when a task is
+    // deleted. Distinct from the `conversations` table, which holds the parsed,
+    // searchable representation — this preserves the byte-for-byte transcript.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`
+        CREATE TABLE IF NOT EXISTS agent_session_logs (
+          task_id     TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          session_id  TEXT NOT NULL,
+          captured_at BIGINT NOT NULL,
+          content     TEXT NOT NULL
+        )
+      `;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (5, '4')
         ON CONFLICT (version) DO NOTHING
       `;
     });
@@ -1213,6 +1240,35 @@ export class PostgresStorage implements Storage {
       SELECT COUNT(*) as count FROM conversations WHERE session_id = ${sessionId}
     `;
     return (result?.count ?? 0) > 0;
+  }
+
+  // --- Agent Session Logs (raw Claude Code JSONL) ---
+
+  async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
+    const { task } = await this.resolveTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    await this.sql`
+      INSERT INTO agent_session_logs (task_id, session_id, captured_at, content)
+      VALUES (${task.id}, ${sessionId}, ${Date.now()}, ${content})
+      ON CONFLICT (task_id) DO UPDATE SET
+        session_id = EXCLUDED.session_id,
+        captured_at = EXCLUDED.captured_at,
+        content = EXCLUDED.content
+    `;
+  }
+
+  async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
+    const { task } = await this.resolveTask(taskId);
+    if (!task) return null;
+    const [row] = await this.sql<AgentSessionLog[]>`
+      SELECT
+        task_id AS "taskId",
+        session_id AS "sessionId",
+        captured_at AS "capturedAt",
+        content
+      FROM agent_session_logs WHERE task_id = ${task.id}
+    `;
+    return row ?? null;
   }
 
   private async recordStatusChange(taskId: string, status: string, timestamp: number, actor?: Actor): Promise<void> {

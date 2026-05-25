@@ -159,7 +159,7 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
             await cleanupTaskContainer(storage, session, taskRef(task), root);
             const worktreePath = getWorktreePath(root, task);
             await removeLock(worktreePath);
-            await cleanupWorktreeAndBranch(worktreePath, session.git_branch, root);
+            await cleanupWorktreeAndBranch(worktreePath, session.git_branch, root, storage, task.id, session.agent_session_id);
             removeProtocolDir(protocolDir(task.id));
           } catch (err) {
             logger.debug(`Cleanup after merge completion failed for task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);

@@ -42,6 +42,7 @@ import type {
   StorageVersion,
   SearchResult,
   StoredConversation,
+  AgentSessionLog,
   TurnsFile,
   CommitsFile,
   PromptHistoryFile,
@@ -1989,6 +1990,40 @@ export class FileStorage implements Storage {
     } catch {
       return false;
     }
+  }
+
+  // --- Agent Session Logs (raw Claude Code JSONL) ---
+
+  async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+    const taskDir = this.getTaskDir(fullId);
+    await mkdir(taskDir, { recursive: true });
+    // Store the JSONL byte-for-byte in its own file so resume gets an exact
+    // copy; a sidecar holds the session id and capture timestamp.
+    await writeFile(join(taskDir, 'agent-session.jsonl'), content, 'utf-8');
+    await writeFile(
+      join(taskDir, 'agent-session.json'),
+      JSON.stringify({ sessionId, capturedAt: Date.now() }, null, 2),
+      'utf-8',
+    );
+  }
+
+  async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return null;
+    const taskDir = this.getTaskDir(fullId);
+    let meta: { sessionId: string; capturedAt: number };
+    try {
+      meta = JSON.parse(await readFile(join(taskDir, 'agent-session.json'), 'utf-8'));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new Error(`Failed to read agent session metadata for ${fullId}: ${(err as Error).message}`);
+    }
+    const content = await readFile(join(taskDir, 'agent-session.jsonl'), 'utf-8');
+    return { taskId: fullId, sessionId: meta.sessionId, capturedAt: meta.capturedAt, content };
   }
 
   // --- Status History ---

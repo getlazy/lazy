@@ -17,6 +17,7 @@ import {
   commandDiff, diffUsage,
   commandShell, shellUsage,
   commandPair, pairUsage,
+  commandChat, chatUsage,
   commandAccept, acceptUsage,
   commandClose, closeUsage,
   commandReject, rejectUsage,
@@ -100,6 +101,7 @@ Inspect:
   status <task_id>       Show worktree and commit state
   shell <task_id>        Open shell in task's worktree
   pair <task_id>         Pair program with Claude in task's worktree
+  chat <task_id>         Read-only chat with a finished task's agent session
   accept <task_id>       Merge task's work
   close <task_id>        Close a task (no session required)
   reject <task_id>       Reject a task's work and close its PR
@@ -186,6 +188,7 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'status':   { run: commandStatus, usage: statusUsage },
   'shell':    { run: commandShell, usage: shellUsage },
   'pair':     { run: commandPair, usage: pairUsage },
+  'chat':     { run: commandChat, usage: chatUsage },
   'accept':   { run: commandAccept, usage: acceptUsage },
   'close':    { run: commandClose, usage: closeUsage },
   'reject':   { run: commandReject, usage: rejectUsage },
