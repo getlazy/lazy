@@ -49,6 +49,7 @@ import type {
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
+import { targetBranchOf } from '../task-target';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
@@ -57,6 +58,7 @@ import { spawnSync } from '../utils/spawn';
 import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
+import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
 
 export interface GlResult {
   stdout: string;
@@ -159,7 +161,10 @@ export class GitLabDriver implements RepositoryDriver {
     await withRemoteRetry(
       async () => {
         logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-        const result = await this.git(['push', '-u', this.remoteName, branch]);
+        // No -u: task branches must not set upstream tracking, or `git pull`
+        // in the worktree would silently merge the remote task branch. The
+        // doctor command flags any task branch that has tracking configured.
+        const result = await this.git(['push', this.remoteName, branch]);
         if (result.exitCode !== 0) {
           if (result.stderr.includes('Everything up-to-date')) {
             logger.debug('Branch already up-to-date on remote');
@@ -245,12 +250,9 @@ export class GitLabDriver implements RepositoryDriver {
       };
     }
 
-    // Store the target branch in metadata so markReadyForReview can create the MR later
-    return {
-      metadata: {
-        remote_target_branch: opts.targetBranch,
-      },
-    };
+    // Nothing to persist: markReadyForReview derives the MR target from the
+    // task's canonical target (task.target), not from stored metadata.
+    return { metadata: {} };
   }
 
   async markReadyForReview(task: Task): Promise<{ metadata?: Record<string, string> }> {
@@ -1391,14 +1393,22 @@ export class GitLabDriver implements RepositoryDriver {
     return task.metadata?.gitlab_remote_ref_url;
   }
 
+  /**
+   * The target branch for a NEW MR, derived from the task's canonical
+   * integration target ({@link TaskTarget}) — never from stored metadata.
+   *
+   * Used only when *creating* an MR (markReadyForReview). An MR's target is a
+   * creation-time fact owned by GitLab thereafter; a later `lazy reparent` does
+   * not rewrite an open MR's target. MRs are only opened for top-level tasks,
+   * whose target is a named branch.
+   */
   private async targetBranch(task: Task): Promise<string> {
-    const branch = task.metadata?.remote_target_branch;
-    if (branch && branch !== 'HEAD') return branch;
-    if (branch === 'HEAD') {
-      logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
+    const branch = targetBranchOf(task);
+    if (!branch || branch === 'HEAD' || branch.startsWith('lazy/')) {
+      logger.warn(`targetBranch: task ${task.id} has no valid named integration branch ('${branch ?? ''}') — resolving to default branch`);
       return (await this.resolveDefaultBranch()) ?? 'main';
     }
-    return 'main';
+    return branch;
   }
 
   /**
@@ -1444,17 +1454,49 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   private buildMRBody(task: Task): string {
-    const sections: string[] = [];
+    return composeInitialBody({
+      goal: task.goal,
+      prompt: task.prompt ?? undefined,
+      footer: '---\n*Created by [lazy](https://getlazy.dev/)*',
+    });
+  }
 
-    sections.push(`## Goal\n\n${task.goal}`);
-
-    if (task.prompt) {
-      sections.push(`## Prompt\n\n${task.prompt}`);
+  async updateRemoteBody(task: Task, summary: string): Promise<void> {
+    const mrIid = this.mrNumber(task);
+    if (!mrIid) {
+      logger.debug('updateRemoteBody: task has no MR — skipping');
+      return;
     }
 
-    sections.push('---\n*Created by [lazy](https://getlazy.dev/)*');
+    await withRemoteRetry(
+      async () => {
+        // Read the live description so human edits outside the lazy section survive.
+        const viewResult = await this.gl(['mr', 'view', mrIid, '--output', 'json']);
+        if (viewResult.exitCode !== 0) {
+          throw new Error(`glab mr view failed (exit ${viewResult.exitCode}) for MR !${mrIid}: ${viewResult.stderr.trim()}`);
+        }
+        let currentBody = '';
+        try {
+          currentBody = JSON.parse(viewResult.stdout).description ?? '';
+        } catch (err) {
+          throw new Error(`glab mr view returned unparseable JSON for MR !${mrIid}: ${err instanceof Error ? err.message : err}`);
+        }
 
-    return sections.join('\n\n');
+        const newBody = applyFidelitySection(currentBody, summary);
+        if (newBody === currentBody) {
+          logger.debug(`updateRemoteBody: MR !${mrIid} description unchanged — skipping edit`);
+          return;
+        }
+
+        const editResult = await this.gl(['mr', 'update', mrIid, '--description', newBody]);
+        if (editResult.exitCode !== 0) {
+          throw new Error(`glab mr update failed (exit ${editResult.exitCode}) for MR !${mrIid}: ${editResult.stderr.trim()}`);
+        }
+        logger.debug(`updateRemoteBody: updated lazy section of MR !${mrIid}`);
+      },
+      `update description of MR !${mrIid}`,
+      this.retryOpts,
+    );
   }
 
   /** Check if sourceBranch is already fully merged into targetBranch via git. */

@@ -15,6 +15,7 @@ import type { TaskTreeNode } from '../../storage/types';
 import { readPendingProposals, updateProposalStatus } from '../commands/propose';
 import { getNewNotesSince } from '../commands/shared';
 import type { Task, Session, Turn, Comment, Commit } from '../../types';
+import { parentTaskIdOf } from '../../task-target';
 import type { Proposal } from '../commands/propose';
 import type { Storage } from '../../storage';
 import { getDataDir } from '../init';
@@ -69,10 +70,12 @@ export async function loadReviewData(
   const taskShortId = shortId(task.id);
   const worktreePath = getWorktreePath(root, task);
 
+  const parentId = parentTaskIdOf(task);
+
   // Determine target branch
   let targetBranch: string;
-  if (task.parent_task_id) {
-    targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+  if (parentId) {
+    targetBranch = await getBranchNameFromId(parentId, storage);
   } else {
     targetBranch = await getRemoteDefaultBranch(root);
   }
@@ -83,7 +86,7 @@ export async function loadReviewData(
     session ? storage.getSessionCommits(session.id) : Promise.resolve([]),
     storage.getTaskComments(task.id),
     Promise.resolve(readPendingProposals(storage, task.id)),
-    task.parent_task_id ? storage.getTask(task.parent_task_id) : Promise.resolve(null),
+    parentId ? storage.getTask(parentId) : Promise.resolve(null),
   ]);
 
   const lastAgentTurn = turns.filter(t => t.role === 'agent').pop() ?? null;
@@ -172,7 +175,7 @@ export async function loadReviewData(
   // Build task tree if this task is part of a hierarchy
   let taskTree: TaskTreeNode | null = null;
   const childTasks = await storage.getChildTasks(task.id);
-  if (task.parent_task_id || childTasks.length > 0) {
+  if (parentId || childTasks.length > 0) {
     const rootTask = await storage.getRootTask(task.id);
     if (rootTask) {
       taskTree = await storage.getTaskTree(rootTask.id);
@@ -203,8 +206,9 @@ async function loadReviewDataForSubtask(
 
   // Minimal data for tasks without sessions
   const childTasks = await storage.getChildTasks(task.id);
-  const parentTask = task.parent_task_id
-    ? await storage.getTask(task.parent_task_id)
+  const parentId = parentTaskIdOf(task);
+  const parentTask = parentId
+    ? await storage.getTask(parentId)
     : null;
 
   const worktreePath = getWorktreePath(root, task);
@@ -236,8 +240,8 @@ async function loadReviewDataForSubtask(
   // or missing session record) — still try to get branch diff
   // Determine target branch for diff
   let targetBranch = '';
-  if (task.parent_task_id) {
-    targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+  if (parentId) {
+    targetBranch = await getBranchNameFromId(parentId, storage);
   } else {
     targetBranch = await getRemoteDefaultBranch(root);
   }

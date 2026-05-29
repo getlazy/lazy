@@ -15,7 +15,8 @@
  *   - on launchSupervisor failure, the status must revert to the prior value
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
 // --- Controllable mock state ---
@@ -35,7 +36,7 @@ import {
   getDefaultConfigTemplate as REAL_getDefaultConfigTemplate,
 } from '../../src/config/loader';
 
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: { driver: 'local', git_remote: 'origin', auto_approve: false },
     storage: { backend: 'external', external_path: '' },
@@ -47,20 +48,20 @@ mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
   getOrCreateStorage: async () => createMockStorage(),
   RpcError: RealRpcError,
   initDaemonStorage: () => {},
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     resolveUpstreamRef: async (branch: string) => branch,
   }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   hasUncommittedChanges: async () => false,
   applyPatch: async () => true,
   hasUpstreamChanges: async () => hasUpstreamChangesValue,
@@ -71,29 +72,29 @@ mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   getCurrentSha: async () => 'deadbeef',
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
   pathExists: async () => true,
   dirExists: async () => true,
   ensureDir: async () => {},
   readFileSafe: async () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
   checkPairingLock: () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
   validateBranchInSyncWithRemote: async () => ({ inSync: true }),
   runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   checkLock: () => null,
   acquireLock: () => {},
   removeLock: () => {},
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -103,7 +104,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async () => 'lazy/parent-branch',
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -111,7 +112,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   formatReparentWarning: () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
@@ -125,7 +126,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => 
   resolveParentBranchWithFallback: async () => ({ branch: 'main', warnings: [] }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
   protocolDir: () => '/tmp/protocol',
   writeCommand: () => {
     writeCommandCalls++;
@@ -138,7 +139,7 @@ mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
   removeProtocolDir: () => {},
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/runner/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/runner/index.ts'), () => ({
   createRunner: async () => ({
     type: 'host-process',
     setAgent: () => {},
@@ -151,12 +152,12 @@ mock.module(resolve(import.meta.dir, '../../src/runner/index.ts'), () => ({
   }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/daemon/task-launcher.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/daemon/task-launcher.ts'), () => ({
   writeDaemonMcpConfig: async () => '/tmp/fake-daemon-config.json',
   SANDBOX_DIR: '.lazy-task-sandbox',
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/sandbox.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/sandbox.ts'), () => ({
   SANDBOX_DIR: '.lazy-task-sandbox',
   setupSandbox: async (worktreePath: string) => ({
     worktreePath,
@@ -164,7 +165,7 @@ mock.module(resolve(import.meta.dir, '../../src/utils/sandbox.ts'), () => ({
   }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/agent/registry.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/agent/registry.ts'), () => ({
   getAgent: () => ({
     id: 'claude-code',
     binary: 'fake-claude',
@@ -213,7 +214,7 @@ function makeTask() {
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: { parent_branch: 'main' },
@@ -372,4 +373,8 @@ describe('syncTask state transitions', () => {
     expect(writeCommandCalls).toBeGreaterThanOrEqual(1);
     expect(consumeCommandCalls).toBe(writeCommandCalls);
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

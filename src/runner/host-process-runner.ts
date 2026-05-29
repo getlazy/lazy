@@ -145,16 +145,14 @@ export class HostProcessRunner implements Runner {
       }
     }
 
+    // Auth is NOT enforced here. The daemon credential gate
+    // (src/daemon/credential-gate.ts) is the single enforcement point.
     if (this._ollamaConfig?.enabled) {
-      // When Ollama is configured, auth is always available (dummy tokens).
       // Log a warning if Ollama is unreachable (don't fail — it might come up later).
       const check = checkOllamaConnectivity(this._ollamaConfig);
       if (!check.reachable) {
         logger.warn(check.reason);
       }
-    } else {
-      // Check auth — fail fast on missing credentials
-      this.getAuthEnvVars();
     }
   }
 

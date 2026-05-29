@@ -186,7 +186,7 @@ describe('orphan children', () => {
     // Set up parent relationship and branched_from_sha
     const parentTaskJson = readTaskJson(ctx.root, parentId);
     const parentFullId = findFullTaskId(ctx.root, parentId);
-    childTaskJson.parent_task_id = parentFullId;
+    childTaskJson.target = { kind: 'task' as const, parentTaskId: parentFullId };
     // Use the parent worktree's HEAD as the branch point
     const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
     const shaResult = ctx.git('-C', parentWorktree, 'rev-parse', 'HEAD');

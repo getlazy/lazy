@@ -15,7 +15,7 @@ import type { TaskStatus } from '../../src/types';
 // All statuses that exist in the TaskStatus type
 const ALL_STATUSES: TaskStatus[] = [
   'backlog', 'working', 'blocked', 'conflict', 'pairing',
-  'interrupted', 'merging', 'zombie', 'complete', 'abandoned',
+  'interrupted', 'submitted', 'merging', 'zombie', 'complete', 'abandoned',
 ];
 
 describe('task-state-machine', () => {

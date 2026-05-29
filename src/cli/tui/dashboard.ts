@@ -12,6 +12,7 @@ import { shortId, displayId, formatDate } from '../helpers';
 import { isTerminalStatus } from '../../task-state-machine';
 import { runReviewTUI } from './review';
 import type { Task } from '../../types';
+import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage';
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ function buildTaskForest(tasks: Task[]): FlatDashboardNode[] {
   // Group tasks by parent
   const childrenOf = new Map<string | null, Task[]>();
   for (const t of tasks) {
-    const parentKey = t.parent_task_id;
+    const parentKey = parentTaskIdOf(t);
     const existing = childrenOf.get(parentKey) ?? [];
     existing.push(t);
     childrenOf.set(parentKey, existing);
@@ -70,7 +71,8 @@ function buildTaskForest(tasks: Task[]): FlatDashboardNode[] {
   // Top-level = tasks with no parent OR whose parent is not in the active set
   const topLevel: Task[] = [];
   for (const t of tasks) {
-    if (!t.parent_task_id || !knownIds.has(t.parent_task_id)) {
+    const parentId = parentTaskIdOf(t);
+    if (!parentId || !knownIds.has(parentId)) {
       topLevel.push(t);
     }
   }

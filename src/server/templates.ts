@@ -8,6 +8,7 @@ import type { Task, Session, Turn, Commit, Comment, SearchResult, TaskPromptVers
 import type { TokenUsage } from '../types';
 import { renderMarkdown } from './markdown';
 import { renderDiffSideBySide, renderDiffUnified, diffStyles } from './diff';
+import { parentTaskIdOf } from '../task-target';
 
 export interface TaskWithSession {
   task: Task;
@@ -500,6 +501,7 @@ export function taskDetailHtml(
 ): string {
   const status = getTaskStatus(task, session);
   const taskDisplayId = displayId(task);
+  const parentId = parentTaskIdOf(task);
 
   // Task info section
   let content = `
@@ -517,7 +519,7 @@ export function taskDetailHtml(
       <div class="detail-row"><span class="detail-label">Created</span><span>${escapeHtml(formatDate(task.created_at))}</span></div>
       ${task.completed_at ? `<div class="detail-row"><span class="detail-label">Completed</span><span>${escapeHtml(formatDate(task.completed_at))}</span></div>` : ''}
       ${task.close_reason ? `<div class="detail-row"><span class="detail-label">Reason</span><span>${escapeHtml(task.close_reason)}</span></div>` : ''}
-      ${task.parent_task_id ? `<div class="detail-row"><span class="detail-label">Parent</span><span><a href="/tasks/${task.parent_task_id}">${escapeHtml(parentTask ? displayId(parentTask) : shortId(task.parent_task_id))}</a></span></div>` : ''}
+      ${parentId ? `<div class="detail-row"><span class="detail-label">Parent</span><span><a href="/tasks/${parentId}">${escapeHtml(parentTask ? displayId(parentTask) : shortId(parentId))}</a></span></div>` : ''}
       ${task.branched_from_sha ? `<div class="detail-row"><span class="detail-label">Branched From</span><span>${escapeHtml(task.branched_from_sha.substring(0, 8))}</span></div>` : ''}
     </div>
   `;
@@ -718,6 +720,7 @@ export function taskPrHtml(
   baseBranch?: string,
 ): string {
   const taskDisplayId = displayId(task);
+  const parentId = parentTaskIdOf(task);
   const breadcrumb = `<div class="breadcrumb"><a href="/tasks/${task.id}">Task ${escapeHtml(taskDisplayId)}</a> &rsaquo; PR</div>`;
 
   const commitList = commits.length > 0 ? `
@@ -737,7 +740,7 @@ export function taskPrHtml(
     <h1>Pull Request: ${escapeHtml(task.goal)}</h1>
     <div class="detail-section">
       <div class="detail-row"><span class="detail-label">Branch</span><span>${escapeHtml(session.git_branch)}</span></div>
-      <div class="detail-row"><span class="detail-label">Base</span><span>${escapeHtml(baseBranch ?? (task.parent_task_id ? 'lazy/' + shortId(task.parent_task_id) : 'main'))}</span></div>
+      <div class="detail-row"><span class="detail-label">Base</span><span>${escapeHtml(baseBranch ?? (parentId ? 'lazy/' + shortId(parentId) : 'main'))}</span></div>
       <div class="detail-row"><span class="detail-label">Duration</span><span>${escapeHtml(formatDuration(session.total_duration_ms))}</span></div>
       ${session.total_usage ? `<div class="detail-row"><span class="detail-label">Token Usage</span><span>${escapeHtml(formatTokenCount(totalInputTokens(session.total_usage)))} in, ${escapeHtml(formatTokenCount(session.total_usage.outputTokens))} out</span></div>` : ''}
     </div>

@@ -10,6 +10,7 @@ import type { Task } from '../../types';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { loadConfig } from '../../config/loader';
+import { parentTaskIdOf } from '../../task-target';
 import { checkLock } from '../../utils/lock';
 import {
   isAutoReactPaused,
@@ -45,8 +46,9 @@ export async function commandStatus(args: string[]): Promise<void> {
     console.log(`  ${theme.label('Goal:')}   ${task.goal}`);
     console.log(`  ${theme.label('Status:')} ${theme.status(task.status)}`);
 
-    if (task.parent_task_id) {
-      console.log(`  ${theme.label('Parent:')} ${theme.taskId(await displayIdFor(storage, task.parent_task_id))}`);
+    const parentId = parentTaskIdOf(task);
+    if (parentId) {
+      console.log(`  ${theme.label('Parent:')} ${theme.taskId(await displayIdFor(storage, parentId))}`);
 
       // Check if this is an orphaned child (parent accepted, branch gone)
       const orphanStatus = await checkOrphanedChild(task, storage, root);

@@ -37,6 +37,7 @@ import {
   commandPropose, proposeUsage,
   commandSubmit, submitUsage,
   commandSync, syncUsage,
+  commandReparent, reparentUsage,
   commandCompletion, completionUsage,
   commandReview, reviewUsage,
   commandRedo, redoUsage,
@@ -52,6 +53,7 @@ import {
   commandReport, reportUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
+import { COMMAND_ALIASES, ALIAS_NAMES } from './cli/command-aliases';
 import { isLoggedToFile } from './utils/logged-error';
 
 
@@ -170,12 +172,9 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'edit':     { run: commandEdit, usage: editUsage },
   'clone':    { run: commandClone, usage: cloneUsage },
   'list':     { run: commandList, usage: listUsage },
-  'ls':       { run: commandList, usage: listUsage },
-  'tasks':    { run: commandList, usage: listUsage },
   'active':   { run: commandActive, usage: activeUsage },
   'blocked':  { run: commandBlocked, usage: blockedUsage },
   'show':     { run: commandShow, usage: showUsage },
-  'view':     { run: commandShow, usage: showUsage },
   'search':   { run: commandSearch, usage: searchUsage },
   'comment':  { run: commandComment, usage: commentUsage },
   'start':    { run: commandStart, usage: startUsage },
@@ -201,13 +200,13 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'propose':  { run: commandPropose, usage: proposeUsage },
   'submit':   { run: commandSubmit, usage: submitUsage },
   'sync':     { run: commandSync, usage: syncUsage },
+  'reparent': { run: commandReparent, usage: reparentUsage },
   'completion': { run: commandCompletion, usage: completionUsage },
   'review':   { run: commandReview, usage: reviewUsage },
   'redo':     { run: commandRedo, usage: redoUsage },
   'upgrade':  { run: commandUpgrade, usage: upgradeUsage },
   'system':   { run: commandSystem, usage: systemUsage },
   'document': { run: commandDocument, usage: documentUsage },
-  'doc':      { run: commandDocument, usage: documentUsage },
   'refactor': { run: commandRefactor, usage: refactorUsage },
   'fix':      { run: commandFix, usage: fixUsage },
   'rework':   { run: commandRework, usage: reworkUsage },
@@ -217,9 +216,22 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'report':   { run: commandReport, usage: reportUsage },
 };
 
+// Register alias entries, each pointing at its canonical command's handler.
+// Sourced from COMMAND_ALIASES so the dispatcher and shell completion never
+// drift — adding an alias there wires it up in both places.
+for (const [canonical, aliases] of Object.entries(COMMAND_ALIASES)) {
+  const entry = commandMap[canonical];
+  if (!entry) {
+    throw new Error(`command-aliases references unknown canonical command: ${canonical}`);
+  }
+  for (const alias of aliases) {
+    commandMap[alias] = entry;
+  }
+}
+
 // All valid command names for fuzzy matching (excludes aliases like ls/tasks/view
 // to avoid confusing suggestions — we match against canonical names only)
-const fuzzyMatchCommands = Object.keys(commandMap).filter(c => c !== 'ls' && c !== 'tasks' && c !== 'doc' && c !== 'view');
+const fuzzyMatchCommands = Object.keys(commandMap).filter(c => !ALIAS_NAMES.includes(c));
 
 
 async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
@@ -352,7 +364,17 @@ if (!isHelpOrVersion) {
   // auto-init may have just created .lazy/ and the cached null is now stale.
   const root = cachedLazyRoot ?? findLazyRoot();
   if (root) {
-    await ensureDaemon(command, root);
+    try {
+      await ensureDaemon(command, root);
+    } catch (err) {
+      // Surface daemon startup failures (missing auth credential, web-port
+      // conflict, etc.) as a clean, actionable message rather than an uncaught
+      // top-level rejection with a stack trace. The daemon is the single
+      // enforcement point for auth — clients pass through and let the daemon's
+      // gate surface the problem instead of enforcing it themselves.
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
   }
 }
 

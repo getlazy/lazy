@@ -35,6 +35,7 @@ You have five categories of lazy MCP tools:
 - `lazy_clone` — Create a variant (child) of an existing task
 - `lazy_reopen` — Reopen an abandoned or completed task
 - `lazy_redo` — Abandon a stale task and create a fresh replacement
+- `lazy_reparent` — Repoint a task created on the wrong parent to a new parent and sync (keeps the task)
 
 **Conversation tools (search past builder sessions):**
 - `lazy_conversations` — List captured builder conversations

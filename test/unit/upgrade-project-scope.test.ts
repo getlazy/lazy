@@ -11,7 +11,8 @@
  * `lazy-builder-*` container running anywhere on the host.
  */
 
-import { describe, test, expect, beforeEach, mock } from 'bun:test';
+import { describe, test, expect, beforeEach, mock, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
 // Capture the args of every spawnSync invocation so we can assert that the
@@ -24,7 +25,7 @@ const recordedCalls: RecordedCall[] = [];
 let mockStdout = '';
 let mockExitCode = 0;
 
-mock.module(resolve(import.meta.dir, '../../src/utils/spawn.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/spawn.ts'), () => ({
   DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
   spawn: () => {
     throw new Error('spawn() not expected in these tests');
@@ -131,4 +132,8 @@ describe('HostProcessRunner.discoverProjectBuilderRuns', () => {
     const runner = new HostProcessRunner();
     expect(runner.discoverProjectBuilderRuns('/any/project')).toEqual([]);
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

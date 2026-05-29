@@ -15,6 +15,7 @@ import type { Storage } from '../storage/interface';
 import { logger } from '../utils/logger';
 import { getCurrentSha, branchExists } from '../git/operations';
 import { getWorktreePathForRef, taskRef } from '../cli/helpers';
+import { parentTaskIdOf } from '../task-target';
 import type { Task, TaskStatus } from '../types/index';
 
 // --- Event Types ---
@@ -312,7 +313,7 @@ export async function sendCatchupEvents(
     if (!task) return;
 
     // Check if parent branch has new commits
-    if (task.parent_task_id) {
+    if (parentTaskIdOf(task)) {
       await checkParentBranchAdvanced(storage, task, lazyRoot);
     }
 
@@ -336,12 +337,13 @@ export async function isParentBranchAhead(
   task: Task,
   lazyRoot: string,
 ): Promise<{ ahead: boolean; parentTip: string | null }> {
-  if (!task.parent_task_id) return { ahead: false, parentTip: null };
+  const parentId = parentTaskIdOf(task);
+  if (!parentId) return { ahead: false, parentTip: null };
 
   const session = await storage.getSessionByTaskId(task.id);
   if (!session?.git_branch) return { ahead: false, parentTip: null };
 
-  const parentTask = await storage.getTask(task.parent_task_id);
+  const parentTask = await storage.getTask(parentId);
   if (!parentTask) return { ahead: false, parentTip: null };
 
   const parentRef = taskRef(parentTask);
@@ -377,10 +379,11 @@ async function checkParentBranchAdvanced(
   lazyRoot: string,
 ): Promise<void> {
   const { ahead } = await isParentBranchAhead(storage, task, lazyRoot);
-  if (ahead && task.parent_task_id) {
+  const parentId = parentTaskIdOf(task);
+  if (ahead && parentId) {
     sendEvent(task.id, {
       type: 'upstream.updated',
-      source_task_id: task.parent_task_id,
+      source_task_id: parentId,
       payload: { reason: 'catchup' },
     });
   }

@@ -28,7 +28,7 @@ describe('execWithWatchdog', () => {
   // INVARIANT: When timeoutMs is 0, the watchdog is disabled and does not interfere.
   test('disabled when timeout is 0 — process runs normally', async () => {
     const result = await execWithWatchdog(
-      ['bun', '-e', 'console.log("hello"); process.exit(0)'],
+      [process.execPath, '-e', 'console.log("hello"); process.exit(0)'],
       { cwd: '/tmp', env: {}, timeoutMs: 0 },
     );
 
@@ -39,7 +39,7 @@ describe('execWithWatchdog', () => {
 
   test('process completes normally when output is produced before timeout', async () => {
     const result = await execWithWatchdog(
-      ['bun', '-e', 'console.log("fast output"); process.exit(0)'],
+      [process.execPath, '-e', 'console.log("fast output"); process.exit(0)'],
       { cwd: '/tmp', env: {}, timeoutMs: 5000 },
     );
 
@@ -61,7 +61,7 @@ describe('execWithWatchdog', () => {
       process.exit(0);
     `;
     const result = await execWithWatchdog(
-      ['bun', '-e', script],
+      [process.execPath, '-e', script],
       { cwd: '/tmp', env: {}, timeoutMs: 200 },
     );
 
@@ -80,7 +80,7 @@ describe('execWithWatchdog', () => {
       process.exit(0);
     `;
     const result = await execWithWatchdog(
-      ['bun', '-e', script],
+      [process.execPath, '-e', script],
       { cwd: '/tmp', env: {}, timeoutMs: 200 },
     );
 
@@ -94,7 +94,7 @@ describe('execWithWatchdog', () => {
   test('kills process after timeout with no output', async () => {
     // Process hangs for 10s — watchdog should kill it much sooner
     const result = await execWithWatchdog(
-      ['bun', '-e', 'console.log("start"); await Bun.sleep(10000)'],
+      [process.execPath, '-e', 'console.log("start"); await Bun.sleep(10000)'],
       { cwd: '/tmp', env: {}, timeoutMs: 200 },
     );
 
@@ -109,7 +109,7 @@ describe('execWithWatchdog', () => {
       await Bun.sleep(10000);
     `;
     const result = await execWithWatchdog(
-      ['bun', '-e', script],
+      [process.execPath, '-e', script],
       { cwd: '/tmp', env: {}, timeoutMs: 200 },
     );
 
@@ -120,7 +120,7 @@ describe('execWithWatchdog', () => {
 
   test('non-zero exit code is captured when watchdog is not involved', async () => {
     const result = await execWithWatchdog(
-      ['bun', '-e', 'console.log("oops"); process.exit(42)'],
+      [process.execPath, '-e', 'console.log("oops"); process.exit(42)'],
       { cwd: '/tmp', env: {}, timeoutMs: 5000 },
     );
 

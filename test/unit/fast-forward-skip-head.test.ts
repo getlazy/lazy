@@ -133,12 +133,13 @@ describe('fastForwardBranch skips HEAD', () => {
 /**
  * INVARIANT: targetBranch must never return literal "HEAD".
  *
- * When a task has "HEAD" stored as remote_target_branch (from legacy code that didn't
- * use resolveDetachedHead), the driver's targetBranch() method must resolve it to the
- * remote's default branch — never pass "HEAD" to the forge API as a PR/MR base.
+ * When a task's integration target carries "HEAD" (e.g. the root repo was in
+ * detached-HEAD state when the task started), the driver's targetBranch()
+ * method must resolve it to the remote's default branch — never pass "HEAD" to
+ * the forge API as a PR/MR base. The base is derived from task.target.
  */
 
-function makeTask(metadata: Record<string, string>): Task {
+function makeTask(targetBranch: string): Task {
   return {
     id: 'test-task-id-12345678',
     code: 'test-code',
@@ -149,11 +150,11 @@ function makeTask(metadata: Record<string, string>): Task {
     agent_id: 'test-agent',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: targetBranch },
     branched_from_sha: null,
     close_reason: null,
     model: null,
-    metadata,
+    metadata: {},
     pending_sync: 0,
   };
 }
@@ -187,7 +188,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
     };
 
     const driver = new GitLabDriver(gitlabConfig, deps);
-    const task = makeTask({ remote_target_branch: 'HEAD' });
+    const task = makeTask('HEAD');
     await driver.markReadyForReview(task);
 
     // Find the glab mr create call and check --target-branch value
@@ -224,7 +225,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
     };
 
     const driver = new GitLabDriver(gitlabConfig, deps);
-    const task = makeTask({ remote_target_branch: 'HEAD' });
+    const task = makeTask('HEAD');
     await driver.markReadyForReview(task);
 
     const mrCreateCall = glCalls.find(args => args[0] === 'mr' && args[1] === 'create');
@@ -261,7 +262,7 @@ describe('targetBranch resolves HEAD to default branch', () => {
     };
 
     const driver = new GitHubDriver(mockConfig, deps);
-    const task = makeTask({ remote_target_branch: 'HEAD' });
+    const task = makeTask('HEAD');
     await driver.markReadyForReview(task);
 
     // Find the gh pr create call and check --base value

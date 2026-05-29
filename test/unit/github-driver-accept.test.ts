@@ -56,7 +56,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     status: 'working' as const,
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     model: null,
@@ -368,125 +368,13 @@ describe('GitHubDriver merge', () => {
     }
   });
 
-  // INVARIANT: merge() must check CI status before attempting merge.
-  // This prevents admin users from accidentally bypassing branch protection
-  // when GitHub allows admin merge bypass by default.
-  test('refuses to merge when CI checks are failing', async () => {
-    const ghCalls: string[][] = [];
-
-    const deps = makeDeps(async (args) => {
-      ghCalls.push([...args]);
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
-      }
-      // Pre-merge CI check: return failed checks
-      if (args[0] === 'pr' && args[1] === 'checks') {
-        return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'FAILURE', bucket: 'fail', link: 'https://example.com/1' },
-        ])));
-      }
-      if (args[0] === 'pr' && args[1] === 'merge') {
-        throw new Error('merge should not be called when checks are failing');
-      }
-      return Promise.resolve(fail('unexpected gh call'));
-    });
-
-    const driver = new GitHubDriver(mockConfig, deps);
-    const result = await driver.merge({
-      sourceBranch: 'lazy/test1234',
-      targetBranch: 'main',
-      task: makeTask(),
-      taskShortId: 'test1234',
-      root: '/tmp/test',
-    });
-
-    expect(result.status).toBe('failed');
-    if (result.status === 'failed') {
-      expect(result.error).toContain('CI checks failed');
-      expect(result.error).toContain('ci/build');
-    }
-    // Verify merge was never called
-    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
-  });
-
-  // INVARIANT: merge() must check CI status before attempting merge.
-  // Pending checks should return 'pending' so the task enters 'merging' state.
-  test('returns pending when CI checks are still running (pre-merge)', async () => {
-    const ghCalls: string[][] = [];
-
-    const deps = makeDeps(async (args) => {
-      ghCalls.push([...args]);
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
-      }
-      if (args[0] === 'pr' && args[1] === 'checks') {
-        return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'PENDING', bucket: 'pending', link: null },
-        ])));
-      }
-      if (args[0] === 'pr' && args[1] === 'merge') {
-        throw new Error('merge should not be called when checks are pending');
-      }
-      return Promise.resolve(fail('unexpected gh call'));
-    });
-
-    const driver = new GitHubDriver(mockConfig, deps);
-    const result = await driver.merge({
-      sourceBranch: 'lazy/test1234',
-      targetBranch: 'main',
-      task: makeTask(),
-      taskShortId: 'test1234',
-      root: '/tmp/test',
-    });
-
-    expect(result.status).toBe('pending');
-    if (result.status === 'pending') {
-      expect(result.reason).toContain('CI checks pending');
-    }
-    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
-  });
-
-  // INVARIANT: merge() must check review status before attempting merge.
-  // Required reviews must be approved before merging.
-  test('refuses to merge when required reviews are not approved', async () => {
-    const ghCalls: string[][] = [];
-
-    const deps = makeDeps(async (args) => {
-      ghCalls.push([...args]);
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('url,number,state')) {
-        return Promise.resolve(ok(JSON.stringify({ url: 'https://github.com/o/r/pull/42', number: 42, state: 'OPEN' })));
-      }
-      // CI checks pass
-      if (args[0] === 'pr' && args[1] === 'checks') {
-        return Promise.resolve(ok(JSON.stringify([
-          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', link: null },
-        ])));
-      }
-      // Review decision: not approved
-      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision')) {
-        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'REVIEW_REQUIRED' })));
-      }
-      if (args[0] === 'pr' && args[1] === 'merge') {
-        throw new Error('merge should not be called when reviews are missing');
-      }
-      return Promise.resolve(fail('unexpected gh call'));
-    });
-
-    const driver = new GitHubDriver(mockConfig, deps);
-    const result = await driver.merge({
-      sourceBranch: 'lazy/test1234',
-      targetBranch: 'main',
-      task: makeTask(),
-      taskShortId: 'test1234',
-      root: '/tmp/test',
-    });
-
-    expect(result.status).toBe('pending');
-    if (result.status === 'pending') {
-      expect(result.reason).toContain('Required reviews not approved');
-    }
-    expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'merge')).toBeUndefined();
-  });
+  // INVARIANT (moved to checkAcceptGates): pre-merge gate checks (CI, reviews)
+  // are the responsibility of `checkAcceptGates`, not `merge()`. The original
+  // tests asserted that `merge()` itself refused to merge on failing/pending CI
+  // or missing reviews; that gate behavior was deliberately relocated to
+  // `checkAcceptGates` (caller `acceptTask` throws 409 on any warning). The
+  // gate-level coverage now lives in `checkAcceptGates (mocked)` below — this
+  // mirrors the GitLab driver tests, which were migrated when the gate moved.
 
   // INVARIANT: merge() proceeds when checks pass and reviews are approved.
   test('merges when CI passes and reviews are approved', async () => {
@@ -685,5 +573,97 @@ describe('GitHubDriver merge', () => {
     const repoIndex = createCall!.indexOf('--repo');
     expect(repoIndex).toBeGreaterThan(-1);
     expect(createCall![repoIndex + 1]).toBe('owner/repo');
+  });
+});
+
+// Gate-level coverage migrated from the deleted `merge() refuses to merge ...`
+// tests. Pre-merge CI/review gating now lives in checkAcceptGates(), which the
+// daemon's acceptTask() consults before calling merge(). See the migration note
+// in the `GitHubDriver merge` describe above and the GitLab equivalent.
+describe('GitHubDriver checkAcceptGates', () => {
+  // INVARIANT: a failing CI check surfaces a 'ci' warning so accept is blocked.
+  test('warns when CI checks are failing', async () => {
+    const deps = makeDeps(async (args) => {
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return Promise.resolve(ok(JSON.stringify([
+          { name: 'ci/build', state: 'FAILURE', bucket: 'fail', link: 'https://example.com/1' },
+        ])));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision,reviewThreads')) {
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'APPROVED', reviewThreads: [] })));
+      }
+      return Promise.resolve(fail('unexpected gh call'));
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const warnings = await driver.checkAcceptGates(makeTask());
+
+    const ciWarning = warnings.find(w => w.gate === 'ci');
+    expect(ciWarning).toBeDefined();
+    expect(ciWarning?.message).toContain('ci/build');
+  });
+
+  // INVARIANT: pending CI checks surface a 'ci' warning (accept waits/merging).
+  test('warns when CI checks are still running', async () => {
+    const deps = makeDeps(async (args) => {
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return Promise.resolve(ok(JSON.stringify([
+          { name: 'ci/build', state: 'PENDING', bucket: 'pending', link: null },
+        ])));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision,reviewThreads')) {
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'APPROVED', reviewThreads: [] })));
+      }
+      return Promise.resolve(fail('unexpected gh call'));
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const warnings = await driver.checkAcceptGates(makeTask());
+
+    const ciWarning = warnings.find(w => w.gate === 'ci');
+    expect(ciWarning).toBeDefined();
+    expect(ciWarning?.message).toContain('ci/build');
+  });
+
+  // INVARIANT: a non-APPROVED review decision surfaces a 'reviews' warning.
+  test('warns when required reviews are not approved', async () => {
+    const deps = makeDeps(async (args) => {
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return Promise.resolve(ok(JSON.stringify([
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', link: null },
+        ])));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision,reviewThreads')) {
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'REVIEW_REQUIRED', reviewThreads: [] })));
+      }
+      return Promise.resolve(fail('unexpected gh call'));
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const warnings = await driver.checkAcceptGates(makeTask());
+
+    const reviewWarning = warnings.find(w => w.gate === 'reviews');
+    expect(reviewWarning).toBeDefined();
+    expect(reviewWarning?.message).toContain('REVIEW_REQUIRED');
+  });
+
+  // Negative case: green CI, approved reviews, no unresolved threads → no warnings.
+  test('returns no warnings when all gates pass', async () => {
+    const deps = makeDeps(async (args) => {
+      if (args[0] === 'pr' && args[1] === 'checks') {
+        return Promise.resolve(ok(JSON.stringify([
+          { name: 'ci/build', state: 'SUCCESS', bucket: 'pass', link: null },
+        ])));
+      }
+      if (args[0] === 'pr' && args[1] === 'view' && args.includes('reviewDecision,reviewThreads')) {
+        return Promise.resolve(ok(JSON.stringify({ reviewDecision: 'APPROVED', reviewThreads: [] })));
+      }
+      return Promise.resolve(fail('unexpected gh call'));
+    });
+
+    const driver = new GitHubDriver(mockConfig, deps);
+    const warnings = await driver.checkAcceptGates(makeTask());
+
+    expect(warnings).toEqual([]);
   });
 });

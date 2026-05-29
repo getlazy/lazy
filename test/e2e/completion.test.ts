@@ -81,6 +81,77 @@ describe('lazy completion', () => {
     expectOutput(result, '--model');
     expectOutput(result, '--follow');
   });
+
+  // INVARIANT: completion must cover every canonical top-level command in the
+  // dispatcher (src/index.ts commandMap). These were missing/added during the
+  // completion audit — regressions would silently drop their command-name
+  // completion.
+  for (const shell of ['--bash', '--zsh'] as const) {
+    test(`${shell} script completes previously-missing commands`, async () => {
+      const result = await ctx.lazy(['completion', shell]);
+      expectSuccess(result);
+      expectOutput(result, 'chat');
+      expectOutput(result, 'stop');
+      expectOutput(result, 'reparent');
+      expectOutput(result, 'report');
+    });
+
+    test(`${shell} script completes subcommands for system/daemon/config`, async () => {
+      const result = await ctx.lazy(['completion', shell]);
+      expectSuccess(result);
+      // system subcommands
+      expectOutput(result, 'prompts');
+      expectOutput(result, 'export-dockerfile');
+      // daemon subcommands
+      expectOutput(result, 'restart');
+      // config subcommands
+      expectOutput(result, 'set get');
+    });
+
+    test(`${shell} script completes terminal-task commands via list --all --ids-only`, async () => {
+      const result = await ctx.lazy(['completion', shell]);
+      expectSuccess(result);
+      expectOutput(result, 'list --all --ids-only');
+    });
+  }
+
+  // INVARIANT: command aliases (ls/tasks/view/doc) must tab-complete and behave
+  // like their canonical command. The alias mapping is sourced from
+  // src/cli/command-aliases.ts so the dispatcher and completion never drift.
+  for (const shell of ['--bash', '--zsh'] as const) {
+    test(`${shell} script completes aliases and gives them canonical behavior`, async () => {
+      const result = await ctx.lazy(['completion', shell]);
+      expectSuccess(result);
+      // Alias appears in command-name completion.
+      expectOutput(result, 'ls');
+      expectOutput(result, 'view');
+      // `ls` inherits `list`'s flags; `view` inherits `show`'s flags.
+      expectOutput(result, '--ids-only');
+      // `view` (alias of `show`, a task-ref command) gets task-ID completion:
+      // it must appear in the active-task bucket case alongside `show`.
+      const bucketLine = result.stdout
+        .split('\n')
+        .find((l) => l.includes('show|start') || l.includes('show|'));
+      if (!bucketLine || !/\bview\b/.test(bucketLine)) {
+        throw new Error(`Alias 'view' missing from task-ID completion bucket: ${bucketLine}`);
+      }
+    });
+  }
+
+  // `logs` is not a top-level command — it is `daemon logs`. The audit removed
+  // the stale top-level `logs` completion entry.
+  test('bash script does not offer a stale top-level logs command', async () => {
+    const result = await ctx.lazy(['completion', '--bash']);
+    expectSuccess(result);
+    // The command list is space-joined; a top-level `logs` token would appear
+    // surrounded by spaces in the compgen -W word list on the commands line.
+    const commandsLine = result.stdout
+      .split('\n')
+      .find((l) => l.includes('compgen -W') && l.includes('create'));
+    if (commandsLine && /\blogs\b/.test(commandsLine)) {
+      throw new Error(`Stale top-level 'logs' command still in completion: ${commandsLine}`);
+    }
+  });
 });
 
 describe('lazy active --ids-only', () => {

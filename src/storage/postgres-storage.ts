@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import type { Storage, CreateTurnOptions } from './interface';
 import type {
   Task,
+  TaskTarget,
   Session,
   Turn,
   Commit,
@@ -34,6 +35,7 @@ import type {
   HunkApprovalLineage,
 } from './types';
 import { isTerminalStatus, DEFAULT_TASK_TYPE, type TaskType } from '../types';
+import { targetFromLegacy, targetToLegacy } from '../task-target';
 import { assertValidTransition } from '../task-state-machine';
 
 export interface PostgresStorageOptions {
@@ -80,14 +82,20 @@ export class PostgresStorage implements Storage {
       options: '-c client_min_messages=warning',
     };
 
-    // Initialize connection
+    // Initialize connection.
+    // Cast: passing a custom `types` map makes postgres.js infer a narrowed
+    // Sql<{ bigint: number }>, which is not assignable to the field's
+    // Sql<{}> because Sql.begin's callback parameter is contravariant. The
+    // narrowing is irrelevant to us (it only affects BIGINT parsing), so we
+    // normalize to the base Sql type — mirroring the same escape hatch used
+    // for txSql in migrateToV1().
     if (options.url) {
       this.sql = postgres(options.url, {
         max: options.max ?? 10,
         types,
         ssl,
         connection,
-      });
+      }) as unknown as ReturnType<typeof postgres>;
     } else {
       this.sql = postgres({
         host: options.host ?? 'localhost',
@@ -99,7 +107,7 @@ export class PostgresStorage implements Storage {
         types,
         ssl,
         connection,
-      });
+      }) as unknown as ReturnType<typeof postgres>;
     }
 
     // PostgreSQL storage doesn't use local paths, but we need to provide
@@ -155,6 +163,9 @@ export class PostgresStorage implements Storage {
     if (version < 5) {
       await this.migrateToV5();
     }
+    if (version < 6) {
+      await this.migrateToV6();
+    }
   }
 
   private async migrateToV1(): Promise<void> {
@@ -175,6 +186,7 @@ export class PostgresStorage implements Storage {
           model TEXT,
           agent_id TEXT NOT NULL DEFAULT 'claude-code',
           parent_task_id TEXT,
+          target JSONB,
           branched_from_sha TEXT,
           close_reason TEXT,
           metadata JSONB,
@@ -498,6 +510,33 @@ export class PostgresStorage implements Storage {
     });
   }
 
+  private async migrateToV6(): Promise<void> {
+    // Add the canonical `target` JSONB column (TaskTarget discriminated union).
+    // Backfill existing rows from the legacy (parent_task_id,
+    // metadata->>'remote_target_branch') pair — the same mapping targetFromLegacy
+    // applies in code. parent_task_id stays as the denormalized task↔task edge
+    // used by the ancestry CTE and child lookups.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target JSONB`;
+      // Backfill: stacked-on-a-task rows → {kind:'task'}; everything else →
+      // {kind:'branch'} carrying the legacy remote_target_branch (or '' sentinel).
+      await sql`
+        UPDATE tasks SET target = jsonb_build_object('kind', 'task', 'parentTaskId', parent_task_id)
+        WHERE target IS NULL AND parent_task_id IS NOT NULL
+      `;
+      await sql`
+        UPDATE tasks SET target = jsonb_build_object('kind', 'branch', 'branch', COALESCE(metadata->>'remote_target_branch', ''))
+        WHERE target IS NULL AND parent_task_id IS NULL
+      `;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (6, '5')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
   async createTask(
     goal: string,
     parentTaskId?: string,
@@ -524,14 +563,20 @@ export class PostgresStorage implements Storage {
     const taskType = (type ?? DEFAULT_TASK_TYPE) as TaskType;
     const resolvedAgentId = agentId ?? 'claude-code';
 
+    const target = targetFromLegacy(parentTaskId ?? null, null);
+    // INVARIANT: the parent_task_id column is a pure projection of `target`
+    // (targetToLegacy), never set independently — so the denormalized edge
+    // used by the ancestry CTE / child lookups can never drift from the
+    // canonical union.
+    const parentColumn = targetToLegacy(target).parent_task_id;
     await this.sql`
       INSERT INTO tasks (
-        id, goal, prompt, code, type, status, parent_task_id, branched_from_sha,
+        id, goal, prompt, code, type, status, parent_task_id, target, branched_from_sha,
         created_at, metadata, agent_id
       )
       VALUES (
         ${id}, ${goal}, '', ${code ?? null}, ${taskType}, 'backlog',
-        ${parentTaskId ?? null}, ${branchedFromSha ?? null}, ${now}, ${null},
+        ${parentColumn}, ${this.sql.json(target)}, ${branchedFromSha ?? null}, ${now}, ${null},
         ${resolvedAgentId}
       )
     `;
@@ -547,7 +592,7 @@ export class PostgresStorage implements Storage {
       status: 'backlog',
       model: null,
       agent_id: resolvedAgentId,
-      parent_task_id: parentTaskId ?? null,
+      target,
       branched_from_sha: branchedFromSha ?? null,
       close_reason: null,
       metadata: null,
@@ -557,17 +602,38 @@ export class PostgresStorage implements Storage {
     };
   }
 
+  /**
+   * Map a raw `tasks` row into the domain Task. The canonical `target` column
+   * (TaskTarget) is authoritative; rows predating the column (target IS NULL)
+   * are normalized from the legacy (parent_task_id, metadata.remote_target_branch)
+   * pair via the single targetFromLegacy mapping. The legacy parent_task_id
+   * column survives only as the denormalized task↔task edge for ancestry/child
+   * queries; consumers only ever see `target`.
+   */
+  private rowToTask(row: Record<string, unknown>): Task {
+    const parentTaskId = (row.parent_task_id as string | null | undefined) ?? null;
+    const metadata = (row.metadata as Record<string, string> | null | undefined) ?? null;
+    const rawTarget = row.target as TaskTarget | null | undefined;
+    const target = rawTarget ?? targetFromLegacy(parentTaskId, metadata?.remote_target_branch ?? null);
+    const { parent_task_id: _parent, ...rest } = row as Record<string, unknown>;
+    return { ...rest, metadata, target } as unknown as Task;
+  }
+
+  private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
+    return rows.map(r => this.rowToTask(r));
+  }
+
   async getTask(taskId: string): Promise<Task | null> {
     const { task } = await this.resolveTask(taskId);
     return task;
   }
 
   async resolveTask(input: string): Promise<{ task: Task | null; ambiguousMatches?: Task[] }> {
-    const [exact] = await this.sql<Task[]>`SELECT * FROM tasks WHERE id = ${input}`;
+    const [exact] = this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE id = ${input}`);
     if (exact) return { task: exact };
 
     if (input.match(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/)) {
-      const codeMatches = await this.sql<Task[]>`SELECT * FROM tasks WHERE code = ${input}`;
+      const codeMatches = this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE code = ${input}`);
       if (codeMatches.length === 0) {
         // Fall through to prefix matching
       } else if (codeMatches.length === 1) {
@@ -599,7 +665,7 @@ export class PostgresStorage implements Storage {
       }
     }
 
-    const prefixMatches = await this.sql<Task[]>`SELECT * FROM tasks WHERE id LIKE ${input + '%'}`;
+    const prefixMatches = this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE id LIKE ${input + '%'}`);
     if (prefixMatches.length === 1) return { task: prefixMatches[0] };
     if (prefixMatches.length > 1) return { task: null, ambiguousMatches: prefixMatches };
 
@@ -607,12 +673,12 @@ export class PostgresStorage implements Storage {
   }
 
   async listTasks(): Promise<Task[]> {
-    return this.sql<Task[]>`SELECT * FROM tasks ORDER BY created_at DESC`;
+    return this.rowsToTasks(await this.sql`SELECT * FROM tasks ORDER BY created_at DESC`);
   }
 
   async listTasksWithOptions(options: ListTasksOptions): Promise<Task[]> {
     // Use parameterized queries with conditional fragments instead of sql.unsafe()
-    return this.sql<Task[]>`
+    const rows = await this.sql`
       SELECT * FROM tasks
       WHERE 1=1
       ${options.rootsOnly ? this.sql`AND parent_task_id IS NULL` : this.sql``}
@@ -626,6 +692,7 @@ export class PostgresStorage implements Storage {
       ${options.nonTerminalOnly ? this.sql`AND status NOT IN ('complete', 'abandoned')` : this.sql``}
       ORDER BY created_at DESC
     `;
+    return this.rowsToTasks(rows);
   }
 
   async updateTaskStatus(taskId: string, status: TaskStatus, actor?: Actor): Promise<void> {
@@ -658,8 +725,16 @@ export class PostgresStorage implements Storage {
     await this.sql`UPDATE tasks SET code = ${code} WHERE id = ${taskId}`;
   }
 
-  async updateTaskParent(taskId: string, parentTaskId: string | null): Promise<void> {
-    await this.sql`UPDATE tasks SET parent_task_id = ${parentTaskId} WHERE id = ${taskId}`;
+  async updateTaskTarget(taskId: string, target: TaskTarget): Promise<void> {
+    // `target` (JSONB) is authoritative. INVARIANT: the parent_task_id column is
+    // a pure projection of `target` (targetToLegacy), never set independently —
+    // it's the denormalized task↔task edge for the ancestry CTE / child lookups
+    // (NULL for branch targets). We no longer write metadata.remote_target_branch.
+    const parentTaskId = targetToLegacy(target).parent_task_id;
+    await this.sql`
+      UPDATE tasks SET target = ${this.sql.json(target)}, parent_task_id = ${parentTaskId}
+      WHERE id = ${taskId}
+    `;
   }
 
   async updateTaskBranchedFromSha(taskId: string, sha: string): Promise<void> {
@@ -1072,7 +1147,7 @@ export class PostgresStorage implements Storage {
   }
 
   async getChildTasks(parentTaskId: string): Promise<Task[]> {
-    return this.sql<Task[]>`SELECT * FROM tasks WHERE parent_task_id = ${parentTaskId} ORDER BY created_at ASC`;
+    return this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE parent_task_id = ${parentTaskId} ORDER BY created_at ASC`);
   }
 
   async getRootTask(taskId: string): Promise<Task | null> {
@@ -1081,14 +1156,14 @@ export class PostgresStorage implements Storage {
   }
 
   async getTaskAncestry(taskId: string): Promise<Task[]> {
-    const results = await this.sql<Task[]>`
+    const results = this.rowsToTasks(await this.sql`
       WITH RECURSIVE ancestors AS (
         SELECT * FROM tasks WHERE id = ${taskId}
         UNION ALL
         SELECT t.* FROM tasks t INNER JOIN ancestors a ON t.id = a.parent_task_id
       )
       SELECT * FROM ancestors
-    `;
+    `);
     return results.reverse();
   }
 
@@ -1289,8 +1364,8 @@ export class PostgresStorage implements Storage {
     const pattern = `%${query}%`;
 
     // Run all 6 queries in parallel since they're independent
-    const [tasks, prompts, turns, commits, comments, conversations] = await Promise.all([
-      this.sql<Task[]>`SELECT * FROM tasks WHERE goal ILIKE ${pattern}`,
+    const [taskRows, prompts, turns, commits, comments, conversations] = await Promise.all([
+      this.sql`SELECT * FROM tasks WHERE goal ILIKE ${pattern}`,
 
       this.sql<(TaskPromptVersion & { task_goal: string; task_code: string | null })[]>`
         SELECT ph.*, t.goal as task_goal, t.code as task_code
@@ -1343,6 +1418,7 @@ export class PostgresStorage implements Storage {
 
     const results: SearchResult[] = [];
 
+    const tasks = this.rowsToTasks(taskRows);
     for (const task of tasks) {
       results.push({
         entity_type: 'task',

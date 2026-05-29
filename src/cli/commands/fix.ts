@@ -3,6 +3,7 @@ import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 
 
 import fixConstraints from '../../prompts/fix-constraints.md' with { type: 'text' };
+import { parentTaskIdOf } from '../../task-target';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -109,8 +110,9 @@ export async function commandFix(args: string[]): Promise<void> {
     if (t.code) {
       console.log(`  Code:   ${t.code}`);
     }
-    if (t.parent_task_id) {
-      console.log(`  Parent: ${await displayIdFor(storage, t.parent_task_id)}`);
+    const parentId = parentTaskIdOf(t);
+    if (parentId) {
+      console.log(`  Parent: ${await displayIdFor(storage, parentId)}`);
     }
 
     // Add the full prompt (user prompt + constraints)
@@ -143,7 +145,7 @@ subtle bugs that resist traditional debugging approaches.
 Options:
   --goal <goal>      Bug or issue to fix (what's broken and symptoms)
   --prompt <text>    Additional context (reproduction steps, error messages, etc.)
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
   --code <code>      Human-readable code (e.g. "fix-token-hang", "fix-null-deref")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

@@ -50,6 +50,7 @@ import type {
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
+import { targetBranchOf } from '../task-target';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
@@ -58,6 +59,7 @@ import { spawnSync } from '../utils/spawn';
 import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
+import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
 
 export interface GhResult {
   stdout: string;
@@ -189,7 +191,10 @@ export class GitHubDriver implements RepositoryDriver {
     await withRemoteRetry(
       async () => {
         logger.info(`Pushing branch ${branch} to ${this.remoteName}...`);
-        const result = await this.git(['push', '-u', this.remoteName, branch]);
+        // No -u: task branches must not set upstream tracking, or `git pull`
+        // in the worktree would silently merge the remote task branch. The
+        // doctor command flags any task branch that has tracking configured.
+        const result = await this.git(['push', this.remoteName, branch]);
         if (result.exitCode !== 0) {
           if (result.stderr.includes('Everything up-to-date')) {
             logger.debug('Branch already up-to-date on remote');
@@ -279,12 +284,9 @@ export class GitHubDriver implements RepositoryDriver {
       };
     }
 
-    // Store the target branch in metadata so markReadyForReview can create the PR later
-    return {
-      metadata: {
-        remote_target_branch: opts.targetBranch,
-      },
-    };
+    // Nothing to persist: markReadyForReview derives the PR base from the task's
+    // canonical target (task.target), not from stored metadata.
+    return { metadata: {} };
   }
 
   async markReadyForReview(task: Task): Promise<{ metadata?: Record<string, string> }> {
@@ -332,11 +334,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
     if (!targetBranch || targetBranch.trim() === '') {
-      const metaDump = JSON.stringify({
-        remote_target_branch: task.metadata?.remote_target_branch,
-        github_pr_target_branch: task.metadata?.github_pr_target_branch,
-      });
-      throw new Error(`Cannot create PR for branch ${branchName}: target branch is empty. Task metadata: ${metaDump}`);
+      throw new Error(`Cannot create PR for branch ${branchName}: target branch is empty. Task target: ${JSON.stringify(task.target)}`);
     }
 
     logger.debug(`markReadyForReview: branchName=${branchName}, targetBranch=${targetBranch}`);
@@ -433,10 +431,7 @@ export class GitHubDriver implements RepositoryDriver {
 
       // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
       if (!targetBranch || targetBranch.trim() === '') {
-        logger.error(`merge: targetBranch is empty. Task metadata: ${JSON.stringify({
-          remote_target_branch: task.metadata?.remote_target_branch,
-          github_pr_target_branch: task.metadata?.github_pr_target_branch,
-        })}`);
+        logger.error(`merge: targetBranch is empty. Task target: ${JSON.stringify(task.target)}`);
         return {
           status: 'failed',
           error: 'Target branch is empty',
@@ -1245,42 +1240,33 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   /**
-   * Read the target branch from task metadata with backward compatibility.
-   * remote_target_branch is driver-agnostic, github_pr_target_branch is legacy.
+   * The base branch for a NEW PR, derived from the task's canonical integration
+   * target ({@link TaskTarget}) — never from stored metadata.
+   *
+   * This is used only when *creating* a PR (markReadyForReview). A PR's base is
+   * a creation-time fact owned by GitHub thereafter: once the PR exists,
+   * markReadyForReview early-returns and never re-targets it, and an existing
+   * PR's base is read back from the forge rather than from lazy. So a later
+   * `lazy reparent` does not silently rewrite an open PR's base — it only
+   * affects the base of a PR not yet created.
+   *
+   * PRs are only opened for top-level tasks, whose target is a named branch.
+   * The legacy `github_pr_target_branch` / `remote_target_branch` metadata keys
+   * are no longer consulted (task.target is the single source of truth); they
+   * survive on disk only as a one-time read for the storage-layer migration.
    */
   private async targetBranch(task: Task): Promise<string> {
-    const remote = task.metadata?.remote_target_branch;
-    const github = task.metadata?.github_pr_target_branch;
+    const branch = targetBranchOf(task);
 
-    // The ?? operator doesn't catch empty strings, so we need to check explicitly
-    if (remote !== null && remote !== undefined) {
-      if (remote.trim() === '') {
-        logger.warn(`targetBranch: remote_target_branch is empty string for task ${task.id}`);
-        return github || 'main';
-      }
-      // Defense-in-depth: "HEAD" is not a valid branch name for GitHub PRs.
-      // This can happen if the root repo was in detached HEAD state when the
-      // task was started (getCurrentBranch returns literal "HEAD" in that case).
-      if (remote === 'HEAD') {
-        logger.warn(`targetBranch: remote_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
-        return (await this.resolveDefaultBranch()) ?? (github || 'main');
-      }
-      return remote;
+    // No usable named branch: the task is stacked on another task, the target
+    // is unresolved, or it's a literal "HEAD" (detached-HEAD repo at start) —
+    // none are valid PR bases. Resolve the repo default. (PR creation for a
+    // non-top-level task is unexpected; markReadyForReview also guards empties.)
+    if (!branch || branch === 'HEAD' || branch.startsWith('lazy/')) {
+      logger.warn(`targetBranch: task ${task.id} has no valid named integration branch ('${branch ?? ''}') — resolving repo default`);
+      return (await this.resolveDefaultBranch()) ?? 'main';
     }
-
-    if (github !== null && github !== undefined) {
-      if (github.trim() === '') {
-        logger.warn(`targetBranch: github_pr_target_branch is empty string for task ${task.id}`);
-        return 'main';
-      }
-      if (github === 'HEAD') {
-        logger.warn(`targetBranch: github_pr_target_branch is literal "HEAD" for task ${task.id} — resolving to default branch`);
-        return (await this.resolveDefaultBranch()) ?? 'main';
-      }
-      return github;
-    }
-
-    return 'main';
+    return branch;
   }
 
   /**
@@ -1341,17 +1327,52 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   private buildPRBody(task: Task): string {
-    const sections: string[] = [];
+    return composeInitialBody({
+      goal: task.goal,
+      prompt: task.prompt ?? undefined,
+      footer: '---\n*Created by [lazy](https://getlazy.dev/)*',
+    });
+  }
 
-    sections.push(`## Goal\n\n${task.goal}`);
-
-    if (task.prompt) {
-      sections.push(`## Prompt\n\n${task.prompt}`);
+  async updateRemoteBody(task: Task, summary: string): Promise<void> {
+    const prNumber = this.prNumber(task);
+    if (!prNumber) {
+      // No PR yet — nothing to update. The lazy-owned section is seeded into
+      // the body at PR-creation time (buildPRBody), so a later regeneration
+      // will land in place once the PR exists.
+      logger.debug('updateRemoteBody: task has no PR — skipping');
+      return;
     }
 
-    sections.push('---\n*Created by [lazy](https://getlazy.dev/)*');
+    await withRemoteRetry(
+      async () => {
+        // Read the live body so human edits outside the lazy section survive.
+        const viewResult = await this.gh(['pr', 'view', prNumber, '--json', 'body']);
+        if (viewResult.exitCode !== 0) {
+          throw new Error(`gh pr view failed (exit ${viewResult.exitCode}) for PR #${prNumber}: ${viewResult.stderr.trim()}`);
+        }
+        let currentBody = '';
+        try {
+          currentBody = JSON.parse(viewResult.stdout).body ?? '';
+        } catch (err) {
+          throw new Error(`gh pr view returned unparseable JSON for PR #${prNumber}: ${err instanceof Error ? err.message : err}`);
+        }
 
-    return sections.join('\n\n');
+        const newBody = applyFidelitySection(currentBody, summary);
+        if (newBody === currentBody) {
+          logger.debug(`updateRemoteBody: PR #${prNumber} body unchanged — skipping edit`);
+          return;
+        }
+
+        const editResult = await this.gh(['pr', 'edit', prNumber, '--body', newBody]);
+        if (editResult.exitCode !== 0) {
+          throw new Error(`gh pr edit failed (exit ${editResult.exitCode}) for PR #${prNumber}: ${editResult.stderr.trim()}`);
+        }
+        logger.debug(`updateRemoteBody: updated lazy section of PR #${prNumber}`);
+      },
+      `update body of PR #${prNumber}`,
+      this.retryOpts,
+    );
   }
 
   /** Check if sourceBranch is already fully merged into targetBranch via git. */

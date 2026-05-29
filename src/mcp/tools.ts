@@ -44,6 +44,8 @@ function rejectIfReadOnly(toolName: string): void {
 import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef } from '../cli/helpers';
 import type { Storage } from '../storage';
 import type { Proposal } from '../cli/commands/propose';
+import type { TaskTarget } from '../types';
+import { parentTaskIdOf, taskTarget, branchTarget } from '../task-target';
 import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
 
 import { queryWait } from '../daemon/rpc-fallback';
@@ -77,6 +79,7 @@ import {
   acceptTaskPreflight,
   acceptTask,
   syncTask,
+  reparentTask,
   submitTask,
   type UnblockTaskParams,
   type AskTaskParams,
@@ -86,6 +89,7 @@ import {
   type AcceptTaskPreflightParams,
   type AcceptTaskParams,
   type SyncTaskParams,
+  type ReparentTaskParams,
   type SubmitTaskParams,
 } from '../daemon/task-lifecycle';
 
@@ -294,9 +298,9 @@ export const showTool: McpTool = {
         type: 'array',
         items: {
           type: 'string',
-          enum: ['turns', 'commits', 'comments', 'children'],
+          enum: ['turns', 'commits', 'comments', 'children', 'status-history'],
         },
-        description: 'Sections to include in full (e.g. ["turns", "commits"]). Without this, only counts are returned.',
+        description: 'Sections to include in full (e.g. ["turns", "commits", "status-history"]). Without this, only counts are returned. "status-history" surfaces the audit trail of status transitions (from → to, actor, timestamp).',
       },
       offset: {
         type: 'number',
@@ -339,7 +343,7 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         status: task.status,
         model: task.model ?? null,
         created_at: new Date(task.created_at).toISOString(),
-        parent_task_id: task.parent_task_id ? shortId(task.parent_task_id) : null,
+        parent_task_id: parentTaskIdOf(task) ? shortId(parentTaskIdOf(task)!) : null,
       };
 
       // Include full prompt (bounded by design)
@@ -384,8 +388,10 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
       // Comments and children counts (always included)
       const allComments = await storage.getTaskComments(task.id);
       const allChildren = await storage.getChildTasks(task.id);
+      const allStatusHistory = await storage.getStatusHistory(task.id);
       result.comment_count = allComments.length;
       result.children_count = allChildren.length;
+      result.status_history_count = allStatusHistory.length;
 
       // Drill-down: include full section data when explicitly requested
       if (sectionsSet.has('turns') && allTurns.length > 0) {
@@ -415,6 +421,19 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
           content: c.content,
           created_at: new Date(c.created_at).toISOString(),
         }));
+      }
+
+      if (sectionsSet.has('status-history')) {
+        if (allStatusHistory.length > 0) {
+          const sliced = allStatusHistory.slice(offset, offset + limit);
+          result.status_history = sliced.map((c, i) => ({
+            // `from` is the prior entry's status; null for the very first transition.
+            from: (offset + i) === 0 ? null : allStatusHistory[offset + i - 1].status,
+            to: c.status,
+            actor: c.actor ?? null,
+            timestamp: new Date(c.timestamp).toISOString(),
+          }));
+        }
       }
 
       if (sectionsSet.has('children') && allChildren.length > 0) {
@@ -464,7 +483,7 @@ export const createTool: McpTool = {
       },
       model: {
         type: 'string',
-        description: 'Model ID to use for this task (e.g., opus, sonnet, claude-sonnet-4-5-20250929)',
+        description: 'Model ID to use for this task (e.g., opus, sonnet, claude-opus-4-8)',
 
       },
       type: {
@@ -473,7 +492,7 @@ export const createTool: McpTool = {
       },
       parent: {
         type: 'string',
-        description: 'Parent task ID to create this as a child/variant task',
+        description: 'Either a parent task ID (creates a child task) or a raw git branch name (top-level task targeting that branch). Without this, the task targets the repo default branch; the currently checked-out branch is never silently adopted.',
       },
       confirmation_code: {
         type: 'string',
@@ -496,14 +515,29 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
 
     const storage = await getStorage(ctx);
     try {
-      // Resolve parent task if specified
+      // Resolve --parent: a task code/short-ID (creates a child) or a raw git
+      // branch (top-level task targeting that branch). Same precedence as
+      // `lazy reparent` / CLI `lazy create`: try task first, then branch.
       let parentTaskId: string | undefined;
+      let explicitBranchTarget: string | undefined;
       if (parent) {
         const resolved = await storage.resolveTask(parent);
-        if (!resolved.task) {
-          throw new Error(`Parent task not found: ${parent}`);
+        if (resolved.task) {
+          parentTaskId = resolved.task.id;
+        } else if (resolved.ambiguousMatches?.length) {
+          throw new Error(`Ambiguous parent '${parent}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+        } else {
+          // Not a task — verify as branch.
+          const root = requireLazyRoot();
+          const verify = await runGit(['rev-parse', '--verify', '--quiet', parent], { cwd: root });
+          if (verify.exitCode !== 0) {
+            throw new Error(`Parent '${parent}' is neither a known task nor a local git branch.`);
+          }
+          if (parent.startsWith('lazy/')) {
+            throw new Error(`parent must be an integration branch, not a lazy task branch ('${parent}').`);
+          }
+          explicitBranchTarget = parent;
         }
-        parentTaskId = resolved.task.id;
       }
 
       // Check for parent warning: creating under main while active tasks exist.
@@ -563,6 +597,10 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
       }
 
       const task = await storage.createTask(goal, parentTaskId, undefined, code, type);
+
+      if (explicitBranchTarget) {
+        await storage.updateTaskTarget(task.id, branchTarget(explicitBranchTarget));
+      }
 
       if (prompt) {
         await storage.updateTaskPrompt(task.id, prompt);
@@ -1139,7 +1177,7 @@ interface StorageForDiff {
  * Returns 0 if the diff can't be computed (e.g., worktree gone).
  */
 async function getDiffLinesChanged(
-  task: { id: string; parent_task_id: string | null },
+  task: { id: string; target: TaskTarget },
   session: { git_branch: string; git_start_sha: string },
   storage: StorageForDiff,
 ): Promise<number> {
@@ -1153,14 +1191,15 @@ async function getDiffLinesChanged(
  * Returns null if the diff can't be computed (git error, worktree gone, etc.).
  */
 async function getDiffStat(
-  task: { id: string; parent_task_id: string | null },
+  task: { id: string; target: TaskTarget },
   session: { git_branch: string; git_start_sha: string },
   storage: StorageForDiff,
 ): Promise<DiffStat | null> {
   try {
     const lazyRoot = requireLazyRoot();
-    const parentBranch = task.parent_task_id
-      ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
+    const parentId = task.target.kind === 'task' ? task.target.parentTaskId : null;
+    const parentBranch = parentId
+      ? (await storage.getSessionByTaskId(parentId))?.git_branch ?? 'main'
       : 'main';
 
     const { cwd, diffRange } = await computeDiffCwdAndRange(session, parentBranch, storage.getStoragePath(), lazyRoot);
@@ -1557,8 +1596,9 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
         return await executeAccept(taskId, reason, approvedFiles);
       }
 
-      const parentBranch = task.parent_task_id
-        ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
+      const pid = parentTaskIdOf(task);
+      const parentBranch = pid
+        ? (await storage.getSessionByTaskId(pid))?.git_branch ?? 'main'
         : 'main';
 
       const code = generateCode('ac');
@@ -1991,7 +2031,7 @@ export function createListHandler(ctx: McpToolContext): McpToolHandler {
           goal: t.goal,
           status: t.status,
           model: t.model ?? null,
-          parent_task_id: t.parent_task_id ? shortId(t.parent_task_id) : null,
+          parent_task_id: parentTaskIdOf(t) ? shortId(parentTaskIdOf(t)!) : null,
         })),
       };
     } finally {
@@ -2153,8 +2193,9 @@ export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
       // merge-base and shows only what the task itself changed, excluding upstream
       // merges. Fall back to two-dot from upstream_merge_sha or git_start_sha when
       // the parent branch ref is unavailable (e.g., deleted after accept).
-      const parentBranch = task.parent_task_id
-        ? (await storage.getSessionByTaskId(task.parent_task_id))?.git_branch ?? 'main'
+      const pid = parentTaskIdOf(task);
+      const parentBranch = pid
+        ? (await storage.getSessionByTaskId(pid))?.git_branch ?? 'main'
         : 'main';
 
       let diffRange: string;
@@ -2388,13 +2429,14 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
 
       if (parent !== undefined) {
         if (parent === '') {
-          await storage.updateTaskParent(task.id, null);
+          // Clear parent → top-level, integrating into main.
+          await storage.updateTaskTarget(task.id, branchTarget('main'));
         } else {
           const parentResolved = await storage.resolveTask(parent);
           if (!parentResolved.task) {
             throw new Error(`Parent task not found: ${parent}`);
           }
-          await storage.updateTaskParent(task.id, parentResolved.task.id);
+          await storage.updateTaskTarget(task.id, taskTarget(parentResolved.task.id));
         }
         changes.push('parent');
       }
@@ -2693,7 +2735,7 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
         // Create new task
         const newTask = await storage.createTask(
           oldTask.goal,
-          oldTask.parent_task_id ?? undefined,
+          parentTaskIdOf(oldTask) ?? undefined,
           undefined,
           redoCode || undefined,
         );
@@ -2792,6 +2834,63 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_reparent
+// ---------------------------------------------------------------------------
+
+export const reparentTool: McpTool = {
+  name: 'lazy_reparent',
+  description:
+    'Repoint a task to a new parent and merge that parent into the task\'s ' +
+    'branch. Use this when a task was created on the wrong parent (e.g. ' +
+    'branched from main when it should have been on a release branch). ' +
+    'Reparent KEEPS the task — same session, turns, commits, and branch — and ' +
+    'only changes its parent pointer, then runs a sync so the task\'s own ' +
+    'agent merges the new parent in (resolving conflicts in place). The task ' +
+    'must not be currently working; terminal tasks must be reopened first.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code) to reparent',
+        minLength: 1,
+      },
+      parent: {
+        type: 'string',
+        description: 'New parent: a task code, short ID, or a raw branch name (e.g. "main")',
+        minLength: 1,
+      },
+    },
+    required: ['task_id', 'parent'],
+  },
+};
+
+export function createReparentHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+    const parent = args.parent as string;
+
+    const root = requireLazyRoot();
+    const params: ReparentTaskParams = {
+      taskId,
+      parent,
+    };
+
+    const result = await reparentTask(root, params);
+
+    return {
+      output: result.message,
+      taskId: result.taskId,
+      displayId: result.displayId,
+      status: result.status,
+      syncStatus: result.syncStatus,
+      newParent: result.newParent,
+      warnings: result.warnings,
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Registration helper
 // ---------------------------------------------------------------------------
 
@@ -2828,6 +2927,7 @@ export const allTools: McpTool[] = [
   reopenTool,
   redoTool,
   syncTool,
+  reparentTool,
 ];
 
 /**
@@ -2864,5 +2964,6 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_reopen', createReopenHandler(ctx));
   handlers.set('lazy_redo', createRedoHandler(ctx));
   handlers.set('lazy_sync', createSyncHandler(ctx));
+  handlers.set('lazy_reparent', createReparentHandler(ctx));
   return handlers;
 }

@@ -135,17 +135,16 @@ describe('lazy pair', () => {
     const branchName = `lazy/${taskId}`;
     ctx.git('checkout', branchName);
 
-    // Running `lazy pair` without arguments should detect the task.
-    // It will fail at the auth check (no API token), proving it resolved the task.
-    const result = await ctx.lazy(['pair'], {
-      env: {
-        CLAUDE_CODE_OAUTH_TOKEN: '',
-        ANTHROPIC_API_KEY: '',
-      },
-    });
+    // Running `lazy pair` without arguments should detect the task from the
+    // branch. With a credential present (the default fake key, so the daemon
+    // gate passes), pair resolves the task and proceeds to the launch step,
+    // printing the resume message — proving it detected the task from the
+    // lazy/* branch. (It ultimately fails later because the `claude` binary
+    // isn't installed in the test env.)
+    const result = await ctx.lazy(['pair']);
 
-    expectFailure(result);
-    expectError(result, 'No API token found');
+    expectOutputExcludes(result, 'Usage: lazy pair');
+    expectOutput(result, 'No existing Claude session to resume');
   });
 
   test('--unlock fails without task on non-task branch', async () => {
@@ -241,9 +240,12 @@ describe('lazy pair', () => {
     expectError(result, 'already being paired on');
   });
 
-  // INVARIANT: Pairing requires an API token for post-session summarization.
-  // Without a token, summarization would silently fail, losing valuable context.
-  test('fails when no API token is available', async () => {
+  // INVARIANT: pair does NOT enforce auth itself — the daemon credential gate
+  // is the single enforcement point. `lazy pair` auto-starts the daemon, which
+  // refuses to start without a credential. So a missing credential surfaces as
+  // the daemon's actionable error (clients pass through, they don't re-enforce).
+  // This is the behavior that makes dropping the old client-side check safe.
+  test('missing credential surfaces the daemon gate error, not a client check', async () => {
     const taskId = await createTask(ctx, 'No auth task', 'Some work');
     createSessionManually(ctx, taskId);
     setTaskStatus(ctx.root, taskId, 'blocked');
@@ -256,18 +258,20 @@ describe('lazy pair', () => {
     });
 
     expectFailure(result);
-    expectError(result, 'No API token found');
-    expectError(result, '--no-summary');
+    // The daemon gate fired — not the old client-side "No API token found".
+    expectError(result, 'Daemon refuses to start');
+    expectError(result, 'ANTHROPIC_API_KEY');
+    expectOutputExcludes(result, 'No API token found');
   });
 
-  test('--no-summary bypasses auth check', async () => {
+  // INVARIANT: the daemon gate is not bypassable by client flags. --no-summary
+  // used to skip pair's local auth check; now there is no client check, and the
+  // daemon still requires a credential regardless of the flag.
+  test('--no-summary does not bypass the daemon credential gate', async () => {
     const taskId = await createTask(ctx, 'No auth task', 'Some work');
     createSessionManually(ctx, taskId);
     setTaskStatus(ctx.root, taskId, 'blocked');
 
-    // With --no-summary and no auth, the command should proceed past the auth
-    // check. It will still fail because `claude` binary doesn't exist, but the
-    // auth error should NOT appear.
     const result = await ctx.lazy(['pair', taskId, '--no-summary'], {
       env: {
         CLAUDE_CODE_OAUTH_TOKEN: '',
@@ -275,24 +279,22 @@ describe('lazy pair', () => {
       },
     });
 
-    // Should not fail with auth error (may fail for other reasons like no claude binary)
-    expectOutputExcludes(result, 'No API token found');
+    expectFailure(result);
+    expectError(result, 'Daemon refuses to start');
   });
 
-  test('does not fail auth check when API token is available', async () => {
+  test('proceeds past the gate when a credential is available', async () => {
     const taskId = await createTask(ctx, 'Auth task', 'Some work');
     createSessionManually(ctx, taskId);
     setTaskStatus(ctx.root, taskId, 'blocked');
 
-    // Run pair with an API key set. The command will fail because `claude`
-    // binary doesn't exist, but the auth error should NOT appear.
-    const result = await ctx.lazy(['pair', taskId], {
-      env: {
-        ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
-      },
-    });
+    // Credential present (default fake key) → daemon gate passes, pair resolves
+    // the task and reaches the launch step. It fails later because the `claude`
+    // binary doesn't exist, but it must NOT fail with the credential gate error.
+    const result = await ctx.lazy(['pair', taskId]);
 
-    expectOutputExcludes(result, 'No API token found');
+    expectOutputExcludes(result, 'Daemon refuses to start');
+    expectOutput(result, 'No existing Claude session to resume');
   });
 
   // INVARIANT: --resume is only valid in branchless mode.

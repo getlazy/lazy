@@ -1,5 +1,6 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, validateCode, taskRef } from '../helpers';
 import { resolveDetachedHead } from '../../git/operations';
+import { targetBranchOf } from '../../task-target';
 import { isTTY, promptYesNo, promptLine, readStdinIfPiped } from '../editor';
 import { commandSyncTask } from './sync';
 import { loadConfig } from '../../config/loader';
@@ -240,7 +241,7 @@ async function handleContinuationTaskOffer(
     const originalGoal = originalTask?.goal ?? 'Unknown goal';
 
     // Determine merge target for the continuation prompt
-    const mergeTargetBranch = task.metadata?.remote_target_branch ?? 'main';
+    const mergeTargetBranch = targetBranchOf(task) ?? 'main';
 
     console.log(`\nThe original task was: ${theme.taskId(originalTaskCode)}`);
     console.log(`  ${theme.label('Goal:')} ${originalGoal}`);

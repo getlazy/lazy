@@ -10,6 +10,7 @@ import { existsSync } from 'fs';
 import type { Task, Session } from '../../types';
 import type { Storage } from '../../storage';
 import { isTerminalStatus } from '../../task-state-machine';
+import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../../task-target';
 import { theme } from '../theme';
 import {
   displayId,
@@ -46,11 +47,12 @@ async function checkStaleParent(
   storage: Storage,
   root: string,
 ): Promise<TaskCheckResult> {
-  if (!task.parent_task_id) {
+  const parentId = parentTaskIdOf(task);
+  if (!parentId) {
     return { ok: true, label: 'Parent: none (top-level task)' };
   }
 
-  const parent = await storage.getTask(task.parent_task_id);
+  const parent = await storage.getTask(parentId);
   if (!parent) {
     return { ok: true, label: 'Parent: not found (may have been deleted)' };
   }
@@ -59,18 +61,23 @@ async function checkStaleParent(
     return { ok: true, label: `Parent: ${displayId(parent)} (${parent.status})` };
   }
 
-  // Parent is terminal — find the grandparent or null (reparent to top-level)
-  const newParentId = parent.parent_task_id;
-  const newParentLabel = newParentId
-    ? (await storage.getTask(newParentId))?.code ?? shortId(newParentId)
-    : 'none (top-level)';
+  // Parent is terminal — reparent to the grandparent (stack on it) or, if the
+  // parent was top-level, to the branch it integrated into (the resolver will
+  // heal a stale branch on the next sync).
+  const grandparentId = parentTaskIdOf(parent);
+  const newTarget = grandparentId
+    ? taskTarget(grandparentId)
+    : branchTarget(targetBranchOf(parent) ?? 'main');
+  const newParentLabel = grandparentId
+    ? (await storage.getTask(grandparentId))?.code ?? shortId(grandparentId)
+    : `none (top-level, ${newTarget.kind === 'branch' ? newTarget.branch : ''})`;
 
   return {
     ok: false,
     label: `Stale parent: ${displayId(parent)} is ${parent.status}`,
     detail: `    → Reparent to ${newParentLabel}?`,
     fix: async () => {
-      await storage.updateTaskParent(task.id, newParentId);
+      await storage.updateTaskTarget(task.id, newTarget);
       console.log(theme.success(`    Reparented to ${newParentLabel}`));
     },
   };

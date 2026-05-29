@@ -16,6 +16,7 @@ import { branchExists, getTaskTargetBranch } from '../git/operations';
 import type { Storage } from '../storage/interface';
 import { getBranchNameFromId } from './helpers';
 import { getActor } from '../constants';
+import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../task-target';
 
 export interface OrphanCheckResult {
   /** True if the task is a child whose parent is in a terminal state and parent's branch is gone */
@@ -39,11 +40,12 @@ export async function checkOrphanedChild(
   storage: Storage,
   root: string,
 ): Promise<OrphanCheckResult> {
-  if (!task.parent_task_id) {
+  const parentId = parentTaskIdOf(task);
+  if (!parentId) {
     return { isOrphaned: false, parentTask: null, retargetBranch: null };
   }
 
-  const parentTask = await storage.getTask(task.parent_task_id);
+  const parentTask = await storage.getTask(parentId);
   if (!parentTask) {
     // Parent task not found in storage — treat as orphaned, target main
     return { isOrphaned: true, parentTask: null, retargetBranch: 'main' };
@@ -56,7 +58,7 @@ export async function checkOrphanedChild(
   // Parent is in terminal state. Check if the branch still exists.
   let parentBranchName: string;
   try {
-    parentBranchName = await getBranchNameFromId(task.parent_task_id, storage);
+    parentBranchName = await getBranchNameFromId(parentId, storage);
   } catch {
     // Can't determine parent's branch name — treat as orphaned
     return { isOrphaned: true, parentTask, retargetBranch: await getTaskTargetBranch(parentTask, root) ?? 'main' };
@@ -83,10 +85,10 @@ export async function checkOrphanedChild(
  * Retarget an orphaned child task to a new upstream branch.
  *
  * This:
- * 1. Stores the original parent_task_id in metadata for history
- * 2. Clears parent_task_id (so downstream code uses remote_target_branch)
- * 3. Sets remote_target_branch to the retarget branch
- * 4. Adds a comment recording the retarget
+ * 1. Stores the original parent task id in metadata for history
+ * 2. Repoints the task's target from the dead parent to the named branch
+ *    (a single `{ kind: 'branch' }` target — no separate parent/branch fields)
+ * 3. Adds a comment recording the retarget
  *
  * After retargeting, the next `lazy sync` will merge the new target
  * branch into the child's worktree, and the agent resolves any conflicts.
@@ -97,18 +99,16 @@ export async function retargetOrphanedChild(
   retargetBranch: string,
 ): Promise<void> {
   // Preserve history
-  if (task.parent_task_id) {
-    await storage.updateTaskMetadata(task.id, 'original_parent_task_id', task.parent_task_id);
+  const originalParentId = parentTaskIdOf(task);
+  if (originalParentId) {
+    await storage.updateTaskMetadata(task.id, 'original_parent_task_id', originalParentId);
   }
 
-  // Clear parent relationship so all code paths fall through to remote_target_branch
-  await storage.updateTaskParent(task.id, null);
-
-  // Set the new target branch
-  await storage.updateTaskMetadata(task.id, 'remote_target_branch', retargetBranch);
+  // Repoint to the named branch as a single canonical target.
+  await storage.updateTaskTarget(task.id, branchTarget(retargetBranch));
 
   // Record the retarget as a comment for the session history
-  const parentRef = task.parent_task_id ? task.parent_task_id.substring(0, 8) : 'unknown';
+  const parentRef = originalParentId ? originalParentId.substring(0, 8) : 'unknown';
   await storage.createComment(
     task.id,
     `[Retargeted] Parent task ${parentRef} was accepted. Retargeted from parent's branch to ${retargetBranch}.`,
@@ -136,8 +136,9 @@ export async function getActiveChildren(
  */
 export function formatReparentWarning(reparented: Task[], parentTask: Task): string | null {
   if (reparented.length === 0) return null;
-  const newParentDesc = parentTask.parent_task_id
-    ? parentTask.parent_task_id.substring(0, 8)
+  const grandparentId = parentTaskIdOf(parentTask);
+  const newParentDesc = grandparentId
+    ? grandparentId.substring(0, 8)
     : 'top-level';
   const plural = reparented.length === 1 ? 'child' : 'children';
   return `Re-parented ${reparented.length} unfinished ${plural} to ${newParentDesc}`;
@@ -162,29 +163,21 @@ export async function reparentChildren(
   const activeChildren = await getActiveChildren(acceptedTask.id, storage);
   if (activeChildren.length === 0) return [];
 
-  const newParentId = acceptedTask.parent_task_id ?? null;
+  const newParentId = parentTaskIdOf(acceptedTask);
 
-  // Determine the new merge target for reparented children.
-  // The accepted task's remote_target_branch is where it merged into — children
-  // should now target the same branch (or the new parent's branch if reparented
-  // to another task).
-  let newTargetBranch: string | undefined;
-  if (newParentId) {
-    // Reparented to grandparent — children will use getBranchNameFromId() at sync time
-  } else {
-    // Reparented to top-level — update remote_target_branch to match the accepted
-    // task's target so syncTask can find the right branch.
-    newTargetBranch = acceptedTask.metadata?.remote_target_branch ?? undefined;
-  }
+  // Determine the new target for reparented children.
+  // - Accepted task had a parent (grandparent): children stack on the grandparent;
+  //   the branch is derived from it at sync time.
+  // - Accepted task was top-level: children inherit the branch the accepted task
+  //   merged into so syncTask can find the right upstream after the old parent
+  //   branch is deleted; if that's unknown, keep the child's own branch, else main.
+  const inheritedBranch = newParentId ? undefined : targetBranchOf(acceptedTask);
 
   for (const child of activeChildren) {
-    await storage.updateTaskParent(child.id, newParentId);
-
-    // Update remote_target_branch so syncTask() can find the correct upstream
-    // after the old parent branch is deleted.
-    if (newTargetBranch) {
-      await storage.updateTaskMetadata(child.id, 'remote_target_branch', newTargetBranch);
-    }
+    const newTarget = newParentId
+      ? taskTarget(newParentId)
+      : branchTarget(inheritedBranch ?? targetBranchOf(child) ?? 'main');
+    await storage.updateTaskTarget(child.id, newTarget);
 
     const acceptedRef = acceptedTask.code ?? acceptedTask.id.substring(0, 8);
     const newParentRef = newParentId ? newParentId.substring(0, 8) : 'top-level';

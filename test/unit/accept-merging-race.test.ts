@@ -15,7 +15,8 @@
  * that idempotent behavior.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 import { RpcError as RealRpcError } from '../../src/daemon/rpc-handlers';
 import {
@@ -34,23 +35,24 @@ let raceTaskStatusOverride: TaskStatus | null = null;
 // Records of state transitions attempted so we can assert what acceptTask did.
 let transitionLog: Array<{ from: TaskStatus; to: TaskStatus }> = [];
 
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin', auto_approve: false },
     storage: { backend: 'external', external_path: '' },
+    models: { default: 'claude-opus-4-7' },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
   getOrCreateStorage: async () => createMockStorage(),
   RpcError: RealRpcError,
   initDaemonStorage: () => {},
 }));
 
 // validateAccept returns null → skip auto-create branch and go straight to merge.
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     needsSync: false,
@@ -74,7 +76,7 @@ mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   hasUncommittedChanges: async () => false,
   applyPatch: async () => true,
   hasUpstreamChanges: async () => false,
@@ -85,29 +87,29 @@ mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   getCurrentSha: async () => 'deadbeef',
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
   pathExists: async () => true,
   dirExists: async () => true,
   ensureDir: async () => {},
   readFileSafe: async () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
   checkPairingLock: () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
   validateBranchInSyncWithRemote: async () => ({ inSync: true }),
   runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   checkLock: () => null,
   acquireLock: () => {},
   removeLock: () => {},
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -116,7 +118,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async () => 'lazy/parent-branch',
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -124,7 +126,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   formatReparentWarning: () => null,
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
@@ -137,7 +139,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => 
   syncTaskFromRemote: async () => {},
 }));
 
-mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
   protocolDir: () => '/tmp/protocol',
   writeCommand: async () => {},
   ensureProtocolDir: () => {},
@@ -164,6 +166,9 @@ function createMockStorage() {
     getSessionByTaskId: async () => mockSession,
     getSessionTurns: async () => [],
     getSessionCommits: async () => mockCommits,
+    // Consumed by the fidelity summarizer (regenerateFidelity) during accept.
+    getTaskComments: async () => [],
+    getChildTasks: async () => [],
     updateTaskStatus: async (_id: string, to: TaskStatus) => {
       // Use the "true" current status — overridden by race when set, else live.
       const from = raceTaskStatusOverride ?? liveStatus;
@@ -195,7 +200,7 @@ function makeTask() {
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: {},
@@ -258,4 +263,8 @@ describe('acceptTask: race with remote-sync reconciler', () => {
     expect(tried).toContain('blocked→merging');
     expect(tried).toContain('merging→complete');
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

@@ -10,6 +10,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes } from '../helpers/assertions';
+import { parentTaskIdOf } from '../../src/task-target';
 import { createStorage, type Storage } from '../../src/storage';
 import type { Task } from '../../src/types';
 
@@ -65,7 +66,7 @@ describe('lazy doctor <task-id>', () => {
     try {
       const parent = await storage.createTask('parent task', undefined, undefined, 'stale-parent');
       const child = await storage.createTask('child task', undefined, undefined, 'stale-child');
-      await storage.updateTaskParent(child.id, parent.id);
+      await storage.updateTaskTarget(child.id, { kind: 'task' as const, parentTaskId: parent.id });
       // Transition parent through valid states: backlog → working → blocked → merging → complete
       await storage.updateTaskStatus(parent.id, 'working', 'system');
       await storage.updateTaskStatus(parent.id, 'blocked', 'system');
@@ -92,8 +93,8 @@ describe('lazy doctor <task-id>', () => {
       const parent = await storage.createTask('parent', undefined, undefined, 'parent-gp');
       const child = await storage.createTask('child', undefined, undefined, 'child-gp');
 
-      await storage.updateTaskParent(parent.id, grandparent.id);
-      await storage.updateTaskParent(child.id, parent.id);
+      await storage.updateTaskTarget(parent.id, { kind: 'task' as const, parentTaskId: grandparent.id });
+      await storage.updateTaskTarget(child.id, { kind: 'task' as const, parentTaskId: parent.id });
       // Transition parent through valid states: backlog → working → blocked → merging → complete
       await storage.updateTaskStatus(parent.id, 'working', 'system');
       await storage.updateTaskStatus(parent.id, 'blocked', 'system');
@@ -115,7 +116,7 @@ describe('lazy doctor <task-id>', () => {
     const storage2 = await openTestStorage(ctx.root);
     try {
       const child = await storage2.getTask(childFullId);
-      expect(child!.parent_task_id).toBe(grandparentFullId);
+      expect(parentTaskIdOf(child!)).toBe(grandparentFullId);
     } finally {
       await storage2.close();
     }
@@ -152,7 +153,7 @@ describe('lazy doctor <task-id>', () => {
       const parent = await storage.createTask('parent-dr', undefined, undefined, 'parent-dr');
       const child = await storage.createTask('child-dr', undefined, undefined, 'child-dr');
 
-      await storage.updateTaskParent(child.id, parent.id);
+      await storage.updateTaskTarget(child.id, { kind: 'task' as const, parentTaskId: parent.id });
       // Transition parent through valid states: backlog → working → blocked → merging → complete
       await storage.updateTaskStatus(parent.id, 'working', 'system');
       await storage.updateTaskStatus(parent.id, 'blocked', 'system');
@@ -250,7 +251,7 @@ describe('lazy doctor <task-id>', () => {
       const parent = await storage.createTask('active parent', undefined, undefined, 'act-parent');
       const child = await storage.createTask('child of active', undefined, undefined, 'child-act');
 
-      await storage.updateTaskParent(child.id, parent.id);
+      await storage.updateTaskTarget(child.id, { kind: 'task' as const, parentTaskId: parent.id });
       childShortId = child.id.substring(0, 8);
     } finally {
       await storage.close();

@@ -9,7 +9,8 @@
  * (disk full, race condition, swallowed git error) is caught before cleanup.
  */
 
-import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
@@ -17,7 +18,7 @@ import { runGit } from '../../src/utils/git';
 
 // Mock squashMergeTaskBranch to be a no-op that returns "success" without
 // committing anything — simulating the silent-failure mode the guard protects against.
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   checkMergeConflicts: async () => false,
   checkMergeConflictsIntoTarget: async () => false,
   squashMergeTaskBranch: async () => {
@@ -84,4 +85,8 @@ describe('LocalDriver.merge: safe-branch-delete guard', () => {
     const log = await runGit(['log', '--format=%s', 'lazy/task-1'], { cwd: repo });
     expect(log.stdout).toContain('task work');
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

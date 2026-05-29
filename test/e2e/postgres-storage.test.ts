@@ -10,6 +10,7 @@
 import { describe, test, beforeEach, afterEach, expect, beforeAll, afterAll } from 'bun:test';
 import postgres from 'postgres';
 import { PostgresStorage } from '../../src/storage/postgres-storage';
+import { parentTaskIdOf } from '../../src/task-target';
 
 const TEST_URL = process.env.LAZY_POSTGRES_URL;
 
@@ -65,7 +66,7 @@ describeWithPg('PostgresStorage', () => {
     const parent = await storage.createTask('Parent task');
     const child = await storage.createTask('Child task', parent.id, 'abc123');
 
-    expect(child.parent_task_id).toBe(parent.id);
+    expect(parentTaskIdOf(child)).toBe(parent.id);
     expect(child.branched_from_sha).toBe('abc123');
 
     const children = await storage.getChildTasks(parent.id);

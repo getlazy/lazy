@@ -33,6 +33,7 @@ export { commandRevert, revertUsage } from './revert';
 export { commandPropose, proposeUsage } from './propose';
 export { commandSubmit, submitUsage } from './submit';
 export { commandSync, commandSyncTask, syncUsage } from './sync';
+export { commandReparent, reparentUsage } from './reparent';
 export { commandCompletion, completionUsage } from './completion';
 export { commandReview, reviewUsage } from './review';
 export { commandRedo, redoUsage } from './redo';

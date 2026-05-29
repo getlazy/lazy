@@ -82,7 +82,11 @@ async function runLazy(cwd: string, args: string[], protocolBase: string, extraE
     stdin: input !== undefined ? new Blob([input]) : undefined,
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, LAZY_PROTOCOL_BASE: protocolBase, ...extraEnv },
+    // Provide fake auth so the daemon credential gate (the single enforcement
+    // point) lets the implicitly auto-started daemon come up. Mirrors
+    // runLazyMocked/startTestDaemon. Placed BEFORE extraEnv so individual tests
+    // can clear it (e.g. ANTHROPIC_API_KEY: '') to exercise the gate.
+    env: { ...process.env, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...extraEnv },
   });
 
   const [stdout, stderr, exitCode] = await Promise.all([

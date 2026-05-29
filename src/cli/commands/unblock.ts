@@ -19,6 +19,7 @@ import { removeRecoveryFile } from '../editor';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
+import { parentTaskIdOf } from '../../task-target';
 
 /**
  * Determine whether unblock should run in interactive mode.
@@ -115,7 +116,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
 
     // Check for orphaned child — prompt in CLI, pass retargetOrphan to RPC
     let retargetOrphan = false;
-    if (task.parent_task_id) {
+    if (parentTaskIdOf(task)) {
       const orphanStatus = await checkOrphanedChild(task, storage, root);
       if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
         console.log(theme.warning(`\nParent task was accepted and its branch deleted.`));
@@ -166,7 +167,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           sess.git_branch,
           worktreePath,
           root,
-          task.parent_task_id,
+          parentTaskIdOf(task),
           storage,
           task.id,
           sess.id,
@@ -248,8 +249,9 @@ export async function commandUnblock(args: string[]): Promise<void> {
         let commitsBehind = 0;
         let isStale = false;
         try {
-          const mainBranch = task.parent_task_id
-            ? await getBranchNameFromId(task.parent_task_id, storage)
+          const parentId = parentTaskIdOf(task);
+          const mainBranch = parentId
+            ? await getBranchNameFromId(parentId, storage)
             : await getRemoteDefaultBranch(root);
           commitsBehind = await getCommitsBehindCount(sess.git_branch, mainBranch, root);
           isStale = commitsBehind >= STALE_THRESHOLD;
@@ -373,7 +375,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           const taskShortId = shortId(task.id);
           const tRef = taskRef(task);
           const worktreePath = getWorktreePathForRef(root, tRef);
-          const result = await getEditorFeedback(task.id, task.goal, sess.id, taskShortId, storage, false, worktreePath, task.parent_task_id, root, displayId(task));
+          const result = await getEditorFeedback(task.id, task.goal, sess.id, taskShortId, storage, false, worktreePath, parentTaskIdOf(task), root, displayId(task));
           if (result.type !== 'feedback') {
             console.error('Unexpected result from editor.');
             process.exit(1);
@@ -548,7 +550,7 @@ Arguments:
 Options:
   -f <file>           Read feedback from a file
   --message <text>    Provide inline feedback
-  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-4-8)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.
   --approve-file <file>   Approve a violated file (repeatable, for conflict tasks)

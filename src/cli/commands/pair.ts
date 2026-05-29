@@ -13,7 +13,7 @@ import {
   checkPairingLock,
   forceRemovePairingLock,
 } from '../../utils/pairing-lock';
-import { runClaude, hasAuthEnv } from '../../capture/claude';
+import { runClaude } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
 import { isOfflineMode } from '../../utils/offline';
@@ -385,15 +385,13 @@ export async function commandPair(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Pre-flight: check API token availability for post-session summarization.
-    // The interactive Claude session itself may work via `claude` CLI's own auth,
-    // but our summarization step calls the API directly and needs an explicit token.
-    if (!noSummary && !hasAuthEnv()) {
-      console.error('Error: No API token found (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY).');
-      console.error('Pairing requires a token for post-session summarization.');
-      console.error('Set one of these env vars, or use --no-summary to skip summarization.');
-      process.exit(1);
-    }
+    // Credential enforcement is no longer done here. The daemon is the single
+    // enforcement point: `lazy pair` auto-starts the daemon (ensureDaemon),
+    // which refuses to start without a Claude Code OAuth token / Anthropic API
+    // key. A missing credential therefore surfaces as an actionable daemon
+    // error before we ever reach this point — clients pass through, they don't
+    // re-enforce. (Summarization runs in the same environment the daemon gate
+    // already validated, so it has the credential it needs.)
 
     // Task must have a claude session ID to resume (or we'll start fresh)
     let claudeSessionId = sess.agent_session_id;

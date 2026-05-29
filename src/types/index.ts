@@ -10,6 +10,26 @@ export const DEFAULT_TASK_TYPE: TaskType = 'task';
 
 export const VALID_TASK_TYPES: readonly TaskType[] = ['task', 'fix', 'spike', 'refactor', 'test', 'audit', 'migrate', 'document', 'tidy', 'rework', 'feature', 'release'] as const;
 
+/**
+ * A task's integration target — the single source of truth for "where do I
+ * sync against / accept into". Modeled as a discriminated union so illegal
+ * states are unrepresentable: a task is EITHER stacked on another task
+ * (branch derived from the parent) OR integrates into a named branch. It can
+ * never be both, neither, or carry a contradictory pair.
+ *
+ * This replaces the old `(parent_task_id?, remote_target_branch?)` pair, which
+ * encoded one concept across two independent nullable fields and let illegal
+ * combinations (both set, both empty, a `lazy/...` ref in the branch slot)
+ * slip through by convention rather than by type.
+ *
+ * Construct via the smart constructors in `src/task-target.ts`
+ * (`taskTarget` / `branchTarget`) — `branchTarget` rejects `lazy/...` refs and
+ * empty strings at the construction boundary.
+ */
+export type TaskTarget =
+  | { kind: 'task'; parentTaskId: string }   // stacked on another task; branch derived from parent
+  | { kind: 'branch'; branch: string };      // top-level; integrates into a named branch
+
 export type SessionOutcome = 'accepted' | 'rejected';
 export type CommitStatus = 'pending_review' | 'approved' | 'rejected' | 'superseded';
 export type ReviewVerdict = 'approve' | 'reject' | 'request_changes';
@@ -35,7 +55,13 @@ export interface Task {
   status: TaskStatus;
   created_at: number;
   completed_at: number | null;
-  parent_task_id: string | null;
+  /**
+   * Canonical integration target. Replaces the old
+   * `(parent_task_id, metadata.remote_target_branch)` pair — see {@link TaskTarget}.
+   * The legacy two-field shape is normalized into this union at the storage
+   * boundary on read and serialized back from it on write.
+   */
+  target: TaskTarget;
   branched_from_sha: string | null;
   close_reason: string | null;
   model: string | null;

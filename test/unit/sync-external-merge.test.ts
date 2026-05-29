@@ -6,7 +6,8 @@
  * (blocked → merging → complete, never blocked → complete directly).
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
 // Track calls to storage.updateTaskStatus to verify transition sequence
@@ -20,19 +21,20 @@ let mockSessionCommits: any[] = [];
 import { DEFAULT_CONFIG as REAL_DEFAULT_CONFIG, getDefaultConfigTemplate as REAL_getDefaultConfigTemplate } from '../../src/config/loader';
 
 // Mock the config loader to return a github driver config
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: () => ({
     remote: {
       driver: 'github',
       git_remote: 'origin',
     },
+    models: { default: 'claude-opus-4-7' },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
 }));
 
 // Mock the remote module to return a controllable driver
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     hasRemoteRef: (task: any) => task.metadata?.github_pr_number !== undefined,
@@ -56,24 +58,24 @@ mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
 }));
 
 // Mock the orphan reparenting function
-mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   reparentChildren: async () => [],
 }));
 
 // Mock the shared cleanup functions
-mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
   syncTaskFromRemote: async () => {},
   cleanupWorktreeAndBranch: () => {},
   cleanupTaskContainer: async () => {},
 }));
 
 // Mock the lock utilities
-mock.module(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: () => {},
 }));
 
 // Mock the protocol utilities
-mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
   protocolDir: () => '/tmp/protocol',
   removeProtocolDir: () => {},
 }));
@@ -122,7 +124,7 @@ function makeTask(status: 'blocked' | 'conflict' | 'merging', hasRemoteRef = tru
     model: 'claude-opus-4-6',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: hasRemoteRef ? { github_pr_number: '123' } : null,
@@ -223,4 +225,8 @@ describe('sync external merge detection', () => {
     // No status transitions should occur for spurious merges
     expect(statusTransitions).toHaveLength(0);
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

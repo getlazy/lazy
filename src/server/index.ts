@@ -25,6 +25,7 @@ import {
 } from './templates';
 import type { DashboardStats, TaskWithSession, ChartDataPoint, ActiveTaskInfo, ActivityDay, ActiveStates } from './templates';
 import { taskRefFromId } from '../cli/helpers';
+import { parentTaskIdOf } from '../task-target';
 
 function html(content: string, status: number = 200): Response {
   return new Response(content, {
@@ -456,7 +457,8 @@ async function handleTaskDetail(storage: Storage, taskId: string): Promise<Respo
   const comments = await storage.getTaskComments(task.id);
   const children = await storage.getChildTasks(task.id);
   const promptVersions = await storage.getPromptHistory(task.id);
-  const parentTask = task.parent_task_id ? await storage.getTask(task.parent_task_id) : null;
+  const parentId = parentTaskIdOf(task);
+  const parentTask = parentId ? await storage.getTask(parentId) : null;
 
   return html(taskDetailHtml(task, session, turns, commits, comments, children, promptVersions, parentTask));
 }
@@ -498,8 +500,9 @@ async function handleTaskPr(storage: Storage, taskId: string): Promise<Response>
 
   const commits = await storage.getSessionCommits(session.id);
 
-  const baseBranch = task.parent_task_id
-    ? 'lazy/' + await taskRefFromId(task.parent_task_id, storage)
+  const parentId = parentTaskIdOf(task);
+  const baseBranch = parentId
+    ? 'lazy/' + await taskRefFromId(parentId, storage)
     : 'main';
 
   return html(taskPrHtml(task, session, commits, baseBranch));

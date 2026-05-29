@@ -45,6 +45,8 @@ export interface DaemonStatus {
   socketPath?: string;
   uptime?: number;
   version?: string;
+  /** UTC ISO timestamp the daemon binary was built, or 'dev' when run from source. */
+  buildTime?: string;
   webPort?: number;
   autoReactBudget?: AutoReactBudgetEntry[];
 }
@@ -174,13 +176,14 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { uptime?: number; version?: string; webPort?: number; autoReactBudget?: AutoReactBudgetEntry[] };
+    const data = await response.json() as { uptime?: number; version?: string; buildTime?: string; webPort?: number; autoReactBudget?: AutoReactBudgetEntry[] };
     return {
       running: true,
       pid: pid ?? undefined,
       socketPath,
       uptime: data.uptime,
       version: data.version,
+      buildTime: data.buildTime,
       webPort: data.webPort,
       autoReactBudget: data.autoReactBudget,
     };

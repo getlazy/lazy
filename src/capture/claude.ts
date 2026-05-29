@@ -14,6 +14,10 @@ import { getEffectiveModel } from '../utils/ollama';
 import { isOfflineMode } from '../utils/offline';
 import { spawn, spawnSync } from '../utils/spawn';
 import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
+
+// Re-export so other modules (e.g. `lazy system export-dockerfile`) can use the
+// exact same embedded text as the single source of truth — never copy it.
+export { DEFAULT_DOCKERFILE };
 import { getHome } from '../utils/home';
 
 // Embedded at build/compile time — the agent binary is bundled into the lazy executable.

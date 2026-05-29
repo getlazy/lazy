@@ -4,37 +4,45 @@
  *
  * INVARIANT: When a task's parent is terminal (complete/closed/abandoned),
  * the function walks up the ancestor chain to find a living parent. If none
- * is found, it falls back to top-level (remote_target_branch or main).
- * The task is reparented as a side effect so future operations don't walk again.
+ * is found, it falls back to top-level (the named target branch or main).
+ * The task's canonical `target` is repointed as a side effect so future
+ * operations don't walk again. Since the target is a single discriminated
+ * union, a parent task and a target branch can never be set independently —
+ * the resolver always writes exactly one TaskTarget.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
+import type { TaskTarget } from '../../src/types';
 
 // --- Track storage mutations ---
-let parentUpdates: Array<{ taskId: string; parentId: string | null }> = [];
-let metadataUpdates: Array<{ taskId: string; key: string; value: string }> = [];
+let targetUpdates: Array<{ taskId: string; target: TaskTarget }> = [];
 let comments: Array<{ taskId: string; content: string }> = [];
 let taskStore: Map<string, any> = new Map();
 
 // Mock storage
 const mockStorage = {
   getTask: async (id: string) => taskStore.get(id) ?? null,
-  updateTaskParent: async (taskId: string, parentId: string | null) => {
-    parentUpdates.push({ taskId, parentId });
-  },
-  updateTaskMetadata: async (taskId: string, key: string, value: string) => {
-    metadataUpdates.push({ taskId, key, value });
+  updateTaskTarget: async (taskId: string, target: TaskTarget) => {
+    targetUpdates.push({ taskId, target });
   },
   createComment: async (taskId: string, content: string, _actor: string) => {
     comments.push({ taskId, content });
   },
 };
 
-// Mock getCurrentBranch
-let mockCurrentBranch = 'main';
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
-  getCurrentBranch: async () => mockCurrentBranch,
+// INVARIANT: the heal path resolves to the REPO DEFAULT branch (origin/HEAD →
+// 'main' fallback) — NEVER to whatever branch the user happens to have checked
+// out at sync time. Adopting the current branch was the root of the
+// fix-target-adoption bug: tasks created/synced from a release branch silently
+// adopted it as their integration target and later opened PRs against dead
+// bases. The resolver now reads only the configured remote default.
+let mockRemoteDefaultBranch = 'main';
+let mockCurrentBranchSentinel = 'should-never-be-read';
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+  getRemoteDefaultBranch: async () => mockRemoteDefaultBranch,
+  getCurrentBranch: async () => mockCurrentBranchSentinel,
   resolveDetachedHead: async (branch: string) => branch,
   getCurrentSha: async () => 'abc123',
   branchExists: async () => false,
@@ -45,11 +53,17 @@ mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   checkMergeConflictsIntoTarget: async () => false,
 }));
 
+// Mock loadConfig — the resolver needs config.remote.git_remote to ask the right
+// remote for its default branch.
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+  loadConfig: async () => ({ remote: { git_remote: 'origin' } }),
+}));
+
 // Mock getBranchNameFromId — import real functions to avoid breaking other tests
 // (bun's mock.module replaces the entire module, so we must re-export everything)
 import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/cli/helpers';
 const branchNameMap = new Map<string, string>();
-mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async (taskId: string) => {
     return branchNameMap.get(taskId) ?? `lazy/${taskId.substring(0, 8)}`;
   },
@@ -62,164 +76,172 @@ mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
 }));
 
 // Mock constants
-mock.module(resolve(import.meta.dir, '../../src/constants.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/constants.ts'), () => ({
   getActor: () => 'test',
 }));
 
 // Mock logger
-mock.module(resolve(import.meta.dir, '../../src/utils/logger.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/logger.ts'), () => ({
   logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
 }));
 
 // Import the real function after mocks are registered
 const { resolveParentBranchWithFallback } = await import('../../src/daemon/task-lifecycle');
 
+// Helpers to build the canonical target on mock tasks.
+const branchT = (branch: string): TaskTarget => ({ kind: 'branch', branch });
+const taskT = (parentTaskId: string): TaskTarget => ({ kind: 'task', parentTaskId });
+
 describe('resolveParentBranch stale parent fallback', () => {
   beforeEach(() => {
-    parentUpdates = [];
-    metadataUpdates = [];
+    targetUpdates = [];
     comments = [];
     taskStore.clear();
     branchNameMap.clear();
-    mockCurrentBranch = 'main';
+    mockRemoteDefaultBranch = 'main';
   });
 
-  // INVARIANT: No parent → return remote_target_branch or current branch
-  test('returns remote_target_branch for top-level task', async () => {
-    const task = { id: 'child-id-1234', parent_task_id: null, metadata: { remote_target_branch: 'develop' } };
+  // INVARIANT: Top-level (branch target) → return that branch, no rewrite.
+  test('returns target branch for top-level task', async () => {
+    const task = { id: 'child-id-1234', target: branchT('develop'), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
     expect(result.branch).toBe('develop');
     expect(result.warnings).toEqual([]);
-    expect(parentUpdates).toEqual([]);
+    expect(targetUpdates).toEqual([]);
   });
 
   // INVARIANT: Living parent → return parent's branch directly
   test('returns parent branch when parent is alive', async () => {
-    const parent = { id: 'parent-id-1234', status: 'blocked', code: 'parent-task' };
+    const parent = { id: 'parent-id-1234', status: 'blocked', code: 'parent-task', target: branchT('main') };
     taskStore.set(parent.id, parent);
     branchNameMap.set(parent.id, 'lazy/parent-task');
 
-    const task = { id: 'child-id-1234', parent_task_id: parent.id, metadata: {} };
+    const task = { id: 'child-id-1234', target: taskT(parent.id), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
     expect(result.branch).toBe('lazy/parent-task');
     expect(result.warnings).toEqual([]);
-    expect(parentUpdates).toEqual([]);
+    expect(targetUpdates).toEqual([]);
   });
 
-  // INVARIANT: Terminal parent → walk up and reparent to living grandparent
+  // INVARIANT: Terminal parent → walk up and reparent to living grandparent.
+  // The new target is a single { kind: 'task' } — no stale branch tags along.
   test('walks up to living grandparent when parent is complete', async () => {
-    const grandparent = { id: 'gp-id-12345678', status: 'blocked', code: 'grandparent' };
-    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', parent_task_id: grandparent.id };
+    const grandparent = { id: 'gp-id-12345678', status: 'blocked', code: 'grandparent', target: branchT('main') };
+    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', target: taskT(grandparent.id) };
     taskStore.set(grandparent.id, grandparent);
     taskStore.set(parent.id, parent);
     branchNameMap.set(grandparent.id, 'lazy/grandparent');
 
-    const task = { id: 'child-id-1234', parent_task_id: parent.id, metadata: {} };
+    const task = { id: 'child-id-1234', target: taskT(parent.id), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     expect(result.branch).toBe('lazy/grandparent');
     expect(result.warnings.length).toBe(1);
     expect(result.warnings[0]).toContain('is complete');
     expect(result.warnings[0]).toContain('grandparent');
-    expect(parentUpdates).toEqual([{ taskId: 'child-id-1234', parentId: grandparent.id }]);
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'task' as const, parentTaskId: grandparent.id } }]);
     expect(comments.length).toBe(1);
     expect(comments[0].content).toContain('[Re-parented]');
   });
 
-  // INVARIANT: Entire chain terminal → fall back to main, reparent to top-level,
-  // and always set remote_target_branch to the resolved main branch.
+  // INVARIANT: Entire chain terminal → fall back to main and repoint the target
+  // to a single { kind: 'branch' } pointing at the resolved main branch.
   test('falls back to main when all ancestors are terminal', async () => {
-    const grandparent = { id: 'gp-id-12345678', status: 'closed', code: 'gp', parent_task_id: null };
-    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', parent_task_id: grandparent.id };
+    const grandparent = { id: 'gp-id-12345678', status: 'abandoned', code: 'gp', target: branchT('main') };
+    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', target: taskT(grandparent.id) };
     taskStore.set(grandparent.id, grandparent);
     taskStore.set(parent.id, parent);
-    mockCurrentBranch = 'main';
+    mockRemoteDefaultBranch = 'main';
 
-    const task = { id: 'child-id-1234', parent_task_id: parent.id, metadata: {} };
+    const task = { id: 'child-id-1234', target: taskT(parent.id), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     expect(result.branch).toBe('main');
     expect(result.warnings.length).toBe(1);
     expect(result.warnings[0]).toContain('is complete');
     expect(result.warnings[0]).toContain('main');
-    expect(parentUpdates).toEqual([{ taskId: 'child-id-1234', parentId: null }]);
-    // Always sets remote_target_branch when falling back to top-level
-    expect(metadataUpdates).toEqual([{ taskId: 'child-id-1234', key: 'remote_target_branch', value: 'main' }]);
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'branch' as const, branch: 'main' } }]);
   });
 
   // INVARIANT: Missing parent (deleted from storage) → fall back to main
   test('falls back to main when parent is not found in storage', async () => {
-    const task = { id: 'child-id-1234', parent_task_id: 'missing-parent', metadata: {} };
-    mockCurrentBranch = 'main';
+    const task = { id: 'child-id-1234', target: taskT('missing-parent'), metadata: {} };
+    mockRemoteDefaultBranch = 'main';
 
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     expect(result.branch).toBe('main');
     expect(result.warnings.length).toBe(1);
-    expect(parentUpdates).toEqual([{ taskId: 'child-id-1234', parentId: null }]);
-    expect(metadataUpdates).toEqual([{ taskId: 'child-id-1234', key: 'remote_target_branch', value: 'main' }]);
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'branch' as const, branch: 'main' } }]);
   });
 
-  // INVARIANT: Closed parent → same behavior as complete parent
-  test('treats closed parent same as complete parent', async () => {
-    const parent = { id: 'parent-id-1234', status: 'closed', code: 'closed-parent', parent_task_id: null };
+  // INVARIANT: Abandoned parent → same behavior as complete parent
+  test('treats abandoned parent same as complete parent', async () => {
+    const parent = { id: 'parent-id-1234', status: 'abandoned', code: 'abandoned-parent', target: branchT('main') };
     taskStore.set(parent.id, parent);
-    mockCurrentBranch = 'main';
+    mockRemoteDefaultBranch = 'main';
 
-    const task = { id: 'child-id-1234', parent_task_id: parent.id, metadata: {} };
+    const task = { id: 'child-id-1234', target: taskT(parent.id), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     expect(result.branch).toBe('main');
-    expect(parentUpdates).toEqual([{ taskId: 'child-id-1234', parentId: null }]);
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'branch' as const, branch: 'main' } }]);
   });
 
-  // INVARIANT: Top-level task with stale lazy/* remote_target_branch → detect and
-  // correct to actual main branch. No legitimate target branch starts with lazy/ —
-  // that prefix is reserved for task branches.
-  test('corrects stale lazy/* remote_target_branch on top-level task', async () => {
-    const task = { id: 'child-id-1234', parent_task_id: null, metadata: { remote_target_branch: 'lazy/stale-parent-branch' } };
-    mockCurrentBranch = 'main';
+  // INVARIANT: Top-level task with a stale lazy/* branch in its target → detect
+  // and correct to the actual main branch. No legitimate target branch starts
+  // with lazy/ — that prefix is reserved for task branches, and a lazy/ ref in
+  // the branch slot can only come from legacy data the resolver heals.
+  test('corrects stale lazy/* target branch on top-level task', async () => {
+    const task = { id: 'child-id-1234', target: branchT('lazy/stale-parent-branch'), metadata: {} };
+    mockRemoteDefaultBranch = 'main';
 
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     // Should fall back to getCurrentBranch, not use the stale lazy/* branch
     expect(result.branch).toBe('main');
-    // Should overwrite the stale metadata
-    expect(metadataUpdates).toEqual([{ taskId: 'child-id-1234', key: 'remote_target_branch', value: 'main' }]);
+    // Should overwrite the stale target with a canonical branch target
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'branch' as const, branch: 'main' } }]);
     // Should warn about the correction
     expect(result.warnings.length).toBe(1);
-    expect(result.warnings[0]).toContain('Corrected stale remote_target_branch');
+    expect(result.warnings[0]).toContain('Corrected stale target branch');
     expect(result.warnings[0]).toContain('lazy/stale-parent-branch');
-    // Should NOT reparent (already top-level)
-    expect(parentUpdates).toEqual([]);
   });
 
-  // INVARIANT: Top-level task with legitimate non-lazy remote_target_branch → use as-is
-  test('preserves legitimate remote_target_branch on top-level task', async () => {
-    const task = { id: 'child-id-1234', parent_task_id: null, metadata: { remote_target_branch: 'develop' } };
+  // INVARIANT: Top-level task with a legitimate non-lazy target branch → use as-is
+  test('preserves legitimate target branch on top-level task', async () => {
+    const task = { id: 'child-id-1234', target: branchT('develop'), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
     expect(result.branch).toBe('develop');
     expect(result.warnings).toEqual([]);
-    // Should NOT overwrite metadata
-    expect(metadataUpdates).toEqual([]);
-    expect(parentUpdates).toEqual([]);
+    // Should NOT rewrite the target
+    expect(targetUpdates).toEqual([]);
   });
 
-  // INVARIANT: Stale remote_target_branch is IGNORED when falling back to top-level.
-  // remote_target_branch was set relative to the now-dead parent chain — using it
-  // would sync against a stale branch forever.
-  test('ignores stale remote_target_branch when all ancestors are terminal', async () => {
-    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', parent_task_id: null };
-    taskStore.set(parent.id, parent);
-    mockCurrentBranch = 'main';
+  // INVARIANT (fix-target-adoption): when the heal path fires, the resolver
+  // reads the repo's configured default branch — NEVER the user's currently
+  // checked-out branch. Adopting `getCurrentBranch()` was the root of the
+  // silent-target-adoption bug: syncing a task while accidentally checked
+  // out on `lazy/release-v015` heal-pathed the task onto that branch and
+  // later opened a PR against a dead base.
+  test('heal path resolves to repo default, NOT current branch', async () => {
+    mockRemoteDefaultBranch = 'main';
+    // If the resolver ever calls getCurrentBranch, it'll get a sentinel that
+    // the assertion below rejects — defense in depth against the regression
+    // returning silently.
+    mockCurrentBranchSentinel = 'lazy/release-v015';
 
-    const task = { id: 'child-id-1234', parent_task_id: parent.id, metadata: { remote_target_branch: 'lazy/stale-parent-branch' } };
+    // Top-level with empty-sentinel target (a fresh top-level task before
+    // start, or any task whose target was never explicitly set).
+    const task = { id: 'child-id-1234', target: branchT(''), metadata: {} };
     const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
 
-    // Should use getCurrentBranch ('main'), NOT the stale 'lazy/stale-parent-branch'
     expect(result.branch).toBe('main');
-    // Should overwrite the stale remote_target_branch metadata
-    expect(metadataUpdates).toEqual([{ taskId: 'child-id-1234', key: 'remote_target_branch', value: 'main' }]);
+    expect(result.branch).not.toBe('lazy/release-v015');
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

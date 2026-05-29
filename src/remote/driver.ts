@@ -89,6 +89,14 @@ export interface MergeOptions {
   taskShortId: string;
   /** Repository root path */
   root: string;
+  /**
+   * Optional synthesized faithful summary of what the work actually became.
+   * Used by the LocalDriver as the squash commit body (commit/PR fidelity).
+   * Hosted drivers ignore it — they read the (already-updated) PR/MR body live
+   * at merge time. When absent, the local squash falls back to the
+   * deterministic goal + commit-subjects message.
+   */
+  fidelityBody?: string;
 }
 
 /**
@@ -306,6 +314,25 @@ export interface RepositoryDriver {
 
   /** Publish a turn summary so external reviewers can follow progress. */
   postTurnSummary(task: Task, content: string): Promise<void>;
+
+  /**
+   * Update the lazy-owned, delimited section of the PR/MR body with a
+   * synthesized summary reflecting what the work actually became (pivots,
+   * human-feedback rounds, child contributions).
+   *
+   * Updates ONLY the text between the lazy delimiters — human-authored edits to
+   * the rest of the description are preserved. If the delimiters are absent, a
+   * fresh delimited section is appended (never clobbering human text).
+   *
+   * This is a remote *write*: it uses the fail-hard retry policy and THROWS on
+   * remote failure (no silent fallback). Callers that treat body regeneration
+   * as an enhancement (accept, sync) wrap this in try/catch so a write failure
+   * never blocks the merge or push — distinct from synthesis failure, which is
+   * handled upstream in src/synthesis/fidelity.ts.
+   *
+   * No-op for the local driver (no remote body to update).
+   */
+  updateRemoteBody(task: Task, summary: string): Promise<void>;
 
   /**
    * Post an approving review on the task's PR/MR with the given reason.

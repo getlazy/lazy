@@ -22,14 +22,16 @@ import { existsSync } from 'fs';
 import { loadConfig } from '../config/loader';
 import { createStorage, type Storage, type StorageBackend } from '../storage';
 import type { Task, SearchResult } from '../storage';
+import type { TaskTarget } from '../types';
+import { parentTaskIdOf, targetBranchOf } from '../task-target';
 import { buildTaskTree } from '../cli/commands/list';
 import { loadTaskShowData } from '../cli/commands/show';
 import { isStructuredQuery, structuredSearch } from '../search';
-import { getDiffStat, getDiffFull, getCurrentBranch, branchExists, recoverMissingWorktreeWithFetch } from '../git/operations';
+import { getDiffStat, getDiffFull, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { getNewNotesSince } from '../cli/commands/shared';
 import { getWorktreePath, getBranchNameFromId, displayId, formatDate } from '../cli/helpers';
 import { launchTask, writeDaemonMcpConfig, type StartTaskParams } from './task-launcher';
-import { launchUnblockTask, launchAskTask, rejectTask, closeTask, stopTask, acceptTaskPreflight, acceptTask, syncTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type StopTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
+import { launchUnblockTask, launchAskTask, rejectTask, closeTask, stopTask, acceptTaskPreflight, acceptTask, syncTask, reparentTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type StopTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type SyncTaskParams, type ReparentTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
 import type { Comment } from '../types';
 import { logger } from '../utils/logger';
 
@@ -152,6 +154,7 @@ export async function handleRpc(
     case 'submitTask': return handleSubmitTask(projectRoot, params);
     case 'resumeTask': return handleResumeTask(projectRoot, params);
     case 'syncTask': return handleSyncTask(projectRoot, params);
+    case 'reparentTask': return handleReparentTask(projectRoot, params);
     case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
     case 'storage': return handleStorageCall(projectRoot, params);
     default: throw new RpcError(404, `Unknown RPC command: ${command}`);
@@ -163,7 +166,7 @@ export async function handleRpc(
 function collectDescendants(taskId: string, allTasks: Task[]): Set<string> {
   const descendants = new Set<string>();
   descendants.add(taskId);
-  const children = allTasks.filter(t => t.parent_task_id === taskId);
+  const children = allTasks.filter(t => parentTaskIdOf(t) === taskId);
   for (const child of children) {
     for (const id of collectDescendants(child.id, allTasks)) {
       descendants.add(id);
@@ -241,6 +244,7 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     turns: data.turns,
     commits: data.commits,
     comments: data.comments,
+    statusHistory: data.statusHistory,
     children: data.children,
     childSessions: Object.fromEntries(data.childSessions.entries()),
     proposals: data.proposals,
@@ -358,9 +362,16 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
   let fromRef: string;
   let useTwoDotDiff = false;
 
-  const parentBranch = task.parent_task_id
-    ? await getBranchNameFromId(task.parent_task_id, storage)
-    : await getCurrentBranch(projectRoot);
+  const parentId = parentTaskIdOf(task);
+  // Top-level task: derive the diff base from the task's own integration
+  // target — NOT from whatever branch the user currently has checked out.
+  // Adopting the current branch here would compute diff stats against an
+  // unrelated tip and silently mis-report what the task changed. Fall back
+  // to the repo default only when the task target is the unresolved sentinel.
+  const diffConfig = await loadConfig(projectRoot);
+  const parentBranch = parentId
+    ? await getBranchNameFromId(parentId, storage)
+    : (targetBranchOf(task) ?? await getRemoteDefaultBranch(projectRoot, diffConfig.remote.git_remote));
 
   if (await branchExists(parentBranch, worktreePath)) {
     fromRef = parentBranch;
@@ -710,6 +721,24 @@ export async function handleSyncTask(projectRoot: string, params: Record<string,
   return syncTask(projectRoot, syncParams);
 }
 
+// --- Reparent Task ---
+
+export async function handleReparentTask(projectRoot: string, params: Record<string, unknown>) {
+  const reparentParams: ReparentTaskParams = {
+    taskId: params.taskId as string,
+    parent: params.parent as string,
+  };
+
+  if (!reparentParams.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (!reparentParams.parent) {
+    throw new RpcError(400, 'parent is required');
+  }
+
+  return reparentTask(projectRoot, reparentParams);
+}
+
 // --- Get Daemon MCP Config ---
 
 export async function handleGetDaemonMcpConfig(projectRoot: string, params: Record<string, unknown>) {
@@ -765,7 +794,7 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   updateTaskStatus: (s, a) => s.updateTaskStatus(a.taskId as string, a.status as any, a.actor as any),
   updateTaskGoal: (s, a) => s.updateTaskGoal(a.taskId as string, a.goal as string),
   updateTaskCode: (s, a) => s.updateTaskCode(a.taskId as string, a.code as string | null),
-  updateTaskParent: (s, a) => s.updateTaskParent(a.taskId as string, a.parentTaskId as string | null),
+  updateTaskTarget: (s, a) => s.updateTaskTarget(a.taskId as string, a.target as TaskTarget),
   updateTaskBranchedFromSha: (s, a) => s.updateTaskBranchedFromSha(a.taskId as string, a.sha as string),
   updateTaskModel: (s, a) => s.updateTaskModel(a.taskId as string, a.model as string),
   updateTaskType: (s, a) => s.updateTaskType(a.taskId as string, a.type as string),

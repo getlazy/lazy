@@ -8,6 +8,7 @@ import { loadConfig } from '../../config/loader';
 
 import { getDataDir } from '../init';
 import { getActor } from '../../constants';
+import { parentTaskIdOf } from '../../task-target';
 
 async function promptForReason(taskShortId: string, goal?: string): Promise<{ reason: string; recoveryPath: string | null }> {
   const headerLines = [
@@ -108,7 +109,7 @@ export async function commandReopen(args: string[]): Promise<void> {
     const sess = await storage.getSessionByTaskId(task.id);
 
     // Check for orphaned child (parent accepted, branch gone) and retarget before recreating worktree
-    if (task.parent_task_id) {
+    if (parentTaskIdOf(task)) {
       const orphanStatus = await checkOrphanedChild(task, storage, root);
       if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
         console.log(`\nParent task was accepted and its branch deleted.`);
@@ -132,11 +133,12 @@ export async function commandReopen(args: string[]): Promise<void> {
     if (sess) {
       // Determine start SHA: for child tasks, use parent's current HEAD; otherwise use main
       let startSha: string | undefined;
-      if (task.parent_task_id) {
+      const parentId = parentTaskIdOf(task);
+      if (parentId) {
         // Child task: must branch from parent's current HEAD
-        const parentTask = await storage.getTask(task.parent_task_id);
+        const parentTask = await storage.getTask(parentId);
         if (!parentTask) {
-          console.error(`Parent task not found: ${task.parent_task_id}`);
+          console.error(`Parent task not found: ${parentId}`);
           process.exit(1);
         }
 

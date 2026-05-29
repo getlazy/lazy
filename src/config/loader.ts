@@ -42,7 +42,7 @@ async function findConfigDir(lazyRoot: string, startDir?: string): Promise<strin
 // Default configuration values
 export const DEFAULT_CONFIG: ResolvedConfig = {
   models: {
-    default: 'claude-sonnet-4-5-20250929',
+    default: 'claude-opus-4-8',
   },
   session: {
     verbose: false,
@@ -362,9 +362,9 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
 [models]
-# Default model for sessions — use raw model IDs (e.g., "claude-sonnet-4-5-20250929",
-# "claude-opus-4-7", "qwen3.5:35b-a3b-coding-nvfp4")
-default = "claude-sonnet-4-5-20250929"
+# Default model for sessions — use raw model IDs (e.g., "claude-opus-4-8",
+# "claude-sonnet-4-6", "qwen3.5:35b-a3b-coding-nvfp4")
+default = "claude-opus-4-8"
 
 [session]
 # Show Docker output in real-time during session execution

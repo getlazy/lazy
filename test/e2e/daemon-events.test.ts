@@ -496,7 +496,7 @@ describe('daemon event routing', () => {
 
       // Set up parent-child relationship and child status
       // Must transition through valid states: backlog → working → blocked
-      await storage.updateTaskParent(childTask.id, parentTask.id);
+      await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
       await storage.updateTaskStatus(childTask.id, 'working', 'system');
       await storage.updateTaskStatus(childTask.id, 'blocked', 'system');
 
@@ -575,7 +575,7 @@ describe('daemon event routing', () => {
         const parentTask = allTasks.find(t => t.id.startsWith(parentShortId))!;
         const childTask = allTasks.find(t => t.id.startsWith(childShortId))!;
 
-        await storage.updateTaskParent(childTask.id, parentTask.id);
+        await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         const result = await isParentBranchAhead(storage, childTask, ctx.root);
         expect(result.ahead).toBe(false);

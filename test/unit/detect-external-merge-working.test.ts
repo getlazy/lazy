@@ -14,8 +14,11 @@
  * non-terminal tasks are now checked for external state changes.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
+import { parentTaskIdOf } from '../../src/task-target';
+import type { TaskTarget } from '../../src/types';
 
 // --- Track storage mutations ---
 let statusUpdates: Array<{ taskId: string; status: string }> = [];
@@ -50,17 +53,18 @@ const mockStorage = {
     commentsCreated.push({ taskId, content });
   },
   closeTask: async () => {},
-  updateTaskParent: async (taskId: string, parentId: string | null) => {
-    parentUpdates.push({ taskId, parentId });
+  updateTaskTarget: async (taskId: string, target: TaskTarget) => {
+    parentUpdates.push({ taskId, parentId: target.kind === 'task' ? target.parentTaskId : null });
   },
   getActiveChildren: async (taskId: string) => mockChildren.get(taskId) ?? [],
   close: async () => {},
 };
 
 // Mock config loader
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin' },
+    models: { default: 'claude-opus-4-7' },
   }),
   DEFAULT_CONFIG: {},
   getDefaultConfigTemplate: () => '',
@@ -88,62 +92,62 @@ const mockDriver = {
   postTurnSummary: async () => {},
 };
 
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   createDriver: () => mockDriver,
   detectRemote: () => null,
 }));
 
 // Mock orphan module — track reparent calls
-mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   reparentChildren: async (task: any, _storage: any) => {
     const children = mockChildren.get(task.id) ?? [];
     for (const child of children) {
-      parentUpdates.push({ taskId: child.id, parentId: task.parent_task_id });
+      parentUpdates.push({ taskId: child.id, parentId: parentTaskIdOf(task) });
     }
     return children;
   },
 }));
 
 // Mock shared module (cleanup functions)
-mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
   syncTaskFromRemote: async () => {},
   cleanupWorktreeAndBranch: async () => {},
   cleanupTaskContainer: async () => {},
 }));
 
 // Mock git operations
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   localBranchExists: async () => false,
 }));
 
 // Mock logger
-mock.module(resolve(import.meta.dir, '../../src/utils/logger.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/logger.ts'), () => ({
   logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
 }));
 
 // Mock lock/protocol
-mock.module(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: async () => {},
 }));
-mock.module(resolve(import.meta.dir, '../../src/protocol.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/protocol.ts'), () => ({
   protocolDir: () => '/tmp/protocol',
   removeProtocolDir: () => {},
 }));
 
 // Mock constants
-mock.module(resolve(import.meta.dir, '../../src/constants.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/constants.ts'), () => ({
   getActor: () => 'test',
 }));
 
 // Mock signals
-mock.module(resolve(import.meta.dir, '../../src/daemon/signals.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/daemon/signals.ts'), () => ({
   emitSignal: () => {},
 }));
 
 // Mock helpers — import real functions to avoid breaking other tests when run together
 // (bun's mock.module replaces the entire module, so we must re-export everything)
 import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/cli/helpers';
-mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   getWorktreePath: () => '/tmp/worktree',
@@ -152,7 +156,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
 }));
 
 // Mock theme
-mock.module(resolve(import.meta.dir, '../../src/cli/theme.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/theme.ts'), () => ({
   theme: {
     taskId: (s: string) => s,
     success: (s: string) => s,
@@ -195,7 +199,7 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
       id: 'working-task-1234',
       code: 'release-v011',
       status: 'working',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '42' },
     };
     mockTasks.push(task);
@@ -229,7 +233,7 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
       id: 'interrupted-task-1',
       code: 'crashed-task',
       status: 'interrupted',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '43' },
     };
     mockTasks.push(task);
@@ -259,14 +263,14 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
       id: 'parent-working-id',
       code: 'release-v011',
       status: 'working',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '44' },
     };
     const child = {
       id: 'child-task-id-1',
       code: 'release-v012',
       status: 'backlog',
-      parent_task_id: parent.id,
+      target: { kind: 'task' as const, parentTaskId: parent.id },
     };
     mockTasks.push(parent);
     mockPRStates.set(parent.id, 'MERGED');
@@ -300,7 +304,7 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
     const completedTask = {
       id: 'completed-task-id',
       status: 'complete',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '99' },
     };
     mockTasks.push(completedTask);
@@ -318,7 +322,7 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
     const backlogTask = {
       id: 'backlog-task-id',
       status: 'backlog',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '100' },
     };
     mockTasks.push(backlogTask);
@@ -337,7 +341,7 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
     const pairingTask = {
       id: 'pairing-task-id',
       status: 'pairing',
-      parent_task_id: null,
+      target: { kind: 'branch' as const, branch: 'main' },
       metadata: { gitlab_mr_iid: '101' },
     };
     mockTasks.push(pairingTask);
@@ -356,4 +360,8 @@ describe('detectExternalChanges handles working/interrupted tasks', () => {
     // Pairing task should NOT be transitioned — human is driving
     expect(statusUpdates).toEqual([]);
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

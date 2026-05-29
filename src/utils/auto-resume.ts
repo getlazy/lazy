@@ -21,7 +21,8 @@ import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
 import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
-import { getCurrentBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
+import { getRemoteDefaultBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
+import { parentTaskIdOf } from '../task-target';
 import { writeDaemonMcpConfig } from '../daemon/task-launcher';
 import { hasDaemonContext } from '../daemon/context';
 
@@ -155,7 +156,7 @@ export async function autoResumeTask(
     const sandboxPath = sandbox.sandboxPath;
 
     // When Ollama is enabled for Claude Code, always use the Ollama model — task model
-    // names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
+    // names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (task.model ?? config.models.default);
@@ -214,10 +215,15 @@ export async function autoResumeTask(
       logger.debug(`Auto-resume ${taskShortId}: worktree is dirty, skipping upstream merge`);
     } else {
       try {
-        if (task.parent_task_id) {
-          parentBranch = await getBranchNameFromId(task.parent_task_id, storage);
+        const arParentId = parentTaskIdOf(task);
+        if (arParentId) {
+          parentBranch = await getBranchNameFromId(arParentId, storage);
         } else {
-          parentBranch = await getTaskTargetBranch(task, lazyRoot) ?? await getCurrentBranch(lazyRoot);
+          // Top-level task: prefer the task's stored integration target; fall
+          // back to the repo's configured default branch — NEVER to whatever
+          // branch the user currently has checked out. Auto-resume runs from
+          // the daemon, possibly while the user is on an unrelated branch.
+          parentBranch = await getTaskTargetBranch(task, lazyRoot) ?? await getRemoteDefaultBranch(lazyRoot, config.remote.git_remote);
         }
         syncBeforeWork = true;
       } catch (err) {

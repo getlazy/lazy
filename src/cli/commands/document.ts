@@ -6,6 +6,7 @@ import { loadConfig } from '../../config/loader';
 
 
 import documentConstraints from '../../prompts/document-constraints.md' with { type: 'text' };
+import { parentTaskIdOf } from '../../task-target';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -168,8 +169,9 @@ export async function commandDocument(args: string[]): Promise<void> {
     if (t.code) {
       console.log(`  Code:   ${t.code}`);
     }
-    if (t.parent_task_id) {
-      console.log(`  Parent: ${await displayIdFor(storage, t.parent_task_id)}`);
+    const parentId = parentTaskIdOf(t);
+    if (parentId) {
+      console.log(`  Parent: ${await displayIdFor(storage, parentId)}`);
     }
     console.log(`  Docs:   ${docsPath}/`);
 
@@ -199,7 +201,7 @@ in markdown with mermaid diagrams. It does NOT modify code files.
 Options:
   --goal <goal>      Documentation goal (what to document)
   --prompt <text>    Additional instructions for the documentation agent
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
   --code <code>      Human-readable code (e.g. "doc-storage", "doc-architecture")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

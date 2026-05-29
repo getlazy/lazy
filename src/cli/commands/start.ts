@@ -18,6 +18,7 @@ import { queryStartTask } from '../../daemon/rpc-fallback';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
+import { parentTaskIdOf } from '../../task-target';
 import { formatMarkdown } from '../../utils/markdown';
 
 
@@ -93,10 +94,11 @@ export async function commandStart(args: string[]): Promise<void> {
       }
 
       // Check for orphaned child (parent accepted, branch gone) and prompt for retarget
-      if (t.parent_task_id) {
-        const parentTask = await storage.getTask(t.parent_task_id);
+      const parentId = parentTaskIdOf(t);
+      if (parentId) {
+        const parentTask = await storage.getTask(parentId);
         if (!parentTask) {
-          console.error(`Parent task not found: ${t.parent_task_id}`);
+          console.error(`Parent task not found: ${parentId}`);
           process.exit(1);
         }
 
@@ -133,7 +135,7 @@ export async function commandStart(args: string[]): Promise<void> {
       }
 
       // Warn if task has no parent and there are active tasks on other branches
-      if (!t.parent_task_id) {
+      if (!parentId) {
         const allTasks = await storage.listTasks();
         const activeTasks = allTasks.filter(task => {
           const status = task.status;
@@ -248,7 +250,7 @@ Arguments:
   <task_id>          ID of the task to start (short hex prefix or task code)
 
 Options:
-  --model <model>    Override model for this session (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-4-8)
   --agent <agent_id> Agent to use for this task (default: from task or lazy.toml)
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
                      Persists on the task so resumes use the same value.
@@ -261,7 +263,7 @@ Model Selection:
   1. --model flag (session override)
   2. Task's model setting (if set during task creation)
   3. lazy.toml default model
-  4. Built-in default (claude-sonnet-4-5-20250929)
+  4. Built-in default (claude-opus-4-8)
 
 Notes:
   - Each task can only have one session (1:1 relationship)

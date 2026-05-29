@@ -103,15 +103,17 @@ export class DockerRunner implements Runner {
 
   checkAvailability(): void {
     checkDocker(this.binary);
+    // Auth is NOT enforced here. The daemon credential gate
+    // (src/daemon/credential-gate.ts) is the single enforcement point — every
+    // path that launches containers goes through a daemon that refuses to start
+    // without a credential, so a redundant client-side check here would just
+    // duplicate (and risk diverging from) that gate.
     if (this._ollamaConfig?.enabled) {
-      // When Ollama is configured, auth is always available (dummy tokens).
       // Log a warning if Ollama is unreachable (don't fail — it might come up later).
       const check = checkOllamaConnectivity(this._ollamaConfig);
       if (!check.reachable) {
         logger.warn(check.reason);
       }
-    } else {
-      getAuthEnvVars(); // Fail fast on missing auth before creating state
     }
   }
 

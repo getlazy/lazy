@@ -5,7 +5,8 @@
  * MR/PR existence, while PR comment fetching only runs when hasRemoteRef is true.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
 // Track calls to driver methods
@@ -19,7 +20,7 @@ import { DEFAULT_CONFIG as REAL_DEFAULT_CONFIG, getDefaultConfigTemplate as REAL
 
 // Mock the config loader to return a github driver config
 // Uses absolute paths to .ts files, matching the pattern in preload-mocks.ts
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: () => ({
     remote: {
       driver: 'github',
@@ -31,7 +32,7 @@ mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
 }));
 
 // Mock the remote module to return a controllable driver
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     hasRemoteRef: () => mockHasRemoteRef,
@@ -61,7 +62,7 @@ function makeTask() {
     model: 'claude-opus-4-6',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: null,
@@ -170,4 +171,8 @@ describe('runSyncWithRemote', () => {
 
     expect(result.remoteBranch).toBeUndefined();
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

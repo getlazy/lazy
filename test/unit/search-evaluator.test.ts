@@ -14,7 +14,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     status: 'working',
     created_at: new Date('2026-02-15T10:00:00Z').getTime(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     model: 'claude-opus-4-6',

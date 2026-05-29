@@ -1,10 +1,12 @@
-import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, promptLine, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import type { TaskType } from '../../types';
 import { VALID_TASK_TYPES } from '../../types';
 import { listAgents } from '../../agent/registry';
 import { loadConfig } from '../../config/loader';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
+import { parentTaskIdOf, branchTarget } from '../../task-target';
+import { runGit } from '../../utils/git';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -129,18 +131,47 @@ export async function commandCreate(args: string[]): Promise<void> {
   }
 
   const storage = await requireStorage();
+  let explicitBranchTarget: string | undefined;
   try {
-    // Resolve and validate parent if provided
+    // Resolve --parent: a task code/short-ID, or (fall-through) a raw git branch
+    // name. Same precedence as `lazy reparent` — try task first, then branch.
     if (parentValue !== undefined) {
-      const parentTask = await resolveTaskOrExit(storage, parentValue);
-      if (TERMINAL_STATUSES.includes(parentTask.status)) {
-        console.error(`Cannot use task ${displayId(parentTask)} as parent: task is ${parentTask.status}`);
+      const resolved = await storage.resolveTask(parentValue);
+      if (resolved.task) {
+        if (TERMINAL_STATUSES.includes(resolved.task.status)) {
+          console.error(`Cannot use task ${displayId(resolved.task)} as parent: task is ${resolved.task.status}`);
+          process.exit(1);
+        }
+        parentTaskId = resolved.task.id;
+      } else if (resolved.ambiguousMatches?.length) {
+        console.error(`Ambiguous parent '${parentValue}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
         process.exit(1);
+      } else {
+        // Not a task — try as a raw branch name. Verify it resolves locally so
+        // we don't store a typo as the integration target.
+        const root = requireLazyRoot();
+        const verify = await runGit(['rev-parse', '--verify', '--quiet', parentValue], { cwd: root });
+        if (verify.exitCode !== 0) {
+          console.error(`--parent '${parentValue}' is neither a known task nor a local git branch.`);
+          process.exit(1);
+        }
+        if (parentValue.startsWith('lazy/')) {
+          console.error(`--parent must be an integration branch, not a lazy task branch ('${parentValue}').`);
+          process.exit(1);
+        }
+        explicitBranchTarget = parentValue;
       }
-      parentTaskId = parentTask.id;
     }
 
     const t = await storage.createTask(goal, parentTaskId, undefined, code, taskType ?? undefined, agentId);
+
+    // Persist the explicit branch target right after creation. The task is
+    // now on disk with the empty-sentinel default; we overwrite to the user's
+    // explicit choice before any further work.
+    if (explicitBranchTarget) {
+      await storage.updateTaskTarget(t.id, branchTarget(explicitBranchTarget));
+      t.target = branchTarget(explicitBranchTarget);
+    }
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);
@@ -148,8 +179,11 @@ export async function commandCreate(args: string[]): Promise<void> {
     if (t.code) {
       console.log(`  Code:   ${t.code}`);
     }
-    if (t.parent_task_id) {
-      console.log(`  Parent: ${await displayIdFor(storage, t.parent_task_id)}`);
+    const parentId = parentTaskIdOf(t);
+    if (parentId) {
+      console.log(`  Parent: ${await displayIdFor(storage, parentId)}`);
+    } else if (explicitBranchTarget) {
+      console.log(`  Target: branch ${explicitBranchTarget}`);
     }
     if (t.type !== 'task') {
       console.log(`  Type:   ${t.type}`);
@@ -192,13 +226,18 @@ Create a new task. Interactive if no flags provided.
 Options:
   --goal <goal>      Task goal
   --prompt <text>    Task prompt/specification
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Default: task
   --code <code>      Human-readable code (e.g. "fix-models", "add-auth")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
-  --parent <task_id> Parent task ID (creates a child task)
-                     Parent must exist and not be in a terminal state
+  --parent <ref>     Parent: a task code/short-ID (creates a child task) or a
+                     raw branch name (top-level task targeting that branch).
+                     Parent task must not be in a terminal state.
+                     Without --parent, the task targets the repo's default
+                     integration branch (origin/HEAD → main fallback). The
+                     branch the user currently has checked out is NEVER
+                     adopted silently — pass it explicitly if you want it.
   --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
   --effort <level>   Claude Code reasoning effort for this task (low, medium, high, xhigh, max)
                      Persists across resumes. Default: from lazy.toml [agent].effort (medium)

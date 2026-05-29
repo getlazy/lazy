@@ -71,6 +71,7 @@ function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
     syncComments: async () => [],
     getPRState: async () => null,
     postTurnSummary: async () => {},
+    updateRemoteBody: async () => {},
     postAcceptReview: async () => null,
     postRejectReview: async () => null,
     cleanup: async () => {},

@@ -50,6 +50,18 @@ function setTaskStatus(root: string, fullTaskId: string, status: string): void {
 }
 
 /**
+ * Create the authoritative accept tag the zombie sweep gates on.
+ * Mirrors what `lazy accept` does during the merge step (annotated tag,
+ * `lazy-accept-<full-task-id>`, pointing at the merge/FF commit).
+ */
+function createAcceptTag(ctx: TestContext, fullTaskId: string, commitish: string = 'main'): void {
+  const r = ctx.git('tag', '-a', '-f', '-m', `Accepted task ${fullTaskId}`, `lazy-accept-${fullTaskId}`, commitish);
+  if (r.exitCode !== 0) {
+    throw new Error(`Failed to create accept tag: ${r.stderr}`);
+  }
+}
+
+/**
  * Run reconciliation directly (simulates what the daemon does).
  * Tests can't rely on CLI commands triggering reconciliation — only the daemon does that.
  */
@@ -369,7 +381,10 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     await ctx.cleanup();
   });
 
-  test('task whose branch was merged into main is detected and fixed', async () => {
+  // REGRESSION: squash accept path. A task whose work was squash-merged into the target
+  // and tagged with `lazy-accept-<id>`, but whose status update crashed before reaching
+  // `complete`, IS recovered by the sweep.
+  test('accepted (tagged) task whose status crashed is recovered — squash path', async () => {
     // 1. Create and start a task with commits
     const taskId = await createTask(ctx, 'Zombie branch test', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
@@ -386,12 +401,13 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     const taskBefore = JSON.parse(readFileSync(taskPath, 'utf-8'));
     expect(taskBefore.status).toBe('blocked');
 
-    // 4. Manually squash-merge the task branch into main (simulating what accept does)
-    //    but WITHOUT updating session/task metadata (simulating crash after merge)
+    // 4. Simulate accept that crashed after merge: squash-merge into main AND create the
+    //    authoritative accept tag, but WITHOUT updating session/task metadata.
     const branchName = `lazy/${taskId}`;
     ctx.git('checkout', 'main');
     ctx.git('merge', '--squash', branchName);
     ctx.git('commit', '-m', `Accept task ${taskId}: Zombie branch test`);
+    createAcceptTag(ctx, fullTaskId, 'main');
     ctx.git('checkout', branchName);
 
     // 5. Trigger reconciliation — sweep should detect and fix the zombie
@@ -402,38 +418,67 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     expectOutput(showAfter, 'complete');
   });
 
-  test('task whose branch was deleted after merge is detected via commit message', async () => {
-    // 1. Create and start a task with commits
-    const taskId = await createTask(ctx, 'Deleted branch zombie', 'Do work');
+  // REGRESSION: fast-forward accept path. The remote FF path moves the target ref and
+  // produces no "Accept task <id>" commit message, but DOES create the accept tag. The
+  // sweep must recover from the tag alone, independent of how the commit was produced.
+  test('accepted (tagged) task whose status crashed is recovered — fast-forward path', async () => {
+    const taskId = await createTask(ctx, 'FF zombie test', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
-    // 2. Reconcile to move to blocked
     await runReconcile(ctx.root);
-
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     const branchName = `lazy/${taskId}`;
 
-    // 3. Squash-merge into main, then delete the branch (simulating partial cleanup)
+    // Simulate a FF accept: fast-forward main to the branch tip (no squash/merge commit),
+    // tag the FF commit, then delete the branch (cleanup ran after merge).
     ctx.git('checkout', 'main');
-    ctx.git('merge', '--squash', branchName);
-    ctx.git('commit', '-m', `Accept task ${taskId}: Deleted branch zombie`);
+    ctx.git('merge', '--ff-only', branchName);
+    createAcceptTag(ctx, fullTaskId, 'main');
 
-    // Remove worktree first (required before deleting branch)
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     if (existsSync(worktreePath)) {
       ctx.git('worktree', 'remove', worktreePath, '--force');
     }
     ctx.git('branch', '-D', branchName);
 
-    // 4. Trigger reconciliation (simulates daemon)
     await runReconcile(ctx.root);
 
-    // 5. Verify task is now complete
     const showAfter = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfter);
     expectOutput(showAfter, 'complete');
+  });
+
+  // INVARIANT: a crash-looping task whose branch is tree-equal to the target but was NEVER
+  // accepted (no `lazy-accept-<id>` tag) MUST NOT be swept to complete. The old sweep used
+  // a branch-relative tree-equality check (isBranchMergedInto) / commit-message grep, which
+  // silently completed crash-looping tasks that merely happened to match the target. The
+  // accept tag is now the authoritative — and only — completion signal.
+  test('tree-equal but never-accepted (no tag) task is NOT swept to complete', async () => {
+    const taskId = await createTask(ctx, 'No-tag tree-equal zombie', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    await runReconcile(ctx.root);
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    setTaskStatus(ctx.root, fullTaskId, 'interrupted');
+
+    // Make the branch tree-equal to main (work merged) but DO NOT create the accept tag —
+    // this is exactly the ambiguous signal that previously caused false positives.
+    const branchName = `lazy/${taskId}`;
+    ctx.git('checkout', 'main');
+    ctx.git('merge', '--squash', branchName);
+    ctx.git('commit', '-m', `Accept task ${taskId}: No-tag tree-equal zombie`);
+    ctx.git('checkout', branchName);
+
+    await runReconcile(ctx.root);
+
+    // Must stay interrupted — never accepted, so never auto-completed.
+    const showAfter = await ctx.lazy(['show', taskId]);
+    expectSuccess(showAfter);
+    expectOutput(showAfter, 'interrupted');
   });
 
   test('normal blocked task with unmerged branch is not affected', async () => {
@@ -456,8 +501,9 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
 
   // INVARIANT: Tasks with no agent work must never be auto-accepted by the zombie sweep.
   // If the agent never ran (zero agent turns), there's nothing to accept — the task's
-  // intent would be lost. This is defense-in-depth against false positives in isBranchMergedInto.
-  test('task with zero agent turns is not auto-accepted even if branch looks merged', async () => {
+  // intent would be lost. This is the defense-in-depth `hasAgentWork` guard that runs
+  // even when an accept tag is present, so this test creates the tag to exercise it.
+  test('task with zero agent turns is not auto-accepted even if accept tag is present', async () => {
     // 1. Create and start a task (mock agent writes a response that creates an agent turn)
     const taskId = await createTask(ctx, 'No-agent zombie test', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
@@ -486,14 +532,16 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     session.ended_at = null;
     writeFileSync(sessionPath, JSON.stringify(session, null, 2));
 
-    // 5. Squash-merge the branch into main (making it look like a zombie)
+    // 5. Squash-merge the branch into main AND create the accept tag (making it look like
+    //    a fully accepted zombie) — only the missing agent turns should stop completion.
     const branchName = `lazy/${taskId}`;
     ctx.git('checkout', 'main');
     ctx.git('merge', '--squash', branchName);
     ctx.git('commit', '-m', `Accept task ${taskId}: No-agent zombie test`);
+    createAcceptTag(ctx, fullTaskId, 'main');
     ctx.git('checkout', branchName);
 
-    // 6. Trigger reconciliation — the sweep should skip this task
+    // 6. Trigger reconciliation — the sweep should skip this task on the hasAgentWork guard
     await runReconcile(ctx.root);
 
     // 7. Verify task is still blocked (NOT auto-accepted to complete)
@@ -502,10 +550,10 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     expectOutput(showAfter, 'blocked');
   });
 
-  // INVARIANT: Branches with only empty commits (no file changes) are not "merged".
-  // The --allow-empty init commit created by `lazy start` should not trigger zombie detection.
-  // This tests both the isBranchMergedInto guard AND the zero-agent-turns guard.
-  test('task with only empty init commit is not auto-accepted', async () => {
+  // INVARIANT: A never-accepted task (no `lazy-accept-<id>` tag) with only the --allow-empty
+  // init commit created by `lazy start` must never be swept to complete. With no accept tag
+  // there is nothing to recover, regardless of commit count or tree-equality.
+  test('task with only empty init commit and no accept tag is not auto-accepted', async () => {
     // 1. Create a task
     const taskId = await createTask(ctx, 'Empty commit zombie test', 'Do work');
 
@@ -563,7 +611,9 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     expectOutput(showAfter, 'blocked');
   });
 
-  test('interrupted task whose branch was merged is fixed', async () => {
+  // REGRESSION: the exact reported bug — a crash-looping `interrupted` task that WAS
+  // accepted (tag present) but whose status update crashed must be recovered to complete.
+  test('interrupted task that was accepted (tag present) is recovered', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Interrupted zombie test', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
@@ -575,11 +625,12 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     setTaskStatus(ctx.root, fullTaskId, 'interrupted');
 
-    // 3. Squash-merge into main without updating metadata
+    // 3. Squash-merge into main AND create the accept tag, without updating metadata
     const branchName = `lazy/${taskId}`;
     ctx.git('checkout', 'main');
     ctx.git('merge', '--squash', branchName);
     ctx.git('commit', '-m', `Accept task ${taskId}: Interrupted zombie test`);
+    createAcceptTag(ctx, fullTaskId, 'main');
     ctx.git('checkout', branchName);
 
     // 4. Trigger reconciliation (simulates daemon)

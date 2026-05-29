@@ -17,7 +17,8 @@
  * refactors do not re-collapse them.
  */
 
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
 // --- Controllable state for the mocks ---
@@ -36,7 +37,7 @@ import {
 } from '../../src/config/loader';
 
 // --- Mock config loader ---
-mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: {
       driver: 'github',
@@ -50,7 +51,7 @@ mock.module(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
 }));
 
 // --- Mock rpc-handlers to avoid daemon storage init ---
-mock.module(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => ({
   getOrCreateStorage: async () => createMockStorage(),
   RpcError: RealRpcError,
   initDaemonStorage: () => {},
@@ -60,7 +61,7 @@ mock.module(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), () => 
 // validateAccept returns an error string → acceptTask enters the
 // push + markReadyForReview branch. hasRemoteRef returns false initially and
 // (for the push-fails case) stays false, so we never try to merge.
-mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     needsSync: true,
@@ -85,7 +86,7 @@ mock.module(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
 }));
 
 // --- Mock git operations ---
-mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   hasUncommittedChanges: async () => false,
   applyPatch: async () => true,
   hasUpstreamChanges: async () => false,
@@ -98,7 +99,7 @@ mock.module(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
 }));
 
 // --- Mock fs helpers ---
-mock.module(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
   pathExists: async () => true,
   dirExists: async () => true,
   ensureDir: async () => {},
@@ -106,25 +107,25 @@ mock.module(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
 }));
 
 // --- Mock pairing lock ---
-mock.module(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), () => ({
   checkPairingLock: () => null,
 }));
 
 // --- Mock git utilities (validateBranchInSyncWithRemote + runGit) ---
-mock.module(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
   validateBranchInSyncWithRemote: async () => ({ inSync: true }),
   runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
 }));
 
 // --- Mock lock utilities ---
-mock.module(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   checkLock: () => null,
   acquireLock: () => {},
   removeLock: () => {},
 }));
 
 // --- Mock cli/helpers for branch name resolution ---
-mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -134,7 +135,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
 }));
 
 // --- Mock orphan helpers (not reached in our error paths, but still imported) ---
-mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -143,7 +144,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
 }));
 
 // --- Mock shared cleanup (not reached in error paths) ---
-mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
@@ -157,7 +158,7 @@ mock.module(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => 
 }));
 
 // --- Mock protocol helpers ---
-mock.module(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
   protocolDir: () => '/tmp/protocol',
   writeCommand: async () => {},
   ensureProtocolDir: () => {},
@@ -198,7 +199,7 @@ function makeTask() {
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: {},
@@ -289,4 +290,8 @@ describe('acceptTask remote-ref creation error messages', () => {
       /Failed to push branch/,
     );
   });
+});
+
+afterAll(() => {
+  restoreMockedModules();
 });

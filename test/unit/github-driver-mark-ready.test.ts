@@ -56,7 +56,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     status: 'working' as const,
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     model: null,

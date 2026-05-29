@@ -282,6 +282,7 @@ lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 - `lazy_comment(task_id="<id>", message="...")` — Add a comment to a task
 - `lazy_clone(task_id="<id>")` — Create a variant (fork) of a task
 - `lazy_redo(task_id="<id>")` — Close a stale task and create a fresh replacement
+- `lazy_reparent(task_id="<id>", parent="<task-or-branch>")` — Repoint a task created on the wrong parent to a new parent (task code, short ID, or branch like `main`) and merge that parent into its branch. Keeps the task — same session, turns, and commits.
 - `lazy_conversations` — List past builder conversations
 - `lazy_conversation_search(query="...")` — Search conversation content
 - `lazy_conversation_read(session_id="...")` — Read a specific conversation

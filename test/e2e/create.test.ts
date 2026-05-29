@@ -118,11 +118,81 @@ describe('lazy create', () => {
     expectError(result, 'task is closed');
   });
 
+  // INVARIANT (fix-target-adoption): when the user runs `lazy create` while
+  // checked out on a non-default branch, the task target MUST NOT silently
+  // adopt that branch. Top-level tasks target the repo default (origin/HEAD
+  // → main) unless --parent is passed explicitly. Adopting the checked-out
+  // branch produced PRs against dead release bases.
+  test('does NOT adopt current branch as target when --parent is omitted', async () => {
+    // Create and check out a feature branch in the test repo
+    const branchResult = ctx.git('checkout', '-b', 'some-feature');
+    expect(branchResult.exitCode).toBe(0);
+
+    const result = await ctx.lazy(['create', '--goal', 'No-parent task']);
+    expectSuccess(result);
+    const taskId = extractTaskId(result.stdout);
+
+    // The persisted target should NOT be 'some-feature'. We read it via show.
+    const showResult = await ctx.lazy(['show', taskId]);
+    expectSuccess(showResult);
+    if (showResult.stdout.includes('some-feature')) {
+      throw new Error(`Task adopted the current branch 'some-feature' as its target — should default to repo default. show output:\n${showResult.stdout}`);
+    }
+  });
+
+  test('--parent accepts a raw branch name and persists it as target', async () => {
+    const branchResult = ctx.git('checkout', '-b', 'release-x');
+    expect(branchResult.exitCode).toBe(0);
+    // Switch back to main so the test isn't relying on current-branch behavior
+    ctx.git('checkout', 'main');
+
+    const result = await ctx.lazy(['create', '--goal', 'Explicit branch parent', '--parent', 'release-x']);
+    expectSuccess(result);
+    expectOutput(result, 'Target: branch release-x');
+  });
+
+  // INVARIANT (fix-target-adoption): the explicit `--parent <branch>` flag
+  // always wins, even when it disagrees with the currently checked-out branch.
+  // This is the user's escape hatch from the new default-branch behavior:
+  // "I really do want main, even though I'm on some-feature." Without this
+  // invariant, the explicit-vs-default story collapses: the user couldn't
+  // override the default in either direction.
+  test('--parent main wins over the currently checked-out feature branch', async () => {
+    const branchResult = ctx.git('checkout', '-b', 'some-feature');
+    expect(branchResult.exitCode).toBe(0);
+    // Do NOT switch back — we want to prove the explicit flag wins even while
+    // checked out on the "wrong" branch.
+
+    const result = await ctx.lazy(['create', '--goal', 'Explicit main', '--parent', 'main']);
+    expectSuccess(result);
+    expectOutput(result, 'Target: branch main');
+
+    const taskId = extractTaskId(result.stdout);
+    const showResult = await ctx.lazy(['show', taskId]);
+    expectSuccess(showResult);
+    // The persisted target must be 'main', NOT 'some-feature'.
+    if (showResult.stdout.includes('some-feature')) {
+      throw new Error(`Explicit --parent main was overridden by current branch 'some-feature'. show output:\n${showResult.stdout}`);
+    }
+  });
+
+  test('--parent rejects a lazy/* task ref as branch', async () => {
+    const branchResult = ctx.git('checkout', '-b', 'lazy/some-task');
+    expect(branchResult.exitCode).toBe(0);
+    ctx.git('checkout', 'main');
+
+    const result = await ctx.lazy(['create', '--goal', 'Bad parent', '--parent', 'lazy/some-task']);
+    expectFailure(result);
+    expectError(result, 'not a lazy task branch');
+  });
+
   test('rejects non-existent parent', async () => {
     const result = await ctx.lazy(['create', '--goal', 'Child task', '--parent', 'nonexist0']);
 
     expectFailure(result);
-    expectError(result, 'No task found');
+    // --parent now accepts a raw branch name too, so the error mentions both
+    // failure modes (not a task, not a branch).
+    expectError(result, 'neither a known task nor a local git branch');
   });
 
   test('creates a task with --type refactor', async () => {

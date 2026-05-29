@@ -5,6 +5,7 @@ import { runGit } from '../utils/git';
 import { withRemoteRetry } from '../utils/retry';
 import { pathExists, ensureDir, stat, copyFile, chmod } from '../utils/fs';
 import type { Task } from '../types';
+import { targetBranchOf } from '../task-target';
 
 export interface GitCommitInfo {
   sha: string;
@@ -82,16 +83,16 @@ export async function resolveDetachedHead(branch: string, cwd?: string, remoteNa
 }
 
 /**
- * Get the target branch for a task, resolving "HEAD" if present.
+ * Get the named integration branch for a top-level task, resolving "HEAD".
  *
- * Reads `remote_target_branch` from task metadata and applies `resolveDetachedHead`
- * if the value is "HEAD" (defense against legacy metadata with literal "HEAD" stored).
- *
- * Returns undefined if the task has no `remote_target_branch` metadata, allowing
- * callers to provide their own fallback (e.g., getCurrentBranch or 'main').
+ * Reads the canonical {@link TaskTarget}: returns undefined when the task is
+ * stacked on another task (kind === 'task') or when the branch slot is an
+ * unresolved sentinel, so callers can apply their own fallback (getCurrentBranch
+ * or 'main'). Applies `resolveDetachedHead` when the branch is literal "HEAD"
+ * (defense against legacy data started in a detached-HEAD repo).
  */
 export async function getTaskTargetBranch(task: Task, cwd: string, remoteName: string = 'origin'): Promise<string | undefined> {
-  const targetBranch = task.metadata?.remote_target_branch;
+  const targetBranch = targetBranchOf(task);
   if (!targetBranch) return undefined;
   return await resolveDetachedHead(targetBranch, cwd, remoteName);
 }
@@ -205,6 +206,50 @@ export async function createTag(name: string, cwd?: string): Promise<void> {
   if (result.exitCode !== 0) {
     throw new Error(`git tag ${name} failed: ${result.stderr}`);
   }
+}
+
+/**
+ * The git tag that authoritatively marks a task as accepted (merged).
+ * Uses the FULL task id for uniqueness, and is global to the repo so it
+ * survives branch deletion and reparenting.
+ */
+export function acceptTagName(taskId: string): string {
+  return `lazy-accept-${taskId}`;
+}
+
+/**
+ * Create the authoritative accept tag for a task, pointing at the resulting
+ * merge/FF commit. This is the single source of truth the zombie sweep uses
+ * to decide whether a non-terminal task was actually accepted.
+ *
+ * Annotated so it carries a timestamp; forced (`-f`) so idempotent retries of
+ * accept (e.g. a re-entry after a crash) update rather than fail. Must be
+ * created BEFORE the task status flips to `complete`, so that a crash in the
+ * window between merge and status update still leaves a recoverable signal.
+ */
+export async function createAcceptTag(taskId: string, commitish: string, cwd?: string): Promise<void> {
+  const name = acceptTagName(taskId);
+  const resolved = await runGit(['rev-parse', '--verify', `${commitish}^{commit}`], { cwd });
+  if (resolved.exitCode !== 0) {
+    throw new Error(`Failed to resolve ${commitish} for accept tag ${name}: ${resolved.stderr || 'unknown error'}`);
+  }
+  const sha = resolved.stdout.trim();
+  const result = await runGit(['tag', '-a', '-f', '-m', `Accepted task ${taskId}`, name, sha], { cwd });
+  if (result.exitCode !== 0) {
+    throw new Error(`git tag ${name} failed: ${result.stderr || 'unknown error'}`);
+  }
+}
+
+/**
+ * Return the commit SHA an accept tag points at, or null if the tag doesn't
+ * exist or doesn't resolve to a commit.
+ */
+export async function getAcceptTagCommit(taskId: string, cwd?: string): Promise<string | null> {
+  const name = acceptTagName(taskId);
+  const result = await runGit(['rev-parse', '--verify', '--quiet', `refs/tags/${name}^{commit}`], { cwd });
+  if (result.exitCode !== 0) return null;
+  const sha = result.stdout.trim();
+  return sha.length > 0 ? sha : null;
 }
 
 export async function mergeBranch(branch: string, cwd?: string): Promise<void> {
@@ -707,13 +752,24 @@ export async function checkMergeConflictsIntoTarget(sourceBranch: string, target
 
 /**
  * Build a squash commit message for a task merge.
+ *
+ * When `fidelityBody` is provided (a synthesized summary of what the work
+ * actually became), it replaces the raw commit-subject list — this is the
+ * local-driver sink for commit/PR fidelity. When it is absent (synthesis
+ * unavailable, or non-fidelity callers), we fall back to the deterministic
+ * goal + commit-subjects message.
  */
-async function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string): Promise<string> {
-  const commitMsgs = await getBranchCommitMessages(sourceBranch, targetBranch, root);
+async function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string, fidelityBody?: string): Promise<string> {
   let message = `Accept task ${taskShortId}: ${goal}`;
-  if (commitMsgs.length > 0) {
-    message += '\n\nSquashed commit of the following:\n' +
-      commitMsgs.map(m => `  ${m}`).join('\n');
+  const body = fidelityBody?.trim();
+  if (body) {
+    message += `\n\n${body}`;
+  } else {
+    const commitMsgs = await getBranchCommitMessages(sourceBranch, targetBranch, root);
+    if (commitMsgs.length > 0) {
+      message += '\n\nSquashed commit of the following:\n' +
+        commitMsgs.map(m => `  ${m}`).join('\n');
+    }
   }
   // Add Lazy co-author trailer
   message += `\n\n${LAZY_COAUTHOR_TRAILER}`;
@@ -722,6 +778,10 @@ async function buildSquashCommitMessage(taskShortId: string, goal: string, sourc
 
 /**
  * Squash-merge a task branch into its target branch.
+ *
+ * `fidelityBody`, when provided, is a synthesized faithful summary used as the
+ * squash commit body instead of the raw commit-subject list. See
+ * buildSquashCommitMessage.
  */
 export async function squashMergeTaskBranch(
   sourceBranch: string,
@@ -729,8 +789,9 @@ export async function squashMergeTaskBranch(
   taskShortId: string,
   goal: string,
   root: string,
+  fidelityBody?: string,
 ): Promise<void> {
-  const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root);
+  const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root, fidelityBody);
   await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
 }
 

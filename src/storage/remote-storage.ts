@@ -32,7 +32,7 @@ import type {
   AgentSessionLog,
   StatusChange,
 } from './types';
-import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage } from '../types';
+import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage, TaskTarget } from '../types';
 
 export class RemoteStorage implements Storage {
   constructor(
@@ -108,8 +108,8 @@ export class RemoteStorage implements Storage {
     await this.call('updateTaskCode', { taskId, code });
   }
 
-  async updateTaskParent(taskId: string, parentTaskId: string | null): Promise<void> {
-    await this.call('updateTaskParent', { taskId, parentTaskId });
+  async updateTaskTarget(taskId: string, target: TaskTarget): Promise<void> {
+    await this.call('updateTaskTarget', { taskId, target });
   }
 
   async updateTaskBranchedFromSha(taskId: string, sha: string): Promise<void> {

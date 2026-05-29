@@ -6,6 +6,7 @@ import { createRunner } from '../../runner';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
+import { parentTaskIdOf } from '../../task-target';
 
 export interface TaskWithSession {
   task: Task;
@@ -58,8 +59,9 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
   // Build tree structure
   const roots: TaskWithSession[] = [];
   for (const node of taskMap.values()) {
-    if (node.task.parent_task_id) {
-      const parent = taskMap.get(node.task.parent_task_id);
+    const parentId = parentTaskIdOf(node.task);
+    if (parentId) {
+      const parent = taskMap.get(parentId);
       if (parent) {
         parent.children.push(node);
       } else {
@@ -253,7 +255,8 @@ function renderListOutput(
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
     for (const task of tasks) {
-      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const parentId = parentTaskIdOf(task);
+      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
@@ -351,7 +354,8 @@ function renderActiveOutput(
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
     for (const task of tasks) {
-      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const parentId = parentTaskIdOf(task);
+      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
@@ -399,7 +403,8 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
     for (const { task } of flatNodes) {
-      const parent = task.parent_task_id ? theme.taskId(parentDisplayId(task.parent_task_id)) : '-';
+      const parentId = parentTaskIdOf(task);
+      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';

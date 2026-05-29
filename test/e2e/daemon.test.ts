@@ -1246,4 +1246,93 @@ describe('lazy daemon', () => {
       expect(result.stderr).not.toContain('Daemon did not start within');
     }, 20_000);
   });
+
+  // The daemon is the SINGLE enforcement point for auth: it launches task
+  // containers that inherit its credential, so gating the daemon itself on
+  // credential presence eliminates the "daemon up but every container
+  // unauthenticated" failure mode at the source. These tests exercise the gate
+  // end-to-end through the real CLI (subprocess), with HOME pinned to a tmp dir
+  // so the developer's real daemon directory is untouched and LAZY_TEST=''
+  // so the daemon start path actually runs.
+  describe('credential gate', () => {
+    let ctx: TestContext;
+    let tmpHome: string;
+
+    beforeEach(async () => {
+      ctx = await setupTestLazy();
+      tmpHome = await mkdtemp(join(tmpdir(), 'lazy-daemon-credgate-'));
+    });
+
+    afterEach(async () => {
+      await ctx.cleanup();
+      await rm(tmpHome, { recursive: true, force: true });
+    });
+
+    // INVARIANT: the daemon refuses to start when no Claude Code OAuth token /
+    // Anthropic API key is present, with an actionable error naming both env
+    // vars. This is what makes dropping the client-side checks safe.
+    test('daemon refuses to start without a credential', async () => {
+      const result = await ctx.lazy(['daemon', 'start'], {
+        env: {
+          HOME: tmpHome,
+          LAZY_TEST: '',
+          ANTHROPIC_API_KEY: '',
+          CLAUDE_CODE_OAUTH_TOKEN: '',
+        },
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('Daemon refuses to start');
+      // Actionable: names both credential env vars and how to set them.
+      expect(result.stderr).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+      expect(result.stderr).toContain('ANTHROPIC_API_KEY');
+    });
+  });
+
+  // INVARIANT: `lazy daemon status` surfaces the build time of the running
+  // daemon binary. In dev/test there is no compile step, so it reports 'dev'
+  // (graceful fallback) instead of crashing or printing a misleading value.
+  describe('daemon status shows build time', () => {
+    let ctx: TestContext;
+
+    beforeEach(async () => {
+      ctx = await setupTestLazy();
+    });
+
+    afterEach(async () => {
+      await ctx.cleanup();
+    });
+
+    test('status output includes the Built line', async () => {
+      const tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-status-build-'));
+      const originalHome = process.env.HOME;
+      process.env.HOME = tmpDir;
+      process.env.LAZY_TEST = '1';
+
+      try {
+        const { getSocketPath } = await import('../../src/daemon/paths');
+        const defaultSocket = getSocketPath(ctx.root);
+        const daemon = await startDaemonServer({
+          projectRoot: ctx.root,
+          socketPath: defaultSocket,
+          noWeb: true,
+        });
+        try {
+          const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
+            env: { HOME: tmpDir, LAZY_TEST: '1' },
+          });
+          expectSuccess(result);
+          expectOutput(result, 'Daemon is running');
+          expectOutput(result, 'Built:');
+          // No build step in tests → graceful 'dev' fallback.
+          expectOutput(result, 'dev');
+        } finally {
+          daemon.stop();
+        }
+      } finally {
+        process.env.HOME = originalHome;
+        await rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

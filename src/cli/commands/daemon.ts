@@ -31,6 +31,7 @@ import {
   getSocketPath,
 } from '../../daemon';
 import { startDaemonBackground } from '../../daemon/auto-start';
+import { assertDaemonCredentials } from '../../daemon/credential-gate';
 import { commandLogs } from './logs';
 
 export async function commandDaemon(args: string[]): Promise<void> {
@@ -85,6 +86,12 @@ async function daemonStart(args: string[]): Promise<void> {
   const projectRoot = resolveProjectRoot(parsed.flags);
 
   if (foreground) {
+    // Credential gate (single enforcement point for auth). The background path
+    // checks this inside startDaemonBackground before spawning; the foreground
+    // path starts the server in-process, so gate here too. This also covers the
+    // detached child, which runs `daemon start --foreground`.
+    await assertDaemonCredentials(projectRoot);
+
     // Foreground mode: startDaemonServer() acquires the flock internally.
     // If lock held → throws "Already running." If not → starts. One path.
     cleanupStaleFiles(projectRoot);
@@ -208,6 +215,11 @@ async function daemonStatus(args: string[]): Promise<void> {
     }
     if (status.version) {
       console.log(`  Version: ${status.version}`);
+    }
+    if (status.buildTime) {
+      // 'dev' when the daemon runs from source (no build step); otherwise the
+      // UTC timestamp embedded into the compiled binary at build time.
+      console.log(`  Built:   ${status.buildTime}${status.buildTime === 'dev' ? '' : ' (UTC)'}`);
     }
 
     // Auto-react budget info

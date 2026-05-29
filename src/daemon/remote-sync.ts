@@ -17,11 +17,15 @@
 import { shortId, displayId, getWorktreePath, taskRef } from '../cli/helpers';
 import { loadConfig } from '../config/loader';
 import { createDriver, type RepositoryDriver } from '../remote';
+import { regenerateFidelity } from '../synthesis/fidelity';
+import { getSummarizer } from '../synthesis/summarizer';
+import type { Summarizer } from '../synthesis/summarizer';
 import { syncTaskFromRemote, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { theme } from '../cli/theme';
 import { logger } from '../utils/logger';
 import { localBranchExists } from '../git/operations';
 import { isTerminalStatus } from '../types';
+import { targetBranchOf } from '../task-target';
 import { removeLock } from '../utils/lock';
 import { protocolDir, removeProtocolDir } from '../protocol';
 import { getActor } from '../constants';
@@ -266,7 +270,7 @@ async function exportTasks(storage: Storage, root: string, driver: RepositoryDri
  * conversation. Both agent and human turns are posted — human turns represent
  * review feedback that external reviewers need to see.
  */
-async function postTurnSummaries(storage: Storage, driver: RepositoryDriver): Promise<{ posted: number; errors: string[] }> {
+async function postTurnSummaries(storage: Storage, driver: RepositoryDriver, summarizer: Summarizer): Promise<{ posted: number; errors: string[] }> {
   const result = { posted: 0, errors: [] as string[] };
 
   const allTasks = await storage.listTasks();
@@ -316,6 +320,15 @@ async function postTurnSummaries(storage: Storage, driver: RepositoryDriver): Pr
       // Mark the last successfully posted turn
       if (lastSuccessSeq > lastPostedSeqNum) {
         await storage.updateTaskMetadata(task.id, driver.postedTurnSeqKey(), String(lastSuccessSeq));
+
+        // New work landed (direct commits/turns pushed) — regenerate the
+        // fidelity record so the PR/MR body reflects what the work has become.
+        // INVARIANT: this fires only when there are NEW turns to post, i.e. on
+        // actual new work — never on upstream-merge sync (syncTask), which does
+        // not post turns. See CLAUDE.md "Upstream merge is sync's job".
+        // Non-blocking: regenerateFidelity never throws.
+        const fidelity = await regenerateFidelity(storage, task, driver, summarizer);
+        if (fidelity.warning) result.errors.push(fidelity.warning);
       }
     } catch (err) {
       result.errors.push(`Failed to post summary for task ${displayId(task)}: ${err instanceof Error ? err.message : err}`);
@@ -581,7 +594,10 @@ async function fetchRemoteComments(storage: Storage, root: string, driver: Repos
  */
 export async function runSync(root: string, storage: Storage, log: SyncLogger): Promise<void> {
   const config = await loadConfig(root);
-  const driver = createDriver(config);
+  // Provide storage/root context so hosted-driver CLI calls (incl. commit/PR
+  // fidelity body edits) run against the project root.
+  const driver = createDriver(config, { storage, lazyRoot: root });
+  const summarizer = getSummarizer(config.models.default);
 
   // Collect unique target branches from active tasks so we can fast-forward them
   const allTasksForBranches = await storage.listTasks();
@@ -589,7 +605,7 @@ export async function runSync(root: string, storage: Storage, log: SyncLogger): 
     ...new Set(
       allTasksForBranches
         .filter(t => !isTerminalStatus(t.status))
-        .map(t => t.metadata?.remote_target_branch ?? t.metadata?.github_pr_target_branch)
+        .map(t => targetBranchOf(t))
         .filter((b): b is string => typeof b === 'string' && b !== 'HEAD')
     ),
   ];
@@ -668,7 +684,7 @@ export async function runSync(root: string, storage: Storage, log: SyncLogger): 
 
   // Post turns to PRs (agent summaries + human review feedback)
   log.phase('Posting task artifacts to PRs...');
-  const summaryResult = await postTurnSummaries(storage, driver);
+  const summaryResult = await postTurnSummaries(storage, driver, summarizer);
 
   if (summaryResult.posted > 0) {
     log.detail(`  ${summaryResult.posted} turn(s) posted`);

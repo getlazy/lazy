@@ -26,6 +26,9 @@ lazy-agent
 # Generated version file (from scripts/generate-version.ts)
 src/version.ts
 
+# Generated build-info file (from scripts/generate-version.ts / scripts/build.ts)
+src/build-info.ts
+
 dist/
 
 .DS_Store

@@ -28,6 +28,7 @@ import { getActor } from '../../constants';
 import { tmuxSessionName, killTmuxWatchSession } from '../../terminal';
 import { reparentChildren, formatReparentWarning } from '../orphan';
 import { readPendingProposals } from './propose';
+import { parentTaskIdOf } from '../../task-target';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 
@@ -905,7 +906,7 @@ export async function runFeedbackFlow(
   modelOverride?: string,
   effortOverride?: string,
 ): Promise<'continue' | 'done'> {
-  const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, task!.parent_task_id, root, displayId(task!));
+  const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, parentTaskIdOf(task!), root, displayId(task!));
 
   if (result.type === 'accept') {
     // User wants to accept — close storage and delegate to commandAccept

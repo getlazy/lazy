@@ -19,7 +19,7 @@ import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus } from '../protocol';
 import type { CompletedResponse, ErrorResponse } from '../protocol';
-import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, branchExists, isBranchMergedInto, findCommitByMessage, getTaskTargetBranch } from '../git/operations';
+import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
 import { checkLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
@@ -741,20 +741,26 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
 }
 
 /**
- * Sweep non-terminal tasks whose branch was already merged into their target.
+ * Sweep non-terminal tasks that were accepted but never finished transitioning to complete.
  *
- * This detects the "zombie" scenario where `lazy accept` successfully squash-merged
- * the task branch into main (or parent's branch) but crashed before updating the
- * session outcome and task status. The code is merged but the task stays stuck as
- * "blocked" or "interrupted" with an active session.
+ * This detects the "zombie" scenario where `lazy accept` successfully merged the
+ * task branch (squash into the target, or fast-forward from a merged PR) but crashed
+ * before updating the session outcome and task status. The code is merged but the
+ * task stays stuck as "blocked" or "interrupted" with an active session.
  *
- * Detection:
- * 1. For each non-terminal task with a session that has a git_branch:
- *    a. Determine the merge target (main for root tasks, parent's branch for child tasks)
- *    b. If the branch still exists: check `git merge-base --is-ancestor <branch> <target>`
- *    c. If the branch was deleted (cleanup succeeded): look for a squash-merge commit
- *       on the target mentioning the task's short ID
- * 2. If merged → fix: set session outcome to "accepted", set ended_at, set task status to "complete"
+ * Detection is gated SOLELY on the authoritative accept tag `lazy-accept-<full-task-id>`,
+ * which accept creates during the merge step, before the status→complete transition
+ * (see createAcceptTag). A task is recovered iff that tag exists and points at a real
+ * commit.
+ *
+ * The tag is created on BOTH accept paths and is global to the repo, so the sweep does
+ * not need to compute a merge target or care which branch the work landed on — this
+ * avoids the reparent-target fragility and the false positives that the old branch-relative
+ * tree-equality (`isBranchMergedInto`) and commit-message-grep (`findCommitByMessage`)
+ * signals produced. A crash-looping task that was NEVER accepted has no tag and is left
+ * alone, regardless of commit count or coincidental tree-equality with the target.
+ *
+ * If accepted → fix: set session outcome to "accepted", set ended_at, set task status to "complete".
  */
 async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<void> {
   const allTasks = await storage.listTasks();
@@ -763,8 +769,6 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
     if (TERMINAL_STATUSES.has(task.status)) continue;
 
     // Never auto-accept a working task — the agent is actively running.
-    // A working task's branch may appear "merged" if it was just created
-    // from the target and the agent hasn't committed yet.
     if (task.status === 'working') continue;
 
     try {
@@ -776,44 +780,25 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
 
       const taskShortId = shortId(task.id);
 
-      // Guard: skip tasks where the agent never ran. If there are zero agent turns,
-      // the task has no work to accept — auto-accepting would lose the task's intent.
-      // This is defense-in-depth against false positives from isBranchMergedInto.
+      // Authoritative gate: only recover tasks that were actually accepted. The accept
+      // tag is created during the merge step before the status flips to complete, so its
+      // presence proves a human-driven accept merged this task's work. No tag → never
+      // accepted → leave it alone.
+      const acceptCommit = await getAcceptTagCommit(task.id, lazyRoot);
+      if (!acceptCommit) continue;
+
+      // Defense-in-depth: skip tasks where the agent never ran. If there are zero agent
+      // turns, the task has no work to accept. This should never co-occur with an accept
+      // tag, but keep the cheap guard.
       const turns = await storage.getSessionTurns(session.id);
       const hasAgentWork = turns.some(t => t.role === 'agent');
       if (!hasAgentWork) {
-        logger.debug(`Task ${taskShortId}: skipping zombie sweep — no agent turns (only ${turns.length} turns, all human/system)`);
+        logger.debug(`Task ${taskShortId}: skipping zombie sweep — accept tag present but no agent turns (${turns.length} turns, all human/system)`);
         continue;
       }
 
-      // Determine merge target: child tasks merge into parent's branch, root tasks into main
-      let mergeTarget: string;
-      if (task.parent_task_id) {
-        const parentRef = await taskRefFromId(task.parent_task_id, storage);
-        mergeTarget = `lazy/${parentRef}`;
-        // If parent's branch doesn't exist, we can't check — skip
-        if (!await branchExists(mergeTarget, lazyRoot)) continue;
-      } else {
-        mergeTarget = await getTaskTargetBranch(task, lazyRoot) ?? 'main';
-      }
-
-      let isMerged = false;
-
-      if (await branchExists(session.git_branch, lazyRoot)) {
-        // Branch still exists — check if all its commits are reachable from the target
-        isMerged = await isBranchMergedInto(session.git_branch, mergeTarget, lazyRoot);
-        logger.debug(`Task ${taskShortId}: branch ${session.git_branch} exists, isBranchMergedInto(${mergeTarget}) = ${isMerged}`);
-      } else {
-        // Branch was deleted (cleanup ran after merge) — look for the squash-merge
-        // commit message pattern: "Accept task <shortId>: ..."
-        isMerged = await findCommitByMessage(mergeTarget, `Accept task ${taskShortId}`, lazyRoot);
-        logger.debug(`Task ${taskShortId}: branch ${session.git_branch} deleted, findCommitByMessage = ${isMerged}`);
-      }
-
-      if (!isMerged) continue;
-
-      // Zombie detected: branch is merged but task/session not updated
-      logger.warn(`Task ${taskShortId}: branch ${session.git_branch} already merged into ${mergeTarget}, fixing zombie state (${turns.length} turns, ${turns.filter(t => t.role === 'agent').length} agent)`);
+      // Zombie detected: task was accepted (tag points at ${acceptCommit}) but task/session not updated
+      logger.warn(`Task ${taskShortId}: accept tag found (commit ${acceptCommit.slice(0, 8)}), fixing zombie state (${turns.length} turns, ${turns.filter(t => t.role === 'agent').length} agent)`);
 
       await storage.endSession(session.id, 'accepted');
       await storage.updateTaskStatus(task.id, 'zombie', 'system');

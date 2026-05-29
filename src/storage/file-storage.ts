@@ -58,6 +58,8 @@ import type {
   HunkApprovalLineage,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
+import { targetFromLegacy, parentTaskIdOf } from '../task-target';
+import type { TaskTarget } from '../types';
 import { assertValidTransition } from '../task-state-machine';
 import { StorageLock } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
@@ -251,6 +253,33 @@ export class FileStorage implements Storage {
     }
     if (raw.completed_at !== undefined && raw.completed_at !== null && typeof raw.completed_at !== 'number') {
       raw.completed_at = FileStorage.migrateTimestamp(raw.completed_at);
+      needsWrite = true;
+    }
+
+    // Normalize the legacy (parent_task_id, metadata.remote_target_branch) pair
+    // into the canonical `target` discriminated union. This is the ONE place
+    // the legacy two-field shape is mapped (see src/task-target.ts). After
+    // normalization `target` is the single source of truth: parent_task_id and
+    // the metadata.remote_target_branch / github_pr_target_branch keys are no
+    // longer read by anything (this READ is their last consumer), so they are
+    // dropped from the canonical on-disk form on first load.
+    if (raw.target === undefined || raw.target === null) {
+      const legacyParent = (raw.parent_task_id as string | null | undefined) ?? null;
+      const legacyBranch =
+        (raw.metadata as Record<string, string> | null | undefined)?.remote_target_branch ?? null;
+      raw.target = targetFromLegacy(legacyParent, legacyBranch) as unknown as Record<string, unknown>;
+      needsWrite = true;
+    }
+    if ('parent_task_id' in raw) {
+      delete raw.parent_task_id;
+      needsWrite = true;
+    }
+    // Drop the dead legacy target keys from metadata once their value has been
+    // folded into `target` above. Safe: nothing reads them anymore.
+    const rawMeta = raw.metadata as Record<string, unknown> | null | undefined;
+    if (rawMeta && ('remote_target_branch' in rawMeta || 'github_pr_target_branch' in rawMeta)) {
+      delete rawMeta.remote_target_branch;
+      delete rawMeta.github_pr_target_branch;
       needsWrite = true;
     }
 
@@ -632,7 +661,7 @@ export class FileStorage implements Storage {
         status: 'backlog',
         created_at: now,
         completed_at: null,
-        parent_task_id: parentTaskId ?? null,
+        target: targetFromLegacy(parentTaskId ?? null, null),
         branched_from_sha: branchedFromSha ?? null,
         close_reason: null,
         model: null,
@@ -745,7 +774,7 @@ export class FileStorage implements Storage {
     }
 
     return tasks.filter((task) => {
-      if (options.rootsOnly && task.parent_task_id !== null) {
+      if (options.rootsOnly && parentTaskIdOf(task) !== null) {
         return false;
       }
       if (options.blockedOnly && !isBlockedStatus(task.status)) {
@@ -830,7 +859,7 @@ export class FileStorage implements Storage {
     });
   }
 
-  async updateTaskParent(taskId: string, parentTaskId: string | null): Promise<void> {
+  async updateTaskTarget(taskId: string, target: TaskTarget): Promise<void> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
       if (!fullId) return;
@@ -838,9 +867,13 @@ export class FileStorage implements Storage {
       const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
       if (!task) return;
 
-      this.assertNotTerminal(task, 'update parent');
+      this.assertNotTerminal(task, 'update target');
 
-      task.parent_task_id = parentTaskId;
+      task.target = target;
+      // task.target is the single source of truth. The legacy
+      // metadata.remote_target_branch / github_pr_target_branch keys are no
+      // longer written or read; readTask already stripped them on load, so the
+      // task we persist here carries none.
 
       await this.atomicWriteTask(fullId, { 'task.json': task });
     });
@@ -1750,14 +1783,15 @@ export class FileStorage implements Storage {
 
   async getChildTasks(parentTaskId: string): Promise<Task[]> {
     const allTasks = await this.listTasks();
-    return allTasks.filter((t) => t.parent_task_id === parentTaskId);
+    return allTasks.filter((t) => parentTaskIdOf(t) === parentTaskId);
   }
 
   async getRootTask(taskId: string): Promise<Task | null> {
     const task = await this.getTask(taskId);
     if (!task) return null;
-    if (!task.parent_task_id) return task;
-    return this.getRootTask(task.parent_task_id);
+    const parentId = parentTaskIdOf(task);
+    if (!parentId) return task;
+    return this.getRootTask(parentId);
   }
 
   async getTaskAncestry(taskId: string): Promise<Task[]> {
@@ -1768,7 +1802,7 @@ export class FileStorage implements Storage {
       const task = await this.getTask(currentId);
       if (!task) break;
       ancestry.unshift(task); // Add to front (root first)
-      currentId = task.parent_task_id;
+      currentId = parentTaskIdOf(task);
     }
 
     return ancestry;

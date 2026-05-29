@@ -55,6 +55,7 @@ import { startSyncRetryLoop } from './sync-retry';
 import { createDriver } from '../remote';
 import { runSync, debugSyncLogger } from './remote-sync';
 import { isOfflineMode } from '../utils/offline';
+import { parentTaskIdOf } from '../task-target';
 
 export interface DaemonServerOptions {
   /** Project root this daemon serves. Required — the daemon is per-project. */
@@ -238,6 +239,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         version = mod.VERSION;
       } catch { /* version file may not exist in tests */ }
 
+      // Build timestamp embedded at compile time (UTC ISO string), or 'dev'
+      // when running from source (bun run ./src/index.ts) where there is no
+      // build step. Falls back gracefully so status never crashes.
+      let buildTime = 'dev';
+      try {
+        const mod = await import('../build-info');
+        buildTime = mod.BUILD_TIME;
+      } catch { /* build-info file may not exist in some contexts */ }
+
       // Auto-react budget: file-based read only (no storage, no lock).
       // tasksAtLimit is populated from a cache updated by the reconcile loop.
       let autoReactBudget: { project: string; used: number; limit: number; tasksAtLimit: string[] }[] | undefined;
@@ -257,6 +267,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         pid: process.pid,
         uptime,
         version,
+        buildTime,
         socketPath,
         webPort: boundWebPort,
         ...(autoReactBudget ? { autoReactBudget } : {}),
@@ -765,7 +776,7 @@ function startDaemonReconcileLoop(
       const parentByTaskId = new Map<string, string | null>();
 
       for (const task of workingBefore) {
-        parentByTaskId.set(task.id, task.parent_task_id);
+        parentByTaskId.set(task.id, parentTaskIdOf(task));
         const session = await storage.getSessionByTaskId(task.id);
         if (session?.git_branch) {
           branchByTaskId.set(task.id, session.git_branch);

@@ -10,6 +10,7 @@ import { logger } from '../../utils/logger';
 
 import { getActor } from '../../constants';
 import type { Storage } from '../../storage/interface';
+import { parentTaskIdOf } from '../../task-target';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
@@ -165,7 +166,7 @@ export async function commandRedo(args: string[]): Promise<void> {
 
     // --- Create new task first (so we have its ID for the close reason) ---
     // Preserve parent relationship if the old task had one
-    const newTask = await storage.createTask(oldTask.goal, oldTask.parent_task_id ?? undefined, undefined, undefined);
+    const newTask = await storage.createTask(oldTask.goal, parentTaskIdOf(oldTask) ?? undefined, undefined, undefined);
 
     // Set prompt
     await storage.updateTaskPrompt(newTask.id, newPrompt);
@@ -249,7 +250,7 @@ Arguments:
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-opus-4-8)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
 

@@ -114,7 +114,7 @@ Arguments:
   <task_id>    ID of the interrupted task to resume
 
 Options:
-  --model <model>    Override model for this session (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-4-8)
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
   --follow           Wait for the agent to finish, streaming output in real time
 

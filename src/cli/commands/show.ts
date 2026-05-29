@@ -9,7 +9,9 @@ import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
 import type { Task, Session, Turn, Commit, Comment } from '../../types';
+import type { StatusChange } from '../../storage/types';
 import type { SupervisorStatus } from '../../protocol/types';
+import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
@@ -25,6 +27,7 @@ export interface TaskShowData {
   turns: Turn[];
   commits: Commit[];
   comments: Comment[];
+  statusHistory: StatusChange[];
   children: Task[];
   childSessions: Map<string, Session | null>;
   proposals: Proposal[];
@@ -60,9 +63,11 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   const turns = sess ? await storage.getSessionTurns(sess.id) : [];
   const commits = sess ? await storage.getSessionCommits(sess.id) : [];
   const comments = await storage.getTaskComments(task.id);
+  const statusHistory = await storage.getStatusHistory(task.id);
   const proposals = readPendingProposals(storage, task.id);
 
-  const parent = task.parent_task_id ? await storage.getTask(task.parent_task_id) : null;
+  const parentId = parentTaskIdOf(task);
+  const parent = parentId ? await storage.getTask(parentId) : null;
 
   const childSessions = new Map<string, Session | null>();
   for (const child of children) {
@@ -71,7 +76,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
 
   // Check orphan status for child tasks
   let orphanStatus: OrphanCheckResult | null = null;
-  if (task.parent_task_id && root) {
+  if (parentId && root) {
     orphanStatus = await checkOrphanedChild(task, storage, root);
   }
 
@@ -86,7 +91,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus };
+  return { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus };
 }
 
 /**
@@ -94,7 +99,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * Used by both the show command (for display) and the search command (for line number computation).
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean): string[] {
-  const { task, session: sess, turns, commits, comments, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus } = data;
+  const { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus } = data;
   const outputLines: string[] = [];
 
   // Supervisor status header (only for working tasks with a status file)
@@ -130,9 +135,10 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
   }
 
   // Parent info
-  if (task.parent_task_id) {
+  const parentTaskId = parentTaskIdOf(task);
+  if (parentTaskId) {
     outputLines.push(`\n${theme.label('Parent Task:')}`);
-    outputLines.push(`  ${theme.taskId(parent ? displayId(parent) : shortId(task.parent_task_id))} - ${parent?.goal ?? '(unknown)'}`);
+    outputLines.push(`  ${theme.taskId(parent ? displayId(parent) : shortId(parentTaskId))} - ${parent?.goal ?? '(unknown)'}`);
     if (task.branched_from_sha) {
       outputLines.push(`  ${theme.label('Branched from:')} ${theme.commitSha(task.branched_from_sha.substring(0, 8))}`);
     }
@@ -317,6 +323,20 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
         const preview = comment.content.substring(0, 80).replace(/\n/g, ' ');
         outputLines.push(`  [${theme.timestamp(formatDate(comment.created_at))}] ${preview}${comment.content.length > 80 ? '...' : ''}`);
       }
+    }
+  }
+
+  // Status History (audit trail of status transitions)
+  if (statusHistory.length > 0) {
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Status History (${statusHistory.length})`)} ${theme.separator('---')}`);
+    let prev: string | null = null;
+    for (const change of statusHistory) {
+      const transition = prev === null
+        ? theme.status(change.status)
+        : `${theme.status(prev)} → ${theme.status(change.status)}`;
+      const actor = change.actor ? ` ${theme.label('by')} ${change.actor}` : '';
+      outputLines.push(`  [${theme.timestamp(formatDate(change.timestamp))}] ${transition}${actor}`);
+      prev = change.status;
     }
   }
 
@@ -572,7 +592,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     created_at: task.created_at,
     completed_at: task.completed_at,
     close_reason: task.close_reason,
-    parent_task_id: task.parent_task_id,
+    parent_task_id: parentTaskIdOf(task),
     branched_from_sha: task.branched_from_sha,
     metadata: task.metadata,
     session: sess ? {

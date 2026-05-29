@@ -18,6 +18,7 @@ import type {
   Comment,
   TaskPromptVersion,
   TaskStatus,
+  TaskTarget,
   SessionOutcome,
   TurnRole,
   TurnType,
@@ -147,9 +148,12 @@ export interface Storage {
   updateTaskCode(taskId: string, code: string | null): Promise<void>;
 
   /**
-   * Update task parent (set or clear parent_task_id)
+   * Set a task's canonical integration target (see {@link TaskTarget}).
+   * Replaces the old updateTaskParent + updateTaskMetadata('remote_target_branch')
+   * pair — callers construct a single discriminated union, so a parent task and
+   * a target branch can never be set independently or left contradictory.
    */
-  updateTaskParent(taskId: string, parentTaskId: string | null): Promise<void>;
+  updateTaskTarget(taskId: string, target: TaskTarget): Promise<void>;
 
   /**
    * Update the SHA that a child task was branched from

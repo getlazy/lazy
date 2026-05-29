@@ -124,7 +124,7 @@ describe('lazy-agent mcp', () => {
 
     const result = toolsResponse!.result as { tools: Array<{ name: string; description: string; inputSchema: unknown }> };
     expect(result.tools).toBeArray();
-    expect(result.tools.length).toBe(25);
+    expect(result.tools.length).toBe(30);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).toEqual([
@@ -133,6 +133,7 @@ describe('lazy-agent mcp', () => {
       'lazy_ask',
       'lazy_blocked',
       'lazy_clone',
+      'lazy_close',
       'lazy_comment',
       'lazy_commit',
       'lazy_conversation_read',
@@ -144,12 +145,17 @@ describe('lazy-agent mcp', () => {
       'lazy_list',
       'lazy_propose',
       'lazy_redo',
+      'lazy_reject',
       'lazy_reopen',
+      'lazy_reparent',
       'lazy_resume',
       'lazy_search',
       'lazy_show',
       'lazy_start',
       'lazy_status',
+      'lazy_stop',
+      'lazy_submit',
+      'lazy_sync',
       'lazy_unblock',
       'lazy_wait',
     ]);

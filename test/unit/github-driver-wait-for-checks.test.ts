@@ -62,7 +62,7 @@ describe('GitHubDriver waitForChecks', () => {
     agent_id: 'claude-code',
     created_at: Date.now(),
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     metadata: {

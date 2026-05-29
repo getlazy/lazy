@@ -9,7 +9,7 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     type: 'task' as const,
     status: 'backlog' as const,
     completed_at: null,
-    parent_task_id: null,
+    target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
     close_reason: null,
     model: null,

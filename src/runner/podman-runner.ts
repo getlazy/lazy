@@ -12,7 +12,6 @@
  */
 
 import { DockerRunner, type DockerRunnerOptions } from './docker-runner';
-import { getAuthEnvVars } from '../capture/claude';
 import { logger } from '../utils/logger';
 import { spawnSync } from '../utils/spawn';
 
@@ -44,9 +43,7 @@ export class PodmanRunner extends DockerRunner {
 
     logger.debug('Podman is running ✓');
 
-    // When Ollama is configured, auth is always available (dummy tokens)
-    if (!this._ollamaConfig?.enabled) {
-      getAuthEnvVars(); // Fail fast on missing auth before creating state
-    }
+    // Auth is NOT enforced here. The daemon credential gate
+    // (src/daemon/credential-gate.ts) is the single enforcement point.
   }
 }

@@ -472,6 +472,11 @@ export function calculateDockerfileHash(_lazyRoot: string): string {
   return 'mock-dockerfile-hash';
 }
 
+// Mirror the real module's re-export (consumed by `lazy system export-dockerfile`).
+// The mock replaces capture/claude entirely under LAZY_TEST, so every symbol the
+// source imports must be present here or module resolution fails CLI-wide.
+export const DEFAULT_DOCKERFILE = '# mock Dockerfile\n';
+
 // --- Token usage extraction ---
 
 export function extractTokenUsage(response: AgentResponse): TokenUsage {

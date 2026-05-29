@@ -4,6 +4,7 @@ import { logger } from '../../utils/logger';
 import type { Storage } from '../../storage/interface';
 import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
+import { parentTaskIdOf } from '../../task-target';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -127,7 +128,7 @@ export async function commandClone(args: string[]): Promise<void> {
       newParentTaskId = undefined;
     } else {
       // No flags: inherit parent from source task (default behavior)
-      newParentTaskId = sourceTask.parent_task_id ?? undefined;
+      newParentTaskId = parentTaskIdOf(sourceTask) ?? undefined;
     }
 
     // Determine code: explicit > auto-generated > none
@@ -193,7 +194,7 @@ Options:
   --default-parent   Use default parent (null, root task) instead of inheriting from source
                      (conflicts with --parent)
   --code <code>      Set a custom code for the cloned task (default: auto-generated)
-  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-opus-4-8)
                      Default: inherit from source task
 
 What gets carried over:

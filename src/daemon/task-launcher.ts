@@ -27,12 +27,13 @@ import { createRunner } from '../runner';
 import { createDriver } from '../remote';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
-import { getCurrentSha, getCurrentBranch, resolveDetachedHead, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
+import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt } from '../cli/commands/shared';
 import { checkOrphanedChild, retargetOrphanedChild } from '../cli/orphan';
+import { parentTaskIdOf, branchTarget } from '../task-target';
 import { getAgent, listAgents } from '../agent/registry';
 import { getDataDir } from '../cli/init';
 import { isFeatureEnabled } from '../utils/features';
@@ -186,10 +187,11 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
   }
 
   // Check parent worktree exists for child tasks
-  if (t.parent_task_id) {
-    const parentTask = await storage.getTask(t.parent_task_id);
+  const tParentId = parentTaskIdOf(t);
+  if (tParentId) {
+    const parentTask = await storage.getTask(tParentId);
     if (!parentTask) {
-      throw new RpcError(400, `Parent task not found: ${t.parent_task_id}`);
+      throw new RpcError(400, `Parent task not found: ${tParentId}`);
     }
     const parentWorktreePath = getWorktreePath(root, parentTask);
     if (!await pathExists(parentWorktreePath)) {
@@ -200,7 +202,7 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
   // Handle orphaned child (parent accepted, branch gone).
   // CLI prompts the user and passes retargetOrphan=true if confirmed.
   // Daemon only retargets when explicitly told to.
-  if (t.parent_task_id && retargetOrphan) {
+  if (tParentId && retargetOrphan) {
     const orphanStatus = await checkOrphanedChild(t, storage, root);
     if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
       await retargetOrphanedChild(t, storage, orphanStatus.retargetBranch);
@@ -309,16 +311,17 @@ export async function launchTask(
     : `lazy/${tRef}`;
 
   // --- Determine parent branch and start SHA ---
+  const tParentId = parentTaskIdOf(t);
   let startSha: string;
   let parentBranch: string | null = null;
 
   if (isLinkedTask && existingSession) {
     startSha = existingSession.git_start_sha;
-    parentBranch = t.metadata?.parent_branch ?? await resolveDetachedHead(await getCurrentBranch(projectRoot), projectRoot, config.remote.git_remote);
-  } else if (t.parent_task_id) {
-    const parentTask = (await storage.getTask(t.parent_task_id))!;
+    parentBranch = t.metadata?.parent_branch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+  } else if (tParentId) {
+    const parentTask = (await storage.getTask(tParentId))!;
     const parentWorktreePath = getWorktreePath(projectRoot, parentTask);
-    parentBranch = await getBranchNameFromId(t.parent_task_id, storage);
+    parentBranch = await getBranchNameFromId(tParentId, storage);
 
     try {
       const parentRef = await driver.resolveUpstreamRef(parentBranch, projectRoot);
@@ -344,7 +347,12 @@ export async function launchTask(
     await storage.updateTaskBranchedFromSha(t.id, startSha);
     t.branched_from_sha = startSha;
   } else {
-    parentBranch = await resolveDetachedHead(await getCurrentBranch(projectRoot), projectRoot, config.remote.git_remote);
+    // Top-level task with no stored target. Default to the repo's configured
+    // integration branch (origin/HEAD → main fallback), NOT the user's currently
+    // checked-out branch. Adopting whatever the user happens to be on at start
+    // time produced bad PRs targeting dead release branches. Explicit override:
+    // pass --parent at create-time (or use lazy reparent post-creation).
+    parentBranch = await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
 
     try {
       const parentRef = await driver.resolveUpstreamRef(parentBranch, projectRoot);
@@ -424,7 +432,7 @@ export async function launchTask(
 
     // --- Model resolution ---
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && t.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? t.model ?? config.models.default);
@@ -442,7 +450,7 @@ export async function launchTask(
 
     let turnPrompt = t.prompt;
     if (isLinkedTask) {
-      const linkedParentBranch = t.metadata?.parent_branch ?? await resolveDetachedHead(await getCurrentBranch(projectRoot), projectRoot, config.remote.git_remote);
+      const linkedParentBranch = t.metadata?.parent_branch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
       const preamble = await buildLinkedTaskPreamble(worktreePath, branchName, linkedParentBranch);
       turnPrompt = preamble + '\n---\n\n' + t.prompt;
     }
@@ -472,14 +480,20 @@ export async function launchTask(
 
     // --- Publish branch ---
     let parentDisplayId: string | null = null;
-    if (t.parent_task_id) {
-      const parentTask = await storage.getTask(t.parent_task_id);
+    if (tParentId) {
+      const parentTask = await storage.getTask(tParentId);
       if (parentTask) parentDisplayId = displayId(parentTask);
     }
 
     if (!isLinkedTask) {
-      const mergeTarget = parentBranch ?? await resolveDetachedHead(await getCurrentBranch(projectRoot), projectRoot, config.remote.git_remote);
-      await storage.updateTaskMetadata(t.id, 'remote_target_branch', mergeTarget);
+      const mergeTarget = parentBranch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+      // Only a top-level task's integration target is a named branch. A child
+      // task's target is its parent (kind: 'task') and must not be clobbered —
+      // its mergeTarget here is the parent's lazy/ branch, used only to base the
+      // published branch, never as the canonical integration target.
+      if (!tParentId) {
+        await storage.updateTaskTarget(t.id, branchTarget(mergeTarget));
+      }
 
       try {
         const publishResult = await driver.publishBranch({

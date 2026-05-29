@@ -8,6 +8,32 @@
 
 import { resolve } from 'path';
 import { parseFlags } from '../helpers';
+import { COMMAND_ALIASES } from '../command-aliases';
+
+// Expand a canonical-keyed command list so aliases of any included command are
+// also completed (e.g. `show` brings in `view`). Aliases inherit the canonical
+// command's behavior — same flags, same task-ID bucket, same subcommands.
+function withAliases(commands: string[]): string[] {
+  const expanded = [...commands];
+  for (const cmd of commands) {
+    for (const alias of COMMAND_ALIASES[cmd] ?? []) {
+      expanded.push(alias);
+    }
+  }
+  return expanded;
+}
+
+// Expand a canonical-keyed map so each alias inherits its canonical command's
+// value (flags, subcommands, etc.).
+function expandAliasKeys<T>(map: Record<string, T>): Record<string, T> {
+  const expanded: Record<string, T> = { ...map };
+  for (const [cmd, value] of Object.entries(map)) {
+    for (const alias of COMMAND_ALIASES[cmd] ?? []) {
+      expanded[alias] = value;
+    }
+  }
+  return expanded;
+}
 
 /**
  * Get the absolute path to the lazy binary for embedding in completion scripts.
@@ -24,26 +50,47 @@ function getLazyBinaryPath(): string {
   return argv0;
 }
 
-// Commands that take a task ID as their first positional argument
-const TASK_ID_COMMANDS = [
-  'show', 'start', 'edit', 'comment', 'clone', 'unblock', 'review', 'resume', 'reopen',
-  'branch', 'rework', 'diff', 'status', 'shell', 'pair', 'accept', 'reject', 'revert',
-  'close', 'redo', 'submit', 'sync', 'wait', 'watch', 'doctor',
-];
+// Commands whose first positional is a task reference and that operate on
+// currently-active (working/blocked) tasks. Completed from `active --ids-only`.
+const ACTIVE_TASK_ID_COMMANDS = withAliases([
+  'show', 'start', 'edit', 'comment', 'clone', 'unblock', 'review', 'resume',
+  'branch', 'diff', 'status', 'shell', 'pair', 'accept', 'reject',
+  'close', 'submit', 'sync', 'wait', 'watch', 'doctor', 'stop', 'reparent',
+]);
 
-// All top-level commands (canonical names only, no aliases)
-const ALL_COMMANDS = [
+// Commands whose first positional is a task reference but that operate on
+// terminal/finished tasks (accepted, rejected, closed, abandoned). `active`
+// would return nothing useful for these, so they complete from
+// `list --all --ids-only`, which includes terminal tasks.
+const ALL_TASK_ID_COMMANDS = withAliases([
+  'chat', 'reopen', 'revert', 'redo', 'rework',
+]);
+
+// Commands that dispatch to a fixed set of subcommands as their first
+// positional argument (e.g. `lazy system prompts`). Completed from this map.
+const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
+  'system': ['prompts', 'build', 'offline', 'online', 'export-dockerfile'],
+  'daemon': ['start', 'stop', 'restart', 'status', 'logs'],
+  'config': ['set', 'get'],
+});
+
+// All top-level commands. The literal is the canonical set (mirrors the
+// dispatcher in src/index.ts); withAliases() appends aliases like ls/tasks/
+// view/doc so they tab-complete too.
+const ALL_COMMANDS = withAliases([
   'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'clone',
-  'list', 'active', 'blocked', 'show', 'search',
+  'list', 'active', 'blocked', 'show', 'search', 'report',
   'review', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
-  'diff', 'status', 'shell', 'pair', 'accept', 'reject', 'revert', 'rework', 'close', 'redo',
+  'diff', 'status', 'shell', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
+  'close', 'redo', 'stop', 'reparent',
   'link', 'import-conversation', 'propose', 'submit', 'sync',
-  'daemon', 'logs', 'server', 'config',
+  'daemon', 'server', 'config',
   'builder', 'init', 'doctor', 'upgrade', 'completion', 'system',
-];
+]);
 
-// Flags per command (only commands with flags are listed)
-const COMMAND_FLAGS: Record<string, string[]> = {
+// Flags per command (only commands with flags are listed). Aliases inherit
+// their canonical command's flags via expandAliasKeys.
+const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'create':              ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--agent'],
   'start':               ['--model', '--agent', '--follow', '--yes', '--force-local'],
   'fix':                 ['--goal', '--prompt', '--model', '--code', '--parent'],
@@ -77,7 +124,6 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   'import-conversation': ['--list', '--show-imported', '--show', '--all'],
   'builder':             ['--autonomous', '--yes', '--resume'],
   'daemon':              ['--foreground', '--background', '--project'],
-  'logs':                ['--lines', '--follow', '--no-follow', '--project'],
   'server':              ['--port'],
   'config':              ['--task', '--reason'],
   'doctor':              ['--no-resume', '--dry-run', '--yes'],
@@ -85,17 +131,28 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   'propose':             ['--goal', '--code', '--prompt', '--task'],
   'upgrade':             ['--force', '--dry-run'],
   'completion':          ['--bash', '--zsh'],
-};
+  'chat':                ['--effort'],
+  'stop':                ['--reason', '--yes'],
+  'reparent':            ['--parent', '--yes'],
+  'report':              ['--start', '--end', '--pdf', '--out'],
+});
 
 function generateBashScript(): string {
   const lazyBin = getLazyBinaryPath();
   const commands = ALL_COMMANDS.join(' ');
-  const taskIdCmds = TASK_ID_COMMANDS.join('|');
+  const activeTaskCmds = ACTIVE_TASK_ID_COMMANDS.join('|');
+  const allTaskCmds = ALL_TASK_ID_COMMANDS.join('|');
 
   // Build the flag cases for each command
   const flagCases: string[] = [];
   for (const [cmd, flags] of Object.entries(COMMAND_FLAGS)) {
     flagCases.push('            ' + cmd + ') flags="' + flags.join(' ') + '" ;;');
+  }
+
+  // Build subcommand cases (e.g. `lazy system <TAB>` -> prompts build ...)
+  const subCases: string[] = [];
+  for (const [cmd, subs] of Object.entries(SUBCOMMANDS)) {
+    subCases.push('        ' + cmd + ') COMPREPLY=($(compgen -W "' + subs.join(' ') + '" -- "$cur")); return ;;');
   }
 
   // Build the bash completion script using plain string concatenation
@@ -123,11 +180,26 @@ function generateBashScript(): string {
     '        return',
     '    fi',
     '',
-    '    # Complete task IDs for commands that take them',
+    '    # Complete subcommands at position 2 for commands that have them',
+    '    if [ "$cword" -eq 2 ]; then',
+    '        case "$cmd" in',
+    ...subCases,
+    '        esac',
+    '    fi',
+    '',
+    '    # Complete task IDs for commands that take them.',
+    '    # Active commands operate on working/blocked tasks; terminal commands',
+    '    # operate on finished tasks and need the full task list.',
     '    case "$cmd" in',
-    '        ' + taskIdCmds + ')',
+    '        ' + activeTaskCmds + ')',
     '            local ids',
     '            ids="$("' + lazyBin + '" active --ids-only 2>/dev/null)"',
+    '            COMPREPLY=($(compgen -W "$ids" -- "$cur"))',
+    '            return',
+    '            ;;',
+    '        ' + allTaskCmds + ')',
+    '            local ids',
+    '            ids="$("' + lazyBin + '" list --all --ids-only 2>/dev/null)"',
     '            COMPREPLY=($(compgen -W "$ids" -- "$cur"))',
     '            return',
     '            ;;',
@@ -142,12 +214,19 @@ function generateBashScript(): string {
 
 function generateZshScript(): string {
   const lazyBin = getLazyBinaryPath();
-  const taskIdCmds = TASK_ID_COMMANDS.join('|');
+  const activeTaskCmds = ACTIVE_TASK_ID_COMMANDS.join('|');
+  const allTaskCmds = ALL_TASK_ID_COMMANDS.join('|');
 
   // Build flag cases using compadd
   const flagCases: string[] = [];
   for (const [cmd, flags] of Object.entries(COMMAND_FLAGS)) {
     flagCases.push('            ' + cmd + ') compadd -- ' + flags.join(' ') + ' ;;');
+  }
+
+  // Build subcommand cases (e.g. `lazy system <TAB>` -> prompts build ...)
+  const subCases: string[] = [];
+  for (const [cmd, subs] of Object.entries(SUBCOMMANDS)) {
+    subCases.push('            ' + cmd + ') compadd -- ' + subs.join(' ') + '; return ;;');
   }
 
   // Build the zsh completion script using plain string concatenation
@@ -181,11 +260,25 @@ function generateZshScript(): string {
     '            ;;',
     '    esac',
     '',
-    '    # Task ID completion for commands that accept them',
+    '    # Subcommand completion at position 3 (words[2] is the command)',
+    '    if (( CURRENT == 3 )); then',
+    '        case $cmd in',
+    ...subCases,
+    '        esac',
+    '    fi',
+    '',
+    '    # Task ID completion for commands that accept them.',
+    '    # Active commands operate on working/blocked tasks; terminal commands',
+    '    # operate on finished tasks and need the full task list.',
     '    case $cmd in',
-    '        ' + taskIdCmds + ')',
+    '        ' + activeTaskCmds + ')',
     '            local -a ids',
     '            ids=(${(f)"$("' + lazyBin + '" active --ids-only 2>/dev/null)"})',
+    '            compadd -a ids',
+    '            ;;',
+    '        ' + allTaskCmds + ')',
+    '            local -a ids',
+    '            ids=(${(f)"$("' + lazyBin + '" list --all --ids-only 2>/dev/null)"})',
     '            compadd -a ids',
     '            ;;',
     '    esac',
@@ -241,6 +334,7 @@ Setup:
 
 Completions include:
   - Command names (lazy <TAB>)
+  - Subcommands (lazy system <TAB>, lazy daemon <TAB>, lazy config <TAB>)
   - Task IDs for commands that accept them (lazy show <TAB>)
   - Flags for each command (lazy list --<TAB>)`);
 }

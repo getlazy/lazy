@@ -30,6 +30,7 @@ import {
   handleRejectTask,
   handleCloseTask,
   handleSyncTask,
+  handleReparentTask,
   handleResumeTask,
   handleGetDaemonMcpConfig,
   RpcError,
@@ -556,4 +557,30 @@ export async function querySyncTask(params: {
 
   const root = requireLazyRoot();
   return await handleSyncTask(root, params) as SyncTaskRpcResult;
+}
+
+// --- Reparent Task ---
+
+export interface ReparentTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  status: 'noop' | 'reparented' | 'reparented_no_sync';
+  syncStatus?: 'up_to_date' | 'sync_launched' | 'pending_sync';
+  newParent: string;
+  message: string;
+  warnings: string[];
+}
+
+export async function queryReparentTask(params: {
+  taskId: string;
+  parent: string;
+}): Promise<ReparentTaskRpcResult> {
+  const rpc = await tryRpc<ReparentTaskRpcResult>('reparentTask', {
+    taskId: params.taskId,
+    parent: params.parent,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleReparentTask(root, params) as ReparentTaskRpcResult;
 }

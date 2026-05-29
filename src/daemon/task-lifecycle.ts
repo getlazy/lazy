@@ -25,19 +25,22 @@ import { loadConfig } from '../config/loader';
 import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
 import { createDriver } from '../remote';
+import { regenerateFidelity } from '../synthesis/fidelity';
+import { getSummarizer } from '../synthesis/summarizer';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { resolveAndPersistEffort } from './effort';
 import { getAgent } from '../agent/registry';
-import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getCurrentBranch, recoverMissingWorktreeWithFetch } from '../git/operations';
+import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus } from '../protocol';
-import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
+import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { resetAutoReactCounters } from './auto-react-budget';
 import { isFeatureEnabled } from '../utils/features';
 import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
+import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../task-target';
 import { logger } from '../utils/logger';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
@@ -103,32 +106,41 @@ export async function resolveParentBranchWithFallback(
 ): Promise<{ branch: string; warnings: string[] }> {
   const warnings: string[] = [];
 
-  if (!task.parent_task_id) {
-    let branch = task.metadata?.remote_target_branch;
-    if (!branch || branch.startsWith('lazy/')) {
-      // Stale task-branch reference or missing — resolve to actual main branch
-      branch = await getCurrentBranch(projectRoot);
-      if (task.metadata?.remote_target_branch) {
-        // Overwrite stale metadata so future syncs use the correct branch
-        await storage.updateTaskMetadata(task.id, 'remote_target_branch', branch);
-        warnings.push(`Corrected stale remote_target_branch from ${task.metadata.remote_target_branch} to ${branch}.`);
+  const directParentId = parentTaskIdOf(task);
+
+  if (!directParentId) {
+    // Top-level task: integrate into the named branch. An empty '' sentinel or a
+    // stale 'lazy/...' ref (a task-branch reference that legacy data could hold
+    // in the branch slot) means the stored branch needs runtime resolution —
+    // heal to the repo's configured default integration branch (origin/HEAD →
+    // 'main' fallback), NEVER to whatever the user currently has checked out at
+    // sync time. Note: targetBranchOf does NOT strip 'lazy/', so the raw stored
+    // branch is inspected here.
+    const stored = task.target.kind === 'branch' ? task.target.branch : '';
+    let branch = (stored && !stored.startsWith('lazy/')) ? stored : '';
+    if (!branch) {
+      const cfg = await loadConfig(projectRoot);
+      branch = await getRemoteDefaultBranch(projectRoot, cfg.remote.git_remote);
+      if (stored) {
+        await storage.updateTaskTarget(task.id, branchTarget(branch));
+        warnings.push(`Corrected stale target branch from ${stored} to ${branch}.`);
       }
     }
     return { branch, warnings };
   }
 
   // Check if the direct parent is still alive
-  const parentTask = await storage.getTask(task.parent_task_id);
+  const parentTask = await storage.getTask(directParentId);
   if (parentTask && !isTerminalStatus(parentTask.status)) {
     // Parent is alive — use its branch directly
     return {
-      branch: await getBranchNameFromId(task.parent_task_id, storage),
+      branch: await getBranchNameFromId(directParentId, storage),
       warnings,
     };
   }
 
   // Parent is terminal (or missing) — walk up to find a living ancestor
-  let currentParentId: string | null = task.parent_task_id;
+  let currentParentId: string | null = directParentId;
   const staleAncestors: string[] = [];
 
   while (currentParentId) {
@@ -140,17 +152,16 @@ export async function resolveParentBranchWithFallback(
     }
 
     if (!isTerminalStatus(ancestor.status)) {
-      // Found a living ancestor — reparent to it.
-      // Note: remote_target_branch may be stale (set relative to the old parent),
-      // but it's not used when parent_task_id is set — the branch is derived from
-      // the parent task ID. If this ancestor later becomes terminal too, the
-      // "all ancestors terminal" path below ignores remote_target_branch.
+      // Found a living ancestor — reparent to it. The target becomes a
+      // `{ kind: 'task' }` pointing at the ancestor; its branch is derived from
+      // the ancestor at sync time, so there's no separate branch to keep in
+      // step (the union can't hold a stale branch alongside a parent).
       const ancestorDisplay = displayId(ancestor);
       const staleList = staleAncestors.join(' → ');
       logger.info(`Task ${displayId(task)}: parent chain ${staleList} is terminal, reparenting to ${ancestorDisplay}`);
       warnings.push(`Parent task ${staleList} is complete. Reparented to ${ancestorDisplay}.`);
 
-      await storage.updateTaskParent(task.id, ancestor.id);
+      await storage.updateTaskTarget(task.id, taskTarget(ancestor.id));
       await storage.createComment(
         task.id,
         `[Re-parented] Stale parent chain detected during sync. Re-parented from ${staleList} to ${ancestorDisplay}.`,
@@ -165,19 +176,19 @@ export async function resolveParentBranchWithFallback(
 
     // This ancestor is terminal too — keep walking
     staleAncestors.push(displayId(ancestor));
-    currentParentId = ancestor.parent_task_id;
+    currentParentId = parentTaskIdOf(ancestor);
   }
 
-  // Reached top-level — all ancestors are terminal or missing.
-  // Ignore remote_target_branch: it was set relative to the now-dead parent chain.
-  // Use getCurrentBranch to get the actual main branch.
+  // Reached top-level — all ancestors are terminal or missing. The old target
+  // branch was set relative to the now-dead parent chain, so ignore it and
+  // resolve to the repo's configured default integration branch.
   const staleList = staleAncestors.join(' → ');
-  const fallbackBranch = await getCurrentBranch(projectRoot);
+  const cfg = await loadConfig(projectRoot);
+  const fallbackBranch = await getRemoteDefaultBranch(projectRoot, cfg.remote.git_remote);
   logger.info(`Task ${displayId(task)}: entire parent chain ${staleList} is terminal, falling back to ${fallbackBranch}`);
   warnings.push(`Parent task ${staleList} is complete. Syncing with ${fallbackBranch} instead.`);
 
-  await storage.updateTaskParent(task.id, null);
-  await storage.updateTaskMetadata(task.id, 'remote_target_branch', fallbackBranch);
+  await storage.updateTaskTarget(task.id, branchTarget(fallbackBranch));
   await storage.createComment(
     task.id,
     `[Re-parented] Stale parent chain detected during sync. All ancestors terminal (${staleList}). Re-parented to top-level, targeting ${fallbackBranch}.`,
@@ -297,7 +308,7 @@ export async function launchUnblockTask(
   runner.checkAvailability();
 
   // --- Orphan detection/retargeting ---
-  if (task.parent_task_id) {
+  if (parentTaskIdOf(task)) {
     const orphanStatus = await checkOrphanedChild(task, storage, projectRoot);
     if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
       if (params.retargetOrphan) {
@@ -448,7 +459,7 @@ export async function launchUnblockTask(
       }
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
@@ -992,7 +1003,7 @@ export async function rejectTask(
     throw new RpcError(400, `Task ${displayId(task)} has no session.`);
   }
   if (sess.outcome === 'rejected') {
-    return { taskId: task.id, displayId: displayId(task), branchName: sess.git_branch, parentTaskId: task.parent_task_id, warnings: ['Task was already rejected.'] };
+    return { taskId: task.id, displayId: displayId(task), branchName: sess.git_branch, parentTaskId: parentTaskIdOf(task), warnings: ['Task was already rejected.'] };
   }
   if (sess.ended_at) {
     throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
@@ -1053,7 +1064,7 @@ export async function rejectTask(
     taskId: task.id,
     displayId: displayId(task),
     branchName: sess.git_branch,
-    parentTaskId: task.parent_task_id,
+    parentTaskId: parentTaskIdOf(task),
     warnings,
   };
 }
@@ -1159,7 +1170,7 @@ export async function closeTask(
     taskId: task.id,
     displayId: displayId(task),
     branchName: sess?.git_branch ?? null,
-    parentTaskId: task.parent_task_id,
+    parentTaskId: parentTaskIdOf(task),
     warnings,
   };
 }
@@ -1316,12 +1327,13 @@ export async function acceptTaskPreflight(
   let mergeTargetBranch: string;
   let parentDisplayId: string | null = null;
   let parentTask: Task | null = null;
-  const isChildTask = !!task.parent_task_id;
+  const childParentId = parentTaskIdOf(task);
+  const isChildTask = !!childParentId;
 
-  if (task.parent_task_id) {
-    parentTask = await storage.getTask(task.parent_task_id);
+  if (childParentId) {
+    parentTask = await storage.getTask(childParentId);
     if (!parentTask) {
-      throw new RpcError(400, `Parent task ${task.parent_task_id} not found`);
+      throw new RpcError(400, `Parent task ${childParentId} not found`);
     }
 
     // Refuse to merge into active parent
@@ -1330,10 +1342,10 @@ export async function acceptTaskPreflight(
     }
 
     parentDisplayId = displayId(parentTask);
-    mergeTargetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+    mergeTargetBranch = await getBranchNameFromId(childParentId, storage);
   } else {
     const { resolveDetachedHead } = await import('../git/operations');
-    mergeTargetBranch = await resolveDetachedHead(task.metadata?.remote_target_branch ?? 'main', projectRoot, config.remote.git_remote);
+    mergeTargetBranch = await resolveDetachedHead(targetBranchOf(task) ?? 'main', projectRoot, config.remote.git_remote);
   }
 
   // --- Branch sync validation (root tasks with remote driver) ---
@@ -1357,7 +1369,7 @@ export async function acceptTaskPreflight(
     worktreePath,
     branchName: sess.git_branch,
     sessionId: sess.id,
-    parentTaskId: task.parent_task_id,
+    parentTaskId: parentTaskIdOf(task),
     mergeTargetBranch,
     isChildTask,
     parentDisplayId,
@@ -1413,7 +1425,9 @@ export async function acceptTask(
   const warnings: string[] = [];
   const config = await loadConfig(projectRoot);
   const offline = await isOfflineMode(join(projectRoot, '.lazy'));
-  const driver = createDriver(config, undefined, { offline });
+  // Pass a DriverContext so hosted-driver CLI calls (e.g. gh pr edit for
+  // commit/PR fidelity) run against the project root and can read storage.
+  const driver = createDriver(config, { storage, lazyRoot: projectRoot }, { offline });
   if (offline) {
     const configuredDriver = config.remote.driver;
     if (configuredDriver === 'gitlab' || configuredDriver === 'github') {
@@ -1468,7 +1482,7 @@ export async function acceptTask(
       // Remote merge completed — fast-forward local and finalize
       const { resolveDetachedHead } = await import('../git/operations');
       const resolvedMergeTarget = await resolveDetachedHead(
-        task.metadata?.remote_target_branch ?? mergeTargetBranch,
+        targetBranchOf(task) ?? mergeTargetBranch,
         projectRoot,
         config.remote.git_remote,
       );
@@ -1481,6 +1495,10 @@ export async function acceptTask(
         warnings.push(ffResult.warning);
       }
 
+      // Authoritative accept marker — created BEFORE the status transition so a
+      // crash here still leaves a recoverable signal for the zombie sweep.
+      await createAcceptTag(task.id, resolvedMergeTarget, projectRoot);
+
       await storage.endSession(sess.id, 'accepted');
       await storage.updateTaskStatus(task.id, 'complete', getActor());
 
@@ -1490,6 +1508,9 @@ export async function acceptTask(
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
+
+      // Child→parent fidelity (remote-merge re-entry paths).
+      await regenerateParentFidelity(storage, task, driver, getSummarizer(config.models.default), warnings);
 
       await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
       await removeLock(worktreePath);
@@ -1555,7 +1576,7 @@ export async function acceptTask(
     if (retryResult.status === 'merged') {
       const { resolveDetachedHead } = await import('../git/operations');
       const resolvedMergeTarget = await resolveDetachedHead(
-        task.metadata?.remote_target_branch ?? mergeTargetBranch,
+        targetBranchOf(task) ?? mergeTargetBranch,
         projectRoot,
         config.remote.git_remote,
       );
@@ -1566,6 +1587,10 @@ export async function acceptTask(
       }
       if (ffResult.warning) warnings.push(ffResult.warning);
 
+      // Authoritative accept marker — created BEFORE the status transition so a
+      // crash here still leaves a recoverable signal for the zombie sweep.
+      await createAcceptTag(task.id, resolvedMergeTarget, projectRoot);
+
       await storage.endSession(sess.id, 'accepted');
       await storage.updateTaskStatus(task.id, 'complete', getActor());
 
@@ -1575,6 +1600,9 @@ export async function acceptTask(
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
+
+      // Child→parent fidelity (remote-merge re-entry paths).
+      await regenerateParentFidelity(storage, task, driver, getSummarizer(config.models.default), warnings);
 
       await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
       await removeLock(worktreePath);
@@ -1691,6 +1719,18 @@ export async function acceptTask(
     }
   }
 
+  // --- Step 4b: Regenerate the fidelity record before merge ---
+  // Synthesize a faithful summary of what the work actually became (pivots,
+  // human feedback, child contributions) from storage. For hosted drivers this
+  // updates the lazy-owned section of the PR/MR body, which is what the squash
+  // commit is built from at merge time. For the local driver the summary is
+  // carried into the squash message via MergeOptions.fidelityBody below.
+  // Never blocks the merge: synthesis failure falls back to deterministic
+  // output, and a remote-write failure is surfaced as a warning.
+  const summarizer = getSummarizer(config.models.default);
+  const fidelity = await regenerateFidelity(storage, task, driver, summarizer);
+  if (fidelity.warning) warnings.push(fidelity.warning);
+
   // --- Step 5: Attempt merge via driver ---
   let result = await driver.merge({
     sourceBranch: sess.git_branch,
@@ -1698,6 +1738,7 @@ export async function acceptTask(
     task,
     taskShortId: taskRef(task),
     root: projectRoot,
+    fidelityBody: fidelity.fidelityBody,
   });
 
   // Always persist metadata immediately
@@ -1743,7 +1784,7 @@ export async function acceptTask(
   // --- Step 7: Merge succeeded — fast-forward local and finalize ---
   const { resolveDetachedHead } = await import('../git/operations');
   const resolvedMergeTarget = await resolveDetachedHead(
-    task.metadata?.remote_target_branch ?? mergeTargetBranch,
+    targetBranchOf(task) ?? mergeTargetBranch,
     projectRoot,
     config.remote.git_remote,
   );
@@ -1755,6 +1796,12 @@ export async function acceptTask(
   if (ffResult.warning) {
     warnings.push(ffResult.warning);
   }
+
+  // Authoritative accept marker — created BEFORE the status transition so a
+  // crash in the window between merge and status update still leaves a
+  // recoverable signal for the zombie sweep. Covers both the local squash
+  // path (target HEAD is the squash commit) and the remote FF path.
+  await createAcceptTag(task.id, resolvedMergeTarget, projectRoot);
 
   // End session, create comment, post review
   await storage.endSession(sess.id, 'accepted');
@@ -1792,6 +1839,13 @@ export async function acceptTask(
     await storage.incrementTaskPendingSync(child.id);
   }
 
+  // Child→parent fidelity: this task's work just landed in its parent's branch,
+  // so regenerate the parent/hub body to reflect the new child contribution.
+  // Because the parent body is kept current as children land (read from
+  // storage), by the time the parent merges to main it already reflects all
+  // child work — no separate aggregation step is needed.
+  await regenerateParentFidelity(storage, task, driver, summarizer, warnings);
+
   await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
   await removeLock(worktreePath);
   await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
@@ -1805,6 +1859,26 @@ export async function acceptTask(
     prUrl: prUrl ?? undefined,
     warnings,
   };
+}
+
+/**
+ * If `task` was a child merged into its parent, regenerate the parent's
+ * fidelity record so the parent/hub PR/MR body reflects the newly-landed child.
+ * No-op when the task has no parent. Never throws (regenerateFidelity is safe).
+ */
+async function regenerateParentFidelity(
+  storage: Storage,
+  task: Task,
+  driver: ReturnType<typeof createDriver>,
+  summarizer: ReturnType<typeof getSummarizer>,
+  warnings: string[],
+): Promise<void> {
+  const parentId = parentTaskIdOf(task);
+  if (!parentId) return;
+  const parent = await storage.getTask(parentId);
+  if (!parent) return;
+  const parentFidelity = await regenerateFidelity(storage, parent, driver, summarizer);
+  if (parentFidelity.warning) warnings.push(parentFidelity.warning);
 }
 
 // =====================================================================
@@ -2098,6 +2172,201 @@ export async function syncTask(
   } finally {
     await removeLock(worktreePath);
   }
+}
+
+// =====================================================================
+// Reparent Task — repoint a task to a new parent and sync
+// =====================================================================
+
+export interface ReparentTaskParams {
+  taskId: string;
+  /** New parent: a task code, short ID, or a raw branch name (e.g. "main"). */
+  parent: string;
+}
+
+export interface ReparentTaskResult {
+  taskId: string;
+  displayId: string;
+  /**
+   * - 'noop': task is already parented on the requested target — nothing changed
+   * - 'reparented': parent repointed and a sync ran (see syncStatus)
+   * - 'reparented_no_sync': parent repointed but the task has no live session
+   *   yet (e.g. backlog), so there is nothing to merge — it will branch from
+   *   the new parent when started
+   */
+  status: 'noop' | 'reparented' | 'reparented_no_sync';
+  /** Underlying sync status when a sync ran. */
+  syncStatus?: 'up_to_date' | 'sync_launched' | 'pending_sync';
+  /** Human-readable description of the new parent. */
+  newParent: string;
+  message: string;
+  warnings: string[];
+}
+
+/**
+ * Repoint a task to a new parent and merge the new parent into its branch.
+ *
+ * Reparent does exactly two things — it does NOT create a new task, reset the
+ * session, or touch the task's history:
+ *   1. Repoint the task's canonical integration target (a single TaskTarget —
+ *      either { kind: 'task' } or { kind: 'branch' }) through the Storage interface.
+ *   2. Run the existing `lazy sync` machinery so the task's own agent merges
+ *      the new parent into its branch and resolves any conflicts in place.
+ *
+ * The task keeps its identity: same session, same turns, same commits, same
+ * branch. Only its parent pointer (and therefore its sync/accept/diff base)
+ * changes.
+ */
+export async function reparentTask(
+  projectRoot: string,
+  params: ReparentTaskParams,
+): Promise<ReparentTaskResult> {
+  const storage = await getOrCreateStorage();
+  const warnings: string[] = [];
+
+  // --- Resolve task ---
+  const result = await storage.resolveTask(params.taskId);
+  if (!result.task) {
+    if (result.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'. Matches: ${result.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${params.taskId}`);
+  }
+  const task = result.task;
+
+  // --- Status validation ---
+  // Don't pull the branch out from under a running agent.
+  if (task.status === 'working') {
+    throw new RpcError(409, `Task ${displayId(task)} is currently working. Wait for it to finish or interrupt it before reparenting.`);
+  }
+  // A terminal task's branch may already be merged or deleted — reopen first.
+  if (isTerminalStatus(task.status)) {
+    throw new RpcError(409, `Task ${displayId(task)} is ${task.status}. Reopen it first with: lazy reopen ${displayId(task)}`);
+  }
+
+  // --- Resolve the new parent (task code / short ID, or raw branch name) ---
+  let newParentTaskId: string | null = null;
+  let targetBranch: string;
+  let newParentLabel: string;
+
+  const parentResult = await storage.resolveTask(params.parent);
+  if (parentResult.task) {
+    const parentTask = parentResult.task;
+
+    if (parentTask.id === task.id) {
+      throw new RpcError(400, `Cannot reparent ${displayId(task)} onto itself.`);
+    }
+    if (isTerminalStatus(parentTask.status)) {
+      throw new RpcError(409, `Cannot use ${displayId(parentTask)} as parent: it is ${parentTask.status}.`);
+    }
+    // Cycle check: the new parent must not be a descendant of this task.
+    const parentAncestry = await storage.getTaskAncestry(parentTask.id);
+    if (parentAncestry.some(a => a.id === task.id)) {
+      throw new RpcError(400, `Cannot reparent ${displayId(task)} onto ${displayId(parentTask)}: that would create a cycle (the target is a descendant of this task).`);
+    }
+
+    newParentTaskId = parentTask.id;
+    targetBranch = await getBranchNameFromId(parentTask.id, storage);
+    newParentLabel = `${displayId(parentTask)} (${targetBranch})`;
+  } else if (parentResult.ambiguousMatches?.length) {
+    throw new RpcError(409, `Ambiguous parent '${params.parent}'. Matches: ${parentResult.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+  } else {
+    // Not a task — treat it as a raw branch name. Verify it resolves locally
+    // (boundary check); sync's resolveUpstreamRef handles the remote fetch.
+    const branch = params.parent;
+    const verify = await runGit(['rev-parse', '--verify', '--quiet', branch], { cwd: projectRoot });
+    if (verify.exitCode !== 0) {
+      throw new RpcError(404, `Could not resolve '${params.parent}' as a task or a git branch.`);
+    }
+    newParentTaskId = null;
+    targetBranch = branch;
+    newParentLabel = `branch ${branch}`;
+  }
+
+  // --- No-op detection (already on that parent) ---
+  const currentParentId = parentTaskIdOf(task);
+  let isNoop = false;
+  if (newParentTaskId !== null) {
+    isNoop = currentParentId === newParentTaskId;
+  } else if (currentParentId === null) {
+    // Both top-level: compare the effective tracked branch.
+    const cur = targetBranchOf(task);
+    const cfg = await loadConfig(projectRoot);
+    const curBranch = cur ?? await getRemoteDefaultBranch(projectRoot, cfg.remote.git_remote);
+    isNoop = curBranch === targetBranch;
+  }
+
+  if (isNoop) {
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'noop',
+      newParent: newParentLabel,
+      message: `Task ${displayId(task)} is already parented on ${newParentLabel}. Nothing to do.`,
+      warnings,
+    };
+  }
+
+  // --- Step 1: repoint the target through the Storage interface ---
+  const oldParentLabel = currentParentId
+    ? await displayIdFor(storage, currentParentId)
+    : (targetBranchOf(task) ? `branch ${targetBranchOf(task)}` : 'top-level');
+
+  // A single canonical target — either stacked on a task or pointed at a branch.
+  // There is no separate parent/branch pair to keep consistent.
+  await storage.updateTaskTarget(
+    task.id,
+    newParentTaskId !== null ? taskTarget(newParentTaskId) : branchTarget(targetBranch),
+  );
+
+  await storage.createComment(
+    task.id,
+    `[Reparented] Parent changed from ${oldParentLabel} to ${newParentLabel}.`,
+    getActor(),
+  );
+
+  // Children stack on THIS task's branch, not on its parent. Repointing this
+  // task doesn't change its own branch — children remain based on it and pick
+  // up the new parent's changes the next time they sync. So we don't block or
+  // orphan them; just inform the caller.
+  const activeChildren = await getActiveChildren(task.id, storage);
+  if (activeChildren.length > 0) {
+    const plural = activeChildren.length === 1 ? 'child task remains' : 'child tasks remain';
+    warnings.push(
+      `${activeChildren.length} active ${plural} based on this task's branch (${getBranchName(task)}). ` +
+      `They are unaffected by the reparent and will pick up the new parent's changes the next time they sync.`,
+    );
+  }
+
+  // --- Step 2: merge the new parent into the task branch via existing sync ---
+  const sess = await storage.getSessionByTaskId(task.id);
+  if (!sess || sess.ended_at || task.status === 'backlog') {
+    // No live session (e.g. backlog / never started). Nothing to merge — the
+    // task will branch from the new parent when it starts.
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'reparented_no_sync',
+      newParent: newParentLabel,
+      message: `Reparented ${displayId(task)} onto ${newParentLabel}. Task has no active session yet; it will branch from the new parent when started.`,
+      warnings,
+    };
+  }
+
+  // Reuse the existing sync machinery — do NOT reimplement merge logic. The
+  // task's own agent rides along to resolve any conflicts in place.
+  const syncResult = await syncTask(projectRoot, { taskId: task.id });
+  warnings.push(...syncResult.warnings);
+
+  return {
+    taskId: task.id,
+    displayId: displayId(task),
+    status: 'reparented',
+    syncStatus: syncResult.status,
+    newParent: newParentLabel,
+    message: `Reparented ${displayId(task)} onto ${newParentLabel}. ${syncResult.message}`,
+    warnings,
+  };
 }
 
 // =====================================================================
@@ -2441,7 +2710,7 @@ export async function resumeTask(
       }
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
+    // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);

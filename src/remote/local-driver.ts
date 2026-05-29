@@ -32,7 +32,7 @@ export class LocalDriver implements RepositoryDriver {
   }
 
   async merge(opts: MergeOptions): Promise<MergeResult> {
-    const { sourceBranch, targetBranch, task, taskShortId, root } = opts;
+    const { sourceBranch, targetBranch, task, taskShortId, root, fidelityBody } = opts;
 
     // Check for merge conflicts
     // Use the appropriate check based on whether we're merging to main (HEAD) or a specific target
@@ -65,7 +65,7 @@ export class LocalDriver implements RepositoryDriver {
 
     // Perform the squash merge — local merges are always immediate, never pending
     try {
-      await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root);
+      await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody);
     } catch (err) {
       return {
         status: 'failed',
@@ -139,6 +139,11 @@ export class LocalDriver implements RepositoryDriver {
 
   async postTurnSummary(_task: Task, _content: string): Promise<void> {
     // No-op for local driver
+  }
+
+  async updateRemoteBody(_task: Task, _summary: string): Promise<void> {
+    // No-op for local driver — there is no remote body. The synthesized
+    // summary reaches the local squash commit via MergeOptions.fidelityBody.
   }
 
   async postAcceptReview(_task: Task, _reason: string): Promise<string | null> {

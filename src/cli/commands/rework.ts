@@ -5,6 +5,7 @@ import { theme } from '../theme';
 import type { Task } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { logger } from '../../utils/logger';
+import { parentTaskIdOf } from '../../task-target';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -65,13 +66,14 @@ async function resolveParent(
   }
 
   // Inherit from original task's parent
-  if (originalTask.parent_task_id) {
-    const parentTask = await storage.getTask(originalTask.parent_task_id);
+  const originalParentId = parentTaskIdOf(originalTask);
+  if (originalParentId) {
+    const parentTask = await storage.getTask(originalParentId);
     if (parentTask && TERMINAL_STATUSES.includes(parentTask.status)) {
       console.error(`Original parent ${displayId(parentTask)} is ${parentTask.status}. Use --parent to specify where this rework should land.`);
       process.exit(1);
     }
-    return originalTask.parent_task_id;
+    return originalParentId;
   }
 
   return undefined;

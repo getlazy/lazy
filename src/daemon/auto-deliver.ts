@@ -27,6 +27,7 @@ import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
 import { logger } from '../utils/logger';
 import { taskRef, getWorktreePathForRef } from '../cli/helpers';
+import { parentTaskIdOf } from '../task-target';
 import { branchExists } from '../git/operations';
 import { shouldAutoReact, recordAutoReact, type AutoReactTrigger } from './auto-react-budget';
 import { runGit } from '../utils/git';
@@ -52,12 +53,13 @@ async function isParentBranchAhead(
   task: Task,
   lazyRoot: string,
 ): Promise<{ ahead: boolean; parentTip: string | null }> {
-  if (!task.parent_task_id) return { ahead: false, parentTip: null };
+  const parentId = parentTaskIdOf(task);
+  if (!parentId) return { ahead: false, parentTip: null };
 
   const session = await storage.getSessionByTaskId(task.id);
   if (!session?.git_branch) return { ahead: false, parentTip: null };
 
-  const parentTask = await storage.getTask(task.parent_task_id);
+  const parentTask = await storage.getTask(parentId);
   if (!parentTask) return { ahead: false, parentTip: null };
 
   const parentRef = taskRef(parentTask);
@@ -169,7 +171,7 @@ export async function autoUnblockTask(
   try {
     const config = await loadConfig(lazyRoot, { cwd: worktreePath });
     // When Ollama is enabled for Claude Code, always use the Ollama model — task model
-    // names (e.g. "claude-opus-4-7") don't exist in Ollama's model registry.
+    // names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
     const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
       ? config.ollama.model
       : (task.model ?? config.models.default);
@@ -514,9 +516,10 @@ export async function detectAndDeliverEvents(
       if (currStatus === 'complete' && prevStatus !== 'complete') {
         // Task was accepted since last tick
         const task = allTasks.find(t => t.id === taskId);
-        if (task?.parent_task_id) {
+        const parentId = task ? parentTaskIdOf(task) : null;
+        if (parentId) {
           logger.debug(`Auto-deliver: detected accept of task ${shortId(taskId)}`);
-          await handleTaskAccepted(storage, taskId, task.parent_task_id, lazyRoot);
+          await handleTaskAccepted(storage, taskId, parentId, lazyRoot);
         }
       }
     }
@@ -579,8 +582,9 @@ async function detectParentBranchChanges(
   // Build a set of parent task IDs that have children
   const parentIds = new Set<string>();
   for (const task of tasks) {
-    if (task.parent_task_id) {
-      parentIds.add(task.parent_task_id);
+    const parentId = parentTaskIdOf(task);
+    if (parentId) {
+      parentIds.add(parentId);
     }
   }
 
@@ -701,10 +705,11 @@ export async function runBlockedTaskCatchup(
     // --- Phase 1: Detect conditions and emit durable signals ---
     for (const task of blockedTasks) {
       // --- Check 1: Parent branch ahead of merge-base ---
-      if (task.parent_task_id) {
+      const parentId = parentTaskIdOf(task);
+      if (parentId) {
         try {
           const { ahead, parentTip } = await isParentBranchAhead(storage, task, lazyRoot);
-          logger.debug(`Catchup: task ${shortId(task.id)} parent_task_id=${shortId(task.parent_task_id)} ahead=${ahead} parentTip=${parentTip ? shortId(parentTip) : 'null'}`);
+          logger.debug(`Catchup: task ${shortId(task.id)} parent_task_id=${shortId(parentId)} ahead=${ahead} parentTip=${parentTip ? shortId(parentTip) : 'null'}`);
 
           if (ahead && parentTip) {
             // Content-based dedup: check if a signal already exists for this parent tip

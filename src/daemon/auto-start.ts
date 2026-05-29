@@ -16,6 +16,7 @@ import { dirname } from 'path';
 import { spawn } from '../utils/spawn';
 import { waitForDaemon, cleanupStaleFiles, isDaemonRunning, getLogPath, getStartupErrorPath } from './index';
 import { getLazyCommand } from '../utils/cli-path';
+import { assertDaemonCredentials } from './credential-gate';
 
 /** Commands that should NOT trigger auto-start (they work without daemon) */
 const SKIP_AUTO_START = new Set([
@@ -38,6 +39,12 @@ const SKIP_AUTO_START = new Set([
  * @param projectRoot - Project root directory
  */
 export async function startDaemonBackground(projectRoot: string): Promise<void> {
+  // Credential gate (the single enforcement point for auth). Pre-flight here,
+  // before spawning the detached child, so a missing credential surfaces as an
+  // immediate actionable error in the caller's terminal — not a confusing
+  // "Daemon did not start within 5 seconds" timeout after the child dies.
+  await assertDaemonCredentials(projectRoot);
+
   const logPath = getLogPath(projectRoot);
   const startupErrorPath = getStartupErrorPath(projectRoot);
 

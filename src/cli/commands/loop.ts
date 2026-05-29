@@ -15,6 +15,7 @@ import { ActivityMonitor } from '../activity-monitor';
 
 import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
 import { getActor } from '../../constants';
+import { parentTaskIdOf } from '../../task-target';
 
 /** Maximum number of recent activity lines to display in the polling view. */
 const MAX_ACTIVITY_LINES = 10;
@@ -147,8 +148,9 @@ async function handleInterruptedTasks(
 
     // Show recent commits if available
     let targetBranch: string;
-    if (task.parent_task_id) {
-      targetBranch = await getBranchNameFromId(task.parent_task_id, storage);
+    const parentId = parentTaskIdOf(task);
+    if (parentId) {
+      targetBranch = await getBranchNameFromId(parentId, storage);
     } else {
       targetBranch = 'main';
     }
@@ -414,7 +416,7 @@ export async function commandLoop(args: string[]): Promise<void> {
         sess.git_branch,
         worktreePath,
         root,
-        task.parent_task_id,
+        parentTaskIdOf(task),
         storage,
         task.id,
         sess.id,
@@ -498,7 +500,7 @@ remain, enters a follow mode that shows active tasks and polls for new blocked
 tasks every 3 seconds. Ctrl+C exits at any time.
 
 Options:
-  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-sonnet-4-5-20250929)
+  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-opus-4-8)
   --follow          Wait for agent after giving feedback
 
 Examples:

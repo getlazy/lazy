@@ -5,6 +5,7 @@ import { getTurnDiff } from '../../utils/diff';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
 import { queryDiff } from '../../daemon/rpc-fallback';
+import { parentTaskIdOf } from '../../task-target';
 
 export async function commandDiff(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -62,7 +63,7 @@ export async function commandDiff(args: string[]): Promise<void> {
           process.exit(1);
         }
       }
-      await handleTurnDiff(storage, sess.id, turnValue, worktreePath, task.parent_task_id, root, lineRange);
+      await handleTurnDiff(storage, sess.id, turnValue, worktreePath, parentTaskIdOf(task), root, lineRange);
     } finally {
       await storage.close();
     }

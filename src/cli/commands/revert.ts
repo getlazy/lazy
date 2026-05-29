@@ -3,6 +3,7 @@ import { openEditor, removeRecoveryFile, isTTY } from '../editor';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
 import { runGit } from '../../utils/git';
+import { parentTaskIdOf } from '../../task-target';
 
 /**
  * Find the merge commit SHA for an accepted task on the target branch.
@@ -58,8 +59,9 @@ export async function commandRevert(args: string[]): Promise<void> {
     }
 
     // Determine the target branch where the merge landed
-    const mergeTargetBranch = task.parent_task_id
-      ? await getBranchNameFromId(task.parent_task_id, storage)
+    const parentId = parentTaskIdOf(task);
+    const mergeTargetBranch = parentId
+      ? await getBranchNameFromId(parentId, storage)
       : 'main';
 
     // Find the merge commit

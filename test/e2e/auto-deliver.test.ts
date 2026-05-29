@@ -74,8 +74,8 @@ describe('auto-deliver', () => {
         const childB = allTasks.find(t => t.id.startsWith(childBShortId))!;
 
         // Set up parent-child relationships
-        await storage.updateTaskParent(childA.id, parentTask.id);
-        await storage.updateTaskParent(childB.id, parentTask.id);
+        await storage.updateTaskTarget(childA.id, { kind: 'task' as const, parentTaskId: parentTask.id });
+        await storage.updateTaskTarget(childB.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         // Child B is working with SSE connection
         await storage.updateTaskStatus(childB.id, 'working', 'system');
@@ -155,7 +155,7 @@ describe('auto-deliver', () => {
         const parentTask = allTasks.find(t => t.id.startsWith(parentShortId))!;
         const childTask = allTasks.find(t => t.id.startsWith(childShortId))!;
 
-        await storage.updateTaskParent(childTask.id, parentTask.id);
+        await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         // Parent is blocked (has a session but completed a turn)
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
@@ -195,7 +195,7 @@ describe('auto-deliver', () => {
         const parentTask = allTasks.find(t => t.id.startsWith(parentShortId))!;
         const childTask = allTasks.find(t => t.id.startsWith(childShortId))!;
 
-        await storage.updateTaskParent(childTask.id, parentTask.id);
+        await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         // Parent is blocked
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
@@ -230,7 +230,7 @@ describe('auto-deliver', () => {
         const parentTask = allTasks.find(t => t.id.startsWith(parentShortId))!;
         const childTask = allTasks.find(t => t.id.startsWith(childShortId))!;
 
-        await storage.updateTaskParent(childTask.id, parentTask.id);
+        await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
 
         // Parent HAS SSE connection
@@ -334,8 +334,8 @@ describe('auto-deliver', () => {
         const childA = allTasks.find(t => t.id.startsWith(childAShortId))!;
         const childB = allTasks.find(t => t.id.startsWith(childBShortId))!;
 
-        await storage.updateTaskParent(childA.id, parentTask.id);
-        await storage.updateTaskParent(childB.id, parentTask.id);
+        await storage.updateTaskTarget(childA.id, { kind: 'task' as const, parentTaskId: parentTask.id });
+        await storage.updateTaskTarget(childB.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         // Put child B in blocked state
         await storage.updateTaskStatus(childB.id, 'working', 'system');
@@ -548,7 +548,7 @@ describe('auto-deliver', () => {
         const parentTask = allTasks.find(t => t.id.startsWith(parentShortId))!;
         const childTask = allTasks.find(t => t.id.startsWith(childShortId))!;
 
-        await storage.updateTaskParent(childTask.id, parentTask.id);
+        await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
         await storage.updateTaskStatus(parentTask.id, 'blocked', 'system');
