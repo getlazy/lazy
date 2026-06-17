@@ -41,6 +41,8 @@ export async function commandShell(args: string[]): Promise<void> {
     console.log(`  Type 'exit' to return.\n`);
 
     const shell = process.env.SHELL || '/bin/sh';
+    // spawnSync (sync) is required: this is an interactive terminal handoff —
+    // the child shell takes over the TTY and must block until the user exits.
     spawnSync([shell], {
       cwd: worktreePath,
       stdin: 'inherit',

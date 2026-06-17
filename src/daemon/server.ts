@@ -590,7 +590,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // by the reconcile loop.
     try {
       const runner = await createRunner(projectRoot);
-      const runs = runner.discoverRunningRuns();
+      const runs = await runner.discoverRunningRuns();
       for (const runName of runs) {
         // Extract task short ID from run name (e.g., "lazy-abcd1234" → "abcd1234")
         const taskShortId = runName.replace(/^lazy-/, '');
@@ -606,7 +606,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
         try {
           logger.info(`Stopping supervisor ${runner.runDisplayName(runName)}...`);
-          const ok = runner.stopRun(runName);
+          const ok = await runner.stopRun(runName);
           if (ok) {
             logger.info(`Stopped supervisor ${runner.runDisplayName(runName)}`);
           } else {

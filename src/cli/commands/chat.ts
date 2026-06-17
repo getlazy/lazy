@@ -133,6 +133,8 @@ export async function commandChat(args: string[]): Promise<void> {
 
     let exitCode = 0;
     try {
+      // spawnSync (sync) is required: this is an interactive terminal handoff
+      // (stdin/stdout/stderr inherited) that must block until Claude exits.
       const result = spawnSync(claudeArgs, {
         cwd,
         stdin: 'inherit',

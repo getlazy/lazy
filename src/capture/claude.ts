@@ -42,17 +42,31 @@ const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
 // Timeout for Docker inspection commands (ms). Prevents process hangs if Docker daemon is unresponsive.
 const DOCKER_TIMEOUT_MS = 10_000;
 
+/**
+ * Bounded timeout for launching a supervisor container (`docker run`).
+ *
+ * `launchSupervisorAsync` runs on the daemon's hottest paths (launch / unblock /
+ * resume / auto-deliver). A wedged `docker run` (hung container runtime, stuck
+ * image pull) must NEVER freeze the daemon event loop indefinitely, so the launch
+ * is bounded. The value is generous — the image is normally already built by
+ * `ensureImage` before launch, so `docker run -d` is sub-second, but a first-run
+ * environment may still pull layers — yet finite so a hang surfaces as an
+ * actionable error instead of a frozen daemon.
+ */
+const CONTAINER_LAUNCH_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+
 // Singleton agent instances for delegation. Functions in this file that were
 // previously hard-coded now delegate to the agent abstraction.
 const _agent = new ClaudeCodeAgent();
 const _packaging = new ClaudeCodePackaging();
 
 
-export function checkDocker(binary: string = 'docker'): void {
+export async function checkDocker(binary: string = 'docker'): Promise<void> {
   logger.debug(`Checking ${binary}...`);
 
-  const result = spawnSync([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
-  if (result.exitCode !== 0) {
+  const proc = spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
     throw new Error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
   }
@@ -249,7 +263,7 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
   const binary = options.binary ?? 'docker';
   const noCache = options.noCache ?? false;
 
-  checkDocker(binary);
+  await checkDocker(binary);
 
   logger.info(`Building ${IMAGE_NAME} container image...`);
   logger.debug('Using embedded default Dockerfile');
@@ -270,7 +284,7 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
  * with a previously-built image even if the Dockerfile has changed.
  */
 export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean }): Promise<string> {
-  checkDocker(binary);
+  await checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
   const imageName = await resolveImageName(lazyRoot);
@@ -729,13 +743,14 @@ export function extractTokenUsage(response: AgentResponse): TokenUsage {
  * Check if a Docker container is currently running.
  * Returns false if Docker is not available.
  */
-export function isContainerRunning(containerName: string, binary: string = 'docker'): boolean {
+export async function isContainerRunning(containerName: string, binary: string = 'docker'): Promise<boolean> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'ps', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
-    return result.exitCode === 0 && result.stdout.toString().trim().length > 0;
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return exitCode === 0 && stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -745,13 +760,14 @@ export function isContainerRunning(containerName: string, binary: string = 'dock
  * Check if a Docker container exists (running or stopped).
  * Returns false if Docker is not available.
  */
-export function containerExists(containerName: string, binary: string = 'docker'): boolean {
+export async function containerExists(containerName: string, binary: string = 'docker'): Promise<boolean> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'ps', '-a', '--filter', `name=^/${containerName}$`, '--format', '{{.ID}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
-    return result.exitCode === 0 && result.stdout.toString().trim().length > 0;
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return exitCode === 0 && stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -761,15 +777,16 @@ export function containerExists(containerName: string, binary: string = 'docker'
  * Get the exit code of a stopped container, or null if still running.
  * Returns null if Docker is not available.
  */
-export function getContainerExitCode(containerName: string, binary: string = 'docker'): number | null {
+export async function getContainerExitCode(containerName: string, binary: string = 'docker'): Promise<number | null> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
-    if (result.exitCode !== 0) return null;
+    const [stdout, procExit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (procExit !== 0) return null;
 
-    const output = result.stdout.toString().trim();
+    const output = stdout.trim();
     const [running, exitCode] = output.split(' ');
     if (running === 'true') return null; // Still running
     return parseInt(exitCode, 10);
@@ -799,16 +816,19 @@ export function getContainerOutput(containerName: string, binary: string = 'dock
  * Get the last N lines of container logs (stdout + stderr combined).
  * Returns null if Docker is not available or container doesn't exist.
  */
-export function getContainerLogs(containerName: string, tailLines: number = 50, binary: string = 'docker'): string | null {
+export async function getContainerLogs(containerName: string, tailLines: number = 50, binary: string = 'docker'): Promise<string | null> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'logs', '--tail', String(tailLines), containerName],
       { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
-    if (result.exitCode !== 0) return null;
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (exitCode !== 0) return null;
     // Combine stdout and stderr since docker logs splits them
-    const stdout = result.stdout.toString();
-    const stderr = result.stderr.toString();
     return (stdout + stderr).trim() || null;
   } catch {
     return null;
@@ -819,15 +839,15 @@ export function getContainerLogs(containerName: string, tailLines: number = 50, 
  * Remove a Docker container. Logs a warning on failure but does not throw.
  * No-op if Docker is not available.
  */
-export function removeContainer(containerName: string, binary: string = 'docker'): void {
+export async function removeContainer(containerName: string, binary: string = 'docker'): Promise<void> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'rm', '-f', containerName],
       { stdout: 'ignore', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS }
     );
-    if (result.exitCode !== 0) {
-      const stderr = result.stderr.toString().trim();
-      logger.warn(`Failed to remove container ${containerName} (exit ${result.exitCode}): ${stderr}`);
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (exitCode !== 0) {
+      logger.warn(`Failed to remove container ${containerName} (exit ${exitCode}): ${stderr.trim()}`);
     }
   } catch {
     // Docker not available — nothing to remove
@@ -844,27 +864,28 @@ export interface ContainerInfo {
  * Get detailed info about a container: running state, exit code, and finished time.
  * Returns null if the container doesn't exist or Docker is unavailable.
  */
-export function getContainerInfo(containerName: string, binary: string = 'docker'): ContainerInfo | null {
+export async function getContainerInfo(containerName: string, binary: string = 'docker'): Promise<ContainerInfo | null> {
   try {
-    const result = spawnSync(
+    const proc = spawn(
       [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
-    if (result.exitCode !== 0) return null;
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (exitCode !== 0) return null;
 
-    const output = result.stdout.toString().trim();
+    const output = stdout.trim();
     const parts = output.split(' ');
     if (parts.length < 3) return null;
 
     const running = parts[0] === 'true';
-    const exitCode = parseInt(parts[1], 10);
+    const containerExitCode = parseInt(parts[1], 10);
     // FinishedAt is "0001-01-01T00:00:00Z" when never finished (still running or never started)
     const finishedAt = parts.slice(2).join(' ');
     const isZeroTime = finishedAt.startsWith('0001-01-01');
 
     return {
       running,
-      exitCode,
+      exitCode: containerExitCode,
       finishedAt: isZeroTime ? null : finishedAt,
     };
   } catch {
@@ -998,15 +1019,49 @@ export async function launchSupervisorAsync(
 
   logger.info('Launching supervisor container...');
 
-  const result = spawnSync(args, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  // Async spawn (not spawnSync) so a wedged `docker run` can never block the
+  // daemon event loop. We own the timeout explicitly (wrapper timer disabled via
+  // timeout: 0) so a timeout produces an actionable error rather than an opaque
+  // signal exit code: on deadline we kill the process, which closes its streams
+  // and lets the reads below resolve.
+  const proc = spawn(args, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
 
-  if (result.exitCode !== 0) {
-    const stderr = result.stderr.toString().trim();
-    logger.error(`Failed to launch supervisor container: ${stderr}`);
-    throw new Error(`Failed to launch supervisor container: ${stderr}`);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill();
+    } catch {
+      // Process may have already exited — nothing to kill.
+    }
+  }, CONTAINER_LAUNCH_TIMEOUT_MS);
+
+  let stdout: string;
+  let stderr: string;
+  let exitCode: number;
+  try {
+    [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (timedOut) {
+    const msg =
+      `Timed out after ${CONTAINER_LAUNCH_TIMEOUT_MS / 60_000}m launching supervisor container ${containerName}. ` +
+      `The container runtime (${binary}) may be unresponsive or stuck pulling an image — ` +
+      `check \`${binary} info\` and \`${binary} ps\`, then retry.`;
+    logger.error(msg);
+    throw new Error(msg);
+  }
+
+  if (exitCode !== 0) {
+    const errText = stderr.trim();
+    logger.error(`Failed to launch supervisor container: ${errText}`);
+    throw new Error(`Failed to launch supervisor container: ${errText}`);
   }
 
   logger.debug(`Supervisor container ${containerName} launched`);

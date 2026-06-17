@@ -55,7 +55,7 @@ export async function commandReview(args: string[]): Promise<void> {
     const { createRunner } = await import('../../runner');
     const runner = await createRunner(root);
     try {
-      runner.checkAvailability();
+      await runner.checkAvailability();
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);

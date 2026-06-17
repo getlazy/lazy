@@ -39,7 +39,7 @@ export interface Runner {
    * Pre-flight check. Throws if the runner infrastructure is not available
    * (e.g., Docker not installed, claude not on PATH).
    */
-  checkAvailability(): void;
+  checkAvailability(): Promise<void>;
 
   /**
    * Ensure infrastructure is ready (Docker image built, agent binary compiled, etc.).
@@ -75,28 +75,28 @@ export interface Runner {
   ): Promise<AgentResponse>;
 
   /** Check if a run is currently active. */
-  isRunning(runName: string): boolean;
+  isRunning(runName: string): Promise<boolean>;
 
   /** Check if a run exists (active or stopped). */
-  runExists(runName: string): boolean;
+  runExists(runName: string): Promise<boolean>;
 
   /** Get detailed info about a run. Returns null if not found. */
-  getRunInfo(runName: string): RunInfo | null;
+  getRunInfo(runName: string): Promise<RunInfo | null>;
 
   /** Get exit code of a stopped run. Returns null if still running or not found. */
-  getRunExitCode(runName: string): number | null;
+  getRunExitCode(runName: string): Promise<number | null>;
 
   /** Get logs from a run. */
-  getRunLogs(runName: string, tailLines?: number): string | null;
+  getRunLogs(runName: string, tailLines?: number): Promise<string | null>;
 
   /** Stop a running process/container. Returns true if successfully stopped. */
-  stopRun(runName: string): boolean;
+  stopRun(runName: string): Promise<boolean>;
 
   /** Remove/cleanup a stopped run (container rm, PID file cleanup). */
-  removeRun(runName: string): void;
+  removeRun(runName: string): Promise<void>;
 
   /** List all running lazy runs (container names or run names). */
-  discoverRunningRuns(): string[];
+  discoverRunningRuns(): Promise<string[]>;
 
   /**
    * List builder run names that belong to the given project root.
@@ -107,7 +107,7 @@ export interface Runner {
    * runner-specific mechanism to identify project ownership (DockerRunner
    * uses a container label; host-process mode has no builder runs).
    */
-  discoverProjectBuilderRuns(projectRoot: string): string[];
+  discoverProjectBuilderRuns(projectRoot: string): Promise<string[]>;
 
   /**
    * Start following a run's output for live display.
@@ -150,7 +150,7 @@ export interface Runner {
    * DockerRunner checks Docker; HostProcessRunner checks `claude` on PATH; etc.
    * Follows the same HealthCheck pattern as remote driver's checkHealth().
    */
-  diagnose(): HealthCheck[];
+  diagnose(): Promise<HealthCheck[]>;
 
   // ----- Prompt support -----
 

@@ -6,8 +6,6 @@
  */
 
 import type { Storage, Task, Session, StatusChange } from '../storage';
-import { findLazyRoot } from '../cli/init';
-import { tryRemoteStorage } from '../cli/helpers';
 import { getCommitDiff } from '../git/operations';
 import { logger } from '../utils/logger';
 
@@ -484,7 +482,7 @@ async function handleCommitDetail(storage: Storage, taskId: string, commitId: st
   const diffText = await getCommitDiff(commit.sha);
   const viewMode = getViewMode(url);
 
-  return html(commitDetailHtml(task, commit, diffText, viewMode));
+  return html(await commitDetailHtml(task, commit, diffText, viewMode));
 }
 
 async function handleTaskPr(storage: Storage, taskId: string): Promise<Response> {
@@ -659,8 +657,8 @@ const MAX_PORT_ATTEMPTS = 100;
  * Create the web dashboard request handler for a given storage instance.
  *
  * This handler serves HTML pages and JSON API endpoints for the web dashboard.
- * It's used by both the standalone `lazy server` command and the daemon's
- * TCP-bound web server.
+ * It's used by the daemon's TCP-bound web server, which is the only thing that
+ * serves the dashboard (`lazy server` is a thin alias that prints its URL).
  */
 export function createWebRequestHandler(storage: Storage): (req: Request) => Promise<Response> {
   return async (req: Request) => {
@@ -776,50 +774,4 @@ export function tryBindTcpPort(
   }
 
   return null;
-}
-
-export async function startServer(port: number): Promise<void> {
-  const root = findLazyRoot();
-  if (!root) {
-    console.error('Error: not in a lazy project. Run `lazy init` first.');
-    process.exit(1);
-  }
-
-  const storage = await tryRemoteStorage(root);
-  if (!storage) {
-    console.error('Error: Daemon is not running. Start it with: lazy daemon start');
-    process.exit(1);
-  }
-
-  const requestHandler = createWebRequestHandler(storage);
-
-  const result = tryBindTcpPort(port, requestHandler);
-  if (!result) {
-    console.error(
-      `Error: Could not find an available port (tried ${port}–${port + MAX_PORT_ATTEMPTS - 1}).`,
-    );
-    await storage.close();
-    process.exit(1);
-  }
-
-  const server = result.server;
-
-  logger.info(`Lazy server running at http://localhost:${server.port}`);
-  console.log(`Lazy server running at http://localhost:${server.port}`);
-  console.log('Press Ctrl+C to stop.');
-
-  // Graceful shutdown handler
-  const shutdown = async () => {
-    logger.info('Shutting down server...');
-    server!.stop();
-    await storage.close();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  // Block forever — the process.exit(0) in index.ts fires after dispatch()
-  // returns, so we must never return. Ctrl+C / SIGTERM triggers shutdown above.
-  await new Promise(() => {});
 }

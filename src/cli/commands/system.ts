@@ -1,6 +1,7 @@
 import { printBuiltinPrompts } from './prompts';
 import { commandSystemBuild } from './system-build';
 import { commandOffline, commandOnline } from './offline';
+import { commandSystemStatus } from './system-status';
 import { commandExportDockerfile } from './export-dockerfile';
 
 export async function commandSystem(args: string[]): Promise<void> {
@@ -26,6 +27,9 @@ export async function commandSystem(args: string[]): Promise<void> {
     case 'online':
       await commandOnline(sub);
       break;
+    case 'status':
+      await commandSystemStatus(sub);
+      break;
     case 'export-dockerfile':
     // `eject-dockerfile` is the pre-v0.16.x name, kept as a hidden alias for
     // back-compat. Not advertised in usage or completion — prefer the canonical
@@ -48,6 +52,7 @@ Inspect and prebuild Lazy system internals, and toggle project-wide modes.
 Subcommands:
   prompts            List built-in system prompt templates
   build <name>       Prebuild a lazy system image (bypasses lazy.toml)
+  status             Show current system state (offline/online, driver, daemon, storage)
   offline            Enable offline mode (skip all remote operations)
   online             Disable offline mode (restore remote operations)
   export-dockerfile  Write the embedded default Dockerfile to disk for customization
@@ -57,6 +62,7 @@ View any with: lazy show <code>
 
 Examples:
   lazy system prompts                             # List all built-in system prompts
+  lazy system status                              # Show current system state
   lazy system build lazy-runner                   # Prebuild the base runner image
   lazy system offline                             # Skip all remote operations
   lazy system online                              # Restore remote operations

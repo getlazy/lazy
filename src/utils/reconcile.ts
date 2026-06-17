@@ -239,15 +239,15 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   }
 
   // Step 3: Grace period expired — check if run is still alive
-  if (runner.isRunning(containerName)) {
+  if (await runner.isRunning(containerName)) {
     logger.debug(`Task ${taskShortId}: run ${containerName} still running, no response yet`);
     return; // Still working
   }
 
   // Step 4: Run not active and no response — check status.json for context
-  if (runner.runExists(containerName)) {
-    const exitCode = runner.getRunExitCode(containerName);
-    const logs = runner.getRunLogs(containerName, 50);
+  if (await runner.runExists(containerName)) {
+    const exitCode = await runner.getRunExitCode(containerName);
+    const logs = await runner.getRunLogs(containerName, 50);
     const status = readStatus(protoDir);
     const reason = exitCodeToReason(exitCode);
 
@@ -259,7 +259,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     await storage.updateSessionContainerName(session.id, null);
     killTmuxWatchSession(tmuxSessionName(taskShortId));
     clearStatus(protoDir);
-    runner.removeRun(containerName);
+    await runner.removeRun(containerName);
 
     // Auto-resume if circuit breaker allows
     await maybeAutoResume(storage, taskId, session.id, lazyRoot);
@@ -727,9 +727,9 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
 
       const containerName = session.container_name;
 
-      if (runner.runExists(containerName)) {
+      if (await runner.runExists(containerName)) {
         logger.warn(`Task ${taskShortId}: removing orphaned run ${containerName} for ${task.status} task`);
-        runner.removeRun(containerName);
+        await runner.removeRun(containerName);
       }
 
       // Clear container_name so future sweeps skip this task

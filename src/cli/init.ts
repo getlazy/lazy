@@ -299,7 +299,9 @@ function checkAuthSetup(): void {
   console.log('');
   console.log('Checking authentication...');
 
-  // Check for Claude Code CLI installation
+  // Check for Claude Code CLI installation.
+  // spawnSync (sync) is acceptable: `lazy init` is one-shot CLI startup that
+  // runs once before any event loop matters.
   const claudeCheck = spawnSync(['claude', '--version'], {
     stdout: 'pipe',
     stderr: 'pipe',

@@ -1400,6 +1400,53 @@ describe('GitLabDriver', () => {
     });
   });
 
+  describe('markReadyForReview: never retargets a lazy-parented task to main', () => {
+    // INVARIANT: PRs only for protected branches / subtask→parent merges are
+    // local. A child task (target.kind === 'task') must NEVER have an MR created
+    // — and must NEVER be silently retargeted to the default branch ('main').
+    // markReadyForReview must throw loudly rather than open an MR against main.
+    test('throws for a child task instead of opening an MR against main', async () => {
+      const glCalls: string[][] = [];
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          glCalls.push([...args]);
+          return ok();
+        },
+        // resolveDefaultBranch would resolve origin/HEAD → main if reached;
+        // the throw must happen BEFORE any such fallback.
+        runGit: async () => ok('refs/remotes/origin/main'),
+      };
+
+      // Stacked on another task — no MR should ever be created for this.
+      const task = makeTask({
+        metadata: {},
+        target: { kind: 'task', parentTaskId: 'parent-task-id' },
+      });
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/merge-routing bug/);
+      // No `glab mr create` was attempted (it never reached MR creation).
+      const createCall = glCalls.find(c => c[0] === 'mr' && c[1] === 'create');
+      expect(createCall).toBeUndefined();
+    });
+
+    // INVARIANT: a legacy 'lazy/...' sentinel in the branch slot is equally a
+    // lazy task-branch parent — it must fail loudly, never retarget to main.
+    test('throws for a legacy lazy/ branch sentinel', async () => {
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async () => ok(),
+        runGit: async () => ok('refs/remotes/origin/main'),
+      };
+      const task = makeTask({
+        metadata: {},
+        target: { kind: 'branch', branch: 'lazy/release-v017' },
+      });
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+
+      await expect(driver.markReadyForReview(task)).rejects.toThrow(/lazy task branch/);
+    });
+  });
+
   describe('cleanup', () => {
     test('closes open MR', async () => {
       const glCalls: string[][] = [];

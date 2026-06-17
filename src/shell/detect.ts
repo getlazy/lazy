@@ -8,7 +8,7 @@
 
 import { basename, join } from 'path';
 import { getHome } from '../utils/home';
-import { spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { pathExists, readFileSafe } from '../utils/fs';
 
 export type ShellName = 'bash' | 'zsh' | 'fish' | 'unknown';
@@ -33,24 +33,28 @@ function parseShellName(shellPath: string): ShellName {
 }
 
 /**
- * Get the shell version without spawning a subprocess.
- * Reads the version from a quick spawnSync call with --version.
- * Returns undefined if version cannot be determined.
+ * Get the shell version by running `<shell> --version`.
+ * Async (not spawnSync) so it never blocks the event loop. Returns undefined
+ * if the version cannot be determined.
  */
-function getShellVersion(shellPath: string, shellName: ShellName): string | undefined {
+async function getShellVersion(shellPath: string, shellName: ShellName): Promise<string | undefined> {
   if (shellName === 'unknown') return undefined;
 
   try {
     // All three shells support --version
-    const result = spawnSync([shellPath, '--version'], {
+    const proc = spawn([shellPath, '--version'], {
       stdout: 'pipe',
       stderr: 'pipe',
       timeout: 2_000,
     });
+    const [stdout, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
 
-    if (result.exitCode !== 0) return undefined;
+    if (exitCode !== 0) return undefined;
 
-    const output = result.stdout.toString().trim();
+    const output = stdout.trim();
     if (!output) return undefined;
 
     // Parse version from first line
@@ -199,7 +203,7 @@ export async function detectShell(): Promise<ShellInfo> {
   }
 
   const name = parseShellName(shellPath);
-  const version = getShellVersion(shellPath, name);
+  const version = await getShellVersion(shellPath, name);
   const completionInstalled = await checkCompletionInstalled(name);
 
   return {

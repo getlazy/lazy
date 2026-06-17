@@ -203,6 +203,8 @@ async function checkDataDir(root: string): Promise<CheckResult> {
   return { ok: true, label: `Data directory valid (${displayPath})` };
 }
 
+// spawnSync (sync) is acceptable throughout this function: `lazy doctor` is a
+// one-shot CLI health check, not a daemon path — blocking here is fine.
 function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
   try {
     const result = spawnSync(
@@ -237,6 +239,8 @@ async function checkImageUpToDate(root: string, imageName: string, binary: strin
   }
 
   try {
+    // spawnSync (sync) is acceptable: `lazy doctor` is a one-shot CLI health
+    // check, not a daemon path — blocking here is fine.
     const inspect = spawnSync(
       [binary, 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
@@ -387,7 +391,7 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
       const tRef = taskRef(task);
       const runName = session.container_name ?? runner.runNameForTask(tRef);
 
-      const info = runner.getRunInfo(runName);
+      const info = await runner.getRunInfo(runName);
       if (!info) continue; // Run doesn't exist or runner unavailable
 
       // We're looking for stopped runs with non-zero exit codes
@@ -418,6 +422,8 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
 // TERMINAL_STATUSES imported from ../../types
 
+// spawnSync (sync) is acceptable here: `lazy doctor` is a one-shot CLI health
+// check, not a daemon path — blocking the (otherwise idle) loop is fine.
 async function checkOrphanedContainers(root: string | null, binary: string = 'docker'): Promise<CheckResult> {
   try {
     const result = spawnSync(
@@ -824,8 +830,9 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
   // Runner-specific health checks — each runner knows what it needs.
   // DockerRunner checks Docker; PodmanRunner checks Podman; HostProcessRunner checks claude CLI.
+  const diag = runner ? await runner.diagnose() : [];
   if (runner) {
-    for (const check of runner.diagnose()) {
+    for (const check of diag) {
       switch (check.state) {
         case 'ok':
           results.push({ ok: true, label: check.what });
@@ -850,7 +857,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
   // Container-dependent checks only run if the runner's own diagnostics all passed
   const runnerDiagnosticsOk = runner
-    ? runner.diagnose().every(c => c.state !== 'fail')
+    ? diag.every(c => c.state !== 'fail')
     : false;
 
   if (root) {

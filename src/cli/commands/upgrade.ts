@@ -24,11 +24,11 @@ import { loadConfig } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
 import { isTTY } from '../editor';
-import { promptChoice } from '../editor';
+import { promptChoice, promptLine } from '../editor';
 import { theme } from '../theme';
 import type { Task } from '../../types';
 import type { Storage } from '../../storage';
-import { checkDaemonHealth, requestShutdown } from '../../daemon';
+import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
 import { ensureDaemon } from '../../daemon/auto-start';
 import { spawnSync } from '../../utils/spawn';
 import { VERSION } from '../../version';
@@ -46,7 +46,7 @@ interface ContainerInfo {
  * Discover all running lazy containers and match them to tasks.
  */
 async function discoverRunningContainers(storage: Storage, runner: Runner): Promise<ContainerInfo[]> {
-  const names = runner.discoverRunningRuns();
+  const names = await runner.discoverRunningRuns();
   const containers: ContainerInfo[] = [];
 
   for (const name of names) {
@@ -84,7 +84,7 @@ async function discoverRunningContainers(storage: Storage, runner: Runner): Prom
  * runner-specific mechanism — DockerRunner uses the `lazy.project` label,
  * host-process mode has no builder runs at all.
  */
-function discoverProjectBuilderContainers(runner: Runner, projectRoot: string): string[] {
+async function discoverProjectBuilderContainers(runner: Runner, projectRoot: string): Promise<string[]> {
   return runner.discoverProjectBuilderRuns(projectRoot);
 }
 
@@ -134,6 +134,8 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
 
   // Remove existing image to force rebuild
   try {
+    // spawnSync (sync) is acceptable: `lazy upgrade` is a one-shot CLI command
+    // that runs to completion; there is no daemon event loop to block here.
     spawnSync(
       [binary, 'rmi', '-f', imageName],
       { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
@@ -171,6 +173,91 @@ async function forceRebuildAgentBinary(): Promise<string> {
   return ensureAgentBinary();
 }
 
+/**
+ * Synchronous pre-stop prompt for live builder containers.
+ *
+ * Stopping a builder kills its `--rm` container; any message the human has typed
+ * into the Claude prompt but NOT yet submitted is lost (Claude Code owns that
+ * buffer and we pass SIGTERM straight through `--init` — see
+ * docs/spikes/builder-upgrade-resume.md §1.4/§2-S3). The conversation itself is
+ * durable and resumes automatically; only the unsent buffer is at risk.
+ *
+ * This honors CLAUDE.md's "never lose human feedback" invariant for the common
+ * case: warn the human and block until they confirm they've submitted any
+ * in-progress message. It is the v0.17 mitigation; the event-plane
+ * `upgrade.imminent` warning into the live builder pane is a deferred follow-up.
+ *
+ * Behavior is gated so it never hangs a non-interactive caller:
+ * - Interactive TTY and not `--force`: warn and wait for Enter (ctrl-c cancels).
+ * - `--force` or no TTY: skip the prompt, print a warning that we are proceeding
+ *   without waiting and that unsent builder input may be lost, then continue.
+ */
+export async function promptBuilderPreStop(builderCount: number, force: boolean): Promise<void> {
+  if (builderCount === 0) return;
+
+  const noun = builderCount === 1 ? 'builder session' : 'builder sessions';
+  console.log('');
+  console.log(theme.warning(`${builderCount} ${noun} will be restarted to apply the upgrade.`));
+  console.log('  The conversation is preserved and resumes automatically — but any message');
+  console.log('  typed into a builder and not yet submitted CANNOT be preserved.');
+
+  // --force or non-TTY: never block. Document that we proceed without waiting.
+  if (force || !isTTY()) {
+    console.log(theme.warning('  Proceeding without prompting (--force or no TTY); unsent builder input may be lost.'));
+    return;
+  }
+
+  console.log('  If you have an unsent message in a builder, submit it now.');
+  // promptLine blocks until Enter. In test mode (LAZY_PROMPT_DEFAULTS) it returns
+  // immediately without waiting, so e2e tests don't hang.
+  await promptLine('Press Enter when ready to continue (ctrl-c to cancel)');
+}
+
+/**
+ * Write a durable builder-resume-intent for each builder about to be stopped.
+ *
+ * The relaunched host `lazy builder` wrapper (add-builder-relaunch-loop) reads
+ * these to learn it was stopped by an upgrade and should resume in place, rather
+ * than exiting. The intent MUST be durable: by the time it is read, the builder
+ * container is dead and the daemon has restarted — the transient event plane
+ * cannot carry it (docs/spikes/builder-upgrade-resume.md §3).
+ *
+ * CANONICAL KEY: the intent's `builderId` is the SHORT builder id — the
+ * container name with the `lazy-builder-` prefix stripped. This is deliberate
+ * and load-bearing: docker-runner derives `builderId = configBasename.replace(
+ * 'builder-', '')` (the short id) and names the container `lazy-builder-<id>`
+ * (docker-runner.ts), then launches the supervisor with `--builder-id <id>`.
+ * The supervisor's sessionId stamp (add-builder-sessionid-stamp) keys its
+ * `saveBuilderResumeIntent` update by that SAME short id, so writing the intent
+ * under the short id is what lets the stamp find and populate it. Writing the
+ * full run name here would make the stamp's lookup miss and silently defeat it.
+ * `discoverProjectBuilderRuns` returns full `lazy-builder-<id>` names, so we
+ * strip the prefix before writing. (The relaunch wrapper matches both forms
+ * defensively, but the stamp must actually land.)
+ *
+ * `sessionId` is left undefined here: in docker mode the host never learns the
+ * Claude sessionId (it is `null` to the host — §1.2). It is populated either by
+ * the supervisor's stamp (keyed by the same short id) or resolved by the wrapper
+ * from storage. Written BEFORE the stop ("save first, act second") so a stop
+ * failure never loses the intent.
+ */
+export async function writeBuilderResumeIntents(
+  storage: Storage,
+  builderNames: string[],
+  projectRoot: string,
+): Promise<void> {
+  const createdAt = new Date().toISOString();
+  for (const name of builderNames) {
+    // Strip the `lazy-builder-` run-name prefix to get the canonical short id.
+    const builderId = name.replace(/^lazy-builder-/, '');
+    await storage.saveBuilderResumeIntent({
+      builderId,
+      projectRoot,
+      createdAt,
+    });
+  }
+}
+
 export async function commandUpgrade(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'force', takesValue: false },
@@ -194,7 +281,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // Pre-flight checks
     const runner = await createRunner(root);
     try {
-      runner.checkAvailability();
+      await runner.checkAvailability();
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
@@ -206,7 +293,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // touch builders from other projects.
     const containers = await discoverRunningContainers(storage, runner);
     const workingContainers = containers.filter(c => c.isWorking);
-    const builderContainers = discoverProjectBuilderContainers(runner, root);
+    const builderContainers = await discoverProjectBuilderContainers(runner, root);
 
     // Dry run: show what would happen
     if (dryRun) {
@@ -240,12 +327,15 @@ export async function commandUpgrade(args: string[]): Promise<void> {
           for (const name of builderContainers) {
             console.log(`    ${name}`);
           }
+          console.log('');
+          console.log(theme.warning('  Builders will be stopped and resume in place. You will be prompted'));
+          console.log('  to submit any in-progress message first (unless --force / no TTY).');
         }
       }
 
       console.log('');
       console.log('  After rebuild: daemon restarts and auto-resumes interrupted tasks (~10s).');
-      console.log('  Builder containers will restart on next use.');
+      console.log('  Running builder sessions resume in place after the upgrade.');
       return;
     }
 
@@ -287,6 +377,11 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       await waitForWorkingTasks(storage, workingContainers);
     }
 
+    // Pre-stop prompt: give the human a chance to submit any in-progress
+    // message in a live builder before its container is killed. Honors
+    // "never lose human feedback" (CLAUDE.md). Skipped under --force / non-TTY.
+    await promptBuilderPreStop(builderContainers.length, force);
+
     // Step 1: Stop all running containers/processes for this project
     const totalContainers = containers.length + builderContainers.length;
     if (totalContainers > 0) {
@@ -294,19 +389,27 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
       // Stop task containers
       for (const c of containers) {
-        const stopped = runner.stopRun(c.name);
+        const stopped = await runner.stopRun(c.name);
         if (stopped) {
           console.log(`  ${theme.success('stopped')} ${c.name}`);
         } else {
           console.log(`  ${theme.error('failed')} ${c.name}`);
         }
         // Remove the stopped container/process
-        runner.removeRun(c.name);
+        await runner.removeRun(c.name);
+      }
+
+      // Write durable resume intents BEFORE stopping any builder ("save first,
+      // act second"): the relaunched wrapper reads these to resume in place. The
+      // builder is still alive here, so its sessionId is unknown to the host —
+      // the wrapper resolves it from storage after the child exits.
+      if (builderContainers.length > 0) {
+        await writeBuilderResumeIntents(storage, builderContainers, root);
       }
 
       // Stop builder containers
       for (const name of builderContainers) {
-        const stopped = runner.stopRun(name);
+        const stopped = await runner.stopRun(name);
         if (stopped) {
           console.log(`  ${theme.success('stopped')} ${name}`);
         } else {
@@ -343,7 +446,28 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     const daemonStatus = await checkDaemonHealth(root);
     if (daemonStatus.running) {
       console.log('\nRestarting daemon...');
+      // Capture the OLD daemon's pid BEFORE shutdown — we wait for that exact
+      // process to die, not just for the socket to vanish.
+      const oldPid = daemonStatus.pid ?? readPid(root);
       await requestShutdown(root);
+      // requestShutdown only DELIVERS the request — the daemon exits async, and
+      // it removes its own socket/PID files as the LAST steps before exit. We
+      // must wait for the old PROCESS to fully die before starting a fresh
+      // daemon; otherwise (a) ensureDaemon sees a live process and skips the
+      // restart, or (b) the old daemon's trailing cleanup clobbers the new
+      // daemon's freshly-written socket/PID — leaving the project with no
+      // reachable daemon. Both stranded the builder relaunch loop / broke the
+      // next command ("Daemon is not running").
+      const stopped = await waitForDaemonStop(root, 15000, oldPid);
+      if (!stopped) {
+        // The old daemon acked shutdown but never exited (wedged). Force it
+        // down so we can guarantee a clean fresh start.
+        console.log('  (old daemon did not exit in time — forcing it down)');
+        if (oldPid != null) {
+          try { process.kill(oldPid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+        cleanupStaleFiles(root);
+      }
     }
     await ensureDaemon('upgrade', root);
     console.log('  Daemon restarted with new version.');
@@ -364,16 +488,22 @@ export function upgradeUsage(): void {
 Rebuild the Docker image and agent binary, then restart the daemon.
 
 What happens:
-  1. All running lazy containers are stopped (task supervisors and builders)
-  2. Docker image and agent binary are force-rebuilt
-  3. Daemon is restarted with new code
-  4. Daemon auto-reconciles and auto-resumes interrupted tasks (~10 seconds)
-  5. Builder containers restart on next use
+  1. Live builder sessions are warned to submit any in-progress message
+  2. All running lazy containers are stopped (task supervisors and builders)
+  3. Docker image and agent binary are force-rebuilt
+  4. Daemon is restarted with new code
+  5. Daemon auto-reconciles and auto-resumes interrupted tasks (~10 seconds)
+  6. Running builder sessions resume in place with their conversation intact
 
 If any containers are in 'working' state (mid-turn), you'll be prompted with
 three options: stop and upgrade now, wait for tasks to finish, or cancel.
 Mid-turn work will be lost if you stop, but tasks resume from their last
 checkpoint.
+
+If any builder sessions are running, you'll be warned to submit any in-progress
+message before they restart — their conversation resumes automatically, but a
+typed-but-unsent message cannot be preserved. With --force or no TTY this
+warning is printed but not blocked on, and unsent builder input may be lost.
 
 Options:
   --force     Don't prompt, stop everything including working containers

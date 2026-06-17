@@ -18,7 +18,7 @@
 import { join } from 'path';
 import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { getHome } from '../../utils/home';
-import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from '../helpers';
+import { requireLazyRoot, requireStorage, tryRemoteStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
 import { isTTY, promptLine, promptYesNo } from '../editor';
 import { getProjectName } from '../../storage';
@@ -26,6 +26,8 @@ import { theme } from '../theme';
 import { createRunner, type Runner } from '../../runner';
 import { generateBuilderConfig } from '../../builder/server';
 import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
+import { checkDaemonHealth } from '../../daemon/lifecycle';
+import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 // Embedded at build/compile time — changes to these files require rebuild
@@ -213,7 +215,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // This validates Docker availability and API key presence early, so the user
   // doesn't go through disclosure prompts only to hit a failure.
   try {
-    runner.checkAvailability();
+    await runner.checkAvailability();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Error: ${msg}`);
@@ -304,62 +306,87 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
   const builderEffort = effortOverride ?? config.builder.effort;
 
-  // Add --dangerously-skip-permissions when in autonomous mode,
-  // and --resume <id> when resuming a session
-  const finalClaudeExtraArgs = [
-    ...(autonomous ? ['--dangerously-skip-permissions'] : []),
-    ...(resumeId ? ['--resume', resumeId] : []),
-    // When Ollama is enabled, force Claude Code to use the Ollama model.
-    // Without this, Claude Code defaults to its own model (opus) which doesn't exist in Ollama.
-    ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
-    '--effort', builderEffort,
-  ];
+  // Launch the builder child once for a given resume id. The relaunch loop calls
+  // this repeatedly: after an upgrade stops the child it re-launches with the
+  // resolved --resume id. Each call builds its own args/config so the resume id
+  // (and a fresh container) is correct per iteration.
+  const launchOnce = async (rid: string | null): Promise<BuilderLaunchResult> => {
+    // Add --dangerously-skip-permissions when in autonomous mode,
+    // and --resume <id> when resuming a session.
+    const claudeExtraArgs = [
+      ...(autonomous ? ['--dangerously-skip-permissions'] : []),
+      ...(rid ? ['--resume', rid] : []),
+      // When Ollama is enabled, force Claude Code to use the Ollama model.
+      // Without this, Claude Code defaults to its own model (opus) which doesn't exist in Ollama.
+      ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
+      '--effort', builderEffort,
+    ];
 
-  let exitCode: number;
-  let sessionId: string | null = null;
+    if (runner.usesSandbox()) {
+      // Container mode: use daemon MCP proxy so tool calls route through the daemon.
+      // The daemon generates the MCP config (it knows its own webPort and token).
+      const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
+        name: `builder-${Date.now()}`,
+      });
 
-  if (runner.usesSandbox()) {
-    // Container mode: use daemon MCP proxy so tool calls route through the daemon.
-    // The daemon generates the MCP config (it knows its own webPort and token).
-    const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
-      name: `builder-${Date.now()}`,
-    });
+      // Still need a builder config for conversation capture (the supervisor reads it)
+      // but we don't start a separate HTTP server. `id` is this builder's stable
+      // identifier — it matches the `lazy-builder-<id>` container name and is how
+      // a resume intent written by `lazy upgrade` is keyed.
+      const dataDir = config.data.path;
+      const { configPath, config: builderConfig, id } = generateBuilderConfig(root, dataDir);
+      writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
 
-    // Still need a builder config for conversation capture (the supervisor reads it)
-    // but we don't start a separate HTTP server.
-    const dataDir = config.data.path;
-    const { configPath, config: builderConfig } = generateBuilderConfig(root, dataDir);
-    writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
-
-    try {
-      const result = await runner.launchBuilderInteractive(
-        root, systemPrompt, configPath, finalClaudeExtraArgs, undefined, daemonConfigPath,
-      );
-      exitCode = result.exitCode;
-      sessionId = result.sessionId;
-    } finally {
-      for (const tmpFile of [daemonConfigPath, configPath]) {
-        try {
-          if (existsSync(tmpFile)) unlinkSync(tmpFile);
-        } catch { /* best effort */ }
+      try {
+        const result = await runner.launchBuilderInteractive(
+          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath,
+        );
+        return { exitCode: result.exitCode, sessionId: result.sessionId, builderId: id };
+      } finally {
+        for (const tmpFile of [daemonConfigPath, configPath]) {
+          try {
+            if (existsSync(tmpFile)) unlinkSync(tmpFile);
+          } catch { /* best effort */ }
+        }
       }
+    } else {
+      // Host-process mode: launch Claude Code directly (no HTTP server needed).
+      // The runner handles conversation capture internally. There is no container
+      // for upgrade to stop, so builderId is null — the loop never relaunches.
+      const result = await runner.launchBuilderInteractive(root, systemPrompt, '', claudeExtraArgs);
+      return { exitCode: result.exitCode, sessionId: result.sessionId, builderId: null };
     }
-  } else {
-    // Host-process mode: launch Claude Code directly (no HTTP server needed).
-    // The runner handles conversation capture internally.
-    const result = await runner.launchBuilderInteractive(root, systemPrompt, '', finalClaudeExtraArgs);
-    exitCode = result.exitCode;
-    sessionId = result.sessionId;
-  }
+  };
 
-  // Print the session ID so the user can resume later
-  if (sessionId) {
+  // Supervised relaunch loop: in docker/podman mode, an upgrade can stop the
+  // builder container mid-session and leave a durable resume intent. When it
+  // does, wait for the upgrade to finish and re-launch --resume into THIS
+  // terminal. In host-process mode (canRelaunch=false) the loop runs exactly
+  // once — upgrade does not stop host builders, so there is nothing to relaunch.
+  const loopResult = await runBuilderRelaunchLoop({
+    initialResumeId: resumeId,
+    canRelaunch: runner.usesSandbox(),
+    projectRoot: root,
+    launch: launchOnce,
+    // Re-resolve storage per access so a fresh daemon token is used after the
+    // upgrade restarts the daemon. Returns null (not exit) when unavailable so a
+    // normal builder quit is never turned into an error by a daemon hiccup.
+    getStorage: () => tryRemoteStorage(root),
+    daemonStatus: () => checkDaemonHealth(root),
+    ensureReady: () => runner.ensureReady(),
+    log: (m) => console.log(m),
+    errorOut: (m) => console.error(m),
+  });
+
+  // Print the session ID so the user can resume later (suppressed when the loop
+  // already printed an actionable manual-resume fallback).
+  if (loopResult.sessionId) {
     console.log('');
-    console.log(`Session: ${sessionId}`);
-    console.log(`Resume:  lazy builder --resume ${sessionId}`);
+    console.log(`Session: ${loopResult.sessionId}`);
+    console.log(`Resume:  lazy builder --resume ${loopResult.sessionId}`);
   }
 
-  process.exit(exitCode);
+  process.exit(loopResult.exitCode);
 }
 
 export function builderUsage(): void {
@@ -387,6 +414,15 @@ with --resume <id>. Set LAZY_LAST_SESSION_ID in your shell to enable bare
 --resume and the interactive resume prompt.
 
 The interactive system prompt warning is automatically skipped when resuming.
+
+Auto-resume across upgrade (docker/podman only):
+  If 'lazy upgrade' stops this builder to rebuild the image, the session is
+  automatically relaunched in place — same conversation, same terminal — once
+  the upgrade finishes; no manual --resume needed. (Host-process builders are
+  not stopped by upgrade, so there is nothing to relaunch there.) Finish typing
+  any in-progress message before upgrading: unsent input cannot be recovered.
+  If the relaunch can't complete, the command prints the exact
+  'lazy builder --resume <id>' to run.
 
 Flags:
   --autonomous         Run without permission prompts (adds --dangerously-skip-permissions)

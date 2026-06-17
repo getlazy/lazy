@@ -36,7 +36,7 @@ import lazyToolInstructions from '../../prompts/tool-instructions.md' with { typ
 import systemInstructionsText from '../../prompts/system-instructions.md' with { type: 'text' };
 import mergeInstructionsTemplate from '../../prompts/merge-instructions.md' with { type: 'text' };
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
-import { spawnSync } from '../../utils/spawn';
+import { rm } from 'fs/promises';
 import { runGit } from '../../utils/git';
 
 const PROGRESS_POLL_MS = 1000;
@@ -221,8 +221,11 @@ export async function cleanupWorktree(
       // Worktree may be corrupted (e.g. .git is a dir instead of file).
       // Fall back to manual removal + prune.
       console.log('Worktree remove failed, cleaning up manually...');
-      spawnSync(['rm', '-rf', worktreePath]);
-      runGit(['worktree', 'prune'], { cwd: root });
+      // fs.rm (not a spawned `rm -rf`): fs beats spawning a process (CLAUDE.md),
+      // and it's async so teardown never blocks the event loop — cleanupWorktree
+      // is reachable from async daemon/storage close paths.
+      await rm(worktreePath, { recursive: true, force: true });
+      await runGit(['worktree', 'prune'], { cwd: root });
     }
   }
 }
@@ -262,7 +265,7 @@ export async function cleanupTaskContainer(
 ): Promise<void> {
   const runner = await createRunner(lazyRoot);
   const runName = session.container_name ?? runner.runNameForTask(tRef);
-  runner.removeRun(runName);
+  await runner.removeRun(runName);
   if (session.container_name) {
     await storage.updateSessionContainerName(session.id, null);
   }
@@ -462,7 +465,7 @@ export async function followContainer(
     }
 
     // Check if run is still active
-    if (!runner.isRunning(containerName)) {
+    if (!(await runner.isRunning(containerName))) {
       logger.debug(`Run ${containerName} exited`);
       break;
     }
@@ -525,7 +528,12 @@ export async function syncTaskFromRemote(
     // create a PR/MR via markReadyForReview if the task has commits.
     if (!driver.hasRemoteRef(task)) {
       const session = await storage.getSessionByTaskId(task.id);
-      if (session?.git_branch) {
+      // INVARIANT: PRs only for protected branches; subtask→parent merges are
+      // local. A child task (stacked on another task) must NEVER get an MR/PR —
+      // markReadyForReview would throw for it. Skip the creation attempt: there
+      // is no remote ref to create and therefore no MR comments to sync (the
+      // early return below then short-circuits comment sync for this task).
+      if (session?.git_branch && !parentTaskIdOf(task)) {
         const commits = await storage.getSessionCommits(session.id);
         if (commits.length > 0) {
           try {

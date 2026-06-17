@@ -11,7 +11,7 @@ import { repoHasCommits } from '../git/operations';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
 import type { Task, TokenUsage } from '../types';
-import { DaemonClient } from '../daemon/client';
+import { DaemonClient, RpcApplicationError } from '../daemon/client';
 import { RemoteStorage } from '../storage/remote-storage';
 
 /**
@@ -57,8 +57,13 @@ export async function tryRemoteStorage(root: string): Promise<Storage | null> {
     }) as string;
 
     return new RemoteStorage(client, root, info);
-  } catch {
-    // Daemon unavailable
+  } catch (err) {
+    // The daemon RESPONDED but the operation failed (e.g. storage-lock
+    // contention, a 500). That is NOT "daemon not running" — surface it so the
+    // real problem is visible instead of sending the user to restart a healthy
+    // daemon. Only a transport failure (daemon genuinely unreachable) should
+    // fall through to the null → "Daemon is not running" path.
+    if (err instanceof RpcApplicationError) throw err;
     return null;
   }
 }

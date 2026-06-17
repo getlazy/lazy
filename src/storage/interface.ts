@@ -29,6 +29,7 @@ import type {
   SearchResult,
   StoredConversation,
   AgentSessionLog,
+  BuilderResumeIntent,
   StatusChange,
   Actor,
   CommentSource,
@@ -468,6 +469,29 @@ export interface Storage {
    * if none has been captured (e.g. the task never ran an agent turn).
    */
   getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null>;
+
+  // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
+
+  /**
+   * Save (create or overwrite) a builder resume intent. Keyed by builderId —
+   * writing an intent for a builderId that already has one overwrites it.
+   * Written by `lazy upgrade` before it stops a builder container.
+   */
+  saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void>;
+
+  /**
+   * Atomically consume the resume intent for a builderId: return it (or null if
+   * none exists) and clear it in the same operation, so a given intent is acted
+   * on at most once. Called by the host builder wrapper after a successful
+   * relaunch.
+   */
+  takeBuilderResumeIntent(builderId: string): Promise<BuilderResumeIntent | null>;
+
+  /**
+   * List all outstanding builder resume intents, optionally filtered to a
+   * single project root.
+   */
+  listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]>;
 
   // --- Status History ---
 

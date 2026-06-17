@@ -11,6 +11,7 @@ export {
   isProcessAlive,
   requestShutdown,
   waitForDaemon,
+  waitForDaemonStop,
   readPid,
   readToken,
   cleanupStaleFiles,

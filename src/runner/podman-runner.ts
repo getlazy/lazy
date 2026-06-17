@@ -13,7 +13,7 @@
 
 import { DockerRunner, type DockerRunnerOptions } from './docker-runner';
 import { logger } from '../utils/logger';
-import { spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 
 const PODMAN_TIMEOUT_MS = 10_000;
 
@@ -27,15 +27,16 @@ export class PodmanRunner extends DockerRunner {
    * The base class checkDocker(binary) throws on failure with a Docker-themed
    * message. We provide a better Podman-specific message.
    */
-  override checkAvailability(): void {
+  override async checkAvailability(): Promise<void> {
     logger.debug('Checking Podman...');
 
-    const result = spawnSync(['podman', 'info'], {
+    const proc = spawn(['podman', 'info'], {
       stdout: 'ignore',
       stderr: 'ignore',
       timeout: PODMAN_TIMEOUT_MS,
     });
-    if (result.exitCode !== 0) {
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
       throw new Error(
         'Podman is not installed or not running. Install Podman: https://podman.io/docs/installation'
       );

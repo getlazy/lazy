@@ -11,7 +11,7 @@ import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RunnerType, OllamaConfig } from '../config/types';
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { spawn, spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
@@ -101,8 +101,8 @@ export class DockerRunner implements Runner {
     return runName;
   }
 
-  checkAvailability(): void {
-    checkDocker(this.binary);
+  async checkAvailability(): Promise<void> {
+    await checkDocker(this.binary);
     // Auth is NOT enforced here. The daemon credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point — every
     // path that launches containers goes through a daemon that refuses to start
@@ -146,53 +146,64 @@ export class DockerRunner implements Runner {
     return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this._ollamaConfig);
   }
 
-  isRunning(runName: string): boolean {
+  async isRunning(runName: string): Promise<boolean> {
     return isContainerRunning(runName, this.binary);
   }
 
-  runExists(runName: string): boolean {
+  async runExists(runName: string): Promise<boolean> {
     return containerExists(runName, this.binary);
   }
 
-  getRunInfo(runName: string): RunInfo | null {
+  async getRunInfo(runName: string): Promise<RunInfo | null> {
     return dockerGetContainerInfo(runName, this.binary);
   }
 
-  getRunExitCode(runName: string): number | null {
+  async getRunExitCode(runName: string): Promise<number | null> {
     return getContainerExitCode(runName, this.binary);
   }
 
-  getRunLogs(runName: string, tailLines?: number): string | null {
+  async getRunLogs(runName: string, tailLines?: number): Promise<string | null> {
     return getContainerLogs(runName, tailLines, this.binary);
   }
 
-  stopRun(runName: string): boolean {
+  async stopRun(runName: string): Promise<boolean> {
     try {
-      const result = spawnSync(
-        [this.binary, 'stop', runName],
-        { stdout: 'ignore', stderr: 'pipe', timeout: 30_000 },
+      // Use `kill` (immediate SIGKILL), not `stop` (SIGTERM + ~10s grace + SIGKILL):
+      // there is no graceful shutdown to wait for — the agent's container is just
+      // being terminated. `stop`'s grace period is pure latency here.
+      //
+      // Async spawn (not spawnSync) because this runs in the daemon hot path
+      // (stopTask in src/daemon/task-lifecycle.ts); a blocking spawn would freeze
+      // the entire daemon event loop for the duration of the call.
+      const proc = spawn(
+        [this.binary, 'kill', runName],
+        { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
-      return result.exitCode === 0;
+      const exitCode = await proc.exited;
+      return exitCode === 0;
     } catch {
+      // stopRun's contract is "true on success" — a spawn failure (binary missing,
+      // container already gone) is reported as a non-success, not propagated.
       return false;
     }
   }
 
-  removeRun(runName: string): void {
-    removeContainer(runName, this.binary);
+  async removeRun(runName: string): Promise<void> {
+    await removeContainer(runName, this.binary);
   }
 
-  discoverRunningRuns(): string[] {
+  async discoverRunningRuns(): Promise<string[]> {
     try {
       // Query container names and their project labels in one call.
       // Format: "name\tlabel" where label is empty for unlabeled (pre-label) containers.
-      const result = spawnSync(
+      const proc = spawn(
         [this.binary, 'ps', '--filter', 'name=^lazy-',
          '--format', `{{.Names}}\t{{.Label "${PROJECT_LABEL_KEY}"}}`],
         { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
-      if (result.exitCode !== 0) return [];
-      const output = result.stdout.toString().trim();
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode !== 0) return [];
+      const output = stdout.trim();
       if (!output) return [];
 
       const lines = output.split('\n').filter(Boolean);
@@ -220,9 +231,9 @@ export class DockerRunner implements Runner {
     }
   }
 
-  discoverProjectBuilderRuns(projectRoot: string): string[] {
+  async discoverProjectBuilderRuns(projectRoot: string): Promise<string[]> {
     try {
-      const result = spawnSync(
+      const proc = spawn(
         [
           this.binary, 'ps',
           '--filter', 'name=^lazy-builder-',
@@ -231,8 +242,9 @@ export class DockerRunner implements Runner {
         ],
         { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
-      if (result.exitCode !== 0) return [];
-      const output = result.stdout.toString().trim();
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode !== 0) return [];
+      const output = stdout.trim();
       if (!output) return [];
       return output.split('\n').filter(Boolean);
     } catch {
@@ -292,17 +304,18 @@ export class DockerRunner implements Runner {
     };
   }
 
-  diagnose(): HealthCheck[] {
+  async diagnose(): Promise<HealthCheck[]> {
     const results: HealthCheck[] = [];
     const timeout = 10_000;
 
     // Check binary installed
     try {
-      const result = spawnSync([this.binary, '--version'], {
+      const proc = spawn([this.binary, '--version'], {
         stdout: 'pipe', stderr: 'ignore', timeout,
       });
-      if (result.exitCode === 0) {
-        const raw = result.stdout.toString().trim();
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode === 0) {
+        const raw = stdout.trim();
         const match = this.binary === 'podman'
           ? raw.match(/podman version ([^\s,]+)/)
           : raw.match(/Docker version ([^\s,]+)/);
@@ -325,10 +338,11 @@ export class DockerRunner implements Runner {
 
     // Check daemon running
     try {
-      const result = spawnSync([this.binary, 'info'], {
+      const proc = spawn([this.binary, 'info'], {
         stdout: 'ignore', stderr: 'ignore', timeout,
       });
-      if (result.exitCode === 0) {
+      const exitCode = await proc.exited;
+      if (exitCode === 0) {
         const name = this.binary === 'podman' ? 'Podman' : 'Docker';
         results.push({ state: 'ok', what: `${name} daemon running` });
       } else {
@@ -506,6 +520,10 @@ export class DockerRunner implements Runner {
       '--worktree', lazyRoot,
       // Use container config (host.docker.internal) not the host config (127.0.0.1)
       '--builder-config', containerConfigFile,
+      // Stable builder id so the supervisor can stamp the detected Claude
+      // sessionId onto this builder's resume intent on exit (host gets
+      // sessionId: null from the runner — only the supervisor knows the id).
+      '--builder-id', builderId,
     );
 
     // Pass daemon config to builder supervisor if available

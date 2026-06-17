@@ -257,3 +257,28 @@ export interface AgentSessionLog {
   /** Raw JSONL content, byte-for-byte */
   content: string;
 }
+
+// --- Builder resume intent (durable upgrade↔builder handshake) ---
+
+/**
+ * The durable cross-gap handshake that lets a relaunched `lazy builder` know it
+ * was stopped by an upgrade and should resume the same Claude session in the
+ * same terminal.
+ *
+ * `lazy upgrade` writes one intent per builder it is about to stop; the host
+ * builder wrapper consumes+clears it (see `takeBuilderResumeIntent`) after a
+ * successful relaunch. It MUST be durable because the consumer (the builder
+ * container) is dead and the daemon restarts during the gap the intent has to
+ * survive — the transient event plane cannot carry it (see
+ * docs/spikes/builder-upgrade-resume.md §3).
+ */
+export interface BuilderResumeIntent {
+  /** Stable per-builder identifier (the `lazy-builder-<builderId>` run name). */
+  builderId: string;
+  /** Absolute project root the builder belongs to. Scopes intents per project. */
+  projectRoot: string;
+  /** Claude session UUID to resume, if known when the intent was written. */
+  sessionId?: string;
+  /** When the intent was created (ISO timestamp). */
+  createdAt: string;
+}

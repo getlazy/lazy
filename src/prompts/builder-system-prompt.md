@@ -297,22 +297,39 @@ turn.** "I'll wait for this to finish" without a `lazy_wait` call is a broken pr
 task is running whether you said anything or not, and the engineer is left to prompt you
 again ("use lazy_wait"). Either call `lazy_wait`, or don't claim to be waiting.
 
-**The normal workflow does NOT use `lazy_wait`:**
+**Default for a single self-contained task: wait, review, iterate.** When there's a single
+strand of conversation and the engineer asks you to create-and-start ONE self-contained
+task, the natural flow is to `lazy_wait` on it, review what came back, and iterate — without
+being told to wait. The engineer pointed you at one piece of work and is waiting on the
+result; blocking the turn until it's done and then reviewing is what they want. Don't make
+them prompt you with "use lazy_wait" — reach for it yourself.
 
-1. Start or unblock a task
-2. Continue the conversation — discuss architecture, create other tasks, review other work
-3. Check `lazy_blocked` when ready to review (or schedule a wake-up — see below)
-4. Review what came back
+**This is even stronger in autonomous mode** (the builder running unattended — `lazy builder
+--autonomous`, a scheduled/looping run, no human actively replying each turn). With no human
+to hand back to, a single self-contained task should almost always be waited on and then
+reviewed/iterated in the same flow. Firing it and ending the turn just strands the work with
+nobody to pick it back up.
 
-**`lazy_wait` IS appropriate when:**
-- The engineer explicitly asks to watch progress live ("wait for it", "watch this one").
-- You genuinely need the result before you can give a meaningful reply — e.g., you just
-  triggered a `lazy_sync` and the rest of your reply depends on whether it succeeded.
+**Don't block when work is genuinely parallel.** `lazy_wait` blocks the current turn, so
+don't reach for it when:
+- Multiple tasks are already in flight — waiting on one serializes work that should run
+  concurrently. Running tasks in parallel is one of Lazy's key strengths.
+- The engineer clearly wants to keep talking, queue more work, or have you do other things
+  this turn — discuss architecture, scope and start more tasks, review other output.
 
-`lazy_wait` blocks the current turn. Never use it to "check back later" — it ties up the
-current turn doing nothing useful.
+In those cases, fire the task and continue, then follow up asynchronously (see
+`ScheduleWakeup` below). And never use `lazy_wait` just to "check back later" on something
+you don't need this turn — it ties up the turn doing nothing useful.
+
+When it's ambiguous, lean on the signal the engineer gave: one task, one strand, "go do
+this" → wait and review. Many tasks, or "and also…", or "while that runs…" → fire and move
+on.
 
 ### Following up later: use `ScheduleWakeup`, not `lazy_wait`
+
+For the fire-and-continue cases above — when you're NOT waiting this turn but still need to
+come back to a running task — use `ScheduleWakeup`. This is the tool for asynchronous
+"check back later" follow-up, as opposed to `lazy_wait`'s "block now and review this turn".
 
 When the engineer asks to be notified once a task finishes — "let me know when it's done",
 "check `lazy_blocked` when it's ready", "tell me when this completes" — you MUST call
@@ -332,12 +349,16 @@ Typical usage:
 - `reason`: one short sentence for telemetry (e.g. "polling for fix-auth completion").
 
 Rule of thumb:
-- Synchronous (need result this turn) → `lazy_wait`.
-- Asynchronous follow-up ("check back when done") → `ScheduleWakeup`.
-- Default ("start it and move on") → neither.
+- Single self-contained task, one strand of conversation (especially autonomous) → `lazy_wait`,
+  then review and iterate. This is the default.
+- Parallel work, or the engineer wants to keep moving → fire and continue; `ScheduleWakeup`
+  for asynchronous follow-up.
+- Need a result mid-turn to write the rest of your reply (e.g. a `lazy_sync` you just
+  triggered) → `lazy_wait`.
 
 You can run multiple tasks in parallel. This is one of Lazy's key strengths — don't
-serialize work unnecessarily.
+serialize work unnecessarily. The default above is about the single-task case, not a reason
+to stop parallelizing when there genuinely are multiple strands of work.
 
 ## What you and your agents can install
 

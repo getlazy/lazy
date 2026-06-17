@@ -16,6 +16,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, constants } from 'fs';
 import { join, dirname } from 'path';
 import { getDataDir } from '../cli/init';
+import { spawn } from './spawn';
 
 const LOCK_FILENAME = '.storage-lock';
 
@@ -33,15 +34,38 @@ interface StorageLockFile {
   acquired_at: string;
 }
 
+/** True if a `ps`-reported process state denotes a zombie/defunct process. */
+export function isZombieState(state: string): boolean {
+  // 'Z' is the zombie/defunct code on both macOS and Linux ps output.
+  return state.trim().startsWith('Z');
+}
+
 /**
- * Check if a process is still running by sending signal 0.
+ * Check if a process is alive AND able to hold the lock.
+ *
+ * `process.kill(pid, 0)` only tests whether the pid exists in the process
+ * table — and a ZOMBIE (defunct) process, terminated but not yet reaped by its
+ * parent, still answers it. A zombie holds no resources and will NEVER release
+ * the storage lock, so treating it as "alive" deadlocks every future writer
+ * forever (observed in the wild: a `lazy pair` child grabbed the lock, died,
+ * and was left unreaped — the daemon then 500'd on every storage RPC). So we
+ * additionally check the process state and treat a zombie as dead.
  */
-function isProcessRunning(pid: number): boolean {
+export async function isProcessRunning(pid: number): Promise<boolean> {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
-    return false;
+    return false; // No such process.
+  }
+  // Exists in the table — distinguish a live process from a zombie via `ps`.
+  try {
+    const proc = spawn(['ps', '-o', 'state=', '-p', String(pid)], { stdout: 'pipe', stderr: 'ignore' });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return !isZombieState(out);
+  } catch {
+    // `ps` unavailable — be conservative and assume the holder is alive rather
+    // than risk stealing a lock from a genuinely-running process.
+    return true;
   }
 }
 
@@ -79,7 +103,7 @@ export class StorageLock {
     }
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      if (this.tryAcquire()) {
+      if (await this.tryAcquire()) {
         this.depth = 1;
         return;
       }
@@ -136,7 +160,7 @@ export class StorageLock {
    * Uses O_EXCL for atomic create-or-fail to prevent TOCTOU races where
    * two processes both see "no lock file" and both write their own.
    */
-  private tryAcquire(): boolean {
+  private async tryAcquire(): Promise<boolean> {
     // Precondition: lock directory must exist
     const lockDir = dirname(this.lockPath);
     if (!existsSync(lockDir)) {
@@ -178,8 +202,8 @@ export class StorageLock {
         return true;
       }
 
-      // Check if the owning process is still alive
-      if (isProcessRunning(lock.pid)) {
+      // Check if the owning process is still alive (zombies count as dead)
+      if (await isProcessRunning(lock.pid)) {
         return false; // Lock held by a live process
       }
 

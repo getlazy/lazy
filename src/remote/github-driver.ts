@@ -1256,14 +1256,34 @@ export class GitHubDriver implements RepositoryDriver {
    * survive on disk only as a one-time read for the storage-layer migration.
    */
   private async targetBranch(task: Task): Promise<string> {
+    // INVARIANT: PRs only for protected branches; subtask→parent merges are
+    // local. A task stacked on another task (target.kind === 'task') or carrying
+    // a legacy 'lazy/...' sentinel must NEVER have its PR silently retargeted to
+    // the repo default — that is exactly the "PR against main for a child task"
+    // bug. A PR is only ever created for a protected named-branch target, so
+    // reaching here for a lazy-parented task is a merge-routing bug; fail loudly.
+    if (task.target.kind === 'task') {
+      throw new Error(
+        `Refusing to create a PR for task ${task.id}: it is stacked on another task ` +
+        `(parent ${task.target.parentTaskId}). Subtask→parent merges must be local git ` +
+        `operations, not remote PRs — this is a merge-routing bug.`,
+      );
+    }
     const branch = targetBranchOf(task);
+    if (branch?.startsWith('lazy/')) {
+      throw new Error(
+        `Refusing to create a PR for task ${task.id}: integration target ('${branch}') is a lazy task branch, ` +
+        `not a real integration branch. A lazy task-branch parent means the merge must be a local git operation, ` +
+        `not a remote PR — this is a merge-routing bug.`,
+      );
+    }
 
-    // No usable named branch: the task is stacked on another task, the target
-    // is unresolved, or it's a literal "HEAD" (detached-HEAD repo at start) —
-    // none are valid PR bases. Resolve the repo default. (PR creation for a
-    // non-top-level task is unexpected; markReadyForReview also guards empties.)
-    if (!branch || branch === 'HEAD' || branch.startsWith('lazy/')) {
-      logger.warn(`targetBranch: task ${task.id} has no valid named integration branch ('${branch ?? ''}') — resolving repo default`);
+    // No usable named branch: the task is a detached-HEAD root task (literal
+    // "HEAD") or the target is unresolved ('' / undefined). Both legitimately
+    // integrate into the repo default branch. (markReadyForReview also guards
+    // empties.)
+    if (!branch || branch === 'HEAD') {
+      logger.warn(`targetBranch: task ${task.id} target ('${branch ?? ''}') resolves to the repo default branch`);
       return (await this.resolveDefaultBranch()) ?? 'main';
     }
     return branch;

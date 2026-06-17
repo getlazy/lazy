@@ -657,6 +657,8 @@ lazy upgrade
 
 It will warn you if any of the agents is working on a task.
 
+If you have an interactive `lazy builder` session open (docker/podman), `lazy upgrade` restarts it to apply the new image and the session **auto-resumes in place** — same conversation, same terminal, no manual `--resume`. Before it stops a live builder, upgrade warns you to submit any in-progress message first: the conversation is preserved, but a message you've typed into the builder and not yet sent cannot be recovered. Host-process builders aren't stopped by upgrade, so there's nothing to resume there.
+
 ### Waiting on a Task
 
 When you want to wait for a task (e.g. to review it or to run upgrade) you run:

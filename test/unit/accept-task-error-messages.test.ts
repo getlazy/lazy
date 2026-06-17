@@ -39,10 +39,15 @@ import {
 // --- Mock config loader ---
 await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
+    // auto_approve + a protected target is the configuration under which accept
+    // exercises the remote-ref auto-creation path (push + markReadyForReview).
+    // After the "PRs only for protected branches" routing fix, an UNPROTECTED
+    // target is merged locally and never pushes/creates a PR — so to test the
+    // push/PR-creation error messages we must model a protected target.
     remote: {
       driver: 'github',
       git_remote: 'origin',
-      auto_approve: false,
+      auto_approve: true,
     },
     storage: { backend: 'external', external_path: '' },
   }),
@@ -68,7 +73,9 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
     validateAccept: () => 'Task has no remote reference',
     hasRemoteRef: () => false,
     hasExternalApproval: async () => false,
-    isTargetBranchProtected: async () => false,
+    // Protected target → accept stays on the remote MR path (push +
+    // markReadyForReview), which is what these error-message tests exercise.
+    isTargetBranchProtected: async () => true,
     pushBranch: (branch: string) => pushBranchImpl(branch),
     markReadyForReview: () => markReadyForReviewImpl(),
     getPRState: async () => null,

@@ -21,7 +21,7 @@ import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { getActor } from '../../constants';
-import { spawnSync, spawn } from '../../utils/spawn';
+import { spawn } from '../../utils/spawn';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -528,19 +528,28 @@ export async function commandPair(args: string[]): Promise<void> {
         claudeArgs.push('--model', config.ollama.model);
       }
 
-      // Launch Claude Code interactively in the worktree
-      const result = spawnSync(claudeArgs, {
+      // Launch Claude Code interactively in the worktree. Use ASYNC spawn +
+      // await (not spawnSync): inherited stdio still gives a normal interactive
+      // terminal, but the event loop keeps running for the duration of the
+      // session. That matters because `lazy pair` auto-starts the daemon as a
+      // CHILD process (via ensureDaemon); spawnSync would freeze the event loop
+      // for the whole session, so if that daemon child dies (e.g. another
+      // terminal runs `lazy upgrade`), the runtime can never reap it and it
+      // becomes a zombie that holds the storage lock. Keeping the loop alive
+      // lets the runtime reap exited children. (pairBranchless does the same.)
+      const proc = spawn(claudeArgs, {
         cwd: worktreePath,
         stdin: 'inherit',
         stdout: 'inherit',
         stderr: 'inherit',
+        timeout: 0, // Long-running: interactive session runs until the user exits
         env: {
           ...process.env,
           LAZY_TASK: taskShortId,
         },
       });
 
-      exitCode = result.exitCode;
+      exitCode = await proc.exited;
     } finally {
       // Always transition back to blocked, clean up symlinks, and release lock.
       // The transition back to 'blocked' MUST happen even if Claude crashes.

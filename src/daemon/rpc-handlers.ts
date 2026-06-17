@@ -875,6 +875,11 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   saveAgentSessionLog: (s, a) => s.saveAgentSessionLog(a.taskId as string, a.sessionId as string, a.content as string),
   getAgentSessionLog: (s, a) => s.getAgentSessionLog(a.taskId as string),
 
+  // Builder resume intents (durable upgrade↔builder handshake)
+  saveBuilderResumeIntent: (s, a) => s.saveBuilderResumeIntent(a.intent as any),
+  takeBuilderResumeIntent: (s, a) => s.takeBuilderResumeIntent(a.builderId as string),
+  listBuilderResumeIntents: (s, a) => s.listBuilderResumeIntents(a.projectRoot as string | undefined),
+
   // Status History
   getStatusHistory: (s, a) => s.getStatusHistory(a.taskId as string),
 

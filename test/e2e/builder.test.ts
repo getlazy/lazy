@@ -73,6 +73,19 @@ describe('lazy builder', () => {
     expectOutput(result, 'Conversations are captured');
   });
 
+  // The supervised relaunch loop is docker/podman-only — host-process builders
+  // are not stopped by upgrade, so help must say auto-resume applies there only.
+  test('help documents docker-only auto-resume across upgrade', async () => {
+    const result = await ctx.lazy(['builder', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Auto-resume across upgrade (docker/podman only)');
+    // Honesty about the unsent-input loss (spike §4 / S3).
+    expectOutput(result, 'unsent input cannot be recovered');
+    // Actionable manual fallback is documented.
+    expectOutput(result, 'lazy builder --resume');
+  });
+
   test('--help shows resume options', async () => {
     const result = await ctx.lazy(['builder', '--help']);
 

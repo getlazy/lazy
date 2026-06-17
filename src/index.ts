@@ -95,6 +95,7 @@ Working on Tasks:
 System:
   system prompts         List built-in system prompt templates
   system build <name>    Prebuild a lazy system image (e.g., lazy-runner)
+  system status          Show current system state (offline/online, driver, daemon)
   system offline         Enable offline mode (skip all remote operations)
   system online          Disable offline mode (restore remote operations)
 

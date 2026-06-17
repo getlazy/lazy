@@ -57,7 +57,7 @@ import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
 import { PROTOCOL_VERSION } from '../protocol/types';
 import { VERSION } from '../version';
-import { spawn, spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { detectViolations } from './permissions';
 import { runPermissionPushback } from './pushback';
@@ -85,12 +85,14 @@ export interface SupervisorConfig {
  * Check that required tools are available.
  * Uses the runner to determine which tools are needed for this environment.
  */
-function checkRequiredTools(runner: Runner): void {
+async function checkRequiredTools(runner: Runner): Promise<void> {
   const checks = runner.supervisorToolChecks();
 
   for (const { cmd, name, hint } of checks) {
-    const result = spawnSync(['which', cmd], { stdout: 'ignore', stderr: 'ignore' });
-    if (result.exitCode !== 0) {
+    // Async spawn (not spawnSync) so the supervisor event loop is never blocked.
+    const proc = spawn(['which', cmd], { stdout: 'ignore', stderr: 'ignore' });
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
       logError(`[supervisor] ${hint}`);
       process.exit(1);
     }
@@ -143,7 +145,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
   }
 
   // Check required tools before doing any work
-  checkRequiredTools(runner);
+  await checkRequiredTools(runner);
 
   // Recovery: clean up any in-progress merge left by a previous crash
   await recoverWorktreeState(worktreePath);

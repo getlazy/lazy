@@ -173,4 +173,52 @@ describe('resolveUpstreamRef', () => {
       expect(ref).toBe('main');
     });
   });
+
+  describe('no silent stale/local fallback (sync merges the LIVE remote)', () => {
+    // INVARIANT: Sync's entire job is to deliver the LIVE remote upstream into a
+    // task branch. A remote driver must resolve to the remote-tracking ref
+    // (`<remote>/<branch>`), NEVER a bare local branch name — merging the local
+    // branch silently drops upstream changes and lets accepts fail later with
+    // "MR has merge conflicts" that no local sync surfaced. Two guarantees the
+    // callers (launchTask, syncTask) depend on:
+    //   1. On success the resolved ref is the remote-tracking form (live).
+    //   2. On fetch failure the driver THROWS — callers must propagate, not
+    //      swallow into a stale local ref. This guards the regression where
+    //      launchTask had an empty `catch {}` that fell back to the local
+    //      branch name (a stale/local-ref merge); per CLAUDE.md "fail hard on
+    //      remote failures — no silent fallbacks" that fallback is forbidden
+    //      unless the caller explicitly opted into --force-local.
+    test('GitLab: success resolves remote-tracking ref, not the local branch', async () => {
+      const gitlabConfig = {
+        ...mockConfig,
+        remote: { ...mockConfig.remote, driver: 'gitlab' as const },
+      };
+      const driver = new GitLabDriver(gitlabConfig, {
+        runGl: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      });
+      const ref = await driver.resolveUpstreamRef('lazy/release-v017', '/tmp/worktree');
+      // The merge target must be the remote-tracking ref so the pinned SHA
+      // reflects the live remote, not whatever the local branch happens to be.
+      expect(ref).toBe('origin/lazy/release-v017');
+      expect(ref).not.toBe('lazy/release-v017');
+    });
+
+    test('GitLab: fetch failure throws (so callers cannot silently use a stale local ref)', async () => {
+      const gitlabConfig = {
+        ...mockConfig,
+        remote: { ...mockConfig.remote, driver: 'gitlab' as const },
+      };
+      const driver = new GitLabDriver(gitlabConfig, {
+        runGl: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        runGit: async (args: string[]) =>
+          args[0] === 'fetch'
+            ? { stdout: '', stderr: 'fatal: could not read from remote', exitCode: 128 }
+            : { stdout: '', stderr: '', exitCode: 0 },
+      });
+      await expect(
+        driver.resolveUpstreamRef('lazy/release-v017', '/tmp/worktree'),
+      ).rejects.toThrow(/Failed to fetch/);
+    });
+  });
 });

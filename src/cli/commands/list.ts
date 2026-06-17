@@ -40,7 +40,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
     if (session && !['complete', 'abandoned'].includes(task.status)) {
       const tRef = taskRef(task);
       const cn = session.container_name ?? runner.runNameForTask(tRef);
-      const info = runner.getRunInfo(cn);
+      const info = await runner.getRunInfo(cn);
       if (info && !info.running) {
         crashed = true;
       }

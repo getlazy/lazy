@@ -59,6 +59,7 @@ Options:
   --worktree <path>            Path to the repo root (required)
   --builder-config <path>      Path to builder config JSON (host + port + token) (required)
   --daemon-config <path>       Path to daemon MCP config (preferred over builder-config)
+  --builder-id <id>            Stable builder id; stamps sessionId onto its resume intent on exit
   -- <args...>                 Additional args passed to Claude Code`);
     process.exit(0);
   }
@@ -67,6 +68,7 @@ Options:
   const promptFileIdx = args.indexOf('--system-prompt-file');
   const builderConfigIdx = args.indexOf('--builder-config');
   const daemonConfigIdx = args.indexOf('--daemon-config');
+  const builderIdIdx = args.indexOf('--builder-id');
   const dashDashIdx = args.indexOf('--');
 
   if (worktreeIdx === -1 || worktreeIdx + 1 >= args.length) {
@@ -88,6 +90,9 @@ Options:
   const daemonConfigPath = (daemonConfigIdx !== -1 && daemonConfigIdx + 1 < args.length)
     ? args[daemonConfigIdx + 1]
     : undefined;
+  const builderId = (builderIdIdx !== -1 && builderIdIdx + 1 < args.length)
+    ? args[builderIdIdx + 1]
+    : undefined;
   const claudeExtraArgs = dashDashIdx !== -1 ? args.slice(dashDashIdx + 1) : undefined;
 
   const { runBuilderSupervisor } = await import('./supervisor/builder');
@@ -96,6 +101,7 @@ Options:
     systemPromptFile,
     builderConfigPath,
     daemonConfigPath,
+    builderId,
     claudeExtraArgs,
     debug: args.includes('--debug'),
   });

@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdir
 import { join } from 'path';
 import { getHome } from '../utils/home';
 import type { SandboxConfig } from '../capture/claude';
-import { spawn, spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { OllamaConfig } from '../config/types';
@@ -127,17 +127,18 @@ export class HostProcessRunner implements Runner {
     return pidData ? `PID ${pidData.pid}` : runName;
   }
 
-  checkAvailability(): void {
+  async checkAvailability(): Promise<void> {
     // Check that the agent binary is on PATH.
     // Skip for non-claude agents (e.g., qa-agent) — they don't use the claude CLI.
     if (!this._agent || this._agent.id === 'claude-code') {
       const binaryName = agentPackaging.binaryName();
-      const result = spawnSync([binaryName, '--version'], {
+      const proc = spawn([binaryName, '--version'], {
         stdout: 'pipe',
         stderr: 'pipe',
         timeout: 10_000,
       });
-      if (result.exitCode !== 0) {
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
         throw new Error(
           `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
           `Host-process runner requires ${binaryName} to be installed on the host.`
@@ -307,17 +308,17 @@ export class HostProcessRunner implements Runner {
     return JSON.parse(output) as AgentResponse;
   }
 
-  isRunning(runName: string): boolean {
+  async isRunning(runName: string): Promise<boolean> {
     const pidData = readPidFile(runName);
     if (!pidData) return false;
     return isProcessAlive(pidData.pid);
   }
 
-  runExists(runName: string): boolean {
+  async runExists(runName: string): Promise<boolean> {
     return readPidFile(runName) !== null;
   }
 
-  getRunInfo(runName: string): RunInfo | null {
+  async getRunInfo(runName: string): Promise<RunInfo | null> {
     const pidData = readPidFile(runName);
     if (!pidData) return null;
 
@@ -332,7 +333,7 @@ export class HostProcessRunner implements Runner {
     };
   }
 
-  getRunExitCode(runName: string): number | null {
+  async getRunExitCode(runName: string): Promise<number | null> {
     const pidData = readPidFile(runName);
     if (!pidData) return null;
     if (isProcessAlive(pidData.pid)) return null;
@@ -340,7 +341,7 @@ export class HostProcessRunner implements Runner {
     return 1;
   }
 
-  getRunLogs(runName: string, tailLines?: number): string | null {
+  async getRunLogs(runName: string, tailLines?: number): Promise<string | null> {
     const pidData = readPidFile(runName);
     if (!pidData) return null;
 
@@ -354,7 +355,7 @@ export class HostProcessRunner implements Runner {
     }
   }
 
-  stopRun(runName: string): boolean {
+  async stopRun(runName: string): Promise<boolean> {
     const pidData = readPidFile(runName);
     if (!pidData) return false;
 
@@ -379,7 +380,7 @@ export class HostProcessRunner implements Runner {
     }
   }
 
-  removeRun(runName: string): void {
+  async removeRun(runName: string): Promise<void> {
     const pidData = readPidFile(runName);
     if (!pidData) return;
 
@@ -405,7 +406,7 @@ export class HostProcessRunner implements Runner {
     }
   }
 
-  discoverRunningRuns(): string[] {
+  async discoverRunningRuns(): Promise<string[]> {
     const dir = pidFileDir();
     if (!existsSync(dir)) return [];
 
@@ -437,7 +438,7 @@ export class HostProcessRunner implements Runner {
     }
   }
 
-  discoverProjectBuilderRuns(_projectRoot: string): string[] {
+  async discoverProjectBuilderRuns(_projectRoot: string): Promise<string[]> {
     // Host-process mode launches the builder as a foreground Claude Code
     // process without writing a PID file, so there are no builder runs to
     // enumerate here. `lazy upgrade` therefore has nothing to stop for
@@ -485,7 +486,7 @@ export class HostProcessRunner implements Runner {
     };
   }
 
-  diagnose(): HealthCheck[] {
+  async diagnose(): Promise<HealthCheck[]> {
     const results: HealthCheck[] = [];
 
     // Delegate agent-specific checks to packaging

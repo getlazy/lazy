@@ -1,45 +1,18 @@
 /**
  * `lazy server` command
  *
- * Alias for the daemon's built-in web dashboard.
- *
- * In normal mode: ensures the daemon is running, prints the web dashboard URL.
- * In standalone mode (--port flag or test env): starts a standalone HTTP server
- * on the specified port, same as the old `lazy server` behavior.
+ * Thin alias for the daemon's built-in web dashboard. Ensures the daemon is
+ * running and prints the dashboard URL. The dashboard is served by the daemon
+ * itself (the single storage writer) — there is no separate standalone server.
  */
 
 import {
   checkDaemonHealth,
   ensureDaemon,
 } from '../../daemon';
-import { startServer } from '../../server';
 import { findLazyRoot } from '../init';
-import { loadConfig } from '../../config/loader';
-import { DEFAULT_WEB_PORT } from '../../config/constants';
 
-export async function commandServer(args: string[]): Promise<void> {
-  // Parse --port flag
-  const portIndex = args.indexOf('--port');
-  let explicitPort: number | undefined;
-  if (portIndex !== -1 && args[portIndex + 1]) {
-    const parsed = parseInt(args[portIndex + 1], 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
-      console.error('Error: --port must be a number between 1 and 65535');
-      process.exit(1);
-    }
-    explicitPort = parsed;
-  }
-
-  // If --port is given, or we're in test mode, use standalone mode.
-  if (explicitPort !== undefined || process.env.LAZY_TEST === '1') {
-    const root = findLazyRoot();
-    const config = root ? await loadConfig(root) : null;
-    const port = explicitPort ?? config?.server.port ?? DEFAULT_WEB_PORT;
-    await startServer(port);
-    return;
-  }
-
-  // Normal mode: start daemon and print URL
+export async function commandServer(_args: string[]): Promise<void> {
   const root = findLazyRoot();
   if (!root) {
     console.error('Error: not in a lazy project. Run `lazy init` first.');
@@ -71,23 +44,16 @@ export async function commandServer(args: string[]): Promise<void> {
 }
 
 export function serverUsage(): void {
-  console.log(`Usage: lazy server [--port <port>]
+  console.log(`Usage: lazy server
 
-Start the web dashboard server.
+Show the web dashboard URL.
 
-When run without --port, starts the daemon (if not already running) and prints
-the web dashboard URL. The web dashboard is built into the daemon and binds to
-TCP port 26024 by default (configurable via [server].port in lazy.toml).
-
-When run with --port, starts a standalone HTTP server on the specified port
-(legacy mode, without the daemon).
-
-Options:
-  --port <port>  Start standalone server on this port (bypasses daemon)
+Ensures the daemon is running (starting it if needed) and prints the URL of the
+web dashboard. The dashboard is built into the daemon and binds to TCP port
+26024 by default (configurable via [server].port in lazy.toml).
 
 Examples:
-  lazy server              # Start daemon and show web URL
-  lazy server --port 8080  # Start standalone server on port 8080
-  lazy daemon status       # Check daemon and web dashboard status
-  lazy daemon stop         # Stop daemon (and web dashboard)`);
+  lazy server          # Start daemon (if needed) and show web dashboard URL
+  lazy daemon status   # Check daemon and web dashboard status
+  lazy daemon stop     # Stop daemon (and web dashboard)`);
 }

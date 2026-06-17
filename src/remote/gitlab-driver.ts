@@ -1403,9 +1403,31 @@ export class GitLabDriver implements RepositoryDriver {
    * whose target is a named branch.
    */
   private async targetBranch(task: Task): Promise<string> {
+    // INVARIANT: PRs only for protected branches; subtask→parent merges are
+    // local. A task stacked on another task (target.kind === 'task') or carrying
+    // a legacy 'lazy/...' sentinel must NEVER have its MR silently retargeted to
+    // the default branch — that is exactly the "MR against main for a child task"
+    // bug. An MR is only ever created for a protected named-branch target, so
+    // reaching here for a lazy-parented task is a merge-routing bug; fail loudly.
+    if (task.target.kind === 'task') {
+      throw new Error(
+        `Refusing to create an MR for task ${task.id}: it is stacked on another task ` +
+        `(parent ${task.target.parentTaskId}). Subtask→parent merges must be local git ` +
+        `operations, not remote MRs — this is a merge-routing bug.`,
+      );
+    }
     const branch = targetBranchOf(task);
-    if (!branch || branch === 'HEAD' || branch.startsWith('lazy/')) {
-      logger.warn(`targetBranch: task ${task.id} has no valid named integration branch ('${branch ?? ''}') — resolving to default branch`);
+    if (branch?.startsWith('lazy/')) {
+      throw new Error(
+        `Refusing to create an MR for task ${task.id}: integration target ('${branch}') is a lazy task branch, ` +
+        `not a real integration branch. A lazy task-branch parent means the merge must be a local git operation, ` +
+        `not a remote MR — this is a merge-routing bug.`,
+      );
+    }
+    // A detached-HEAD root task (branch === 'HEAD') or an unresolved target
+    // ('' / undefined) legitimately integrates into the repo's default branch.
+    if (!branch || branch === 'HEAD') {
+      logger.warn(`targetBranch: task ${task.id} target ('${branch ?? ''}') resolves to the repo default branch`);
       return (await this.resolveDefaultBranch()) ?? 'main';
     }
     return branch;

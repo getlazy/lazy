@@ -45,6 +45,14 @@ const CAPTURE_INTERVAL_MS = 30_000;
 export interface BuilderSupervisorConfig {
   /** Path to the repo root (working directory for Claude Code) */
   worktreePath: string;
+  /**
+   * Stable per-builder identifier (the `lazy-builder-<builderId>` run name).
+   * When present, the detected Claude sessionId is stamped onto a matching
+   * builder-resume-intent on exit so the host relaunch loop can resume the same
+   * conversation deterministically. Docker mode passes this; host-process mode
+   * (which learns the sessionId directly) does not.
+   */
+  builderId?: string;
   /** Path to a file containing the system prompt */
   systemPromptFile: string;
   /** Path to the builder config JSON (host + port + token) — used for conversation capture */
@@ -87,6 +95,17 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const claudeHome = getHome();
   const beforeTimes = getSessionFileTimes(claudeHome, config.worktreePath);
 
+  // When launched with `--resume <id>`, that session IS the one being driven —
+  // Claude appends to <id>.jsonl in place. Capture/stamp must anchor to it
+  // rather than guessing by mtime, because ~/.claude/projects/<proj> is shared
+  // (other builder runs, a plain `claude` in the same repo) and an unrelated
+  // session with a newer mtime would otherwise be detected — resuming the WRONG
+  // conversation after an upgrade. See pickActiveSessionFile.
+  const resumeSessionId = parseResumeSessionId(config.claudeExtraArgs);
+  if (resumeSessionId) {
+    log(`[builder] Launched with --resume ${resumeSessionId}; anchoring capture to it`);
+  }
+
   // Build Claude args
   const claudeArgs = [
     'claude',
@@ -99,7 +118,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   }
 
   // Start background incremental capture
-  const monitor = startCaptureMonitor(config.worktreePath, claudeHome, beforeTimes, createStorage);
+  const monitor = startCaptureMonitor(config.worktreePath, claudeHome, beforeTimes, createStorage, resumeSessionId);
 
   log('[builder] Launching Claude Code interactively...');
 
@@ -121,6 +140,20 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
     log(`[builder] Captured conversation: ${detectedSessionId}`);
     // Print session ID to stderr (stdout is Claude's territory)
     console.error(`\nBuilder session: ${detectedSessionId}`);
+
+    // Stamp the sessionId onto a matching builder-resume-intent so the host
+    // relaunch loop can resume the exact same conversation. In docker mode the
+    // host gets sessionId: null from the runner — only the in-container
+    // supervisor knows the id — so this is the host's deterministic source.
+    // Best-effort and non-blocking: a failure here must not affect exit.
+    if (config.builderId) {
+      await stampSessionIdOntoResumeIntent(
+        config.builderId,
+        config.worktreePath,
+        detectedSessionId,
+        createStorage,
+      );
+    }
   }
 
   // Signal shutdown to host HTTP server (host-process mode without daemon MCP proxy)
@@ -138,6 +171,51 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   }
 
   process.exit(exitCode);
+}
+
+/**
+ * Stamp the detected Claude sessionId onto an existing builder-resume-intent.
+ *
+ * Only updates an intent that already exists for this builderId — it never
+ * creates one. An intent is written by `lazy upgrade` before it stops the
+ * builder container; if there is no intent, this was a normal quit/crash and
+ * there is nothing to resume, so creating a record here would make the host
+ * relaunch loop fire spuriously. The intent's data dir is mounted read-write
+ * into the container, so the host reads the stamped sessionId after the
+ * container exits.
+ *
+ * Best-effort: any failure is logged and swallowed so it cannot affect the
+ * builder's exit path.
+ */
+export async function stampSessionIdOntoResumeIntent(
+  builderId: string,
+  projectRoot: string,
+  sessionId: string,
+  storageFactory: StorageFactory,
+): Promise<void> {
+  let storage: import('../storage/interface').Storage | null = null;
+  try {
+    storage = await storageFactory(projectRoot);
+    const intents = await storage.listBuilderResumeIntents(projectRoot);
+    const existing = intents.find(i => i.builderId === builderId);
+    if (!existing) {
+      // No upgrade-written intent — normal exit, nothing to resume.
+      log(`[builder] No resume intent for ${builderId}; skipping sessionId stamp`);
+      return;
+    }
+    if (existing.sessionId === sessionId) {
+      return; // Already stamped (idempotent).
+    }
+    await storage.saveBuilderResumeIntent({ ...existing, sessionId });
+    log(`[builder] Stamped sessionId ${sessionId} onto resume intent ${builderId}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logError(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
+  } finally {
+    if (storage) {
+      await storage.close();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,27 +246,78 @@ function getSessionFileTimes(claudeHome: string, lazyRoot: string): Map<string, 
   return times;
 }
 
-function findActiveSessionFile(
+/**
+ * Extract the `--resume <id>` session id from the args passed to Claude, or null
+ * if the builder was started fresh.
+ */
+export function parseResumeSessionId(args: string[] | undefined): string | null {
+  if (!args) return null;
+  const i = args.indexOf('--resume');
+  if (i >= 0 && i + 1 < args.length) {
+    const id = args[i + 1]?.trim();
+    return id ? id : null;
+  }
+  return null;
+}
+
+/**
+ * Decide which JSONL file holds the live builder session, given the mtimes
+ * before launch and after, plus the explicit `--resume` id (if any).
+ *
+ * Pure (no fs) so the resolution order is unit-testable. Order:
+ *   1. If launched with `--resume <id>` and `<id>.jsonl` exists, that is the
+ *      session — Claude appends to it in place. This is authoritative: it stops
+ *      an unrelated session in the shared ~/.claude/projects/<proj> dir (other
+ *      builders, a plain `claude` in the repo) from hijacking detection just
+ *      because it has a newer mtime. THIS is the bug that resumed the wrong
+ *      conversation after an upgrade.
+ *   2. Otherwise (fresh session): the newest file that is genuinely NEW since
+ *      launch. A from-scratch session writes a brand-new sessionId file.
+ *   3. Last resort: the newest file whose mtime merely changed (legacy
+ *      heuristic) — only when there is no resume id and no new file.
+ */
+export function pickActiveSessionFile(
   beforeTimes: Map<string, number>,
-  claudeHome: string,
-  lazyRoot: string,
+  afterTimes: Map<string, number>,
+  resumeSessionId: string | null,
 ): string | null {
-  const afterTimes = getSessionFileTimes(claudeHome, lazyRoot);
+  if (resumeSessionId) {
+    const resumedFile = `${resumeSessionId}.jsonl`;
+    if (afterTimes.has(resumedFile)) return resumedFile;
+  }
 
   let newestFile: string | null = null;
-  let newestMtime = 0;
+  let newestMtime = -1;
 
+  // Prefer genuinely-new files (created after launch) — a from-scratch session.
+  for (const [file, mtime] of afterTimes) {
+    if (!beforeTimes.has(file) && mtime > newestMtime) {
+      newestMtime = mtime;
+      newestFile = file;
+    }
+  }
+  if (newestFile) return newestFile;
+
+  // Last resort: newest file whose mtime changed since launch.
   for (const [file, mtime] of afterTimes) {
     const beforeMtime = beforeTimes.get(file);
-    if (beforeMtime === undefined || mtime !== beforeMtime) {
-      if (mtime > newestMtime) {
-        newestMtime = mtime;
-        newestFile = file;
-      }
+    if (beforeMtime !== undefined && mtime !== beforeMtime && mtime > newestMtime) {
+      newestMtime = mtime;
+      newestFile = file;
     }
   }
 
   return newestFile;
+}
+
+function findActiveSessionFile(
+  beforeTimes: Map<string, number>,
+  claudeHome: string,
+  lazyRoot: string,
+  resumeSessionId: string | null,
+): string | null {
+  const afterTimes = getSessionFileTimes(claudeHome, lazyRoot);
+  return pickActiveSessionFile(beforeTimes, afterTimes, resumeSessionId);
 }
 
 function resolveSessionPath(claudeHome: string, lazyRoot: string, fileName: string): string {
@@ -274,6 +403,7 @@ function startCaptureMonitor(
   claudeHome: string,
   beforeTimes: Map<string, number>,
   storageFactory: StorageFactory,
+  resumeSessionId: string | null,
 ): { stop: () => Promise<string | null> } {
   let byteOffset = 0;
   let activeFile: string | null = null;
@@ -290,7 +420,7 @@ function startCaptureMonitor(
 
     try {
       if (!activeFile) {
-        const fileName = findActiveSessionFile(beforeTimes, claudeHome, lazyRoot);
+        const fileName = findActiveSessionFile(beforeTimes, claudeHome, lazyRoot, resumeSessionId);
         if (!fileName) return;
 
         activeFile = resolveSessionPath(claudeHome, lazyRoot, fileName);
@@ -330,7 +460,7 @@ function startCaptureMonitor(
 
       let detectedSessionId: string | null = sessionId;
       try {
-        const fileRef = activeFile ?? findActiveSessionFile(beforeTimes, claudeHome, lazyRoot);
+        const fileRef = activeFile ?? findActiveSessionFile(beforeTimes, claudeHome, lazyRoot, resumeSessionId);
         if (fileRef) {
           const sid = basename(fileRef, '.jsonl');
           detectedSessionId = sid;

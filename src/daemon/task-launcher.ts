@@ -264,7 +264,7 @@ export async function launchTask(
   if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
     (runner as any).setAgent(agent);
   }
-  runner.checkAvailability();
+  await runner.checkAvailability();
 
   const config = await loadConfig(projectRoot);
 
@@ -516,10 +516,28 @@ export async function launchTask(
     ensureProtocolDir(protoDir);
 
     if (parentBranch) {
+      // Resolve to the LIVE remote-tracking ref (e.g. `origin/main`) so the
+      // supervisor's pre-work sync merges the current remote upstream, not a
+      // stale local branch. Per CLAUDE.md "fail hard on remote failures — no
+      // silent fallbacks": a fetch failure here must be visible, never swallowed
+      // into a silent stale/local-ref merge. With `--force-local` the caller has
+      // opted into local HEAD, so degrade to the local branch name but still
+      // surface a warning.
       try {
         parentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
-      } catch {
-        // Resolution failed — use the local branch name
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (params.forceLocal) {
+          warnings.push(
+            `Failed to resolve upstream ref for ${parentBranch} (using local branch, --force-local): ${detail}`,
+          );
+        } else {
+          throw new RpcError(
+            500,
+            `Failed to resolve upstream ref for parent branch ${parentBranch}: ${detail}. ` +
+              `Refusing to fall back to a stale local ref. Use --force-local to start from the local branch.`,
+          );
+        }
       }
     }
 
@@ -552,10 +570,10 @@ export async function launchTask(
     }
 
     // --- Launch supervisor ---
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       // Supervisor already running — it will pick up the new command
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);

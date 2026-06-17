@@ -287,8 +287,48 @@ export async function squashMergeBranch(branch: string, cwd?: string): Promise<v
 }
 
 /**
+ * Run the squash-merge + commit sequence in `cwd`, which MUST already have
+ * `targetBranch` checked out. Does not change branches. Throws (without
+ * committing) when the source has no changes relative to the target.
+ */
+async function runSquashMergeCommit(
+  sourceBranch: string,
+  targetBranch: string,
+  commitMessage: string,
+  cwd: string
+): Promise<void> {
+  const merge = await runGit(['merge', '--squash', sourceBranch], { cwd });
+  if (merge.exitCode !== 0) {
+    throw new Error(`Squash merge failed: ${merge.stderr}`);
+  }
+
+  // Check if the squash merge produced any staged changes
+  const diffIndex = await runGit(['diff', '--cached', '--quiet'], { cwd });
+  if (diffIndex.exitCode === 0) {
+    throw new Error(`Nothing to merge: ${sourceBranch} has no changes relative to ${targetBranch}. Use 'lazy close' or 'lazy reject' instead.`);
+  }
+
+  const commit = await runGit(['commit', '-m', commitMessage], { cwd });
+  if (commit.exitCode !== 0) {
+    throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
+  }
+}
+
+/**
  * Squash-merge a source branch into a target branch.
- * Checks out the target, squash-merges, commits, then returns to the original branch.
+ *
+ * A branch can only be checked out in ONE working tree at a time. When the
+ * target branch is already checked out in a worktree (an intermediate parent
+ * task's branch ALWAYS is — it lives in its own worktree), we cannot
+ * `git checkout` it in the repo root: git refuses with "already used by
+ * worktree at ...". So we run the squash merge IN that worktree instead, where
+ * the branch is already checked out — no checkout required.
+ *
+ * Otherwise (no worktree holds the target), we fall back to checking it out in
+ * the repo root, merging, and restoring the original branch.
+ *
+ * In both cases we never leave any location on the wrong branch or in a dirty
+ * state, on success or failure.
  */
 export async function squashMergeBranchIntoTarget(
   sourceBranch: string,
@@ -298,27 +338,51 @@ export async function squashMergeBranchIntoTarget(
 ): Promise<void> {
   const originalBranch = await getCurrentBranch(cwd);
 
+  // Case 1: the target is already checked out right here (cwd is on it). Merge
+  // in place — no checkout needed, and no branch to restore. This is the common
+  // "accept into main from the repo root" path, byte-for-byte as before.
+  if (originalBranch === targetBranch) {
+    await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, cwd ?? process.cwd());
+    return;
+  }
+
+  // Case 2: the target is checked out in a SEPARATE worktree. A branch can only
+  // be checked out in one working tree at a time, so we cannot `git checkout` it
+  // here — git refuses with "already used by worktree at ...". An intermediate
+  // parent task's branch ALWAYS lives in its own worktree, so this is the path
+  // that the local-merge accept of any child-into-parent takes. Merge directly
+  // in that worktree, where the branch is already checked out.
+  const worktreePath = await findWorktreeForBranch(targetBranch, cwd);
+  if (worktreePath) {
+    // The worktree must be clean: a squash merge stages changes into its index,
+    // which would entangle with any uncommitted work and could not be cleanly
+    // rolled back. An accepted parent task is non-active (blocked), so its
+    // worktree is expected clean — but guard and fail loudly if it isn't.
+    if (await hasUncommittedChanges(worktreePath)) {
+      throw new Error(
+        `Cannot merge into ${targetBranch}: its worktree at ${worktreePath} has uncommitted changes. ` +
+        `Commit or discard them before accepting.`
+      );
+    }
+    try {
+      await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, worktreePath);
+    } catch (err) {
+      // Undo any partial squash staging so the worktree is left clean.
+      await runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
+      throw err;
+    }
+    return;
+  }
+
+  // Case 3: no worktree holds the target branch — safe to check it out in the
+  // repo root, merge, then restore the original branch.
   const checkout = await runGit(['checkout', targetBranch], { cwd });
   if (checkout.exitCode !== 0) {
     throw new Error(`Failed to checkout ${targetBranch}: ${checkout.stderr}`);
   }
 
   try {
-    const merge = await runGit(['merge', '--squash', sourceBranch], { cwd });
-    if (merge.exitCode !== 0) {
-      throw new Error(`Squash merge failed: ${merge.stderr}`);
-    }
-
-    // Check if the squash merge produced any staged changes
-    const diffIndex = await runGit(['diff', '--cached', '--quiet'], { cwd });
-    if (diffIndex.exitCode === 0) {
-      throw new Error(`Nothing to merge: ${sourceBranch} has no changes relative to ${targetBranch}. Use 'lazy close' or 'lazy reject' instead.`);
-    }
-
-    const commit = await runGit(['commit', '-m', commitMessage], { cwd });
-    if (commit.exitCode !== 0) {
-      throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
-    }
+    await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, cwd ?? process.cwd());
   } finally {
     await runGit(['checkout', originalBranch], { cwd });
   }

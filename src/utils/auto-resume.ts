@@ -131,7 +131,7 @@ export async function autoResumeTask(
   const runner = await createRunner(lazyRoot);
 
   try {
-    runner.checkAvailability();
+    await runner.checkAvailability();
   } catch {
     logger.debug(`Auto-resume ${taskShortId}: runner not available, skipping`);
     return false;
@@ -258,10 +258,10 @@ export async function autoResumeTask(
     }
 
     // Check if supervisor is already running
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       logger.debug(`Auto-resume ${taskShortId}: supervisor already running, command written`);
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath);

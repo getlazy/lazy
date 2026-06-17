@@ -27,6 +27,7 @@ import type {
   SearchResult,
   StoredConversation,
   AgentSessionLog,
+  BuilderResumeIntent,
   StatusChange,
   Actor,
   FileViolation,
@@ -410,6 +411,18 @@ export class PostgresStorage implements Storage {
           subagents JSONB NOT NULL
         )
       `;
+
+      // Builder resume intents (durable upgrade↔builder handshake)
+      await sql`
+        CREATE TABLE IF NOT EXISTS builder_resume_intents (
+          builder_id TEXT PRIMARY KEY,
+          project_root TEXT NOT NULL,
+          session_id TEXT,
+          created_at TEXT NOT NULL
+        )
+      `;
+
+      await sql`CREATE INDEX IF NOT EXISTS idx_builder_resume_intents_project_root ON builder_resume_intents(project_root)`;
 
       // Record migration
       await sql`
@@ -1344,6 +1357,61 @@ export class PostgresStorage implements Storage {
       FROM agent_session_logs WHERE task_id = ${task.id}
     `;
     return row ?? null;
+  }
+
+  // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
+
+  async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {
+    await this.sql`
+      INSERT INTO builder_resume_intents (builder_id, project_root, session_id, created_at)
+      VALUES (${intent.builderId}, ${intent.projectRoot}, ${intent.sessionId ?? null}, ${intent.createdAt})
+      ON CONFLICT (builder_id) DO UPDATE SET
+        project_root = EXCLUDED.project_root,
+        session_id = EXCLUDED.session_id,
+        created_at = EXCLUDED.created_at
+    `;
+  }
+
+  async takeBuilderResumeIntent(builderId: string): Promise<BuilderResumeIntent | null> {
+    // INVARIANT: consume+clear atomically. DELETE ... RETURNING does both in a
+    // single statement so an intent is acted on at most once even under
+    // concurrent takers.
+    const [row] = await this.sql<BuilderResumeIntent[]>`
+      DELETE FROM builder_resume_intents WHERE builder_id = ${builderId}
+      RETURNING
+        builder_id AS "builderId",
+        project_root AS "projectRoot",
+        session_id AS "sessionId",
+        created_at AS "createdAt"
+    `;
+    if (!row) return null;
+    // Normalize SQL NULL session_id to an absent optional field.
+    if (row.sessionId === null) delete (row as { sessionId?: string }).sessionId;
+    return row;
+  }
+
+  async listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]> {
+    const rows = projectRoot
+      ? await this.sql<BuilderResumeIntent[]>`
+          SELECT
+            builder_id AS "builderId",
+            project_root AS "projectRoot",
+            session_id AS "sessionId",
+            created_at AS "createdAt"
+          FROM builder_resume_intents WHERE project_root = ${projectRoot} ORDER BY created_at DESC
+        `
+      : await this.sql<BuilderResumeIntent[]>`
+          SELECT
+            builder_id AS "builderId",
+            project_root AS "projectRoot",
+            session_id AS "sessionId",
+            created_at AS "createdAt"
+          FROM builder_resume_intents ORDER BY created_at DESC
+        `;
+    for (const row of rows) {
+      if (row.sessionId === null) delete (row as { sessionId?: string }).sessionId;
+    }
+    return rows;
   }
 
   private async recordStatusChange(taskId: string, status: string, timestamp: number, actor?: Actor): Promise<void> {

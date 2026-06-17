@@ -7,7 +7,7 @@
 import type { Task, Session, Turn, Commit, Comment, SearchResult, TaskPromptVersion } from '../storage';
 import type { TokenUsage } from '../types';
 import { renderMarkdown } from './markdown';
-import { renderDiffSideBySide, renderDiffUnified, diffStyles } from './diff';
+import { renderDiff, diffStyles, diffScripts } from './diff';
 import { parentTaskIdOf } from '../task-target';
 
 export interface TaskWithSession {
@@ -678,16 +678,15 @@ export function promptVersionHtml(task: Task, version: TaskPromptVersion | null,
   `);
 }
 
-export function commitDetailHtml(
+export async function commitDetailHtml(
   task: Task,
   commit: Commit,
   diffText: string,
   viewMode: 'side-by-side' | 'unified',
-): string {
+): Promise<string> {
   const taskDisplayId = displayId(task);
   const breadcrumb = `<div class="breadcrumb"><a href="/tasks/${task.id}">Task ${escapeHtml(taskDisplayId)}</a> &rsaquo; Commit</div>`;
 
-  const otherMode = viewMode === 'side-by-side' ? 'unified' : 'side-by-side';
   const viewToggle = `
     <div class="diff-view-toggle">
       <a href="/tasks/${task.id}/commits/${commit.id}?view=side-by-side" class="${viewMode === 'side-by-side' ? 'active' : ''}">Side by side</a>
@@ -695,9 +694,8 @@ export function commitDetailHtml(
     </div>
   `;
 
-  const renderedDiff = viewMode === 'side-by-side'
-    ? renderDiffSideBySide(diffText)
-    : renderDiffUnified(diffText);
+  const diffMode = viewMode === 'side-by-side' ? 'split' : 'unified';
+  const renderedDiff = await renderDiff(diffText, diffMode);
 
   return layoutHtml(`Commit ${escapeHtml(commit.sha.substring(0, 8))}`, `
     ${breadcrumb}
@@ -710,6 +708,7 @@ export function commitDetailHtml(
     </div>
     ${viewToggle}
     ${renderedDiff}
+    ${diffScripts}
   `);
 }
 

@@ -30,6 +30,7 @@ import type {
   SearchResult,
   StoredConversation,
   AgentSessionLog,
+  BuilderResumeIntent,
   StatusChange,
 } from './types';
 import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage, TaskTarget } from '../types';
@@ -347,6 +348,20 @@ export class RemoteStorage implements Storage {
 
   async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
     return this.call<AgentSessionLog | null>('getAgentSessionLog', { taskId });
+  }
+
+  // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
+
+  async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {
+    await this.call('saveBuilderResumeIntent', { intent });
+  }
+
+  async takeBuilderResumeIntent(builderId: string): Promise<BuilderResumeIntent | null> {
+    return this.call<BuilderResumeIntent | null>('takeBuilderResumeIntent', { builderId });
+  }
+
+  async listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]> {
+    return this.call<BuilderResumeIntent[]>('listBuilderResumeIntents', { projectRoot });
   }
 
   // --- Status History ---

@@ -231,6 +231,39 @@ export async function waitForDaemon(projectRoot: string, timeoutMs: number = 500
   return false;
 }
 
+/**
+ * Wait for the daemon to fully STOP. Polls every 100ms up to the timeout;
+ * returns true once stopped, false if still alive at the deadline.
+ *
+ * `requestShutdown` only delivers the shutdown request — the daemon process
+ * exits asynchronously afterward. A caller that wants to start a FRESH daemon
+ * (e.g. `lazy upgrade`) must wait for the old one to actually die first;
+ * otherwise `ensureDaemon` sees a live process and skips the restart, leaving
+ * no daemon running once the old one finishes exiting.
+ *
+ * `expectedPid` (the OLD daemon's pid, captured before shutdown) is the precise
+ * signal and should always be passed for a restart. Without it we fall back to
+ * `isDaemonRunning`, which keys on the socket FILE — but the daemon removes its
+ * socket (via cleanupStaleFiles) as one of the LAST steps before exit, while the
+ * process is still alive and finishing cleanup. Returning then lets a new daemon
+ * start whose freshly-written socket/PID get clobbered by the old daemon's
+ * trailing cleanup. Waiting on the actual process death avoids that handoff race.
+ */
+export async function waitForDaemonStop(
+  projectRoot: string,
+  timeoutMs: number = 10000,
+  expectedPid?: number | null,
+): Promise<boolean> {
+  const stopped = (): boolean =>
+    expectedPid != null ? !isProcessAlive(expectedPid) : !isDaemonRunning(projectRoot);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (stopped()) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return stopped();
+}
+
 // ─── Legacy start lock (deprecated — superseded by flock) ────────────────────
 // Kept for test compatibility. Not used in production code.
 

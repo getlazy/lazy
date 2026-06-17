@@ -15,7 +15,7 @@ import { describe, test, expect, beforeEach, mock, afterAll } from 'bun:test';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 
-// Capture the args of every spawnSync invocation so we can assert that the
+// Capture the args of every spawn invocation so we can assert that the
 // Docker discovery query carries the project label filter.
 interface RecordedCall {
   cmd: string[];
@@ -27,16 +27,15 @@ let mockExitCode = 0;
 
 await mockModule(resolve(import.meta.dir, '../../src/utils/spawn.ts'), () => ({
   DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
-  spawn: () => {
-    throw new Error('spawn() not expected in these tests');
+  spawnSync: () => {
+    throw new Error('spawnSync() not expected in these tests');
   },
-  spawnSync: (cmd: string[], _options: unknown) => {
+  spawn: (cmd: string[], _options: unknown) => {
     recordedCalls.push({ cmd });
     return {
-      exitCode: mockExitCode,
-      stdout: Buffer.from(mockStdout),
-      stderr: Buffer.from(''),
-      success: mockExitCode === 0,
+      stdout: new Response(mockStdout).body,
+      stderr: new Response('').body,
+      exited: Promise.resolve(mockExitCode),
     };
   },
 }));
@@ -55,9 +54,9 @@ describe('DockerRunner.discoverProjectBuilderRuns', () => {
   // INVARIANT: discovery filters by BOTH the lazy-builder- name prefix AND
   // the lazy.project label. Dropping either filter would let containers
   // from other projects leak into the result set.
-  test('filters docker ps by name prefix AND project label', () => {
+  test('filters docker ps by name prefix AND project label', async () => {
     const runner = new DockerRunner('docker');
-    runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
+    await runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
 
     expect(recordedCalls).toHaveLength(1);
     const { cmd } = recordedCalls[0]!;
@@ -78,40 +77,40 @@ describe('DockerRunner.discoverProjectBuilderRuns', () => {
   // project B. Since we filter on the `lazy.project` label server-side,
   // project B's builders never appear in the result even when docker ps
   // returns nothing (as it would when the filter excludes them).
-  test('returns only containers that docker ps returns (project-scoped)', () => {
+  test('returns only containers that docker ps returns (project-scoped)', async () => {
     const runner = new DockerRunner('docker');
 
     // Simulate docker ps returning only project A's builder — this is what
     // `docker ps --filter label=lazy.project=/project-a` actually produces.
     mockStdout = 'lazy-builder-aaaa1111\n';
-    const result = runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
+    const result = await runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
     expect(result).toEqual(['lazy-builder-aaaa1111']);
 
     // When the filter excludes everything, no names come back and no other
     // project's builder can sneak in.
     recordedCalls.length = 0;
     mockStdout = '';
-    const empty = runner.discoverProjectBuilderRuns('/home/user/prg/empty-project');
+    const empty = await runner.discoverProjectBuilderRuns('/home/user/prg/empty-project');
     expect(empty).toEqual([]);
   });
 
-  test('returns empty array when docker ps fails', () => {
+  test('returns empty array when docker ps fails', async () => {
     const runner = new DockerRunner('docker');
     mockExitCode = 1;
     mockStdout = 'garbage';
-    expect(runner.discoverProjectBuilderRuns('/any/project')).toEqual([]);
+    expect(await runner.discoverProjectBuilderRuns('/any/project')).toEqual([]);
   });
 
-  test('splits multiple container names on newlines', () => {
+  test('splits multiple container names on newlines', async () => {
     const runner = new DockerRunner('docker');
     mockStdout = 'lazy-builder-aaaa1111\nlazy-builder-bbbb2222\n';
-    const result = runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
+    const result = await runner.discoverProjectBuilderRuns('/home/user/prg/project-a');
     expect(result).toEqual(['lazy-builder-aaaa1111', 'lazy-builder-bbbb2222']);
   });
 
-  test('podman runner uses the podman binary with the same filters', () => {
+  test('podman runner uses the podman binary with the same filters', async () => {
     const runner = new DockerRunner('podman', 'podman');
-    runner.discoverProjectBuilderRuns('/tmp/x');
+    await runner.discoverProjectBuilderRuns('/tmp/x');
     expect(recordedCalls[0]!.cmd[0]).toBe('podman');
     const cmd = recordedCalls[0]!.cmd;
     const filters: string[] = [];
@@ -128,9 +127,9 @@ describe('HostProcessRunner.discoverProjectBuilderRuns', () => {
   // Claude Code process without a PID file, so there is nothing for
   // `lazy upgrade` to enumerate or stop. Returning a non-empty list here
   // would trick upgrade into killing unrelated host processes.
-  test('returns empty array (no tracked builder runs in host-process mode)', () => {
+  test('returns empty array (no tracked builder runs in host-process mode)', async () => {
     const runner = new HostProcessRunner();
-    expect(runner.discoverProjectBuilderRuns('/any/project')).toEqual([]);
+    expect(await runner.discoverProjectBuilderRuns('/any/project')).toEqual([]);
   });
 });
 

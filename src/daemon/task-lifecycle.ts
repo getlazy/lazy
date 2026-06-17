@@ -24,7 +24,7 @@ import { stat } from 'fs/promises';
 import { loadConfig } from '../config/loader';
 import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
-import { createDriver } from '../remote';
+import { createDriver, LocalDriver } from '../remote';
 import { regenerateFidelity } from '../synthesis/fidelity';
 import { getSummarizer } from '../synthesis/summarizer';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
@@ -305,7 +305,7 @@ export async function launchUnblockTask(
   if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
     (runner as any).setAgent(getAgent(task.agent_id));
   }
-  runner.checkAvailability();
+  await runner.checkAvailability();
 
   // --- Orphan detection/retargeting ---
   if (parentTaskIdOf(task)) {
@@ -576,10 +576,10 @@ export async function launchUnblockTask(
     }
 
     // Launch or reuse supervisor
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       // Supervisor already running — it will pick up the new command
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
@@ -748,7 +748,7 @@ export async function launchAskTask(
     if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
       (runner as any).setAgent(getAgent(task.agent_id));
     }
-    runner.checkAvailability();
+    await runner.checkAvailability();
     const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
     const fullMessage = buildPromptWithInstructions(params.message.trim(), task.goal, null, projectRoot);
 
@@ -798,10 +798,10 @@ export async function launchAskTask(
       daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
     }
 
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       // Supervisor already running — it will pick up the ask command
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
       } catch (err) {
@@ -1023,7 +1023,7 @@ export async function rejectTask(
   if (task.status === 'working') {
     const runner = await createRunner(projectRoot);
     const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-    runner.stopRun(runName);
+    await runner.stopRun(runName);
     await storage.updateTaskStatus(task.id, 'interrupted', getActor());
   }
 
@@ -1128,7 +1128,7 @@ export async function closeTask(
     if (sess) {
       const runner = await createRunner(projectRoot);
       const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-      runner.stopRun(runName);
+      await runner.stopRun(runName);
     }
     await storage.updateTaskStatus(task.id, 'interrupted', getActor());
   }
@@ -1639,8 +1639,14 @@ export async function acceptTask(
   // Check if the target branch has protection rules requiring approval.
   // This must happen before auto-creating a PR (step 2) to avoid creating
   // orphan PRs when the accept will be refused anyway.
+  //
+  // INVARIANT: subtask→parent merges into an intermediate `lazy/...` branch are
+  // local git operations, never remote MRs. Such branches are NEVER protected,
+  // so we short-circuit the network protection check entirely — it isn't needed
+  // and a transient failure must not be able to misroute the merge.
+  const targetIsLazyBranch = mergeTargetBranch.startsWith('lazy/');
   let targetIsProtected = false;
-  if (driver.needsSync) {
+  if (driver.needsSync && !targetIsLazyBranch) {
     targetIsProtected = await driver.isTargetBranchProtected(mergeTargetBranch);
     if (targetIsProtected && !config.remote.auto_approve) {
       // Without auto_approve, we need an existing external approval to proceed
@@ -1654,19 +1660,39 @@ export async function acceptTask(
     }
   }
 
+  // --- Merge routing decision (INVARIANT: PRs only for protected branches) ---
+  // When the merge target is NOT protected — every intermediate `lazy/...`
+  // parent branch, and any other unprotected named branch — the merge is a
+  // LOCAL git operation. We route it through a LocalDriver so accept performs an
+  // immediate squash merge into the parent branch and NEVER pushes the branch,
+  // creates an MR/PR, or parks the task in `merging`. Only a protected target
+  // (e.g. `main`) goes through the remote driver's MR path below.
+  const useLocalMerge = driver.needsSync && !targetIsProtected;
+  const mergeDriver = useLocalMerge
+    ? new LocalDriver({ storage, lazyRoot: projectRoot })
+    : driver;
+  if (useLocalMerge) {
+    logger.debug(
+      `acceptTask: target '${mergeTargetBranch}' is not protected — performing a local merge (no remote MR/PR).`,
+    );
+  }
+
   // --- Step 2: Auto-create remote ref if needed ---
-  const acceptError = driver.validateAccept(task);
+  // Uses mergeDriver: for an unprotected target this is a LocalDriver whose
+  // validateAccept always passes, so the whole remote-ref creation block is
+  // skipped and no MR/PR is ever opened.
+  const acceptError = mergeDriver.validateAccept(task);
   if (acceptError) {
     logger.debug('No remote reference found — pushing branch and creating PR...');
 
     try {
-      await driver.pushBranch(sess.git_branch);
+      await mergeDriver.pushBranch(sess.git_branch);
     } catch (err) {
       throw new RpcError(500, `Failed to push branch ${sess.git_branch}: ${err instanceof Error ? err.message : err}`);
     }
 
     try {
-      const prResult = await driver.markReadyForReview(task);
+      const prResult = await mergeDriver.markReadyForReview(task);
       if (prResult.metadata) {
         for (const [key, value] of Object.entries(prResult.metadata)) {
           await storage.updateTaskMetadata(task.id, key, value);
@@ -1674,7 +1700,7 @@ export async function acceptTask(
         if (!task.metadata) task.metadata = {};
         Object.assign(task.metadata, prResult.metadata);
       }
-      const retryError = driver.validateAccept(task);
+      const retryError = mergeDriver.validateAccept(task);
       if (retryError) {
         // PR creation returned no error but also no metadata the acceptor can
         // use. This shouldn't happen in practice (markReadyForReview now throws
@@ -1696,7 +1722,9 @@ export async function acceptTask(
   }
 
   // --- Step 3: Check pre-merge gates ---
-  const gateWarnings = await driver.checkAcceptGates(task);
+  // mergeDriver: a LocalDriver has no remote gates, so unprotected merges skip
+  // CI/review gating entirely.
+  const gateWarnings = await mergeDriver.checkAcceptGates(task);
   // When auto_approve is set and we've just submitted an approval, skip the
   // reviews gate — the approval may not have propagated to the API yet.
   const effectiveWarnings = (targetIsProtected && config.remote.auto_approve)
@@ -1711,9 +1739,11 @@ export async function acceptTask(
   // --- Step 4: Push parent branch local commits (INVARIANT) ---
   // If the parent has local-only commits and the remote merge succeeds without them,
   // the remote parent will have the merge commit but not the local commits, causing divergence.
-  if (driver.needsSync) {
+  // Only relevant for the remote-merge path: a local merge into an unprotected
+  // parent (mergeDriver.needsSync === false) needs no push.
+  if (mergeDriver.needsSync) {
     try {
-      await driver.pushBranch(mergeTargetBranch);
+      await mergeDriver.pushBranch(mergeTargetBranch);
     } catch (err) {
       throw new RpcError(500, `Failed to push ${mergeTargetBranch} to remote: ${err instanceof Error ? err.message : err}. The parent branch has local commits that must be pushed before merging.`);
     }
@@ -1728,11 +1758,11 @@ export async function acceptTask(
   // Never blocks the merge: synthesis failure falls back to deterministic
   // output, and a remote-write failure is surfaced as a warning.
   const summarizer = getSummarizer(config.models.default);
-  const fidelity = await regenerateFidelity(storage, task, driver, summarizer);
+  const fidelity = await regenerateFidelity(storage, task, mergeDriver, summarizer);
   if (fidelity.warning) warnings.push(fidelity.warning);
 
   // --- Step 5: Attempt merge via driver ---
-  let result = await driver.merge({
+  let result = await mergeDriver.merge({
     sourceBranch: sess.git_branch,
     targetBranch: mergeTargetBranch,
     task,
@@ -1789,7 +1819,7 @@ export async function acceptTask(
     config.remote.git_remote,
   );
 
-  const ffResult = await driver.fastForwardLocal(resolvedMergeTarget, projectRoot);
+  const ffResult = await mergeDriver.fastForwardLocal(resolvedMergeTarget, projectRoot);
   if (!ffResult.success) {
     throw new RpcError(500, `${ffResult.warning || 'Failed to fast-forward local branch'}. The remote merge succeeded, but the local ${resolvedMergeTarget} branch could not be updated.`);
   }
@@ -1807,7 +1837,7 @@ export async function acceptTask(
   await storage.endSession(sess.id, 'accepted');
   await storage.createComment(task.id, `[Accepted] ${reason}`, getActor());
 
-  const reviewWarning = await driver.postAcceptReview(task, reason);
+  const reviewWarning = await mergeDriver.postAcceptReview(task, reason);
   if (reviewWarning) {
     warnings.push(`Review warning: ${reviewWarning}`);
   }
@@ -1851,7 +1881,9 @@ export async function acceptTask(
   await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
   removeProtocolDir(getProtocolDir(task.id));
 
-  const prUrl = await driver.getTaskUrl(task);
+  // mergeDriver: a local merge has no remote URL, so this is null — correct,
+  // there is no MR/PR to point at.
+  const prUrl = await mergeDriver.getTaskUrl(task);
   return {
     taskId: task.id,
     displayId: preflight.displayId,
@@ -2076,7 +2108,7 @@ export async function syncTask(
     if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
       (runner as any).setAgent(getAgent(task.agent_id));
     }
-    runner.checkAvailability();
+    await runner.checkAvailability();
 
     const containerName = runner.runNameForTask(tRef);
     const sandbox = await setupSandbox(worktreePath);
@@ -2123,10 +2155,10 @@ export async function syncTask(
     }
 
     // Launch or reuse supervisor
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       // Supervisor already running — it will pick up the new command
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
@@ -2451,6 +2483,26 @@ export async function submitTask(
     throw new RpcError(400, 'Submit requires a remote driver (e.g., github). Local driver has no remote to create PRs on.');
   }
 
+  // --- Intermediate-parent routing (INVARIANT: PRs only for protected branches) ---
+  // A child task stacked on another task integrates into an intermediate
+  // `lazy/...` parent branch, which is NEVER a protected integration branch. Such
+  // tasks must NOT open a remote MR/PR — `lazy accept` merges them locally into
+  // the parent. Refuse to submit rather than silently retargeting the MR to main
+  // (which would let the forge evaluate conflicts against the wrong base).
+  // Determined structurally — no network call, so a transient forge failure can
+  // never misroute this. Root tasks targeting a real named branch fall through to
+  // the normal push/MR-creation flow below.
+  const submitParentId = parentTaskIdOf(task);
+  const submitTargetBranch = submitParentId
+    ? await getBranchNameFromId(submitParentId, storage)
+    : (targetBranchOf(task) ?? 'main');
+  if (submitParentId || submitTargetBranch.startsWith('lazy/')) {
+    throw new RpcError(400,
+      `Task ${displayId(task)} integrates into \`${submitTargetBranch}\`, an intermediate task branch — ` +
+      `lazy does not open merge requests for it. ` +
+      `Run \`lazy accept ${displayId(task)}\` to merge it locally into \`${submitTargetBranch}\`.`);
+  }
+
   // --- Push branch ---
   try {
     await driver.pushBranch(sess.git_branch);
@@ -2659,7 +2711,7 @@ export async function resumeTask(
   if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
     (runner as any).setAgent(getAgent(task.agent_id));
   }
-  runner.checkAvailability();
+  await runner.checkAvailability();
 
   // --- Worktree recovery ---
   const worktreePath = getWorktreePathForRef(projectRoot, tRef);
@@ -2773,10 +2825,10 @@ export async function resumeTask(
     }
 
     // Launch or reuse supervisor
-    if (runner.isRunning(containerName)) {
+    if (await runner.isRunning(containerName)) {
       // Supervisor already running — it will pick up the new command
     } else {
-      runner.removeRun(containerName);
+      await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
@@ -2890,7 +2942,7 @@ export async function stopTask(
   // Now halt the supervisor and transition.
   const runner = await createRunner(projectRoot);
   const containerName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-  runner.stopRun(containerName);
+  await runner.stopRun(containerName);
 
   // INVARIANT: lazy stop writes an ErrorResponse to response.json uniformly
   // regardless of command_type. This unblocks any in-flight daemon RPC waiting
@@ -2934,7 +2986,7 @@ export async function stopTask(
   await storage.updateSessionContainerName(sess.id, null);
 
   try {
-    runner.removeRun(containerName);
+    await runner.removeRun(containerName);
   } catch {
     // Best-effort — the reconciler also sweeps orphaned runs.
   }

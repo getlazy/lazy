@@ -69,7 +69,7 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // Commands that dispatch to a fixed set of subcommands as their first
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
-  'system': ['prompts', 'build', 'offline', 'online', 'export-dockerfile'],
+  'system': ['prompts', 'build', 'status', 'offline', 'online', 'export-dockerfile'],
   'daemon': ['start', 'stop', 'restart', 'status', 'logs'],
   'config': ['set', 'get'],
 });
@@ -124,7 +124,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'import-conversation': ['--list', '--show-imported', '--show', '--all'],
   'builder':             ['--autonomous', '--yes', '--resume'],
   'daemon':              ['--foreground', '--background', '--project'],
-  'server':              ['--port'],
+  'server':              [],
   'config':              ['--task', '--reason'],
   'doctor':              ['--no-resume', '--dry-run', '--yes'],
   'init':                ['--toolchain', '--skip-auth-check', '--skip-remote-check', '--skip-github-check', '--skip-completion-check', '--non-interactive'],

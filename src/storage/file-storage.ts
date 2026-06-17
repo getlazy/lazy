@@ -43,6 +43,7 @@ import type {
   SearchResult,
   StoredConversation,
   AgentSessionLog,
+  BuilderResumeIntent,
   TurnsFile,
   CommitsFile,
   PromptHistoryFile,
@@ -2058,6 +2059,47 @@ export class FileStorage implements Storage {
     }
     const content = await readFile(join(taskDir, 'agent-session.jsonl'), 'utf-8');
     return { taskId: fullId, sessionId: meta.sessionId, capturedAt: meta.capturedAt, content };
+  }
+
+  // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
+
+  private get builderResumeIntentsPath(): string {
+    return join(this.basePath, 'builder-resume-intents.json');
+  }
+
+  private async readBuilderResumeIntents(): Promise<BuilderResumeIntent[]> {
+    const file = await this.readJson<{ intents: BuilderResumeIntent[] }>(this.builderResumeIntentsPath);
+    return file?.intents ?? [];
+  }
+
+  async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {
+    // Lock so a concurrent save/take can't interleave a read-modify-write and
+    // drop one of the changes.
+    return this.lock.withLock(async () => {
+      const intents = await this.readBuilderResumeIntents();
+      const next = intents.filter(i => i.builderId !== intent.builderId);
+      next.push(intent);
+      await this.writeJson(this.builderResumeIntentsPath, { intents: next });
+    });
+  }
+
+  async takeBuilderResumeIntent(builderId: string): Promise<BuilderResumeIntent | null> {
+    // INVARIANT: take must consume+clear atomically so a given intent is acted
+    // on at most once. The read, the match, and the rewrite-without-it all
+    // happen under the storage lock.
+    return this.lock.withLock(async () => {
+      const intents = await this.readBuilderResumeIntents();
+      const match = intents.find(i => i.builderId === builderId) ?? null;
+      if (!match) return null;
+      const remaining = intents.filter(i => i.builderId !== builderId);
+      await this.writeJson(this.builderResumeIntentsPath, { intents: remaining });
+      return match;
+    });
+  }
+
+  async listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]> {
+    const intents = await this.readBuilderResumeIntents();
+    return projectRoot ? intents.filter(i => i.projectRoot === projectRoot) : intents;
   }
 
   // --- Status History ---
