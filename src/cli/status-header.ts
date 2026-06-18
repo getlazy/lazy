@@ -8,6 +8,7 @@
  */
 
 import type { SupervisorStatus } from '../protocol/types';
+import { elapsedFrom } from '../utils/elapsed';
 
 export function renderStatusHeader(
   status: SupervisorStatus | null,
@@ -34,30 +35,4 @@ export function renderStatusHeader(
   }
 
   return header;
-}
-
-function elapsedFrom(iso: string | undefined, now: Date): string | null {
-  if (!iso) return null;
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return null;
-  const ms = Math.max(0, now.getTime() - t);
-  return formatElapsed(ms);
-}
-
-function formatElapsed(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${hours}h${pad2(minutes)}m${pad2(seconds)}s`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m${pad2(seconds)}s`;
-  }
-  return `${seconds}s`;
-}
-
-function pad2(n: number): string {
-  return n.toString().padStart(2, '0');
 }

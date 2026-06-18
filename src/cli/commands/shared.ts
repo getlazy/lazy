@@ -8,7 +8,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { removeWorktree, deleteBranch, getBranchCommitMessages, getCurrentSha, getNewCommits, getRemoteDefaultBranch, getDiffStat, getTaskTargetBranch } from '../../git/operations';
 import { createRunner } from '../../runner';
-import { hasResponse, readCommand, protocolDir as getProtocolDir } from '../../protocol';
+import { hasResponse, readCommand, protocolDir as getProtocolDir, removeProtocolDir } from '../../protocol';
 import type { StartCommand, UnblockCommand } from '../../protocol';
 
 import { loadConfig } from '../../config/loader';
@@ -17,7 +17,8 @@ import { buildEditorContentWithDiff, buildFreeformEditorContentWithNotes, extrac
 import { logger } from '../../utils/logger';
 import { captureAgentSessionLog } from '../../import/capture-agent-session-log';
 import type { Storage } from '../../storage';
-import { requireStorage, shortId, displayId, getBranchNameFromId } from '../helpers';
+import { requireStorage, shortId, displayId, getBranchNameFromId, taskRef, getWorktreePath } from '../helpers';
+import { removeLock } from '../../utils/lock';
 import { isTerminalStatus } from '../../types';
 import type { Task, Turn, Comment } from '../../types';
 import { createDriver, type RemoteComment } from '../../remote';
@@ -38,6 +39,7 @@ import mergeInstructionsTemplate from '../../prompts/merge-instructions.md' with
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
 import { rm } from 'fs/promises';
 import { runGit } from '../../utils/git';
+import { latestWorkAgentTurn } from '../../utils/turns';
 
 const PROGRESS_POLL_MS = 1000;
 
@@ -156,11 +158,18 @@ comments. Treat them as review feedback to consider alongside your task goal.
 /**
  * Build the static system prompt for task agents.
  * This content is stable across turns and benefits from prompt caching.
+ *
+ * `chattinessSnippet` (when non-empty) is the rendered verbosity guidance and is
+ * placed at the very TOP of the prompt so it gets the model's attention early.
+ * Empty/omitted means no verbosity guidance is injected (unchanged behavior).
  */
-export function buildSystemPrompt(runnerInstructions?: string): string {
+export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet?: string): string {
   let prompt = lazyToolInstructions + '\n' + systemInstructionsText;
   if (runnerInstructions) {
     prompt += '\n' + runnerInstructions;
+  }
+  if (chattinessSnippet) {
+    prompt = chattinessSnippet + '\n\n' + prompt;
   }
   return prompt;
 }
@@ -247,8 +256,15 @@ export async function cleanupWorktreeAndBranch(
   await cleanupWorktree(worktreePath, root, storage, taskId, sessionId);
   try {
     await deleteBranch(branch, root);
-  } catch {
-    // Branch may already be gone
+  } catch (err) {
+    // Non-fatal: a leftover local branch is recoverable and must never break
+    // finalize (the merge has already landed by the time we get here). But we
+    // do NOT silently swallow it (CLAUDE.md) — surface it as a warning so a
+    // failed deletion is visible instead of accumulating invisibly. The most
+    // common benign cause is the branch already being gone; rarer causes
+    // (still checked out in another worktree, git error) are exactly what we
+    // want to see in the logs.
+    logger.warn(`Failed to delete local branch ${branch}: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -401,14 +417,17 @@ export async function followContainer(
   // Start monitoring worktree for progress (commits, file changes)
   const stopMonitoring = monitorWorktreeProgress(containerName, worktreePath, turnStartedAt);
 
+  // The runner is authoritative for where the agent writes its session logs,
+  // so resolve it before starting the activity monitor.
+  const runner = existingRunner ?? await createRunner(lazyRoot);
+
   // Start activity monitor for Claude Code JSONL session logs
   const taskId = taskIdFromContainer(containerName);
-  const activityMonitor = new ActivityMonitor(worktreePath, taskId, turnStartedAt);
+  const activityMonitor = new ActivityMonitor(runner, worktreePath, taskId, turnStartedAt);
   activityMonitor.start();
 
   // Stream run logs in background, parsing supervisor output into
   // formatted activity lines instead of raw output.
-  const runner = existingRunner ?? await createRunner(lazyRoot);
   let followHandle: ReturnType<typeof runner.followOutput> = null;
   try {
     followHandle = runner.followOutput(containerName, turnStartedAt);
@@ -635,6 +654,26 @@ export async function syncTaskFromRemote(
           const reparented = await reparentChildren(task, storage);
           const reparentMsg = formatReparentWarning(reparented, task);
           if (reparentMsg) console.log(`${reparentMsg}.`);
+
+          // Tear down the worktree and delete the LOCAL task branch. Without
+          // this, an externally-merged task is finalized to `complete` but its
+          // worktree and `lazy/...` branch are left behind forever — the leak
+          // this command sequence is being fixed to prevent. The daemon's
+          // remote-sync reconciler already does this on its MERGED path; the
+          // CLI sync path must match. Safe-deletion holds: prState === MERGED
+          // proves the merge landed. LOCAL branch only — cleanupWorktreeAndBranch
+          // never touches the remote ref.
+          if (sess) {
+            try {
+              await cleanupTaskContainer(storage, sess, taskRef(task), root);
+              const worktreePath = getWorktreePath(root, task);
+              await removeLock(worktreePath);
+              await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root, storage, task.id, sess.agent_session_id);
+              removeProtocolDir(getProtocolDir(task.id));
+            } catch (err) {
+              logger.warn(`Cleanup after external merge failed for task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+            }
+          }
         }
       } else if (prState === 'CLOSED') {
         console.log(`Remote ref was closed externally — marking task ${displayId(task)} abandoned`);
@@ -787,7 +826,9 @@ export async function getEditorFeedback(
   }
 
   const turns = await storage.getSessionTurns(sessionId);
-  const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+  // The review editor shows the work turn's summary + diff. A trailing nudge
+  // turn carries no SHAs and only the follow-up reply, so select the work turn.
+  const lastAgentTurn = latestWorkAgentTurn(turns);
 
   if (lastAgentTurn) {
     // Compute turn diff to include in editor content

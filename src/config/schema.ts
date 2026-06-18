@@ -21,14 +21,18 @@ export const KNOWN_TOP_LEVEL_KEYS: readonly string[] = ['runner'];
 
 /** Known top-level sections and their known keys. */
 export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
-  models: ['default'],
+  // 'roles' is a nested table ([models.roles.builder] / [models.roles.agent]);
+  // its inner keys are validated by the config loader, not the one-level scan here.
+  models: ['default', 'roles'],
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
   storage: ['backend', 'external_path', 'postgres_ssl'],
   git: ['default_branch_prefix'],
   output: ['shortid_length'],
   agent: ['agent_id', 'watchdog_output_timeout_ms', 'graceful_exit_timeout_ms', 'effort'],
-  server: ['port', 'sync_interval'],
+  builder: ['effort'],
+  chattiness: ['default', 'builder', 'agent'],
+  server: ['port', 'sync_interval', 'bind'],
   remote: [
     'driver', 'git_remote', 'auto_approve',
     // Driver-specific keys are also valid at the schema level — a user may
@@ -43,6 +47,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   documents: ['path'],
   worktree: ['include'],
   permissions: ['protected'],
+  automation: ['maintain'],
   checks: ['post_turn', 'post_turn_timeout'],
   daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system

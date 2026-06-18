@@ -271,7 +271,7 @@ function formatTaskActivityBundle(a: TaskActivity): string {
     lines.push(`- turns (${a.turns.length}):`);
     for (const turn of a.turns) {
       const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
-      lines.push(`  - ${formatIso(turn.timestamp)} [${who}]${turn.turn_type === 'ask' ? ' (ask)' : ''}`);
+      lines.push(`  - ${formatIso(turn.timestamp)} [${who}]${turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : ''}`);
       lines.push(`    ${turn.content}`);
     }
   }

@@ -23,6 +23,51 @@ Values are raw model IDs — examples: `"claude-sonnet-4-5-20250929"`, `"claude-
 default = "claude-opus-4-7"
 ```
 
+### `[models.roles.*]` — per-role model targets
+
+Lazy distinguishes two model **roles**: the interactive **builder** (`lazy builder`, `lazy pair`, `lazy chat`) and the **agent** that runs tasks (the task supervisor and all auto-triggered turns). The `[models.roles.builder]` and `[models.roles.agent]` tables let each role run against a different **backend**, so you can — for example — keep the builder on real Anthropic while task agents run on a local Ollama model.
+
+| Key        | Type     | Default       | Description |
+|------------|----------|---------------|-------------|
+| `backend`  | `string` | `"anthropic"` | One of `"anthropic"`, `"ollama"`, or `"proxy"`. All three are Anthropic-native targets — lazy never translates between API shapes. |
+| `model`    | `string` | `""`          | Model passed to the agent via `--model`. **Required** for `ollama`/`proxy`. For `anthropic`, an empty value means "use the normal model chain / `models.default`". |
+| `endpoint` | `string` | see below     | `ANTHROPIC_BASE_URL` for the backend. **Required** for `proxy`. For `ollama` it defaults to `http://host.docker.internal:11434`. Ignored for `anthropic`. |
+
+**Backends:**
+
+- `anthropic` — the real Anthropic API (whatever `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` point at). This is the default for any role you don't configure.
+- `ollama` — a local Ollama instance serving the Anthropic Messages API. Lazy injects dummy credentials and the base URL automatically; the configured `model` is authoritative.
+- `proxy` — an Anthropic-compatible proxy endpoint, forwarded with your real Anthropic credential plus the configured `endpoint` as the base URL.
+
+**How a role resolves to a backend** (precedence, highest first):
+
+1. An explicit `[models.roles.<role>]` table.
+2. The legacy `[ollama]` block (see [`[ollama]`](#ollama)), which maps to **all roles → ollama** when enabled.
+3. The `anthropic` default — i.e. `models.default` / the normal model chain.
+
+For the `anthropic` backend, an explicit `--model` flag, the previous turn's sticky model, or the task's model still take precedence over `models.default` as before. For `ollama`/`proxy` the configured `model` is **authoritative and never silently substituted** — a logical alias like `"claude-opus-4-8"` does not exist in those registries, so it is intentionally ignored. (Local backends only work through the Claude Code agent; any other agent forces the `anthropic` path regardless of config.)
+
+**Guardrails (fail hard, no silent fallback):**
+
+- Invalid `backend`, or an `ollama`/`proxy` role missing its `model` (or a `proxy` role missing its `endpoint`), is rejected at config load with an actionable error.
+- Before every launch lazy **preflights** the role's backend for reachability. If a local backend is unreachable, the launch fails with an actionable error — lazy **never** silently falls back to a different backend.
+- Unresolvable model names surface loudly (e.g. Ollama's `404 model not found`) rather than being quietly swapped.
+
+```toml
+[models]
+default = "claude-opus-4-7"
+
+# Builder talks to real Anthropic; task agents run on a local Ollama model.
+[models.roles.builder]
+backend = "anthropic"
+model = "claude-opus-4-8"
+
+[models.roles.agent]
+backend = "ollama"
+model = "qwen3.5:35b-a3b-coding-nvfp4"
+endpoint = "http://host.docker.internal:11434"
+```
+
 ---
 
 ## `[session]`
@@ -130,14 +175,42 @@ effort = "high"
 
 ---
 
+## `[chattiness]`
+
+Baseline conversational verbosity for the builder and agents — how much they narrate, explain, and elaborate in their replies. This controls *communication style only*, not how hard the model thinks (that is `effort`).
+
+| Key       | Type     | Default | Description |
+|-----------|----------|---------|-------------|
+| `default` | `string` | unset   | Shared baseline applied to both the builder and agents. Valid: `"terse"`, `"normal"`, `"chatty"`. |
+| `builder` | `string` | unset   | Per-role override for builder sessions. Falls back to `default` when omitted. |
+| `agent`   | `string` | unset   | Per-role override for task agents. Falls back to `default` when omitted. |
+
+When a role's effective level is unset (no `default` and no per-role value), **no verbosity guidance is injected** and behavior is unchanged from before this setting existed.
+
+The injected guidance is **elastic, not binary**: the configured level is the baseline, and when you ask for more detail the model steps up *one notch* from that baseline for that reply — not straight to maximum verbosity. At a `terse` baseline, "tell me more" yields a normal-length explanation, not an exhaustive essay. The guidance is placed near the top of the system prompt so it gets the model's attention.
+
+Invalid levels are rejected at config-load time, listing the valid levels.
+
+```toml
+[chattiness]
+# Shared baseline for both roles
+default = "normal"
+# Optional per-role overrides
+builder = "chatty"
+agent = "terse"
+```
+
+---
+
 ## `[server]`
 
 Web dashboard server settings.
 
-| Key             | Type     | Default | Description |
-|-----------------|----------|---------|-------------|
-| `port`          | `number` | `26024` | Port for the web dashboard server. |
-| `sync_interval` | `number` | `60`    | Interval in seconds for background sync when running `lazy server`. Set to `0` to disable. |
+| Key             | Type     | Default       | Description |
+|-----------------|----------|---------------|-------------|
+| `port`          | `number` | `26024`       | Port for the web dashboard server. |
+| `bind`          | `string` | `"127.0.0.1"` | Network interface the daemon's TCP server binds to. Loopback by default so the unauthenticated dashboard and the `/mcp` + `/rpc` endpoints are not reachable from other machines. Set to `"0.0.0.0"` to expose on all interfaces (opt-in to LAN access — the dashboard is unauthenticated, so the daemon logs a warning). The dashboard URL printed by `lazy daemon status`/`lazy server` reflects this value; a `0.0.0.0` bind is shown as `127.0.0.1` for local convenience. |
+| `sync_interval` | `number` | `60`          | Interval in seconds for background sync when running `lazy server`. Set to `0` to disable. |
 
 ---
 
@@ -230,6 +303,8 @@ dockerfile = "Dockerfile.lazy"
 
 Use a local Ollama instance for model inference instead of Anthropic's API. Requires Ollama v0.14+ running on the host with the Anthropic Messages API enabled.
 
+> **Legacy / backward compatibility.** When `enabled = true`, this block maps to **all roles → ollama** (both the builder and task agents). It is kept so existing configs keep working. For finer-grained control — e.g. the builder on Anthropic and agents on Ollama, or a `proxy` backend — prefer the per-role [`[models.roles.*]`](#modelsroles--per-role-model-targets) tables, which override this block for any role they set.
+
 | Key        | Type     | Default                              | Description |
 |------------|----------|--------------------------------------|-------------|
 | `enabled`  | `bool`   | `false`                              | Route agent inference through Ollama. |
@@ -295,6 +370,38 @@ File protection — prevents agents from modifying or deleting certain files.
 ```toml
 [permissions]
 protected = ["README.md", "test/**/*.ts", "*.spec.*"]
+```
+
+---
+
+## `[automation]`
+
+Maintained files — the inverse of `[permissions].protected`. Patterns agents are *expected* to keep up to date as they work (docs, CHANGELOG, architecture diagrams). Agents *may* skip them, but when a turn touches none of an entry's files, the supervisor prompts the agent once to either make the update or record why it skipped — turning a silent omission into a deliberate, reviewable decision. It is a nudge, not a gate: the task still blocks normally (it does not become a `conflict`).
+
+`maintain` is an array of tables (`[[automation.maintain]]`), each with:
+
+| Key            | Type     | Description |
+|----------------|----------|-------------|
+| `title`        | `string` | Short label for the group (shown to the agent and in review). |
+| `pattern`      | `string` | Glob matched against the turn's changed files. |
+| `instructions` | `string` | What/why to maintain — shown to the agent verbatim, up front and in the follow-up. |
+
+Opt-in: empty by default. The follow-up fires at most once per turn, and is skipped entirely only on a no-op turn (no code changes).
+
+When the same turn also has protected-file violations, the maintain nudge runs **after** the push-back exchange and is **independent of its outcome** — it fires whether the agent resolved the violations or kept them. (Earlier versions suppressed it whenever any violation remained; because `lazy.toml` is itself a protected file, every turn that edited it skipped the nudge, making the feature look inert.) Ordering within such a turn is: work → push-back → agent reply → maintain nudge → agent reply. The push-back never re-runs because of the maintain step (it is single-shot), and only the push-back turn carries the final violation set, so a still-violating turn still becomes a `conflict` even though it also got nudged.
+
+The follow-up is recorded as its own discrete turn pair — a `supervisor`-authored prompt turn (under a "Maintained Files Review" heading) followed by the agent's reply turn — so the turn history reads cleanly: work turn → supervisor nudge → agent reply. The nudge text is **not** appended to the work turn's response. The reply turn carries its own token usage (including cache tokens) and any commits the follow-up made are attributed to it, not the work turn. The protected-file push-back behaves the same way ("Permission Violation Review"). In `lazy show` and the dashboard these prompt turns are labelled `supervisor` (not `human`), so you can tell "the human said" from "the supervisor pushed back".
+
+```toml
+[[automation.maintain]]
+title = "docs"
+pattern = "docs/**/*"
+instructions = "Search for docs and update any that have gone out of date due to your work, OR create new docs if needed."
+
+[[automation.maintain]]
+title = "changelog"
+pattern = "CHANGELOG.md"
+instructions = "Add a line that succinctly describes your work; skip if your work is intra-release."
 ```
 
 ---

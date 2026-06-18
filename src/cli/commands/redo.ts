@@ -15,6 +15,7 @@ import { parentTaskIdOf } from '../../task-target';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
+import { latestWorkAgentTurn } from '../../utils/turns';
 
 /**
  * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
@@ -124,9 +125,9 @@ export async function commandRedo(args: string[]): Promise<void> {
     let redoContext = '';
 
     if (sess) {
-      // Get last agent turn summary
+      // Get last agent turn summary — the work turn, not a trailing nudge reply.
       const turns = await storage.getSessionTurns(sess.id);
-      const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+      const lastAgentTurn = latestWorkAgentTurn(turns);
       if (lastAgentTurn) {
         // Truncate to a reasonable size for context injection
         const summary = lastAgentTurn.content.length > 4000

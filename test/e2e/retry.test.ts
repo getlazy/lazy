@@ -26,6 +26,11 @@ import type { UnblockCommand, CompletedResponse, SupervisorStatus, StartCommand 
 import { runWork, CrashError, type RetryState } from '../../src/supervisor/work';
 import type { WorkResult } from '../../src/supervisor/work';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
+import { createRunnerFromType } from '../../src/runner';
+
+// These tests inject _executeOverride, so the runner is never consulted for
+// session-log discovery — any runner instance satisfies the signature.
+const testRunner = createRunnerFromType('dangerously-host-process-without-any-isolation');
 
 describe('supervisor retry', () => {
   let ctx: TestContext;
@@ -282,6 +287,7 @@ describe('runWork retry with command check', () => {
 
     const result = await runWork(
       new ClaudeCodeAgent(),
+      testRunner,
       '/tmp/fake-worktree',
       'test prompt',
       undefined,
@@ -330,6 +336,7 @@ describe('runWork retry with command check', () => {
     await expect(
       runWork(
         new ClaudeCodeAgent(),
+        testRunner,
         '/tmp/fake-worktree',
         'test prompt',
         undefined,

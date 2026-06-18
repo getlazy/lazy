@@ -36,7 +36,7 @@ export type ReviewVerdict = 'approve' | 'reject' | 'request_changes';
 export type TurnRole = 'human' | 'agent';
 
 /** Who performed an action: human (CLI), builder (MCP), or system (reconciler/auto-resume). */
-export type Actor = 'human' | 'builder' | 'system';
+export type Actor = 'human' | 'builder' | 'system' | 'supervisor';
 
 
 export interface TokenUsage {
@@ -180,7 +180,7 @@ export interface Turn {
  * new turn flavors appear — storage and UI code should branch on this
  * rather than adding more boolean flags.
  */
-export type TurnType = 'work' | 'ask';
+export type TurnType = 'work' | 'ask' | 'nudge';
 
 export interface Commit {
   id: string;

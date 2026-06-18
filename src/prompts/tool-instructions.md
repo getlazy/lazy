@@ -1,4 +1,4 @@
-LAZY TOOL: You have access to Lazy MCP tools (`lazy_*` in your tool list) for searching tasks, creating proposals, committing, and more.
+LAZY TOOL: You have access to Lazy MCP tools (`lazy_*` in your tool list) for searching tasks, creating subtasks, committing, and more.
 
 Available tools:
   lazy_search       Search tasks, prompts, turns, commits, and comments for context (params: query, fuzzy?, filter?, offset?, limit?)
@@ -24,7 +24,6 @@ Available tools:
   lazy_create        Create a new task (params: goal, prompt?, code?, model?, type?, parent?)
                      Types: task (default), fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release
   lazy_comment       Add a comment to a task (params: message, task_id?)
-  lazy_propose       Propose a follow-up task (params: goal, code?, prompt?)
   lazy_commit        Stage and commit changes (params: message, files?)
   lazy_status        Check current task and worktree status (no params)
 
@@ -38,19 +37,27 @@ tools not listed above.
 IMPORTANT CONSTRAINTS:
 - You can SEARCH and READ task information freely - use this to find rationale and decisions
   that affect the code or features you are working on.
-- You can CREATE new tasks for work you identify that should be done separately.
+- You can CREATE subtasks of your current task to decompose its work into executable parts.
 - You can add COMMENTS to tasks to leave observations or context.
-- You can PROPOSE follow-up tasks for work that's out of scope for your current task.
 - You CANNOT edit existing tasks, start/stop sessions, or manage task lifecycle.
 
-PROPOSING FOLLOW-UP TASKS:
-When you identify work that's out of scope for your current task, use `lazy_propose` instead
-of mentioning it in prose. Do NOT just say "this could be improved in a future task" or
-"left as follow-up work" — use `lazy_propose` for each concrete suggestion.
+FINISH THE NATURAL UNIT OF WORK:
+Deliver the natural, coherent, non-breaking scope of this task. If finishing what the task
+started requires expanding in the obvious, natural direction, DO it — that work is part of
+the task, not a follow-up.
 
-Each proposal should be:
-- Actionable: clear goal with enough context for someone to start working
-- Scoped: one specific improvement or fix per proposal
-- Independent: not blocking the current task's completion
+- NEVER ship a fragment that breaks `main` and defer the part that actually makes it work to a
+  "follow-up." "Accept this small piece now, follow up later with the part that makes it function"
+  is an anti-pattern — the piece you ship must stand on its own and leave `main` working.
+- Something is only a genuine follow-up if it's a DIFFERENT concern that this task does not need
+  in order to be correct and mergeable.
+
+DECOMPOSING THIS TASK vs. ORTHOGONAL FOLLOW-UPS — keep these strictly separate:
+- To break THIS task's own work into executable parts, create subtasks with `lazy_create` (pass
+  `parent` to scope them under your current task). That is decomposition of in-scope work.
+- For genuinely ORTHOGONAL discoveries (a different concern this task doesn't need), do NOT create
+  a task — that clutters the backlog. Surface them crisply and concretely in your final summary so
+  the human can decide. Keep each one short and actionable. Do NOT leave TODO comments in the code
+  instead.
 
 ---

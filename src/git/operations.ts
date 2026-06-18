@@ -315,6 +315,37 @@ async function runSquashMergeCommit(
 }
 
 /**
+ * How a `git stash pop` failed when restoring the destination worktree's
+ * uncommitted work after a (durable) squash merge:
+ * - `conflict-markers`: the stash applied but conflicts with the merged content,
+ *   leaving conflict markers in the working tree. The stash is RETAINED.
+ * - `pop-refused`: git refused the pop entirely (an untracked file produced by
+ *   the merge collides with a stashed untracked file). NOTHING was applied; the
+ *   worktree sits at the clean merged state. The stash is RETAINED.
+ */
+export type StashRestoreMode = 'conflict-markers' | 'pop-refused';
+
+/**
+ * Signals that a squash merge into a dirty destination worktree committed
+ * successfully and durably, but the worktree's stashed uncommitted work could
+ * NOT be automatically restored afterward. The merge is done; this is a
+ * follow-up reconciliation the destination worktree's owner must perform. The
+ * stash is always retained (never dropped) so the work is never lost.
+ */
+export interface DestinationRestoreConflict {
+  /** The worktree whose stashed work could not be auto-restored. */
+  worktreePath: string;
+  /** The branch the merge committed into (checked out in `worktreePath`). */
+  targetBranch: string;
+  /** Stable reference to the retained stash (its commit SHA). */
+  stashSha: string;
+  /** Human-readable label the stash was pushed with (for `git stash list`). */
+  stashLabel: string;
+  /** Which way the restore failed — drives the recovery instructions. */
+  mode: StashRestoreMode;
+}
+
+/**
  * Squash-merge a source branch into a target branch.
  *
  * A branch can only be checked out in ONE working tree at a time. When the
@@ -335,7 +366,7 @@ export async function squashMergeBranchIntoTarget(
   targetBranch: string,
   commitMessage: string,
   cwd?: string
-): Promise<void> {
+): Promise<DestinationRestoreConflict | null> {
   const originalBranch = await getCurrentBranch(cwd);
 
   // Case 1: the target is already checked out right here (cwd is on it). Merge
@@ -343,7 +374,7 @@ export async function squashMergeBranchIntoTarget(
   // "accept into main from the repo root" path, byte-for-byte as before.
   if (originalBranch === targetBranch) {
     await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, cwd ?? process.cwd());
-    return;
+    return null;
   }
 
   // Case 2: the target is checked out in a SEPARATE worktree. A branch can only
@@ -354,15 +385,17 @@ export async function squashMergeBranchIntoTarget(
   // in that worktree, where the branch is already checked out.
   const worktreePath = await findWorktreeForBranch(targetBranch, cwd);
   if (worktreePath) {
-    // The worktree must be clean: a squash merge stages changes into its index,
-    // which would entangle with any uncommitted work and could not be cleanly
-    // rolled back. An accepted parent task is non-active (blocked), so its
-    // worktree is expected clean — but guard and fail loudly if it isn't.
+    // A squash merge stages changes into the worktree's index and updates its
+    // working files. If the worktree has unrelated uncommitted work, running the
+    // merge directly would entangle with it. We must NOT refuse the accept just
+    // because the DESTINATION worktree is dirty (the dirt is usually unrelated
+    // human work — e.g. merging into a `main` worktree with local edits), and we
+    // must NEVER lose that work. So when the worktree is dirty, stash the human's
+    // changes, merge against the now-clean worktree, then restore the stash on
+    // top of the merged result — exactly like `git stash; git merge; git stash
+    // pop`. When it's clean, merge in place as before.
     if (await hasUncommittedChanges(worktreePath)) {
-      throw new Error(
-        `Cannot merge into ${targetBranch}: its worktree at ${worktreePath} has uncommitted changes. ` +
-        `Commit or discard them before accepting.`
-      );
+      return await squashMergeIntoDirtyWorktree(sourceBranch, targetBranch, commitMessage, worktreePath);
     }
     try {
       await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, worktreePath);
@@ -371,7 +404,7 @@ export async function squashMergeBranchIntoTarget(
       await runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
       throw err;
     }
-    return;
+    return null;
   }
 
   // Case 3: no worktree holds the target branch — safe to check it out in the
@@ -386,6 +419,97 @@ export async function squashMergeBranchIntoTarget(
   } finally {
     await runGit(['checkout', originalBranch], { cwd });
   }
+  return null;
+}
+
+/**
+ * Squash-merge `sourceBranch` into `targetBranch` when the target's worktree has
+ * unrelated uncommitted changes. The destination worktree being dirty must NOT
+ * block the accept, and the human's uncommitted work must NEVER be lost.
+ *
+ * Strategy: stash the human's changes (tracked + untracked) so the worktree is
+ * clean, run the squash merge, then restore the stash on top of the merged
+ * result. This mirrors `git stash; git merge; git stash pop` and is consistent
+ * with the clean-worktree path, which also advances the worktree to the merged
+ * state.
+ *
+ * Failure handling never silently discards work:
+ * - If stashing fails, we abort before touching anything.
+ * - If the merge fails (e.g. a real conflict), we reset the partial merge and
+ *   pop the stash back, leaving the worktree exactly as we found it.
+ * - If the merge succeeds but the stash cannot be reapplied (the human's changes
+ *   conflict with the merged result), the merge is already durable — we do NOT
+ *   fail the accept and we do NOT swallow the failure: we return a structured
+ *   {@link DestinationRestoreConflict} (stash retained) so the caller can hand
+ *   the reconciliation to the worktree's owning agent.
+ */
+async function squashMergeIntoDirtyWorktree(
+  sourceBranch: string,
+  targetBranch: string,
+  commitMessage: string,
+  worktreePath: string
+): Promise<DestinationRestoreConflict | null> {
+  // Stash tracked AND untracked changes so the worktree is clean for the merge
+  // and no human work is left behind. `--include-untracked` keeps untracked
+  // files in the stash so `stash pop` restores them too.
+  const stashLabel = `lazy-accept-autostash into ${targetBranch}`;
+  const stash = await runGit(['stash', 'push', '--include-untracked', '-m', stashLabel], { cwd: worktreePath });
+  if (stash.exitCode !== 0) {
+    throw new Error(
+      `Cannot merge into ${targetBranch}: failed to stash uncommitted changes in its worktree at ` +
+      `${worktreePath}: ${stash.stderr}. Commit or stash them manually, then retry.`
+    );
+  }
+  // Capture the stash's commit SHA now — it's a stable handle to the stashed work
+  // even if more stashes get pushed later (which would shift `stash@{0}`).
+  const stashShaResult = await runGit(['rev-parse', 'stash@{0}'], { cwd: worktreePath });
+  const stashSha = stashShaResult.exitCode === 0 ? stashShaResult.stdout.trim() : 'stash@{0}';
+
+  try {
+    await runSquashMergeCommit(sourceBranch, targetBranch, commitMessage, worktreePath);
+  } catch (err) {
+    // Merge failed (e.g. a genuine conflict). Undo any partial squash staging,
+    // then restore the human's stashed work so the worktree is untouched.
+    await runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
+    const restore = await runGit(['stash', 'pop'], { cwd: worktreePath });
+    if (restore.exitCode !== 0) {
+      throw new Error(
+        `Squash merge into ${targetBranch} failed, and restoring your stashed changes in ${worktreePath} ` +
+        `also failed: ${restore.stderr}. Your uncommitted work is preserved in the git stash — recover it ` +
+        `with 'git stash pop' in that worktree. Original merge error: ${err instanceof Error ? err.message : err}`
+      );
+    }
+    throw err;
+  }
+
+  // Merge committed and durable. Reapply the human's uncommitted work on top.
+  const pop = await runGit(['stash', 'pop'], { cwd: worktreePath });
+  if (pop.exitCode === 0) {
+    return null; // Clean restore — the common case.
+  }
+
+  // The merge succeeded but the stash could not be auto-restored. Do NOT fail the
+  // accept and do NOT swallow this: the stash is retained, so distinguish HOW it
+  // failed and surface a structured signal for the caller to act on.
+  //
+  // Two failure modes:
+  // - untracked collision: git refuses the whole pop ("would be overwritten by
+  //   merge" / "already exists"); nothing is applied, worktree is at clean merge.
+  // - tracked conflict: git applies with conflict markers and keeps the stash.
+  const popText = `${pop.stdout}\n${pop.stderr}`.toLowerCase();
+  const mode: StashRestoreMode =
+    popText.includes('would be overwritten') ||
+    popText.includes('already exists') ||
+    popText.includes('untracked working tree file')
+      ? 'pop-refused'
+      : 'conflict-markers';
+
+  logger.warn(
+    `Merged into ${targetBranch}, but the destination worktree's uncommitted work at ${worktreePath} ` +
+    `could not be auto-restored (${mode}). It is preserved in git stash ${stashSha} ("${stashLabel}").`
+  );
+
+  return { worktreePath, targetBranch, stashSha, stashLabel, mode };
 }
 
 export async function deleteBranch(branch: string, cwd?: string): Promise<void> {
@@ -854,9 +978,9 @@ export async function squashMergeTaskBranch(
   goal: string,
   root: string,
   fidelityBody?: string,
-): Promise<void> {
+): Promise<DestinationRestoreConflict | null> {
   const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root, fidelityBody);
-  await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
+  return await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
 }
 
 /**

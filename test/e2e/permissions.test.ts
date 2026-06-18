@@ -45,12 +45,25 @@ function readTaskStatus(root: string, shortId: string): string {
 function readTurns(root: string, shortId: string): Array<{
   role: string;
   content: string;
+  turn_type?: string;
+  actor?: string;
+  usage?: { cacheCreationTokens?: number; cacheReadTokens?: number };
   violations?: Array<{ file: string; base_sha: string; status: string }>;
 }> {
   const fullId = findFullTaskId(root, shortId);
   const turnsPath = join(getStorageDir(root), 'tasks', fullId, 'turns.json');
   const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
   return data.turns;
+}
+
+/**
+ * The agent turn carrying the FINAL violation set. With the bundle model
+ * violations are re-detected after push-back and attributed to the PUSH-BACK turn
+ * (a turn_type 'nudge' agent turn), NOT the work turn — so tests must look for the
+ * latest agent turn that actually recorded violations.
+ */
+function violationTurn(turns: ReturnType<typeof readTurns>) {
+  return [...turns].reverse().find(t => t.role === 'agent' && t.violations && t.violations.length > 0);
 }
 
 describe('file permission violations', () => {
@@ -100,17 +113,19 @@ describe('file permission violations', () => {
     );
     expectSuccess(result);
 
-    // Verify violations are stored on the agent turn (created during reconciliation)
+    // Verify violations are stored on the push-back turn (the FINAL re-detected set)
     const turns = readTurns(ctx.root, taskId);
-    const agentTurn = turns.find(t => t.role === 'agent');
+    const agentTurn = violationTurn(turns);
     expect(agentTurn).toBeDefined();
     expect(agentTurn!.violations).toBeDefined();
     expect(agentTurn!.violations!.length).toBe(1);
     expect(agentTurn!.violations![0].file).toBe('test.spec.ts');
     expect(agentTurn!.violations![0].status).toBe('pending');
 
-    // Violation text is NOT in the turn content — violations live in the structured field
-    expect(agentTurn!.content).not.toContain('## Permission Violations');
+    // The WORK turn carries NO violations and no violation text.
+    const workTurn = turns.find(t => t.role === 'agent');
+    expect(workTurn!.violations ?? []).toHaveLength(0);
+    expect(workTurn!.content).not.toContain('## Permission Violations');
 
     // INVARIANT: Tasks with violations transition to 'conflict', not 'blocked'.
     // This makes permission violations visible at a glance in task listings.
@@ -461,16 +476,16 @@ describe('file permission violations', () => {
     );
     expectSuccess(result);
 
-    // Verify the custom pattern triggered a violation
+    // Verify the custom pattern triggered a violation (on the push-back turn)
     const turns = readTurns(ctx.root, taskId);
-    const agentTurn = turns.find(t => t.role === 'agent');
+    const agentTurn = violationTurn(turns);
     expect(agentTurn).toBeDefined();
     expect(agentTurn!.violations).toBeDefined();
     expect(agentTurn!.violations!.length).toBe(1);
     expect(agentTurn!.violations![0].file).toBe('docs/api.md');
 
-    // Violation text is NOT in the turn content — violations live in the structured field
-    expect(agentTurn!.content).not.toContain('## Permission Violations');
+    // The work turn carries no violations.
+    expect(turns.find(t => t.role === 'agent')!.violations ?? []).toHaveLength(0);
   });
 
   // INVARIANT: Push-back fires when violations are detected, giving the agent one chance
@@ -510,15 +525,24 @@ describe('file permission violations', () => {
     );
     expectSuccess(result);
 
-    // Verify NO violations remain on the agent turn (agent reverted)
+    // Verify NO violations remain on the work turn (agent reverted)
     const turns = readTurns(ctx.root, taskId);
     const agentTurn = turns.find(t => t.role === 'agent');
     expect(agentTurn).toBeDefined();
     expect(agentTurn!.violations).toBeUndefined();
 
-    // Pushback response IS in the turn content — reviewers need to see the agent's justification
-    expect(agentTurn!.content).toContain('## Permission Violation Review');
-    expect(agentTurn!.content).toContain('I reverted the test file change as it was unnecessary.');
+    // The work turn's content is CLEAN — the push-back exchange is NOT appended.
+    expect(agentTurn!.content).not.toContain('## Permission Violation Review');
+    expect(agentTurn!.content).not.toContain('I reverted the test file change as it was unnecessary.');
+
+    // The push-back is recorded as its own discrete nudge turn pair so reviewers
+    // can see the agent's justification.
+    const nudgeTurns = turns.filter(t => t.turn_type === 'nudge');
+    expect(nudgeTurns).toHaveLength(2);
+    expect(nudgeTurns[0].role).toBe('human');
+    expect(nudgeTurns[0].content).toContain('## Permission Violation Review');
+    expect(nudgeTurns[1].role).toBe('agent');
+    expect(nudgeTurns[1].content).toContain('I reverted the test file change as it was unnecessary.');
 
     // No violations means task goes to 'blocked', not 'conflict'
     const status = readTaskStatus(ctx.root, taskId);
@@ -559,17 +583,25 @@ describe('file permission violations', () => {
     );
     expectSuccess(result);
 
-    // Verify violations persist
+    // Violations persist on the PUSH-BACK turn (the final re-detected set), not
+    // the work turn.
     const turns = readTurns(ctx.root, taskId);
-    const agentTurn = turns.find(t => t.role === 'agent');
-    expect(agentTurn).toBeDefined();
-    expect(agentTurn!.violations).toBeDefined();
-    expect(agentTurn!.violations!.length).toBe(1);
-    expect(agentTurn!.violations![0].file).toBe('test.spec.ts');
+    const violTurn = violationTurn(turns);
+    expect(violTurn).toBeDefined();
+    expect(violTurn!.violations!.length).toBe(1);
+    expect(violTurn!.violations![0].file).toBe('test.spec.ts');
 
-    // Pushback response IS in the turn content — reviewers need to see the agent's justification
-    expect(agentTurn!.content).toContain('## Permission Violation Review');
-    expect(agentTurn!.content).toContain('The test file change is essential for the bug fix.');
+    // The WORK turn carries no violations and no push-back text.
+    const workTurn = turns.find(t => t.role === 'agent');
+    expect(workTurn!.violations ?? []).toHaveLength(0);
+    expect(workTurn!.content).not.toContain('## Permission Violation Review');
+    expect(workTurn!.content).not.toContain('The test file change is essential for the bug fix.');
+
+    // Push-back recorded as its own discrete nudge turn pair with the justification.
+    const nudgeTurns = turns.filter(t => t.turn_type === 'nudge');
+    expect(nudgeTurns).toHaveLength(2);
+    expect(nudgeTurns[0].content).toContain('## Permission Violation Review');
+    expect(nudgeTurns[1].content).toContain('The test file change is essential for the bug fix.');
 
     // Violations remain → task goes to 'conflict'
     const status = readTaskStatus(ctx.root, taskId);
@@ -603,13 +635,14 @@ describe('file permission violations', () => {
     );
     expectSuccess(result);
 
-    // The turn completed (response was written) — push-back happened exactly once
-    // We verify this by checking the response has pushed_back=true and violations
+    // The turn completed (response was written) — push-back happened exactly once.
+    // Exactly ONE push-back turn pair exists (no re-push-back loop), and its
+    // re-detected violations remain.
     const turns = readTurns(ctx.root, taskId);
-    const agentTurn = turns.find(t => t.role === 'agent');
+    const agentTurn = violationTurn(turns);
     expect(agentTurn).toBeDefined();
-    expect(agentTurn!.violations).toBeDefined();
     expect(agentTurn!.violations!.length).toBe(1);
+    expect(turns.filter(t => t.turn_type === 'nudge' && t.content.includes('## Permission Violation Review'))).toHaveLength(1);
 
     // Task completed the turn and moved to conflict (not stuck in a loop)
     const status = readTaskStatus(ctx.root, taskId);
@@ -720,9 +753,10 @@ describe('file permission violations', () => {
     );
     expectSuccess(unblockResult);
 
-    // Verify second turn has violations
+    // Verify the second turn's push-back carries the violations (detected on the
+    // unblock turn, re-detected after push-back).
     turns = readTurns(ctx.root, taskId);
-    const secondAgentTurn = turns.filter(t => t.role === 'agent')[1];
+    const secondAgentTurn = violationTurn(turns);
     expect(secondAgentTurn).toBeDefined();
     expect(secondAgentTurn!.violations).toBeDefined();
     expect(secondAgentTurn!.violations!.length).toBe(1);

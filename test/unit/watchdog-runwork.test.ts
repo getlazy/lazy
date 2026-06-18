@@ -10,8 +10,12 @@ import { describe, test, expect } from 'bun:test';
 import { runWork, type WorkResult, type RetryState } from '../../src/supervisor/work';
 import { WatchdogTimeoutError } from '../../src/supervisor/watchdog';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
+import { createRunnerFromType } from '../../src/runner';
 
 const agent = new ClaudeCodeAgent();
+// Any runner works here: these tests inject _executeOverride, so the runner is
+// never consulted for session-log discovery.
+const runner = createRunnerFromType('dangerously-host-process-without-any-isolation');
 
 const MOCK_SUCCESS: WorkResult = {
   result: 'Task completed successfully',
@@ -33,6 +37,7 @@ describe('runWork watchdog handling', () => {
     await expect(
       runWork(
         agent,
+        runner,
         '/tmp/test',
         'Do the work',
         undefined,  // systemPrompt
@@ -59,6 +64,7 @@ describe('runWork watchdog handling', () => {
     await expect(
       runWork(
         agent,
+        runner,
         '/tmp/test',
         'Do the work',
         undefined,
@@ -79,7 +85,7 @@ describe('runWork watchdog handling', () => {
     };
 
     try {
-      await runWork(agent, '/tmp/test', 'Do the work', undefined, undefined, undefined, undefined, undefined, mockExecute);
+      await runWork(agent, runner, '/tmp/test', 'Do the work', undefined, undefined, undefined, undefined, undefined, mockExecute);
       expect(true).toBe(false); // should not reach here
     } catch (err) {
       expect(err).toBeInstanceOf(WatchdogTimeoutError);

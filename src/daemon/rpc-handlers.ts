@@ -20,6 +20,7 @@
 
 import { existsSync } from 'fs';
 import { loadConfig } from '../config/loader';
+import { getAuthEnvVars } from '../capture/claude';
 import { createStorage, type Storage, type StorageBackend } from '../storage';
 import type { Task, SearchResult } from '../storage';
 import type { TaskTarget } from '../types';
@@ -156,6 +157,7 @@ export async function handleRpc(
     case 'syncTask': return handleSyncTask(projectRoot, params);
     case 'reparentTask': return handleReparentTask(projectRoot, params);
     case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
+    case 'getAuthEnv': return handleGetAuthEnv(projectRoot, params);
     case 'storage': return handleStorageCall(projectRoot, params);
     default: throw new RpcError(404, `Unknown RPC command: ${command}`);
   }
@@ -253,6 +255,7 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     orphanStatus: data.orphanStatus,
     autoReactStatus: data.autoReactStatus,
     supervisorStatus: data.supervisorStatus,
+    workingSubstate: data.workingSubstate,
   };
 }
 
@@ -765,6 +768,36 @@ export async function handleGetDaemonMcpConfig(projectRoot: string, params: Reco
     }
     throw err;
   }
+}
+
+// --- Get Auth Env ---
+
+/**
+ * Return the model auth credential from the DAEMON's environment.
+ *
+ * The daemon is the single owner of credentials (see credential-gate.ts): it
+ * refuses to start without one, so by the time it can answer this RPC it is
+ * guaranteed to hold a usable token (or be Ollama-backed, which needs none).
+ *
+ * Client-side launch paths that spawn their OWN containers — notably
+ * `lazy builder`, which the CLI client launches directly rather than through
+ * the daemon — must source the credential here instead of from their own
+ * `process.env`. The user's interactive shell legitimately has no credential
+ * in daemon-only-env deployments; reading the client env would wrongly fail
+ * with "Authentication required".
+ *
+ * Secrets hygiene: the value crosses the local, token-authenticated unix
+ * socket only and is never logged.
+ */
+export async function handleGetAuthEnv(_projectRoot: string, _params: Record<string, unknown>) {
+  // Returns the bare Anthropic credential from the daemon process env. Callers
+  // (resolveAuthEnvFromDaemon) wrap it for their resolved role target — e.g. a
+  // proxy target layers its base URL on top. Ollama-backed roles need no
+  // credential and derive their dummy env client-side without this RPC.
+  //
+  // Reads the daemon process env. Throws an actionable error if absent, but the
+  // credential gate makes that practically unreachable for a running daemon.
+  return { authEnvVars: getAuthEnvVars() };
 }
 
 // --- Storage proxy ---

@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
+import { formatDashboardUrl } from '../../src/daemon/dashboard-url';
 import {
   readPid,
   readToken,
@@ -1036,6 +1037,129 @@ describe('lazy daemon', () => {
           (logger as any).config.logFile = undefined;
         }
       }
+    });
+  });
+
+  // INVARIANT: the daemon's TCP server (unauthenticated web dashboard + the
+  // /mcp and /rpc endpoints) binds to loopback (127.0.0.1) by DEFAULT so it is
+  // not reachable from other machines on the network. Remote/LAN access is an
+  // explicit opt-in via [server] bind in lazy.toml. See docs/reviews finding S2.
+  describe('web binding interface', () => {
+    let ctx: TestContext;
+    let tmpDir: string;
+    let originalHome: string | undefined;
+    let originalConfig: string | undefined;
+    let daemon: RunningDaemon | undefined;
+
+    beforeEach(async () => {
+      process.env.LAZY_TEST = '1';
+      ctx = await setupTestLazy();
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-bind-'));
+      originalHome = process.env.HOME;
+      process.env.HOME = tmpDir;
+      // Pin LAZY_CONFIG to the isolated project's lazy.toml. Without this,
+      // loadConfig walks up from process.cwd() (the lazy repo worktree running
+      // the test) and picks up THAT lazy.toml instead of the test project's —
+      // so the bind override below would never be read.
+      originalConfig = process.env.LAZY_CONFIG;
+      process.env.LAZY_CONFIG = join(ctx.root, 'lazy.toml');
+    });
+
+    afterEach(async () => {
+      if (daemon) {
+        try { daemon.stop(); } catch { /* ignore */ }
+        daemon = undefined;
+      }
+      process.env.HOME = originalHome;
+      if (originalConfig === undefined) delete process.env.LAZY_CONFIG;
+      else process.env.LAZY_CONFIG = originalConfig;
+      await ctx.cleanup();
+      await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    test('binds the web server to 127.0.0.1 by default', async () => {
+      // No [server] bind set in lazy.toml — must default to loopback.
+      daemon = await startDaemonServer({
+        projectRoot: ctx.root,
+        token: 'bind-default-token',
+        socketPath: join(tmpDir, 'bind-default.sock'),
+        webPort: 0, // ephemeral free port — never collides
+        _forceBindWebInTest: true,
+      });
+      expect(daemon.webServer).toBeDefined();
+      expect(daemon.webServer!.hostname).toBe('127.0.0.1');
+    });
+
+    // INVARIANT: /daemon/status reports the ACTUAL bind interface (127.0.0.1),
+    // not a hardcoded `localhost`. The CLI threads this through to the printed
+    // dashboard URL — `localhost` can resolve to IPv6 ::1 and miss an IPv4-only
+    // 127.0.0.1 bind, leaving users staring at an empty dashboard.
+    test('status payload reports bindHost=127.0.0.1 and a real port (not localhost)', async () => {
+      daemon = await startDaemonServer({
+        projectRoot: ctx.root,
+        token: 'bind-status-token',
+        socketPath: join(tmpDir, 'bind-status.sock'),
+        webPort: 0,
+        _forceBindWebInTest: true,
+      });
+      const resp = await fetch('http://localhost/daemon/status', {
+        unix: join(tmpDir, 'bind-status.sock'),
+        headers: { 'Authorization': 'Bearer bind-status-token' },
+      } as any);
+      expect(resp.ok).toBe(true);
+      const data = await resp.json() as any;
+      expect(data.bindHost).toBe('127.0.0.1');
+      expect(data.webPort).toBeGreaterThan(0);
+      // The user-facing URL must point at the real interface + port.
+      expect(formatDashboardUrl(data.bindHost, data.webPort)).toBe(`http://127.0.0.1:${data.webPort}`);
+      expect(formatDashboardUrl(data.bindHost, data.webPort)).not.toContain('localhost');
+    });
+
+    test('opt-in: [server] bind in lazy.toml changes the bind address', async () => {
+      // Explicit opt-in to LAN exposure — the daemon must honor it. Insert the
+      // key into the existing [server] section rather than clobbering the file
+      // (which would drop storage config and risk a duplicate-section TOML error).
+      const configPath = join(ctx.root, 'lazy.toml');
+      const original = await readFile(configPath, 'utf-8');
+      const patched = original.includes('[server]')
+        ? original.replace('[server]', '[server]\nbind = "0.0.0.0"')
+        : original + '\n[server]\nbind = "0.0.0.0"\n';
+      await writeFile(configPath, patched);
+      daemon = await startDaemonServer({
+        projectRoot: ctx.root,
+        token: 'bind-optin-token',
+        socketPath: join(tmpDir, 'bind-optin.sock'),
+        webPort: 0,
+        _forceBindWebInTest: true,
+      });
+      expect(daemon.webServer).toBeDefined();
+      expect(daemon.webServer!.hostname).toBe('0.0.0.0');
+      expect(daemon.bindHost).toBe('0.0.0.0');
+      // Display rule: a 0.0.0.0 (all-interfaces) bind is reachable locally via
+      // loopback, so the convenient URL we show the user is 127.0.0.1 — never
+      // a literal `0.0.0.0`, which is not a connectable address in a browser.
+      expect(formatDashboardUrl(daemon.bindHost, daemon.webServer!.port!)).toBe(
+        `http://127.0.0.1:${daemon.webServer!.port}`,
+      );
+    });
+  });
+
+  // Pure unit coverage for the host→display-URL formatting rule. Centralizing
+  // this in one helper (formatDashboardUrl) is what keeps the ~5 print sites
+  // from drifting back to a hardcoded `localhost`.
+  describe('formatDashboardUrl', () => {
+    test('loopback bind prints 127.0.0.1', () => {
+      expect(formatDashboardUrl('127.0.0.1', 26024)).toBe('http://127.0.0.1:26024');
+    });
+    test('all-interfaces binds (0.0.0.0 / ::) collapse to loopback for local convenience', () => {
+      expect(formatDashboardUrl('0.0.0.0', 26024)).toBe('http://127.0.0.1:26024');
+      expect(formatDashboardUrl('::', 26024)).toBe('http://127.0.0.1:26024');
+    });
+    test('a specific interface IP is shown as-is', () => {
+      expect(formatDashboardUrl('192.168.1.50', 8080)).toBe('http://192.168.1.50:8080');
+    });
+    test('missing bindHost (older daemon payload) falls back to loopback', () => {
+      expect(formatDashboardUrl(undefined, 26024)).toBe('http://127.0.0.1:26024');
     });
   });
 

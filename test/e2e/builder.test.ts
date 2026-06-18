@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { rm } from 'fs/promises';
 import { join, basename } from 'path';
 import { homedir } from 'os';
@@ -9,6 +9,30 @@ import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expec
 /** Replace the [runner] section's type value in a lazy.toml config string. */
 function setRunnerType(config: string, type: string): string {
   return config.replace(/^type\s*=\s*"[^"]*"/m, `type = "${type}"`);
+}
+
+/**
+ * Install a fake `claude` executable that records each argv entry (one per line)
+ * to `logPath`, then exits 0. Used to capture exactly what flags the builder
+ * passes to the Claude Code invocation. Returns the bin dir to prepend to PATH.
+ *
+ * The fake also satisfies the host-process runner's `claude --version`
+ * availability check (it exits 0 for any argv).
+ */
+function installFakeClaude(root: string, logPath: string): string {
+  const binDir = join(root, 'fakebin');
+  mkdirSync(binDir, { recursive: true });
+  const script = `#!/bin/sh\nprintf '%s\\n' "$@" >> "${logPath}"\nexit 0\n`;
+  const claudePath = join(binDir, 'claude');
+  writeFileSync(claudePath, script);
+  chmodSync(claudePath, 0o755);
+  return binDir;
+}
+
+/** Read the recorded argv (one entry per line) from the fake claude log. */
+function readClaudeArgs(logPath: string): string[] {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf-8').split('\n').filter((l) => l.length > 0);
 }
 
 describe('lazy builder', () => {
@@ -262,6 +286,108 @@ describe('lazy builder', () => {
     expectOutput(result, '⚠ DANGER: Running on the host WITHOUT isolation.');
     expectOutput(result, 'The agent has unrestricted access to your system.');
     expectOutput(result, 'Only proceed on an isolated/disposable machine.');
+  });
+
+  test('--help documents the --model flag (builder model, not per-task)', async () => {
+    const result = await ctx.lazy(['builder', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, '--model <id>');
+    // Must make the BUILDER-vs-per-task distinction explicit.
+    expectOutput(result, "BUILDER's model");
+  });
+
+  // INVARIANT: `lazy builder --model <id>` passes `--model <id>` straight
+  // through to the Claude Code invocation. This is the builder's own model
+  // (distinct from the per-task --model used when starting tasks), and there is
+  // no allow-list — whatever the user gives is forwarded verbatim so brand-new
+  // models work.
+  test('--model is passed through to the Claude Code invocation', async () => {
+    const lazyTomlPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
+    writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
+
+    const logPath = join(ctx.root, 'claude-args.log');
+    const binDir = installFakeClaude(ctx.root, logPath);
+
+    const result = await ctx.lazy(['builder', '--model', 'mythos'], {
+      env: { PATH: `${binDir}:${process.env.PATH}` },
+    });
+    expectSuccess(result);
+
+    const args = readClaudeArgs(logPath);
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('mythos');
+  });
+
+  // INVARIANT: an explicit --model flag takes precedence over the
+  // Ollama-injected model. We must end up with exactly ONE --model arg (the
+  // user's), never two — two would be ambiguous to Claude Code.
+  test('explicit --model wins over the Ollama-injected model', async () => {
+    const lazyTomlPath = join(ctx.root, 'lazy.toml');
+    let cfg = readFileSync(lazyTomlPath, 'utf-8');
+    cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
+    // Enable Ollama with its own model — this would normally inject --model.
+    cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\n`;
+    writeFileSync(lazyTomlPath, cfg);
+
+    const logPath = join(ctx.root, 'claude-args.log');
+    const binDir = installFakeClaude(ctx.root, logPath);
+
+    const result = await ctx.lazy(['builder', '--model', 'mythos'], {
+      env: { PATH: `${binDir}:${process.env.PATH}` },
+    });
+    expectSuccess(result);
+
+    const args = readClaudeArgs(logPath);
+    const modelIndexes = args.flatMap((a, i) => (a === '--model' ? [i] : []));
+    // Exactly one --model arg, and it's the explicit user value.
+    expect(modelIndexes.length).toBe(1);
+    expect(args[modelIndexes[0] + 1]).toBe('mythos');
+    expect(args).not.toContain('ollama-local-model');
+  });
+
+  // Guards the existing behavior: with no --model flag, Ollama's model is still
+  // injected so Claude Code targets the local model rather than its opus default.
+  test('Ollama model is still injected when no --model flag is given', async () => {
+    const lazyTomlPath = join(ctx.root, 'lazy.toml');
+    let cfg = readFileSync(lazyTomlPath, 'utf-8');
+    cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
+    cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\n`;
+    writeFileSync(lazyTomlPath, cfg);
+
+    const logPath = join(ctx.root, 'claude-args.log');
+    const binDir = installFakeClaude(ctx.root, logPath);
+
+    const result = await ctx.lazy(['builder'], {
+      env: { PATH: `${binDir}:${process.env.PATH}` },
+    });
+    expectSuccess(result);
+
+    const args = readClaudeArgs(logPath);
+    const idx = args.indexOf('--model');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe('ollama-local-model');
+  });
+
+  // INVARIANT: --model requires a non-empty value so we never append a dangling
+  // --model arg to Claude Code.
+  test('--model with empty value is rejected', async () => {
+    const result = await ctx.lazy(['builder', '--model', '']);
+    expectFailure(result, 1);
+    expectError(result, 'Invalid --model');
+  });
+
+  // INVARIANT (fix-builder-model-ollama-precedence): an arbitrary (non-Anthropic)
+  // model with NO local server configured resolves to the anthropic backend,
+  // which can't serve it — reject up front instead of failing opaquely at runtime.
+  // (claude-* and the known short names are accepted; a local server would allow
+  // any name — that path is covered by the "wins over Ollama" test above.)
+  test('--model with an unknown name and no local server is rejected up front', async () => {
+    const result = await ctx.lazy(['builder', '--model', 'qwen3-coder']);
+    expectFailure(result, 1);
+    expectError(result, 'Unknown --model');
   });
 
   test('--help shows --autonomous flag', async () => {

@@ -47,7 +47,7 @@ function commitSubject(message: string): string {
 /** Describe a turn for the event bundle, distinguishing human feedback. */
 function formatTurn(turn: Turn): string {
   const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
-  const kind = turn.turn_type === 'ask' ? ' (ask)' : '';
+  const kind = turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : '';
   const auto = turn.auto_triggered ? ' (auto)' : '';
   const content = turn.content.trim();
   return `- [${who}]${kind}${auto}: ${content}`;

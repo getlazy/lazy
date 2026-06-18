@@ -10,15 +10,24 @@
  * This is a single-shot mechanism — no loop. Detect → push back → re-detect → report.
  */
 
-import type { FileViolation } from '../types';
+import type { AgentResponse, FileViolation } from '../types';
 import type { Agent } from '../agent/interface';
 import { log, logError } from './log';
 import { execWithWatchdog } from './watchdog';
 import permissionPushbackTemplate from '../prompts/permission-pushback.md' with { type: 'text' };
 
+/** Zero-usage fallback for a failed follow-up (no agent tokens were spent). */
+const ZERO_USAGE = { input_tokens: 0, output_tokens: 0 } as const;
+
 export interface PushbackResult {
+  /** The push-back prompt the supervisor sent to the agent. */
+  prompt: string;
   /** The agent's text response to the push-back prompt */
   response: string;
+  /** Agent session id the push-back invocation reported (for session reconciliation). */
+  session_id: string;
+  /** Full token usage of the push-back invocation (incl. cache tokens). */
+  usage: AgentResponse['usage'];
 }
 
 /**
@@ -64,19 +73,23 @@ export async function runPermissionPushback(
     logError(`[pushback] Agent exited with code ${exitCode}`);
     logError(`[pushback] stderr: ${stderr.slice(-500)}`);
     // Push-back failure is non-fatal — return empty response and let violations stand
-    return { response: 'Push-back failed: agent exited with an error.' };
+    return { prompt, response: 'Push-back failed: agent exited with an error.', session_id: sessionId, usage: { ...ZERO_USAGE } };
   }
 
-  // Parse the agent's response
+  // Parse the agent's response — full fidelity (result + session_id + usage).
   let responseText: string;
+  let responseSessionId = sessionId;
+  let usage: AgentResponse['usage'] = { ...ZERO_USAGE };
   try {
     const parsed = agent.parseResponse(stdout, { workingDir: worktreePath });
     responseText = parsed.result;
+    responseSessionId = parsed.session_id;
+    usage = parsed.usage;
   } catch (err) {
     logError(`[pushback] Failed to parse response: ${err instanceof Error ? err.message : err}`);
     responseText = 'Push-back failed: could not parse agent response.';
   }
 
   log(`[pushback] Agent responded (${responseText.length} chars)`);
-  return { response: responseText };
+  return { prompt, response: responseText, session_id: responseSessionId, usage };
 }

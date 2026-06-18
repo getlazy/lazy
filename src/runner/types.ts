@@ -9,7 +9,7 @@
 
 import type { SandboxConfig } from '../capture/claude';
 import type { AgentResponse } from '../types';
-import type { RunnerType } from '../config/types';
+import type { RunnerType, RoleTarget } from '../config/types';
 import type { HealthCheck } from '../remote/driver';
 
 export type { RunnerType } from '../config/types';
@@ -34,6 +34,16 @@ export interface FollowHandle {
 
 export interface Runner {
   readonly type: RunnerType;
+
+  /**
+   * Set the fully-resolved per-role model targets (from config.models.roles).
+   * The runner uses the `builder` target for builder launches and the `agent`
+   * target for task/supervisor launches — to inject the right backend env vars
+   * and to preflight reachability before launch. Optional: when unset (e.g. the
+   * in-container supervisor's runner), both roles default to the anthropic
+   * backend, preserving credential-inheritance behavior.
+   */
+  setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void;
 
   /**
    * Pre-flight check. Throws if the runner infrastructure is not available
@@ -124,6 +134,21 @@ export interface Runner {
   usesSandbox(): boolean;
 
   /**
+   * Absolute directory where THIS runner's Claude Code session JSONL files
+   * land for the given worktree. The runner is the single source of truth for
+   * this location because it depends on the HOME the runner gives Claude:
+   *   - sandbox runners (docker/podman):
+   *       <worktree>/.lazy-task-sandbox/.claude/projects/<encodedPath>
+   *   - host-process runner:
+   *       <host-home>/.claude/projects/<encodedPath>
+   *
+   * Callers that tail or discover the agent's session log (`lazy watch`, the
+   * supervisor's graceful-exit recovery, the activity monitor) ask the runner
+   * rather than guessing or scanning every candidate location.
+   */
+  agentSessionProjectDir(worktreePath: string): string;
+
+  /**
    * Tool checks the supervisor should run before starting work.
    * Each runner knows what tools its environment requires.
    */
@@ -182,6 +207,10 @@ export interface Runner {
    * @param claudeExtraArgs    Additional args for Claude Code (e.g., --model)
    * @param debug              Enable debug logging
    * @param daemonConfigPath   Optional path to daemon MCP config (preferred over builder server)
+   * @param projectsDir        Optional host dir to mount at ~/.claude/projects so
+   *                           this builder gets an isolated Claude projects dir
+   *                           (per-builder session ownership). Ignored by runners
+   *                           that cannot isolate the projects dir (host-process).
    * @returns Exit code and detected session ID (if available)
    */
   launchBuilderInteractive(
@@ -191,5 +220,6 @@ export interface Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
+    projectsDir?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }>;
 }

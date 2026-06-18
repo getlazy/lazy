@@ -17,10 +17,12 @@ import { TERMINAL_STATUSES } from '../types';
 import type { TokenUsage } from '../types';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
-import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus } from '../protocol';
+import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus, removeProtocolDir } from '../protocol';
 import type { CompletedResponse, ErrorResponse } from '../protocol';
+import { completedResponses } from '../protocol';
+import { clearTurnEndSignal } from '../protocol/turn-end-signal';
 import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
-import { checkLock } from './lock';
+import { checkLock, removeLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
 import { tmuxSessionName, killTmuxWatchSession } from '../terminal';
@@ -32,6 +34,7 @@ import type { AutoReactTrigger } from '../daemon/auto-react-budget';
 import { loadConfig } from '../config/loader';
 import { runGit } from './git';
 import { reparentChildren, formatReparentWarning } from '../cli/orphan';
+import { readAgentReportFromSessionLog } from '../import/recover-agent-report';
 
 /**
  * Grace period in milliseconds for newly-working tasks.
@@ -46,6 +49,30 @@ import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 function getWorkingGracePeriodMs(): number {
   return process.env.LAZY_TEST === '1' ? 0 : 30000; // 30 seconds (0 in tests)
 }
+
+/**
+ * Supervisor phases that indicate active post-work harness machinery is still
+ * running for a turn. These legitimately run for minutes AFTER the agent is
+ * "done" (a `post_turn_check` can be a full `cargo build`; `post_turn_sync`
+ * merges upstream; pushback re-invokes the agent) and only THEN does the
+ * supervisor write `response.json` to finalize the turn.
+ *
+ * Stranded-completion recovery must never fire while one of these is the
+ * recorded phase: doing so would race the supervisor's own `writeResponse`,
+ * record commits before post-turn sync settles (wrong end_sha / diff scope),
+ * and drop the agent's real report. Only the supervisor's `response.json`
+ * finalizes a turn — recovery is a fallback for when that will NEVER come
+ * (the run is dead), not a shortcut around legitimate finalization.
+ */
+const ACTIVE_HARNESS_PHASES: ReadonlySet<string> = new Set([
+  'sync_with_remote',
+  'merge_and_fix',
+  'permission_pushback',
+  'post_turn_check',
+  'post_turn_sync',
+  'writing_response',
+  'retrying',
+]);
 
 
 /**
@@ -173,6 +200,20 @@ export async function reconcileTasks(
     } catch (err) {
       logger.warn(`Recover backlog with commits failed: ${err instanceof Error ? err.message : err}`);
     }
+
+    // Sweep 7: recover tasks stranded in `working` whose turn was never finalized.
+    // Defense-in-depth for the primary working sweep above (reconcileTask). If
+    // reconcileTask was skipped (transient worktree lock) or threw for a task, a
+    // task whose agent finished and committed real work can sit in `working`
+    // forever — turns/commits unpersisted, no blocked transition, no notification.
+    // This independent net re-checks liveness/turn-end signal and backfills the
+    // committed work to `blocked`. It re-reads current git/task state, so it
+    // survives daemon restarts (mirrors recoverBacklogWithCommits).
+    try {
+      await recoverStrandedWorkingTasks(storage, lazyRoot, runner);
+    } catch (err) {
+      logger.warn(`Recover stranded working tasks failed: ${err instanceof Error ? err.message : err}`);
+    }
 }
 
 async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string, runner: Runner): Promise<void> {
@@ -209,7 +250,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   if (response) {
     if (response.status === 'completed') {
       logger.info(`Task ${taskShortId} finished turn, transitioning to blocked`);
-      await handleCompletedResponse(storage, taskId, session, response, worktreePath, protoDir);
+      await handleCompletedResponses(storage, taskId, session, completedResponses(response), worktreePath, protoDir);
 
       // Note: push and PR operations moved out of reconciler.
       // Read commands (list, show, blocked, active) should be fast and local.
@@ -238,10 +279,29 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     }
   }
 
-  // Step 3: Grace period expired — check if run is still alive
+  // Step 3: Grace period expired — check if run is still alive.
+  // INVARIANT: a live run means the turn may still be finalizing (the agent's
+  // turn-end marker persists through post_turn_check / post_turn_sync / pushback
+  // before the supervisor writes response.json). We must NOT recover here — only
+  // the supervisor's response.json finalizes a turn. Stranded recovery is for
+  // when that response will NEVER come, i.e. the run is dead (handled below).
   if (await runner.isRunning(containerName)) {
     logger.debug(`Task ${taskShortId}: run ${containerName} still running, no response yet`);
     return; // Still working
+  }
+
+  // The run is not alive and there is no response. Before declaring the turn
+  // interrupted, check whether the agent actually finished: a stranded completion
+  // (supervisor died at finalize) leaves real committed work on the branch with no
+  // response. Recover those to 'blocked' with commits backfilled instead of
+  // interrupting — interrupting would re-run the agent and lose the completion.
+  if (await recoverStrandedCompletion(storage, taskId, session, worktreePath, protoDir)) {
+    await storage.updateSessionContainerName(session.id, null);
+    killTmuxWatchSession(tmuxSessionName(taskShortId));
+    if (await runner.runExists(containerName)) {
+      await runner.removeRun(containerName);
+    }
+    return;
   }
 
   // Step 4: Run not active and no response — check status.json for context
@@ -422,10 +482,252 @@ export function enrichResponseWithPlanContent(result: string, worktreePath: stri
 }
 
 /**
+ * Recover a task stranded in `working` whose agent finished real, committed
+ * work but whose turn was never finalized into storage.
+ *
+ * The normal path is: supervisor writes response.json → reconciler records the
+ * agent turn + commits → working→blocked. If the supervisor never produces a
+ * processable response (crash / kill / OOM / teardown at finalize, or an agent
+ * that committed and reported but never exited so no response is ever written),
+ * the turn is lost and the task wedges in `working` forever: zero agent turns,
+ * zero recorded commits, no blocked transition, no review notification.
+ *
+ * The durable proof of work is the git branch — the live specimen had 625
+ * committed lines while storage showed commit_count=0. This backfills those
+ * commits from the branch, records a recovery turn so the lost-finalize gap is
+ * visible, and transitions working→blocked through the canonical state machine.
+ * That working→blocked transition is exactly what the daemon's state-change
+ * detector (src/daemon/server.ts) turns into a `task.completed` notification, so
+ * recovering here restores the review loop with no extra wiring.
+ *
+ * Returns true if it recovered (real committed work existed); false otherwise,
+ * so the caller can fall back to its normal handling (e.g. interrupted).
+ *
+ * INVARIANT: only recovers when the branch holds real committed content beyond
+ * what storage already knows. A `lazy start` init commit (--allow-empty, no
+ * tree change) is NOT work — those tasks fall through to interrupted/resume,
+ * mirroring the zombie sweep's `hasAgentWork` guard.
+ */
+/**
+ * Build the content for a stranded-completion recovery turn.
+ *
+ * Incremental turn persistence: the agent's written report is recovered from
+ * the Claude Code session transcript that was written incrementally to disk as
+ * the agent produced it — so a lost or late finalize no longer loses the words.
+ * When the transcript yields the report, the recovery turn carries the agent's
+ * ACTUAL report (prefixed with a short note that finalize was lost). Only when
+ * no transcript text can be found do we fall back to the lossy placeholder.
+ *
+ * `sinceTimestampMs` is the watermark: the timestamp of the last finalized turn.
+ * Recovery surfaces only transcript content NEWER than it, so a turn that
+ * produced no report falls back to the placeholder instead of resurfacing the
+ * previous turn's report. Null/undefined (a stranded first turn) recovers the
+ * latest message as before. See `readAgentReportFromSessionLog`.
+ *
+ * Exported for unit testing.
+ */
+export async function buildStrandedRecoveryTurnContent(
+  worktreePath: string,
+  agentSessionId: string | null,
+  newCommitCount: number,
+  sinceTimestampMs?: number | null,
+): Promise<string> {
+  const report = await readAgentReportFromSessionLog(worktreePath, agentSessionId, sinceTimestampMs);
+  if (report) {
+    return (
+      '[Recovered] The supervisor never finalized this turn (no response was produced — ' +
+      'likely a crash, kill, or hang at finalize), so the task was recovered from a stranded ' +
+      `'working' state: ${newCommitCount} commit(s) were backfilled from the branch and the task ` +
+      "moved to 'blocked' for review. The agent's written report below was recovered from the " +
+      'session transcript.\n\n---\n\n' +
+      report
+    );
+  }
+  return (
+    '[Recovered] The agent committed its work but the supervisor never finalized the turn ' +
+    '(no response was produced — likely a crash, kill, or hang at finalize). Recovered from a ' +
+    `stranded 'working' state: backfilled ${newCommitCount} commit(s) from the branch and ` +
+    "moved the task to 'blocked' for review. The agent's written report for this turn was lost; " +
+    'the committed code is intact on the branch.'
+  );
+}
+
+async function recoverStrandedCompletion(
+  storage: Storage,
+  taskId: string,
+  session: { id: string; git_start_sha: string; agent_session_id: string | null },
+  worktreePath: string,
+  protoDir: string,
+): Promise<boolean> {
+  const taskShortId = shortId(taskId);
+
+  // Defense-in-depth against a racy liveness probe: never claim completion while
+  // the supervisor's recorded phase shows active post-work harness machinery.
+  // Callers only reach here once the run looks dead, but if that probe is ever
+  // wrong, this keeps us from racing a supervisor that is still finalizing the
+  // turn (post-turn check/sync, merge, pushback, writing the response). Such a
+  // task falls through to the interrupted/auto-resume path instead.
+  const status = readStatus(protoDir);
+  if (status && ACTIVE_HARNESS_PHASES.has(status.phase)) {
+    logger.debug(`Task ${taskShortId}: status phase '${status.phase}' indicates active harness work — skipping stranded recovery.`);
+    return false;
+  }
+
+  const existingCommits = await storage.getSessionCommits(session.id);
+  const lastKnownSha = existingCommits.length > 0
+    ? existingCommits[existingCommits.length - 1].sha
+    : session.git_start_sha;
+
+  let newCommits;
+  try {
+    newCommits = await getNewCommits(lastKnownSha, worktreePath);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: stranded-recovery commit scan failed: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+  if (newCommits.length === 0) return false;
+
+  // Real-work gate: ignore empty (--allow-empty) init commits that introduce no
+  // tree change. `git diff --quiet` exits 1 when trees differ (real content) and
+  // 0 when identical (nothing worth reviewing).
+  const diff = await runGit(['diff', '--quiet', lastKnownSha, 'HEAD'], { cwd: worktreePath });
+  if (diff.exitCode === 0) return false;
+
+  logger.warn(`Task ${taskShortId}: stranded in 'working' with ${newCommits.length} unrecorded commit(s) and no response — recovering to 'blocked' and backfilling commits.`);
+
+  // Backfill commits — git is the source of truth when storage is empty.
+  for (const c of newCommits) {
+    await storage.createCommit(session.id, c.sha, c.message);
+  }
+
+  // Record a recovery turn so the lost-finalize gap is visible to reviewers.
+  // Idempotent: skip if an agent turn already closes out the session.
+  const turns = await storage.getSessionTurns(session.id);
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  if (lastTurn?.role !== 'agent') {
+    // Watermark: recover only transcript content newer than the last finalized
+    // turn. The persisted turns' timestamps ARE the high-water mark of consumed
+    // transcript — using the latest one means a turn that produced no report
+    // falls back to the placeholder instead of resurfacing the prior turn's
+    // report. With no prior turn (stranded first turn) there is no watermark and
+    // recovery takes the latest message, as before. This relies on the turn
+    // timestamp (host clock at finalize) sitting after the agent's transcript
+    // timestamps for already-consumed turns — true on a shared clock, which the
+    // worktree + transcript + reconciler always share (same machine).
+    const watermarkMs = turns.length > 0
+      ? Math.max(...turns.map(t => t.timestamp))
+      : null;
+    const seq = await storage.getNextTurnSequence(session.id);
+    await storage.createTurn({
+      sessionId: session.id,
+      sequence: seq,
+      role: 'agent',
+      content: await buildStrandedRecoveryTurnContent(worktreePath, session.agent_session_id, newCommits.length, watermarkMs),
+    });
+  }
+
+  // Canonical working→blocked transition (validated by src/task-state-machine.ts).
+  await storage.updateTaskStatus(taskId, 'blocked', 'system');
+
+  // A healthy completion clears the crash counters.
+  try {
+    await storage.resetConsecutiveInterruptions(session.id);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not reset interruption counter during recovery: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const { resetAutoReactCounters } = await import('../daemon/auto-react-budget');
+    await resetAutoReactCounters(storage, taskId);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not reset auto-react counters during recovery: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Clear the consumed turn-end marker and stale status so a future turn starts clean.
+  try {
+    await clearTurnEndSignal(protoDir);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not clear turn-end marker during recovery: ${err instanceof Error ? err.message : err}`);
+  }
+  clearStatus(protoDir);
+
+  return true;
+}
+
+/**
  * Handle a completed response from the supervisor.
  * Records the agent turn, captures commits, snapshots, etc.
  */
-async function handleCompletedResponse(
+/** Supervisor-turn heading per follow-up kind, so `lazy show` labels it clearly. */
+function supervisedHeading(kind: 'permission_pushback' | 'maintain'): string {
+  switch (kind) {
+    case 'permission_pushback':
+      return '## Permission Violation Review';
+    case 'maintain':
+      return '## Maintained Files Review';
+  }
+}
+
+/** Convert a protocol usage block to the storage TokenUsage shape (incl. cache). */
+function toTurnUsage(usage: CompletedResponse['usage'] | undefined): TokenUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    inputTokens: usage.input_tokens ?? 0,
+    outputTokens: usage.output_tokens ?? 0,
+    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+  };
+}
+
+/**
+ * Record a supervised follow-up (push-back / maintain nudge) as a discrete turn
+ * pair: a `supervisor`-actored prompt turn carrying the supervisor's prompt, then
+ * the agent's reply turn — modeled the same way a human→agent exchange is. The
+ * reply turn carries the follow-up invocation's OWN usage (incl. cache tokens),
+ * SHA window (so its diff shows only its commits), and any re-detected violations.
+ */
+async function recordSupervisedTurns(
+  storage: Storage,
+  sessionId: string,
+  supervised: CompletedResponse[],
+  worktreePath: string,
+): Promise<void> {
+  for (const resp of supervised) {
+    if (!resp.supervised) continue; // defensive: a supervised follow-up must carry its block
+    const { kind, prompt } = resp.supervised;
+
+    const promptSeq = await storage.getNextTurnSequence(sessionId);
+    await storage.createTurn({
+      sessionId,
+      sequence: promptSeq,
+      role: 'human',
+      content: `${supervisedHeading(kind)}\n\n${prompt}`,
+      prompt,
+      // The supervisor authored this autonomously — not the human, not the agent.
+      actor: 'supervisor',
+      autoTriggered: true,
+      turnType: 'nudge',
+    });
+
+    const replySeq = await storage.getNextTurnSequence(sessionId);
+    await storage.createTurn({
+      sessionId,
+      sequence: replySeq,
+      role: 'agent',
+      content: enrichResponseWithPlanContent(resp.result, worktreePath),
+      usage: toTurnUsage(resp.usage),
+      startSha: resp.start_sha_work,
+      endSha: resp.end_sha_work,
+      startShaWork: resp.start_sha_work,
+      endShaWork: resp.end_sha_work,
+      // Violations re-detected after THIS invocation. Stored only when non-empty;
+      // the final set lands on the push-back turn (latestViolationTurn finds it).
+      ...(resp.violations && resp.violations.length > 0 ? { violations: resp.violations } : {}),
+      turnType: 'nudge',
+    });
+  }
+}
+
+export async function handleCompletedResponse(
   storage: Storage,
   taskId: string,
   session: { id: string; agent_session_id: string | null; git_start_sha: string; container_name: string | null },
@@ -433,34 +735,49 @@ async function handleCompletedResponse(
   worktreePath: string,
   protoDir: string,
 ): Promise<void> {
-  const taskShortId = shortId(taskId);
+  return handleCompletedResponses(storage, taskId, session, [response], worktreePath, protoDir);
+}
 
-  // Reconcile Claude session ID with what the agent actually wrote.
-  // Claude Code rotates session IDs (auto-compact, --resume fallback, etc.)
-  // and machine switches can leave the stored ID pointing at a JSONL that
-  // doesn't exist in this sandbox. Always trust the ID the agent reported
-  // for the just-completed turn — that's the JSONL that exists right now.
-  if (shouldReconcileAgentSessionId(session.agent_session_id, response.session_id)) {
-    await storage.updateSessionClaudeId(session.id, response.session_id);
+/**
+ * Finalize a completed command from its bundle of per-invocation responses.
+ *
+ *   responses[0]   — the WORK response → the work agent turn
+ *   responses[1..] — supervised follow-ups (push-back, maintain) → supervisor
+ *                    prompt turn + agent reply turn each
+ *
+ * Single-invocation callers (ask, sync, stranded recovery) pass a one-element
+ * array via the `handleCompletedResponse` wrapper.
+ */
+export async function handleCompletedResponses(
+  storage: Storage,
+  taskId: string,
+  session: { id: string; agent_session_id: string | null; git_start_sha: string; container_name: string | null },
+  responses: CompletedResponse[],
+  worktreePath: string,
+  protoDir: string,
+): Promise<void> {
+  const taskShortId = shortId(taskId);
+  const work = responses[0];
+  const supervised = responses.slice(1);
+
+  // Reconcile Claude session ID with what the agent actually wrote. With multiple
+  // invocations the LAST one's session id points at the JSONL that exists now
+  // (each resume can rotate the id), so trust the latest non-empty session id.
+  const finalSessionId = [...responses].reverse().find(r => r.session_id)?.session_id ?? work.session_id;
+  if (shouldReconcileAgentSessionId(session.agent_session_id, finalSessionId)) {
+    await storage.updateSessionClaudeId(session.id, finalSessionId);
   }
 
-  // Extract token usage from protocol response
-  const turnUsage: TokenUsage | undefined = response.usage ? {
-    inputTokens: response.usage.input_tokens ?? 0,
-    outputTokens: response.usage.output_tokens ?? 0,
-    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-  } : undefined;
+  // Work-turn usage (supervised usage is recorded on each supervised reply turn).
+  const turnUsage = toTurnUsage(work.usage);
 
-  // Enrich response with plan content from the sandbox (if any)
-  const enrichedResult = enrichResponseWithPlanContent(response.result, worktreePath);
+  // Enrich the work response with plan content from the sandbox (if any)
+  const enrichedResult = enrichResponseWithPlanContent(work.result, worktreePath);
 
-  // Read supervisor status to get per-turn SHAs before it's cleared
-  // Four-SHA model: start_sha, start_sha_work, end_sha_work, end_sha
-  //   start_sha:      HEAD at absolute start of turn (before pre-turn sync)
-  //   start_sha_work: HEAD where agent work begins (after pre-turn sync, or same as start_sha)
-  //   end_sha_work:   HEAD where agent work ends (before post-turn sync)
-  //   end_sha:        HEAD at absolute end of turn (after post-turn sync, or same as end_sha_work)
+  // Read supervisor status to get the WORK turn's SHAs before it's cleared.
+  // Four-SHA model: start_sha, start_sha_work, end_sha_work, end_sha. Note
+  // end_sha_work (status.post_work_sha) is pinned at the WORK end — supervised
+  // commits are NOT folded in, so the work turn's diff shows only work commits.
   const status = readStatus(protoDir);
   let turnStartSha: string | undefined;
   let turnStartShaWork: string | undefined;
@@ -505,17 +822,30 @@ async function handleCompletedResponse(
       endSha: turnEndSha,
       startShaWork: turnStartShaWork,
       endShaWork: turnEndShaWork,
-      mergeConflicts: response.merge_conflicts,
-      violations: response.violations,
-      ...(response.check_exit_code !== undefined ? { checkExitCode: response.check_exit_code } : {}),
-      ...(response.check_output !== undefined ? { checkOutput: response.check_output } : {}),
+      mergeConflicts: work.merge_conflicts,
+      // The work turn carries NO violations — when present they were re-detected
+      // and attributed to the push-back turn (the FINAL set). See recordSupervisedTurns.
+      ...(work.check_exit_code !== undefined ? { checkExitCode: work.check_exit_code } : {}),
+      ...(work.check_output !== undefined ? { checkOutput: work.check_output } : {}),
     });
+
+    // Materialize each supervised follow-up as its own discrete turn pair.
+    //
+    // INVARIANT: supervised turns are recorded ONLY on the same pass that creates
+    // the work turn (inside this `else`). On a reconciler re-run the last turn is
+    // already an agent turn, so the whole block is skipped — no duplicate turns.
+    if (supervised.length > 0) {
+      await recordSupervisedTurns(storage, session.id, supervised, worktreePath);
+    }
   }
 
-  // Accumulate token usage into session totals
-  if (turnUsage) {
+  // Accumulate token usage into session totals — sum EVERY invocation's usage
+  // (work + each supervised follow-up), so per-turn token costs roll up fully.
+  for (const resp of responses) {
+    const usage = toTurnUsage(resp.usage);
+    if (!usage) continue;
     try {
-      await storage.updateSessionUsage(session.id, turnUsage);
+      await storage.updateSessionUsage(session.id, usage);
     } catch {
       logger.debug(`Task ${taskShortId}: could not capture token usage`);
     }
@@ -548,8 +878,13 @@ async function handleCompletedResponse(
     logger.debug(`Task ${taskShortId}: could not capture uncommitted changes`);
   }
 
-  // Transition to blocked (or conflict if there are file permission violations)
-  const nextStatus = (response.violations && response.violations.length > 0) ? 'conflict' : 'blocked';
+  // Transition to blocked (or conflict if file permission violations REMAIN).
+  // Read the FINAL violation set: the last invocation that re-detected them owns
+  // the truth. The push-back response carries an explicit (possibly empty) array,
+  // so a resolved push-back ([]) correctly yields 'blocked' rather than falling
+  // back to the work response's stale pre-push-back set.
+  const finalViolations = [...responses].reverse().find(r => r.violations !== undefined)?.violations ?? [];
+  const nextStatus = finalViolations.length > 0 ? 'conflict' : 'blocked';
   await storage.updateTaskStatus(taskId, nextStatus, 'system');
 
   // pending_sync is managed by the daemon sync retry loop (src/daemon/sync-retry.ts).
@@ -693,7 +1028,7 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
 
       if (response.status === 'completed') {
         logger.debug(`Task ${taskShortId}: found stale completed response for interrupted task, processing`);
-        await handleCompletedResponse(storage, task.id, session, response, worktreePath, protoDir);
+        await handleCompletedResponses(storage, task.id, session, completedResponses(response), worktreePath, protoDir);
       } else {
         // Error response on an already-interrupted task — record the error turn
         logger.debug(`Task ${taskShortId}: found stale error response for interrupted task, recording`);
@@ -809,6 +1144,25 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
       const reparentMsg = formatReparentWarning(reparented, task);
       if (reparentMsg) {
         logger.info(`${reparentMsg} of ${shortIdHelper(task.id)}.`);
+      }
+
+      // Tear down the worktree and delete the LOCAL task branch. The original
+      // accept crashed before its own cleanup ran (that's why this is a zombie),
+      // so without this the task is finalized to `complete` while its worktree
+      // and `lazy/...` branch are left behind forever — the exact leak this
+      // fixes. Safe-deletion holds: the accept tag (gated on above) proves the
+      // merge landed. LOCAL branch only — cleanupWorktreeAndBranch never touches
+      // the remote ref. Dynamic import avoids a top-level cycle with the heavy
+      // cli/commands/shared graph (reconcile is loaded by list/blocked paths).
+      try {
+        const { cleanupWorktreeAndBranch, cleanupTaskContainer } = await import('../cli/commands/shared');
+        await cleanupTaskContainer(storage, session, taskRef(task), lazyRoot);
+        const worktreePath = getWorktreePathForRef(lazyRoot, taskRef(task));
+        await removeLock(worktreePath);
+        await cleanupWorktreeAndBranch(worktreePath, session.git_branch, lazyRoot, storage, task.id, session.agent_session_id);
+        removeProtocolDir(getProtocolDir(task.id));
+      } catch (err) {
+        logger.warn(`Cleanup after zombie-accept recovery failed for task ${taskShortId}: ${err instanceof Error ? err.message : err}`);
       }
     } catch (err) {
       logger.debug(`Failed to check merged branch for task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
@@ -926,5 +1280,75 @@ export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: stri
     }
   } catch (err) {
     logger.debug(`Failed to list backlog tasks for recovery: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
+ * Recover tasks stranded in `working` whose turn was never finalized into
+ * storage. This is the durable, restart-surviving net for the bug where a
+ * completed agent session leaves real committed work on the branch but the
+ * supervisor never produced a processable response, so the task wedges in
+ * `working` forever (zero agent turns, zero recorded commits, no blocked
+ * transition, no notification).
+ *
+ * `reconcileTask` (the primary working sweep) already attempts this recovery
+ * inline. This sweep is defense-in-depth: it catches `working` tasks that
+ * reconcileTask skipped (transient lock) or threw on, re-checking liveness from
+ * scratch rather than relying on in-memory diffs.
+ *
+ * Safety: a task is acted on ONLY when its run is genuinely not alive — a live
+ * run may still be finalizing the turn (post-turn check/sync, pushback) before
+ * the supervisor writes response.json, and only that response finalizes a turn.
+ * recoverStrandedCompletion then gates on real committed work AND refuses while
+ * the recorded phase shows active harness work, so a live or just-started agent
+ * is never disturbed.
+ */
+export async function recoverStrandedWorkingTasks(
+  storage: Storage,
+  lazyRoot: string,
+  runner: Runner,
+): Promise<void> {
+  const workingTasks = await storage.listTasksWithOptions({ workingOnly: true });
+
+  for (const task of workingTasks) {
+    try {
+      const session = await storage.getSessionByTaskId(task.id);
+      if (!session) continue;
+
+      const tRef = taskRef(task);
+      const taskShortId = shortId(task.id);
+      const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
+
+      // Don't touch tasks another process owns, or a human is pairing on.
+      if (await checkLock(worktreePath)) continue;
+      if (checkPairingLock(worktreePath)) continue;
+
+      // Respect the startup grace period — a container/process that just launched
+      // may not register as running yet, and has no work to recover regardless.
+      if (session.last_interaction_at) {
+        const elapsed = Date.now() - new Date(session.last_interaction_at).getTime();
+        if (elapsed >= 0 && elapsed < getWorkingGracePeriodMs()) continue;
+      }
+
+      const protoDir = getProtocolDir(task.id);
+      // A pending response means the primary path will finalize it normally.
+      if (readResponse(protoDir)) continue;
+
+      const containerName = session.container_name ?? runner.runNameForTask(tRef);
+      // Liveness is authoritative: only recover a run that is genuinely dead.
+      // A live run may still be finalizing — leave it for the normal path.
+      if (await runner.isRunning(containerName)) continue;
+
+      const recovered = await recoverStrandedCompletion(storage, task.id, session, worktreePath, protoDir);
+      if (recovered) {
+        await storage.updateSessionContainerName(session.id, null);
+        if (await runner.runExists(containerName)) {
+          await runner.removeRun(containerName);
+        }
+        logger.info(`Task ${taskShortId}: recovered stranded 'working' task to 'blocked' (commits backfilled).`);
+      }
+    } catch (err) {
+      logger.debug(`Failed stranded-working recovery for ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+    }
   }
 }

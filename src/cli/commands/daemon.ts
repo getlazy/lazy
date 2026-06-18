@@ -29,6 +29,7 @@ import {
   blockingFlock,
   cleanupStaleFiles,
   getSocketPath,
+  formatDashboardUrl,
 } from '../../daemon';
 import { startDaemonBackground } from '../../daemon/auto-start';
 import { assertDaemonCredentials } from '../../daemon/credential-gate';
@@ -102,7 +103,7 @@ async function daemonStart(args: string[]): Promise<void> {
     console.log(`Socket: ${daemon.socketPath}`);
     console.log(`Token:  ${daemon.token.substring(0, 8)}...`);
     if (daemon.webPort) {
-      console.log(`Web:    http://localhost:${daemon.webPort}`);
+      console.log(`Web:    ${formatDashboardUrl(daemon.bindHost, daemon.webPort)}`);
     }
     console.log('Press Ctrl+C to stop.');
 
@@ -127,7 +128,7 @@ async function daemonStart(args: string[]): Promise<void> {
     console.log(`Daemon started (PID ${status.pid})`);
     console.log(`Socket: ${getSocketPath(projectRoot)}`);
     if (status.webPort) {
-      console.log(`Web:    http://localhost:${status.webPort}`);
+      console.log(`Web:    ${formatDashboardUrl(status.bindHost, status.webPort)}`);
     }
   }
 }
@@ -200,7 +201,7 @@ async function daemonStatus(args: string[]): Promise<void> {
     console.log(`  PID:     ${status.pid}`);
     console.log(`  Socket:  ${status.socketPath}`);
     if (status.webPort) {
-      console.log(`  Web:     http://localhost:${status.webPort}`);
+      console.log(`  Web:     ${formatDashboardUrl(status.bindHost, status.webPort)}`);
     } else {
       // INVARIANT: always surface the web-port state. Post-fix, the daemon
       // refuses to start when web binding fails, so this branch is only

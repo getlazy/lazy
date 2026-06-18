@@ -39,7 +39,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin', auto_approve: false },
     storage: { backend: 'external', external_path: '' },
-    models: { default: 'claude-opus-4-7' },
+    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,

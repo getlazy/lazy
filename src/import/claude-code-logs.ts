@@ -113,10 +113,21 @@ function getClaudeProjectsDir(): string {
 
 /**
  * Encode a project path as Claude Code does for directory names.
- * Replaces both path separators (/) and dots (.) with dashes.
+ *
+ * Claude Code maps EVERY non-alphanumeric character in the cwd to a single
+ * dash (it does not collapse runs — `/.lazy` becomes `--lazy`, with two dashes).
+ * We must reproduce that exactly: the encoded name is how we locate the
+ * `~/.claude/projects/<encoded>/` directory where session JSONL files live.
+ *
+ * A narrower encoding (e.g. only replacing `/` and `.`) silently diverges for
+ * any path containing `_`, spaces, or other punctuation — the computed
+ * directory then doesn't exist, discovery finds nothing, and the entire
+ * environment captures ZERO conversations. That class of total-loss bug is
+ * exactly what this must avoid, so keep this in lockstep with Claude Code's
+ * own cwd→dirname encoding.
  */
 export function encodeProjectPath(projectPath: string): string {
-  return '-' + projectPath.replace(/[/.]/g, '-').replace(/^-/, '');
+  return '-' + projectPath.replace(/[^a-zA-Z0-9]/g, '-').replace(/^-+/, '');
 }
 
 /**
@@ -180,6 +191,78 @@ export async function discoverAllProjectSessions(repoRootPath: string): Promise<
     }
   } catch {
     // Projects directory doesn't exist
+  }
+
+  return results;
+}
+
+/** A discovered session JSONL file plus the stat info needed to detect changes. */
+export interface SessionFileInfo {
+  /** Encoded project directory name (e.g. "-Users-foo-prg-myproject"). */
+  projectPath: string;
+  /** Session UUID (the JSONL filename without extension). */
+  sessionId: string;
+  /** Absolute path to the JSONL file. */
+  filePath: string;
+  /** Last-modified time in ms. */
+  mtimeMs: number;
+  /** File size in bytes. */
+  size: number;
+}
+
+/**
+ * Discover every Claude Code session JSONL file for a project, with stat info.
+ *
+ * Like {@link discoverAllProjectSessions} this prefix-matches encoded project
+ * directories (so worktrees with diverging paths are still found), but it also
+ * returns each file's mtime and size so callers can detect which files are new
+ * or modified across a session — the basis for capturing ALL segments of a
+ * builder run (Claude opens a fresh JSONL on /clear, compaction, and resume),
+ * not just one.
+ */
+export async function discoverProjectSessionFiles(repoRootPath: string): Promise<SessionFileInfo[]> {
+  const projectsDir = getClaudeProjectsDir();
+  const encodedPrefix = encodeProjectPath(repoRootPath);
+
+  const results: SessionFileInfo[] = [];
+
+  let projectDirs: string[];
+  try {
+    projectDirs = await readdir(projectsDir);
+  } catch {
+    // Projects directory doesn't exist yet — no sessions.
+    return results;
+  }
+
+  for (const dir of projectDirs) {
+    if (!dir.startsWith(encodedPrefix)) continue;
+
+    const fullDir = join(projectsDir, dir);
+    try {
+      const dirStat = await stat(fullDir);
+      if (!dirStat.isDirectory()) continue;
+
+      const entries = await readdir(fullDir);
+      for (const entry of entries) {
+        if (!entry.endsWith('.jsonl')) continue;
+        const filePath = join(fullDir, entry);
+        try {
+          const fileStat = await stat(filePath);
+          if (!fileStat.isFile()) continue;
+          results.push({
+            projectPath: dir,
+            sessionId: basename(entry, '.jsonl'),
+            filePath,
+            mtimeMs: fileStat.mtimeMs,
+            size: fileStat.size,
+          });
+        } catch {
+          // File vanished between readdir and stat — skip it.
+        }
+      }
+    } catch {
+      // Directory vanished or is inaccessible — skip it.
+    }
   }
 
   return results;

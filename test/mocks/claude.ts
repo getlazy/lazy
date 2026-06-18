@@ -311,28 +311,40 @@ export async function launchSupervisorAsync(
   };
   writeFileSync(join(protocolDir, 'status.json'), JSON.stringify(status, null, 2));
 
+  // Per-invocation responses for the bundle. responses[0] is the WORK response;
+  // supervised follow-ups (push-back, maintain) append after it as FULL responses
+  // with their own SHA window + usage (incl. cache) + (for push-back) violation set.
+  // Mirrors src/supervisor/index.ts. Synthetic non-zero cache tokens on supervised
+  // responses let tests assert cache usage lands per supervised turn.
+  const supervised: Array<Record<string, unknown>> = [];
+  const SUPERVISED_USAGE = {
+    input_tokens: 50, output_tokens: 20,
+    cache_creation_input_tokens: 30, cache_read_input_tokens: 40,
+  };
+  let lastSha = postWorkSha;
+  // Final remaining violations across the exchange (set by push-back re-detection).
+  let finalViolations: Array<{ file: string; base_sha: string; status: string }> = [];
+  let pushbackTriggered = false;
+
   // Detect file permission violations (same logic as real supervisor).
   // Read protected_patterns from command.json (written by the host before launching us).
-  let violations: Array<{ file: string; base_sha: string; status: string }> | undefined;
   try {
     const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
     const commandPath = join(protocolDir, 'command.json');
     if (existsFs(commandPath)) {
       const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
       const patterns = cmd.protected_patterns as string[] | undefined;
-      const branchPointSha = cmd.branch_point_sha as string | undefined;
       if (patterns && patterns.length > 0 && preTurnSha !== 'unknown' && postWorkSha && preTurnSha !== postWorkSha) {
         const { detectViolations } = await import('../../src/supervisor/permissions');
         const detected = await detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
         if (detected.length > 0) {
+          pushbackTriggered = true;
           // Simulate push-back: give the agent one chance to self-correct.
-          // LAZY_MOCK_PUSHBACK_REVERTS: JSON array of file paths the agent "reverts" during push-back.
-
+          // LAZY_MOCK_PUSHBACK_REVERTS: JSON array of file paths the agent "reverts".
           const pushbackReverts = process.env.LAZY_MOCK_PUSHBACK_REVERTS;
           if (pushbackReverts) {
             const revertFiles = JSON.parse(pushbackReverts) as string[];
             for (const filePath of revertFiles) {
-              // Revert file to its state at preTurnSha
               Bun.spawnSync(['git', 'checkout', preTurnSha, '--', filePath], { cwd: sandbox.worktreePath });
             }
             if (revertFiles.length > 0) {
@@ -340,7 +352,7 @@ export async function launchSupervisorAsync(
             }
           }
 
-          // Re-detect violations after push-back (agent may have reverted some files)
+          // Re-detect violations after push-back (agent may have reverted some files).
           const postPushbackShaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
             cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
           });
@@ -348,17 +360,74 @@ export async function launchSupervisorAsync(
             ? postPushbackShaResult.stdout.toString().trim()
             : postWorkSha;
 
-          // Update post_work_sha in status
-          status.post_work_sha = postPushbackSha;
-          writeFileSync(join(protocolDir, 'status.json'), JSON.stringify(status, null, 2));
+          // INVARIANT: status.post_work_sha stays pinned at the WORK end — NOT
+          // advanced past push-back commits (no double-count on the work turn).
+          finalViolations = await detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
 
-          const remaining = await detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
-          violations = remaining.length > 0 ? remaining : undefined;
+          // The push-back is a FULL response: its own SHA window + usage + the
+          // FINAL violation set (empty array when resolved). LAZY_MOCK_PUSHBACK_RESPONSE
+          // supplies the agent's justification text.
+          const pushbackResponse = process.env.LAZY_MOCK_PUSHBACK_RESPONSE
+            ?? 'Mock agent: reviewed the protected-file changes.';
+          supervised.push({
+            status: 'completed',
+            result: pushbackResponse,
+            session_id: 'mock-sess-pushback',
+            usage: { ...SUPERVISED_USAGE },
+            start_sha_work: lastSha,
+            end_sha_work: postPushbackSha,
+            violations: finalViolations,
+            supervised: { kind: 'permission_pushback', prompt: 'Mock push-back prompt: you modified protected file(s). Revert or justify.' },
+          });
+          lastSha = postPushbackSha;
         }
       }
     }
   } catch {
     // Non-fatal: skip violation detection if it fails in tests
+  }
+
+  // Maintained-file skip check (mirrors src/supervisor/index.ts).
+  // PRECEDENCE INVARIANT (maintain-nudge-violation-precedence): the maintain nudge
+  // runs AFTER the push-back exchange and is INDEPENDENT of its outcome — it is NOT
+  // gated on `finalViolations.length === 0`. It appends after the push-back response
+  // (start_sha_work = lastSha, which advanced to the post-push-back SHA) and never
+  // re-triggers push-back (push-back is single-shot above). The maintain response
+  // carries NO `violations` field, so the reconciler's final-violation lookup still
+  // reads the push-back set and a still-violating turn stays `conflict`.
+  try {
+    const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
+    const commandPath = join(protocolDir, 'command.json');
+    if (existsFs(commandPath)) {
+      const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
+      const maintain = cmd.maintain as Array<{ title: string; pattern: string; instructions: string }> | undefined;
+      if (maintain && maintain.length > 0 && preTurnSha !== 'unknown') {
+        const currentShaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+          cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+        });
+        const currentSha = currentShaResult.exitCode === 0
+          ? currentShaResult.stdout.toString().trim()
+          : preTurnSha;
+        const { detectSkippedMaintainEntries } = await import('../../src/supervisor/maintain');
+        const { skipped } = await detectSkippedMaintainEntries(sandbox.worktreePath, preTurnSha, currentSha, maintain);
+        if (skipped.length > 0) {
+          const response = process.env.LAZY_MOCK_MAINTAIN_RESPONSE
+            ?? 'Mock agent: reviewed the skipped maintained files.';
+          supervised.push({
+            status: 'completed',
+            result: response,
+            session_id: 'mock-sess-maintain',
+            usage: { ...SUPERVISED_USAGE },
+            start_sha_work: lastSha,
+            end_sha_work: currentSha,
+            supervised: { kind: 'maintain', prompt: `Mock maintain nudge: you skipped ${skipped.map(s => s.title).join(', ')}. Update or justify.` },
+          });
+          lastSha = currentSha;
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: skip maintained-file check if it fails in tests
   }
 
   // Post-turn check: if the command has post_turn_check, run it and capture result
@@ -386,27 +455,25 @@ export async function launchSupervisorAsync(
     // Non-fatal: skip check execution if it fails in tests
   }
 
-  // Write a mock response to the protocol directory so reconciliation picks it up.
-  // Violations are stored in the structured field — NOT prepended to resultText.
-  // The pushback response IS appended so reviewers can see the agent's justification.
+  // Build the completed bundle: work response (clean) + supervised follow-ups.
+  // The work response carries turn-level outputs (post-turn check) and `pushed_back`
+  // metadata but NOT violations — those live on the push-back response.
   const mockResp = getMockResponse();
-
-  let resultText = mockResp.result;
-  const pushbackResponse = process.env.LAZY_MOCK_PUSHBACK_RESPONSE;
-  if (pushbackResponse) {
-    resultText += '\n\n---\n\n## Permission Violation Review\n\n' + pushbackResponse;
-  }
-
-  const response: Record<string, unknown> = {
+  const workResponse: Record<string, unknown> = {
     status: 'completed',
-    result: resultText,
+    result: mockResp.result,
     session_id: mockResp.session_id,
     usage: mockResp.usage,
-    ...(violations ? { violations, pushed_back: true } : {}),
+    ...(pushbackTriggered ? { pushed_back: true } : {}),
     ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
     ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
   };
-  writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));
+
+  const bundle: Record<string, unknown> = {
+    status: 'completed',
+    responses: [workResponse, ...supervised],
+  };
+  writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(bundle, null, 2));
 }
 
 // --- Container management ---

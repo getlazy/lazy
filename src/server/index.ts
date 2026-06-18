@@ -740,11 +740,17 @@ export function createWebRequestHandler(storage: Storage): (req: Request) => Pro
 /**
  * Try to bind an HTTP server to a TCP port with auto-increment on conflict.
  * Returns the server instance, or null if all ports were exhausted.
+ *
+ * `hostname` is the network interface to bind to. It defaults to loopback
+ * ('127.0.0.1') so the daemon's unauthenticated dashboard and the /mcp + /rpc
+ * endpoints are NOT reachable from other machines. Callers wanting LAN/remote
+ * access must pass an explicit interface (e.g. '0.0.0.0').
  */
 export function tryBindTcpPort(
   port: number,
   handler: (req: Request) => Promise<Response>,
   maxAttempts: number = MAX_PORT_ATTEMPTS,
+  hostname: string = '127.0.0.1',
 ): { server: ReturnType<typeof Bun.serve>; lastError: unknown } | null {
   let lastError: unknown = null;
 
@@ -752,6 +758,7 @@ export function tryBindTcpPort(
     const tryPort = port + attempt;
     try {
       const server = Bun.serve({
+        hostname,
         port: tryPort,
         fetch: handler,
         idleTimeout: 120,

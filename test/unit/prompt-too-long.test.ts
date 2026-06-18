@@ -8,8 +8,12 @@
 import { describe, test, expect } from 'bun:test';
 import { runWork, CrashError, type WorkResult, type RetryState } from '../../src/supervisor/work';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
+import { createRunnerFromType } from '../../src/runner';
 
 const agent = new ClaudeCodeAgent();
+// These tests inject _executeOverride, so the runner is never consulted for
+// session-log discovery — any runner instance satisfies the signature.
+const runner = createRunnerFromType('dangerously-host-process-without-any-isolation');
 
 const MOCK_SUCCESS: WorkResult = {
   result: 'Task completed successfully',
@@ -70,6 +74,7 @@ describe('runWork prompt-too-long handling', () => {
     const retryStates: (RetryState | null)[] = [];
     const result = await runWork(
       agent,
+      runner,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -112,6 +117,7 @@ describe('runWork prompt-too-long handling', () => {
     await expect(
       runWork(
         agent,
+        runner,
         '/tmp/test',
         'Do the work',
         undefined,  // systemPrompt
@@ -152,6 +158,7 @@ describe('runWork prompt-too-long handling', () => {
     const retryStates: (RetryState | null)[] = [];
     const result = await runWork(
       agent,
+      runner,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -187,6 +194,7 @@ describe('runWork prompt-too-long handling', () => {
     const retryStates: (RetryState | null)[] = [];
     await runWork(
       agent,
+      runner,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -225,6 +233,7 @@ describe('runWork prompt-too-long handling', () => {
 
     await runWork(
       agent,
+      runner,
       '/tmp/test',
       'Do the work',
       undefined,  // systemPrompt
@@ -258,6 +267,7 @@ describe('runWork prompt-too-long handling', () => {
     await expect(
       runWork(
         agent,
+        runner,
         '/tmp/test',
         'Do the work',
         undefined,  // systemPrompt

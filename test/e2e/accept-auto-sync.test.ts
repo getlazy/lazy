@@ -2,13 +2,20 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
+import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
- * Tests for accept auto-sync behavior when the GitHub driver is configured
- * but the task has no PR yet. Verifies that accept attempts to push and
- * create a PR automatically instead of failing with a misleading error.
+ * Tests for accept behavior when the GitHub driver is configured but the task
+ * has no PR yet.
+ *
+ * NOTE: Since `fix-mr-targets-main`, merges into an UNPROTECTED target (which
+ * includes `main` when the remote has no branch-protection rules — exactly the
+ * case here, where the bare file-path remote has no protection) are LOCAL squash
+ * merges and NEVER open a PR/MR. Since `fix-push-after-local-merge`, that local
+ * merge also pushes the parent branch to origin. So these tests assert: accept
+ * SUCCEEDS via a local merge, opens NO PR, and keeps origin in lockstep — not the
+ * old (pre-routing) behavior of auto-creating a PR.
  */
 describe('lazy accept auto-sync', () => {
   let ctx: TestContext;
@@ -62,7 +69,11 @@ describe('lazy accept auto-sync', () => {
     }
   }
 
-  test('accept with github driver auto-syncs when no PR exists', async () => {
+  // INVARIANT (fix-mr-targets-main + fix-push-after-local-merge): merging into an
+  // UNPROTECTED `main` is a LOCAL squash merge that opens NO PR and pushes the
+  // merged branch to origin. Accept must SUCCEED — it must NOT fail trying to
+  // create a PR (the pre-routing behavior).
+  test('accept with github driver into unprotected main does a local merge (no PR)', async () => {
     // 1. Create and start a task (with local driver first, so start works)
     const taskId = await createTask(ctx, 'Auto-sync test', 'Add a file');
 
@@ -91,28 +102,23 @@ describe('lazy accept auto-sync', () => {
     // 3. Switch to GitHub driver (task has no PR in metadata)
     switchToGitHubDriver();
 
-    // 4. Try to accept — should attempt auto-sync instead of old error
+    // 4. Accept — unprotected main → local merge + push, never a PR.
     const acceptResult = await ctx.lazy(['accept', taskId]);
+    expectSuccess(acceptResult);
 
-    // The auto-sync will push (succeeds with bare remote) but PR creation
-    // fails (no real GitHub / gh CLI). The accept should fail gracefully.
-    expectFailure(acceptResult);
-
-    // INVARIANT: Auto-sync MUST be attempted — the error must indicate the
-    // branch was pushed before PR creation failed. If this assertion fails
-    // because the message moved out of stderr, check that auto-sync still
-    // happens (don't drop the assertion: it's the entire point of the test).
-    expectError(acceptResult, 'was pushed');
-    expectError(acceptResult, 'PR creation failed');
-
+    // No PR was created and no auto-sync PR path ran.
+    expect(acceptResult.stderr).not.toContain('PR creation failed');
+    expect(acceptResult.stdout).not.toContain('No remote reference found');
     // Should NOT show the old misleading "start the task" message
     expect(acceptResult.stderr).not.toContain('start the task to push the branch');
     expect(acceptResult.stderr).not.toContain('lazy start');
   });
 
-  test('accept auto-sync failure shows correct error message', async () => {
+  // INVARIANT (fix-push-after-local-merge): the local merge into unprotected main
+  // pushes the merged branch to origin, so local and origin stay in lockstep.
+  test('accept into unprotected main pushes the merge to origin (no divergence)', async () => {
     // 1. Create and start a task
-    const taskId = await createTask(ctx, 'Error msg test', 'Add a file');
+    const taskId = await createTask(ctx, 'No-divergence test', 'Add a file');
 
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -135,21 +141,15 @@ describe('lazy accept auto-sync', () => {
 
     // 3. Switch to GitHub driver (with bare remote for push)
     switchToGitHubDriver();
+    const bareRemotePath = join(ctx.root, '.test-remote.git');
 
-    // 4. Accept should fail with the new accurate error message
+    // 4. Accept should succeed and leave origin/main == local main.
     const acceptResult = await ctx.lazy(['accept', taskId]);
-    expectFailure(acceptResult);
+    expectSuccess(acceptResult);
 
-    // INVARIANT: Error message must be accurate — must mention that PR
-    // creation failed (the actual root cause), NOT the old misleading
-    // "start the task" message. The post-daemon-refactor error wording is
-    // "Branch X was pushed, but PR creation failed: <gh error>".
-    expectError(acceptResult, 'PR creation failed');
-
-    // Should NOT contain the old misleading messages
-    expect(acceptResult.stdout).not.toContain('Or start the task');
-    expect(acceptResult.stderr).not.toContain('Or start the task');
-    expect(acceptResult.stderr).not.toContain('lazy start');
+    const localMain = ctx.git('rev-parse', 'main').stdout.trim();
+    const originMain = ctx.git('--git-dir', bareRemotePath, 'rev-parse', 'main').stdout.trim();
+    expect(originMain).toBe(localMain);
   });
 
   test('accept with local driver still works (no auto-sync needed)', async () => {

@@ -13,6 +13,7 @@ import {
 import { theme } from '../theme';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { loadConfig } from '../../config/loader';
+import { resolveRoleTarget, preflightRoleTarget, targetEnvVars, anthropicEnvVarsFromProcess } from '../../utils/role-target';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { logger } from '../../utils/logger';
 import { spawnSync } from '../../utils/spawn';
@@ -126,10 +127,14 @@ export async function commandChat(args: string[]): Promise<void> {
       '--effort', effort,
     ];
 
+    // Resolve the builder-role target (chat is an interactive builder session).
     const config = await loadConfig(root);
-    if (config.ollama.enabled && config.ollama.model) {
-      claudeArgs.push('--model', config.ollama.model);
+    const chatTarget = resolveRoleTarget('builder', config);
+    await preflightRoleTarget('builder', chatTarget);
+    if (chatTarget.model) {
+      claudeArgs.push('--model', chatTarget.model);
     }
+    const chatEnvVars = targetEnvVars(chatTarget, anthropicEnvVarsFromProcess());
 
     let exitCode = 0;
     try {
@@ -142,6 +147,7 @@ export async function commandChat(args: string[]): Promise<void> {
         stderr: 'inherit',
         env: {
           ...process.env,
+          ...Object.fromEntries(chatEnvVars.map(v => [v.key, v.value])),
           LAZY_TASK: taskShortId,
         },
       });

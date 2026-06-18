@@ -8,9 +8,9 @@ import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
-import type { OllamaConfig } from '../config/types';
+import type { RoleTarget } from '../config/types';
+import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET } from '../utils/role-target';
 import { logger } from '../utils/logger';
-import { getEffectiveModel } from '../utils/ollama';
 import { isOfflineMode } from '../utils/offline';
 import { spawn, spawnSync } from '../utils/spawn';
 import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
@@ -570,26 +570,25 @@ export function hasAuthEnv(): boolean {
 export type { OllamaConfig } from '../config/types';
 
 /**
- * Get auth environment variables.
- * When Ollama is configured, returns env vars for Ollama instead of Anthropic API auth.
- * Delegates to ClaudeCodeAgent.getAuthEnvVars() for standard auth.
+ * Get auth environment variables for a resolved role target.
+ *
+ * - ollama: self-contained dummy credentials + base URL + stability flags.
+ * - proxy:  base URL override forwarded with the real Anthropic credential.
+ * - anthropic (or no target): the real Anthropic credential (throws if absent,
+ *   via ClaudeCodeAgent.getAuthEnvVars()).
  */
-export function getAuthEnvVars(ollamaConfig?: OllamaConfig): Array<{ key: string; value: string }> {
-  if (ollamaConfig?.enabled) {
-    return [
-      { key: 'ANTHROPIC_BASE_URL', value: ollamaConfig.endpoint },
-      { key: 'ANTHROPIC_AUTH_TOKEN', value: 'ollama' },
-      { key: 'ANTHROPIC_API_KEY', value: 'ollama' },
-      { key: 'DISABLE_TELEMETRY', value: '1' },
-      { key: 'DISABLE_ERROR_REPORTING', value: '1' },
-      { key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', value: '1' },
-    ];
+export function getAuthEnvVars(target?: RoleTarget): Array<{ key: string; value: string }> {
+  const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
+  if (resolved.backend === 'ollama') {
+    // Ollama is self-contained — no real credential needed.
+    return targetEnvVars(resolved, []);
   }
-  return _agent.getAuthEnvVars();
+  // anthropic / proxy: forward the real credential (throwing if absent).
+  return targetEnvVars(resolved, _agent.getAuthEnvVars());
 }
 
-function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', ollamaConfig?: OllamaConfig): string[] {
-  const authEnvVars = getAuthEnvVars(ollamaConfig);
+function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', target?: RoleTarget): string[] {
+  const authEnvVars = getAuthEnvVars(target);
   const repoRoot = getLazyRoot();
 
   return [
@@ -620,7 +619,7 @@ export async function runClaude(
   debug: boolean = false,
   model?: string,
   binary: string = 'docker',
-  ollamaConfig?: OllamaConfig,
+  target?: RoleTarget,
   effort?: string,
 ): Promise<AgentResponse> {
   const [imageName, agentBinaryPath] = await Promise.all([
@@ -628,7 +627,10 @@ export async function runClaude(
     ensureAgentBinary(),
   ]);
 
-  const effectiveModel = getEffectiveModel(model, ollamaConfig);
+  // The caller's decision site resolves the model; for a local backend fall back
+  // to the target's authoritative model if no explicit model was passed.
+  const effectiveModel =
+    model ?? (target && target.backend !== 'anthropic' ? target.model : undefined);
 
   const claudeArgs = [
     'claude', '-p', prompt,
@@ -645,7 +647,7 @@ export async function runClaude(
   }
 
   logger.debug('Setting up sandbox...');
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, ollamaConfig);
+  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, target);
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -968,14 +970,14 @@ export async function launchSupervisorAsync(
   debug: boolean = false,
   binary: string = 'docker',
   daemonConfigPath?: string,
-  ollamaConfig?: OllamaConfig,
+  target?: RoleTarget,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
-  const authEnvVars = getAuthEnvVars(ollamaConfig);
+  const authEnvVars = getAuthEnvVars(target);
   const repoRoot = getLazyRoot();
 
   const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);

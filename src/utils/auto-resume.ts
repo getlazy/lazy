@@ -15,6 +15,7 @@ import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
 import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
 import { loadConfig } from '../config/loader';
+import { resolveAgentModel } from './role-target';
 import { createRunner } from '../runner';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
@@ -155,11 +156,12 @@ export async function autoResumeTask(
     const sandbox = await setupSandbox(worktreePath);
     const sandboxPath = sandbox.sandboxPath;
 
-    // When Ollama is enabled for Claude Code, always use the Ollama model — task model
-    // names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
-    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
-      ? config.ollama.model
-      : (task.model ?? config.models.default);
+    // Per-role model resolution: a local backend (ollama/proxy) forces its
+    // authoritative model; otherwise task.model > default.
+    const modelName = resolveAgentModel(config, {
+      preferredModel: task.model,
+      agentId: task.agent_id,
+    });
     const modelId = modelName;
 
     // Try to find Claude session ID

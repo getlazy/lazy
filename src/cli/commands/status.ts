@@ -12,6 +12,10 @@ import { theme } from '../theme';
 import { loadConfig } from '../../config/loader';
 import { parentTaskIdOf } from '../../task-target';
 import { checkLock } from '../../utils/lock';
+import { createRunner } from '../../runner';
+import { protocolDir as getProtocolDir } from '../../protocol';
+import { computeWorkingSubstate, renderWorkingStatus } from '../../utils/working-substate';
+import { logger } from '../../utils/logger';
 import {
   isAutoReactPaused,
   getAutoReactPausedReason,
@@ -42,9 +46,24 @@ export async function commandStatus(args: string[]): Promise<void> {
     // Get session
     const sess = await storage.getSessionByTaskId(task.id);
 
+    // Derive the working substate (agent / harness:<phase> / not-alive) so the
+    // status word distinguishes busy post-turn work from a hung or dead supervisor.
+    let statusText: string = task.status;
+    if (task.status === 'working' && sess) {
+      try {
+        const runner = await createRunner(root);
+        const cn = sess.container_name ?? runner.runNameForTask(taskRef(task));
+        const info = await runner.getRunInfo(cn);
+        const substate = await computeWorkingSubstate(getProtocolDir(task.id), info?.running === true);
+        statusText = renderWorkingStatus(substate);
+      } catch (err) {
+        logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
     console.log(`Task ${theme.taskId(displayId(task))} Status`);
     console.log(`  ${theme.label('Goal:')}   ${task.goal}`);
-    console.log(`  ${theme.label('Status:')} ${theme.status(task.status)}`);
+    console.log(`  ${theme.label('Status:')} ${theme.status(statusText)}`);
 
     const parentId = parentTaskIdOf(task);
     if (parentId) {
@@ -155,7 +174,7 @@ export async function commandStatus(args: string[]): Promise<void> {
     }
 
     // Session status
-    const status = sess.outcome ?? (sess.ended_at ? 'ended' : task.status);
+    const status = sess.outcome ?? (sess.ended_at ? 'ended' : statusText);
     console.log(`\n  ${theme.label('Session status:')} ${theme.status(status)}`);
 
     // Auto-react diagnostics (only for blocked tasks)

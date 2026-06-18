@@ -34,23 +34,24 @@ export async function createRunner(lazyRoot: string): Promise<Runner> {
     );
   }
 
-  // Wire Ollama config into runners so they can inject the right env vars
-  const ollamaConfig = config.ollama.enabled ? config.ollama : undefined;
+  // Wire the per-role model targets into runners so they can inject the right
+  // backend env vars and preflight reachability per role (builder vs agent).
+  const roleTargets = config.models.roles;
 
   switch (config.runner.type) {
     case 'docker': {
       const runner = new DockerRunner('docker', 'docker', undefined, lazyRoot);
-      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      runner.setRoleTargets(roleTargets);
       return runner;
     }
     case 'podman': {
       const runner = new PodmanRunner(undefined, lazyRoot);
-      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      runner.setRoleTargets(roleTargets);
       return runner;
     }
     case 'dangerously-host-process-without-any-isolation': {
       const runner = new HostProcessRunner(lazyRoot);
-      if (ollamaConfig) runner.setOllamaConfig(ollamaConfig);
+      runner.setRoleTargets(roleTargets);
       return runner;
     }
     default:

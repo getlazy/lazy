@@ -418,6 +418,59 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     expectOutput(showAfter, 'complete');
   });
 
+  // REGRESSION: local branches left behind after accept. When the zombie sweep recovers a
+  // crashed accept, it must ALSO tear down the worktree and delete the LOCAL task branch —
+  // exactly the cleanup the crashed accept never reached. Before the fix the sweep flipped
+  // the task to `complete` but left the `lazy/<id>` branch and its worktree behind forever,
+  // which is how ~80 stale local branches accumulated. The remote ref MUST survive: the fix
+  // deletes local branches only.
+  test('zombie-sweep recovery deletes the local branch + worktree but leaves the remote ref untouched', async () => {
+    const taskId = await createTask(ctx, 'Zombie cleanup test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    await runReconcile(ctx.root);
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const branchName = `lazy/${taskId}`;
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+
+    // Stand up a bare remote and push the task branch to it. The fix must delete the
+    // LOCAL branch only — the engineer explicitly wants remote lazy/* refs preserved.
+    expect(ctx.git('init', '--bare', 'remote.git').exitCode).toBe(0);
+    expect(ctx.git('remote', 'add', 'origin', join(ctx.root, 'remote.git')).exitCode).toBe(0);
+    expect(ctx.git('push', 'origin', `${branchName}:${branchName}`).exitCode).toBe(0);
+
+    // Pre-conditions: local branch + worktree present, remote ref present.
+    expect(ctx.git('rev-parse', '--verify', `refs/heads/${branchName}`).exitCode).toBe(0);
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(ctx.git('ls-remote', '--heads', 'origin', branchName).stdout).toContain(branchName);
+
+    // Simulate an accept that merged + tagged but crashed before cleanup: squash-merge into
+    // main and create the authoritative accept tag, but leave the task non-terminal and the
+    // worktree/branch in place (no metadata update, no teardown). Leave the main repo on
+    // `main` so the worktree retains the branch (mirrors the real crash state).
+    ctx.git('checkout', 'main');
+    ctx.git('merge', '--squash', branchName);
+    ctx.git('commit', '-m', `Accept task ${taskId}: Zombie cleanup test`);
+    createAcceptTag(ctx, fullTaskId, 'main');
+
+    // Trigger reconciliation — the sweep recovers the zombie AND runs cleanup.
+    await runReconcile(ctx.root);
+
+    // Task recovered to complete.
+    const showAfter = await ctx.lazy(['show', taskId]);
+    expectSuccess(showAfter);
+    expectOutput(showAfter, 'complete');
+
+    // LOCAL branch deleted and worktree torn down — no leftovers.
+    expect(ctx.git('rev-parse', '--verify', `refs/heads/${branchName}`).exitCode).not.toBe(0);
+    expect(existsSync(worktreePath)).toBe(false);
+
+    // REMOTE ref preserved — the fix must NEVER delete remote lazy/* refs.
+    expect(ctx.git('ls-remote', '--heads', 'origin', branchName).stdout).toContain(branchName);
+  });
+
   // REGRESSION: fast-forward accept path. The remote FF path moves the target ref and
   // produces no "Accept task <id>" commit message, but DOES create the accept tag. The
   // sweep must recover from the tag alone, independent of how the commit was produced.
@@ -640,6 +693,99 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     const showAfter = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfter);
     expectOutput(showAfter, 'complete');
+  });
+});
+
+// ============================================================
+// Section 4b: Stranded working-task recovery
+// ============================================================
+
+describe('reconciliation sweep: stranded working tasks', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // REGRESSION: the reported bug. An agent finished a turn and committed real
+  // work to its branch, but the supervisor never produced a processable response
+  // (crash / kill / hang at finalize). The task must NOT wedge in 'working'
+  // forever with turns/commits unpersisted — the reconciler recovers it to
+  // 'blocked' and backfills the committed work from the branch (git is the
+  // source of truth when storage is empty).
+  test('working task with committed work but no response recovers to blocked + backfills commits', async () => {
+    const taskId = await createTask(ctx, 'Stranded recovery test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+
+    // Simulate the stranded state: the agent committed (start's mock made a real
+    // commit on the branch) but the turn was never finalized — drop the response
+    // so the normal completion path can't run, and leave the task in 'working'.
+    consumeResponse(protoDir);
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+
+    // Pre-condition: no commit recorded yet (the turn was never finalized).
+    const showBefore = await ctx.lazy(['show', taskId]);
+    expectSuccess(showBefore);
+    expectOutput(showBefore, 'working');
+
+    // Reconcile — the stranded-completion recovery should fire.
+    await runReconcile(ctx.root);
+
+    // Recovered to blocked, with the committed work backfilled and visible.
+    const showAfter = await ctx.lazy(['show', taskId]);
+    expectSuccess(showAfter);
+    expectOutput(showAfter, 'blocked');
+
+    // The task now surfaces for review (in `lazy blocked`) — the review loop is restored.
+    const blocked = await ctx.lazy(['blocked']);
+    expectSuccess(blocked);
+    expectOutput(blocked, taskId);
+
+    // Commits were backfilled from the branch (commit_count > 0), so the task is
+    // acceptable. A recovery turn records the lost-finalize gap.
+    const showFull = await ctx.lazy(['show', taskId, '--full']);
+    expectSuccess(showFull);
+    expectOutput(showFull, 'Recovered');
+  });
+
+  // INVARIANT: a working task whose branch has only the --allow-empty init commit
+  // (agent never produced real work) must NOT be "recovered" to blocked — there is
+  // nothing to review. It falls through to interrupted, the same as before.
+  test('working task with no real committed work falls through to interrupted', async () => {
+    const taskId = await createTask(ctx, 'No-work stranded test', 'Do work');
+    // Start WITHOUT LAZY_MOCK_SHOULD_COMMIT — only the empty init commit exists.
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+
+    // Strip any agent commits the mock may have made so the branch is tree-equal
+    // to its base, then strand it in 'working' with no response.
+    const branchName = `lazy/${taskId}`;
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const mergeBase = ctx.git('merge-base', branchName, 'main').stdout.trim();
+    Bun.spawnSync(['git', 'reset', '--hard', mergeBase], { cwd: worktreePath });
+    // Re-create the empty init commit so the branch still exists with a tip.
+    Bun.spawnSync(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: worktreePath });
+
+    consumeResponse(protoDir);
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+
+    await runReconcile(ctx.root);
+
+    // No real work → not recovered to blocked; ends up interrupted (existing behavior).
+    const showAfter = await ctx.lazy(['show', taskId]);
+    expectSuccess(showAfter);
+    expectOutput(showAfter, 'interrupted');
   });
 });
 

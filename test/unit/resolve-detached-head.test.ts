@@ -15,8 +15,11 @@ describe('resolveDetachedHead', () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'lazy-test-detached-'));
-    // Initialize a git repo with a commit
-    spawnSync(['git', 'init'], { cwd: tmpDir });
+    // Initialize a git repo with a commit. Force the initial branch to "master"
+    // so the test is deterministic regardless of the machine's
+    // init.defaultBranch (modern git defaults to "main") — the remote setup
+    // below pushes "master" and sets origin/HEAD to it.
+    spawnSync(['git', 'init', '-b', 'master'], { cwd: tmpDir });
     spawnSync(['git', 'config', 'user.email', 'test@test.com'], { cwd: tmpDir });
     spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: tmpDir });
     spawnSync(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: tmpDir });

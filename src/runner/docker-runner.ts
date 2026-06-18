@@ -8,18 +8,21 @@
 import type { SandboxConfig } from '../capture/claude';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
-import type { RunnerType, OllamaConfig } from '../config/types';
+import type { RunnerType, RoleTarget } from '../config/types';
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
-import { checkOllamaConnectivity } from '../utils/ollama';
+import {
+  checkTargetConnectivity,
+  preflightRoleTarget,
+  ANTHROPIC_DEFAULT_TARGET,
+} from '../utils/role-target';
 
 import {
   checkDocker,
-  getAuthEnvVars,
   ensureImage,
   ensureAgentBinary,
   containerNameForTask,
@@ -34,6 +37,9 @@ import {
 } from '../capture/claude';
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
+import { encodeProjectPath } from '../import/claude-code-logs';
+import { SANDBOX_DIR } from '../utils/sandbox';
+import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
 import dockerAgentInstructions from '../prompts/docker-agent-instructions.md' with { type: 'text' };
 import { writeToolPermissions } from '../mcp/config';
@@ -83,7 +89,7 @@ export class DockerRunner implements Runner {
   protected readonly binary: string;
   private options: DockerRunnerOptions;
   private lazyRoot: string | undefined;
-  protected _ollamaConfig?: OllamaConfig;
+  protected _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
 
   constructor(binary: string = 'docker', type: RunnerType = 'docker', options?: DockerRunnerOptions, lazyRoot?: string) {
     this.binary = binary;
@@ -92,9 +98,19 @@ export class DockerRunner implements Runner {
     this.lazyRoot = lazyRoot;
   }
 
-  /** Set Ollama config for local model inference. */
-  setOllamaConfig(config: OllamaConfig): void {
-    this._ollamaConfig = config;
+  /** Set the per-role model targets (builder vs agent backends). */
+  setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void {
+    this._roleTargets = targets;
+  }
+
+  /** The resolved target for task/supervisor (agent) launches. */
+  protected agentTarget(): RoleTarget {
+    return this._roleTargets?.agent ?? ANTHROPIC_DEFAULT_TARGET;
+  }
+
+  /** The resolved target for builder launches. */
+  protected builderTarget(): RoleTarget {
+    return this._roleTargets?.builder ?? ANTHROPIC_DEFAULT_TARGET;
   }
 
   runDisplayName(runName: string): string {
@@ -108,11 +124,15 @@ export class DockerRunner implements Runner {
     // path that launches containers goes through a daemon that refuses to start
     // without a credential, so a redundant client-side check here would just
     // duplicate (and risk diverging from) that gate.
-    if (this._ollamaConfig?.enabled) {
-      // Log a warning if Ollama is unreachable (don't fail — it might come up later).
-      const check = checkOllamaConnectivity(this._ollamaConfig);
+    // Early, non-fatal warning if a configured local backend looks unreachable.
+    // The fail-hard enforcement happens at launch (preflightRoleTarget); here we
+    // only nudge so the user gets feedback before they kick off a task.
+    for (const role of ['agent', 'builder'] as const) {
+      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
+      if (target.backend === 'anthropic') continue;
+      const check = await checkTargetConnectivity(target);
       if (!check.reachable) {
-        logger.warn(check.reason);
+        logger.warn(`[${role}] ${check.reason}`);
       }
     }
   }
@@ -133,7 +153,10 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     daemonConfigPath?: string,
   ): Promise<void> {
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this._ollamaConfig);
+    // Fail hard before launch if the agent's backend is unreachable — never
+    // silently fall back to a different backend (CLAUDE.md: fail hard).
+    await preflightRoleTarget('agent', this.agentTarget());
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget());
   }
 
   async runClaudeSync(
@@ -143,7 +166,7 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<AgentResponse> {
-    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this._ollamaConfig);
+    return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this.agentTarget());
   }
 
   async isRunning(runName: string): Promise<boolean> {
@@ -277,6 +300,13 @@ export class DockerRunner implements Runner {
     return true;
   }
 
+  agentSessionProjectDir(worktreePath: string): string {
+    // Docker/Podman run Claude with HOME pointed at the in-worktree sandbox,
+    // so its session JSONL lands under <worktree>/.lazy-task-sandbox/.claude.
+    const encoded = encodeProjectPath(worktreePath);
+    return join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encoded);
+  }
+
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
     return agentPackaging.supervisorToolChecks();
   }
@@ -357,13 +387,15 @@ export class DockerRunner implements Runner {
       results.push({ state: 'fail', what: `${name} daemon running`, reason: `${name} is not responsive.` });
     }
 
-    // Check Ollama connectivity when configured
-    if (this._ollamaConfig?.enabled) {
-      const check = checkOllamaConnectivity(this._ollamaConfig);
+    // Check connectivity for any per-role local backend (ollama/proxy).
+    for (const role of ['agent', 'builder'] as const) {
+      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
+      if (target.backend === 'anthropic') continue;
+      const check = await checkTargetConnectivity(target);
       if (check.reachable) {
-        results.push({ state: 'ok', what: `Ollama reachable at ${check.endpoint}` });
+        results.push({ state: 'ok', what: `[${role}] ${target.backend} reachable at ${check.endpoint}` });
       } else {
-        results.push({ state: 'fail', what: 'Ollama reachable', reason: check.reason });
+        results.push({ state: 'fail', what: `[${role}] ${target.backend} reachable`, reason: check.reason });
       }
     }
 
@@ -380,6 +412,44 @@ export class DockerRunner implements Runner {
     return dockerBuilderInstructions;
   }
 
+  /**
+   * Probe whether the in-container `user` can WRITE the per-builder isolation
+   * dir when it's bind-mounted at the same path Claude will use. This is the
+   * faithful test: it runs a throwaway container from the SAME image with NO
+   * `--user` override (so it runs as the image's default `user`, exactly like
+   * the real builder) and tries to create+remove a file under the overlay mount
+   * point. Exit 0 ⇒ writable ⇒ safe to isolate; anything else ⇒ fall back.
+   *
+   * Why a container probe and not a host-side uid check: ownership semantics for
+   * bind mounts depend on the platform (Docker Desktop's VM maps uids, userns
+   * remapping shifts them, Linux-native preserves host uid). Only an actual
+   * write as the container user reflects what Claude will experience. Cost is one
+   * short-lived container (~hundreds of ms) per launch — acceptable for an
+   * interactive command, and the price of never shipping a broken overlay.
+   *
+   * Conservative by design: any error (spawn failure, timeout, non-zero exit)
+   * returns false so we degrade to the shared dir rather than risk a broken run.
+   */
+  private async probeProjectsDirWritable(hostDir: string, imageName: string): Promise<boolean> {
+    try {
+      const probeTarget = '/home/user/.claude/projects/.lazy-write-probe';
+      const proc = spawn(
+        [
+          this.binary, 'run', '--rm', '--init',
+          '-v', `${hostDir}:/home/user/.claude/projects`,
+          imageName,
+          'sh', '-c', `touch ${probeTarget} && rm -f ${probeTarget}`,
+        ],
+        { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+      );
+      const exitCode = await proc.exited;
+      return exitCode === 0;
+    } catch {
+      // Conservative: treat any probe failure as "not writable" → fall back.
+      return false;
+    }
+  }
+
   async launchBuilderInteractive(
     lazyRoot: string,
     systemPrompt: string,
@@ -387,13 +457,23 @@ export class DockerRunner implements Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
+    projectsDir?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
+    // Fail hard before launch if the builder's backend is unreachable.
+    await preflightRoleTarget('builder', this.builderTarget());
+
     const [imageName, agentBinaryPath] = await Promise.all([
       ensureImage(this.binary),
       ensureAgentBinary(),
     ]);
 
-    const authEnvVars = getAuthEnvVars(this._ollamaConfig);
+    // The builder container is launched here by the CLI CLIENT process, not by
+    // the daemon — so it cannot inherit the daemon's environment. Source the
+    // credential from the daemon over RPC instead of from this process's env,
+    // which in a daemon-only-env deployment legitimately has none. (Reading the
+    // client env here was the cause of the spurious "Authentication required"
+    // failure on `lazy builder`.)
+    const authEnvVars = await resolveAuthEnvFromDaemon(this.builderTarget());
 
     // Read the builder config to get port for the container config
     const builderConfig = JSON.parse(readFileSync(builderConfigPath, 'utf-8'));
@@ -469,6 +549,28 @@ export class DockerRunner implements Runner {
     // Mutating tools (create, start, accept, etc.) still require user confirmation.
     await writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
 
+    // Self-healing isolation: only overlay the per-builder projects dir if the
+    // container user can actually WRITE it. This is the one failure mode that
+    // can't be detected host-side: on Linux-native docker a bind mount preserves
+    // host ownership, so the in-container `user` (uid 1000) may be unable to
+    // write a dir created by a host uid that differs (Docker Desktop / userns
+    // remapping make this a non-issue, but we can't assume that). If Claude
+    // started against an unwritable overlay it would fail to create session
+    // JSONL — breaking the builder. So we PROBE first and fall back to the
+    // shared ~/.claude/projects dir (today's behavior) when the probe fails.
+    let useProjectsMount = false;
+    if (projectsDir) {
+      useProjectsMount = await this.probeProjectsDirWritable(projectsDir, imageName);
+      if (!useProjectsMount) {
+        logger.warn(
+          `Per-builder Claude projects isolation is disabled for this run: the container ` +
+          `user could not write the isolation dir (${projectsDir}). Falling back to the ` +
+          `shared ~/.claude/projects dir. Concurrent builders may cross-capture sessions ` +
+          `this run; single-builder /clear-resume is unaffected.`,
+        );
+      }
+    }
+
     // Build container args: launch lazy-agent in builder mode
     // --init provides a proper PID 1 init process (tini/catatonit) that forwards
     // signals and reaps zombies. Required for Podman where conmon doesn't provide
@@ -497,6 +599,14 @@ export class DockerRunner implements Runner {
       // so Claude Code finds them at $HOME/.claude and $HOME/.claude.json without needing
       // to override HOME (which would cause warnings about missing .local/bin).
       '-v', `${getHome()}/.claude:/home/user/.claude`,
+      // Per-builder projects isolation: overlay a dedicated host dir at
+      // ~/.claude/projects (a deeper, more-specific bind than the ~/.claude mount
+      // above, so it shadows only the projects subtree). This gives THIS builder
+      // its own Claude session JSONL dir, so post-/clear session ownership is
+      // evidence-based and concurrent builders never cross-capture. Creds/settings/
+      // .claude.json stay shared via the ~/.claude mount. See projects-isolation.ts.
+      // Gated on the write-probe above so an unwritable overlay never breaks the run.
+      ...(useProjectsMount ? ['-v', `${projectsDir}:/home/user/.claude/projects`] : []),
       // Merged Claude config with MCP server entry (writable — Claude Code updates it on startup)
       '-v', `${mergedConfigFile}:/home/user/.claude.json`,
       // Auth

@@ -7,6 +7,25 @@
 # Options: "sonnet", "opus", "haiku"
 default = "sonnet"
 
+# Per-role model targets (optional). Route the interactive builder and task
+# agents to different backends — backend = "anthropic" | "ollama" | "proxy".
+# All three are Anthropic-native; lazy never translates between API shapes.
+# When set, these override the legacy [ollama] block below for that role.
+#   - ollama/proxy require `model`; proxy also requires `endpoint`.
+#   - ollama defaults `endpoint` to http://host.docker.internal:11434.
+# Lazy preflights each backend before launch and fails with an actionable
+# error if it is unreachable — it never silently falls back to another backend.
+# Example: keep the builder on real Anthropic, run agents on a local Ollama model.
+#
+# [models.roles.builder]
+# backend = "anthropic"
+# model = "claude-opus-4-8"
+#
+# [models.roles.agent]
+# backend = "ollama"
+# model = "qwen3.5:35b-a3b-coding-nvfp4"
+# endpoint = "http://host.docker.internal:11434"
+
 [session]
 # Show Docker output in real-time during session execution
 verbose = false
@@ -115,6 +134,24 @@ dockerfile = ""
 # Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
 protected = ["README.md", "test/**/*.ts"]
 
+[automation]
+# Maintained files — the inverse of [permissions].protected. Patterns agents are
+# *expected* to keep up to date as they work (docs, CHANGELOG, architecture).
+# When a turn's commits touch none of an entry's files, the supervisor prompts
+# the agent once to update them or record why it skipped, before the task blocks
+# for review. A nudge, not a gate. Opt-in: empty by default.
+# Each entry needs title, pattern, and instructions.
+#
+# [[automation.maintain]]
+# title = "docs"
+# pattern = "docs/**/*"
+# instructions = "Update any docs that have gone out of date due to your work, OR create new docs if needed."
+#
+# [[automation.maintain]]
+# title = "changelog"
+# pattern = "CHANGELOG.md"
+# instructions = "Add a line that succinctly describes your work; skip if your work is intra-release."
+
 [checks]
 # Command to run after each agent turn. Output is captured and attached to
 # the turn for reviewers to see. Does NOT block the agent or trigger retries.
@@ -125,6 +162,10 @@ post_turn = "echo all-good >&2"
 post_turn_timeout = 300
 
 [ollama]
+# Legacy local-model config. Kept for backward compatibility: when enabled it
+# maps to "all roles -> ollama" (both the builder and task agents). For finer
+# control — e.g. builder on Anthropic, agents on Ollama — prefer the per-role
+# [models.roles.*] tables above, which override this block for any role they set.
 # enabled = true
 # model = "qwen3.5:35b-a3b-coding-nvfp4"
 # endpoint defaults to http://host.docker.internal:11434 if omitted

@@ -1,21 +1,24 @@
 /**
  * Activity monitor for live agent streaming.
  *
- * Tails Claude Code JSONL session logs from the sandbox directory and
- * formats condensed activity lines showing what the agent is doing:
+ * Tails Claude Code JSONL session logs and formats condensed activity lines
+ * showing what the agent is doing:
  *   - Tool calls (file reads, edits, writes, bash commands)
  *   - Brief summaries of what Claude is thinking/doing
  *
  * Used by followContainer() and the loop polling display to show
  * real-time agent activity instead of raw Docker logs.
+ *
+ * WHERE the session log lives depends on the runner (its HOME differs), so the
+ * monitor asks the runner via `runner.agentSessionProjectDir()` and discovers
+ * the active file with the shared `findLatestSessionFile` helper — no private,
+ * sandbox-only copy of that logic.
  */
 
-import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { readFile, stat } from 'fs/promises';
 import { theme, dim } from './theme';
-import { encodeProjectPath } from '../import/claude-code-logs';
-
-const SANDBOX_DIR = '.lazy-task-sandbox';
+import { findLatestSessionFile } from '../agent/session-discovery';
+import type { Runner } from '../runner/types';
 
 /**
  * Human-readable descriptions for Claude Code tool calls.
@@ -131,14 +134,14 @@ export interface ActivityLine {
  * formatted activity lines.
  *
  * Usage:
- *   const monitor = new ActivityMonitor(worktreePath, taskId);
+ *   const monitor = new ActivityMonitor(runner, worktreePath, taskId);
  *   monitor.start();
  *   // ... poll for activities ...
  *   const lines = monitor.drain();
  *   monitor.stop();
  */
 export class ActivityMonitor {
-  private worktreePath: string;
+  private projectDir: string;
   private taskId: string;
   private turnStartedAt: number;
   private stopped = false;
@@ -146,9 +149,12 @@ export class ActivityMonitor {
   private pendingLines: ActivityLine[] = [];
   private lastFileSize = 0;
   private lastSessionFile: string | null = null;
+  /** Guards against overlapping async polls when one runs longer than the interval. */
+  private polling = false;
 
-  constructor(worktreePath: string, taskId: string, turnStartedAt?: string) {
-    this.worktreePath = worktreePath;
+  constructor(runner: Runner, worktreePath: string, taskId: string, turnStartedAt?: string) {
+    // The runner is authoritative about where its agent writes session logs.
+    this.projectDir = runner.agentSessionProjectDir(worktreePath);
     this.taskId = taskId;
     this.turnStartedAt = turnStartedAt ? new Date(turnStartedAt).getTime() : Date.now();
   }
@@ -157,10 +163,10 @@ export class ActivityMonitor {
   start(pollIntervalMs = 1000): void {
     this.timer = setInterval(() => {
       if (this.stopped) return;
-      this.poll();
+      void this.poll();
     }, pollIntervalMs);
     // Do an immediate poll
-    this.poll();
+    void this.poll();
   }
 
   /** Stop monitoring. */
@@ -202,43 +208,20 @@ export class ActivityMonitor {
     return `[${m}:${s}]`;
   }
 
-  /** Find the most recently modified JSONL file in the sandbox. */
-  private findSessionFile(): string | null {
-    const encodedPath = encodeProjectPath(this.worktreePath);
-    const projectDir = join(this.worktreePath, SANDBOX_DIR, '.claude', 'projects', encodedPath);
-
-    if (!existsSync(projectDir)) return null;
-
-    let latestFile: string | null = null;
-    let latestMtime = 0;
-
-    try {
-      const entries = readdirSync(projectDir);
-      for (const entry of entries) {
-        if (!entry.endsWith('.jsonl')) continue;
-        const fullPath = join(projectDir, entry);
-        try {
-          const st = statSync(fullPath);
-          if (st.mtimeMs > latestMtime) {
-            latestMtime = st.mtimeMs;
-            latestFile = fullPath;
-          }
-        } catch {
-          // Skip
-        }
-      }
-    } catch {
-      // Directory may not exist yet
-    }
-
-    return latestFile;
+  /** Find the most recently modified JSONL file for this runner's project dir. */
+  private async findSessionFile(): Promise<string | null> {
+    const info = await findLatestSessionFile(this.projectDir);
+    return info?.path ?? null;
   }
 
   /** Poll for new JSONL entries and extract activities. */
-  private poll(): void {
+  private async poll(): Promise<void> {
+    // Skip if a previous poll is still in flight (slow disk, large file).
+    if (this.polling) return;
+    this.polling = true;
     try {
       // Find the session file (may change between polls if a new session starts)
-      const sessionFile = this.findSessionFile();
+      const sessionFile = await this.findSessionFile();
       if (!sessionFile) return;
 
       // If we switched to a new file, reset the read position
@@ -250,7 +233,7 @@ export class ActivityMonitor {
       // Check file size to see if there's new content
       let fileSize: number;
       try {
-        fileSize = statSync(sessionFile).size;
+        fileSize = (await stat(sessionFile)).size;
       } catch {
         return;
       }
@@ -259,7 +242,7 @@ export class ActivityMonitor {
 
       // Read the entire file and process only new lines
       // (Reading only the tail is tricky with UTF-8 and partial lines)
-      const content = readFileSync(sessionFile, 'utf-8');
+      const content = await readFile(sessionFile, 'utf-8');
       const lines = content.split('\n');
 
       // Process lines from where we left off (approximate by character count)
@@ -287,6 +270,8 @@ export class ActivityMonitor {
       this.lastFileSize = fileSize;
     } catch {
       // Non-fatal — session logs may not exist yet
+    } finally {
+      this.polling = false;
     }
   }
 }

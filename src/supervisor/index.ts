@@ -61,6 +61,8 @@ import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { detectViolations } from './permissions';
 import { runPermissionPushback } from './pushback';
+import { detectSkippedMaintainEntries, runMaintainFollowup, renderMaintainContext } from './maintain';
+import type { CompletedResponseBundle } from '../protocol/types';
 import { truncateLog } from '../utils/log-truncate';
 
 export interface SupervisorConfig {
@@ -278,7 +280,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   // machinery (sync, merge, violation check, post-turn check) runs — this is
   // a read-only Q&A turn owned end-to-end by the daemon.
   if (command.type === 'ask') {
-    await handleAskCommand(command as AskCommand, config);
+    await handleAskCommand(command as AskCommand, config, runner);
     return;
   }
 
@@ -448,11 +450,19 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       ? (command as UnblockCommand).permission_mode
       : undefined;
 
+    // Up-front maintained-file context: tell the agent which files this project
+    // expects kept up to date (and why) while it works. No-op when unconfigured.
+    const maintainContext = renderMaintainContext(cmd.maintain);
+    const systemPromptForWork = maintainContext
+      ? `${cmd.system_prompt ?? ''}\n\n${maintainContext}`
+      : cmd.system_prompt;
+
     const result = await runWork(
       agent,
+      runner,
       worktreePath,
       cmd.prompt,
-      cmd.system_prompt,
+      systemPromptForWork,
       cmd.model_id,
       claudeSessionId,
       protocolDir,
@@ -509,9 +519,31 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     let violations = await detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns, branchPointSha);
     log(`[supervisor] Violations detected: ${violations.length}`);
 
+    // Supervised follow-up invocations (push-back, maintain nudge). Each is a
+    // SEPARATE `claude -p` invocation and becomes a FULL CompletedResponse in the
+    // bundle — its own commits/SHAs, usage (incl. cache), and (for push-back) its
+    // own re-detected violation set. The work turn's response stays clean; the
+    // reconciler materializes each as a discrete supervisor→agent turn pair.
+    //
+    // INVARIANT: status.post_work_sha stays pinned at the WORK end (postWorkSha)
+    // — it is NOT advanced past supervised commits. That kills the double-count:
+    // the work turn's diff covers only work commits; each supervised response
+    // carries its OWN start/end SHA window so its commits attribute to ITS turn.
+    const supervisedResponses: CompletedResponse[] = [];
+    let lastInvocationSha = postWorkSha;
+    // The session the next supervised invocation resumes from. Starts at the work
+    // session; advances to the push-back session so the maintain nudge continues the
+    // conversation AFTER the push-back exchange rather than branching off the work turn.
+    let lastSessionId = result.session_id;
+    // Whether the push-back exchange ran this command. Tracked explicitly (not derived
+    // from the FINAL violation set) so it stays true even when the agent RESOLVED the
+    // violations. The maintain step reads it to guarantee it never loops back into a
+    // second push-back round.
+    let pushedBack = false;
+
     // Push-back: give the agent one chance to self-correct before blocking
-    let pushbackResponse: string | undefined;
     if (violations.length > 0) {
+      pushedBack = true;
       log(`[supervisor] Detected ${violations.length} file permission violation(s). Pushing back...`);
       updatePhase(status, 'permission_pushback', protocolDir);
 
@@ -523,21 +555,98 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         cmd.model_id,
         cmd.effort,
       );
-      pushbackResponse = pushbackResult.response;
 
-      // Re-check violations on the new HEAD (agent may have reverted some files)
+      // Re-check violations on the new HEAD (agent may have reverted some files).
       const postPushbackSha = await getHeadSha(worktreePath);
       violations = await detectViolations(worktreePath, startShaWork, postPushbackSha, protectedPatterns, branchPointSha);
       log(`[supervisor] After push-back: ${violations.length} violation(s) remaining`);
       updatePhase(status, 'permission_pushback_done', protocolDir);
 
-      // Update the post-work SHA and tag to reflect the push-back
-      if (postPushbackSha !== postWorkSha) {
-        status.post_work_sha = postPushbackSha;
-        writeStatus(protocolDir, status);
+      // The push-back response owns exactly the commits made during ITS invocation
+      // (lastInvocationSha..postPushbackSha) and carries the FINAL violation set
+      // (empty array when the agent resolved them — so the reconciler sees "checked,
+      // none remain" rather than falling back to the work response's stale set).
+      supervisedResponses.push({
+        status: 'completed',
+        result: pushbackResult.response,
+        session_id: pushbackResult.session_id,
+        usage: pushbackResult.usage,
+        start_sha_work: lastInvocationSha,
+        end_sha_work: postPushbackSha,
+        violations,
+        supervised: { kind: 'permission_pushback', prompt: pushbackResult.prompt },
+      });
 
+      if (postPushbackSha !== lastInvocationSha) {
         const pushbackTagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postPushbackSha.substring(0, 8)}`;
         await tagHead(worktreePath, pushbackTagName);
+      }
+      lastInvocationSha = postPushbackSha;
+      // Resume the maintain nudge from the push-back session so it lands AFTER the
+      // push-back exchange in one continuous conversation.
+      lastSessionId = pushbackResult.session_id;
+    }
+
+    // Phase 3b-2: Maintained-file skip check. The inverse of protected files —
+    // groups the project expects kept up to date. When the turn touched none of
+    // a group's files, nudge the agent once to update or justify skipping.
+    //
+    // PRECEDENCE INVARIANT (maintain-nudge-violation-precedence): the maintain
+    // nudge runs AFTER the push-back exchange and is INDEPENDENT of its outcome.
+    //   - It fires whether push-back left violations or the agent resolved them —
+    //     it is NOT gated on `violations.length === 0`. (Rationale: lazy.toml is
+    //     itself a protected file, so every turn that edits it would otherwise
+    //     never get a maintain nudge, making the feature look inert.)
+    //   - It must NEVER re-trigger push-back. Push-back is single-shot and already
+    //     ran above when `pushedBack` is set; this step only ever sends a maintain
+    //     nudge, so there is no second push-back round. `pushedBack` is referenced
+    //     here to document that the ordering (work → push-back → maintain) is
+    //     deliberate and that re-running push-back is structurally impossible.
+    //   - Sequencing: this nudge resumes `lastSessionId`, which advanced to the
+    //     push-back session above, so the nudge lands after the push-back reply.
+    //   - The maintain response carries NO `violations` field, so the reconciler's
+    //     "last response with violations wins" rule still reads the push-back set —
+    //     a still-violating turn stays `conflict` even though it also got nudged.
+    const maintainEntries = cmd.maintain ?? [];
+    if (maintainEntries.length > 0) {
+      const maintainEndSha = await getHeadSha(worktreePath);
+      const { skipped, turnHadChanges } = await detectSkippedMaintainEntries(
+        worktreePath,
+        startShaWork,
+        maintainEndSha,
+        maintainEntries,
+      );
+      log(`[supervisor] Maintained-file check: ${maintainEntries.length} group(s), turnHadChanges=${turnHadChanges}, skipped=${skipped.length}, violationsRemaining=${violations.length}, pushedBack=${pushedBack}`);
+
+      if (skipped.length > 0) {
+        log(`[supervisor] ${skipped.length} maintained group(s) skipped — prompting agent...`);
+        const followup = await runMaintainFollowup(
+          agent,
+          worktreePath,
+          lastSessionId,
+          skipped,
+          cmd.model_id,
+          cmd.effort,
+        );
+
+        // The follow-up may have committed updates (it can do real work). Those
+        // commits belong to the maintain turn — attribute them via its own SHA
+        // window (lastInvocationSha..postFollowupSha), not the work turn.
+        const postFollowupSha = await getHeadSha(worktreePath);
+        supervisedResponses.push({
+          status: 'completed',
+          result: followup.response,
+          session_id: followup.session_id,
+          usage: followup.usage,
+          start_sha_work: lastInvocationSha,
+          end_sha_work: postFollowupSha,
+          supervised: { kind: 'maintain', prompt: followup.prompt },
+        });
+
+        if (postFollowupSha !== lastInvocationSha) {
+          await tagHead(worktreePath, `turn/${cmd.task_id.substring(0, 8)}/post-work/${postFollowupSha.substring(0, 8)}`);
+        }
+        lastInvocationSha = postFollowupSha;
       }
     }
 
@@ -608,28 +717,32 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
     // Write response
     updatePhase(status, 'writing_response', protocolDir);
-    log(`[supervisor] Writing response: violations=${violations.length}, check_exit_code=${checkExitCode}, merge_conflicts=${allMergeConflicts.length}`);
+    log(`[supervisor] Writing response: violations=${violations.length}, supervised=${supervisedResponses.length}, check_exit_code=${checkExitCode}, merge_conflicts=${allMergeConflicts.length}`);
 
-    // Violations are stored in response.violations (structured field) and
-    // rendered by the display layer — do NOT prepend them into resultText.
-    // The pushback response IS appended so reviewers can see the agent's justification.
-    let resultText = result.result;
-    if (pushbackResponse) {
-      resultText += '\n\n---\n\n## Permission Violation Review\n\n' + pushbackResponse;
-    }
-
-    const response: CompletedResponse = {
+    // The WORK response (responses[0]) is kept CLEAN — supervised follow-ups are
+    // NOT appended to it. Turn-level outputs (merge conflicts from pre-work merges,
+    // the single post-turn check) attach here. Violations are NOT on the work
+    // response: when present they were re-detected and carried on the push-back
+    // response (the FINAL set). `pushed_back` records that the supervisor gave the
+    // agent a chance to self-correct — true whenever push-back RAN, independent of
+    // whether violations remained (so a resolved push-back still reports it).
+    const workResponse: CompletedResponse = {
       status: 'completed',
-      result: resultText,
+      result: result.result,
       session_id: result.session_id,
       usage: result.usage,
       ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
-      ...(violations.length > 0 ? { violations, pushed_back: true } : {}),
+      ...(pushedBack ? { pushed_back: true } : {}),
       ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
       ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
     };
-    log(`[supervisor] Response written: status=${response.status}, pushed_back=${response.pushed_back}`);
-    writeResponse(protocolDir, response);
+
+    const bundle: CompletedResponseBundle = {
+      status: 'completed',
+      responses: [workResponse, ...supervisedResponses],
+    };
+    log(`[supervisor] Response written: ${bundle.responses.length} invocation response(s), final violations=${violations.length}`);
+    writeResponse(protocolDir, bundle);
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -805,7 +918,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
  * waits synchronously for response.json, so it owns the response file;
  * the CLI never polls.
  */
-async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Promise<void> {
+async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runner: Runner): Promise<void> {
   const { protocolDir, worktreePath } = config;
 
   log(`[supervisor] Ask command for task ${cmd.task_id.substring(0, 8)} (effort=${cmd.effort ?? 'default'})`);
@@ -860,6 +973,7 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig): Prom
     const agentStart = Date.now();
     const result = await runWork(
       agent,
+      runner,
       worktreePath,
       cmd.prompt,
       askPrompt,

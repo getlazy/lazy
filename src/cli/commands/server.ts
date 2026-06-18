@@ -9,6 +9,7 @@
 import {
   checkDaemonHealth,
   ensureDaemon,
+  formatDashboardUrl,
 } from '../../daemon';
 import { findLazyRoot } from '../init';
 
@@ -36,7 +37,7 @@ export async function commandServer(_args: string[]): Promise<void> {
   }
 
   if (status.webPort) {
-    console.log(`Web dashboard: http://localhost:${status.webPort}`);
+    console.log(`Web dashboard: ${formatDashboardUrl(status.bindHost, status.webPort)}`);
   } else {
     console.log('Daemon is running but web dashboard port is not available.');
     console.log('Check daemon status: lazy daemon status');

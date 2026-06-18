@@ -20,7 +20,7 @@ import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
 import { PROTOCOL_VERSION } from './types';
-import type { ResolvedConfig } from '../config/types';
+import type { ResolvedConfig, MaintainEntry } from '../config/types';
 
 /**
  * Common policy fields for every start/unblock command.
@@ -39,6 +39,7 @@ export function commonCommandFields(config: ResolvedConfig): {
   protected_patterns: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  maintain?: MaintainEntry[];
 } {
   return {
     protocol_version: PROTOCOL_VERSION,
@@ -53,6 +54,11 @@ export function commonCommandFields(config: ResolvedConfig): {
     ...(config.checks.post_turn !== '' && {
       post_turn_check: config.checks.post_turn,
       post_turn_timeout: config.checks.post_turn_timeout,
+    }),
+    // Maintained-file groups (opt-in). Only sent when configured — omitted
+    // entirely on the default empty config so the supervisor skips the check.
+    ...(config.automation.maintain.length > 0 && {
+      maintain: config.automation.maintain,
     }),
   };
 }

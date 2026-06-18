@@ -22,6 +22,8 @@
 import { join } from 'path';
 import { stat } from 'fs/promises';
 import { loadConfig } from '../config/loader';
+import { resolveAgentModel } from '../utils/role-target';
+import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
 import { createDriver, LocalDriver } from '../remote';
@@ -31,9 +33,10 @@ import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { resolveAndPersistEffort } from './effort';
 import { getAgent } from '../agent/registry';
 import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag } from '../git/operations';
+import type { DestinationRestoreConflict } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus } from '../protocol';
+import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus, completedResponses } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
@@ -48,12 +51,13 @@ import { setupSandbox } from '../utils/sandbox';
 import { hasDaemonContext } from './context';
 import { runGit } from '../utils/git';
 import { validateBranchInSyncWithRemote } from '../utils/git';
+import { latestViolationTurn } from '../utils/turns';
 import { isOfflineMode } from '../utils/offline';
 import { readdir, readFile } from 'fs/promises';
 
 import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, CompletedResponse, ErrorResponse } from '../protocol';
 import { PROTOCOL_VERSION } from '../protocol/types';
-import type { FileViolation, Task, TokenUsage } from '../types';
+import type { FileViolation, Task, TokenUsage, Session, TaskStatus } from '../types';
 import type { Storage } from '../storage';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
@@ -394,7 +398,10 @@ export async function launchUnblockTask(
 
     if (task.status === 'conflict') {
       const existingTurns = await storage.getSessionTurns(sess.id);
-      const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
+      // The FINAL violation set lives on the push-back turn (the last invocation
+      // that re-detected them), NOT the work turn — use latestViolationTurn so the
+      // reviewer resolves exactly what the agent left unresolved.
+      const latestAgentTurn = latestViolationTurn(existingTurns);
 
       if (latestAgentTurn?.violations?.length) {
         const violations = latestAgentTurn.violations;
@@ -458,11 +465,12 @@ export async function launchUnblockTask(
         }
       }
     }
-    // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
-    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
-      ? config.ollama.model
-      : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
+    // Per-role model resolution: a local backend (ollama/proxy) forces its
+    // authoritative model; otherwise CLI flag > sticky > task.model > default.
+    const modelName = resolveAgentModel(config, {
+      preferredModel: params.modelOverride ?? stickyModel ?? task.model,
+      agentId: task.agent_id,
+    });
     const modelId = modelName;
 
     if (!task.model) {
@@ -518,7 +526,7 @@ export async function launchUnblockTask(
     }
 
     // Build prompts
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)));
     const fullMessage = buildPromptWithInstructions(message.trim(), task.goal, null, projectRoot, turnHistory, notesCtx, remoteCommentsCtx);
 
     // --- Persist state BEFORE launching container ---
@@ -660,8 +668,10 @@ const ASK_TIMEOUT_MS = 10 * 60 * 1000;
  *   - Always runs in plan mode (read-only, no writes, no commits).
  *   - Skips all integration machinery: no upstream sync, no pre/post-turn
  *     merge, no violation detection, no post-turn check.
- *   - Rejects with 409 unless the task is currently 'blocked' (an ask only
- *     makes sense against a paused, reviewable task).
+ *   - Rejects with 409 unless the task is 'blocked' or 'conflict' (an ask only
+ *     makes sense against a paused, reviewable task; 'conflict' is a blocked
+ *     variant). The pre-ask status is restored when the ask completes, so a
+ *     read-only ask never mutates task state.
  *   - Is daemon-owned end-to-end: the daemon waits for response.json, processes
  *     it, and returns the answer in the RPC result — so the CLI doesn't poll
  *     and can't race the reconciler.
@@ -696,16 +706,23 @@ export async function launchAskTask(
     throw new RpcError(409, `Task ${displayId(task)} has no agent session to resume — cannot ask until the agent has run at least once.`);
   }
 
-  // --- Status gate: only ever ask a task that's blocked ---
-  // The daemon may autonomously flip blocked → working at any moment (CI
-  // trigger, comment arrival, upstream sync). If that race loses, the
+  // --- Status gate: only ask a task that's blocked or conflict ---
+  // An ask is read-only (plan-mode resume, no worktree/commit changes), so it
+  // is safe against any paused, reviewable task. `conflict` is a blocked
+  // variant ("blocked, with a protected-file conflict to resolve") and must be
+  // askable too — forcing the reviewer to unblock just to ask a question is a
+  // surprise. The daemon may autonomously flip these → working at any moment
+  // (CI trigger, comment arrival, upstream sync); if that race loses, the
   // reviewer must retry; we must not stomp live work with a read-only turn.
-  if (task.status !== 'blocked') {
+  const askableStatus = task.status === 'blocked' || task.status === 'conflict';
+  if (!askableStatus) {
     throw new RpcError(409,
-      `Task ${displayId(task)} is '${task.status}', not 'blocked'. ` +
-      `Review questions only run while the task is blocked — the agent may have picked up autonomous work. Retry once it's blocked again.`,
+      `Task ${displayId(task)} is '${task.status}', not 'blocked' or 'conflict'. ` +
+      `Review questions only run while the task is paused (blocked/conflict) — the agent may have picked up autonomous work. Retry once it's paused again.`,
     );
   }
+  // Preserve the pre-ask status so a read-only ask never mutates task state.
+  const statusBeforeAsk = task.status;
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
@@ -734,9 +751,10 @@ export async function launchAskTask(
         break;
       }
     }
-    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
-      ? config.ollama.model
-      : (stickyModel ?? task.model ?? config.models.default);
+    const modelName = resolveAgentModel(config, {
+      preferredModel: stickyModel ?? task.model,
+      agentId: task.agent_id,
+    });
     const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
 
     // --- Build prompts ---
@@ -749,7 +767,7 @@ export async function launchAskTask(
       (runner as any).setAgent(getAgent(task.agent_id));
     }
     await runner.checkAvailability();
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)));
     const fullMessage = buildPromptWithInstructions(params.message.trim(), task.goal, null, projectRoot);
 
     // --- Record the human turn BEFORE launching ---
@@ -826,27 +844,34 @@ export async function launchAskTask(
       throw new RpcError(500, `Ask failed: ${response.error}`);
     }
 
-    // --- Completed: record agent turn, transition back to blocked ---
-    const turnNumber = await recordAskCompletedTurn(storage, sess, response, protoDir);
-    await storage.updateTaskStatus(task.id, 'blocked', 'system');
+    // An ask is always a single-invocation, read-only turn — never a bundle.
+    // Normalize defensively to the primary response.
+    const completed = completedResponses(response)[0];
+
+    // --- Completed: record agent turn, restore the pre-ask status ---
+    // An ask is read-only, so it must leave the task exactly as it found it
+    // (e.g. a 'conflict' task stays 'conflict', not silently demoted to
+    // 'blocked').
+    const turnNumber = await recordAskCompletedTurn(storage, sess, completed, protoDir);
+    await storage.updateTaskStatus(task.id, statusBeforeAsk, 'system');
 
     return {
       sessionId: sess.id,
       turnNumber,
-      answer: response.result,
-      usage: response.usage
+      answer: completed.result,
+      usage: completed.usage
         ? {
-            inputTokens: response.usage.input_tokens ?? 0,
-            outputTokens: response.usage.output_tokens ?? 0,
-            cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-            cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+            inputTokens: completed.usage.input_tokens ?? 0,
+            outputTokens: completed.usage.output_tokens ?? 0,
+            cacheCreationTokens: completed.usage.cache_creation_input_tokens ?? 0,
+            cacheReadTokens: completed.usage.cache_read_input_tokens ?? 0,
           }
         : undefined,
       warnings,
       timings: {
         daemon_ms: Date.now() - daemonStart,
         wait_ms: waitMs,
-        agent_ms: response.agent_duration_ms,
+        agent_ms: completed.agent_duration_ms,
       },
     };
   } finally {
@@ -1285,8 +1310,10 @@ export async function acceptTaskPreflight(
   }
 
   // --- File violation checks ---
+  // The FINAL violation set lives on the push-back turn (the last invocation that
+  // re-detected them), not response #1 / the work turn — use latestViolationTurn.
   const turns = await storage.getSessionTurns(sess.id);
-  const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+  const lastAgentTurn = latestViolationTurn(turns);
   if (lastAgentTurn?.violations?.some(v => v.status === 'pending')) {
     const pendingFiles = lastAgentTurn.violations
       .filter(v => v.status === 'pending')
@@ -1811,6 +1838,12 @@ export async function acceptTask(
     };
   }
 
+  // The merge committed durably. If the destination/parent worktree had
+  // uncommitted work that couldn't be auto-restored after the stash-merge, the
+  // accept STILL succeeds — we hand reconciliation to that worktree's owner
+  // below (Step 9), after the child accept is fully finalized.
+  const restoreConflict = result.restoreConflict;
+
   // --- Step 7: Merge succeeded — fast-forward local and finalize ---
   const { resolveDetachedHead } = await import('../git/operations');
   const resolvedMergeTarget = await resolveDetachedHead(
@@ -1825,6 +1858,39 @@ export async function acceptTask(
   }
   if (ffResult.warning) {
     warnings.push(ffResult.warning);
+  }
+
+  // --- Step 7b: Push the locally-merged parent branch to origin ---
+  // INVARIANT (CLAUDE.md "Fail hard on remote failures" + "Before performing a
+  // remote merge ... the parent branch's local commits MUST be pushed"): a LOCAL
+  // squash merge writes the merge commit only to the local parent branch. If it
+  // is never pushed, local <parent> drifts permanently ahead of origin/<parent>
+  // (the "local-always-ahead" bug) AND `lazy sync` resolves upstream to a stale
+  // origin/<parent> and falsely reports "Already up to date" — silently dropping
+  // upstream delivery. So after a successful local merge we push the parent.
+  //
+  // We use the ORIGINAL `driver`, not `mergeDriver`: when the target is an
+  // unprotected branch but a real GitHub/GitLab remote exists, `mergeDriver` was
+  // swapped to a LocalDriver (whose pushBranch is a no-op), losing the knowledge
+  // that there IS a remote to push to. `useLocalMerge` is `driver.needsSync &&
+  // !targetIsProtected`, so `useLocalMerge === true` already implies a real
+  // remote exists. When lazy is configured offline/local, `driver` is itself a
+  // LocalDriver (needsSync === false), `useLocalMerge` is false, and we correctly
+  // skip — there is no remote to push to.
+  //
+  // This is a plain branch push (driver.pushBranch wraps withRemoteRetry and
+  // FAILS hard after retries), NEVER a PR/MR — opening one would regress
+  // fix-mr-targets-main. Applies to `main` AND intermediate `lazy/...` parents.
+  if (useLocalMerge) {
+    try {
+      await driver.pushBranch(resolvedMergeTarget);
+    } catch (err) {
+      throw new RpcError(500,
+        `Local merge into ${resolvedMergeTarget} succeeded, but pushing it to ` +
+        `${config.remote.git_remote} failed: ${err instanceof Error ? err.message : err}. ` +
+        `Local ${resolvedMergeTarget} is now ahead of the remote — push it manually ` +
+        `(git push ${config.remote.git_remote} ${resolvedMergeTarget}) to reconcile.`);
+    }
   }
 
   // Authoritative accept marker — created BEFORE the status transition so a
@@ -1881,6 +1947,15 @@ export async function acceptTask(
   await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
   removeProtocolDir(getProtocolDir(task.id));
 
+  // --- Step 9: Hand off any destination-worktree restore conflict ---
+  // The merge is durable and the child accept has succeeded. If the merged-into
+  // worktree's stashed work couldn't be auto-restored, reconcile it via the
+  // worktree's owning task (its agent) — or, failing that, surface loud,
+  // actionable recovery steps. Never blocks or fails the child accept.
+  if (restoreConflict) {
+    await handleDestinationRestoreConflict(projectRoot, storage, restoreConflict, displayId(task), warnings);
+  }
+
   // mergeDriver: a local merge has no remote URL, so this is null — correct,
   // there is no MR/PR to point at.
   const prUrl = await mergeDriver.getTaskUrl(task);
@@ -1891,6 +1966,135 @@ export async function acceptTask(
     prUrl: prUrl ?? undefined,
     warnings,
   };
+}
+
+/** Statuses from which `launchUnblockTask` can deliver feedback and resume the agent. */
+const UNBLOCKABLE_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+  'blocked', 'interrupted', 'conflict', 'submitted',
+]);
+
+/**
+ * Compose the mode-specific recovery steps for a destination restore conflict.
+ * Shared between the parent-agent feedback and the human-facing fallback so both
+ * always describe exactly what git did and how to finish reconciling.
+ */
+function restoreConflictRecoverySteps(rc: DestinationRestoreConflict): string {
+  if (rc.mode === 'conflict-markers') {
+    return (
+      `Git re-applied your stashed changes but they conflict with the merged changes — the working tree ` +
+      `now contains conflict markers. Resolve the conflicts, \`git add\` the results, then ` +
+      `\`git stash drop ${rc.stashSha}\` to discard the retained safety copy.`
+    );
+  }
+  // pop-refused
+  return (
+    `Git refused to restore your stashed changes because doing so would overwrite untracked files produced ` +
+    `by the merge. Nothing was applied; the worktree is at the clean merged state. Move or remove the ` +
+    `conflicting files, then run \`git stash pop\` (stash ${rc.stashSha}) to restore your work.`
+  );
+}
+
+/**
+ * Find the task that owns a git branch by matching `session.git_branch`.
+ * Storage has no branch index, so we scan tasks — the idiomatic pattern here.
+ */
+async function findTaskByBranch(
+  storage: Storage,
+  branch: string,
+): Promise<{ task: Task; session: Session } | null> {
+  const tasks = await storage.listTasks();
+  for (const t of tasks) {
+    const session = await storage.getSessionByTaskId(t.id);
+    if (session && session.git_branch === branch) {
+      return { task: t, session };
+    }
+  }
+  return null;
+}
+
+/** Feedback handed to the destination worktree's agent to reconcile the stash. */
+function buildRestoreConflictFeedback(rc: DestinationRestoreConflict, childDisplayId: string): string {
+  return (
+    `Accepting ${childDisplayId} squash-merged its work into this branch (${rc.targetBranch}). Before ` +
+    `merging, your worktree had uncommitted changes, which I stashed so the merge could run safely. Git ` +
+    `could not automatically restore them afterward.\n\n${restoreConflictRecoverySteps(rc)}\n\n` +
+    `Your work is preserved in git stash ${rc.stashSha} (labeled "${rc.stashLabel}"). Please reconcile ` +
+    `it in your worktree and commit or clean up as appropriate.`
+  );
+}
+
+/**
+ * Decide how to reconcile a destination restore conflict — PURE (reads storage,
+ * no side effects), so it's unit-testable without launching a supervisor.
+ *
+ * The Case-2 destination IS the parent task's worktree, and accept is only
+ * permitted when that parent is idle. So when an owning task exists with a live
+ * session in an unblockable state, hand the conflict to its agent. Otherwise
+ * (no owning task — e.g. a raw branch checkout — or a non-idle owner) fall back
+ * to a human-facing message. The stash is retained either way.
+ */
+export type RestoreConflictPlan =
+  | { kind: 'unblock'; taskId: string; taskDisplayId: string; feedback: string }
+  | { kind: 'fallback' };
+
+export async function planRestoreConflictReconciliation(
+  storage: Storage,
+  rc: DestinationRestoreConflict,
+  childDisplayId: string,
+): Promise<RestoreConflictPlan> {
+  const owner = await findTaskByBranch(storage, rc.targetBranch);
+  if (owner && owner.session.ended_at === null && UNBLOCKABLE_STATUSES.has(owner.task.status)) {
+    return {
+      kind: 'unblock',
+      taskId: owner.task.id,
+      taskDisplayId: displayId(owner.task),
+      feedback: buildRestoreConflictFeedback(rc, childDisplayId),
+    };
+  }
+  return { kind: 'fallback' };
+}
+
+/**
+ * Reconcile a destination worktree whose stashed work couldn't be auto-restored
+ * after a durable squash merge (see {@link DestinationRestoreConflict}). Hands
+ * the conflict to the worktree's owning agent via the same internal unblock
+ * machinery the `unblock` RPC uses, or surfaces a loud, actionable fallback.
+ * Never blocks or fails the (already-durable) child accept.
+ */
+async function handleDestinationRestoreConflict(
+  projectRoot: string,
+  storage: Storage,
+  rc: DestinationRestoreConflict,
+  childDisplayId: string,
+  warnings: string[],
+): Promise<void> {
+  const plan = await planRestoreConflictReconciliation(storage, rc, childDisplayId);
+
+  if (plan.kind === 'unblock') {
+    try {
+      await launchUnblockTask(projectRoot, { taskId: plan.taskId, message: plan.feedback });
+      warnings.push(
+        `The destination worktree for ${rc.targetBranch} (task ${plan.taskDisplayId}) had uncommitted ` +
+        `changes that could not be auto-restored after the merge (${rc.mode}); its agent was unblocked to ` +
+        `reconcile the preserved stash ${rc.stashSha}. The accept itself succeeded.`
+      );
+      return;
+    } catch (err) {
+      // Unblock failed — fall through to the loud human-facing fallback so the
+      // preserved work is never silently stranded.
+      warnings.push(
+        `Could not unblock task ${plan.taskDisplayId} to reconcile the destination worktree for ` +
+        `${rc.targetBranch}: ${err instanceof Error ? err.message : err}.`
+      );
+    }
+  }
+
+  // Fallback: no owning task, owner not unblockable, or unblock failed.
+  warnings.push(
+    `Merged into ${rc.targetBranch}, but its worktree at ${rc.worktreePath} had uncommitted changes that ` +
+    `could not be auto-restored after the merge (${rc.mode}). Your work is preserved in git stash ` +
+    `${rc.stashSha} (labeled "${rc.stashLabel}"). To recover it manually in that worktree: ${restoreConflictRecoverySteps(rc)}`
+  );
 }
 
 /**
@@ -2628,10 +2832,13 @@ async function findClaudeSessionId(sandboxPath: string): Promise<string | null> 
 /**
  * Build the static system prompt for task resume (after interruption).
  */
-export function buildSystemPromptForResume(runnerInstructions?: string): string {
+export function buildSystemPromptForResume(runnerInstructions?: string, chattinessSnippet?: string): string {
   let prompt = lazyToolInstructions + '\n' + systemInstructionsResumeText;
   if (runnerInstructions) {
     prompt += '\n' + runnerInstructions;
+  }
+  if (chattinessSnippet) {
+    prompt = chattinessSnippet + '\n\n' + prompt;
   }
   return prompt;
 }
@@ -2763,9 +2970,10 @@ export async function resumeTask(
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
     // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
-    const modelName = (config.ollama.enabled && config.ollama.model && task.agent_id === 'claude-code')
-      ? config.ollama.model
-      : (params.modelOverride ?? stickyModel ?? task.model ?? config.models.default);
+    const modelName = resolveAgentModel(config, {
+      preferredModel: params.modelOverride ?? stickyModel ?? task.model,
+      agentId: task.agent_id,
+    });
     const modelId = modelName;
 
     if (!task.model) {
@@ -2784,7 +2992,7 @@ export async function resumeTask(
     }
 
     // --- Build prompts ---
-    const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions());
+    const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)));
     const fullPrompt = buildResumePrompt(task.goal);
 
     // --- Persist state BEFORE launch ---

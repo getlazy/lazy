@@ -3,7 +3,9 @@
  *
  * The daemon binds to two listeners:
  *   1. Unix socket (for CLI/agent communication) — requires bearer token auth
- *   2. TCP port (for web browser access) — no auth required (localhost only)
+ *   2. TCP port (for web browser access) — dashboard requires no auth; /mcp and
+ *      /rpc require bearer token. Binds to loopback (127.0.0.1) by default;
+ *      remote access is opt-in via [server] bind in lazy.toml.
  *
  * Unix socket endpoints:
  *   GET  /daemon/status          — health check / status endpoint
@@ -36,9 +38,10 @@ import { createRunner } from '../runner';
 import { logger, LogLevel } from '../utils/logger';
 import { markLoggedToFile } from '../utils/logged-error';
 import { createWebRequestHandler, tryBindTcpPort } from '../server';
+import { formatDashboardUrl } from './dashboard-url';
 import { getLogPath } from './paths';
 import { loadConfig } from '../config/loader';
-import { DEFAULT_WEB_PORT } from '../config/constants';
+import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND } from '../config/constants';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
 import { setDaemonContext } from './context';
 import {
@@ -94,6 +97,8 @@ export interface RunningDaemon {
   webServer?: ReturnType<typeof Bun.serve>;
   /** TCP port the web dashboard is listening on, if bound. */
   webPort?: number;
+  /** Interface the web dashboard bound to (= config.server.bind), if bound. */
+  bindHost?: string;
   /** Stop the daemon server and clean up files. Does NOT exit the process. */
   stop: () => void;
 }
@@ -216,6 +221,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   // Mutable web port — set after TCP binding, read by status endpoint
   let boundWebPort: number | undefined;
+  // Actual interface the web server bound to (= config.server.bind). Set after
+  // TCP binding, surfaced via /daemon/status so the CLI prints a URL that
+  // points at the real interface instead of a hardcoded `localhost`.
+  let boundBindHost: string | undefined;
 
   // Shared daemon-specific request handler (status, shutdown, RPC)
   const handleDaemonRequest = async (req: Request, requireAuth: boolean): Promise<Response | null> => {
@@ -270,6 +279,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         buildTime,
         socketPath,
         webPort: boundWebPort,
+        bindHost: boundBindHost,
         ...(autoReactBudget ? { autoReactBudget } : {}),
       });
     }
@@ -392,9 +402,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   if (shouldBindWeb) {
     // Port priority: explicit option > project config > global default
     let configPort: number | undefined;
+    // Bind interface: defaults to loopback so the unauthenticated dashboard and
+    // the /mcp + /rpc endpoints are not exposed to the LAN. Users opt into
+    // remote access via [server] bind in lazy.toml.
+    let bindHost: string = DEFAULT_SERVER_BIND;
     try {
       const config = await loadConfig(projectRoot);
       configPort = config.server.port;
+      bindHost = config.server.bind;
     } catch { /* config load failure shouldn't prevent web server startup */ }
     const desiredPort = options.webPort ?? configPort ?? DEFAULT_WEB_PORT;
     const attempts = options.maxPortAttempts ?? 100;
@@ -481,7 +496,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     let bindResult: ReturnType<typeof tryBindTcpPort> = null;
     let bindThrownError: unknown = null;
     try {
-      bindResult = tryBindTcpPort(desiredPort, tcpHandler, attempts);
+      bindResult = tryBindTcpPort(desiredPort, tcpHandler, attempts, bindHost);
     } catch (err) {
       // tryBindTcpPort rethrows anything that isn't EADDRINUSE (e.g., EACCES
       // on privileged ports, unexpected Bun.serve failures). Surface these
@@ -546,6 +561,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     const actualPort = webServer.port!;
     webPort = actualPort;
     boundWebPort = actualPort;
+    boundBindHost = bindHost;
     // Set daemon context so RPC handlers (e.g., task launcher) can access
     // the daemon's own webPort and token without health checks.
     setDaemonContext({ webPort: actualPort, token });
@@ -563,7 +579,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       return handler(req);
     };
 
-    logger.info(`Web dashboard: http://localhost:${webPort}`);
+    logger.info(`Web dashboard: ${formatDashboardUrl(bindHost, webPort)}`);
+    if (bindHost !== DEFAULT_SERVER_BIND) {
+      // Make the exposure visible: the dashboard is unauthenticated, so binding
+      // beyond loopback means anyone who can reach this interface can read it.
+      logger.warn(
+        `Daemon TCP server bound to ${bindHost}:${webPort} (not loopback). ` +
+        `The web dashboard is unauthenticated and now reachable from other hosts ` +
+        `on that interface. This was enabled via [server] bind in lazy.toml.`,
+      );
+    }
   }
 
   const result: RunningDaemon = {
@@ -575,6 +600,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     knownTaskIds,
     webServer,
     webPort,
+    bindHost: boundBindHost,
     stop: () => {},
   };
 

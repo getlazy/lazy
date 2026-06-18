@@ -12,7 +12,7 @@ import type { GitLabDriverDeps, GlResult } from '../../src/remote/gitlab-driver'
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929' },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
@@ -20,7 +20,8 @@ const mockConfig: ResolvedConfig = {
   output: { shortid_length: 8 },
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0, effort: 'medium' },
   builder: { effort: 'high' },
-  server: { port: 3000, sync_interval: 1000 },
+  chattiness: { default: '', builder: '', agent: '' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
   remote: {
     driver: 'gitlab',
     git_remote: 'origin',
@@ -36,6 +37,7 @@ const mockConfig: ResolvedConfig = {
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
+  automation: { maintain: [] },
   checks: { post_turn: '', post_turn_timeout: 300 },
   ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
   daemon: {

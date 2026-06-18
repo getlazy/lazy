@@ -16,11 +16,16 @@ import type { SandboxConfig } from '../capture/claude';
 import { spawn } from '../utils/spawn';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
-import type { OllamaConfig } from '../config/types';
+import type { RoleTarget } from '../config/types';
 import { getAuthEnvVars as getDefaultAuthEnvVars } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
+import { encodeProjectPath } from '../import/claude-code-logs';
 import { logger } from '../utils/logger';
-import { checkOllamaConnectivity, getEffectiveModel } from '../utils/ollama';
+import {
+  checkTargetConnectivity,
+  preflightRoleTarget,
+  ANTHROPIC_DEFAULT_TARGET,
+} from '../utils/role-target';
 import { getLazyCommand } from '../utils/cli-path';
 import type { Agent } from '../agent/interface';
 import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
@@ -102,24 +107,36 @@ export class HostProcessRunner implements Runner {
   }
 
   private _agent?: Agent;
-  private _ollamaConfig?: OllamaConfig;
+  private _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
 
   /** Set the agent to use for auth. If not set, falls back to ClaudeCodeAgent singleton. */
   setAgent(agent: Agent): void {
     this._agent = agent;
   }
 
-  /** Set Ollama config for local model inference. */
-  setOllamaConfig(config: OllamaConfig): void {
-    this._ollamaConfig = config;
+  /** Set the per-role model targets (builder vs agent backends). */
+  setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void {
+    this._roleTargets = targets;
   }
 
-  private getAuthEnvVars(): Array<{ key: string; value: string }> {
-    // When Ollama is configured, use Ollama env vars instead of API auth
-    if (this._ollamaConfig?.enabled) {
-      return getDefaultAuthEnvVars(this._ollamaConfig);
+  /** The resolved target for task/supervisor (agent) launches. */
+  private agentTarget(): RoleTarget {
+    return this._roleTargets?.agent ?? ANTHROPIC_DEFAULT_TARGET;
+  }
+
+  /** The resolved target for builder launches. */
+  private builderTarget(): RoleTarget {
+    return this._roleTargets?.builder ?? ANTHROPIC_DEFAULT_TARGET;
+  }
+
+  private getAuthEnvVars(target?: RoleTarget): Array<{ key: string; value: string }> {
+    const resolved = target ?? this.agentTarget();
+    // Local backends are self-contained; the anthropic path may use the
+    // injected agent's credential (falls back to the default reader).
+    if (resolved.backend === 'anthropic' && this._agent) {
+      return this._agent.getAuthEnvVars();
     }
-    return this._agent ? this._agent.getAuthEnvVars() : getDefaultAuthEnvVars();
+    return getDefaultAuthEnvVars(resolved);
   }
 
   runDisplayName(runName: string): string {
@@ -148,11 +165,14 @@ export class HostProcessRunner implements Runner {
 
     // Auth is NOT enforced here. The daemon credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point.
-    if (this._ollamaConfig?.enabled) {
-      // Log a warning if Ollama is unreachable (don't fail — it might come up later).
-      const check = checkOllamaConnectivity(this._ollamaConfig);
+    // Early, non-fatal reachability nudge for local backends (fail-hard happens
+    // at launch via preflightRoleTarget).
+    for (const role of ['agent', 'builder'] as const) {
+      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
+      if (target.backend === 'anthropic') continue;
+      const check = await checkTargetConnectivity(target);
       if (!check.reachable) {
-        logger.warn(check.reason);
+        logger.warn(`[${role}] ${check.reason}`);
       }
     }
   }
@@ -172,7 +192,10 @@ export class HostProcessRunner implements Runner {
     debug?: boolean,
     daemonConfigPath?: string,
   ): Promise<void> {
-    const authEnvVars = this.getAuthEnvVars();
+    // Fail hard before launch if the agent's backend is unreachable.
+    await preflightRoleTarget('agent', this.agentTarget());
+
+    const authEnvVars = this.getAuthEnvVars(this.agentTarget());
 
     // Set up log file for this run
     const logDir = join(getHome(), '.lazy', 'logs');
@@ -244,9 +267,13 @@ export class HostProcessRunner implements Runner {
     debug?: boolean,
     model?: string,
   ): Promise<AgentResponse> {
-    const authEnvVars = this.getAuthEnvVars();
+    const target = this.agentTarget();
+    const authEnvVars = this.getAuthEnvVars(target);
 
-    const effectiveModel = getEffectiveModel(model, this._ollamaConfig);
+    // The caller resolves the model; for a local backend fall back to the
+    // target's authoritative model when none was passed.
+    const effectiveModel =
+      model ?? (target.backend !== 'anthropic' ? target.model : undefined);
 
     const claudeArgs = [
       'claude', '-p', prompt,
@@ -469,6 +496,13 @@ export class HostProcessRunner implements Runner {
     return false;
   }
 
+  agentSessionProjectDir(worktreePath: string): string {
+    // Host-process runs Claude with the real host HOME (no sandbox), so its
+    // session JSONL lands under <host-home>/.claude/projects/<encoded>.
+    const encoded = encodeProjectPath(worktreePath);
+    return join(getHome(), '.claude', 'projects', encoded);
+  }
+
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
     const binaryName = agentPackaging.binaryName();
     return [
@@ -494,13 +528,15 @@ export class HostProcessRunner implements Runner {
 
     results.push({ state: 'ok', what: 'Runner mode: host-process (no container isolation)' });
 
-    // Check Ollama connectivity when configured
-    if (this._ollamaConfig?.enabled) {
-      const check = checkOllamaConnectivity(this._ollamaConfig);
+    // Check connectivity for any per-role local backend (ollama/proxy).
+    for (const role of ['agent', 'builder'] as const) {
+      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
+      if (target.backend === 'anthropic') continue;
+      const check = await checkTargetConnectivity(target);
       if (check.reachable) {
-        results.push({ state: 'ok', what: `Ollama reachable at ${check.endpoint}` });
+        results.push({ state: 'ok', what: `[${role}] ${target.backend} reachable at ${check.endpoint}` });
       } else {
-        results.push({ state: 'fail', what: 'Ollama reachable', reason: check.reason });
+        results.push({ state: 'fail', what: `[${role}] ${target.backend} reachable`, reason: check.reason });
       }
     }
 
@@ -524,11 +560,23 @@ export class HostProcessRunner implements Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
+    _projectsDir?: string,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
     // Host-process mode: launch Claude Code directly (no supervisor, no MCP proxy).
+    // projectsDir isolation is N/A here — there is no container HOME to remap, so
+    // Claude reads/writes the real host ~/.claude/projects. (This mode is the
+    // explicitly-unisolated runner anyway.)
     // MCP tools are not available in this mode — the builder relies on Claude Code's
     // built-in capabilities plus any tools the user has configured.
     // We still capture the conversation after exit by reading JSONL files.
+
+    // Fail hard before launch if the builder's backend is unreachable.
+    await preflightRoleTarget('builder', this.builderTarget());
+
+    // Inject the builder target's backend env vars (base URL for ollama/proxy,
+    // dummy credentials for ollama) so a local-backend builder actually talks to
+    // that backend rather than the inherited shell's default endpoint.
+    const builderEnvVars = this.getAuthEnvVars(this.builderTarget());
 
     const claudeArgs = [
       'claude',
@@ -543,13 +591,17 @@ export class HostProcessRunner implements Runner {
     logger.info('Launching Claude Code...');
 
     // Snapshot JSONL file times before launch for conversation capture
-    const beforeSnapshot = snapshotSessionFiles(lazyRoot);
+    const beforeSnapshot = await snapshotSessionFiles(lazyRoot);
 
     const proc = spawn(claudeArgs, {
       cwd: lazyRoot,
       stdin: 'inherit',
       stdout: 'inherit',
       stderr: 'inherit',
+      env: {
+        ...process.env,
+        ...Object.fromEntries(builderEnvVars.map(v => [v.key, v.value])),
+      },
     });
 
     const exitCode = await proc.exited;

@@ -41,11 +41,12 @@ const activeMonitors = new Map<string, ActivityMonitor>();
  */
 function syncActivityMonitors(
   workingTaskIds: Map<string, { worktreePath: string; turnStartedAt?: string }>,
+  runner: import('../../runner').Runner,
 ): void {
   // Start monitors for new working tasks
   for (const [taskShortId, info] of workingTaskIds) {
     if (!activeMonitors.has(taskShortId)) {
-      const monitor = new ActivityMonitor(info.worktreePath, taskShortId, info.turnStartedAt);
+      const monitor = new ActivityMonitor(runner, info.worktreePath, taskShortId, info.turnStartedAt);
       monitor.start();
       activeMonitors.set(taskShortId, monitor);
     }
@@ -338,7 +339,7 @@ export async function commandLoop(args: string[]): Promise<void> {
                 });
               }
             }
-            syncActivityMonitors(workingTasks);
+            syncActivityMonitors(workingTasks, runner);
             drainActivityMonitors();
 
             const tree = await buildTaskTree(storage, activeTasks, root);

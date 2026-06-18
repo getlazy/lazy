@@ -14,6 +14,7 @@ import type { RetryError } from '../protocol/types';
 import { hasCommand } from '../protocol/io';
 import { log, logError } from './log';
 import type { Agent } from '../agent/interface';
+import type { Runner } from '../runner/types';
 import { execWithWatchdog, WatchdogTimeoutError, GracefulExitTimeoutError } from './watchdog';
 import { clearTurnEndSignal, turnEndSignalPath } from '../protocol/turn-end-signal';
 import { findLatestSessionFile } from '../agent/session-discovery';
@@ -77,6 +78,7 @@ function isSessionNotFoundError(agent: Agent, errorMessage: string): boolean {
  */
 async function executeAgent(
   agent: Agent,
+  runner: Runner,
   worktreePath: string,
   prompt: string,
   systemPrompt?: string,
@@ -129,6 +131,7 @@ async function executeAgent(
 
   if (killedByGracefulExit) {
     const recoveredSessionId = await recoverSessionIdForGracefulExit(
+      runner,
       worktreePath,
       claudeSessionId,
       launchTime,
@@ -205,23 +208,24 @@ async function executeAgent(
  *
  *   1. Resumed turn — the daemon already passed `agent_session_id` to the
  *      supervisor, which forwarded it as `--resume`. We have it locally.
- *   2. Fresh first turn — Claude writes
- *      `<worktree>/.lazy-task-sandbox/.claude/projects/<encoded>/<session-id>.jsonl`
- *      from the moment it starts (same path `lazy watch` discovers). Pick the
- *      file modified after `launchTime` so we ignore stale sessions from
- *      previous turns.
+ *   2. Fresh first turn — Claude writes `<session-id>.jsonl` into the runner's
+ *      agent session project dir (`runner.agentSessionProjectDir`) from the
+ *      moment it starts (same path `lazy watch` discovers). Pick the file
+ *      modified after `launchTime` so we ignore stale sessions from previous
+ *      turns.
  *
  * Returns undefined only when neither path yields anything (e.g. claude died
  * before writing any jsonl). The caller logs that case so it is debuggable.
  */
 export async function recoverSessionIdForGracefulExit(
+  runner: Runner,
   worktreePath: string,
   claudeSessionId: string | undefined,
   launchTime: number,
 ): Promise<string | undefined> {
   if (claudeSessionId) return claudeSessionId;
   try {
-    const info = await findLatestSessionFile(worktreePath, launchTime);
+    const info = await findLatestSessionFile(runner.agentSessionProjectDir(worktreePath), launchTime);
     if (info) {
       log(`[work] Recovered session id ${info.sessionId.substring(0, 8)} from ${info.path} after graceful-exit kill.`);
       return info.sessionId;
@@ -299,6 +303,7 @@ async function sleepWithCommandCheck(protocolDir: string, delayMs: number): Prom
  * Automatically retries on failure with exponential backoff.
  *
  * @param agent The agent to use for execution
+ * @param runner The runner — authoritative for where the agent's session log lives
  * @param worktreePath Working directory
  * @param prompt Full prompt to send to the agent
  * @param systemPrompt Optional static system prompt
@@ -312,6 +317,7 @@ async function sleepWithCommandCheck(protocolDir: string, delayMs: number): Prom
  */
 export async function runWork(
   agent: Agent,
+  runner: Runner,
   worktreePath: string,
   prompt: string,
   systemPrompt?: string,
@@ -328,7 +334,7 @@ export async function runWork(
   const execute = _executeOverride
     ? _executeOverride
     : (wt: string, p: string, sp?: string, mid?: string, sid?: string, eff?: string, pm?: 'plan' | 'default') =>
-        executeAgent(agent, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm, protocolDir, gracefulExitTimeoutMs);
+        executeAgent(agent, runner, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm, protocolDir, gracefulExitTimeoutMs);
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {

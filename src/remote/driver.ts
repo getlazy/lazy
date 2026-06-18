@@ -8,6 +8,7 @@
 
 import type { Task } from '../types';
 import type { Storage } from '../storage';
+import type { DestinationRestoreConflict } from '../git/operations';
 
 /**
  * Truncate a PR/MR title to 128 characters to avoid GitLab's 255-char limit.
@@ -118,9 +119,14 @@ export interface AcceptGateWarning {
  *   "Required checks pending"). The task should be set to 'merging' status.
  * - `failed`: Merge attempted but failed. `isConflict` indicates merge conflicts
  *   (caller can offer sync-with-upstream). Other failures are errors.
+ *
+ * On `merged`, `restoreConflict` is set when the merge committed durably but the
+ * destination worktree's stashed uncommitted work could not be auto-restored —
+ * the accept still succeeded; the caller hands the reconciliation to the
+ * destination worktree's owning task.
  */
 export type MergeResult =
-  | { status: 'merged'; metadata?: Record<string, string> }
+  | { status: 'merged'; metadata?: Record<string, string>; restoreConflict?: DestinationRestoreConflict }
   | { status: 'pending'; reason: string; metadata?: Record<string, string> }
   | { status: 'failed'; error: string; isConflict?: boolean; metadata?: Record<string, string> };
 

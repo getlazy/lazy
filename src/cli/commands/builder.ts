@@ -20,28 +20,39 @@ import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, tryRemoteStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
+import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
 import { isTTY, promptLine, promptYesNo } from '../editor';
 import { getProjectName } from '../../storage';
 import { theme } from '../theme';
+import { logger } from '../../utils/logger';
 import { createRunner, type Runner } from '../../runner';
 import { generateBuilderConfig } from '../../builder/server';
 import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
 import { checkDaemonHealth } from '../../daemon/lifecycle';
 import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
+import { resolveBuilderProjectsDir, pruneStaleBuilderProjectsDirs } from '../../builder/projects-isolation';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
+import { resolveBuilderChattiness, renderChattinessSnippet } from '../../config/chattiness';
 
 // Embedded at build/compile time — changes to these files require rebuild
 import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
 import modelGuidance from '../../prompts/model-guidance.md' with { type: 'text' };
 
 async function buildSystemPrompt(lazyRoot: string, runner: Runner): Promise<string> {
+  const config = await loadConfig(lazyRoot);
+
   // Inject runner-specific instructions into the template
   const runnerInstructions = runner.getBuilderInstructions().trimEnd();
-  let prompt = lazySystemPrompt.replace('{{RUNNER_INSTRUCTIONS}}', runnerInstructions).trimEnd();
+  let prompt = lazySystemPrompt.replace('{{RUNNER_INSTRUCTIONS}}', runnerInstructions);
+
+  // Inject the verbosity snippet near the top (placeholder sits right after the
+  // intro). Empty when unset, so the placeholder collapses to nothing.
+  const chattinessSnippet = renderChattinessSnippet(resolveBuilderChattiness(config));
+  prompt = prompt.replace('{{CHATTINESS}}', chattinessSnippet ? chattinessSnippet + '\n\n' : '');
+  prompt = prompt.trimEnd();
 
   if (await hasExplicitModelConfig(lazyRoot)) {
     // User configured a default model — tell builder to respect it
-    const config = await loadConfig(lazyRoot);
     const defaultModel = config.models.default;
     prompt += `\n\n## Model selection\n\nThe project is configured to use **${defaultModel}** as the default model (in lazy.toml).\nDo NOT pass \`--model\` when creating or starting tasks unless the engineer explicitly asks for a different model.\nOmitting \`--model\` lets the CLI use the configured default automatically.`;
   } else {
@@ -158,11 +169,26 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'yes', takesValue: false },
     { name: 'resume', takesValue: true, optionalValue: true },
     { name: 'effort', takesValue: true },
+    { name: 'model', takesValue: true },
   ];
   const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
   const autonomous = parsed.flags.get('autonomous') === true;
   const yes = parsed.flags.get('yes') === true;
   const resumeArg = parsed.flags.get('resume') ?? null;
+
+  // --model overrides which model the BUILDER itself runs as (distinct from the
+  // per-task --model used when starting tasks). No allow-list validation: new
+  // models ship faster than we can hard-code them, so pass through whatever the
+  // user gives. An empty value is rejected so we never append a dangling --model.
+  let modelOverride: string | undefined;
+  const modelValue = parsed.flags.get('model') as string | undefined;
+  if (modelValue !== undefined) {
+    if (modelValue.trim() === '') {
+      console.error('Invalid --model: a model id is required, e.g. --model mythos');
+      process.exit(1);
+    }
+    modelOverride = modelValue.trim();
+  }
 
   // --effort override > config.builder.effort > built-in default (enforced in loader: "high")
   let effortOverride: EffortLevel | undefined;
@@ -306,6 +332,50 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
   const builderEffort = effortOverride ?? config.builder.effort;
 
+  // Resolve the per-builder Claude projects-dir isolation ONCE, before the
+  // relaunch loop. The dir must be STABLE across the loop's iterations (so an
+  // upgrade relaunch's `--resume <id>` finds the prior segment's JSONL) yet
+  // DISTINCT between concurrent invocations. On resume we reuse the dir that
+  // already holds the target session; for a fresh run we mint a new one.
+  //
+  // SELF-HEALING: isolation is always attempted (docker/podman only — host-
+  // process can't isolate the real host home), but it must NEVER block the
+  // builder. This host-side step only creates/locates the dir; the docker
+  // runner does a write-probe as the container user and silently falls back to
+  // the shared ~/.claude/projects dir if the overlay won't work. Here we guard
+  // the host-side setup the same way: if the dir can't be created or the resume
+  // target lives in the shared dir (isolating would hide it and break --resume),
+  // we leave projectsDir undefined and Claude uses the shared dir as before.
+  const dataDirAbs = join(root, config.data.path);
+  let projectsDir: string | undefined;
+  if (runner.usesSandbox()) {
+    try {
+      const isolation = await resolveBuilderProjectsDir({ dataDirAbs, lazyRoot: root, resumeId });
+      projectsDir = isolation?.hostDir;
+      // Opportunistic cleanup so per-builder dirs don't accumulate. Best-effort —
+      // never block launching on a prune failure. Keep the active dir.
+      try {
+        const removed = await pruneStaleBuilderProjectsDirs(dataDirAbs, isolation?.id ?? null);
+        if (removed.length > 0) {
+          logger.info(`Cleaned up ${removed.length} stale builder session dir(s).`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`Could not prune stale builder session dirs: ${msg}`);
+      }
+    } catch (err) {
+      // Host-side isolation setup failed (e.g. the dir couldn't be created).
+      // Degrade gracefully: run against the shared dir rather than failing.
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        `Per-builder Claude projects isolation could not be set up (${msg}); ` +
+        `falling back to the shared ~/.claude/projects dir for this run. ` +
+        `Concurrent builders may cross-capture sessions.`,
+      );
+      projectsDir = undefined;
+    }
+  }
+
   // Launch the builder child once for a given resume id. The relaunch loop calls
   // this repeatedly: after an upgrade stops the child it re-launches with the
   // resolved --resume id. Each call builds its own args/config so the resume id
@@ -313,12 +383,36 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const launchOnce = async (rid: string | null): Promise<BuilderLaunchResult> => {
     // Add --dangerously-skip-permissions when in autonomous mode,
     // and --resume <id> when resuming a session.
+    // Resolve the builder's model via the per-role target. The explicit --model
+    // flag is a hard override: it wins over a configured model on EVERY backend,
+    // including ollama/proxy, while the backend+endpoint (the "server") stay as
+    // configured — so `lazy builder --model X` runs model X against whatever
+    // server the role points at. Without the flag, a local backend keeps forcing
+    // its authoritative model. An empty result means "omit --model" so Claude
+    // Code uses its own default — we resolve to a single value here so we never
+    // append two --model args to the Claude Code child (which would be ambiguous).
+    const builderTarget = resolveRoleTarget('builder', config, { overrideModel: modelOverride });
+    // An explicit --model that resolves to the anthropic backend (no local server
+    // configured for this role) must be a model the Anthropic API can actually
+    // serve. Reject an unrecognized name up front instead of handing it to Claude
+    // Code and failing opaquely at runtime. `claude-*` is the escape hatch for
+    // models newer than our known list; to run anything else (e.g. a local model),
+    // configure a server in lazy.toml [models.roles.builder].
+    if (modelOverride && builderTarget.backend === 'anthropic' && !isKnownAnthropicModel(modelOverride)) {
+      console.error(
+        `Unknown --model "${modelOverride}". lazy recognizes Anthropic models ` +
+        `(claude-*, or ${KNOWN_ANTHROPIC_SHORT_NAMES.join('/')}). To run a different model, ` +
+        `configure a local server in lazy.toml [models.roles.builder] ` +
+        `(backend = "ollama" or "proxy", with an endpoint).`,
+      );
+      process.exit(1);
+    }
+    const resolvedModel = builderTarget.model || undefined;
+
     const claudeExtraArgs = [
       ...(autonomous ? ['--dangerously-skip-permissions'] : []),
       ...(rid ? ['--resume', rid] : []),
-      // When Ollama is enabled, force Claude Code to use the Ollama model.
-      // Without this, Claude Code defaults to its own model (opus) which doesn't exist in Ollama.
-      ...(config.ollama.enabled && config.ollama.model ? ['--model', config.ollama.model] : []),
+      ...(resolvedModel ? ['--model', resolvedModel] : []),
       '--effort', builderEffort,
     ];
 
@@ -339,7 +433,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
       try {
         const result = await runner.launchBuilderInteractive(
-          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath,
+          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath, projectsDir,
         );
         return { exitCode: result.exitCode, sessionId: result.sessionId, builderId: id };
       } finally {
@@ -429,11 +523,17 @@ Flags:
   --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
   --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
                        Defaults to lazy.toml [builder].effort (default "high")
+  --model <id>         Override the model the builder itself runs as (passed
+                       straight through to Claude Code's --model; no allow-list,
+                       so brand-new models work). Takes precedence over the
+                       Ollama-injected model. This is the BUILDER's model, not
+                       the per-task --model used when starting tasks.
 
 Examples:
   lazy builder                    # Start new session
   lazy builder --resume <uuid>    # Resume a specific session
   lazy builder --resume           # Resume from LAZY_LAST_SESSION_ID
   lazy builder list               # List captured conversations
-  lazy builder --autonomous       # Run without permission prompts`);
+  lazy builder --autonomous       # Run without permission prompts
+  lazy builder --model mythos     # Run the builder on a specific model`);
 }

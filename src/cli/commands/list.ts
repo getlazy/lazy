@@ -7,6 +7,7 @@ import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
 import { parentTaskIdOf } from '../../task-target';
+import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
 
 export interface TaskWithSession {
   task: Task;
@@ -15,6 +16,12 @@ export interface TaskWithSession {
   children: TaskWithSession[];
   retryCount?: number;
   crashed?: boolean;
+  /**
+   * Derived working substate (agent / harness:<phase> / not-alive) for `working`
+   * tasks. Observational only — never changes task state. Undefined for
+   * non-working tasks or when no substate can be derived.
+   */
+  workingSubstate?: WorkingSubstate;
 }
 
 export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: string): Promise<TaskWithSession[]> {
@@ -26,23 +33,33 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
     const session = await storage.getSessionByTaskId(task.id);
     let retryCount: number | undefined;
     let crashed = false;
+    let isAlive = false;
+    let workingSubstate: WorkingSubstate | undefined;
 
-    // Check if task is in retry state
-    if (task.status === 'working' && session) {
-      const protoDir = getProtocolDir(task.id);
-      const status = readStatus(protoDir);
-      if (status?.phase === 'retrying' && status.retryCount !== undefined) {
-        retryCount = status.retryCount;
-      }
-    }
-
-    // Check for crashed run (non-terminal tasks with dead runs)
+    // Probe run liveness for non-terminal tasks. One runner call feeds both the
+    // crashed indicator and the working-substate derivation.
     if (session && !['complete', 'abandoned'].includes(task.status)) {
       const tRef = taskRef(task);
       const cn = session.container_name ?? runner.runNameForTask(tRef);
       const info = await runner.getRunInfo(cn);
       if (info && !info.running) {
         crashed = true;
+      }
+      isAlive = info?.running === true;
+    }
+
+    if (task.status === 'working' && session) {
+      const protoDir = getProtocolDir(task.id);
+
+      // Derive the working substate (agent / harness:<phase> / not-alive) from
+      // status.json + liveness — the single shared derivation used by every
+      // read surface.
+      workingSubstate = (await computeWorkingSubstate(protoDir, isAlive)) ?? undefined;
+
+      // Retry count (when retrying) is surfaced separately alongside the substate.
+      const status = readStatus(protoDir);
+      if (status?.phase === 'retrying' && status.retryCount !== undefined) {
+        retryCount = status.retryCount;
       }
     }
 
@@ -53,6 +70,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
       children: [],
       retryCount,
       crashed,
+      workingSubstate,
     });
   }
 
@@ -128,6 +146,14 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = task.status;
   }
 
+  // For working tasks, decorate the status with the derived substate
+  // (working(agent) / working(harness:<phase>) / working(not-alive)) so a busy
+  // post-turn check is distinguishable from a hung or dead supervisor.
+  const isNotAlive = node.workingSubstate?.kind === 'not-alive';
+  if (task.status === 'working' && status === 'working' && node.workingSubstate) {
+    status = renderWorkingStatus(node.workingSubstate);
+  }
+
   // Add retry count to status if retrying
   if (node.retryCount !== undefined && node.retryCount > 0) {
     status = `${status} (retry ${node.retryCount})`;
@@ -138,8 +164,9 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = `${status} (auto)`;
   }
 
-  // Add crashed indicator
-  if (node.crashed) {
+  // Add crashed indicator — but not when the working substate already conveys
+  // not-alive (the same dead-run fact), to avoid a redundant double signal.
+  if (node.crashed && !isNotAlive) {
     status = `${status} [CRASHED]`;
   }
 
@@ -249,24 +276,36 @@ function renderListOutput(
     }
   } else {
     // Flat list
-    const tasks = flattenTree(tree).map(n => n.task);
-    const parentDisplayId = buildDisplayIdMap(tasks);
+    const nodes = flattenTree(tree);
+    const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
     console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
-    for (const task of tasks) {
+    for (const node of nodes) {
+      const task = node.task;
       const parentId = parentTaskIdOf(task);
       const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
       );
     }
   }
 
   printCrashedFootnote(countCrashed(tree));
+}
+
+/**
+ * Status text for a node in flat views: plain task status, decorated with the
+ * working substate for `working` tasks so flat views match the tree view.
+ */
+function flatStatusText(node: TaskWithSession): string {
+  if (node.task.status === 'working' && node.workingSubstate) {
+    return renderWorkingStatus(node.workingSubstate);
+  }
+  return node.task.status;
 }
 
 /** Flatten a TaskWithSession tree into a flat array, depth-first. */
@@ -348,19 +387,20 @@ function renderActiveOutput(
       printTaskTree(rootNode);
     }
   } else {
-    const tasks = flattenTree(tree).map(n => n.task);
-    const parentDisplayId = buildDisplayIdMap(tasks);
+    const nodes = flattenTree(tree);
+    const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
     console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
-    for (const task of tasks) {
+    for (const node of nodes) {
+      const task = node.task;
       const parentId = parentTaskIdOf(task);
       const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
       );
     }
   }
@@ -402,14 +442,15 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
     console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
     console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
 
-    for (const { task } of flatNodes) {
+    for (const node of flatNodes) {
+      const task = node.task;
       const parentId = parentTaskIdOf(task);
       const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
       const code = displayId(task);
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(task.status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
       );
     }
   }

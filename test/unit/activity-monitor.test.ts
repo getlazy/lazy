@@ -1,5 +1,9 @@
-import { describe, test, expect } from 'bun:test';
-import { parseSupervisorLogLine } from '../../src/cli/activity-monitor';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { ActivityMonitor, parseSupervisorLogLine } from '../../src/cli/activity-monitor';
+import { createRunnerFromType } from '../../src/runner';
 
 describe('parseSupervisorLogLine', () => {
   test('formats phase transitions', () => {
@@ -52,5 +56,54 @@ describe('parseSupervisorLogLine', () => {
 
   test('handles lines without timestamp prefix', () => {
     expect(parseSupervisorLogLine('[supervisor] Phase: work')).toBe('Agent working...');
+  });
+});
+
+// INVARIANT: ActivityMonitor must discover the agent's JSONL via the runner's
+// own session-log location — NOT a hard-coded sandbox path. For a host-process
+// runner that means the real host HOME. This guards against the regression
+// where the loop dashboard shows no agent activity for host-runner tasks.
+describe('ActivityMonitor (runner-driven discovery)', () => {
+  let worktree: string;
+  let fakeHome: string;
+  let originalHome: string | undefined;
+
+  beforeEach(async () => {
+    worktree = await mkdtemp(join(tmpdir(), 'lazy-am-wt-'));
+    fakeHome = await mkdtemp(join(tmpdir(), 'lazy-am-home-'));
+    originalHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+  });
+
+  afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    await rm(worktree, { recursive: true, force: true });
+    await rm(fakeHome, { recursive: true, force: true });
+  });
+
+  test('drains tool-call activity from the host-runner session log', async () => {
+    const runner = createRunnerFromType('dangerously-host-process-without-any-isolation');
+    const projDir = runner.agentSessionProjectDir(worktree);
+    await mkdir(projDir, { recursive: true });
+
+    const entry = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/repo/src/index.ts' } }],
+      },
+    });
+    await writeFile(join(projDir, 'sess.jsonl'), entry + '\n', 'utf-8');
+
+    const monitor = new ActivityMonitor(runner, worktree, 'task1234');
+    // start() kicks an immediate async poll; give it a beat to read the file.
+    monitor.start(50);
+    await Bun.sleep(120);
+    monitor.stop();
+
+    const lines = monitor.drain();
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.some((l) => l.activity.includes('Reading') && l.activity.includes('index.ts'))).toBe(true);
   });
 });

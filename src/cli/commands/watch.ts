@@ -26,17 +26,18 @@ import { theme, dim } from '../theme';
 import { findLatestSessionFile } from '../../agent/session-discovery';
 import { renderEntry, type RawLogEntry } from '../watch-renderer';
 import { createRunner } from '../../runner';
-import type { FollowHandle } from '../../runner/types';
+import type { FollowHandle, Runner } from '../../runner/types';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { renderStatusHeader } from '../status-header';
+import { computeWorkingSubstate, formatWorkingSubstate } from '../../utils/working-substate';
 
 const POLL_INTERVAL_MS = 500;
 const STATUS_CHECK_INTERVAL_MS = 5000;
 
 // ── Session file discovery ──────────────────────────────────────────────
 
-async function findSessionFile(worktreePath: string): Promise<string | null> {
-  const info = await findLatestSessionFile(worktreePath);
+async function findSessionFile(projectDir: string): Promise<string | null> {
+  const info = await findLatestSessionFile(projectDir);
   return info?.path ?? null;
 }
 
@@ -97,19 +98,27 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
 
   console.log(`Watching task ${theme.taskId(display)}...\n`);
 
-  // Print initial header (if status.json exists)
-  printHeader(protoDir);
+  // The runner is the source of truth for where the agent writes its session
+  // JSONL, so we create it up front (construction is cheap and doesn't touch
+  // Docker) and ask it for the project dir to tail.
+  const runner = await createRunner(root);
+  const projectDir = runner.agentSessionProjectDir(worktreePath);
 
-  // Start tailing supervisor stdout via the runner
+  // Start tailing supervisor stdout via the runner. Keep the run name in scope
+  // so the header can also probe run liveness for the substate.
   let followHandle: FollowHandle | null = null;
+  let runName: string | null = null;
   try {
-    const runner = await createRunner(root);
     const session = await storage.getSessionByTaskId(task.id);
-    const runName = session?.container_name ?? runner.runNameForTask(taskRef(task));
+    runName = session?.container_name ?? runner.runNameForTask(taskRef(task));
     followHandle = runner.followOutput(runName);
   } catch {
-    // Runner unavailable (e.g. Docker not running) — agent stream still works.
+    // Supervisor follow unavailable (e.g. Docker daemon down) — agent stream
+    // still works because it reads the JSONL directly off the filesystem.
   }
+
+  // Print initial header (if status.json exists)
+  await printHeader(protoDir, runner, runName);
 
   let supervisorReaderDone = false;
   if (followHandle?.stdout) {
@@ -145,7 +154,7 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
 
   // Wait for the agent's JSONL session file to appear (best effort — task
   // may be in pre-turn phases where the agent has not started yet).
-  let sessionFile = await findSessionFile(worktreePath);
+  let sessionFile = await findSessionFile(projectDir);
 
   let lastFileSize = 0;
   let lastStatusCheck = Date.now();
@@ -167,7 +176,7 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
 
   try {
     while (running) {
-      const newSessionFile = await findSessionFile(worktreePath);
+      const newSessionFile = await findSessionFile(projectDir);
       if (newSessionFile && newSessionFile !== currentSessionFile) {
         currentSessionFile = newSessionFile;
         lastFileSize = 0;
@@ -211,7 +220,7 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
       // Refresh header every 5s alongside the status check
       if (now - lastHeaderPrint >= STATUS_CHECK_INTERVAL_MS) {
         lastHeaderPrint = now;
-        printHeader(protoDir);
+        await printHeader(protoDir, runner, runName);
       }
 
       if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
@@ -238,9 +247,28 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
   }
 }
 
-function printHeader(protoDir: string): void {
+async function printHeader(
+  protoDir: string,
+  runner: Runner | null,
+  runName: string | null,
+): Promise<void> {
   const status = readStatus(protoDir);
-  process.stdout.write(dim(renderStatusHeader(status)) + '\n');
+  let line = renderStatusHeader(status);
+
+  // Append the derived substate (agent / harness:<phase> / not-alive), reconciled
+  // with run liveness via the shared derivation, when the runner is available.
+  if (runner && runName) {
+    try {
+      const info = await runner.getRunInfo(runName);
+      const substate = await computeWorkingSubstate(protoDir, info?.running === true);
+      if (substate) line += `  [${formatWorkingSubstate(substate)}]`;
+    } catch {
+      // Liveness probe failed (runner hiccup) — the supervisor header is still
+      // useful on its own, so render it without the substate suffix.
+    }
+  }
+
+  process.stdout.write(dim(line) + '\n');
 }
 
 async function readTail(filePath: string, start: number, end: number): Promise<string | null> {

@@ -21,6 +21,7 @@ import type {
 } from './driver';
 import type { Task } from '../types';
 import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch } from '../git/operations';
+import type { DestinationRestoreConflict } from '../git/operations';
 import { runGit } from '../utils/git';
 
 export class LocalDriver implements RepositoryDriver {
@@ -64,8 +65,9 @@ export class LocalDriver implements RepositoryDriver {
     const preSquashSha = preSquashShaResult.stdout.trim();
 
     // Perform the squash merge — local merges are always immediate, never pending
+    let restoreConflict: DestinationRestoreConflict | null = null;
     try {
-      await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody);
+      restoreConflict = await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody);
     } catch (err) {
       return {
         status: 'failed',
@@ -87,7 +89,7 @@ export class LocalDriver implements RepositoryDriver {
       };
     }
 
-    return { status: 'merged' };
+    return { status: 'merged', restoreConflict: restoreConflict ?? undefined };
   }
 
   async getChecksStatus(_task: Task): Promise<ChecksStatusResult> {

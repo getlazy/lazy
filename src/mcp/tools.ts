@@ -48,7 +48,19 @@ import type { TaskTarget } from '../types';
 import { parentTaskIdOf, taskTarget, branchTarget } from '../task-target';
 import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
 
-import { queryWait } from '../daemon/rpc-fallback';
+import {
+  queryWait,
+  queryStartTask,
+  queryUnblockTask,
+  queryAskTask,
+  queryAcceptTask,
+  queryRejectTask,
+  queryCloseTask,
+  queryStopTask,
+  querySubmitTask,
+  querySyncTask,
+  queryReparentTask,
+} from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
 import {
@@ -68,25 +80,20 @@ import {
   type DiffStat,
 } from './confirmation-context';
 
-// Import daemon lifecycle functions for direct invocation (no subprocess spawning)
-import { launchTask, type StartTaskParams } from '../daemon/task-launcher';
+// Lifecycle parameter types. The lifecycle operations themselves are invoked
+// through the query* RPC-fallback layer (see ../daemon/rpc-fallback), NOT by
+// calling the daemon functions directly: a direct call obtains storage via
+// getOrCreateStorage(), which only works inside the daemon process. Routing
+// through query*/tryRpc forwards to the daemon over RPC when this handler runs
+// in a builder/pairing process and falls back to the direct daemon function
+// under LAZY_IS_DAEMON=1 / LAZY_TEST=1 — without spawning a lazy subprocess.
+import { type StartTaskParams } from '../daemon/task-launcher';
 import {
-  launchUnblockTask,
-  launchAskTask,
-  rejectTask,
-  closeTask,
-  stopTask,
-  acceptTaskPreflight,
-  acceptTask,
-  syncTask,
-  reparentTask,
-  submitTask,
   type UnblockTaskParams,
   type AskTaskParams,
   type RejectTaskParams,
   type CloseTaskParams,
   type StopTaskParams,
-  type AcceptTaskPreflightParams,
   type AcceptTaskParams,
   type SyncTaskParams,
   type ReparentTaskParams,
@@ -1122,12 +1129,21 @@ export function createConversationReadHandler(ctx: McpToolContext): McpToolHandl
 // ---------------------------------------------------------------------------
 // Lifecycle tools: lazy_start, lazy_unblock, lazy_accept, lazy_reject, lazy_close, lazy_submit
 //
-// IMPORTANT: These handlers call daemon lifecycle functions DIRECTLY — never
-// spawn lazy CLI as a subprocess. Spawning lazy from within the daemon causes
-// deadlocks (child RPCs back to parent) and storage lock contention.
+// IMPORTANT: These handlers hand the lifecycle operation off through the query*
+// RPC-fallback layer (src/daemon/rpc-fallback.ts) — never by spawning a lazy
+// CLI subprocess. Spawning lazy from within the daemon causes deadlocks (child
+// RPCs back to parent) and storage lock contention; that lazy-on-lazy spawning
+// was deliberately eliminated and must not return.
 //
-// The daemon has direct access to storage, runners, and all task lifecycle
-// functions. Use them directly instead of forking processes.
+// Why query*/tryRpc rather than calling the daemon function (launchTask,
+// acceptTask, …) directly: those obtain storage via getOrCreateStorage(), which
+// only works inside the daemon process (where initDaemonStorage() has run). When
+// an MCP handler runs in a builder/pairing process, ctx.storage is undefined —
+// reads/comments reach the daemon via RemoteStorage, but a direct lifecycle call
+// has no initialized storage and throws "Daemon storage not initialized". The
+// query* layer forwards to the daemon over RPC when not in-daemon and falls back
+// to the direct daemon function under LAZY_IS_DAEMON=1 / LAZY_TEST=1 — an
+// in-process RPC call, NOT a subprocess — so these tools work in both contexts.
 // ---------------------------------------------------------------------------
 
 /** Parse git diff --shortstat output into structured numbers. */
@@ -1243,14 +1259,21 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const model = args.model as string | undefined;
 
-    const root = requireLazyRoot();
     const params: StartTaskParams = {
       taskId,
       modelOverride: model,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
     };
 
-    const result = await launchTask(root, params);
+    // Route through queryStartTask (the RPC layer) rather than calling
+    // launchTask() directly. launchTask uses getOrCreateStorage(), which only
+    // works inside the daemon process (where initDaemonStorage() has run). When
+    // this handler executes in a builder/pairing process — ctx.storage is
+    // undefined and other tools reach the daemon via RemoteStorage — a direct
+    // launchTask() throws "Daemon storage not initialized". queryStartTask works
+    // in both contexts: it forwards to the daemon via RPC when not in-daemon,
+    // and falls back to the direct handler under LAZY_IS_DAEMON=1 / LAZY_TEST=1.
+    const result = await queryStartTask(params);
 
     return {
       output: `Started task ${result.sessionId} on branch ${result.branchName}`,
@@ -1354,7 +1377,6 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const root = requireLazyRoot();
     const params: UnblockTaskParams = {
       taskId,
       message: feedback,
@@ -1364,7 +1386,7 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       notesInEditor: false,
     };
 
-    const result = await launchUnblockTask(root, params);
+    const result = await queryUnblockTask(params);
 
     return {
       output: `Unblocked task ${result.sessionId} on branch ${result.branchName}`,
@@ -1380,10 +1402,10 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
 export const askTool: McpTool = {
   name: 'lazy_ask',
   description:
-    'Ask a blocked task\'s agent a free-form question and get its answer back. ' +
+    'Ask a paused task\'s agent a free-form question and get its answer back. ' +
     'Read-only: resumes the agent\'s session in plan mode — does NOT unblock the task, ' +
     'commit, or modify the worktree. Synchronous: blocks until the agent responds. ' +
-    'The task must be in \'blocked\' status and have an existing agent session. ' +
+    'The task must be in \'blocked\' or \'conflict\' status and have an existing agent session. ' +
     'Uses the same mechanism as `lazy review -i`\'s ask (`a`) action. ' +
     'Prefer this over re-reading the diff when you need the agent\'s intent or reasoning rather than facts.',
   inputSchema: {
@@ -1442,24 +1464,23 @@ export function createAskHandler(ctx: McpToolContext): McpToolHandler {
           `Task ${shortId(task.id)} has no agent session to resume — cannot ask until the agent has run at least once.`,
         );
       }
-      if (task.status !== 'blocked') {
+      if (task.status !== 'blocked' && task.status !== 'conflict') {
         throw new Error(
-          `Task ${shortId(task.id)} is '${task.status}', not 'blocked'. ` +
-          `Ask only runs against a blocked task — wait until the agent is paused for review.`,
+          `Task ${shortId(task.id)} is '${task.status}', not 'blocked' or 'conflict'. ` +
+          `Ask only runs against a blocked or conflict task — wait until the agent is paused for review.`,
         );
       }
     } finally {
       await storage.close();
     }
 
-    const root = requireLazyRoot();
     const params: AskTaskParams = {
       taskId,
       message,
       effortOverride: effort,
     };
 
-    const result = await launchAskTask(root, params);
+    const result = await queryAskTask(params);
 
     return {
       answer: result.answer,
@@ -1511,7 +1532,6 @@ async function executeAccept(
   reason: string | undefined,
   approvedFiles: string[] | undefined,
 ): Promise<{ output: string; status: string; prUrl?: string; warnings: string[] }> {
-  const root = requireLazyRoot();
   const params: AcceptTaskParams = {
     taskId,
     reason,
@@ -1519,7 +1539,7 @@ async function executeAccept(
     acceptDirtyWorktree: false,
   };
 
-  const result = await acceptTask(root, params);
+  const result = await queryAcceptTask(params);
 
   const statusMsg = result.status === 'merged'
     ? `Task ${result.displayId} accepted and merged`
@@ -1680,14 +1700,13 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_reject without a code to get a new one.');
         }
 
-        const root = requireLazyRoot();
         const params: RejectTaskParams = {
           taskId,
           reason: reason || '',
           acceptDirtyWorktree,
         };
 
-        const result = await rejectTask(root, params);
+        const result = await queryRejectTask(params);
 
         return {
           output: `Rejected task ${result.displayId} (${result.branchName})`,
@@ -1779,14 +1798,13 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_close without a code to get a new one.');
         }
 
-        const root = requireLazyRoot();
         const params: CloseTaskParams = {
           taskId,
           reason: reason || '',
           acceptDirtyWorktree,
         };
 
-        const result = await closeTask(root, params);
+        const result = await queryCloseTask(params);
 
         return {
           output: `Closed task ${result.displayId} (${result.branchName})`,
@@ -1870,9 +1888,8 @@ export function createStopHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const root = requireLazyRoot();
     const params: StopTaskParams = { taskId, reason: reason.trim() };
-    const result = await stopTask(root, params);
+    const result = await queryStopTask(params);
 
     return {
       output: `Stopped task ${result.displayId}: ${result.reason}`,
@@ -1908,12 +1925,11 @@ export function createSubmitHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
 
-    const root = requireLazyRoot();
     const params: SubmitTaskParams = {
       taskId,
     };
 
-    const result = await submitTask(root, params);
+    const result = await querySubmitTask(params);
 
     return {
       output: `Submitted task ${result.displayId}`,
@@ -1957,7 +1973,6 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
 
     // Resume is like unblock but for interrupted tasks, without a feedback message.
     // Use unblock with a standard resume message.
-    const root = requireLazyRoot();
     const params: UnblockTaskParams = {
       taskId,
       message: '[Resumed after interruption]',
@@ -1966,7 +1981,7 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
       notesInEditor: false,
     };
 
-    const result = await launchUnblockTask(root, params);
+    const result = await queryUnblockTask(params);
 
     return {
       output: `Resumed task ${result.sessionId} on branch ${result.branchName}`,
@@ -2816,12 +2831,11 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
 
-    const root = requireLazyRoot();
     const params: SyncTaskParams = {
       taskId,
     };
 
-    const result = await syncTask(root, params);
+    const result = await querySyncTask(params);
 
     return {
       output: result.message,
@@ -2870,13 +2884,12 @@ export function createReparentHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const parent = args.parent as string;
 
-    const root = requireLazyRoot();
     const params: ReparentTaskParams = {
       taskId,
       parent,
     };
 
-    const result = await reparentTask(root, params);
+    const result = await queryReparentTask(params);
 
     return {
       output: result.message,

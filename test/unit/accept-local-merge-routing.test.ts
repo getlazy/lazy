@@ -30,9 +30,13 @@ let mockParent: any = null;
 let mockSession: any = null;
 let mockCommits: any[] = [];
 let remoteProtected = false;
+// When true, createDriver returns a LocalDriver (needsSync === false), simulating
+// lazy configured offline/local — there is no remote, so accept must push nothing.
+let localConfigDriver = false;
 
 // --- Call recorders ---
 let remoteCalls: string[] = [];
+let pushedBranches: string[] = [];
 let localMergeTargets: string[] = [];
 let localDriverInstantiated = 0;
 
@@ -40,7 +44,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false },
     storage: { backend: 'external', external_path: '' },
-    models: { default: 'claude-opus-4-7' },
+    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
@@ -55,28 +59,11 @@ await mockModule(resolve(import.meta.dir, '../../src/daemon/rpc-handlers.ts'), (
 // The remote driver (createDriver) records every call so we can assert that the
 // MR/PR path was NOT taken for an unprotected target. A real LocalDriver mock
 // records the merge target so we can assert the local merge actually ran.
-await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
-  detectRemote: () => null,
-  createDriver: () => ({
-    needsSync: true,
-    validateAccept: () => { remoteCalls.push('validateAccept'); return null; },
-    hasRemoteRef: () => true,
-    hasExternalApproval: async () => true,
-    isTargetBranchProtected: async () => { remoteCalls.push('isTargetBranchProtected'); return remoteProtected; },
-    pushBranch: async () => { remoteCalls.push('pushBranch'); },
-    markReadyForReview: async () => { remoteCalls.push('markReadyForReview'); return { metadata: { gitlab_remote_ref_id: '1' } }; },
-    getPRState: async () => null,
-    getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
-    getTaskUrl: async () => 'https://gitlab/mr/1',
-    postAcceptReview: async () => null,
-    checkAcceptGates: async () => { remoteCalls.push('checkAcceptGates'); return []; },
-    merge: async () => { remoteCalls.push('merge'); return { status: 'merged' as const, metadata: {} }; },
-    fastForwardLocal: async () => ({ success: true }),
-    postTurnSummary: async () => {},
-    updateRemoteBody: async () => {},
-    recoverRemoteRef: async () => null,
-  }),
-  LocalDriver: class {
+await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
+  // The LocalDriver mock records the merge target so we can assert the local
+  // merge ran, and (critically) its pushBranch is a no-op — exactly like the
+  // real LocalDriver — so a local merge never touches a remote.
+  const LocalDriver = class {
     needsSync = false;
     constructor() { localDriverInstantiated++; }
     validateAccept() { return null; }
@@ -90,8 +77,33 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
     async postAcceptReview() { return null; }
     async getTaskUrl() { return null; }
     async updateRemoteBody() {}
-  },
-}));
+  };
+  return {
+    detectRemote: () => null,
+    // createDriver returns a LocalDriver when lazy is configured offline/local,
+    // and the recording remote driver otherwise — mirroring the real factory.
+    createDriver: () => localConfigDriver ? new LocalDriver() : ({
+      needsSync: true,
+      validateAccept: () => { remoteCalls.push('validateAccept'); return null; },
+      hasRemoteRef: () => true,
+      hasExternalApproval: async () => true,
+      isTargetBranchProtected: async () => { remoteCalls.push('isTargetBranchProtected'); return remoteProtected; },
+      pushBranch: async (branch: string) => { remoteCalls.push('pushBranch'); pushedBranches.push(branch); },
+      markReadyForReview: async () => { remoteCalls.push('markReadyForReview'); return { metadata: { gitlab_remote_ref_id: '1' } }; },
+      getPRState: async () => null,
+      getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
+      getTaskUrl: async () => 'https://gitlab/mr/1',
+      postAcceptReview: async () => null,
+      checkAcceptGates: async () => { remoteCalls.push('checkAcceptGates'); return []; },
+      merge: async () => { remoteCalls.push('merge'); return { status: 'merged' as const, metadata: {} }; },
+      fastForwardLocal: async () => ({ success: true }),
+      postTurnSummary: async () => {},
+      updateRemoteBody: async () => {},
+      recoverRemoteRef: async () => null,
+    }),
+    LocalDriver,
+  };
+});
 
 await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => ({
   hasUncommittedChanges: async () => false,
@@ -228,16 +240,27 @@ describe('acceptTask: merge routing (PRs only for protected branches)', () => {
     mockSession = makeSession();
     mockCommits = [{ sha: 'commit1', message: 'work' }];
     remoteCalls = [];
+    pushedBranches = [];
     localMergeTargets = [];
     localDriverInstantiated = 0;
     remoteProtected = false;
+    localConfigDriver = false;
     mockParent = null;
   });
 
-  // INVARIANT: PRs only for protected branches / subtask→parent merges are local.
-  // A child task whose parent is an unprotected `lazy/...` branch must be merged
-  // LOCALLY into that parent branch — no MR is created and no remote merge runs.
-  test('child task into unprotected lazy/ parent does a LOCAL merge, opens NO MR', async () => {
+  // INVARIANT: PRs only for protected branches / subtask→parent merges are local,
+  // BUT a local merge into a remote-backed unprotected parent MUST still push the
+  // merged parent branch to origin (a plain branch push, NOT a PR/MR).
+  //
+  // This test previously asserted pushBranch was NEVER called — that encoded the
+  // "local-always-ahead" bug as correct behavior. The bug: a local squash merge
+  // wrote the merge commit only to local <parent>, never pushing it, so local
+  // <parent> drifted permanently ahead of origin/<parent> AND `lazy sync` read a
+  // stale origin/<parent> and falsely reported "Already up to date". The fix
+  // (task fix-push-after-local-merge): after a successful local merge, push the
+  // parent branch via the ORIGINAL remote driver. We still open NO MR and run NO
+  // remote merge — only a plain branch push.
+  test('child task into unprotected lazy/ parent does a LOCAL merge then pushes the parent (NO MR)', async () => {
     mockParent = { ...makeTask({ kind: 'branch', branch: 'main' }), id: 'parent-id-87654321', status: 'blocked' };
     mockTask = makeTask({ kind: 'task', parentTaskId: 'parent-id-87654321' });
 
@@ -247,12 +270,34 @@ describe('acceptTask: merge routing (PRs only for protected branches)', () => {
     // The local merge ran against the parent branch...
     expect(localDriverInstantiated).toBe(1);
     expect(localMergeTargets).toEqual(['lazy/parent-branch']);
-    // ...and NOTHING on the remote driver opened or merged an MR.
+    // ...NO MR was opened and NO remote merge ran...
     expect(remoteCalls).not.toContain('markReadyForReview');
     expect(remoteCalls).not.toContain('merge');
-    expect(remoteCalls).not.toContain('pushBranch');
+    // ...but the merged parent branch WAS pushed to origin (plain branch push)
+    // so local and origin stay in lockstep and sync reads a fresh upstream.
+    expect(remoteCalls).toContain('pushBranch');
+    expect(pushedBranches).toEqual(['lazy/parent-branch']);
     // No PR URL for a local merge.
     expect(result.prUrl).toBeUndefined();
+  });
+
+  // INVARIANT: when lazy is configured offline/local there is NO remote, so a
+  // local merge MUST NOT attempt any push. `createDriver` returns a LocalDriver
+  // (needsSync === false), making useLocalMerge false, so the post-merge parent
+  // push is skipped entirely.
+  test('local/offline config does a LOCAL merge and pushes nothing', async () => {
+    localConfigDriver = true;
+    mockParent = { ...makeTask({ kind: 'branch', branch: 'main' }), id: 'parent-id-87654321', status: 'blocked' };
+    mockTask = makeTask({ kind: 'task', parentTaskId: 'parent-id-87654321' });
+
+    const result = await acceptTask('/tmp/test', { taskId: 'child-task' });
+
+    expect(result.status).toBe('merged');
+    // The merge ran locally against the parent branch...
+    expect(localMergeTargets).toEqual(['lazy/parent-branch']);
+    // ...and nothing was ever pushed — there is no remote.
+    expect(remoteCalls).not.toContain('pushBranch');
+    expect(pushedBranches).toEqual([]);
   });
 
   // INVARIANT: The intermediate-parent merge target must NEVER require a network

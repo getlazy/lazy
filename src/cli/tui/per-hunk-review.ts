@@ -973,10 +973,10 @@ class AskAborted extends Error {
 }
 
 /**
- * Send a review question to the agent via the daemon's unblock RPC with
- * `permissionMode: 'plan'`. The daemon enforces that the task is in `blocked`
- * status — this is the only way a review question ever turns into an agent
- * turn. If the daemon has auto-transitioned the task (CI failure, upstream
+ * Send a review question to the agent via the daemon's ask RPC (read-only,
+ * plan-mode resume). The daemon enforces that the task is in `blocked` or
+ * `conflict` status — this is the only way a review question ever turns into an
+ * agent turn. If the daemon has auto-transitioned the task (CI failure, upstream
  * sync, incoming comment), we get a 409 and surface it to the reviewer.
  *
  * Waits for `response.json` written by the supervisor, then returns its

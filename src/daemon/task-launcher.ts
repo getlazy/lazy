@@ -23,6 +23,8 @@ import { mkdir, writeFile } from 'fs/promises';
 import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
+import { resolveAgentModel } from '../utils/role-target';
+import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
 import { createDriver } from '../remote';
 import { getOrCreateStorage } from './rpc-handlers';
@@ -431,11 +433,12 @@ export async function launchTask(
     const sandbox = await setupSandbox(worktreePath);
 
     // --- Model resolution ---
-    // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
-    // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
-    const modelName = (config.ollama.enabled && config.ollama.model && t.agent_id === 'claude-code')
-      ? config.ollama.model
-      : (params.modelOverride ?? t.model ?? config.models.default);
+    // Per-role model resolution: a local backend (ollama/proxy) forces its
+    // authoritative model; otherwise CLI flag > task.model > default.
+    const modelName = resolveAgentModel(config, {
+      preferredModel: params.modelOverride ?? t.model,
+      agentId: t.agent_id,
+    });
     const modelId = modelName;
 
     if (!t.model) {
@@ -455,7 +458,7 @@ export async function launchTask(
       turnPrompt = preamble + '\n---\n\n' + t.prompt;
     }
 
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions());
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)));
     const fullPrompt = buildPromptWithInstructions(turnPrompt, t.goal, true, projectRoot, notesCtx);
 
     // --- Persist state BEFORE launch (crash-safe) ---

@@ -558,10 +558,15 @@ export function taskDetailHtml(
       const usageInfo = turn.usage
         ? ` <span class="turn-tokens">${escapeHtml(formatTokenCount(totalInputTokens(turn.usage)))} in, ${escapeHtml(formatTokenCount(turn.usage.outputTokens))} out</span>`
         : '';
+      // Label human-role turns by their authoring actor (e.g. 'supervisor' for
+      // push-back/maintain prompts) so the UI distinguishes them from the human.
+      const authorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
+        ? turn.actor
+        : turn.role;
       return `
       <div class="turn">
         <div class="turn-header">
-          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(turn.role)}] ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}</span>
+          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(authorLabel)}] ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}</span>
         </div>
         <div class="turn-content">${preview}</div>
       </div>
@@ -774,11 +779,17 @@ export function turnDetailHtml(
     ${turnNav}
   `;
 
-  // Human turn
+  // Human turn — heading reflects the authoring actor (e.g. "Supervisor" for a
+  // push-back/maintain prompt) so it's not mislabeled as the human's words.
   if (humanTurn) {
+    const authorHeading = humanTurn.actor === 'supervisor'
+      ? 'Supervisor'
+      : humanTurn.actor === 'builder'
+        ? 'Builder'
+        : 'Human';
     content += `
       <div class="detail-section">
-        <h2>Human</h2>
+        <h2>${authorHeading}</h2>
         <div class="turn-content">${renderMarkdown(humanTurn.content)}</div>
       </div>
     `;

@@ -17,6 +17,10 @@ describe('GitHubDriver 422 self-approval handling', () => {
   const mockConfig: ResolvedConfig = {
     models: {
       default: 'claude-sonnet-4-5-20250929',
+      roles: {
+        builder: { backend: 'anthropic', model: '', endpoint: '' },
+        agent: { backend: 'anthropic', model: '', endpoint: '' },
+      },
     },
     session: {
       verbose: false,
@@ -45,9 +49,11 @@ describe('GitHubDriver 422 self-approval handling', () => {
     builder: {
       effort: 'high',
     },
+    chattiness: { default: '', builder: '', agent: '' },
     server: {
       port: 3000,
       sync_interval: 1000,
+      bind: '127.0.0.1',
     },
     remote: {
       driver: 'github',
@@ -68,6 +74,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     features: {},
     worktree: { include: [] },
     permissions: { protected: [] },
+  automation: { maintain: [] },
     checks: { post_turn: '', post_turn_timeout: 300 },
     ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
     daemon: {

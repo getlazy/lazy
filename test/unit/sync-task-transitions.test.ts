@@ -42,7 +42,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
     storage: { backend: 'external', external_path: '' },
     data: { path: '/tmp/fake-data' },
     ollama: { enabled: false, model: null },
-    models: { default: 'claude-opus-4-7' },
+    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,

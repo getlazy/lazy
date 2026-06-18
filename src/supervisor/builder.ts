@@ -19,25 +19,18 @@
  * NOT on the host CLI side.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { spawn } from '../utils/spawn';
-import { join, basename } from 'path';
-import { getHome } from '../utils/home';
+import { basename } from 'path';
 import { log, logError, setLogFile } from './log';
 
-// JSONL parsing for conversation capture
+// JSONL discovery / capture for conversation capture
+import { discoverProjectSessionFiles } from '../import/claude-code-logs';
 import {
-  encodeProjectPath,
-  discoverAllProjectSessions,
-  parseConversation,
-  extractSummary,
-  conversationStats,
-  createParseState,
-  parseJsonlLines,
-  type JsonlParseState,
-} from '../import/claude-code-logs';
-import { toStoredConversation } from '../import/conversation-storage';
-import type { StoredConversation } from '../storage/types';
+  snapshotSessionFiles,
+  captureNewOrModifiedConversations,
+  type SessionSnapshot,
+} from '../import/capture-session';
 
 /** How often to check for JSONL changes and re-capture (ms) */
 const CAPTURE_INTERVAL_MS = 30_000;
@@ -84,23 +77,25 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   log(`[builder] Worktree: ${config.worktreePath}`);
 
   // Read system prompt from file
-  const systemPrompt = readFileSync(config.systemPromptFile, 'utf-8');
+  const systemPrompt = await readFile(config.systemPromptFile, 'utf-8');
   log(`[builder] System prompt loaded (${systemPrompt.length} chars)`);
 
   // Read builder config for MCP proxy setup
-  const builderConfig = JSON.parse(readFileSync(config.builderConfigPath, 'utf-8'));
+  const builderConfig = JSON.parse(await readFile(config.builderConfigPath, 'utf-8'));
   log(`[builder] Builder config loaded (host: ${builderConfig.host}, port: ${builderConfig.port})`);
 
-  // Claude home for JSONL discovery
-  const claudeHome = getHome();
-  const beforeTimes = getSessionFileTimes(claudeHome, config.worktreePath);
+  // Snapshot the project's session files before launch. Any file new-or-modified
+  // after this baseline belongs to this run and must be captured — there can be
+  // several (Claude opens a fresh JSONL on /clear, compaction, and resume).
+  const beforeSnapshot = await snapshotSessionFiles(config.worktreePath);
 
-  // When launched with `--resume <id>`, that session IS the one being driven —
-  // Claude appends to <id>.jsonl in place. Capture/stamp must anchor to it
-  // rather than guessing by mtime, because ~/.claude/projects/<proj> is shared
-  // (other builder runs, a plain `claude` in the same repo) and an unrelated
-  // session with a newer mtime would otherwise be detected — resuming the WRONG
-  // conversation after an upgrade. See pickActiveSessionFile.
+  // When launched with `--resume <id>`, that session is where the run STARTED —
+  // Claude appends to <id>.jsonl in place until /clear, compaction, or resume
+  // rolls it to a fresh segment. The resume target stamped at exit is always the
+  // NEWEST owned segment, not <id>; the resume id only serves as a tiebreaker so
+  // an unrelated, merely-touched session in the shared ~/.claude/projects/<proj>
+  // dir can't hijack detection when no new segment rolled. See
+  // pickActiveSessionFile.
   const resumeSessionId = parseResumeSessionId(config.claudeExtraArgs);
   if (resumeSessionId) {
     log(`[builder] Launched with --resume ${resumeSessionId}; anchoring capture to it`);
@@ -117,8 +112,11 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
     log(`[builder] Claude args: ${claudeArgs.join(' ')}`);
   }
 
-  // Start background incremental capture
-  const monitor = startCaptureMonitor(config.worktreePath, claudeHome, beforeTimes, createStorage, resumeSessionId);
+  // Start background incremental capture. This is the primary safety net for
+  // non-graceful exit (Ctrl-C / SIGTERM / container stop / crash): it persists
+  // ALL new-or-modified session files on a timer and on signal, so a builder
+  // killed before the final flush still gets its conversations saved.
+  const monitor = startCaptureMonitor(config.worktreePath, beforeSnapshot, createStorage, resumeSessionId);
 
   log('[builder] Launching Claude Code interactively...');
 
@@ -222,27 +220,30 @@ export async function stampSessionIdOntoResumeIntent(
 // Conversation capture
 // ---------------------------------------------------------------------------
 
-function getSessionFileTimes(claudeHome: string, lazyRoot: string): Map<string, number> {
-  const encodedPath = encodeProjectPath(lazyRoot);
-  const projectDir = join(claudeHome, '.claude', 'projects', encodedPath);
+/**
+ * Build a filename→mtime map for the project's session files (async).
+ *
+ * This feeds {@link pickActiveSessionFile}, which decides the single live
+ * session whose id is stamped onto the resume intent. Capturing conversations
+ * is handled separately (and for ALL files) by the capture monitor; this map
+ * exists only for resume-target detection.
+ */
+async function getSessionFileTimes(lazyRoot: string): Promise<Map<string, number>> {
+  const files = await discoverProjectSessionFiles(lazyRoot);
   const times = new Map<string, number>();
-
-  try {
-    const entries = readdirSync(projectDir);
-    for (const entry of entries) {
-      if (entry.endsWith('.jsonl')) {
-        try {
-          const mtime = statSync(join(projectDir, entry)).mtimeMs;
-          times.set(entry, mtime);
-        } catch {
-          // Skip inaccessible files
-        }
-      }
-    }
-  } catch {
-    // Project directory doesn't exist yet
+  for (const f of files) {
+    // Keyed by filename to preserve pickActiveSessionFile's contract.
+    times.set(`${f.sessionId}.jsonl`, f.mtimeMs);
   }
+  return times;
+}
 
+/** Convert a capture SessionSnapshot into the filename→mtime map pickActiveSessionFile expects. */
+function snapshotToFileTimes(snapshot: SessionSnapshot): Map<string, number> {
+  const times = new Map<string, number>();
+  for (const [sessionId, info] of snapshot) {
+    times.set(`${sessionId}.jsonl`, info.mtimeMs);
+  }
   return times;
 }
 
@@ -264,15 +265,25 @@ export function parseResumeSessionId(args: string[] | undefined): string | null 
  * Decide which JSONL file holds the live builder session, given the mtimes
  * before launch and after, plus the explicit `--resume` id (if any).
  *
+ * The resume target is ALWAYS the newest segment owned by this run — `--resume
+ * <id>` defines where the run STARTED, never what it ends as. A single run spans
+ * many JSONL files: `/clear`, compaction, and resume each roll Claude to a fresh
+ * `<uuid>.jsonl`. The live tail of the conversation is the newest of those.
+ *
  * Pure (no fs) so the resolution order is unit-testable. Order:
- *   1. If launched with `--resume <id>` and `<id>.jsonl` exists, that is the
- *      session — Claude appends to it in place. This is authoritative: it stops
- *      an unrelated session in the shared ~/.claude/projects/<proj> dir (other
+ *   1. The newest file that is genuinely NEW since launch. `/clear`, compaction,
+ *      and resume-rolls all write a brand-new sessionId file, as does a
+ *      from-scratch session — so the newest new file is the live tail. This MUST
+ *      win over the `--resume` id: after a `/clear` in a resumed run the original
+ *      `<resumeId>.jsonl` still exists on disk but is dormant, and pinning to it
+ *      resumes the conversation the user deliberately cleared away (the bug this
+ *      fixes).
+ *   2. No new file rolled: if launched with `--resume <id>` and `<id>.jsonl`
+ *      exists, Claude appended to it in place and it IS the newest segment.
+ *      Pinning to it here (over the merely-changed fallback below) stops an
+ *      unrelated session in the shared ~/.claude/projects/<proj> dir (other
  *      builders, a plain `claude` in the repo) from hijacking detection just
- *      because it has a newer mtime. THIS is the bug that resumed the wrong
- *      conversation after an upgrade.
- *   2. Otherwise (fresh session): the newest file that is genuinely NEW since
- *      launch. A from-scratch session writes a brand-new sessionId file.
+ *      because it was touched more recently.
  *   3. Last resort: the newest file whose mtime merely changed (legacy
  *      heuristic) — only when there is no resume id and no new file.
  */
@@ -281,170 +292,113 @@ export function pickActiveSessionFile(
   afterTimes: Map<string, number>,
   resumeSessionId: string | null,
 ): string | null {
+  // 1. Prefer genuinely-new files (created after launch). These are the segments
+  //    a run rolls to on /clear, compaction, resume — and the file a fresh
+  //    session creates. The newest is the live tail, even across a --resume.
+  let newestNew: string | null = null;
+  let newestNewMtime = -1;
+  for (const [file, mtime] of afterTimes) {
+    if (!beforeTimes.has(file) && mtime > newestNewMtime) {
+      newestNewMtime = mtime;
+      newestNew = file;
+    }
+  }
+  if (newestNew) return newestNew;
+
+  // 2. No new segment rolled. A resumed run appended to <id>.jsonl in place —
+  //    that is the newest segment. Pin to it so an unrelated, merely-touched
+  //    session in the shared project dir can't hijack detection by mtime.
   if (resumeSessionId) {
     const resumedFile = `${resumeSessionId}.jsonl`;
     if (afterTimes.has(resumedFile)) return resumedFile;
   }
 
-  let newestFile: string | null = null;
-  let newestMtime = -1;
-
-  // Prefer genuinely-new files (created after launch) — a from-scratch session.
-  for (const [file, mtime] of afterTimes) {
-    if (!beforeTimes.has(file) && mtime > newestMtime) {
-      newestMtime = mtime;
-      newestFile = file;
-    }
-  }
-  if (newestFile) return newestFile;
-
-  // Last resort: newest file whose mtime changed since launch.
+  // 3. Last resort: newest file whose mtime changed since launch.
+  let newestChanged: string | null = null;
+  let newestChangedMtime = -1;
   for (const [file, mtime] of afterTimes) {
     const beforeMtime = beforeTimes.get(file);
-    if (beforeMtime !== undefined && mtime !== beforeMtime && mtime > newestMtime) {
-      newestMtime = mtime;
-      newestFile = file;
+    if (beforeMtime !== undefined && mtime !== beforeMtime && mtime > newestChangedMtime) {
+      newestChangedMtime = mtime;
+      newestChanged = file;
     }
   }
 
-  return newestFile;
+  return newestChanged;
 }
 
-function findActiveSessionFile(
+async function findActiveSessionFile(
   beforeTimes: Map<string, number>,
-  claudeHome: string,
   lazyRoot: string,
   resumeSessionId: string | null,
-): string | null {
-  const afterTimes = getSessionFileTimes(claudeHome, lazyRoot);
+): Promise<string | null> {
+  const afterTimes = await getSessionFileTimes(lazyRoot);
   return pickActiveSessionFile(beforeTimes, afterTimes, resumeSessionId);
-}
-
-function resolveSessionPath(claudeHome: string, lazyRoot: string, fileName: string): string {
-  const encodedPath = encodeProjectPath(lazyRoot);
-  return join(claudeHome, '.claude', 'projects', encodedPath, fileName);
-}
-
-function readNewLines(filePath: string, fromOffset: number): { text: string; newOffset: number } {
-  let fd: number;
-  try {
-    fd = openSync(filePath, 'r');
-  } catch {
-    return { text: '', newOffset: fromOffset };
-  }
-
-  try {
-    const fileSize = fstatSync(fd).size;
-    if (fileSize <= fromOffset) {
-      return { text: '', newOffset: fromOffset };
-    }
-
-    const bytesToRead = fileSize - fromOffset;
-    const buffer = Buffer.alloc(bytesToRead);
-    readSync(fd, buffer, 0, bytesToRead, fromOffset);
-    const raw = buffer.toString('utf-8');
-
-    const lastNewline = raw.lastIndexOf('\n');
-    if (lastNewline === -1) {
-      return { text: '', newOffset: fromOffset };
-    }
-
-    const completeText = raw.substring(0, lastNewline + 1);
-    const bytesConsumed = Buffer.byteLength(completeText, 'utf-8');
-    return { text: completeText, newOffset: fromOffset + bytesConsumed };
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function buildIncrementalConversation(
-  sessionId: string,
-  projectPath: string,
-  state: JsonlParseState,
-): StoredConversation {
-  const allTimestamps = state.messages
-    .map(m => m.timestamp)
-    .filter(t => t)
-    .sort();
-  const startedAt = allTimestamps[0] ?? null;
-  const endedAt = allTimestamps[allTimestamps.length - 1] ?? null;
-
-  const summary = state.messages.find(m => m.role === 'user' && m.text.trim())?.text.split('\n')[0]?.substring(0, 200) ?? '(empty conversation)';
-  const userMsgs = state.messages.filter(m => m.role === 'user');
-  const asstMsgs = state.messages.filter(m => m.role === 'assistant');
-
-  return {
-    sessionId,
-    projectPath,
-    cwd: state.metadata.cwd ?? null,
-    version: state.metadata.version ?? null,
-    gitBranch: state.metadata.gitBranch ?? null,
-    startedAt,
-    endedAt,
-    importedAt: Date.now(),
-    summary,
-    stats: {
-      messageCount: state.messages.length,
-      userMessageCount: userMsgs.length,
-      assistantMessageCount: asstMsgs.length,
-      subagentCount: 0,
-      totalTokens: state.usage.inputTokens + state.usage.outputTokens + state.usage.cacheCreationTokens + state.usage.cacheReadTokens,
-    },
-    totalUsage: state.usage,
-    messages: state.messages,
-    subagents: [],
-  };
 }
 
 type StorageFactory = (lazyRoot: string) => Promise<import('../storage/interface').Storage>;
 
+/**
+ * Background conversation capture for the builder supervisor.
+ *
+ * Captures EVERY session file the run touches (Claude rolls to a new JSONL on
+ * /clear, compaction, and resume — single-file capture silently drops the rest)
+ * and is resilient to non-graceful exit:
+ *
+ *   - A timer re-captures all new-or-modified files every CAPTURE_INTERVAL_MS,
+ *     so a builder killed by Ctrl-C / SIGTERM / container stop / crash still has
+ *     its conversations saved up to the last tick.
+ *   - SIGINT/SIGTERM handlers trigger an immediate final flush before the
+ *     process dies (SIGKILL and machine sleep cannot be intercepted; the timer
+ *     is the safety net there).
+ *   - The graceful path calls stop() after Claude exits for a final flush.
+ *
+ * Capture errors are surfaced (logged at error level) — never swallowed — since
+ * losing builder history silently is the bug this exists to prevent.
+ */
 function startCaptureMonitor(
   lazyRoot: string,
-  claudeHome: string,
-  beforeTimes: Map<string, number>,
+  beforeSnapshot: SessionSnapshot,
   storageFactory: StorageFactory,
   resumeSessionId: string | null,
 ): { stop: () => Promise<string | null> } {
-  let byteOffset = 0;
-  let activeFile: string | null = null;
-  let sessionId: string | null = null;
-  let projectPath: string | null = null;
-  const parseState = createParseState();
+  const beforeTimes = snapshotToFileTimes(beforeSnapshot);
+  // Tracks what we've already persisted so each pass only re-saves files that
+  // actually changed since last capture.
+  const captured: SessionSnapshot = new Map();
   let stopped = false;
   let inFlight = false;
   let storage: import('../storage/interface').Storage | null = null;
+  let lastDetectedSessionId: string | null = resumeSessionId;
+
+  async function getStorage(): Promise<import('../storage/interface').Storage> {
+    if (!storage) storage = await storageFactory(lazyRoot);
+    return storage;
+  }
+
+  /** Capture all new-or-modified files once. Returns true if anything was saved. */
+  async function captureOnce(): Promise<void> {
+    const s = await getStorage();
+    const result = await captureNewOrModifiedConversations(lazyRoot, beforeSnapshot, s, captured);
+    for (const { sessionId, error } of result.errors) {
+      logError(`[builder] Incremental capture failed for ${sessionId}: ${error.message}`);
+    }
+    if (result.captured.length > 0) {
+      log(`[builder] Incremental capture: saved ${result.captured.length} session file(s)`);
+    }
+    // Resume target: prefer the explicit --resume id when its file still exists,
+    // otherwise the newest owned session (handles /clear and compaction rolling
+    // to a fresh sessionId mid-run).
+    const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
+    if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
+    else if (result.newestSessionId) lastDetectedSessionId = result.newestSessionId;
+  }
 
   const timer = setInterval(async () => {
     if (stopped || inFlight) return;
     inFlight = true;
-
     try {
-      if (!activeFile) {
-        const fileName = findActiveSessionFile(beforeTimes, claudeHome, lazyRoot, resumeSessionId);
-        if (!fileName) return;
-
-        activeFile = resolveSessionPath(claudeHome, lazyRoot, fileName);
-        sessionId = basename(fileName, '.jsonl');
-
-        const available = await discoverAllProjectSessions(lazyRoot);
-        const match = available.find(s => s.sessionId === sessionId);
-        projectPath = match?.projectPath ?? encodeProjectPath(lazyRoot);
-      }
-
-      const { text, newOffset } = readNewLines(activeFile, byteOffset);
-      if (!text) return;
-
-      byteOffset = newOffset;
-      parseJsonlLines(text, parseState);
-
-      if (sessionId && parseState.messages.length > 0) {
-        if (!storage) {
-          storage = await storageFactory(lazyRoot);
-        }
-        const stored = buildIncrementalConversation(sessionId, projectPath!, parseState);
-        await storage.saveConversation(stored);
-        log(`[builder] Incremental capture: ${parseState.messages.length} messages, offset ${byteOffset}`);
-      }
+      await captureOnce();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logError(`[builder] Incremental capture failed: ${msg}`);
@@ -453,41 +407,60 @@ function startCaptureMonitor(
     }
   }, CAPTURE_INTERVAL_MS);
 
-  return {
-    stop: async (): Promise<string | null> => {
-      stopped = true;
-      clearInterval(timer);
-
-      let detectedSessionId: string | null = sessionId;
+  // Non-graceful exit safety net: flush on signal, then re-raise so the process
+  // exits with the conventional code. Without this, Ctrl-C / docker stop would
+  // skip the final capture and rely solely on the (up-to-30s-stale) timer.
+  let signalHandled = false;
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (signalHandled) return;
+    signalHandled = true;
+    // Best-effort synchronous-ish flush. We can't await in a signal handler and
+    // block exit indefinitely, so kick off the flush and let it complete; the
+    // process is being torn down, so close storage when done.
+    void (async () => {
       try {
-        const fileRef = activeFile ?? findActiveSessionFile(beforeTimes, claudeHome, lazyRoot, resumeSessionId);
-        if (fileRef) {
-          const sid = basename(fileRef, '.jsonl');
-          detectedSessionId = sid;
-          const available = await discoverAllProjectSessions(lazyRoot);
-          const match = available.find(s => s.sessionId === sid);
-          if (match) {
-            if (!storage) {
-              storage = await storageFactory(lazyRoot);
-            }
-            const conversation = await parseConversation(match.projectPath, match.sessionId);
-            const summary = extractSummary(conversation);
-            const stats = conversationStats(conversation);
-            const stored = toStoredConversation(conversation, summary, stats);
-            await storage.saveConversation(stored);
-            log('[builder] Final conversation capture completed');
-          }
-        }
+        await stopInternal();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logError(`[builder] Final capture failed: ${msg}`);
+        logError(`[builder] Signal-triggered capture failed: ${msg}`);
       } finally {
-        if (storage) {
-          await storage.close();
-        }
+        process.removeListener('SIGINT', onSignal);
+        process.removeListener('SIGTERM', onSignal);
+        process.kill(process.pid, signal);
       }
-
-      return detectedSessionId;
-    },
+    })();
   };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  // Memoized so a graceful stop() and a signal-triggered flush converge on the
+  // SAME completion — the signal handler awaits this before re-raising, so it
+  // can never kill the process mid-flush.
+  let stopPromise: Promise<string | null> | null = null;
+  async function doStop(): Promise<string | null> {
+    stopped = true;
+    clearInterval(timer);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+
+    try {
+      await captureOnce();
+      log('[builder] Final conversation capture completed');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logError(`[builder] Final capture failed: ${msg}`);
+    } finally {
+      if (storage) {
+        await storage.close();
+        storage = null;
+      }
+    }
+    return lastDetectedSessionId;
+  }
+  function stopInternal(): Promise<string | null> {
+    if (!stopPromise) stopPromise = doStop();
+    return stopPromise;
+  }
+
+  return { stop: stopInternal };
 }

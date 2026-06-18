@@ -15,6 +15,7 @@ import {
 } from '../../utils/pairing-lock';
 import { runClaude } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
+import { resolveRoleTarget, preflightRoleTarget, targetEnvVars, anthropicEnvVarsFromProcess } from '../../utils/role-target';
 import { createDriver } from '../../remote';
 import { isOfflineMode } from '../../utils/offline';
 import { logger, LogLevel } from '../../utils/logger';
@@ -200,7 +201,7 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
   console.log(`\nLaunching Claude Code in ${process.cwd()}...`);
   console.log(`(no task context — conversation will be captured for search)\n`);
 
-  const beforeSnapshot = snapshotSessionFiles(root);
+  const beforeSnapshot = await snapshotSessionFiles(root);
 
   // Build claude command
   const claudeArgs = ['claude'];
@@ -210,11 +211,16 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
   if (autonomous) {
     claudeArgs.push('--dangerously-skip-permissions');
   }
-  // When Ollama is enabled, force Claude Code to use the Ollama model
+  // Resolve the builder-role target (pair is an interactive builder session).
+  // A local backend (ollama/proxy) forces its model and base-URL env; preflight
+  // fails hard if it is unreachable rather than silently using anthropic.
   const config = await loadConfig(root);
-  if (config.ollama.enabled && config.ollama.model) {
-    claudeArgs.push('--model', config.ollama.model);
+  const pairTarget = resolveRoleTarget('builder', config);
+  await preflightRoleTarget('builder', pairTarget);
+  if (pairTarget.model) {
+    claudeArgs.push('--model', pairTarget.model);
   }
+  const pairEnvVars = targetEnvVars(pairTarget, anthropicEnvVarsFromProcess());
 
   // Launch Claude Code interactively in the current directory
   const proc = spawn(claudeArgs, {
@@ -223,6 +229,7 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
     stdout: 'inherit',
     stderr: 'inherit',
     timeout: 0, // Long-running: interactive session runs until the user exits
+    env: { ...process.env, ...Object.fromEntries(pairEnvVars.map(v => [v.key, v.value])) },
   });
 
   const exitCode = await proc.exited;
@@ -522,11 +529,14 @@ export async function commandPair(args: string[]): Promise<void> {
       if (autonomous) {
         claudeArgs.push('--dangerously-skip-permissions');
       }
-      // When Ollama is enabled, force Claude Code to use the Ollama model
+      // Resolve the builder-role target (pair is an interactive builder session).
       const config = await loadConfig(root);
-      if (config.ollama.enabled && config.ollama.model) {
-        claudeArgs.push('--model', config.ollama.model);
+      const pairTarget = resolveRoleTarget('builder', config);
+      await preflightRoleTarget('builder', pairTarget);
+      if (pairTarget.model) {
+        claudeArgs.push('--model', pairTarget.model);
       }
+      const pairEnvVars = targetEnvVars(pairTarget, anthropicEnvVarsFromProcess());
 
       // Launch Claude Code interactively in the worktree. Use ASYNC spawn +
       // await (not spawnSync): inherited stdio still gives a normal interactive
@@ -545,6 +555,7 @@ export async function commandPair(args: string[]): Promise<void> {
         timeout: 0, // Long-running: interactive session runs until the user exits
         env: {
           ...process.env,
+          ...Object.fromEntries(pairEnvVars.map(v => [v.key, v.value])),
           LAZY_TASK: taskShortId,
         },
       });

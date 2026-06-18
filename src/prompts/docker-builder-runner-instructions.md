@@ -15,7 +15,6 @@ You have five categories of lazy MCP tools:
 - `lazy_show` — View detailed task information
 - `lazy_create` — Create new tasks
 - `lazy_comment` — Add comments to tasks
-- `lazy_propose` — Propose follow-up tasks
 - `lazy_edit` — Edit a task's goal, prompt, model, type, code, or parent
 
 **Task listing tools:**

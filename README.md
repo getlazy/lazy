@@ -340,7 +340,8 @@ Agents are harnessed into a deterministic turn lifecycle. On every turn, the age
 * Merge upstream changes (changes on the branch of the parent task) and resolve conflicts
 * Work on the prompt as they see fit, fully autonomously, committing as they go along
 * Stop their turn by leaving the summary of their work
-* Prompted back into action if they have violated protected paths.
+* Be automatically prompted back into action if they have made changes to protected paths (e.g. unit tests)
+* Be automatically prompted back into action if they have *not* made changes to maintained files (e.g. docs, architecture diagrams, changelog)
 
 Within lifecycle harnessing, `lazy` pushes back against builder and agent actions:
 
@@ -466,6 +467,44 @@ lazy report --pdf --out <path-to-pdf>
 ```
 
 An example of the output can be found [here](docs/lazy-report-example-20260523.md).
+
+### Protected Files
+
+`lazy` allows you to softly disallow changes to certain files and paths. "Softly" here means that changes are actually tolerated *but* task agents are automatically prompted to reflect and confirm that the changes are really necessary (rather than say just artifacts of reward hacking). To use this feature, update `lazy.toml` with:
+
+```
+[permissions]
+# Glob patterns for files agents are NOT allowed to delete or modify.
+# They are allowed to *add* into existing files *and* matching globs.
+# Violations are detected after each agent turn and flagged for review.
+# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
+protected = /* e.g. ["README.md", "test/**/*.ts"] */
+```
+
+When agents do happen to insist that the files have to be changed due to the nature of the task, the task enters `conflict` state and you (or your builder) have to explicitly approve each file during the acceptance process. Or you can reject *some* files when unblocking and agent will need to deal with that.
+
+### Maintained Files
+
+The counterpart to protected files are maintained files - files that we *want* task agents to always updated if there is a need. Examples are changelogs, documentation, maybe some kind of maintained registry of modules and so on. To use this feature, you have to update your `lazy.toml` in the following manner (example from `lazy`'s config):
+
+```
+[automation]
+# Maintained files — inverse of [permissions].protected. Patterns agents are
+# nudged to keep up to date; the supervisor prompts once when a turn's commits
+# touch none of an entry's files. A nudge, not a gate. Opt-in (empty by default).
+
+[[automation.maintain]]
+title = "docs"
+pattern = "docs/**/*"
+instructions = "Update any docs that have gone out of date due to your work, OR create new docs if needed."
+
+[[automation.maintain]]
+title = "changelog"
+pattern = "CHANGELOG.md"
+instructions = "Add a line that succinctly describes your work; skip if your work is intra-release; update if needed and if you have already created such a line in a previous turn"
+```
+
+This feature is more mature than protected files and it allows you to specify the prompt to inject to the automatic feedback to the agent.
 
 ### Collaborative Pairing
 

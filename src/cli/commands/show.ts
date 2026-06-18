@@ -1,8 +1,10 @@
-import { requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines } from '../helpers';
+import { requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines, taskRef } from '../helpers';
 import { queryTaskShow, type ShowResult } from '../../daemon/rpc-fallback';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
+import { createRunner } from '../../runner';
 import { theme, dim } from '../theme';
 import { renderStatusHeader } from '../status-header';
+import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
 import { readPendingProposals, type Proposal } from './propose';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
 import { showConversationTranscript } from './import-conversation';
@@ -15,6 +17,7 @@ import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
+import { logger } from '../../utils/logger';
 import { existsSync, readFileSync } from 'fs';
 
 /**
@@ -37,6 +40,12 @@ export interface TaskShowData {
   autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
   /** Supervisor status snapshot for working tasks (null when task is not working or status file is missing). */
   supervisorStatus: SupervisorStatus | null;
+  /**
+   * Derived working substate (agent / harness:<phase> / not-alive) for working
+   * tasks. Observational only. Null when the task is not working or no substate
+   * can be derived. Shares the single derivation used by ls/blocked/active/watch.
+   */
+  workingSubstate: WorkingSubstate | null;
 }
 
 /**
@@ -48,6 +57,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
 
   let retryStatus: TaskShowData['retryStatus'] = null;
   let supervisorStatus: SupervisorStatus | null = null;
+  let workingSubstate: WorkingSubstate | null = null;
   if (task.status === 'working' && sess) {
     const protoDir = getProtocolDir(task.id);
     const status = readStatus(protoDir);
@@ -57,6 +67,20 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
         retryCount: status.retryCount ?? 0,
         errors: status.errors ?? [],
       };
+    }
+
+    // Derive the working substate from status.json + run liveness. Requires a
+    // root to probe the runner; when absent (e.g. search line-number computation)
+    // we degrade to no substate rather than guessing alive/dead.
+    if (root) {
+      try {
+        const runner = await createRunner(root);
+        const cn = sess.container_name ?? runner.runNameForTask(taskRef(task));
+        const info = await runner.getRunInfo(cn);
+        workingSubstate = await computeWorkingSubstate(protoDir, info?.running === true);
+      } catch (err) {
+        logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);
+      }
     }
   }
 
@@ -91,7 +115,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus };
+  return { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
 }
 
 /**
@@ -99,8 +123,13 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * Used by both the show command (for display) and the search command (for line number computation).
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean): string[] {
-  const { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus } = data;
+  const { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
   const outputLines: string[] = [];
+
+  // Status text decorated with the derived working substate for working tasks.
+  const taskStatusText = task.status === 'working' && workingSubstate
+    ? renderWorkingStatus(workingSubstate)
+    : task.status;
 
   // Supervisor status header (only for working tasks with a status file)
   if (task.status === 'working' && supervisorStatus) {
@@ -115,7 +144,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
     outputLines.push(`  ${theme.label('Code:')}    ${task.code}`);
   }
   outputLines.push(`  ${theme.label('Goal:')}    ${task.goal}`);
-  outputLines.push(`  ${theme.label('Status:')}  ${theme.status(task.status)}`);
+  outputLines.push(`  ${theme.label('Status:')}  ${theme.status(taskStatusText)}`);
   outputLines.push(`  ${theme.label('Model:')}   ${theme.model(task.model ?? '-')}`);
   outputLines.push(`  ${theme.label('Agent:')}   ${task.agent_id}`);
   outputLines.push(`  ${theme.label('Type:')}    ${task.type ?? 'task'}`);
@@ -152,7 +181,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
 
   // Session info (unified view)
   if (sess) {
-    const status = sess.outcome ?? (sess.ended_at ? 'ended' : task.status);
+    const status = sess.outcome ?? (sess.ended_at ? 'ended' : taskStatusText);
     outputLines.push(`\n${theme.label('Session')} (${sess.agent_id})`);
     outputLines.push(`  ${theme.label('Status:')}           ${theme.status(status)}${sess.ended_at ? ' (' + theme.timestamp(formatDate(sess.ended_at)) + ')' : ''}`);
     outputLines.push(`  ${theme.label('Branch:')}           ${sess.git_branch}`);
@@ -250,7 +279,13 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
             : ` | ${theme.error(`check: FAILED (exit ${turn.check_exit_code})`)}`)
           : '';
         const autoSuffix = turn.auto_triggered ? ` | ${theme.warning('auto')}` : '';
-        const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(turn.role);
+        // Show the author for human-role turns authored by a non-human actor
+        // (e.g. 'supervisor' for push-back/maintain prompts, 'builder' for MCP),
+        // so the reader can tell "the human said" from "the supervisor pushed back".
+        const authorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
+          ? turn.actor
+          : turn.role;
+        const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(authorLabel);
         if (showFull) {
           outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ---`);
           if (isErrorTurn) {
@@ -278,7 +313,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
           if (isErrorTurn) {
             outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
           } else {
-            outputLines.push(`    #${turn.sequence} [${theme.turnRole(turn.role)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
           }
         }
       }

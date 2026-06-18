@@ -11,6 +11,7 @@
  */
 
 import type { TokenUsage, MergeConflict, FileViolation } from '../types';
+import type { MaintainEntry } from '../config/types';
 
 /**
  * Wire-protocol version between host CLI/daemon and supervisor.
@@ -27,7 +28,7 @@ import type { TokenUsage, MergeConflict, FileViolation } from '../types';
  *
  * Integer only. Protocols either match or they don't; no semver, no ranges.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // --- Command (host → supervisor) ---
 
@@ -55,6 +56,7 @@ export interface StartCommand {
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
 }
 
 export interface UnblockCommand {
@@ -87,6 +89,7 @@ export interface UnblockCommand {
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
 }
 
 /**
@@ -126,6 +129,7 @@ export interface AskCommand {
   protected_patterns?: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  maintain?: MaintainEntry[];
 }
 
 /**
@@ -177,7 +181,8 @@ export interface CompletedResponse {
   };
   /** Merge conflicts captured before agent resolution (if any merges had conflicts) */
   merge_conflicts?: MergeConflict[];
-  /** File permission violations detected after agent work */
+  /** File permission violations detected after this invocation (FINAL set for the
+   * last invocation that re-detected them; empty array means "checked, none remain"). */
   violations?: FileViolation[];
   /** Whether the agent was given a push-back chance for violations */
   pushed_back?: boolean;
@@ -191,6 +196,46 @@ export interface CompletedResponse {
    * to break ask-turn latency into agent vs supervisor vs daemon vs rpc.
    */
   agent_duration_ms?: number;
+  /**
+   * Per-invocation work SHA window — HEAD before/after THIS `claude -p`
+   * invocation's commits. Lets the reconciler attribute each invocation's
+   * commits/diff to ITS own turn (the work response's window covers only the
+   * work commits; a push-back response's window covers only the push-back
+   * commits). Set by the supervisor for supervised follow-ups; the work
+   * response derives its SHAs from status.json instead (4-SHA pre-turn model).
+   */
+  start_sha_work?: string;
+  end_sha_work?: string;
+  /**
+   * Present ONLY on supervised follow-up responses (push-back, maintain nudge).
+   * Carries the kind and the prompt the SUPERVISOR authored and sent to the
+   * agent. The reconciler materializes this as a `supervisor`-actored prompt
+   * turn followed by the agent's reply turn — a discrete exchange, modeled the
+   * same way a human→agent exchange is. Absent on the work response.
+   */
+  supervised?: {
+    kind: 'permission_pushback' | 'maintain';
+    prompt: string;
+  };
+}
+
+/**
+ * Completed-work envelope: a bundle of full `CompletedResponse` objects, one per
+ * `claude -p` invocation the supervisor ran for a single command, in order.
+ *
+ *   responses[0]   — the work response (the agent's task work)
+ *   responses[1..] — supervised follow-ups (push-back, maintain nudge), each a
+ *                    FULL CompletedResponse with its own commits/SHAs, usage
+ *                    (incl. cache tokens), violations, and a `supervised` block.
+ *
+ * Why an array and not a reduced nudge struct: each supervised exchange is a real
+ * agent invocation with real cost and real commits. Flattening it to prompt+text
+ * dropped usage and forced lumping all commits onto the work turn (double-count).
+ * The array gives each invocation full fidelity, attributed to its own turn.
+ */
+export interface CompletedResponseBundle {
+  status: 'completed';
+  responses: CompletedResponse[];
 }
 
 export interface ErrorResponse {
@@ -213,7 +258,19 @@ export interface ErrorResponse {
   session_id?: string;
 }
 
-export type Response = CompletedResponse | ErrorResponse;
+export type Response = CompletedResponse | CompletedResponseBundle | ErrorResponse;
+
+/**
+ * Normalize a completed wire response to the flat array of invocation responses.
+ * A bundle yields its `responses`; a bare CompletedResponse (ask, sync, recovery —
+ * single-invocation paths) yields a one-element array. Callers that only need the
+ * primary/work response take `[0]`.
+ */
+export function completedResponses(
+  response: CompletedResponse | CompletedResponseBundle,
+): CompletedResponse[] {
+  return 'responses' in response ? response.responses : [response];
+}
 
 // --- Status (supervisor checkpoint/heartbeat) ---
 

@@ -1,8 +1,8 @@
 import { join, resolve, isAbsolute, dirname, basename } from 'path';
-import type { LazyConfig, ResolvedConfig, StorageBackendConfig } from './types';
-import { VALID_EFFORT_LEVELS } from './types';
+import type { LazyConfig, ResolvedConfig, StorageBackendConfig, RoleName, RoleTarget, RoleTargetConfig } from './types';
+import { VALID_EFFORT_LEVELS, VALID_CHATTINESS_LEVELS, VALID_ROLE_BACKENDS } from './types';
 import { listAgents } from '../agent/registry';
-import { DEFAULT_WEB_PORT } from './constants';
+import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND } from './constants';
 import { pathExists, readFile } from '../utils/fs';
 import { expandTilde } from '../utils/home';
 
@@ -43,6 +43,13 @@ async function findConfigDir(lazyRoot: string, startDir?: string): Promise<strin
 export const DEFAULT_CONFIG: ResolvedConfig = {
   models: {
     default: 'claude-opus-4-8',
+    roles: {
+      // Both roles default to the anthropic backend with an empty model, which
+      // means "use the normal model chain / models.default". The legacy [ollama]
+      // block and explicit [models.roles.*] override this in loadConfig.
+      builder: { backend: 'anthropic', model: '', endpoint: '' },
+      agent: { backend: 'anthropic', model: '', endpoint: '' },
+    },
   },
   session: {
     verbose: false,
@@ -72,9 +79,15 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   builder: {
     effort: 'high',
   },
+  chattiness: {
+    default: '',
+    builder: '',
+    agent: '',
+  },
   server: {
     port: DEFAULT_WEB_PORT,
     sync_interval: 60,
+    bind: DEFAULT_SERVER_BIND,
   },
   remote: {
     driver: 'local',
@@ -101,6 +114,9 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   permissions: {
     protected: [],
+  },
+  automation: {
+    maintain: [],
   },
   checks: {
     post_turn: '',
@@ -155,6 +171,62 @@ function deepMerge<T>(target: T, source: DeepPartial<T>): T {
   }
 
   return result;
+}
+
+/**
+ * Resolve a single per-role model target from (in precedence order):
+ *   1. an explicit [models.roles.<role>] table,
+ *   2. the legacy [ollama] block (maps every role to the ollama backend),
+ *   3. the anthropic default ("use models.default / the normal model chain").
+ *
+ * Fails hard on an invalid backend, or an ollama/proxy target missing its model
+ * or (for proxy) endpoint — these are config bugs the user must see immediately,
+ * not silently degrade. `merged` is the deep-merged value (default ⊕ explicit).
+ */
+function resolveRole(
+  role: RoleName,
+  explicit: RoleTargetConfig | undefined,
+  config: ResolvedConfig,
+): RoleTarget {
+  if (explicit) {
+    const merged = config.models.roles[role];
+    const backend = merged.backend;
+    if (!VALID_ROLE_BACKENDS.includes(backend)) {
+      throw new Error(
+        `Invalid backend "${backend}" in lazy.toml [models.roles.${role}]. ` +
+        `Valid backends: ${VALID_ROLE_BACKENDS.join(', ')}.`
+      );
+    }
+    if (backend === 'ollama' || backend === 'proxy') {
+      if (!merged.model) {
+        throw new Error(
+          `[models.roles.${role}] uses backend = "${backend}" but no model is set. ` +
+          `Set model (e.g., model = "qwen3.5:35b-a3b-coding-nvfp4").`
+        );
+      }
+      let endpoint = merged.endpoint;
+      if (!endpoint) {
+        if (backend === 'ollama') {
+          endpoint = DEFAULT_CONFIG.ollama.endpoint;
+        } else {
+          throw new Error(
+            `[models.roles.${role}] uses backend = "proxy" but no endpoint is set. ` +
+            `Set endpoint (e.g., endpoint = "http://host.docker.internal:8080").`
+          );
+        }
+      }
+      return { backend, model: merged.model, endpoint };
+    }
+    // anthropic: model may be empty (means "use models.default / the chain").
+    return { backend: 'anthropic', model: merged.model ?? '', endpoint: '' };
+  }
+
+  // No explicit per-role config — legacy [ollama] maps every role to ollama.
+  if (config.ollama.enabled && config.ollama.model) {
+    return { backend: 'ollama', model: config.ollama.model, endpoint: config.ollama.endpoint };
+  }
+
+  return { backend: 'anthropic', model: '', endpoint: '' };
 }
 
 /**
@@ -312,6 +384,18 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     );
   }
 
+  // Validate chattiness levels. Empty string means "unset" (no verbosity snippet
+  // injected — today's behavior), so only non-empty values are checked.
+  for (const key of ['default', 'builder', 'agent'] as const) {
+    const value = config.chattiness[key];
+    if (value !== '' && !VALID_CHATTINESS_LEVELS.includes(value as never)) {
+      throw new Error(
+        `Invalid chattiness level "${value}" in lazy.toml [chattiness] section (key "${key}"). ` +
+        `Valid levels: ${VALID_CHATTINESS_LEVELS.join(', ')}`
+      );
+    }
+  }
+
   // Validate Ollama config
   if (config.ollama.enabled && !config.ollama.model) {
     throw new Error(
@@ -319,6 +403,13 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
       'Set model in lazy.toml [ollama] section (e.g., model = "qwen3.5:35b-a3b-coding-nvfp4").'
     );
   }
+
+  // Resolve per-role model targets. Explicit [models.roles.*] wins; otherwise the
+  // legacy [ollama] block maps to all roles → ollama; otherwise anthropic default.
+  config.models.roles = {
+    builder: resolveRole('builder', parsed.models?.roles?.builder, config),
+    agent: resolveRole('agent', parsed.models?.roles?.agent, config),
+  };
 
   return config;
 }
@@ -365,6 +456,23 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 # Default model for sessions — use raw model IDs (e.g., "claude-opus-4-8",
 # "claude-sonnet-4-6", "qwen3.5:35b-a3b-coding-nvfp4")
 default = "claude-opus-4-8"
+
+# Per-role model targets (optional). Route the builder and task agents to
+# different backends — e.g. keep the builder on real Anthropic while agents run
+# on a local Ollama model. backend = "anthropic" | "ollama" | "proxy".
+# When set, these override the legacy [ollama] block for that role. ollama/proxy
+# require a model; proxy requires an endpoint; ollama defaults the endpoint to
+# host.docker.internal:11434. Lazy preflights each backend before launch and
+# fails (never silently falls back) if it is unreachable.
+#
+# [models.roles.builder]
+# backend = "anthropic"
+# model = "claude-opus-4-8"
+#
+# [models.roles.agent]
+# backend = "ollama"
+# model = "qwen3.5:35b-a3b-coding-nvfp4"
+# endpoint = "http://host.docker.internal:11434"
 
 [session]
 # Show Docker output in real-time during session execution
@@ -413,11 +521,29 @@ agent_id = "claude-code"
 # Valid levels: "low", "medium", "high", "xhigh", "max" (default: "high")
 # effort = "high"
 
+[chattiness]
+# Baseline conversational verbosity for the builder and agents — how much they
+# narrate, explain, and elaborate in their replies (not how hard they think).
+# Valid levels: "terse", "normal", "chatty". When unset, no verbosity guidance
+# is injected and behavior is unchanged.
+# It is elastic: when you ask for more detail, the model steps up ONE notch from
+# this baseline for that reply, not straight to maximum verbosity.
+# "default" applies to both roles; "builder" and "agent" override it per role.
+# default = "normal"
+# builder = "chatty"
+# agent = "terse"
+
 [server]
 # Default port for the web dashboard server
 port = 26024
 # Interval in seconds for background sync when running lazy server (0 to disable)
 # sync_interval = 60
+# Network interface the daemon's TCP server binds to. Defaults to loopback
+# ("127.0.0.1") so the dashboard, /mcp, and /rpc endpoints are reachable only
+# from this machine. The dashboard is UNAUTHENTICATED — only change this if you
+# deliberately want LAN/remote access. Use "0.0.0.0" to listen on all
+# interfaces, or a specific interface IP.
+# bind = "127.0.0.1"
 
 [runner]
 # Runner type: "docker" (default), "podman", or "dangerously-host-process-without-any-isolation"
@@ -464,6 +590,30 @@ dockerfile = ""
 # Agents can still ADD new files matching these patterns — only modifications
 # and deletions are flagged as violations for human review.
 # protected = ["test/**", "tests/**", "spec/**", "*_test.*", "*.test.*", "*.spec.*"]
+
+[automation]
+# Maintained files — the inverse of [permissions].protected. Patterns agents are
+# *expected* to keep up to date as they work (docs, CHANGELOG, architecture).
+# Agents MAY skip them, but when a turn touches none of an entry's files the
+# supervisor prompts the agent once: "you didn't update <title> — are you sure?"
+# The agent must either make the update or record why it skipped, before the task
+# blocks for human review. Opt-in: empty by default. Each entry needs title,
+# pattern, and instructions.
+#
+# [[automation.maintain]]
+# title = "docs"
+# pattern = "docs/**/*"
+# instructions = "Search for docs and update any that have gone out of date due to your work, OR create new docs if needed."
+#
+# [[automation.maintain]]
+# title = "changelog"
+# pattern = "CHANGELOG.md"
+# instructions = "Add a line that succinctly describes your work; skip if your work is intra-release."
+#
+# [[automation.maintain]]
+# title = "architecture-diagrams"
+# pattern = "architecture/**/*"
+# instructions = "Update any architectural diagrams affected by your work."
 
 [checks]
 # Command to run after each agent turn. Output is captured and attached to

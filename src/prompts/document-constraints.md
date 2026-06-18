@@ -9,7 +9,7 @@ This is a documentation task. Your job is to read code and produce or update des
 3. **Compare against existing documents.** If documents already exist in `{{docsPath}}/`, update stale sections rather than creating duplicate documents. Preserve content that is still accurate.
 4. **Follow existing doc style.** If the project already has documentation, match its tone, structure, and conventions.
 5. **Use mermaid diagrams** for: architecture overviews, sequence flows, state machines, component relationships, and data flow. Wrap them in ````mermaid` fenced code blocks.
-6. **If you discover structural issues** in the code while reading it, propose refactoring tasks via `lazy_propose` but do NOT fix them yourself. This task is read-only for code.
+6. **If you discover structural issues** in the code while reading it, call them out crisply in your final summary but do NOT fix them yourself. This task is read-only for code.
 
 ### Document Structure
 

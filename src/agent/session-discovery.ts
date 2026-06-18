@@ -1,22 +1,24 @@
 /**
- * Find the active Claude Code session for a worktree.
+ * Find the active Claude Code session for a runner's project directory.
  *
  * Claude writes one JSONL file per session under
- * `<worktree>/.lazy-task-sandbox/.claude/projects/<encodedPath>/<session-id>.jsonl`
- * (the sandbox is the in-container HOME). The filename (minus `.jsonl`) is
- * the session id, and the most recently modified file is the active one.
+ * `<projectDir>/<session-id>.jsonl`. The filename (minus `.jsonl`) is the
+ * session id, and the most recently modified file is the active one.
  *
- * This logic was previously duplicated in `cli/commands/watch.ts` and
+ * WHERE `projectDir` lives depends on the runner (its HOME differs), so this
+ * helper does NOT compute it — the caller asks the runner via
+ * `runner.agentSessionProjectDir(worktreePath)` and passes the result in. That
+ * keeps every caller (watch, work.ts, the activity monitor) runner-agnostic
+ * and the runner the single source of truth for its own session-log location.
+ *
+ * This scanning logic was previously duplicated in `cli/commands/watch.ts` and
  * `cli/activity-monitor.ts`; it now lives here so the supervisor can use it
  * too — see GracefulExitTimeoutError handling in `supervisor/work.ts`.
  */
 
 import { readdir, stat } from 'fs/promises';
 import { basename, join } from 'path';
-import { encodeProjectPath } from '../import/claude-code-logs';
 import { pathExists } from '../utils/fs';
-
-const SANDBOX_DIR = '.lazy-task-sandbox';
 
 export interface SessionFileInfo {
   /** Absolute path of the JSONL file. */
@@ -28,21 +30,18 @@ export interface SessionFileInfo {
 }
 
 /**
- * Return the most recently modified Claude Code JSONL session file for the
- * given worktree, or null if none exists yet (e.g. the agent hasn't started
- * writing logs).
+ * Return the most recently modified Claude Code JSONL session file in the
+ * given project directory, or null if none exists yet (e.g. the agent hasn't
+ * started writing logs, or the directory doesn't exist).
  *
  * When `minMtimeMs` is provided, only files modified at or after that time
  * are considered — used by the supervisor to ignore stale sessions from a
  * previous turn.
  */
 export async function findLatestSessionFile(
-  worktreePath: string,
+  projectDir: string,
   minMtimeMs?: number,
 ): Promise<SessionFileInfo | null> {
-  const encodedPath = encodeProjectPath(worktreePath);
-  const projectDir = join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encodedPath);
-
   if (!(await pathExists(projectDir))) return null;
 
   let latest: SessionFileInfo | null = null;

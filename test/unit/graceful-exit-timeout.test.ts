@@ -23,6 +23,12 @@ import {
 } from '../../src/protocol/turn-end-signal';
 import { recoverSessionIdForGracefulExit } from '../../src/supervisor/work';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { createRunnerFromType } from '../../src/runner';
+
+// These tests plant JSONL in the sandbox layout
+// (<worktree>/.lazy-task-sandbox/.claude/...), so recovery must resolve via a
+// sandbox runner — the runner is authoritative for that location.
+const sandboxRunner = createRunnerFromType('docker');
 
 describe('turn-end-signal marker file', () => {
   let dir: string;
@@ -242,7 +248,7 @@ describe('recoverSessionIdForGracefulExit', () => {
     await mkdir(projDir, { recursive: true });
     await writeFile(join(projDir, 'WRONG-SESSION-FROM-DISK.jsonl'), '{}\n', 'utf-8');
 
-    const got = await recoverSessionIdForGracefulExit(worktree, 'resume-session-id', Date.now() - 1000);
+    const got = await recoverSessionIdForGracefulExit(sandboxRunner, worktree, 'resume-session-id', Date.now() - 1000);
     expect(got).toBe('resume-session-id');
   });
 
@@ -270,7 +276,7 @@ describe('recoverSessionIdForGracefulExit', () => {
     const live = join(projDir, 'live-session-uuid.jsonl');
     await writeFile(live, '{"type":"system"}\n', 'utf-8');
 
-    const got = await recoverSessionIdForGracefulExit(worktree, undefined, cutoff);
+    const got = await recoverSessionIdForGracefulExit(sandboxRunner, worktree, undefined, cutoff);
     expect(got).toBe('live-session-uuid');
     // Silence the unused-var lint if any. The stale fixture is still on disk;
     // the discovery helper must have skipped it via the minMtime cutoff.
@@ -284,7 +290,7 @@ describe('recoverSessionIdForGracefulExit', () => {
   test('returns undefined when neither --resume nor a JSONL file is available', async () => {
     // No .lazy-task-sandbox directory at all — simulates agent dying before
     // claude wrote anything.
-    const got = await recoverSessionIdForGracefulExit(worktree, undefined, Date.now());
+    const got = await recoverSessionIdForGracefulExit(sandboxRunner, worktree, undefined, Date.now());
     expect(got).toBeUndefined();
   });
 
@@ -296,7 +302,7 @@ describe('recoverSessionIdForGracefulExit', () => {
 
     // launchTime is in the FUTURE relative to the file's mtime.
     const futureLaunch = Date.now() + 60_000;
-    const got = await recoverSessionIdForGracefulExit(worktree, undefined, futureLaunch);
+    const got = await recoverSessionIdForGracefulExit(sandboxRunner, worktree, undefined, futureLaunch);
     expect(got).toBeUndefined();
   });
 });

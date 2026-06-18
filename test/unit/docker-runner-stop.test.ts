@@ -1,19 +1,29 @@
-import { describe, test, expect, mock, afterEach } from 'bun:test';
+import { describe, test, expect, afterEach } from 'bun:test';
+import { mockModule, restoreMockedModules } from '../helpers/mock-module';
+import { resolve } from 'path';
 
 // This file lives separately from docker-runner.test.ts because it relies on
-// mock.module('../../src/utils/spawn'). DockerRunner binds `spawn` at module
+// mocking '../../src/utils/spawn'. DockerRunner binds `spawn` at module
 // evaluation time, so the mock must be installed before the FIRST import of
 // DockerRunner in this module — a sibling file that statically imports
 // DockerRunner would capture the real spawn and defeat the mock.
+//
+// We use the project's mockModule/restoreMockedModules helper (NOT raw
+// mock.module + mock.restore): bun's mock.restore() only undoes spies, not
+// module mocks, so a raw mock.module('.../utils/spawn') would leak the fake
+// spawn into every later test file — and since nearly all git/process work
+// funnels through utils/spawn, that corrupts the whole unit suite. restoreMockedModules()
+// in afterEach re-installs the real spawn before the next file runs.
+const SPAWN_PATH = resolve(import.meta.dir, '../../src/utils/spawn.ts');
 
 describe('DockerRunner.stopRun', () => {
   afterEach(() => {
-    mock.restore();
+    restoreMockedModules();
   });
 
   test('uses `kill` (immediate SIGKILL), not `stop`, and resolves true on success', async () => {
     const calls: string[][] = [];
-    mock.module('../../src/utils/spawn', () => ({
+    await mockModule(SPAWN_PATH, () => ({
       spawn: (cmd: string[]) => {
         calls.push(cmd);
         return { exited: Promise.resolve(0), kill: () => {} };
@@ -42,7 +52,7 @@ describe('DockerRunner.stopRun', () => {
   });
 
   test('resolves false when kill exits non-zero', async () => {
-    mock.module('../../src/utils/spawn', () => ({
+    await mockModule(SPAWN_PATH, () => ({
       spawn: () => ({ exited: Promise.resolve(1), kill: () => {} }),
       spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,

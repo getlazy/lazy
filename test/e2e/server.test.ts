@@ -22,7 +22,10 @@ describe('lazy server', () => {
   async function dashboardUrl(): Promise<string> {
     const result = await ctx.lazy(['server']);
     expect(result.exitCode).toBe(0);
-    const match = result.stdout.match(/Web dashboard: (http:\/\/localhost:\d+)/);
+    // The daemon binds to 127.0.0.1 (loopback) by default, so the printed URL
+    // uses the real interface, not a hardcoded `localhost` (which can resolve
+    // to IPv6 ::1 and miss the IPv4 bind).
+    const match = result.stdout.match(/Web dashboard: (http:\/\/[\d.]+:\d+)/);
     if (!match) {
       throw new Error(`No web dashboard URL in output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
     }
@@ -36,7 +39,11 @@ describe('lazy server', () => {
   test('prints the daemon dashboard URL and exits', async () => {
     const result = await ctx.lazy(['server']);
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('Web dashboard: http://localhost:');
+    // INVARIANT: the URL reflects the actual loopback bind (127.0.0.1), not a
+    // hardcoded `localhost` — `localhost` can resolve to IPv6 ::1 and fail to
+    // reach the IPv4-only 127.0.0.1 bind, leaving the user on an empty page.
+    expect(result.stdout).toContain('Web dashboard: http://127.0.0.1:');
+    expect(result.stdout).not.toContain('http://localhost:');
   });
 
   // INVARIANT: the standalone/--port flag is gone. `lazy server` takes no flags.
