@@ -6,11 +6,22 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
+ * Resolve the tasks directory for a test project. Test projects use external
+ * storage (external_path in lazy.toml) with a fallback to the in-repo
+ * .lazy/tasks layout.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
+/**
  * Find the full task UUID from a short (8-char) prefix.
  */
 function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const dirs = readdirSync(tasksDir);
+  const dirs = readdirSync(tasksDirFor(root));
   const match = dirs.find(d => d.startsWith(shortId));
   if (!match) throw new Error(`Task directory not found for ${shortId}`);
   return match;
@@ -21,7 +32,7 @@ function findFullTaskId(root: string, shortId: string): string {
  */
 function readTurns(root: string, shortId: string): Array<{ sequence: number; role: string; model?: string; content: string }> {
   const fullId = findFullTaskId(root, shortId);
-  const turnsPath = join(root, '.lazy', 'tasks', fullId, 'turns.json');
+  const turnsPath = join(tasksDirFor(root), fullId, 'turns.json');
   const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
   return data.turns;
 }
@@ -30,7 +41,11 @@ describe('per-turn model override', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // start/unblock require a real daemon (post-v0.11 the CLI goes through the
+    // daemon for storage and turn reconciliation), so these run withDaemon.
+    // The per-turn model is set by the launch from the --model flag — it does
+    // not depend on the mocked agent response — so a fixed daemon mock is fine.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -46,13 +61,15 @@ describe('per-turn model override', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+    // Wait for the daemon to reconcile the turn to blocked before reading turns.
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     const turns = readTurns(ctx.root, taskId);
     // First turn (human) should have claude-haiku-4-5-20251001 recorded
     const humanTurn = turns.find(t => t.role === 'human');
     expect(humanTurn).toBeDefined();
     expect(humanTurn!.model).toBe('claude-haiku-4-5-20251001');
-  });
+  }, 30_000);
 
   // INVARIANT: When --model is specified on unblock, the feedback turn records that model.
   test('unblock with --model records model on the feedback turn', async () => {
@@ -63,6 +80,7 @@ describe('per-turn model override', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // Unblock with --model claude-sonnet-4-5-20250929
     const unblockResult = await ctx.lazyMocked(
@@ -71,6 +89,7 @@ describe('per-turn model override', () => {
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblockResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     const turns = readTurns(ctx.root, taskId);
     // Find the feedback turn (second human turn, sequence > 1)
@@ -78,7 +97,7 @@ describe('per-turn model override', () => {
     expect(humanTurns.length).toBeGreaterThanOrEqual(2);
     const feedbackTurn = humanTurns[humanTurns.length - 1];
     expect(feedbackTurn.model).toBe('claude-sonnet-4-5-20250929');
-  });
+  }, 30_000);
 
   // INVARIANT: Sticky behavior - after unblocking with --model claude-haiku-4-5-20251001, the next unblock
   // without --model should still use haiku (inherited from previous turn).
@@ -91,6 +110,7 @@ describe('per-turn model override', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // First unblock with --model claude-haiku-4-5-20251001
     const unblock1 = await ctx.lazyMocked(
@@ -99,6 +119,7 @@ describe('per-turn model override', () => {
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblock1);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // Second unblock WITHOUT --model — should inherit claude-haiku-4-5-20251001 from previous turn
     const unblock2 = await ctx.lazyMocked(
@@ -107,6 +128,7 @@ describe('per-turn model override', () => {
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblock2);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     const turns = readTurns(ctx.root, taskId);
     // Find human turns (skip agent turns)
@@ -114,7 +136,7 @@ describe('per-turn model override', () => {
     // Last human turn should have haiku (sticky from previous)
     const lastHumanTurn = humanTurns[humanTurns.length - 1];
     expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
-  });
+  }, 45_000);
 
   // INVARIANT: When no per-turn model has been set and no --model flag is given,
   // the turn falls back to the task-level model.
@@ -126,13 +148,14 @@ describe('per-turn model override', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     const turns = readTurns(ctx.root, taskId);
     const humanTurn = turns.find(t => t.role === 'human');
     expect(humanTurn).toBeDefined();
     // First turn should record claude-opus-4-6 (the model used)
     expect(humanTurn!.model).toBe('claude-opus-4-6');
-  });
+  }, 30_000);
 
   // INVARIANT: show command displays per-turn model when it differs from task-level model.
   test('show displays per-turn model when it differs from task model', async () => {
@@ -143,6 +166,7 @@ describe('per-turn model override', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // Unblock with haiku (different from task model)
     const unblockResult = await ctx.lazyMocked(
@@ -151,10 +175,11 @@ describe('per-turn model override', () => {
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );
     expectSuccess(unblockResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     // Show should display haiku since it differs from task-level claude-opus-4-6
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'claude-haiku-4-5-20251001');
-  });
+  }, 30_000);
 });

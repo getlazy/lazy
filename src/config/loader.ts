@@ -5,6 +5,7 @@ import { listAgents } from '../agent/registry';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND } from './constants';
 import { pathExists, readFile } from '../utils/fs';
 import { expandTilde } from '../utils/home';
+import { validateMounts } from '../capture/mounts';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -93,6 +94,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     driver: 'local',
     git_remote: 'origin',
     auto_approve: false,
+    offline: false,
     github_auto_push: true,
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
     gitlab_auto_push: true,
@@ -118,6 +120,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   automation: {
     maintain: [],
   },
+  mounts: [],
   checks: {
     post_turn: '',
     post_turn_timeout: 300,
@@ -404,6 +407,11 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     );
   }
 
+  // Validate custom mounts. Fail loud on structurally invalid entries (missing
+  // target, unknown type, bind without source, etc.) so the user sees an
+  // actionable error at load time rather than an opaque `docker run` failure.
+  validateMounts(config.mounts);
+
   // Resolve per-role model targets. Explicit [models.roles.*] wins; otherwise the
   // legacy [ollama] block maps to all roles → ollama; otherwise anthropic default.
   config.models.roles = {
@@ -543,6 +551,11 @@ port = 26024
 # from this machine. The dashboard is UNAUTHENTICATED — only change this if you
 # deliberately want LAN/remote access. Use "0.0.0.0" to listen on all
 # interfaces, or a specific interface IP.
+# On native Linux with a docker/podman runner, the loopback default ALSO binds
+# the docker bridge gateway (e.g. 172.17.0.1) on the same port so containers can
+# reach the daemon via host.docker.internal — that interface is not routable
+# from the LAN, so it does not widen exposure. Setting bind explicitly disables
+# this and uses your value as-is.
 # bind = "127.0.0.1"
 
 [runner]
@@ -561,6 +574,13 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 # When true, lazy accept submits an approving review before merging.
 # For sole developers who don't want to manually approve their own MRs.
 # auto_approve = false
+# Permanent offline mode (default: false). When true, ALL remote operations
+# (push, fetch, sync, PR creation) are skipped indefinitely. Unlike the
+# 'lazy system offline' command — which is temporary and auto-recovers at the
+# next local midnight — this flag stays in effect until you remove it.
+# Use it when you genuinely want to stay offline (e.g. an air-gapped or
+# Ollama-only project). 'lazy system online' will NOT clear it.
+# offline = false
 # When using the GitHub driver, these options are also available:
 # github_auto_push = true   # Automatically push after each agent turn
 # Authentication is handled by gh CLI (run: gh auth login)

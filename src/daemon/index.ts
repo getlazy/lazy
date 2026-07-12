@@ -22,6 +22,7 @@ export {
 } from './lifecycle';
 export { startDaemonServer, type RunningDaemon, type DaemonServerOptions } from './server';
 export { formatDashboardUrl } from './dashboard-url';
+export { enumerateDaemons, writeDaemonRoot, type DaemonRecord } from './registry';
 export { ensureDaemon } from './auto-start';
 export { DaemonClient, DaemonNotRunningError, tryRpc } from './client';
 export { setDaemonContext, getDaemonContext } from './context';

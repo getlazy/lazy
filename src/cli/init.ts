@@ -451,6 +451,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   const ignoreEntries = [
     '.env',
     '.lazy-task-sandbox/',
+    '.lazy-lock',
     '.lazy/worktrees/',
     '.lazy/bin/',
     '.lazy/logs/',

@@ -9,6 +9,7 @@ import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import type { RoleTarget } from '../config/types';
+import { buildMountArgs } from './mounts';
 import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET } from '../utils/role-target';
 import { logger } from '../utils/logger';
 import { isOfflineMode } from '../utils/offline';
@@ -306,7 +307,8 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
     return imageName;
   } catch (buildErr) {
     // If not offline, just propagate the build error
-    if (!(await isOfflineMode(join(lazyRoot, '.lazy')))) {
+    const buildConfig = await loadConfig(lazyRoot);
+    if (!(await isOfflineMode(join(lazyRoot, '.lazy'), buildConfig.remote.offline))) {
       throw buildErr;
     }
 
@@ -980,6 +982,15 @@ export async function launchSupervisorAsync(
   const authEnvVars = getAuthEnvVars(target);
   const repoRoot = getLazyRoot();
 
+  // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
+  // here we just expand placeholders and build the `-v` args. Empty by default,
+  // so default behavior is completely unchanged when no mounts are configured.
+  const config = await loadConfig(repoRoot);
+  const customMountArgs = buildMountArgs(config.mounts, {
+    worktreePath: sandbox.worktreePath,
+    repoRoot,
+  });
+
   const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);
 
   // Daemon MCP config is provided by the caller (daemon task launcher).
@@ -1011,6 +1022,10 @@ export async function launchSupervisorAsync(
       '-v', `${daemonConfigPath}:${daemonConfigPath}:ro`,
       '-e', `LAZY_DAEMON_CONFIG=${daemonConfigPath}`,
     ] : []),
+    // User-configured custom mounts. Appended after the standard worktree mount
+    // so a {worktree}/node_modules volume clearly shadows it (Docker resolves
+    // overlapping mounts by longest container-path match regardless of order).
+    ...customMountArgs,
     imageName,
     'sh', '-c', wrapperScript,
   ];

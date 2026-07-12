@@ -39,6 +39,7 @@ import { requireLazyRoot } from '../cli/helpers';
 import type { TaskWithSession } from '../cli/commands/list';
 import type { TaskShowData } from '../cli/commands/show';
 import type { SearchResult } from '../storage';
+import type { Actor } from '../types';
 
 // --- List ---
 
@@ -235,6 +236,7 @@ export async function queryStartTask(params: {
   forceLocal?: boolean;
   retargetOrphan?: boolean;
   effortOverride?: string;
+  actor?: Actor;
 }): Promise<StartTaskRpcResult> {
   const rpc = await tryRpc<StartTaskRpcResult>('startTask', {
     taskId: params.taskId,
@@ -243,6 +245,7 @@ export async function queryStartTask(params: {
     forceLocal: params.forceLocal,
     retargetOrphan: params.retargetOrphan,
     effortOverride: params.effortOverride,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -293,6 +296,7 @@ export async function queryUnblockTask(params: {
   notesInEditor?: boolean;
   effortOverride?: string;
   permissionMode?: 'plan' | 'default';
+  actor?: Actor;
 }): Promise<UnblockTaskRpcResult> {
   const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
     taskId: params.taskId,
@@ -303,6 +307,7 @@ export async function queryUnblockTask(params: {
     notesInEditor: params.notesInEditor,
     effortOverride: params.effortOverride,
     permissionMode: params.permissionMode,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -335,11 +340,13 @@ export async function queryAskTask(params: {
   taskId: string;
   message: string;
   effortOverride?: string;
+  actor?: Actor;
 }): Promise<AskTaskRpcResult> {
   const rpc = await tryRpc<AskTaskRpcResult>('askTask', {
     taskId: params.taskId,
     message: params.message,
     effortOverride: params.effortOverride,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -474,10 +481,12 @@ export interface StopTaskRpcResult {
 export async function queryStopTask(params: {
   taskId: string;
   reason: string;
+  actor?: Actor;
 }): Promise<StopTaskRpcResult> {
   const rpc = await tryRpc<StopTaskRpcResult>('stopTask', {
     taskId: params.taskId,
     reason: params.reason,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -549,9 +558,11 @@ export interface SyncTaskRpcResult {
 
 export async function querySyncTask(params: {
   taskId: string;
+  actor?: Actor;
 }): Promise<SyncTaskRpcResult> {
   const rpc = await tryRpc<SyncTaskRpcResult>('syncTask', {
     taskId: params.taskId,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 

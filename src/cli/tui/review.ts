@@ -14,7 +14,8 @@ import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBra
 import type { TaskTreeNode } from '../../storage/types';
 import { readPendingProposals, updateProposalStatus } from '../commands/propose';
 import { getNewNotesSince } from '../commands/shared';
-import type { Task, Session, Turn, Comment, Commit } from '../../types';
+import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
+import type { Task, Session, Turn, Comment, Commit, JournalEntry, FollowUp } from '../../types';
 import { parentTaskIdOf } from '../../task-target';
 import type { Proposal } from '../commands/propose';
 import type { Storage } from '../../storage';
@@ -37,13 +38,17 @@ interface TurnInfo {
   diffFiles: string[];      // files changed in this turn
 }
 
-interface ReviewData {
+export interface ReviewData {
   task: Task;
   session: Session | null;
   turns: Turn[];
   commits: Commit[];
   comments: Comment[];
   unseenComments: Comment[];
+  /** Append-only, prompt-immune journal entries (orchestration metadata / memories). */
+  journal: JournalEntry[];
+  /** Passive, agent-recorded orthogonal-work notes. Display-only — never triggers anything. */
+  followUps: FollowUp[];
   proposals: Proposal[];
   diffStat: string;
   diffFull: string;
@@ -81,10 +86,12 @@ export async function loadReviewData(
   }
 
   // Load all data in parallel (skip session-specific data if no session)
-  const [turns, commits, comments, proposals, parentTask] = await Promise.all([
+  const [turns, commits, comments, journal, followUps, proposals, parentTask] = await Promise.all([
     session ? storage.getSessionTurns(session.id) : Promise.resolve([]),
     session ? storage.getSessionCommits(session.id) : Promise.resolve([]),
     storage.getTaskComments(task.id),
+    storage.getTaskJournal(task.id),
+    storage.getTaskFollowUps(task.id),
     Promise.resolve(readPendingProposals(storage, task.id)),
     parentId ? storage.getTask(parentId) : Promise.resolve(null),
   ]);
@@ -183,7 +190,7 @@ export async function loadReviewData(
   }
 
   return {
-    task, session, turns, commits, comments, unseenComments,
+    task, session, turns, commits, comments, unseenComments, journal, followUps,
     proposals, diffStat, diffFull, worktreePath, targetBranch, lastAgentTurn,
     turnInfoMap, taskTree, childTasks, parentTask,
   };
@@ -223,6 +230,8 @@ async function loadReviewDataForSubtask(
       commits: [],
       comments: await storage.getTaskComments(task.id),
       unseenComments: [],
+      journal: await storage.getTaskJournal(task.id),
+      followUps: await storage.getTaskFollowUps(task.id),
       proposals: [],
       diffStat: '',
       diffFull: '',
@@ -282,6 +291,8 @@ async function loadReviewDataForSubtask(
     commits: [],
     comments: await storage.getTaskComments(task.id),
     unseenComments: [],
+    journal: await storage.getTaskJournal(task.id),
+    followUps: await storage.getTaskFollowUps(task.id),
     proposals: [],
     diffStat,
     diffFull,
@@ -358,7 +369,7 @@ function buildTaskNavItem(opts: {
  * @param keyPrefix - Key prefix for namespacing ('' for main task, 'st:abc:' for sub-tasks)
  * @param visited - Set of visited task IDs (cycle detection)
  */
-function buildNavItemsForTask(
+export function buildNavItemsForTask(
   data: ReviewData,
   dataMap: Map<string, ReviewData>,
   keyPrefix: string = '',
@@ -375,21 +386,50 @@ function buildNavItemsForTask(
     expanded: false,
   });
 
-  // ── Turns (all turns as peers, descending — newest first) ──────────
+  // ── Turns (grouped into review chunks; newest chunk/turn first) ─────
+  // A chunk is one human/builder review boundary plus its following
+  // agent/supervisor/system turns — grouped via the single source of truth so
+  // intermediate auto-resume/supervisor turns are navigated WITH their boundary
+  // instead of being skipped past. Turn-node keys are unchanged (content routing
+  // still keys on `turn-node:<seq>`); chunk nodes are a new grouping level.
   if (data.turns.length > 0) {
-    const descending = [...data.turns].sort((a, b) => b.sequence - a.sequence);
+    const ascending = [...data.turns].sort((a, b) => a.sequence - b.sequence);
+    const chunks = groupTurnsIntoChunks(ascending);
+    const newestSeq = ascending[ascending.length - 1].sequence;
 
-    const turnChildren: NavItem[] = descending.map((turn, i) => {
-      const isFirst = i === 0;
-      const icon = turn.role === 'human' ? '👤' : '🤖';
+    const buildTurnNode = (turn: Turn): NavItem => {
+      const icon = turn.role === 'human'
+        ? (turn.actor === 'supervisor' || turn.actor === 'system' ? '⚙️' : '👤')
+        : '🤖';
+      // Provenance: name the authoring actor for non-human human-role turns and
+      // flag auto-triggered turns, so the reviewer can tell automation from human.
+      const actorSuffix = turn.role === 'human' && turn.actor && turn.actor !== 'human'
+        ? ` [${turn.actor}]` : '';
+      const autoSuffix = turn.auto_triggered ? ' (auto)' : '';
       const children = buildTurnChildren(turn, data, keyPrefix);
-
       return {
         key: `${keyPrefix}turn-node:${turn.sequence}`,
-        label: `Turn #${turn.sequence}`,
+        label: `Turn #${turn.sequence}${actorSuffix}${autoSuffix}`,
         icon,
         children: children.length > 0 ? children : undefined,
-        expanded: isFirst, // only expand the newest turn by default
+        expanded: turn.sequence === newestSeq, // expand the newest turn by default
+      };
+    };
+
+    // Chunk nodes newest-first; turns within each chunk newest-first.
+    const chunkNodes: NavItem[] = [...chunks].reverse().map(chunk => {
+      const turnNodes = [...chunk.turns].reverse().map(buildTurnNode);
+      const b = chunk.boundary;
+      const boundaryLabel = b
+        ? `#${b.sequence} ${b.role === 'human' && b.actor && b.actor !== 'human' ? b.actor : b.role}`
+        : 'leading auto turns';
+      return {
+        key: `${keyPrefix}chunk:${chunk.index}`,
+        label: `Chunk ${chunk.index + 1} · ${boundaryLabel}`,
+        icon: '🧩',
+        badge: `${chunk.turns.length}`,
+        children: turnNodes,
+        expanded: chunk.index === chunks.length - 1, // expand the newest chunk
       };
     });
 
@@ -398,7 +438,7 @@ function buildNavItemsForTask(
       label: 'Turns',
       icon: '🔄',
       badge: `${data.turns.length}`,
-      children: turnChildren,
+      children: chunkNodes,
       expanded: keyPrefix === '', // only expand turns at top level
     });
   }
@@ -428,6 +468,55 @@ function buildNavItemsForTask(
       icon: '✍️',
       badge: unseenBadge || `${data.comments.length}`,
       children: commentChildren,
+      expanded: false,
+    });
+  }
+
+  // ── Journal (top-level, peer of Comments) ────────────────────────
+  // Append-only, prompt-immune side channel. No unseen tracking — journal
+  // entries are never delivered to the agent, so "seen by agent" is moot.
+  if (data.journal.length > 0) {
+    const sorted = [...data.journal].reverse();
+    const journalChildren: NavItem[] = sorted.map(entry => {
+      const firstLine = entry.content.split('\n')[0];
+      const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
+      return {
+        key: `${keyPrefix}journal-entry:${entry.id}`,
+        label: preview,
+        icon: '📓',
+      };
+    });
+
+    items.push({
+      key: `${keyPrefix}journal`,
+      label: 'Journal',
+      icon: '📓',
+      badge: `${data.journal.length}`,
+      children: journalChildren,
+      expanded: false,
+    });
+  }
+
+  // ── Follow-ups (top-level, peer of Comments) ─────────────────────
+  // Passive, agent-recorded orthogonal-work notes — display only.
+  if (data.followUps.length > 0) {
+    const sorted = [...data.followUps].reverse();
+    const followUpChildren: NavItem[] = sorted.map(f => {
+      const firstLine = f.content.split('\n')[0];
+      const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
+      return {
+        key: `${keyPrefix}followup:${f.id}`,
+        label: preview,
+        icon: '📌',
+      };
+    });
+
+    items.push({
+      key: `${keyPrefix}followups`,
+      label: 'Follow-ups',
+      icon: '📌',
+      badge: `${data.followUps.length}`,
+      children: followUpChildren,
       expanded: false,
     });
   }
@@ -684,6 +773,10 @@ async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, 
   if (key === 'turns') {
     return getTurnsOverview(mainData);
   }
+  if (key.startsWith('chunk:')) {
+    const idx = parseInt(key.substring(6), 10);
+    return getChunkOverview(mainData, idx);
+  }
   if (key.startsWith('turn-node:')) {
     const seq = parseInt(key.substring(10), 10);
     return getTurnContent(mainData, seq);
@@ -733,6 +826,24 @@ async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, 
   if (key.startsWith('comment:')) {
     const noteId = key.substring(8);
     return getSingleCommentContent(mainData, noteId);
+  }
+
+  // Journal
+  if (key === 'journal') {
+    return getJournalContent(mainData);
+  }
+  if (key.startsWith('journal-entry:')) {
+    const entryId = key.substring('journal-entry:'.length);
+    return getSingleJournalEntryContent(mainData, entryId);
+  }
+
+  // Follow-ups
+  if (key === 'followups') {
+    return getFollowUpsContent(mainData);
+  }
+  if (key.startsWith('followup:')) {
+    const followUpId = key.substring(9);
+    return getSingleFollowUpContent(mainData, followUpId);
   }
 
   // Proposals
@@ -993,6 +1104,62 @@ function getSingleCommentContent(data: ReviewData, noteId: string): string[] {
   return lines;
 }
 
+function getJournalContent(data: ReviewData): string[] {
+  const lines: string[] = [];
+  lines.push(ansi.bold + `Journal (${data.journal.length})` + ansi.reset);
+  lines.push(ansi.dim + 'Append-only orchestration metadata & memories — never sent to the agent.' + ansi.reset);
+  lines.push('');
+
+  // Show newest first
+  const sorted = [...data.journal].reverse();
+  for (const entry of sorted) {
+    const who = entry.actor ? ansi.dim + ` (${entry.actor})` + ansi.reset : '';
+    lines.push(ansi.dim + `[${formatDate(entry.created_at)}]` + ansi.reset + who);
+    lines.push(...entry.content.split('\n'));
+    lines.push('');
+  }
+
+  return lines;
+}
+
+function getFollowUpsContent(data: ReviewData): string[] {
+  const lines: string[] = [];
+  lines.push(ansi.bold + `Follow-ups (${data.followUps.length})` + ansi.reset);
+  lines.push('');
+
+  // Show newest first
+  const sorted = [...data.followUps].reverse();
+  for (const f of sorted) {
+    lines.push(ansi.dim + `[${formatDate(f.created_at)}]` + ansi.reset);
+    lines.push(...f.content.split('\n'));
+    lines.push('');
+  }
+
+  return lines;
+}
+
+function getSingleJournalEntryContent(data: ReviewData, entryId: string): string[] {
+  const entry = data.journal.find(e => e.id === entryId);
+  if (!entry) return ['Journal entry not found.'];
+
+  const lines: string[] = [];
+  lines.push(ansi.dim + `Date: ${formatDate(entry.created_at)}` + (entry.actor ? ` · ${entry.actor}` : '') + ansi.reset);
+  lines.push('');
+  lines.push(...entry.content.split('\n'));
+  return lines;
+}
+
+function getSingleFollowUpContent(data: ReviewData, followUpId: string): string[] {
+  const f = data.followUps.find(x => x.id === followUpId);
+  if (!f) return ['Follow-up not found.'];
+
+  const lines: string[] = [];
+  lines.push(ansi.dim + `Date: ${formatDate(f.created_at)}` + ansi.reset);
+  lines.push('');
+  lines.push(...f.content.split('\n'));
+  return lines;
+}
+
 function getProposalsContent(data: ReviewData): string[] {
   const lines: string[] = [];
   lines.push(ansi.bold + `Proposals (${data.proposals.length} pending)` + ansi.reset);
@@ -1113,6 +1280,37 @@ function getTurnsOverview(data: ReviewData): string[] {
   return lines;
 }
 
+/** Overview for a single review chunk (its boundary + member turns). */
+export function getChunkOverview(data: ReviewData, index: number): string[] {
+  const ascending = [...data.turns].sort((a, b) => a.sequence - b.sequence);
+  const chunks = groupTurnsIntoChunks(ascending);
+  const chunk = chunks[index];
+  if (!chunk) return ['Chunk not found.'];
+
+  const lines: string[] = [];
+  const b = chunk.boundary;
+  const boundaryDesc = b
+    ? `#${b.sequence} [${b.role === 'human' && b.actor && b.actor !== 'human' ? b.actor : b.role}]`
+    : '(no boundary — leading automation turns)';
+  lines.push(ansi.bold + `Chunk ${chunk.index + 1} — ${boundaryDesc}` + ansi.reset);
+  lines.push(ansi.dim + `${chunk.turns.length} turn${chunk.turns.length === 1 ? '' : 's'} (boundary + following agent/supervisor/system turns)` + ansi.reset);
+  lines.push('');
+
+  for (const turn of chunk.turns) {
+    const roleColor = turn.role === 'human' ? ansi.fg.green : ansi.fg.blue;
+    const actorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
+      ? turn.actor.toUpperCase()
+      : turn.role.toUpperCase();
+    const autoSuffix = turn.auto_triggered ? ansi.dim + ' (auto)' + ansi.reset : '';
+    const preview = turn.content.substring(0, 60).replace(/\n/g, ' ');
+    lines.push(roleColor + `#${turn.sequence} [${actorLabel}]` + ansi.reset + autoSuffix + ` ${preview}...`);
+  }
+
+  lines.push('');
+  lines.push(ansi.dim + 'Expand a turn to see its content, plan, commits, and diff.' + ansi.reset);
+  return lines;
+}
+
 /** Content for the "Sub-tasks" section header. */
 function getSubtasksListContent(data: ReviewData): string[] {
   const lines: string[] = [];
@@ -1186,6 +1384,12 @@ function getTaskOverviewContent(data: ReviewData): string[] {
   lines.push(`  ${ansi.bold}Commits:${ansi.reset} ${data.commits.length}`);
   if (data.comments.length > 0) {
     lines.push(`  ${ansi.bold}Comments:${ansi.reset} ${data.comments.length}`);
+  }
+  if (data.journal.length > 0) {
+    lines.push(`  ${ansi.bold}Journal:${ansi.reset} ${data.journal.length}`);
+  }
+  if (data.followUps.length > 0) {
+    lines.push(`  ${ansi.bold}Follow-ups:${ansi.reset} ${data.followUps.length}`);
   }
   lines.push('');
   lines.push(ansi.dim + 'Expand this node to see its Turns, Comments, Commits, and Diff.' + ansi.reset);
@@ -1910,6 +2114,9 @@ function buildStatusLine(data: ReviewData): string {
   parts.push(`Commits: ${data.commits.length}`);
   if (data.unseenComments.length > 0) {
     parts.push(`${data.unseenComments.length} unseen comment(s)`);
+  }
+  if (data.followUps.length > 0) {
+    parts.push(`${data.followUps.length} follow-up(s)`);
   }
   if (data.proposals.length > 0) {
     parts.push(`${data.proposals.length} proposal(s)`);

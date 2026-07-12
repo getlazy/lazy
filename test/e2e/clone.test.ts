@@ -131,6 +131,10 @@ describe('lazy clone', () => {
     expectError(result, 'No task found matching');
   });
 
+  // INVARIANT: A parent in a terminal state cannot be assigned via clone. `close`
+  // moves a task to the 'abandoned' terminal status (there is no literal 'closed'
+  // status — see VALID_TRANSITIONS), and the rejection message reports the actual
+  // status.
   test('fails for terminal parent task', async () => {
     const taskId = await createTask(ctx, 'Task to clone', 'Prompt');
     const parentId = await createTask(ctx, 'Closed parent', 'Prompt');
@@ -139,7 +143,7 @@ describe('lazy clone', () => {
     const result = await ctx.lazy(['clone', taskId, '--parent', parentId]);
 
     expectFailure(result);
-    expectError(result, 'task is closed');
+    expectError(result, 'task is abandoned');
   });
 
   test('shows usage when no task ID provided', async () => {
@@ -227,13 +231,22 @@ describe('lazy clone', () => {
     expectError(result, 'Invalid code');
   });
 
-  test('clone with invalid --model fails', async () => {
+  // INVARIANT: There is no model-name allowlist/registry. validateModel accepts
+  // any non-empty string and defers name resolution to the Claude CLI, so an
+  // unrecognized-looking name is NOT rejected by lazy — only an empty model is.
+  // Do NOT reinstate model-name validation here (see the matching invariant in
+  // edit.test.ts / create.test.ts).
+  test('clone accepts an arbitrary --model but rejects an empty one', async () => {
     const taskId = await createTask(ctx, 'Task', 'Prompt');
 
-    const result = await ctx.lazy(['clone', taskId, '--model', 'invalid-model']);
+    // Any non-empty string is accepted and passed through verbatim.
+    const ok = await ctx.lazy(['clone', taskId, '--model', 'some-custom-model']);
+    expectSuccess(ok);
 
-    expectFailure(result);
-    expectError(result, 'Invalid model');
+    // An empty model string is still refused.
+    const empty = await ctx.lazy(['clone', taskId, '--model', '']);
+    expectFailure(empty);
+    expectError(empty, 'Model name cannot be empty');
   });
 
   test('clone carries over task type', async () => {

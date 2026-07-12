@@ -4,11 +4,12 @@
  * Server-rendered HTML with inline CSS. No frontend build step needed.
  */
 
-import type { Task, Session, Turn, Commit, Comment, SearchResult, TaskPromptVersion } from '../storage';
+import type { Task, Session, Turn, Commit, Comment, JournalEntry, FollowUp, SearchResult, TaskPromptVersion } from '../storage';
 import type { TokenUsage } from '../types';
 import { renderMarkdown } from './markdown';
 import { renderDiff, diffStyles, diffScripts } from './diff';
 import { parentTaskIdOf } from '../task-target';
+import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 
 export interface TaskWithSession {
   task: Task;
@@ -204,6 +205,29 @@ export function layoutHtml(title: string, content: string, extraStyles: string =
     .detail-label {
       color: var(--text-secondary);
       min-width: 140px;
+    }
+    .turn-chunk {
+      margin-bottom: 16px;
+      padding: 8px 8px 4px 8px;
+      border-left: 3px solid var(--border);
+      background: var(--bg-secondary);
+      border-radius: 4px;
+    }
+    .turn-chunk-header {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+    .turn-auto {
+      display: inline-block;
+      font-size: 10px;
+      padding: 0 5px;
+      border-radius: 3px;
+      background: var(--border);
+      color: var(--text-secondary);
     }
     .turn {
       margin-bottom: 12px;
@@ -495,6 +519,8 @@ export function taskDetailHtml(
   turns: Turn[],
   commits: Commit[],
   comments: Comment[],
+  journal: JournalEntry[],
+  followUps: FollowUp[],
   children: Task[],
   promptVersions: TaskPromptVersion[],
   parentTask?: Task | null,
@@ -550,9 +576,12 @@ export function taskDetailHtml(
     `;
   }
 
-  // Turns section - rendered as Markdown with links to turn detail pages
+  // Turns section - grouped into review chunks (one human/builder boundary plus
+  // its following agent/supervisor/system turns) using the single source of
+  // truth, so intermediate auto-resume/supervisor turns are never visually lost.
+  // Rendered as Markdown with links to turn detail pages.
   if (turns.length > 0) {
-    const turnItems = turns.map(turn => {
+    const renderTurnHtml = (turn: Turn): string => {
       const turnLink = session ? `/tasks/${task.id}/turns/${turn.sequence}` : '#';
       const preview = renderMarkdown(turn.content);
       const usageInfo = turn.usage
@@ -563,20 +592,38 @@ export function taskDetailHtml(
       const authorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
         ? turn.actor
         : turn.role;
+      // Surface auto-triggered provenance so a reviewer can tell automation turns
+      // (auto-resume, nudge) from a real human/builder turn.
+      const autoBadge = turn.auto_triggered ? ` <span class="turn-auto">auto</span>` : '';
       return `
       <div class="turn">
         <div class="turn-header">
-          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(authorLabel)}] ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}</span>
+          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(authorLabel)}]${autoBadge} ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}</span>
         </div>
         <div class="turn-content">${preview}</div>
+      </div>
+    `;
+    };
+
+    const chunks = groupTurnsIntoChunks(turns);
+    const chunkItems = chunks.map(chunk => {
+      const b = chunk.boundary;
+      const boundaryLabel = b
+        ? `#${b.sequence} [${escapeHtml(b.role === 'human' && b.actor && b.actor !== 'human' ? b.actor : b.role)}]`
+        : '(no boundary — leading automation turns)';
+      const turnsHtml = chunk.turns.map(renderTurnHtml).join('');
+      return `
+      <div class="turn-chunk">
+        <div class="turn-chunk-header">Chunk ${chunk.index + 1} · ${boundaryLabel} · ${chunk.turns.length} turn${chunk.turns.length === 1 ? '' : 's'}</div>
+        ${turnsHtml}
       </div>
     `;
     }).join('');
 
     content += `
       <div class="detail-section">
-        <h2>Turns (${turns.length})</h2>
-        ${turnItems}
+        <h2>Turns (${turns.length} in ${chunks.length} chunk${chunks.length === 1 ? '' : 's'})</h2>
+        ${chunkItems}
       </div>
     `;
   }
@@ -612,6 +659,40 @@ export function taskDetailHtml(
       <div class="detail-section">
         <h2>Comments (${comments.length})</h2>
         ${commentItems}
+      </div>
+    `;
+  }
+
+  // Journal section — append-only, prompt-immune side channel (separate from Comments)
+  if (journal.length > 0) {
+    const journalItems = journal.map(entry => `
+      <div class="note">
+        <div class="note-date">${escapeHtml(formatDate(entry.created_at))}${entry.actor ? ` · ${escapeHtml(entry.actor)}` : ''}</div>
+        <div class="note-content">${escapeHtml(entry.content)}</div>
+      </div>
+    `).join('');
+
+    content += `
+      <div class="detail-section">
+        <h2>Journal (${journal.length})</h2>
+        ${journalItems}
+      </div>
+    `;
+  }
+
+  // Follow-ups section (passive, agent-recorded orthogonal-work notes; display only)
+  if (followUps.length > 0) {
+    const followUpItems = followUps.map(followUp => `
+      <div class="note">
+        <div class="note-date">${escapeHtml(formatDate(followUp.created_at))}</div>
+        <div class="note-content">${escapeHtml(followUp.content)}</div>
+      </div>
+    `).join('');
+
+    content += `
+      <div class="detail-section">
+        <h2>Follow-ups (${followUps.length})</h2>
+        ${followUpItems}
       </div>
     `;
   }

@@ -53,7 +53,7 @@ function getLazyBinaryPath(): string {
 // Commands whose first positional is a task reference and that operate on
 // currently-active (working/blocked) tasks. Completed from `active --ids-only`.
 const ACTIVE_TASK_ID_COMMANDS = withAliases([
-  'show', 'start', 'edit', 'comment', 'clone', 'unblock', 'review', 'resume',
+  'show', 'start', 'edit', 'comment', 'journal', 'clone', 'unblock', 'review', 'resume',
   'branch', 'diff', 'status', 'shell', 'pair', 'accept', 'reject',
   'close', 'submit', 'sync', 'wait', 'watch', 'doctor', 'stop', 'reparent',
 ]);
@@ -70,7 +70,7 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
   'system': ['prompts', 'build', 'status', 'offline', 'online', 'export-dockerfile'],
-  'daemon': ['start', 'stop', 'restart', 'status', 'logs'],
+  'daemon': ['start', 'stop', 'restart', 'status', 'logs', 'auto-budget'],
   'config': ['set', 'get'],
 });
 
@@ -78,7 +78,7 @@ const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
 // dispatcher in src/index.ts); withAliases() appends aliases like ls/tasks/
 // view/doc so they tab-complete too.
 const ALL_COMMANDS = withAliases([
-  'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'clone',
+  'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'journal', 'clone',
   'list', 'active', 'blocked', 'show', 'search', 'report',
   'review', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
   'diff', 'status', 'shell', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
@@ -104,6 +104,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'show':                ['--full', '--lines', '--json'],
   'search':              ['--fuzzy', '--group', '--json', '--tasks', '--prompts', '--turns', '--commits', '--notes', '--conversations'],
   'comment':             ['--message'],
+  'journal':             ['--message', '--add'],
   'close':               ['--yes', '--reason', '--accept-dirty-worktree'],
   'reject':              ['--yes', '--reason', '--accept-dirty-worktree'],
   'diff':                ['--turn', '--full', '--lines'],

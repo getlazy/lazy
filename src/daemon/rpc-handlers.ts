@@ -23,7 +23,7 @@ import { loadConfig } from '../config/loader';
 import { getAuthEnvVars } from '../capture/claude';
 import { createStorage, type Storage, type StorageBackend } from '../storage';
 import type { Task, SearchResult } from '../storage';
-import type { TaskTarget } from '../types';
+import type { TaskTarget, Actor } from '../types';
 import { parentTaskIdOf, targetBranchOf } from '../task-target';
 import { buildTaskTree } from '../cli/commands/list';
 import { loadTaskShowData } from '../cli/commands/show';
@@ -117,7 +117,13 @@ export async function closeAllStorage(): Promise<void> {
  * they use getOrCreateStorage() instead.
  */
 export async function openProjectStorage(projectRoot: string): Promise<Storage> {
-  const config = await loadConfig(projectRoot);
+  // Resolve config relative to projectRoot, NOT the ambient process.cwd().
+  // loadConfig defaults its search to process.cwd(); a caller running from a
+  // different directory (e.g. an in-process test whose cwd is the dev repo, or
+  // any tool invoked outside the target project) would otherwise pick up the
+  // WRONG project's lazy.toml — resolving external_path to a foreign storage
+  // path. This function takes an explicit root, so config must follow it.
+  const config = await loadConfig(projectRoot, { cwd: projectRoot });
   return createStorage(projectRoot, {
     backend: config.storage.backend as StorageBackend,
     externalPath: config.storage.external_path || undefined,
@@ -246,6 +252,8 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     turns: data.turns,
     commits: data.commits,
     comments: data.comments,
+    journal: data.journal,
+    followUps: data.followUps,
     statusHistory: data.statusHistory,
     children: data.children,
     childSessions: Object.fromEntries(data.childSessions.entries()),
@@ -532,6 +540,7 @@ export async function handleStartTask(projectRoot: string, params: Record<string
     forceLocal: params.forceLocal as boolean | undefined,
     retargetOrphan: params.retargetOrphan as boolean | undefined,
     effortOverride: params.effortOverride as string | undefined,
+    actor: params.actor as Actor | undefined,
   };
 
   if (!startParams.taskId) {
@@ -563,6 +572,7 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
     notesInEditor: params.notesInEditor as boolean | undefined,
     effortOverride: params.effortOverride as string | undefined,
     permissionMode,
+    actor: params.actor as Actor | undefined,
   };
 
   if (!unblockParams.taskId) {
@@ -583,6 +593,7 @@ export async function handleAskTask(projectRoot: string, params: Record<string, 
     taskId: params.taskId as string,
     message: params.message as string,
     effortOverride: params.effortOverride as string | undefined,
+    actor: params.actor as Actor | undefined,
   };
 
   if (!askParams.taskId) throw new RpcError(400, 'taskId is required');
@@ -669,6 +680,7 @@ export async function handleStopTask(projectRoot: string, params: Record<string,
   const stopParams: StopTaskParams = {
     taskId: params.taskId as string,
     reason: params.reason as string,
+    actor: params.actor as Actor | undefined,
   };
   if (!stopParams.taskId) {
     throw new RpcError(400, 'taskId is required');
@@ -715,6 +727,7 @@ export async function handleResumeTask(projectRoot: string, params: Record<strin
 export async function handleSyncTask(projectRoot: string, params: Record<string, unknown>) {
   const syncParams: SyncTaskParams = {
     taskId: params.taskId as string,
+    actor: params.actor as Actor | undefined,
   };
 
   if (!syncParams.taskId) {
@@ -893,6 +906,14 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   // Comments
   createComment: (s, a) => s.createComment(a.taskId as string, a.content as string, a.actor as any, a.source as any),
   getTaskComments: (s, a) => s.getTaskComments(a.taskId as string),
+
+  // Journal (append-only, prompt-immune side channel — never wired into prompt assembly)
+  appendJournalEntry: (s, a) => s.appendJournalEntry(a.taskId as string, a.content as string, a.actor as any),
+  getTaskJournal: (s, a) => s.getTaskJournal(a.taskId as string),
+
+  // Follow-ups (task-level orthogonal-work discoveries)
+  createFollowUp: (s, a) => s.createFollowUp(a.taskId as string, a.content as string, a.sessionId as string | null),
+  getTaskFollowUps: (s, a) => s.getTaskFollowUps(a.taskId as string),
 
   // Hunk approvals (per-hunk reviewed state for `lazy review -i`)
   listHunkApprovals: (s, a) => s.listHunkApprovals(a.taskId as string),

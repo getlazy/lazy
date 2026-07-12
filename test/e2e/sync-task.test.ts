@@ -304,7 +304,13 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
   // transitioned the task out of its prior status, so the reconciler (which
   // only processes working tasks) never saw the supervisor's response.
   // Result: no turn was recorded and status stayed blocked. Silent no-op.
-  test('sync with upstream changes transitions task to working and records human turn', async () => {
+  //
+  // INVARIANT: sync transitions the task to 'working' so the reconciler picks up
+  // the supervisor's response. Turn recording is now owned by the reconciler
+  // (recordSyncTurns), keyed on the merge OUTCOME — so NO turn is pre-created on
+  // the daemon here. Pre-creating one before the outcome is known is exactly what
+  // left a spurious turn pair on no-op syncs (see recordSyncTurns).
+  test('sync with upstream changes transitions task to working and pre-creates no turn', async () => {
     const taskId = await createTask(ctx, 'Sync transitions to working', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
@@ -319,26 +325,28 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
     ctx.git('commit', '-m', 'upstream commit');
     ctx.git('checkout', '-');
 
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
+    const entries0 = readdirSync(tasksDir);
+    const fullId = entries0.find(e => e.startsWith(taskId));
+    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
+
+    // Snapshot the turn count BEFORE sync so we can assert none was pre-created.
+    const turnsBefore = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8')).turns.length;
+
     const result = await ctx.lazy(['sync', taskId]);
     const output = result.stdout + result.stderr;
     expect(output.includes('up to date')).toBe(false);
 
     // Task must transition to 'working' — otherwise the reconciler will never
     // process the supervisor's response and the sync becomes a silent no-op.
-    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
-    const entries = readdirSync(tasksDir);
-    const fullId = entries.find(e => e.startsWith(taskId));
-    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
     const taskData = JSON.parse(readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8'));
     expect(taskData.status).toBe('working');
 
-    // A human turn must exist documenting the sync request, so that the
-    // supervisor's completion response isn't dropped by the reconciler's
-    // idempotency check (which skips when the last turn is already 'agent').
-    const turnsData = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8'));
-    const lastTurn = turnsData.turns[turnsData.turns.length - 1];
-    expect(lastTurn.role).toBe('human');
-    expect(lastTurn.content).toContain('Upstream merge requested');
+    // No synthetic turn is pre-created on the daemon side. The reconciler records
+    // the (supervisor-actored) sync turn only once the supervisor reports the
+    // merge outcome — and records nothing at all for a no-op.
+    const turnsAfter = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8')).turns.length;
+    expect(turnsAfter).toBe(turnsBefore);
   });
 
   test('sync help includes task-level sync documentation', async () => {

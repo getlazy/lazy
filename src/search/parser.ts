@@ -55,14 +55,14 @@ export interface FieldNode {
 /** Scoped search: in:turns "reconciler", in:commits "wip", in:conversations "design" */
 export interface InNode {
   type: 'in';
-  scope: 'turns' | 'commits' | 'comments' | 'conversations';
+  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations';
   value: string;
 }
 
-/** Existence check: has:commits, has:turns, has:comments */
+/** Existence check: has:commits, has:turns, has:comments, has:followups */
 export interface HasNode {
   type: 'has';
-  scope: 'commits' | 'turns' | 'comments';
+  scope: 'commits' | 'turns' | 'comments' | 'followups';
 }
 
 /** Date range: created:>2026-02-15, updated:<2026-01-01 */
@@ -351,9 +351,9 @@ export function parseQuery(input: string): QueryNode {
     // in:scope — the next token is the search text
     if (field === 'in') {
       const scope = value.toLowerCase();
-      if (scope !== 'turns' && scope !== 'commits' && scope !== 'comments' && scope !== 'conversations') {
+      if (scope !== 'turns' && scope !== 'commits' && scope !== 'comments' && scope !== 'followups' && scope !== 'conversations') {
         throw new QueryParseError(
-          `in: scope must be "turns", "commits", "comments", or "conversations" (got "${value}")`,
+          `in: scope must be "turns", "commits", "comments", "followups", or "conversations" (got "${value}")`,
           pos
         );
       }
@@ -378,9 +378,9 @@ export function parseQuery(input: string): QueryNode {
     // has:scope
     if (field === 'has') {
       const scope = value.toLowerCase();
-      if (scope !== 'commits' && scope !== 'turns' && scope !== 'comments') {
+      if (scope !== 'commits' && scope !== 'turns' && scope !== 'comments' && scope !== 'followups') {
         throw new QueryParseError(
-          `has: scope must be "commits", "turns", or "comments" (got "${value}")`,
+          `has: scope must be "commits", "turns", "comments", or "followups" (got "${value}")`,
           pos
         );
       }

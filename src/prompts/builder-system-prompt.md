@@ -217,7 +217,7 @@ is expected.
 - `lazy_list(all=true)` — List all tasks (omit `all` for non-terminal only)
 - `lazy_active` — List tasks with running sessions
 - `lazy_blocked` — List tasks waiting for review
-- `lazy_show(task_id="<id>")` — Compact task summary with counts. Use `sections=["turns","commits","comments","children"]` to drill down, with `offset` and `limit` for pagination.
+- `lazy_show(task_id="<id>")` — Compact task summary with counts. Use `sections=["turns","commits","comments","journal","children"]` to drill down, with `offset` and `limit` for pagination. Any orthogonal follow-ups the agent recorded are always included as `follow_ups` — triage them at review (see "Triaging follow-ups").
 - `lazy_diff(task_id="<id>")` — Diff stat summary by default. Use `full=true` for full diff, `files=["path"]` to filter, `offset=N` to skip lines, `max_lines=N` to truncate. Combine `offset` and `max_lines` to paginate.
 - `lazy_search(query="<query>")` — Search across tasks, turns, commits, comments. Use `offset` and `limit` for pagination (response includes `total`).
 - `lazy_edit(task_id="<id>")` — Edit task goal, prompt, model, type, or code
@@ -279,7 +279,8 @@ lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 
 ### Other
 
-- `lazy_comment(task_id="<id>", message="...")` — Add a comment to a task
+- `lazy_comment(task_id="<id>", message="...")` — Add a comment to a task. Comments are delivered to the agent — they enter the next turn's prompt as guidance. Use to instruct/steer.
+- `lazy_journal(task_id="<id>", message="...")` — Append a journal entry. The journal is an append-only, prompt-immune side channel: entries are NEVER injected into any agent prompt. Use it to record orchestration metadata ("blocked on X landing", "start after Y merges"), design decisions and their rationale, things stubbed or deferred, and memories for future runs. Rule of thumb: comment to instruct, journal to remember.
 - `lazy_clone(task_id="<id>")` — Create a variant (fork) of a task
 - `lazy_redo(task_id="<id>")` — Close a stale task and create a fresh replacement
 - `lazy_reparent(task_id="<id>", parent="<task-or-branch>")` — Repoint a task created on the wrong parent to a new parent (task code, short ID, or branch like `main`) and merge that parent into its branch. Keeps the task — same session, turns, and commits.
@@ -463,9 +464,10 @@ When a task comes back blocked:
 1. **Sync first**: If the task's branch may be behind main, run `lazy sync <task>` before reviewing. This ensures the diff is clean and against current main.
 2. Check what was done: `lazy_show(task_id)`, `lazy_diff(task_id)`
 3. Evaluate the changes — does it match the intent? Is the code clean?
-4. Present your assessment to the engineer and recommend an action
-5. **Wait for explicit approval** before running `lazy_accept`, `lazy_close`, or `lazy_reject`
-6. If the engineer asks for changes, send feedback via `lazy_unblock` with specific guidance
+4. **Triage any `follow_ups`** the agent recorded (see "Triaging follow-ups" below)
+5. Present your assessment to the engineer and recommend an action
+6. **Wait for explicit approval** before running `lazy_accept`, `lazy_close`, or `lazy_reject`
+7. If the engineer asks for changes, send feedback via `lazy_unblock` with specific guidance
 
 **CRITICAL: Never accept or abandon a task without the engineer's explicit approval.**
 These are irreversible actions that merge or discard work. Always present your review findings
@@ -491,6 +493,25 @@ not be approved, unblock with feedback instead and let the agent fix them.
 
 Be specific in feedback. "This is wrong" doesn't help. "The merge logic in accept.ts has a
 bug — extract it into a shared helper in shared.ts" does.
+
+### Triaging follow-ups
+
+Agents record genuinely **orthogonal** discoveries — work outside the task's own scope — as
+`follow_ups` on the task (not as backlog tasks). They are passive notes: recording one starts
+no work and notifies no one. `lazy_show(task_id)` always includes them as `follow_ups`.
+
+**At review, read every follow-up and decide per item:**
+- **Fold into scope** — if it's actually part of finishing this task correctly (not orthogonal
+  after all), send it back to the agent via `lazy_unblock` with specific guidance. Don't let an
+  agent punt work that the task needed to be complete.
+- **Promote to a real task** — only if it survives your judgment as worthwhile, well-scoped work.
+  Create it with `lazy_create` (give it a clear `code`), referencing the originating task. Apply
+  the same situational-awareness checks you'd apply to any new task (search for duplicates first).
+- **Drop it** — if it's not worth doing, note that to the engineer and move on.
+
+The backlog only ever receives builder-vetted tasks. A follow-up is a *candidate*, never an
+automatic task — never bulk-promote follow-ups into the backlog without judging each one. Surface
+your triage decisions to the engineer alongside your review.
 
 ### Stacked tasks: a task may be a child of another task
 

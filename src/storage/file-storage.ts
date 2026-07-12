@@ -31,6 +31,7 @@ import type {
   Review,
   ReviewVerdict,
   Comment,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
@@ -50,6 +51,9 @@ import type {
   SnapshotsFile,
   ReviewsFile,
   CommentsFile,
+  JournalEntry,
+  JournalFile,
+  FollowUpsFile,
   HunkApprovalsFile,
   StatusChange,
   StatusChangelogFile,
@@ -679,6 +683,7 @@ export class FileStorage implements Storage {
         'snapshots.json': { snapshots: [] },
         'reviews.json': { reviews: [] },
         'comments.json': { comments: [] },
+        'follow-ups.json': { follow_ups: [] },
         'status-changelog.json': { changes: [{ status: 'backlog', timestamp: now }] },
       });
 
@@ -1913,6 +1918,94 @@ export class FileStorage implements Storage {
     return comments.sort((a, b) => a.created_at - b.created_at);
   }
 
+  // --- Journal ---
+  //
+  // Stored in journal.json (deliberately distinct from comments.json and the
+  // legacy notes.json so the two can never collide). Journal entries are
+  // prompt-immune: nothing in the prompt-assembly path reads journal.json.
+
+  private async readJournal(taskDir: string): Promise<JournalEntry[]> {
+    const journalPath = join(taskDir, 'journal.json');
+    const journalFile = await this.readJson<JournalFile>(journalPath);
+    return journalFile?.journal ?? [];
+  }
+
+  async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      const journal = await this.readJournal(this.taskDir(fullId));
+
+      const entry: JournalEntry = {
+        id: randomUUID(),
+        task_id: fullId,
+        content,
+        created_at: Date.now(),
+        ...(actor ? { actor } : {}),
+      };
+
+      journal.push(entry);
+
+      await this.atomicWriteTask(fullId, { 'journal.json': { journal } });
+
+      return entry;
+    });
+  }
+
+  async getTaskJournal(taskId: string): Promise<JournalEntry[]> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return [];
+
+    const journal = await this.readJournal(this.taskDir(fullId));
+    return journal.sort((a, b) => a.created_at - b.created_at);
+  }
+
+  // --- Follow-ups (task-level orthogonal-work discoveries) ---
+
+  private async readFollowUps(taskDir: string): Promise<FollowUp[]> {
+    const file = await this.readJson<FollowUpsFile>(join(taskDir, 'follow-ups.json'));
+    return file?.follow_ups ?? [];
+  }
+
+  async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      const followUps = await this.readFollowUps(this.taskDir(fullId));
+
+      const followUp: FollowUp = {
+        id: randomUUID(),
+        task_id: fullId,
+        content,
+        created_at: Date.now(),
+        ...(sessionId ? { session_id: sessionId } : {}),
+      };
+
+      followUps.push(followUp);
+
+      // INVARIANT: this is a plain storage append — it does NOT create a comment,
+      // change task status, or write any protocol/signal. Follow-ups must never
+      // trigger an auto-turn/auto-resume (that's why they aren't comments).
+      await this.atomicWriteTask(fullId, { 'follow-ups.json': { follow_ups: followUps } });
+
+      return followUp;
+    });
+  }
+
+  async getTaskFollowUps(taskId: string): Promise<FollowUp[]> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return [];
+
+    const followUps = await this.readFollowUps(this.taskDir(fullId));
+    return followUps.sort((a, b) => a.created_at - b.created_at);
+  }
+
   // --- Hunk Approvals ---
 
   async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
@@ -2256,6 +2349,22 @@ export class FileStorage implements Storage {
               task_goal: taskGoal,
               content: comment.content,
               match_context: this.extractContext(comment.content, query),
+            });
+          }
+        }
+
+        // Search follow-ups
+        const followUps = await this.readFollowUps(taskDir);
+        for (const followUp of followUps) {
+          if (this.textMatches(followUp.content, query)) {
+            results.push({
+              entity_type: 'followup',
+              entity_id: followUp.id,
+              task_id: dir,
+              task_code: taskCode,
+              task_goal: taskGoal,
+              content: followUp.content,
+              match_context: this.extractContext(followUp.content, query),
             });
           }
         }

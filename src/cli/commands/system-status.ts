@@ -19,7 +19,7 @@
 import { join } from 'path';
 import { requireLazyRoot } from '../helpers';
 import { loadConfig } from '../../config/loader';
-import { getOfflineStatus } from '../../utils/offline';
+import { resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { isDaemonRunning, readPid } from '../../daemon';
 import { theme } from '../theme';
 import { VERSION } from '../../version';
@@ -35,7 +35,7 @@ export async function commandSystemStatus(_args: string[]): Promise<void> {
   const dataDir = join(root, '.lazy');
 
   const config = await loadConfig(root);
-  const offline = await getOfflineStatus(dataDir);
+  const offline = await resolveOfflineStatus(dataDir, config.remote.offline);
   const configuredDriver = config.remote.driver;
 
   console.log(theme.header('System status'));
@@ -46,15 +46,23 @@ export async function commandSystemStatus(_args: string[]): Promise<void> {
   console.log('');
 
   // ── Offline/online — the headline state ──────────────────────────────────
-  if (offline.enabled) {
-    const suspended = offline.configured_driver ?? configuredDriver;
-    line('Mode', theme.warning('OFFLINE'));
-    const since = offline.enabled_at ? ` since ${offline.enabled_at}` : '';
+  // Always surface when offline expires (or that it never will) — no silent
+  // indefinite offline.
+  if (offline.offline) {
+    const suspended = offline.configuredDriver ?? configuredDriver;
+    // e.g. "OFFLINE — auto-resumes in 6h (00:00 local)" or, for the config
+    // flag, "OFFLINE — permanent (set in lazy.toml) — does not auto-resume".
+    line('Mode', theme.warning(`OFFLINE — ${formatOfflineExpiry(offline)}`));
+    const since = offline.enabledAt ? ` since ${offline.enabledAt}` : '';
     console.log(`              Remote operations are skipped${since}.`);
     if (suspended && suspended !== 'local') {
       console.log(`              Configured driver "${suspended}" is suspended.`);
     }
-    console.log(`              Run ${theme.command('lazy system online')} to restore remote operations.`);
+    if (offline.permanent) {
+      console.log(`              Remove ${theme.command('[remote] offline')} from lazy.toml to go back online.`);
+    } else {
+      console.log(`              Run ${theme.command('lazy system online')} to restore remote operations.`);
+    }
   } else {
     line('Mode', theme.success('ONLINE'));
   }
@@ -63,7 +71,7 @@ export async function commandSystemStatus(_args: string[]): Promise<void> {
   // ── Remote driver / git remote ───────────────────────────────────────────
   // Offline mode forces the LocalDriver regardless of configuration, so the
   // effective driver is what actually runs — surface both when they differ.
-  if (offline.enabled && configuredDriver !== 'local') {
+  if (offline.offline && configuredDriver !== 'local') {
     line('Driver', `local (offline — configured: ${configuredDriver})`);
   } else {
     line('Driver', configuredDriver);

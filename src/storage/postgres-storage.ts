@@ -17,6 +17,8 @@ import type {
   Review,
   ReviewVerdict,
   Comment,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
@@ -351,6 +353,36 @@ export class PostgresStorage implements Storage {
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
       `;
+
+      // Journal table — append-only, prompt-immune side channel. A separate
+      // table (not a flag on comments) so there is structurally no code path
+      // from a journal entry into the agent prompt.
+      await sql`
+        CREATE TABLE IF NOT EXISTS journal_entries (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          content TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          actor TEXT
+        )
+      `;
+
+      await sql`CREATE INDEX IF NOT EXISTS idx_journal_entries_task_id ON journal_entries(task_id)`;
+
+      // Follow-ups table (task-level orthogonal-work discoveries). Kept separate
+      // from comments precisely because follow-ups must never feed the comment
+      // auto-react loop — see FollowUp invariant in src/types/index.ts.
+      await sql`
+        CREATE TABLE IF NOT EXISTS follow_ups (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          content TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          session_id TEXT
+        )
+      `;
+
+      await sql`CREATE INDEX IF NOT EXISTS idx_follow_ups_task_id ON follow_ups(task_id)`;
 
       // Prompt history table
       await sql`
@@ -1213,6 +1245,39 @@ export class PostgresStorage implements Storage {
     return this.sql<Comment[]>`SELECT * FROM comments WHERE task_id = ${taskId} ORDER BY created_at ASC`;
   }
 
+  async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
+    const id = randomUUID();
+    const now = Date.now();
+
+    await this.sql`
+      INSERT INTO journal_entries (id, task_id, content, created_at, actor)
+      VALUES (${id}, ${taskId}, ${content}, ${now}, ${actor ?? null})
+    `;
+
+    return { id, task_id: taskId, content, created_at: now, actor };
+  }
+
+  async getTaskJournal(taskId: string): Promise<JournalEntry[]> {
+    return this.sql<JournalEntry[]>`SELECT * FROM journal_entries WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+  }
+
+  async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
+    const id = randomUUID();
+    const now = Date.now();
+
+    // INVARIANT: a plain INSERT — no status change, no signal, no auto-react.
+    await this.sql`
+      INSERT INTO follow_ups (id, task_id, content, created_at, session_id)
+      VALUES (${id}, ${taskId}, ${content}, ${now}, ${sessionId ?? null})
+    `;
+
+    return { id, task_id: taskId, content, created_at: now, session_id: sessionId ?? null };
+  }
+
+  async getTaskFollowUps(taskId: string): Promise<FollowUp[]> {
+    return this.sql<FollowUp[]>`SELECT * FROM follow_ups WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+  }
+
   async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
     return this.sql<HunkApproval[]>`
       SELECT * FROM hunk_approvals WHERE task_id = ${taskId} ORDER BY approved_at ASC
@@ -1431,8 +1496,8 @@ export class PostgresStorage implements Storage {
   async search(query: string): Promise<SearchResult[]> {
     const pattern = `%${query}%`;
 
-    // Run all 6 queries in parallel since they're independent
-    const [taskRows, prompts, turns, commits, comments, conversations] = await Promise.all([
+    // Run all queries in parallel since they're independent
+    const [taskRows, prompts, turns, commits, comments, followUps, conversations] = await Promise.all([
       this.sql`SELECT * FROM tasks WHERE goal ILIKE ${pattern}`,
 
       this.sql<(TaskPromptVersion & { task_goal: string; task_code: string | null })[]>`
@@ -1463,6 +1528,13 @@ export class PostgresStorage implements Storage {
         FROM comments c
         INNER JOIN tasks t ON c.task_id = t.id
         WHERE c.content ILIKE ${pattern}
+      `,
+
+      this.sql<(FollowUp & { task_goal: string; task_code: string | null })[]>`
+        SELECT f.*, t.goal as task_goal, t.code as task_code
+        FROM follow_ups f
+        INNER JOIN tasks t ON f.task_id = t.id
+        WHERE f.content ILIKE ${pattern}
       `,
 
       this.sql<StoredConversation[]>`
@@ -1544,6 +1616,18 @@ export class PostgresStorage implements Storage {
         task_goal: comment.task_goal,
         content: comment.content,
         match_context: comment.content.slice(0, 200),
+      });
+    }
+
+    for (const followUp of followUps) {
+      results.push({
+        entity_type: 'followup',
+        entity_id: followUp.id,
+        task_id: followUp.task_id,
+        task_code: followUp.task_code,
+        task_goal: followUp.task_goal,
+        content: followUp.content,
+        match_context: followUp.content.slice(0, 200),
       });
     }
 

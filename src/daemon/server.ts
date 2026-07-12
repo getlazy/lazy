@@ -30,7 +30,8 @@ import { mkdirSync, existsSync, unlinkSync } from 'fs';
 import { unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { getSocketPath, getStartupErrorPath } from './paths';
-import { writePid, generateToken, readToken, cleanupStaleFiles, acquireDaemonLock, releaseDaemonLock } from './lifecycle';
+import { writePid, generateToken, readToken, cleanupStaleFiles, acquireDaemonLock, releaseDaemonLock, type AutoReactBudgetEntry } from './lifecycle';
+import { writeDaemonRoot } from './registry';
 import { handleRpc, RpcError, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
 import { handleMcpToolCall } from './mcp-routes';
 import { reconcileTasks } from '../utils/reconcile';
@@ -41,7 +42,8 @@ import { createWebRequestHandler, tryBindTcpPort } from '../server';
 import { formatDashboardUrl } from './dashboard-url';
 import { getLogPath } from './paths';
 import { loadConfig } from '../config/loader';
-import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND } from '../config/constants';
+import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
+import { resolveDaemonBindHosts } from './bind-hosts';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
 import { setDaemonContext } from './context';
 import {
@@ -93,8 +95,14 @@ export interface RunningDaemon {
   /** Cache of task short IDs, populated by the reconcile loop.
    *  Used by stop() to filter supervisors to only this project's tasks. */
   knownTaskIds: Set<string>;
-  /** TCP web server instance, if bound. */
+  /** TCP web server instance (primary bind), if bound. */
   webServer?: ReturnType<typeof Bun.serve>;
+  /**
+   * Additional TCP listeners on the same port for other interfaces (e.g. the
+   * docker bridge gateway on native Linux so containers can reach the daemon).
+   * Tracked separately so stop() tears them all down.
+   */
+  extraWebServers?: ReturnType<typeof Bun.serve>[];
   /** TCP port the web dashboard is listening on, if bound. */
   webPort?: number;
   /** Interface the web dashboard bound to (= config.server.bind), if bound. */
@@ -214,6 +222,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Write PID file
   writePid(projectRoot, process.pid);
 
+  // Record the absolute project root this daemon serves. The slug is lossy, so
+  // this marker is what lets `lazy daemon list/kill-stray` recover the real
+  // path and detect a "stray" daemon whose root was deleted. Best-effort —
+  // writeDaemonRoot swallows + logs failures so it can't block startup.
+  await writeDaemonRoot(projectRoot);
+
   // Reuse existing token so daemon restarts don't invalidate tokens held by
   // running containers/builders. Only generate a new token on first start.
   const existingToken = readToken(projectRoot);
@@ -259,14 +273,25 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
       // Auto-react budget: file-based read only (no storage, no lock).
       // tasksAtLimit is populated from a cache updated by the reconcile loop.
-      let autoReactBudget: { project: string; used: number; limit: number; tasksAtLimit: string[] }[] | undefined;
+      let autoReactBudget: AutoReactBudgetEntry[] | undefined;
       try {
-        const { readDailyBudget } = await import('./auto-react-budget');
+        const { readDailyBudget, effectiveDailyLimit, isGlobalAutoReactPaused } = await import('./auto-react-budget');
+        const { nextLocalMidnight } = await import('../utils/local-day');
         const config = await loadConfig(projectRoot);
         const dataDir = join(projectRoot, '.lazy');
         const budget = await readDailyBudget(dataDir);
-        const limit = config.daemon.auto_react_daily_budget;
-        autoReactBudget = [{ project: projectRoot, used: budget.used, limit, tasksAtLimit: cachedTasksAtLimit }];
+        const limit = effectiveDailyLimit(budget, config.daemon.auto_react_daily_budget);
+        const pause = await isGlobalAutoReactPaused(dataDir);
+        autoReactBudget = [{
+          project: projectRoot,
+          used: budget.used,
+          limit,
+          tasksAtLimit: cachedTasksAtLimit,
+          resetAt: nextLocalMidnight().getTime(),
+          paused: pause.paused,
+          pauseExpiresAt: pause.expiresAt,
+          capOverridden: budget.capOverride !== undefined,
+        }];
       } catch {
         // Auto-react budget info is optional
       }
@@ -395,6 +420,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // TCP web server — serves web dashboard + daemon routes
   let webServer: ReturnType<typeof Bun.serve> | undefined;
   let webPort: number | undefined;
+  // Additional listeners on the same port (e.g. docker bridge gateway on Linux).
+  const extraWebServers: ReturnType<typeof Bun.serve>[] = [];
 
   const shouldBindWeb =
     !options.noWeb && (options._forceBindWebInTest === true || !process.env.LAZY_TEST);
@@ -406,13 +433,17 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // the /mcp + /rpc endpoints are not exposed to the LAN. Users opt into
     // remote access via [server] bind in lazy.toml.
     let bindHost: string = DEFAULT_SERVER_BIND;
+    // Runner type decides whether containers need a bridge-reachable bind on
+    // Linux. Defaults to 'docker' (the loader default) if config can't be read.
+    let runnerType: import('../config/types').RunnerType = 'docker';
     try {
       const config = await loadConfig(projectRoot);
       configPort = config.server.port;
       bindHost = config.server.bind;
+      runnerType = config.runner.type;
     } catch { /* config load failure shouldn't prevent web server startup */ }
     const desiredPort = options.webPort ?? configPort ?? DEFAULT_WEB_PORT;
-    const attempts = options.maxPortAttempts ?? 100;
+    const attempts = options.maxPortAttempts ?? MAX_PORT_ATTEMPTS;
 
     // Tear down partial startup state so a failed bind leaves nothing behind:
     // no stale PID/socket/lock, no leaked timers, no dangling unix listener.
@@ -512,19 +543,40 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // throwing "Daemon context not initialized" — violating CLAUDE.md's
       // "fail hard on remote failures" and "principle of least surprise".
       const lastPort = desiredPort + attempts - 1;
+      // Two distinct failure modes need different remediation. Only the
+      // "range exhausted" case is plausibly caused by stray daemons, so only
+      // it leads with `lazy daemon kill-stray` — pointing an EACCES (privileged
+      // port) failure at kill-stray would be a misleading footgun and violate
+      // the principle of least surprise.
+      const isRangeExhausted = !bindThrownError;
       const reason = bindThrownError
         ? `bind error: ${bindThrownError instanceof Error ? bindThrownError.message : String(bindThrownError)}`
         : `no free port in range ${desiredPort}–${lastPort} (tried ${attempts} port${attempts === 1 ? '' : 's'}, all busy)`;
+      const context = isRangeExhausted
+        ? `The whole port range ${desiredPort}–${lastPort} is busy — this is almost always caused by ` +
+          `stray daemons (e.g. left behind by crashed or interrupted runs) squatting the range.\n`
+        : ``;
+      const remediation = isRangeExhausted
+        ? `To fix:\n` +
+          `  • Reap stray daemons whose project no longer exists: lazy daemon kill-stray\n` +
+          `  • See what is holding the ports: lazy daemon list  (or  lsof -i :${desiredPort})\n` +
+          `  • Stop a specific colliding daemon: lazy daemon stop --project <other-project>\n` +
+          `  • Or pick a different port in lazy.toml:\n` +
+          `      [server]\n` +
+          `      port = <number>`
+        : `To fix:\n` +
+          `  • Find what is holding the port: lsof -i :${desiredPort}\n` +
+          `  • Stop a colliding daemon: lazy daemon stop --project <other-project>\n` +
+          `  • Or pick a different port in lazy.toml:\n` +
+          `      [server]\n` +
+          `      port = <number>`;
       const errorMessage =
         `Daemon failed to bind web dashboard: ${reason}. ` +
         `The daemon cannot start without a reachable TCP port — containers call back via host.docker.internal:<port>.\n` +
         `\n` +
-        `To fix:\n` +
-        `  • Find what is holding the port: lsof -i :${desiredPort}\n` +
-        `  • Stop a colliding daemon: lazy daemon stop --project <other-project>\n` +
-        `  • Or pick a different port in lazy.toml:\n` +
-        `      [server]\n` +
-        `      port = <number>`;
+        context +
+        `\n` +
+        remediation;
       // Log via logger.error BEFORE teardown and throw. Logger uses
       // appendFileSync (O_APPEND), guaranteeing the message appears at the
       // END of daemon.log in chronological order with earlier startup lines.
@@ -589,6 +641,65 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         `on that interface. This was enabled via [server] bind in lazy.toml.`,
       );
     }
+
+    // Container reachability on native Linux Docker/Podman.
+    //
+    // The primary bind above (loopback by default) lets the host CLI/browser
+    // reach the daemon, but on native Linux a container reaches the host via
+    // host.docker.internal -> the bridge gateway (a NON-loopback interface),
+    // and a loopback-only daemon refuses that connection. So when the bind is
+    // the loopback default AND a container runner is configured on Linux, we
+    // ALSO bind the docker bridge gateway on the same port. This interface is
+    // host-local + container-network only (not routable from the LAN), so it
+    // does not widen the LAN exposure daemon-bind-localhost guards against.
+    // On macOS/Windows host.docker.internal is proxied to loopback, so the
+    // resolver returns loopback only and this loop is a no-op.
+    const resolution = resolveDaemonBindHosts({
+      configBind: bindHost,
+      platform: process.platform,
+      runnerType,
+    });
+    const extraHosts = resolution.hosts.slice(1);
+    for (const host of extraHosts) {
+      try {
+        // Bind the SAME port (maxAttempts=1) on this interface. A different
+        // local IP means this is a distinct socket, so the port is normally
+        // free here even though the primary already holds it on loopback.
+        const extra = tryBindTcpPort(actualPort, tcpHandler, 1, host);
+        if (extra) {
+          extraWebServers.push(extra.server);
+          logger.info(`Daemon TCP server also bound to ${host}:${actualPort} (container reachability)`);
+        } else {
+          logger.warn(
+            `Could not also bind the daemon to ${host}:${actualPort} (port busy on that interface). ` +
+            `Containers reaching the daemon via host.docker.internal:${actualPort} may fail. ` +
+            `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`,
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          `Could not also bind the daemon to ${host}:${actualPort} (container reachability): ` +
+          `${err instanceof Error ? err.message : String(err)}. ` +
+          `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`,
+        );
+      }
+    }
+
+    if (resolution.bridgeUnreachable) {
+      // Linux + container runner, but no docker/podman bridge interface was
+      // found — agents inside containers will silently fail to reach MCP/RPC.
+      // Surface it loudly with an actionable remediation instead of letting the
+      // failure show up later as opaque "Daemon context not initialized" errors.
+      logger.warn(
+        `Daemon is bound to loopback (${bindHost}:${actualPort}) but no docker/podman bridge ` +
+        `interface was detected, and the configured runner is "${runnerType}". On native Linux ` +
+        `Docker, containers reach the daemon via host.docker.internal -> the bridge gateway, which ` +
+        `a loopback-only daemon refuses — agents/supervisor/MCP may fail to reach the daemon.\n` +
+        `To fix, either ensure the docker bridge (docker0) is up, or set an explicit interface:\n` +
+        `  [server]\n` +
+        `  bind = "0.0.0.0"   # or the docker bridge gateway IP (e.g. 172.17.0.1)`,
+      );
+    }
   }
 
   const result: RunningDaemon = {
@@ -599,6 +710,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     projectRoot,
     knownTaskIds,
     webServer,
+    extraWebServers,
     webPort,
     bindHost: boundBindHost,
     stop: () => {},
@@ -663,6 +775,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     server.stop();
     if (webServer) {
       webServer.stop();
+    }
+    for (const extra of extraWebServers) {
+      extra.stop();
     }
     cleanupStaleFiles(projectRoot);
     // Release the exclusive daemon lock. Closing the fd releases the flock,
@@ -786,7 +901,12 @@ function startDaemonReconcileLoop(
       }
 
       // --- Check offline mode once per tick ---
-      const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+      // Load config to read the permanent-offline flag ([remote] offline). The
+      // expiry check itself is just a timestamp comparison on offline.json; the
+      // small config read here is what lets a permanent-offline project gate
+      // remote ops without writing to the offline file.
+      const reconcileConfig = await loadConfig(projectRoot);
+      const offline = await isOfflineMode(join(projectRoot, '.lazy'), reconcileConfig.remote.offline);
 
       // --- Critical path: detect finished tasks and transition states ---
       // This must run before any network operations (push, sync, auto-react)
@@ -981,7 +1101,7 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
       if (syncInterval <= 0) return;
 
       // Skip sync entirely when offline — no network noise.
-      if (await isOfflineMode(join(projectRoot, '.lazy'))) return;
+      if (await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline)) return;
 
       const driver = createDriver(config);
 

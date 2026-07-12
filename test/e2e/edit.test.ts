@@ -1,7 +1,30 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
+import { join } from 'path';
+import { readFileSync, readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+
+/**
+ * Resolve the tasks directory for a test project. Test projects use external
+ * storage (external_path in lazy.toml) with a fallback to the in-repo
+ * .lazy/tasks layout.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
+/** Read the persisted task.model straight from task.json for a short task ID. */
+function readTaskModel(root: string, shortId: string): string | undefined {
+  const tasksDir = tasksDirFor(root);
+  const match = readdirSync(tasksDir).find(d => d.startsWith(shortId));
+  if (!match) throw new Error(`Task directory not found for ${shortId}`);
+  const task = JSON.parse(readFileSync(join(tasksDir, match, 'task.json'), 'utf-8'));
+  return task.model;
+}
 
 describe('lazy edit', () => {
   let ctx: TestContext;
@@ -14,6 +37,10 @@ describe('lazy edit', () => {
     await ctx.cleanup();
   });
 
+  // INVARIANT: lazy does NOT normalize or shorten model names. validateModel
+  // passes any non-empty string straight through to the Claude CLI (which
+  // resolves the name itself), and both `edit` and `show` echo task.model
+  // verbatim — there is no alias mapping (e.g. claude-opus-4-6 → "opus").
   test('updates task model', async () => {
     const taskId = await createTask(ctx, 'test task');
 
@@ -22,15 +49,15 @@ describe('lazy edit', () => {
     expectSuccess(showResult);
     expectOutput(showResult, 'Model:   -');
 
-    // Update model to opus
+    // Update model — stored and echoed verbatim, no alias normalization
     const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6']);
     expectSuccess(editResult);
-    expectOutput(editResult, 'Updated model: opus');
+    expectOutput(editResult, 'Updated model: claude-opus-4-6');
 
-    // Verify model was updated
+    // Verify model was updated (displayed verbatim)
     const showResult2 = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult2);
-    expectOutput(showResult2, 'Model:   opus');
+    expectOutput(showResult2, 'Model:   claude-opus-4-6');
   });
 
   test('updates task goal', async () => {
@@ -63,15 +90,26 @@ describe('lazy edit', () => {
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'Goal:    updated goal');
-    expectOutput(showResult, 'Model:   haiku');
+    // Model is displayed verbatim — no alias normalization (see INVARIANT above).
+    expectOutput(showResult, 'Model:   claude-haiku-4-5-20251001');
   });
 
-  test('rejects invalid model names', async () => {
+  // INVARIANT: There is no model-name allowlist/registry. validateModel accepts
+  // any non-empty string and defers name resolution to the Claude CLI, so an
+  // unrecognized-looking name is NOT rejected by lazy — only an empty model is.
+  // Do NOT reinstate model-name validation here (see persist-model-change).
+  test('accepts arbitrary model names but rejects an empty one', async () => {
     const taskId = await createTask(ctx, 'test task');
 
-    const editResult = await ctx.lazy(['edit', taskId, '--model', 'invalid']);
-    expectFailure(editResult);
-    expectError(editResult, 'Invalid model: invalid');
+    // Any non-empty string is accepted and passed through verbatim.
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'some-custom-model']);
+    expectSuccess(editResult);
+    expectOutput(editResult, 'Updated model: some-custom-model');
+
+    // An empty model string is still refused.
+    const emptyResult = await ctx.lazy(['edit', taskId, '--model', '']);
+    expectFailure(emptyResult);
+    expectError(emptyResult, 'Model name cannot be empty');
   });
 
   test('prevents editing after task is started', async () => {
@@ -149,16 +187,20 @@ describe('lazy edit', () => {
     expectError(edit2, 'circular parent chain');
   });
 
+  // INVARIANT: A parent in a terminal state cannot be assigned via edit. `close`
+  // moves a task to the 'abandoned' terminal status (not a literal 'closed'
+  // status — that value does not exist), and the rejection message reports the
+  // actual status.
   test('rejects terminal-state parent in edit', async () => {
     const parentId = await createTask(ctx, 'Closed parent');
     const childId = await createTask(ctx, 'Child task');
 
-    // Close the parent
+    // Close the parent → status becomes 'abandoned'
     await ctx.lazy(['close', parentId, '--reason', 'Done']);
 
     const editResult = await ctx.lazy(['edit', childId, '--parent', parentId]);
     expectFailure(editResult);
-    expectError(editResult, 'task is closed');
+    expectError(editResult, 'task is abandoned');
   });
 
   test('rejects non-existent parent in edit', async () => {
@@ -188,13 +230,17 @@ describe('lazy edit', () => {
     expectOutput(showResult2, 'Type:    refactor');
   });
 
+  // INVARIANT: Changing a task's type after its prompt is set warns the user
+  // (the prompt was crafted for the old type). The warning is emitted via
+  // console.warn → STDERR, while the "Updated type" confirmation is on STDOUT;
+  // assert each on the correct stream.
   test('warns when changing type after prompt is set', async () => {
     const taskId = await createTask(ctx, 'test task', 'Some prompt content');
 
-    // Update type to refactor - should show warning
+    // Update type to refactor - should warn on stderr and confirm on stdout
     const editResult = await ctx.lazy(['edit', taskId, '--type', 'refactor']);
     expectSuccess(editResult);
-    expectOutput(editResult, 'Warning');
+    expectError(editResult, 'Warning');
     expectOutput(editResult, 'Updated type: refactor');
   });
 
@@ -204,5 +250,69 @@ describe('lazy edit', () => {
     const editResult = await ctx.lazy(['edit', taskId, '--type', 'invalid-type']);
     expectFailure(editResult);
     expectError(editResult, 'Invalid type');
+  });
+});
+
+describe('lazy edit on started tasks', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    // `start` requires a real daemon (post-v0.11: CLI goes through the daemon
+    // for storage), so these tests run withDaemon.
+    ctx = await setupTestLazy({ withDaemon: true });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  /** Create a task, run one mocked agent turn, and wait until it is blocked. */
+  async function startedTask(): Promise<string> {
+    const taskId = await createTask(ctx, 'Started task', 'Do work');
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+    expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    return taskId;
+  }
+
+  // INVARIANT: A model-only edit is allowed on a started task (has turns).
+  // It is the supported way to durably change a running task's model —
+  // auto-resume/auto-deliver relaunch from task.model, so without this a
+  // stale task.model could crash-loop relaunches on a wrong/dead model.
+  test('model-only edit succeeds on a started task', async () => {
+    const taskId = await startedTask();
+
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6']);
+    expectSuccess(editResult);
+    expectOutput(editResult, 'Updated model: claude-opus-4-6');
+
+    expect(readTaskModel(ctx.root, taskId)).toBe('claude-opus-4-6');
+  });
+
+  // INVARIANT: Non-model fields stay frozen once an agent has worked on the
+  // task — changing goal/prompt/type/code/parent mid-flight is unsafe. Only
+  // --model is exempt.
+  test('goal edit is still rejected on a started task', async () => {
+    const taskId = await startedTask();
+
+    const editResult = await ctx.lazy(['edit', taskId, '--goal', 'New goal']);
+    expectFailure(editResult);
+    expectError(editResult, 'only --model can be changed');
+  });
+
+  // INVARIANT: The model-only exemption does not extend to combined edits —
+  // --model together with a disallowed field is rejected as a whole, with an
+  // actionable message, rather than partially applied.
+  test('model combined with goal is rejected on a started task', async () => {
+    const taskId = await startedTask();
+
+    const before = readTaskModel(ctx.root, taskId);
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6', '--goal', 'New goal']);
+    expectFailure(editResult);
+    expectError(editResult, 'only --model can be changed');
+    // Nothing was applied — the model is unchanged too.
+    expect(readTaskModel(ctx.root, taskId)).toBe(before);
   });
 });

@@ -80,6 +80,27 @@ export interface MaintainEntry {
   instructions: string;
 }
 
+/**
+ * A single custom mount ([[mounts]]) injected into task agent containers.
+ *
+ * Either a bind mount (a host `source` path) or a container-local `volume`
+ * (named or anonymous). Both `source` and `target` accept the `{worktree}` and
+ * `{repo}` placeholders, expanded at launch time. See `src/capture/mounts.ts`
+ * for validation and `docker run -v` argument construction.
+ */
+export interface MountConfigEntry {
+  /** "bind" (default) mounts a host path; "volume" uses a container-local Docker volume. */
+  type?: 'bind' | 'volume';
+  /** Host path for bind mounts (absolute or project-relative). Required for bind; invalid for volume. */
+  source?: string;
+  /** Volume name for a named volume. Omit for an anonymous volume. Only valid for type = "volume". */
+  name?: string;
+  /** Absolute container path to mount at. Supports {worktree} and {repo}. Required. */
+  target: string;
+  /** Mount read-only (default false). */
+  readonly?: boolean;
+}
+
 export interface LazyConfig {
   models?: {
     default?: string;
@@ -142,6 +163,13 @@ export interface LazyConfig {
     driver?: string;
     git_remote?: string;
     auto_approve?: boolean;
+    /**
+     * Permanent offline mode. When true, all remote operations (push, fetch,
+     * sync, PR creation) are skipped indefinitely — NOT subject to the
+     * local-midnight auto-expiry that the `lazy system offline` command uses.
+     * For users who genuinely want to stay offline. Default false.
+     */
+    offline?: boolean;
     github_auto_push?: boolean;
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection?: boolean;
     gitlab_auto_push?: boolean;
@@ -167,6 +195,8 @@ export interface LazyConfig {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain?: MaintainEntry[];
   };
+  /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
+  mounts?: MountConfigEntry[];
   checks?: {
     /** Command to run after each agent turn. Output is captured and attached to the turn. */
     post_turn?: string;
@@ -269,6 +299,12 @@ export interface ResolvedConfig {
     driver: string;
     git_remote: string;
     auto_approve: boolean;
+    /**
+     * Permanent offline mode. When true, remote operations are skipped
+     * indefinitely and are NOT subject to the local-midnight auto-expiry used
+     * by the `lazy system offline` command. Default false.
+     */
+    offline: boolean;
     github_auto_push: boolean;
     github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: boolean;
     gitlab_auto_push: boolean;
@@ -295,6 +331,8 @@ export interface ResolvedConfig {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain: MaintainEntry[];
   };
+  /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
+  mounts: MountConfigEntry[];
   checks: {
     /** Command to run after each agent turn. Output is captured and attached to the turn. */
     post_turn: string;

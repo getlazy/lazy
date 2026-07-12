@@ -584,9 +584,9 @@ export async function commandPair(args: string[]): Promise<void> {
     // Failures here MUST NOT block commit recording or turn creation below.
     if (sess.git_branch) {
       try {
-        const offline = await isOfflineMode(join(root, '.lazy'));
+        const config = await loadConfig(root);
+        const offline = await isOfflineMode(join(root, '.lazy'), config.remote.offline);
         if (!offline) {
-          const config = await loadConfig(root);
           const driver = createDriver(config);
           await driver.pushBranch(sess.git_branch);
         }

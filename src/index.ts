@@ -24,6 +24,7 @@ import {
   commandStop, stopUsage,
   commandSearch, searchUsage,
   commandComment, commentUsage,
+  commandJournal, journalUsage,
   commandLink, linkUsage,
   commandImportConversation, importConversationUsage,
   commandServer, serverUsage,
@@ -130,6 +131,7 @@ Daemon:
   daemon restart         Restart the daemon
   daemon status          Show daemon status and web URL
   daemon logs            Tail daemon log file (primary debugging tool)
+  daemon auto-budget     Control/inspect the auto-react daily budget (list/update/pause/resume)
   server                 Start daemon and show web dashboard URL
   config set/get         Runtime config toggles (e.g., auto_react on/off)
 
@@ -178,6 +180,7 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'show':     { run: commandShow, usage: showUsage },
   'search':   { run: commandSearch, usage: searchUsage },
   'comment':  { run: commandComment, usage: commentUsage },
+  'journal':  { run: commandJournal, usage: journalUsage },
   'start':    { run: commandStart, usage: startUsage },
   'unblock':  { run: commandUnblock, usage: unblockUsage },
   'resume':   { run: commandResume, usage: resumeUsage },
@@ -376,6 +379,20 @@ if (!isHelpOrVersion) {
       console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
+  }
+}
+
+// Test mode: no external daemon runs (tryRemoteStorage/tryRpc return null under
+// LAZY_TEST), so the CLI process executes the daemon RPC handlers in-process via
+// the rpc-fallback path. Those handlers use the daemon-storage singleton, which
+// must be pointed at the project root once — exactly as the daemon server does
+// at startup (src/daemon/server.ts). Without this, commands that reach a handler
+// without first calling requireStorage() throw "Daemon storage not initialized".
+if (process.env.LAZY_TEST === '1') {
+  const root = cachedLazyRoot ?? findLazyRoot();
+  if (root) {
+    const { initDaemonStorage } = await import('./daemon/rpc-handlers');
+    initDaemonStorage(root);
   }
 }
 

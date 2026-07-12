@@ -42,7 +42,7 @@ let localDriverInstantiated = 0;
 
 await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
-    remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false },
+    remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false, offline: false },
     storage: { backend: 'external', external_path: '' },
     models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
   }),

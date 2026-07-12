@@ -15,5 +15,5 @@ This is a refactoring task. Your job is to restructure existing code without cha
 
 - **Read before writing.** Understand the code you are refactoring, its callers, and its tests before making changes.
 - **Identify the refactoring operations** you will perform and their order. Plan the sequence so each step is safe and incremental.
-- **If you discover bugs** while refactoring, call them out crisply in your final summary. Do not fix bugs in a refactoring task — that mixes concerns and makes review harder.
+- **If you discover bugs** while refactoring, record them with `lazy_add_followup` (and call them out crisply in your final summary). Do not fix bugs in a refactoring task — that mixes concerns and makes review harder.
 - **If you discover missing tests** that verify existing behavior, add them first — they serve as your safety net for the refactoring. Call out tests for *new* functionality in your final summary instead of adding them here.

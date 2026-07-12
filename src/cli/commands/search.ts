@@ -178,6 +178,7 @@ export async function commandSearch(args: string[]): Promise<void> {
     { name: 'turns', takesValue: false },
     { name: 'commits', takesValue: false },
     { name: 'notes', takesValue: false },
+    { name: 'followups', takesValue: false },
     { name: 'conversations', takesValue: false },
   ], 'search');
 
@@ -192,10 +193,11 @@ export async function commandSearch(args: string[]): Promise<void> {
   const searchTurns = parsed.flags.get('turns') === true;
   const searchCommits = parsed.flags.get('commits') === true;
   const searchNotes = parsed.flags.get('notes') === true;
+  const searchFollowUps = parsed.flags.get('followups') === true;
   const searchConversations = parsed.flags.get('conversations') === true;
 
   // If no specific types, search all
-  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchConversations;
+  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchFollowUps && !searchConversations;
 
   // Get query (remaining positional args)
   const query = parsed.positional.join(' ');
@@ -214,6 +216,7 @@ export async function commandSearch(args: string[]): Promise<void> {
     if (searchTurns) types.push('turn');
     if (searchCommits) types.push('commit');
     if (searchNotes) types.push('comment');
+    if (searchFollowUps) types.push('followup');
     if (searchConversations) types.push('conversation');
   }
 
@@ -252,7 +255,7 @@ export async function commandSearch(args: string[]): Promise<void> {
 export function searchUsage(): void {
   console.log(`Usage: lazy search <query> [options]
 
-Search across tasks, prompts, turns, commits, notes, and conversations.
+Search across tasks, prompts, turns, commits, notes, follow-ups, and conversations.
 
 Options:
   -f, --fuzzy        Use fuzzy matching (typo-tolerant)
@@ -265,6 +268,7 @@ Filter by type:
   --turns            Search conversation turns only
   --commits          Search commit messages only
   --notes            Search task notes only
+  --followups        Search task follow-ups only
   --conversations    Search captured builder conversations only
 
 Query language:
@@ -285,10 +289,12 @@ Query language:
     in:turns <text>    Search within turn content
     in:commits <text>  Search within commit messages
     in:comments <text> Search within comments
+    in:followups <text>  Search within follow-ups
     in:conversations <text>  Search within conversation messages
     has:commits        Task has commits
     has:turns          Task has turns
     has:comments       Task has comments
+    has:followups      Task has follow-ups
     created:>YYYY-MM-DD / created:<YYYY-MM-DD   Date filter on creation
     updated:>YYYY-MM-DD / updated:<YYYY-MM-DD   Date filter on last update
 

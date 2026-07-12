@@ -2,7 +2,8 @@
  * Working-substate derivation — the single source of truth for distinguishing
  * the three observable flavors of a `working` task:
  *
- *   - working(agent)            the agent (claude/cursor) is the active thing
+ *   - working(agent)            the agent (claude/cursor) is doing real work
+ *   - working(agent:answering)  the agent is answering a question (`lazy ask`)
  *   - working(harness:<phase>)  the supervisor is doing pre/post-turn work
  *   - not-alive                 no live run and no response — a stranded candidate
  *
@@ -25,7 +26,7 @@ import { elapsedFrom } from './elapsed';
 import { logger } from './logger';
 
 export type WorkingSubstate =
-  | { kind: 'agent' }
+  | { kind: 'agent'; answering?: boolean }
   | {
       kind: 'harness';
       /** The supervisor phase driving the work (e.g. `post_turn_check`). */
@@ -67,11 +68,16 @@ export function deriveWorkingSubstate(
   status: SupervisorStatus | null,
   ctx: LivenessContext,
 ): WorkingSubstate | null {
+  // INVARIANT: asking-a-question is an agent substate, not harness — the agent
+  // itself is active during the turn while it drafts a response.
   if (ctx.isAlive) {
     // Alive but no checkpoint yet (container still starting up) — degrade to no
     // substate rather than guessing.
     if (!status) return null;
-    if (AGENT_PHASES.has(status.phase)) return { kind: 'agent' };
+    if (AGENT_PHASES.has(status.phase)) {
+      const answering = status.command_type === 'ask';
+      return answering ? { kind: 'agent', answering: true } : { kind: 'agent' };
+    }
     return {
       kind: 'harness',
       phase: status.phase,
@@ -147,7 +153,7 @@ export async function computeWorkingSubstate(
 
 /**
  * Format the inner label for a working substate (without the `working(...)`
- * wrapper), e.g. `agent`, `harness:post_turn_check (3m00s)`,
+ * wrapper), e.g. `agent`, `agent:answering`, `harness:post_turn_check (3m00s)`,
  * `harness:post_turn_check cargo build (3m00s)`, `not-alive`.
  *
  * `now` is injectable for deterministic tests.
@@ -158,7 +164,7 @@ export function formatWorkingSubstate(
 ): string {
   switch (substate.kind) {
     case 'agent':
-      return 'agent';
+      return substate.answering ? 'agent:answering' : 'agent';
     case 'not-alive':
       return 'not-alive';
     case 'harness': {

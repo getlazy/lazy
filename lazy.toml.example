@@ -76,6 +76,29 @@ agent_id = "claude-code"
 # Valid levels: "low", "medium", "high", "xhigh", "max" (default: "high")
 # effort = "high"
 
+[chattiness]
+# Conversational verbosity baseline for the builder and task agents — how much
+# they narrate, explain, and elaborate in their replies. This is separate from
+# `effort` (how hard they *think*); chattiness only shapes how much they *say*.
+# Levels form a named ladder from least to most verbose:
+#   "terse"  — minimal narration, just the essentials
+#   "normal" — balanced explanation
+#   "chatty" — fuller narration and context
+# The configured level is a baseline, not a ceiling: an in-conversation "tell me
+# more" / "be terser" nudges one rung for that one reply rather than jumping to
+# an extreme.
+#
+# Set a shared `default` for both roles, and optionally override per role with
+# `builder` / `agent` (an override wins over `default` for that role).
+#
+# Unset by default — when a role's level is unset, no verbosity snippet is
+# injected and behavior is unchanged, so existing users see no difference.
+# Invalid values fail loudly, naming the offending key and the valid levels.
+#
+# default = "normal"   # shared baseline for builder and agents
+# builder = "chatty"   # override just the builder
+# agent = "terse"      # override just the task agents
+
 [server]
 # Default port for the web dashboard server
 port = 26024
@@ -127,6 +150,30 @@ dockerfile = ""
 # Example: include = [".env", ".env.local", "config/local.yml"]
 # include = []
 
+# Custom mounts injected into task agent containers (the worktree containers
+# where agents run). Array of tables — each entry is a bind mount or a volume.
+# Opt-in: none by default. Supported placeholders in source/target, expanded at
+# launch: {worktree} → the task's worktree path, {repo} → the repo root.
+# Invalid entries fail loudly at load time (missing target, unknown type, a bind
+# with no source, a volume that sets source) — never silently skipped.
+#
+# Bind a host path into the container (source may be absolute or project-relative):
+# [[mounts]]
+# source = "/abs/or/project-relative/host/path"
+# target = "/absolute/container/path"
+# readonly = false   # optional, default false
+#
+# Shadow a worktree path with a container-local volume — the node_modules case.
+# The worktree (incl. node_modules) is bind-mounted into the container; a volume
+# at {worktree}/node_modules holds the container's Linux binaries so they never
+# clobber the host's macOS ones (Docker resolves overlapping mounts by longest
+# container-path match, so the inner volume wins). Omit `name` for an anonymous
+# volume; set it to reuse/persist a named volume across runs.
+# [[mounts]]
+# type = "volume"
+# name = "myproj-node-modules"   # optional → named; omit → anonymous
+# target = "{worktree}/node_modules"
+
 [permissions]
 # Glob patterns for files agents are NOT allowed to delete or modify.
 # They are allowed to *add* into existing files *and* matching globs.
@@ -150,7 +197,7 @@ protected = ["README.md", "test/**/*.ts"]
 # [[automation.maintain]]
 # title = "changelog"
 # pattern = "CHANGELOG.md"
-# instructions = "Add a line that succinctly describes your work; skip if your work is intra-release."
+# instructions = "Add ONE line to the next release section under Added/Changed/Fixed: bold feature/command name, one sentence of the user-visible effect (not the implementation, no internal type/function names), and your task code in parens as the depth pointer. Max ~25 words. Skip if your work is intra-release; update your existing line instead of adding a second."
 
 [checks]
 # Command to run after each agent turn. Output is captured and attached to

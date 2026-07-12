@@ -16,6 +16,18 @@ import { join, basename } from 'path';
 import { createHash } from 'crypto';
 import { getHome } from '../utils/home';
 
+// Daemon state filenames within a per-project daemon dir. Centralized so that
+// code which scans daemon dirs by slug (e.g. the daemon registry / operator
+// `lazy daemon list`) can address files inside a dir it discovered WITHOUT a
+// projectRoot to feed the path helpers, and without hardcoding string literals.
+export const PID_FILE = 'lazy.pid';
+export const SOCKET_FILE = 'lazy.sock';
+export const TOKEN_FILE = 'token';
+export const LOG_FILE = 'daemon.log';
+export const DAEMON_LOCK_FILE = 'daemon.lock';
+/** Records the canonical project root the daemon serves (see getRootPath). */
+export const ROOT_FILE = 'root';
+
 /**
  * Derive a human-readable, collision-resistant slug from a project root.
  * Format: <last-dir-component>-<sha256(projectRoot).slice(0,8)>
@@ -26,8 +38,18 @@ export function projectSlug(projectRoot: string): string {
   return `${name}-${hash}`;
 }
 
-/** Root directory for all daemon state: ~/.lazy/daemon/ */
+/**
+ * Root directory for all daemon state: ~/.lazy/daemon/
+ *
+ * `LAZY_DAEMON_BASE_DIR` overrides the location. This is a test-isolation and
+ * operator-override seam: the daemon registry and `lazy daemon list/kill-stray`
+ * enumerate every daemon under this dir, so tests point it at a temp directory
+ * to avoid scanning (or reaping!) the host's real daemons. Honored everywhere
+ * because every daemon path flows through this function.
+ */
 export function getDaemonBaseDir(): string {
+  const override = process.env.LAZY_DAEMON_BASE_DIR;
+  if (override) return override;
   return join(getHome(), '.lazy', 'daemon');
 }
 
@@ -38,22 +60,32 @@ export function getDaemonDir(projectRoot: string): string {
 
 /** PID file: ~/.lazy/daemon/<slug>/lazy.pid */
 export function getPidPath(projectRoot: string): string {
-  return join(getDaemonDir(projectRoot), 'lazy.pid');
+  return join(getDaemonDir(projectRoot), PID_FILE);
 }
 
 /** Unix socket: ~/.lazy/daemon/<slug>/lazy.sock */
 export function getSocketPath(projectRoot: string): string {
-  return join(getDaemonDir(projectRoot), 'lazy.sock');
+  return join(getDaemonDir(projectRoot), SOCKET_FILE);
 }
 
 /** Bearer token file: ~/.lazy/daemon/<slug>/token */
 export function getTokenPath(projectRoot: string): string {
-  return join(getDaemonDir(projectRoot), 'token');
+  return join(getDaemonDir(projectRoot), TOKEN_FILE);
 }
 
 /** Daemon log file: ~/.lazy/daemon/<slug>/daemon.log */
 export function getLogPath(projectRoot: string): string {
-  return join(getDaemonDir(projectRoot), 'daemon.log');
+  return join(getDaemonDir(projectRoot), LOG_FILE);
+}
+
+/** Project-root marker: ~/.lazy/daemon/<slug>/root
+ *  Written by the daemon at startup with the absolute project root it serves.
+ *  The slug only encodes basename + a hash of the root, so the full root can't
+ *  be recovered from the dir name alone — this file is the source of truth that
+ *  lets `lazy daemon list/kill-stray` show the real project path and detect
+ *  daemons whose root has been deleted ("stray"). */
+export function getRootPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), ROOT_FILE);
 }
 
 /** Startup lock file: ~/.lazy/daemon/<slug>/start.lock

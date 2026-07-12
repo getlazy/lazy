@@ -41,6 +41,7 @@ import { getDataDir } from '../cli/init';
 import { isFeatureEnabled } from '../utils/features';
 import { logger } from '../utils/logger';
 import { getActor } from '../constants';
+import type { Actor } from '../types';
 import { runGit } from '../utils/git';
 import { RpcError } from './rpc-handlers';
 import { isOfflineMode } from '../utils/offline';
@@ -62,6 +63,13 @@ export interface StartTaskParams {
   retargetOrphan?: boolean;
   /** CLI `--effort` override. Persists on the task so resumes see the same value. */
   effortOverride?: string;
+  /**
+   * Who submitted this command, by channel: MCP boundary → 'builder', CLI → 'human'.
+   * When absent, falls back to getActor() (env-var / 'human'). Set explicitly by
+   * the MCP boundary because the turn is persisted in the daemon process, where
+   * the env-var default cannot see the caller's channel. See {@link MCP_ACTOR}.
+   */
+  actor?: Actor;
 }
 
 export interface StartTaskResult {
@@ -271,7 +279,7 @@ export async function launchTask(
   const config = await loadConfig(projectRoot);
 
   // --- Offline mode: auto-enable forceLocal and use local driver ---
-  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
   if (offline) {
     params.forceLocal = true;
     if (config.remote.driver === 'gitlab' || config.remote.driver === 'github') {
@@ -476,10 +484,12 @@ export async function launchTask(
       content: turnPrompt,
       model: modelName,
       prompt: fullPrompt,
-      actor: getActor(),
+      // Channel actor: MCP-originated starts are 'builder', CLI 'human'.
+      // Falls back to getActor() for CLI (env-var / 'human').
+      actor: params.actor ?? getActor(),
     });
 
-    await storage.updateTaskStatus(t.id, 'working', getActor());
+    await storage.updateTaskStatus(t.id, 'working', params.actor ?? getActor());
 
     // --- Publish branch ---
     let parentDisplayId: string | null = null;

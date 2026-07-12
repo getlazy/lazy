@@ -20,6 +20,8 @@ import type {
   Review,
   ReviewVerdict,
   Comment,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
@@ -305,6 +307,26 @@ export class RemoteStorage implements Storage {
 
   async getTaskComments(taskId: string): Promise<Comment[]> {
     return this.call<Comment[]>('getTaskComments', { taskId });
+  }
+
+  // --- Journal ---
+
+  async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
+    return this.call<JournalEntry>('appendJournalEntry', { taskId, content, actor });
+  }
+
+  async getTaskJournal(taskId: string): Promise<JournalEntry[]> {
+    return this.call<JournalEntry[]>('getTaskJournal', { taskId });
+  }
+
+  // --- Follow-ups (task-level orthogonal-work discoveries) ---
+
+  async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
+    return this.call<FollowUp>('createFollowUp', { taskId, content, sessionId });
+  }
+
+  async getTaskFollowUps(taskId: string): Promise<FollowUp[]> {
+    return this.call<FollowUp[]>('getTaskFollowUps', { taskId });
   }
 
   // --- Hunk Approvals ---

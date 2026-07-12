@@ -31,6 +31,33 @@ describe('deriveWorkingSubstate', () => {
     expect(s).toEqual({ kind: 'agent' });
   });
 
+  // INVARIANT: ask turns during agent phases are a distinct answering substate —
+  // the agent is drafting a response, not executing task work.
+  test('alive + work phase with command_type=ask → agent:answering', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, command_type: 'ask' },
+      { isAlive: true, hasResponse: false },
+    );
+    expect(s).toEqual({ kind: 'agent', answering: true });
+  });
+
+  test('alive + work_done phase with command_type=ask → agent:answering', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, phase: 'work_done', command_type: 'ask' },
+      { isAlive: true, hasResponse: false },
+    );
+    expect(s).toEqual({ kind: 'agent', answering: true });
+  });
+
+  // non-ask command_type during agent phases stays plain agent.
+  test('alive + work phase with command_type=start → agent (not answering)', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, command_type: 'start' },
+      { isAlive: true, hasResponse: false },
+    );
+    expect(s).toEqual({ kind: 'agent' });
+  });
+
   // INVARIANT: any non-work phase while alive is supervisor (harness) work.
   test('alive + post_turn_check phase → harness with phase + command', () => {
     const s = deriveWorkingSubstate(
@@ -93,6 +120,11 @@ describe('formatWorkingSubstate', () => {
     expect(formatWorkingSubstate({ kind: 'agent' }, now)).toBe('agent');
   });
 
+  // INVARIANT: answering substate formats with the agent:answering label.
+  test('agent:answering', () => {
+    expect(formatWorkingSubstate({ kind: 'agent', answering: true }, now)).toBe('agent:answering');
+  });
+
   test('not-alive', () => {
     expect(formatWorkingSubstate({ kind: 'not-alive' }, now)).toBe('not-alive');
   });
@@ -132,6 +164,7 @@ describe('renderWorkingStatus', () => {
 
   test('wraps the substate in working(...)', () => {
     expect(renderWorkingStatus({ kind: 'agent' }, now)).toBe('working(agent)');
+    expect(renderWorkingStatus({ kind: 'agent', answering: true }, now)).toBe('working(agent:answering)');
     expect(renderWorkingStatus({ kind: 'not-alive' }, now)).toBe('working(not-alive)');
   });
 

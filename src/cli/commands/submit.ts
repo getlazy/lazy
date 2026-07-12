@@ -2,6 +2,7 @@ import { join } from 'path';
 import { parseFlags, requireLazyRoot } from '../helpers';
 import { querySubmitTask } from '../../daemon/rpc-fallback';
 import { isOfflineMode } from '../../utils/offline';
+import { loadConfig } from '../../config/loader';
 import { theme } from '../theme';
 
 export async function commandSubmit(args: string[]): Promise<void> {
@@ -18,7 +19,8 @@ export async function commandSubmit(args: string[]): Promise<void> {
   // Early offline check — submit requires remote operations (PR creation),
   // so fail fast before attempting the daemon RPC call.
   const root = requireLazyRoot();
-  if (await isOfflineMode(join(root, '.lazy'))) {
+  const config = await loadConfig(root);
+  if (await isOfflineMode(join(root, '.lazy'), config.remote.offline)) {
     console.error('Error: Cannot submit while in offline mode. Run `lazy system online` to restore remote operations, then retry.');
     process.exit(1);
   }

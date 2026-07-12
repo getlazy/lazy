@@ -14,7 +14,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { readPlanContent, enrichResponseWithPlanContent, reconcileTasks } from '../../src/utils/reconcile';
-import { createStorage } from '../../src/storage';
+import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 import {
   writeCommand,
   readCommand,
@@ -347,7 +347,8 @@ describe('reconciliation with protocol', () => {
 
     // The mock writes response.json during start. In production, the daemon's
     // reconcile loop detects this and transitions working → blocked. In tests,
-    // we call reconcileTasks directly to simulate the daemon.
+    // we drive one reconcile pass via the subprocess helper (opens storage the
+    // way the daemon does, with mocks preloaded) to simulate the daemon.
     await runReconcile(ctx.root);
 
     const showResult = await ctx.lazy(['show', taskId]);
@@ -440,9 +441,12 @@ describe('reconciliation with protocol', () => {
 
   test('no response and no container reconciles to interrupted', async () => {
     const taskId = await createTask(ctx, 'No container test', 'Do some work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    // INVARIANT: the mock must NOT commit here. This test asserts the *interrupt*
+    // path (no response + no live run → interrupted). If the mock leaves real
+    // committed work behind, the reconcile legitimately routes it through
+    // recoverStrandedCompletion → 'blocked' (so committed work is never lost),
+    // which would mask the interrupt path. No commit = nothing to recover.
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // Replace with no response and set task back to working
     const fullTaskId = findFullTaskId(ctx.root, taskId);
@@ -538,6 +542,10 @@ describe('host-side integration', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
+    // Post-v0.11 the CLI no longer reconciles — only the daemon does. Drive one
+    // reconcile pass so the completed response becomes an agent turn.
+    await runReconcile(ctx.root);
+
     // After reconciliation, the custom result should appear in the agent turn
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
@@ -601,7 +609,10 @@ describe('host-side integration', () => {
     };
     writeResponse(protoDir, protocolMismatchResp);
 
-    // Trigger reconciliation — the error turn should be recorded
+    // Trigger reconciliation — the error turn should be recorded. Post-v0.11 the
+    // CLI no longer reconciles (only the daemon does), so drive a pass directly.
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId, '--full']);
     expectOutput(showResult, 'interrupted');
     expectOutput(showResult, 'Protocol version mismatch');
@@ -717,7 +728,11 @@ describe('plan content capture e2e', () => {
       },
     });
 
-    // Trigger reconciliation and check the turn content
+    // Post-v0.11 the CLI no longer reconciles — drive one reconcile pass so the
+    // completed response (with plan content) becomes an agent turn.
+    await runReconcile(ctx.root);
+
+    // Check the turn content
     const showResult = await ctx.lazy(['show', taskId, '--full']);
     expectSuccess(showResult);
     expectOutput(showResult, 'blocked');
@@ -733,6 +748,10 @@ describe('plan content capture e2e', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
+    // Post-v0.11 the CLI no longer reconciles — drive one reconcile pass so the
+    // completed response becomes an agent turn.
+    await runReconcile(ctx.root);
+
     const showResult = await ctx.lazy(['show', taskId, '--full']);
     expectSuccess(showResult);
     expectOutput(showResult, 'I have completed the task');
@@ -746,11 +765,18 @@ describe('plan content capture e2e', () => {
 // ============================================================
 
 /**
- * Run reconciliation directly (simulates what the daemon does).
- * Tests can't rely on CLI commands triggering reconciliation — only the daemon does that.
+ * Run one reconcile pass in-process (simulates the daemon), opening storage the
+ * same way the daemon does (openProjectStorage → resolves external_path), NOT
+ * the bare createStorage(root) which ignored external_path and read an empty
+ * in-repo .lazy/tasks store. Runs in-process (no mock preload) on purpose: a
+ * task with no response + no live run is marked interrupted, and auto-resume's
+ * availability probe then throws (no mocked container boundary) so it skips —
+ * exactly what the interrupt/error-turn assertions here need to observe. Tests
+ * that require auto-resume to actually launch use the subprocess driver instead
+ * (see test/helpers/reconcile.ts / auto-resume.test.ts).
  */
 async function runReconcile(root: string): Promise<void> {
-  const storage = await createStorage(root);
+  const storage = await openProjectStorage(root);
   try {
     await reconcileTasks(storage, root);
   } finally {
@@ -759,10 +785,22 @@ async function runReconcile(root: string): Promise<void> {
 }
 
 /**
+ * Resolve the tasks directory for a test project. Test projects init with
+ * external storage (external_path in lazy.toml), so tasks live outside the
+ * repo; fall back to the in-repo .lazy/tasks layout when no external_path.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
+/**
  * Find the full task ID from a short ID by scanning the tasks directory.
  */
 function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const entries = readdirSync(tasksDir);
   const match = entries.find(e => e.startsWith(shortId));
   if (!match) {
@@ -776,14 +814,14 @@ function findFullTaskId(root: string, shortId: string): string {
  * Used by tests to set up specific reconciliation scenarios.
  */
 function setTaskStatus(root: string, fullTaskId: string, status: string): void {
-  const taskPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
+  const taskPath = join(tasksDirFor(root), fullTaskId, 'task.json');
   const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
   task.status = status;
   writeFileSync(taskPath, JSON.stringify(task, null, 2));
 
   // Also update the session's last_interaction_at to a time far in the past
   // so the grace period doesn't prevent reconciliation in tests
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   if (existsSync(sessionPath)) {
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     // Set to 1 minute ago to bypass grace period

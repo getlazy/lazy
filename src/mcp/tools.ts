@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'crypto';
 import { join } from 'path';
+import { MCP_ACTOR } from '../constants';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
@@ -17,6 +18,8 @@ import { pathExists, ensureDir, writeFile } from '../utils/fs';
 import type { McpTool, McpToolHandler } from './types';
 import { protocolDir as taskProtocolDir } from '../protocol/io';
 import { writeTurnEndSignal } from '../protocol/turn-end-signal';
+import { groupTurnsIntoChunks } from '../utils/turn-chunks';
+import type { Turn } from '../types';
 
 /**
  * Ask-mode read-only guard for write-capable MCP tools.
@@ -143,8 +146,8 @@ async function getStorage(ctx: McpToolContext): Promise<Storage> {
 export const searchTool: McpTool = {
   name: 'lazy_search',
   description:
-    'Search across tasks, prompts, conversation turns, commits, and comments ' +
-    'in the lazy project. Returns structured results with task context. ' +
+    'Search across tasks, prompts, conversation turns, commits, comments, and ' +
+    'follow-ups in the lazy project. Returns structured results with task context. ' +
     'Use this to find rationale, decisions, and context from other tasks.\n\n' +
     'Use "offset" and "limit" to paginate through results. ' +
     'Response always includes "total" count of matching results.',
@@ -163,7 +166,7 @@ export const searchTool: McpTool = {
       filter: {
         type: 'string',
         description: 'Filter results to a specific type',
-        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments'],
+        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments', 'followups'],
       },
       offset: {
         type: 'number',
@@ -290,9 +293,16 @@ export const showTool: McpTool = {
     'Show detailed information about a task including its goal, status, ' +
     'session details, conversation turns, commits, comments, and child tasks. ' +
     'Use this to understand context and decisions from other tasks.\n\n' +
+    'Any orthogonal follow-ups an agent recorded on the task are always included ' +
+    '(as `follow_ups`) so you can triage them at review. ' +
     'Default response is a compact summary with counts. Use "sections" to ' +
-    'drill down into specific data (turns, commits, comments, children). ' +
-    'Use "offset" and "limit" to paginate within sections.',
+    'drill down into specific data (turns, chunks, commits, comments, children). ' +
+    'Use "offset" and "limit" to paginate within sections.\n\n' +
+    'The "chunks" section groups turns by review boundary: each chunk starts at ' +
+    'a human/builder turn and absorbs every following agent, supervisor, and ' +
+    'system turn until the next human/builder turn. Review by chunk to avoid ' +
+    'missing intermediate turns (auto-resumes, supervisor nudges) that a ' +
+    '"latest turn" glance silently skips.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -305,9 +315,9 @@ export const showTool: McpTool = {
         type: 'array',
         items: {
           type: 'string',
-          enum: ['turns', 'commits', 'comments', 'children', 'status-history'],
+          enum: ['turns', 'chunks', 'commits', 'comments', 'journal', 'children', 'status-history'],
         },
-        description: 'Sections to include in full (e.g. ["turns", "commits", "status-history"]). Without this, only counts are returned. "status-history" surfaces the audit trail of status transitions (from → to, actor, timestamp).',
+        description: 'Sections to include in full (e.g. ["turns", "commits", "status-history"]). Without this, only counts are returned. "chunks" groups turns by human/builder review boundary (offset/limit page over chunks, not turns). "status-history" surfaces the audit trail of status transitions (from → to, actor, timestamp).',
       },
       offset: {
         type: 'number',
@@ -321,6 +331,30 @@ export const showTool: McpTool = {
     required: ['task_id'],
   },
 };
+
+/**
+ * Map a stored turn to the shape returned by lazy_show. Includes `actor` and
+ * `auto_triggered` so reviewers can tell a real human/builder turn from an
+ * automation-authored one (supervisor nudge, system auto-resume) — the
+ * provenance that chunk grouping relies on.
+ */
+function mapShowTurn(t: Turn): Record<string, unknown> {
+  return {
+    sequence: t.sequence,
+    role: t.role,
+    // Authoring actor (e.g. 'builder' for MCP-originated turns, 'supervisor'
+    // for push-back). Lets the builder distinguish turns it submitted from
+    // ones a human typed — consistent with the status-history actor field.
+    // Always present (null when absent) so consumers can rely on the field.
+    actor: t.actor ?? null,
+    content: t.content,
+    timestamp: new Date(t.timestamp).toISOString(),
+    ...(t.auto_triggered ? { auto_triggered: true } : {}),
+    ...(t.turn_type !== undefined ? { turn_type: t.turn_type } : {}),
+    ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
+    ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
+  };
+}
 
 export function createShowHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
@@ -375,41 +409,54 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
           started_at: session.started_at ? new Date(session.started_at).toISOString() : null,
         };
 
-        // Include latest turn in summary (untruncated) when not drilling into turns
-        if (!sectionsSet.has('turns') && allTurns.length > 0) {
-          const latest = allTurns[allTurns.length - 1];
-          result.latest_turn = {
-            sequence: latest.sequence,
-            role: latest.role,
-            content: latest.content,
-            timestamp: new Date(latest.timestamp).toISOString(),
-            ...(latest.check_exit_code !== undefined ? { check_exit_code: latest.check_exit_code } : {}),
-            ...(latest.check_output !== undefined ? { check_output: latest.check_output } : {}),
-          };
+        // Include latest turn in summary (untruncated) when not drilling into turns/chunks
+        if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && allTurns.length > 0) {
+          result.latest_turn = mapShowTurn(allTurns[allTurns.length - 1]);
         }
       } else {
         result.turn_count = 0;
         result.commit_count = 0;
       }
 
-      // Comments and children counts (always included)
+      // Comments, journal, follow-ups, and children counts (always included)
       const allComments = await storage.getTaskComments(task.id);
+      const allJournal = await storage.getTaskJournal(task.id);
+      const allFollowUps = await storage.getTaskFollowUps(task.id);
       const allChildren = await storage.getChildTasks(task.id);
       const allStatusHistory = await storage.getStatusHistory(task.id);
       result.comment_count = allComments.length;
+      result.journal_count = allJournal.length;
+      result.follow_up_count = allFollowUps.length;
       result.children_count = allChildren.length;
       result.status_history_count = allStatusHistory.length;
+
+      // Follow-ups are the builder's triage queue at review — always surface
+      // their content inline when present (they're short and few), so the
+      // builder never has to know to drill in to discover there are any.
+      if (allFollowUps.length > 0) {
+        result.follow_ups = allFollowUps.slice(0, Math.max(limit, allFollowUps.length)).map(f => ({
+          id: shortId(f.id),
+          content: f.content,
+          created_at: new Date(f.created_at).toISOString(),
+        }));
+      }
 
       // Drill-down: include full section data when explicitly requested
       if (sectionsSet.has('turns') && allTurns.length > 0) {
         const sliced = allTurns.slice(offset, offset + limit);
-        result.turns = sliced.map(t => ({
-          sequence: t.sequence,
-          role: t.role,
-          content: t.content,
-          timestamp: new Date(t.timestamp).toISOString(),
-          ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
-          ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
+        result.turns = sliced.map(mapShowTurn);
+      }
+
+      // Chunked view: group turns by human/builder review boundary. offset/limit
+      // page over chunks (not turns) so a chunk is never split across pages.
+      if (sectionsSet.has('chunks') && allTurns.length > 0) {
+        const allChunks = groupTurnsIntoChunks(allTurns);
+        result.chunk_count = allChunks.length;
+        const sliced = allChunks.slice(offset, offset + limit);
+        result.chunks = sliced.map(chunk => ({
+          index: chunk.index,
+          boundary: chunk.boundary ? mapShowTurn(chunk.boundary) : null,
+          turns: chunk.turns.map(mapShowTurn),
         }));
       }
 
@@ -427,6 +474,15 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         result.comments = sliced.map(c => ({
           content: c.content,
           created_at: new Date(c.created_at).toISOString(),
+        }));
+      }
+
+      if (sectionsSet.has('journal') && allJournal.length > 0) {
+        const sliced = allJournal.slice(offset, offset + limit);
+        result.journal = sliced.map(j => ({
+          content: j.content,
+          actor: j.actor ?? null,
+          created_at: new Date(j.created_at).toISOString(),
         }));
       }
 
@@ -680,13 +736,80 @@ export function createCommentHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error('No task_id provided and no current task context. Specify a task_id explicitly.');
       }
 
-      const comment = await storage.createComment(taskId, message, 'builder');
+      const comment = await storage.createComment(taskId, message, MCP_ACTOR);
 
       return {
         id: shortId(comment.id),
         task_id: shortId(taskId),
         content: comment.content,
         created_at: new Date(comment.created_at).toISOString(),
+      };
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// lazy_journal
+// ---------------------------------------------------------------------------
+
+export const journalTool: McpTool = {
+  name: 'lazy_journal',
+  description:
+    'Append an entry to a task\'s journal — an append-only side channel for ' +
+    'orchestration metadata, design rationale, decisions and the reasons behind ' +
+    'them, things you stubbed or deferred, and memories meant for future runs. ' +
+    'IMPORTANT: journal entries are NOT injected into any agent prompt — they are ' +
+    'for the human and for your future self, never read back as task guidance. ' +
+    'This is the key difference from lazy_comment: comments ARE delivered to the ' +
+    'agent as guidance; journal entries are not. Use lazy_journal to *record* ' +
+    '(rationale, memory); use lazy_comment to *instruct*.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID to journal on (short hex prefix or code). If omitted, uses the current task.',
+      },
+      message: {
+        type: 'string',
+        description: 'Journal entry text',
+        minLength: 1,
+      },
+    },
+    required: ['message'],
+  },
+};
+
+export function createJournalHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    rejectIfReadOnly('lazy_journal');
+    const message = args.message as string;
+    const taskIdInput = args.task_id as string | undefined;
+
+    const storage = await getStorage(ctx);
+    try {
+      let taskId: string;
+      if (taskIdInput) {
+        const resolved = await storage.resolveTask(taskIdInput);
+        if (!resolved.task) {
+          throw new Error(`Task not found: ${taskIdInput}`);
+        }
+        taskId = resolved.task.id;
+      } else if (ctx.taskId) {
+        taskId = ctx.taskId;
+      } else {
+        throw new Error('No task_id provided and no current task context. Specify a task_id explicitly.');
+      }
+
+      const entry = await storage.appendJournalEntry(taskId, message, 'builder');
+
+      return {
+        id: shortId(entry.id),
+        task_id: shortId(taskId),
+        content: entry.content,
+        created_at: new Date(entry.created_at).toISOString(),
       };
     } finally {
       await storage.close();
@@ -765,6 +888,65 @@ export function createProposeHandler(ctx: McpToolContext): McpToolHandler {
         goal: proposal.goal,
         code: proposal.code || null,
         status: 'pending',
+      };
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// lazy_add_followup
+// ---------------------------------------------------------------------------
+
+export const addFollowUpTool: McpTool = {
+  name: 'lazy_add_followup',
+  description:
+    'Record a follow-up note on the CURRENT task for genuinely ORTHOGONAL work ' +
+    'you discovered — a different concern this task does not need in order to be ' +
+    'correct and mergeable. Follow-ups are passive, task-level notes saved for ' +
+    'the human/builder to triage at review. Recording one does NOT create a task, ' +
+    'does NOT notify anyone, and does NOT trigger any further agent turn. ' +
+    'Do NOT use this to defer part of THIS task\'s own work (finish that). ' +
+    'Do NOT leave follow-up work as TODO comments in code or buried in prose.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      note: {
+        type: 'string',
+        description: 'The follow-up note — short, concrete, and actionable.',
+        minLength: 1,
+      },
+    },
+    required: ['note'],
+  },
+};
+
+export function createAddFollowUpHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    rejectIfReadOnly('lazy_add_followup');
+    if (!ctx.taskId) {
+      throw new Error('lazy_add_followup requires a task context. This tool is not available in builder mode.');
+    }
+
+    const note = args.note as string;
+
+    const storage = await getStorage(ctx);
+    try {
+      // Capture which run surfaced this follow-up (best-effort).
+      const session = await storage.getSessionByTaskId(ctx.taskId);
+
+      // INVARIANT: createFollowUp is a passive storage append. It must NOT
+      // create a comment, change status, or write any signal — recording a
+      // follow-up never triggers an auto-turn/auto-resume. That non-triggering
+      // property is exactly why follow-ups are not comments.
+      const followUp = await storage.createFollowUp(ctx.taskId, note, session?.id ?? null);
+
+      return {
+        id: shortId(followUp.id),
+        task_id: shortId(ctx.taskId),
+        content: followUp.content,
+        created_at: new Date(followUp.created_at).toISOString(),
       };
     } finally {
       await storage.close();
@@ -1263,6 +1445,7 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
       taskId,
       modelOverride: model,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
+      actor: MCP_ACTOR, // MCP boundary → 'builder'
     };
 
     // Route through queryStartTask (the RPC layer) rather than calling
@@ -1384,6 +1567,10 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       approvedFiles,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
       notesInEditor: false,
+      // MCP boundary → 'builder'. INVARIANT: actor = who submitted (the channel),
+      // NOT who authored — feedback the builder relays from a human is still
+      // 'builder' here. Content provenance is preserved separately; see MCP_ACTOR.
+      actor: MCP_ACTOR,
     };
 
     const result = await queryUnblockTask(params);
@@ -1478,6 +1665,7 @@ export function createAskHandler(ctx: McpToolContext): McpToolHandler {
       taskId,
       message,
       effortOverride: effort,
+      actor: MCP_ACTOR, // MCP boundary → 'builder'
     };
 
     const result = await queryAskTask(params);
@@ -1888,7 +2076,7 @@ export function createStopHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const params: StopTaskParams = { taskId, reason: reason.trim() };
+    const params: StopTaskParams = { taskId, reason: reason.trim(), actor: MCP_ACTOR };
     const result = await queryStopTask(params);
 
     return {
@@ -1979,6 +2167,7 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
       modelOverride: model,
       retargetOrphan: true,
       notesInEditor: false,
+      actor: MCP_ACTOR, // MCP boundary → 'builder'
     };
 
     const result = await queryUnblockTask(params);
@@ -2346,7 +2535,8 @@ export const editTool: McpTool = {
   name: 'lazy_edit',
   description:
     'Edit a task\'s goal, prompt, model, type, code, or parent. ' +
-    'Only works on tasks that have not been started by an agent (no turns).',
+    'Goal/prompt/type/code/parent edits only work on tasks that have not been ' +
+    'started by an agent (no turns); a model-only edit is also allowed on started tasks.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2409,10 +2599,16 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Cannot edit task in ${task.status} status`);
       }
 
-      // Check no turns (agent hasn't started working)
+      // Check no turns (agent hasn't started working). Exception: a
+      // model-only edit is safe mid-flight and is the supported way to
+      // durably switch a started task's model — auto-resume/auto-deliver
+      // relaunch from task.model. Same relaxation as the `lazy edit` CLI.
       const turnCount = await storage.getTurnCountByTaskId(task.id);
-      if (turnCount > 0) {
-        throw new Error('Cannot edit task after agent has started working (has turns)');
+      const isModelOnlyEdit = model !== undefined
+        && goal === undefined && prompt === undefined
+        && type === undefined && code === undefined && parent === undefined;
+      if (turnCount > 0 && !isModelOnlyEdit) {
+        throw new Error('Cannot edit task after agent has started working (has turns); only model can be changed on a started task');
       }
 
       const changes: string[] = [];
@@ -2623,14 +2819,14 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
         }
 
         if (reason) {
-          await storage.createComment(task.id, `[Reopened] ${reason}`, 'builder');
+          await storage.createComment(task.id, `[Reopened] ${reason}`, MCP_ACTOR);
         }
 
-        await storage.reopenTask(task.id, 'builder');
+        await storage.reopenTask(task.id, MCP_ACTOR);
 
         const session = await storage.getSessionByTaskId(task.id);
         const newStatus = session ? 'blocked' : 'backlog';
-        await storage.updateTaskStatus(task.id, newStatus, 'builder');
+        await storage.updateTaskStatus(task.id, newStatus, MCP_ACTOR);
 
         if (session) {
           await storage.resetSession(session.id);
@@ -2768,7 +2964,7 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
         await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
 
         // Abandon the old task
-        await storage.abandonTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, 'builder');
+        await storage.abandonTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, MCP_ACTOR);
 
         return {
           old_task_id: shortId(oldTask.id),
@@ -2833,6 +3029,7 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
 
     const params: SyncTaskParams = {
       taskId,
+      actor: MCP_ACTOR, // MCP boundary → 'builder'
     };
 
     const result = await querySyncTask(params);
@@ -2915,7 +3112,9 @@ export const allTools: McpTool[] = [
   showTool,
   createTool,
   commentTool,
+  journalTool,
   proposeTool,
+  addFollowUpTool,
   commitTool,
   statusTool,
   conversationsTool,
@@ -2952,7 +3151,9 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_show', createShowHandler(ctx));
   handlers.set('lazy_create', createCreateHandler(ctx));
   handlers.set('lazy_comment', createCommentHandler(ctx));
+  handlers.set('lazy_journal', createJournalHandler(ctx));
   handlers.set('lazy_propose', createProposeHandler(ctx));
+  handlers.set('lazy_add_followup', createAddFollowUpHandler(ctx));
   handlers.set('lazy_commit', createCommitHandler(ctx));
   handlers.set('lazy_status', createStatusHandler(ctx));
   handlers.set('lazy_conversations', createConversationsHandler(ctx));

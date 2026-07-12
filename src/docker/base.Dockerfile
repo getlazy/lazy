@@ -23,6 +23,7 @@ RUN useradd --create-home --shell /bin/bash user \
     && echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 USER user
+ENV COLORTERM="truecolor"
 ENV PATH="/home/user/.local/bin:${PATH}"
 
 # Install Claude Code via native installer as `user` so it lands in

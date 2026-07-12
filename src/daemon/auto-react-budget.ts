@@ -20,6 +20,7 @@ import { stat, readFile, writeFile, mkdir } from 'fs/promises';
 import type { Storage } from '../storage';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
+import { localDayKey, nextLocalMidnight } from '../utils/local-day';
 
 /** Trigger types that can cause auto-unblocks. */
 export type AutoReactTrigger = 'ci_failure' | 'upstream_sync' | 'comment' | 'child_completed' | 'crash';
@@ -185,12 +186,35 @@ export async function checkBackoff(
 
 // --- Global daily budget ---
 
+/**
+ * A single budget-consuming auto-react, recorded for the `auto-budget list`
+ * activity log. Resets with the day (lives inside the daily-budget file).
+ */
+export interface AutoReactLogEntry {
+  /** Epoch milliseconds when the turn was consumed. */
+  ts: number;
+  /** Short task id (first 8 chars of the full id). */
+  taskId: string;
+  /** Task code, if the task had one. */
+  taskCode?: string;
+  /** What triggered the auto-react. */
+  trigger: AutoReactTrigger;
+}
+
 /** Shape of the daily budget file. */
 interface DailyBudgetState {
-  /** ISO date string (YYYY-MM-DD) for the current budget period. */
+  /** Local-day key (YYYY-MM-DD) for the current budget period. */
   date: string;
   /** Number of auto-triggered turns used today. */
   used: number;
+  /**
+   * Today-only effective cap, set via `lazy daemon auto-budget update`.
+   * Absolute value (not a delta). Ephemeral — cleared when the day rolls over.
+   * When unset, the effective cap is the configured `auto_react_daily_budget`.
+   */
+  capOverride?: number;
+  /** Activity log of what consumed budget today. */
+  log?: AutoReactLogEntry[];
 }
 
 /**
@@ -201,11 +225,14 @@ function getBudgetFilePath(dataDir: string): string {
 }
 
 /**
- * Read the current daily budget state. Resets if the date has changed.
+ * Read the current daily budget state. Resets if the local day has changed.
+ *
+ * "Today" is the machine's LOCAL calendar day (see src/utils/local-day.ts),
+ * not UTC — the budget rolls over at local midnight.
  */
 export async function readDailyBudget(dataDir: string): Promise<DailyBudgetState> {
   const filePath = getBudgetFilePath(dataDir);
-  const today = new Date().toISOString().split('T')[0];
+  const today = localDayKey();
 
   try {
     await stat(filePath);
@@ -222,23 +249,66 @@ export async function readDailyBudget(dataDir: string): Promise<DailyBudgetState
 }
 
 /**
- * Increment the daily budget usage by 1. Returns the new count.
+ * Persist the daily budget state.
  */
-export async function incrementDailyBudget(dataDir: string): Promise<number> {
-  const state = await readDailyBudget(dataDir);
-  state.used += 1;
+async function writeDailyBudget(dataDir: string, state: DailyBudgetState): Promise<void> {
   const filePath = getBudgetFilePath(dataDir);
   await mkdir(dataDir, { recursive: true });
   await writeFile(filePath, JSON.stringify(state, null, 2) + '\n');
+}
+
+/**
+ * Increment the daily budget usage by 1. Returns the new count.
+ * Optionally appends an activity-log entry describing what was consumed.
+ */
+export async function incrementDailyBudget(dataDir: string, entry?: Omit<AutoReactLogEntry, 'ts'>): Promise<number> {
+  const state = await readDailyBudget(dataDir);
+  state.used += 1;
+  if (entry) {
+    state.log = state.log ?? [];
+    state.log.push({ ts: Date.now(), ...entry });
+  }
+  await writeDailyBudget(dataDir, state);
   return state.used;
 }
 
 /**
+ * Resolve the effective daily cap for today: the today-only override if set,
+ * otherwise the configured limit.
+ */
+export function effectiveDailyLimit(state: DailyBudgetState, configuredLimit: number): number {
+  return state.capOverride ?? configuredLimit;
+}
+
+/**
+ * Adjust today's effective cap. `delta` is one of:
+ *   { kind: 'absolute', value }  — set the cap to an exact number (`=100`)
+ *   { kind: 'relative', value }  — add/subtract from the current effective cap (`+50`, `-20`)
+ *
+ * The override is ephemeral (resets at local midnight) and is NOT written to
+ * lazy.toml — permanent changes remain the job of `auto_react_daily_budget`.
+ * Returns the new effective cap (floored at 0).
+ */
+export async function adjustDailyCap(
+  dataDir: string,
+  configuredLimit: number,
+  delta: { kind: 'absolute' | 'relative'; value: number },
+): Promise<number> {
+  const state = await readDailyBudget(dataDir);
+  const current = effectiveDailyLimit(state, configuredLimit);
+  const next = delta.kind === 'absolute' ? delta.value : current + delta.value;
+  state.capOverride = Math.max(0, next);
+  await writeDailyBudget(dataDir, state);
+  return state.capOverride;
+}
+
+/**
  * Check if the daily budget allows another auto-triggered turn.
+ * Respects a today-only cap override when present.
  */
 export async function isDailyBudgetExhausted(dataDir: string, limit: number): Promise<boolean> {
   const state = await readDailyBudget(dataDir);
-  return state.used >= limit;
+  return state.used >= effectiveDailyLimit(state, limit);
 }
 
 // --- Global pause ---
@@ -251,6 +321,20 @@ interface GlobalPauseState {
   paused_at?: string;
   /** Reason for the pause. */
   reason?: string;
+  /**
+   * Epoch milliseconds when the pause auto-expires. When omitted, the pause is
+   * indefinite (the legacy `lazy config set auto_react off` behavior). The
+   * `lazy daemon auto-budget pause` command defaults this to next local midnight.
+   */
+  expires_at?: number;
+}
+
+/** Resolved global-pause status, including any expiry. */
+export interface GlobalPauseStatus {
+  paused: boolean;
+  reason?: string;
+  /** Epoch milliseconds when the pause auto-expires, if bounded. */
+  expiresAt?: number;
 }
 
 /**
@@ -262,14 +346,24 @@ function getGlobalPauseFilePath(dataDir: string): string {
 
 /**
  * Check if auto-react is globally paused for this project.
+ *
+ * An expired pause (expires_at in the past) is treated as NOT paused, and the
+ * stale file is cleared so the daemon auto-resumes cleanly without a manual
+ * `resume`. This is the single check point the gate, status, and subcommands
+ * all share.
  */
-export async function isGlobalAutoReactPaused(dataDir: string): Promise<{ paused: boolean; reason?: string }> {
+export async function isGlobalAutoReactPaused(dataDir: string): Promise<GlobalPauseStatus> {
   const filePath = getGlobalPauseFilePath(dataDir);
   try {
     const raw = await readFile(filePath, 'utf-8');
     const state: GlobalPauseState = JSON.parse(raw);
     if (state.paused) {
-      return { paused: true, reason: state.reason };
+      if (state.expires_at !== undefined && Date.now() >= state.expires_at) {
+        // Pause window elapsed — auto-resume by clearing the stale state.
+        await setGlobalAutoReactPaused(dataDir, false);
+        return { paused: false };
+      }
+      return { paused: true, reason: state.reason, expiresAt: state.expires_at };
     }
   } catch {
     // File doesn't exist or is corrupted — not paused
@@ -279,15 +373,35 @@ export async function isGlobalAutoReactPaused(dataDir: string): Promise<{ paused
 
 /**
  * Set the global auto-react pause state.
+ *
+ * @param expiresAt Epoch milliseconds when the pause should auto-expire. Omit
+ *   for an indefinite pause (legacy behavior). Ignored when paused=false.
  */
-export async function setGlobalAutoReactPaused(dataDir: string, paused: boolean, reason?: string): Promise<void> {
+export async function setGlobalAutoReactPaused(
+  dataDir: string,
+  paused: boolean,
+  reason?: string,
+  expiresAt?: number,
+): Promise<void> {
   const filePath = getGlobalPauseFilePath(dataDir);
   await mkdir(dataDir, { recursive: true });
   const state: GlobalPauseState = {
     paused,
-    ...(paused ? { paused_at: new Date().toISOString(), reason } : {}),
+    ...(paused
+      ? { paused_at: new Date().toISOString(), reason, ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}) }
+      : {}),
   };
   await writeFile(filePath, JSON.stringify(state, null, 2) + '\n');
+}
+
+/**
+ * Pause auto-react globally until the next local midnight (auto-resume).
+ * Returns the expiry timestamp so callers can display the countdown.
+ */
+export async function pauseGlobalAutoReactUntilMidnight(dataDir: string, reason?: string): Promise<number> {
+  const expiresAt = nextLocalMidnight().getTime();
+  await setGlobalAutoReactPaused(dataDir, true, reason, expiresAt);
+  return expiresAt;
 }
 
 // --- Per-task consecutive auto-turn budget ---
@@ -391,11 +505,12 @@ export async function shouldAutoReact(
     return { allowed: false, reason: autoTurnCheck.reason };
   }
 
-  // Gate 3: global daily budget
+  // Gate 3: global daily budget (respects today-only cap override)
   if (await isDailyBudgetExhausted(dataDir, auto_react_daily_budget)) {
     const budget = await readDailyBudget(dataDir);
-    logger.warn(`Auto-react budget exhausted: ${budget.used}/${auto_react_daily_budget} turns used today`);
-    return { allowed: false, reason: `Daily auto-react budget exhausted (${budget.used}/${auto_react_daily_budget})` };
+    const limit = effectiveDailyLimit(budget, auto_react_daily_budget);
+    logger.warn(`Auto-react budget exhausted: ${budget.used}/${limit} turns used today`);
+    return { allowed: false, reason: `Daily auto-react budget exhausted (${budget.used}/${limit})` };
   }
 
   // Gate 4: per-task per-trigger limit
@@ -429,7 +544,18 @@ export async function recordAutoReact(
   dataDir: string,
 ): Promise<void> {
   await incrementAutoReactCount(storage, taskId, trigger);
-  await incrementDailyBudget(dataDir);
+
+  // Resolve the task code for the activity log (best-effort — a missing task
+  // must not block recording the consumption).
+  let taskCode: string | undefined;
+  try {
+    const task = await storage.getTask(taskId);
+    taskCode = task?.code ?? undefined;
+  } catch {
+    // Task lookup failed — log without a code rather than dropping the entry.
+  }
+  await incrementDailyBudget(dataDir, { taskId: taskId.substring(0, 8), taskCode, trigger });
+
   await incrementConsecutiveAutoTurns(storage, taskId);
 }
 

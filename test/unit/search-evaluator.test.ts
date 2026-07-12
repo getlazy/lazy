@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { parseQuery } from '../../src/search/parser';
 import { evaluateQuery, buildSearchResults } from '../../src/search/evaluator';
 import type { TaskData } from '../../src/search/evaluator';
-import type { Task, Turn, Commit, Comment } from '../../src/types';
+import type { Task, Turn, Commit, Comment, FollowUp } from '../../src/types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -64,12 +64,23 @@ function makeComment(overrides: Partial<Comment> = {}): Comment {
   };
 }
 
+function makeFollowUp(overrides: Partial<FollowUp> = {}): FollowUp {
+  return {
+    id: 'followup-001',
+    task_id: 'test-task-id-001',
+    content: 'Consider extracting the retry helper into a shared module',
+    created_at: Date.now(),
+    ...overrides,
+  };
+}
+
 function makeData(overrides: Partial<TaskData> = {}): TaskData {
   return {
     task: makeTask(),
     turns: [makeTurn()],
     commits: [makeCommit()],
     comments: [makeComment()],
+    followUps: [makeFollowUp()],
     ...overrides,
   };
 }
@@ -160,6 +171,16 @@ describe('evaluateQuery', () => {
     expect(evaluateQuery(ast, makeData())).toBe(true);
   });
 
+  test('in:followups matches follow-up content', () => {
+    const ast = parseQuery('in:followups retry');
+    expect(evaluateQuery(ast, makeData())).toBe(true);
+  });
+
+  test('in:followups does not match when not in follow-ups', () => {
+    const ast = parseQuery('in:followups nonexistent');
+    expect(evaluateQuery(ast, makeData())).toBe(false);
+  });
+
   test('has:commits is true when commits exist', () => {
     const ast = parseQuery('has:commits');
     expect(evaluateQuery(ast, makeData())).toBe(true);
@@ -188,6 +209,16 @@ describe('evaluateQuery', () => {
   test('has:comments is false when no comments', () => {
     const ast = parseQuery('has:comments');
     expect(evaluateQuery(ast, makeData({ comments: [] }))).toBe(false);
+  });
+
+  test('has:followups is true when follow-ups exist', () => {
+    const ast = parseQuery('has:followups');
+    expect(evaluateQuery(ast, makeData())).toBe(true);
+  });
+
+  test('has:followups is false when no follow-ups', () => {
+    const ast = parseQuery('has:followups');
+    expect(evaluateQuery(ast, makeData({ followUps: [] }))).toBe(false);
   });
 
   test('created:> matches tasks after date', () => {
@@ -282,5 +313,13 @@ describe('buildSearchResults', () => {
     // The in: node produces text terms, so we get turn match
     const turnResults = results.filter(r => r.entity_type === 'turn');
     expect(turnResults.length).toBe(1);
+  });
+
+  test('returns a followup-typed result when a follow-up matches', () => {
+    const ast = parseQuery('"retry helper"');
+    const results = buildSearchResults(ast, makeData());
+    const followUpResults = results.filter(r => r.entity_type === 'followup');
+    expect(followUpResults.length).toBe(1);
+    expect(followUpResults[0].content).toContain('retry helper');
   });
 });

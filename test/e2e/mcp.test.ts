@@ -124,12 +124,13 @@ describe('lazy-agent mcp', () => {
 
     const result = toolsResponse!.result as { tools: Array<{ name: string; description: string; inputSchema: unknown }> };
     expect(result.tools).toBeArray();
-    expect(result.tools.length).toBe(30);
+    expect(result.tools.length).toBe(31);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).toEqual([
       'lazy_accept',
       'lazy_active',
+      'lazy_add_followup',
       'lazy_ask',
       'lazy_blocked',
       'lazy_clone',

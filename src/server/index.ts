@@ -24,6 +24,7 @@ import {
 import type { DashboardStats, TaskWithSession, ChartDataPoint, ActiveTaskInfo, ActivityDay, ActiveStates } from './templates';
 import { taskRefFromId } from '../cli/helpers';
 import { parentTaskIdOf } from '../task-target';
+import { MAX_PORT_ATTEMPTS } from '../config/constants';
 
 function html(content: string, status: number = 200): Response {
   return new Response(content, {
@@ -453,12 +454,14 @@ async function handleTaskDetail(storage: Storage, taskId: string): Promise<Respo
   const turns = session ? await storage.getSessionTurns(session.id) : [];
   const commits = session ? await storage.getSessionCommits(session.id) : [];
   const comments = await storage.getTaskComments(task.id);
+  const journal = await storage.getTaskJournal(task.id);
+  const followUps = await storage.getTaskFollowUps(task.id);
   const children = await storage.getChildTasks(task.id);
   const promptVersions = await storage.getPromptHistory(task.id);
   const parentId = parentTaskIdOf(task);
   const parentTask = parentId ? await storage.getTask(parentId) : null;
 
-  return html(taskDetailHtml(task, session, turns, commits, comments, children, promptVersions, parentTask));
+  return html(taskDetailHtml(task, session, turns, commits, comments, journal, followUps, children, promptVersions, parentTask));
 }
 
 async function handleCommitDetail(storage: Storage, taskId: string, commitId: string, url: URL): Promise<Response> {
@@ -625,9 +628,11 @@ async function handleApiTaskDetail(storage: Storage, taskId: string): Promise<Re
   const turns = session ? await storage.getSessionTurns(session.id) : [];
   const commits = session ? await storage.getSessionCommits(session.id) : [];
   const comments = await storage.getTaskComments(task.id);
+  const journal = await storage.getTaskJournal(task.id);
+  const followUps = await storage.getTaskFollowUps(task.id);
   const children = await storage.getChildTasks(task.id);
 
-  return json({ task, session, turns, commits, comments, children });
+  return json({ task, session, turns, commits, comments, journal, followUps, children });
 }
 
 /**
@@ -650,8 +655,6 @@ function matchRoute(path: string, pattern: string): Record<string, string> | nul
   }
   return params;
 }
-
-const MAX_PORT_ATTEMPTS = 100;
 
 /**
  * Create the web dashboard request handler for a given storage instance.

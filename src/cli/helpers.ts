@@ -81,6 +81,25 @@ export async function requireStorage(): Promise<Storage> {
   const remote = await tryRemoteStorage(root);
   if (remote) return remote;
 
+  // Test-mode fallback: under LAZY_TEST no daemon runs (tryRemoteStorage returns
+  // null by design, see above), so the CLI process opens storage directly. This
+  // restores the direct-storage path requireStorage had before the daemon-
+  // required refactor (commit 48be24a3), which removed it so production fails
+  // fast when the daemon is down — but left no test-mode escape hatch,
+  // deterministically breaking every LAZY_TEST e2e suite. We reuse the daemon-
+  // storage singleton (getOrCreateStorage) rather than a fresh FileStorage so
+  // that requireStorage and any in-process rpc-fallback handlers share ONE
+  // StorageLock: two instances in one process would contend on .storage-lock
+  // (each has its own re-entrancy counter) and deadlock. Safe: each e2e test is
+  // a single CLI subprocess against its own temp project. NOT a production path
+  // — real invocations never set LAZY_TEST and fail fast below.
+  if (process.env.LAZY_TEST === '1') {
+    // Dynamic import avoids a static cli/helpers ↔ daemon/rpc-handlers cycle.
+    const { initDaemonStorage, getOrCreateStorage } = await import('../daemon/rpc-handlers');
+    initDaemonStorage(root);
+    return getOrCreateStorage();
+  }
+
   console.error('Error: Daemon is not running. Start it with: lazy daemon start');
   process.exit(1);
 }

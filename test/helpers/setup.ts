@@ -6,9 +6,10 @@
  */
 
 import { join, resolve } from 'path';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, rm, writeFile, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { waitForDaemon, readPid, getDaemonDir } from '../../src/daemon';
+import { registerTestDaemonRoot, unregisterTestDaemonRoot } from './daemon-registry';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 const PRELOAD_PATH = resolve(__dirname, '../mocks/preload-mocks.ts');
@@ -76,7 +77,16 @@ function spawnGit(cwd: string, ...args: string[]) {
   };
 }
 
-async function runLazy(cwd: string, args: string[], protocolBase: string, extraEnv?: Record<string, string>, input?: string): Promise<WorkResult> {
+async function runLazy(cwd: string, args: string[], protocolBase: string, withDaemon: boolean, extraEnv?: Record<string, string>, input?: string): Promise<WorkResult> {
+  // Symmetric with runLazyMocked: in a daemonless suite, LAZY_TEST=1 keeps
+  // `ctx.lazy` from auto-starting a daemon (ensureDaemon bypasses under
+  // LAZY_TEST). Without it, a plain `ctx.lazy(['create'])` (e.g. createTask)
+  // spins up a daemon that holds .storage-lock, then any LAZY_TEST subprocess
+  // OR in-process createStorage() in the same suite deadlocks retrying that
+  // lock for 5s — the deterministic breakage behind the daemonless reconcile
+  // suites. withDaemon suites must NOT set it: `ctx.lazy` has to reach the
+  // real daemon for storage.
+  const lazyTestEnv = withDaemon ? {} : { LAZY_TEST: '1' };
   const proc = Bun.spawn(['bun', 'run', ENTRY_PATH, ...args], {
     cwd,
     stdin: input !== undefined ? new Blob([input]) : undefined,
@@ -86,7 +96,7 @@ async function runLazy(cwd: string, args: string[], protocolBase: string, extraE
     // point) lets the implicitly auto-started daemon come up. Mirrors
     // runLazyMocked/startTestDaemon. Placed BEFORE extraEnv so individual tests
     // can clear it (e.g. ANTHROPIC_API_KEY: '') to exercise the gate.
-    env: { ...process.env, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...extraEnv },
+    env: { ...process.env, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...lazyTestEnv, ...extraEnv },
   });
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -247,8 +257,23 @@ async function stopTestDaemon(projectRoot: string): Promise<void> {
  * Call cleanup() in afterEach to remove it.
  */
 export async function setupTestLazy(options: SetupOptions = {}): Promise<TestContext> {
-  const root = await mkdtemp(join(tmpdir(), 'lazy-e2e-'));
+  // CRITICAL: canonicalize to the realpath. On macOS, tmpdir() is the symlink
+  // /var/folders/... whose realpath is /private/var/folders/.... A daemon
+  // auto-started by an inner CLI call derives its project root from
+  // process.cwd()/findLazyRoot, which the OS resolves to the /private realpath,
+  // and keys all its state (pidfile, socket, daemon dir) under that realpath's
+  // slug. If `root` here stayed the /var symlink path, stopTestDaemon(),
+  // rm(getDaemonDir(root)), and the safety net would all compute the WRONG slug
+  // and never find — let alone kill — the daemon. That single divergence is what
+  // leaked 100+ stray daemons. Resolving root once makes every slug agree with
+  // the daemon's own.
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'lazy-e2e-')));
   const protocolBase = await mkdtemp(join(tmpdir(), 'lazy-e2e-protocol-'));
+
+  // Arm the process-death safety net for this root BEFORE any CLI call can
+  // auto-start a daemon (e.g. `lazy init` below). If `afterEach`/cleanup() never
+  // runs, the registry's exit/SIGINT/SIGTERM handlers reap this root's daemon.
+  registerTestDaemonRoot(root);
 
   // Set LAZY_PROTOCOL_BASE for in-process protocol calls (e.g. getProtocolDir in tests)
   process.env.LAZY_PROTOCOL_BASE = protocolBase;
@@ -265,7 +290,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   spawnGit(root, 'commit', '-m', 'Initial commit');
 
   // Run `lazy init` (skip auth/github checks, non-interactive for piped test env)
-  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase);
+  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, options.withDaemon === true);
   if (initResult.exitCode !== 0) {
     throw new Error(`lazy init failed: ${initResult.stderr}\n${initResult.stdout}`);
   }
@@ -281,7 +306,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   const ctx: TestContext = {
     root,
     protocolBase,
-    lazy: (args, optsArg) => runLazy(root, args, protocolBase, optsArg?.env, optsArg?.input),
+    lazy: (args, optsArg) => runLazy(root, args, protocolBase, options.withDaemon === true, optsArg?.env, optsArg?.input),
     lazyMocked: (args, mockResponse, optsArg) =>
       runLazyMocked(root, args, mockResponse, protocolBase, options.withDaemon === true, optsArg?.env, optsArg?.input),
     git: (...args) => spawnGit(root, ...args),
@@ -292,6 +317,9 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
       // outlives the temp dir and leaks its TCP port (we've seen 248 orphan
       // daemons exhaust the 26024–26123 range across repeated test runs).
       await stopTestDaemon(root);
+
+      // Daemon is stopped — the safety net no longer needs to track this root.
+      unregisterTestDaemonRoot(root);
 
       await Promise.all([
         rm(root, { recursive: true, force: true }),

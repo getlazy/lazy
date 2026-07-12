@@ -28,15 +28,17 @@ import { getPidPath, getSocketPath, getTokenPath, getDaemonDir, getDaemonLockPat
 export interface AutoReactBudgetEntry {
   project: string;
   used: number;
+  /** Effective cap for today (reflects any today-only override). */
   limit: number;
   tasksAtLimit: string[];
-}
-
-export interface AutoReactBudgetEntry {
-  project: string;
-  used: number;
-  limit: number;
-  tasksAtLimit: string[];
+  /** Epoch ms when today's budget window resets (next local midnight). */
+  resetAt?: number;
+  /** Whether auto-react is globally paused. */
+  paused?: boolean;
+  /** Epoch ms when an active pause auto-resumes, if bounded. */
+  pauseExpiresAt?: number;
+  /** True when a today-only cap override is in effect. */
+  capOverridden?: boolean;
 }
 
 export interface DaemonStatus {

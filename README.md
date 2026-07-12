@@ -16,7 +16,7 @@
 
 * Prolonged autonomous horizon for agents (hours not tens of minutes)
 * Autonomous, concurrent, asynchronous (turn based) work across multiple tasks
-* Increased agent situational awarness (agents can search over all past tasks and prompts)
+* Increased agent situational awareness (agents can search over all past tasks and prompts)
 
 ## Quick Start
 
@@ -66,9 +66,9 @@ lazy unblock <task-id> --reason "New direction to pivot to"
 
 When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a linux build of `lazy` with a different CLI commands that run inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
 
-When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware and there is a single daemon running for the project. Daemon runs task reconiciliation, CI checks, PR comment harvesting and so on in the background and is the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check deamon state through `lazy daemon` commands.
+When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware and there is a single daemon running for the project. Daemon runs task reconciliation, CI checks, PR comment harvesting and so on in the background and is the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check daemon state through `lazy daemon` commands.
 
-Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon. Same as with deamon this upgrade will be per project.
+Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon. Same as with daemon this upgrade will be per project.
 
 ## Core Concepts
 
@@ -150,7 +150,7 @@ Another thing that is annoying are bootstrapping failures: `lazy` failing so har
 
 ### Why use Docker?
 
-I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastropic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonmously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding `builder` layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
+I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastrophic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonomously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding `builder` layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
 
 ## The Details
 
@@ -302,7 +302,7 @@ By default, `lazy` stores task data in `~/.lazy/<project-name>/`. You can custom
 
 ## Details
 
-### `lazy builer`
+### `lazy builder`
 
 An interactive session with Claude Code with the addition of `lazy`'s own system prompt, guiding the conversation toward task creation, orchestration and reviewing. Work with `builder` to:
 
@@ -385,9 +385,17 @@ And of course - you can do [review](#review) or you can work with [`builder`](#b
 
 ### Turn
 
-A single message in the conversation—either from the human or the agent. Each turn records:
+A single message in the conversation which can come from the following actors:
 
-- Role (`human` or `agent`)
+* Human/engineer (obviously)
+* Builder: engineer's "agentic team lead"
+* Supervisor: lazy's task harness which enforces mechanistic order in agent's work (merge first, then work, then run post-turn checks, etc.)
+* Agent (the agent actually doing the development work)
+* System: actions that lazy takes independent of any supervisor/agent sessions (e.g. automatic syncs, resuming an interrupted task, etc.)
+
+Each turn records:
+ 
+- Role (`human`, `builder`, `agent`, etc)
 - Content (the message text)
 - Token usage (input/output/cache tokens)
 - `git` SHAs before/after the turn
@@ -415,6 +423,10 @@ lazy review -i <task-id>
 
 This allows you to read the agent's summary of the last turn, ask questions about parts of it (by splitting hunks similar to the way `git add -p` does) and provide direct feedback to the agent that it should take on the next turn.
 
+### Follow ups
+
+Occasionally agents will find unrelated issues that are outside of their immediate scope (and don't get me started on how obsessive they can get on scope). In those cases, agents can create follow ups which do not impact the current task at all but that are visible to the engineer and the builder and which can then be folded into the task, promoted to real tasks if need be or ignored. The follow ups are visible in the `review` TUI, `show`, etc.
+
 ## Key Commands
 
 Just run `lazy` and go through the commands. Or run `lazy builder` and skip learning the CLI incantations until you need them.
@@ -425,7 +437,7 @@ Configuration lives in `lazy.toml` at the repository root. Created by `lazy init
 
 ### Example Configuration
 
-See [`lazy.toml.exammple`](./lazy.toml.example)
+See [`lazy.toml.example`](./lazy.toml.example)
 
 Run `lazy doctor` to validate your configuration.
 
@@ -478,7 +490,7 @@ An example of the output can be found [here](docs/lazy-report-example-20260523.m
 # They are allowed to *add* into existing files *and* matching globs.
 # Violations are detected after each agent turn and flagged for review.
 # Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
-protected = /* e.g. ["README.md", "test/**/*.ts"] */
+protected = ["README.md", "test/**/*.ts"]
 ```
 
 When agents do happen to insist that the files have to be changed due to the nature of the task, the task enters `conflict` state and you (or your builder) have to explicitly approve each file during the acceptance process. Or you can reject *some* files when unblocking and agent will need to deal with that.
@@ -505,6 +517,33 @@ instructions = "Add a line that succinctly describes your work; skip if your wor
 ```
 
 This feature is more mature than protected files and it allows you to specify the prompt to inject to the automatic feedback to the agent.
+
+### Mounts
+
+Sometimes there is a tug of war between the host OS and container OS and compiled files need to be constantly refreshed because they cannot be cleanly separated (looking at you `node_modules` - Rust on the other hand is easy). In those cases, an easy fix is to create a separate mounts on the host so that container can keep its files separately from the host's files. For example, the fix to shadow `node_modules` would be something like this:
+
+```
+[[mounts]]
+type = "volume"
+name = "lazy-dev-node-modules"   # named → persists across runs; omit for anonymous
+target = "{worktree}/node_modules"
+```
+
+`{worktree}` is expanded at container launch. Additionally, you can use `{repo}` expansion to mount something from a repository root but that may not be available in the worktree (e.g. some intermediate work that will never be committed)
+
+### Journal
+
+Over time I have realized that prompts, turns and comments are not enough to capture everything that I wanted to capture about tasks. There are architectural, design decisions, rejected hypothesis and so on which really have no room in the larger task work but are rather "engineer's notes" or as I finally named it: `journal`. Before this, the only way to attach such notes were through comments and agents react to comments (even autonomously depending on your config) which forces you to weirdly write "don't react to this but I decided X" and risking the agent misinterpreting such notes and springing into action. In short, comment is there to instruct, journal notes are there to remember. Or as the builder I asked to give me an example put it:
+
+> Live example from today: I journaled the whole v0.20 release plan and per-task review verdicts onto the release-v020 hub so my later wakeup turns (and future builder sessions) could read them — while the hub's agent never sees a word of it in a prompt. Had those been comments, each one would have been queued as guidance for the hub agent's next turn.
+
+To use this, just ask the builder to add notes *or* use CLI:
+
+```bash
+lazy journal <task-id> --message "This is a new note"
+```
+
+There is also `--add` switch which launches `$EDITOR`.
 
 ### Collaborative Pairing
 
@@ -576,11 +615,13 @@ Other times I will want to correct the course of a that was maybe started by cha
 lazy stop <task-id>
 ```
 
+After that I can unblock it or edit its model maybe and similar. But see below what I think of these actions of last resort.
+
 #### Re `watch` and `stop` in spite of `lazy`'s asynchronous paradigm
 
 I consider the use of these actions a smell because it goes directly against the async first nature of `lazy`. So why even build them? I didn't at first but over time it became clear that for it's useful to sometimes observe the agent in its work, mostly for troubleshooting but sometimes things are taking much longer and I start to wonder. As for `stop`, honestly I rarely if ever want to change the direction for the agent: I think we are better off, all told, if we don't micromanage but again follow the async model. But rarely but sometimes the agent was started by the builder onto a truly wrong path or at the wrong time or something has gone astray e.g. same as with `watch` you want to observe it and sometimes, just sometimes you want to stop the agent.
 
-So occasionally useful but if you find yourself using them more than a few times a week, I would the model, effort, how well prompts are written and so on. And of course, I would love to hear about it.
+So occasionally useful but if you find yourself using them more than a few times a week, I recommend trying to calibrate the model, effort, check how well prompts are written for your use case and so on. And of course, I would love to hear about it.
 
 ### Historic Context
 
@@ -590,7 +631,7 @@ I occasionally want to go back to the closed tasks and, similar to pairing, chat
 lazy chat <finished-task-id>
 ```
 
-In this mode, there is no worktree and agent itself is running in plannig mode, without access to things like bash and so on, and on a lower effort level by default (which you can override with `--effort`). This is useful to ask questions and understand more of the context and not to perform work, obviously, as the task has already been closed.
+In this mode, there is no worktree and agent itself is running in planning mode, without access to things like bash and so on, and on a lower effort level by default (which you can override with `--effort`). This is useful to ask questions and understand more of the context and not to perform work, obviously, as the task has already been closed.
 
 ### Confirmation Protocol
 
@@ -629,7 +670,7 @@ In both cases, if there are conflicts, it invokes the agent with a specific prom
 
 After every agent's turn, `lazy` will check if the agent has tried to change or delete files from the areas that are prohibited for it to touch. For me, there are two areas that I don't want agents just screwing around: this `README.md` and the tests. I got tired of agents, not only `lazy` agents but in general, "fixing" the issues by deleting or unnecessarily modifying tests. So now `lazy` is enforcing the rules, not through begging and cajoling in prompts but with a deterministic process.
 
-That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy builder` agent. Then it is up to the reviewer, whatever it may be, to *explicitly* accept chagnes to files. What is not accepted is assumed rejected and on the next turn, before it tries to merge anything or give the agent control, `lazy` will revert the rejected files to their pre-last-turn state and let the agent know about the changes.
+That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy builder` agent. Then it is up to the reviewer, whatever it may be, to *explicitly* accept changes to files. What is not accepted is assumed rejected and on the next turn, before it tries to merge anything or give the agent control, `lazy` will revert the rejected files to their pre-last-turn state and let the agent know about the changes.
 
 ### Head of Line Blocking
 
@@ -688,7 +729,7 @@ Run `lazy doctor` to verify your driver setup and authentication.
 
 ### Upgrading
 
-When you build a new version of `lazy`, you have to replace the instances running in containers as well as the deamon. To do so run:
+When you build a new version of `lazy`, you have to replace the instances running in containers as well as the daemon. To do so run:
 
 ```bash
 lazy upgrade
@@ -831,6 +872,17 @@ lazy redo <task-id>
 ```
 
 Coding is cheap, prompts are valuable, this will inject the original prompt plus as many turns as it can fit into the redo task's prompt.
+
+### Tasks disappeared / dashboard shows nothing
+
+If `lazy list`, the web dashboard, or the builder suddenly show an empty project — no tasks, no history — you are most likely talking to a **stray daemon**.
+
+```bash
+lazy daemon list        # shows every daemon on the host; strays are marked (stray)
+lazy daemon kill-stray  # reaps only daemons whose project root no longer exists
+```
+
+This can happen when there is a deamon from a deleted project squatting on a port.
 
 ## Support
 

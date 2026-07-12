@@ -16,6 +16,8 @@ import type {
   Review,
   ReviewVerdict,
   Comment,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   TaskTarget,
@@ -413,6 +415,47 @@ export interface Storage {
    * Get all comments for a task
    */
   getTaskComments(taskId: string): Promise<Comment[]>;
+
+  // --- Journal ---
+  //
+  // The task journal is an append-only, prompt-immune side channel for
+  // orchestration metadata, decision rationale, and cross-run agent memories.
+  //
+  // INVARIANT: journal entries must NEVER be injected into the agent/LLM
+  // prompt. They are a separate entity from comments precisely so there is no
+  // shared code path that could leak them into a prompt. Do not add methods
+  // here that feed the journal into prompt-assembly, auto-react, or remote PR
+  // sync — those are comment behaviors, not journal behaviors.
+
+  /**
+   * Append an entry to a task's journal. Append-only: there is no update or
+   * delete counterpart by design.
+   */
+  appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry>;
+
+  /**
+   * Get all journal entries for a task, in chronological order.
+   */
+  getTaskJournal(taskId: string): Promise<JournalEntry[]>;
+
+  // --- Follow-ups (task-level orthogonal-work discoveries) ---
+
+  /**
+   * Append a follow-up note to a task.
+   *
+   * INVARIANT: This is a PASSIVE write — recording a follow-up MUST NOT trigger
+   * any auto-turn, auto-resume, or auto-react. That non-triggering property is
+   * exactly why follow-ups are a distinct store and NOT comments (comments feed
+   * the comment auto-react loop, which would spuriously kick the agent into a
+   * new turn — the "lost turn" failure follow-ups exist to avoid). See CLAUDE.md.
+   * @param sessionId - the agent run that surfaced this follow-up, if known.
+   */
+  createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp>;
+
+  /**
+   * Get all follow-ups for a task, oldest first.
+   */
+  getTaskFollowUps(taskId: string): Promise<FollowUp[]>;
 
   // --- Hunk Approvals (per-hunk "reviewed" state for `lazy review -i`) ---
 

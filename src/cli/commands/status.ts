@@ -21,6 +21,7 @@ import {
   getAutoReactPausedReason,
   getAutoReactCount,
   readDailyBudget,
+  effectiveDailyLimit,
   checkBackoff,
   type AutoReactTrigger,
 } from '../../daemon/auto-react-budget';
@@ -248,10 +249,11 @@ async function printAutoReactDiagnostics(
     console.log(`  ${theme.label('Retries:')} none used (max ${auto_react_max_retries} per trigger)`);
   }
 
-  // 3. Daily budget
+  // 3. Daily budget (reflects any today-only cap override)
   const budget = await readDailyBudget(dataDir);
-  const budgetExhausted = budget.used >= auto_react_daily_budget;
-  const budgetStr = `${budget.used}/${auto_react_daily_budget}`;
+  const effectiveLimit = effectiveDailyLimit(budget, auto_react_daily_budget);
+  const budgetExhausted = budget.used >= effectiveLimit;
+  const budgetStr = `${budget.used}/${effectiveLimit}`;
   if (budgetExhausted) {
     console.log(`  ${theme.label('Daily budget:')} ${theme.warning(budgetStr + ' (exhausted)')}`);
     blockReasons.push('daily budget exhausted');

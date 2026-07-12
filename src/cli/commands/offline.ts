@@ -20,25 +20,36 @@
 import { join } from 'path';
 import { requireLazyRoot } from '../helpers';
 import { loadConfig } from '../../config/loader';
-import { setOfflineMode, getOfflineStatus } from '../../utils/offline';
+import { setOfflineMode, resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { theme } from '../theme';
 
 export async function commandOffline(_args: string[]): Promise<void> {
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
 
-  const status = await getOfflineStatus(dataDir);
-  if (status.enabled) {
-    console.log('Already in offline mode.');
-    console.log(`  Run ${theme.command('lazy system online')} when network is available.`);
+  const config = await loadConfig(root);
+  const status = await resolveOfflineStatus(dataDir, config.remote.offline);
+
+  // Permanent offline is configured — the temporary command is a no-op. Tell
+  // the user how to leave it rather than writing a redundant temporary file.
+  if (status.permanent) {
+    console.log('Already offline — permanently, via lazy.toml.');
+    console.log(`  ${theme.label('[remote] offline = true')} keeps remote operations off indefinitely.`);
+    console.log(`  Remove that flag from lazy.toml to go back online (this command would not change anything).`);
     return;
   }
 
-  const config = await loadConfig(root);
+  if (status.temporary) {
+    console.log(`Already in offline mode — ${formatOfflineExpiry(status)}.`);
+    console.log(`  Run ${theme.command('lazy system online')} to restore remote operations now.`);
+    return;
+  }
+
   const driver = config.remote.driver;
   await setOfflineMode(dataDir, true, driver);
+  const enabled = await resolveOfflineStatus(dataDir, config.remote.offline);
 
-  console.log(theme.success('Offline mode enabled.'));
+  console.log(theme.success(`Offline mode enabled — ${formatOfflineExpiry(enabled)}.`));
   if (driver !== 'local') {
     console.log(`  Remote driver "${driver}" operations will be skipped.`);
   }
@@ -55,24 +66,38 @@ export async function commandOffline(_args: string[]): Promise<void> {
   console.log('    - Syncing with upstream');
   console.log('');
   console.log('  The daemon will stop remote operations on the next tick.');
-  console.log(`  Run ${theme.command('lazy system online')} to restore remote operations.`);
+  console.log(`  This is temporary: it auto-recovers at local midnight, or run`);
+  console.log(`  ${theme.command('lazy system online')} to restore remote operations sooner.`);
+  console.log(`  To stay offline permanently, set ${theme.label('offline = true')} under ${theme.label('[remote]')} in lazy.toml.`);
 }
 
 export async function commandOnline(_args: string[]): Promise<void> {
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
 
-  const status = await getOfflineStatus(dataDir);
-  if (!status.enabled) {
+  const config = await loadConfig(root);
+  const status = await resolveOfflineStatus(dataDir, config.remote.offline);
+
+  // Clear any temporary offline file first (cheap, idempotent). This never
+  // touches lazy.toml — permanent offline is the user's config to remove.
+  await setOfflineMode(dataDir, false);
+
+  if (status.permanent) {
+    // Principle of least surprise: do NOT silently rewrite lazy.toml.
+    console.log(theme.warning('Still offline — permanent offline is set in lazy.toml.'));
+    console.log(`  ${theme.label('[remote] offline = true')} keeps remote operations off and does not auto-recover.`);
+    console.log(`  To go online, remove that flag from lazy.toml.`);
+    return;
+  }
+
+  if (!status.temporary) {
     console.log('Already online.');
     return;
   }
 
-  await setOfflineMode(dataDir, false);
-
   console.log(theme.success('Online mode restored.'));
-  if (status.configured_driver && status.configured_driver !== 'local') {
-    console.log(`  Remote driver "${status.configured_driver}" operations will resume.`);
+  if (status.configuredDriver && status.configuredDriver !== 'local') {
+    console.log(`  Remote driver "${status.configuredDriver}" operations will resume.`);
     console.log(`  The daemon will sync on the next tick.`);
   }
 }
@@ -84,8 +109,15 @@ Enable offline mode for this project. All remote operations (push, fetch,
 sync, PR creation) are skipped. Tasks start from local HEAD, accept
 performs local squash merge.
 
-Use before going offline (e.g., boarding a plane). Run 'lazy system online'
-when network access is restored.
+This is TEMPORARY: offline mode auto-recovers at the next local midnight, so
+you can't get stranded offline after forgetting to come back. The output and
+'lazy system status' always show when it expires. Run 'lazy system online' to
+restore remote operations sooner.
+
+To stay offline PERMANENTLY (e.g. an air-gapped or Ollama-only project), set
+'offline = true' under '[remote]' in lazy.toml instead. That is not subject to
+the midnight auto-expiry, and 'lazy system online' will not clear it — remove
+the flag from lazy.toml to go back online.
 
 What works offline:
   - Creating and starting tasks
@@ -99,8 +131,8 @@ What is deferred:
 Equivalent to: lazy config set offline on
 
 Examples:
-  lazy system offline           # Enable offline mode
-  lazy system online            # Restore remote operations`);
+  lazy system offline           # Enable temporary offline (auto-recovers at midnight)
+  lazy system online            # Restore remote operations now`);
 }
 
 export function onlineUsage(): void {

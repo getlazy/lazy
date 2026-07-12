@@ -12,17 +12,29 @@ import {
 } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
 import { reconcileTasks } from '../../src/utils/reconcile';
-import { createStorage } from '../../src/storage';
+import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 
 // ============================================================
 // Helpers
 // ============================================================
 
 /**
+ * Resolve the tasks directory for a test project. Test projects init with
+ * external storage (external_path in lazy.toml), so tasks live outside the
+ * repo; fall back to the in-repo .lazy/tasks layout when no external_path.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
+/**
  * Find the full task ID from a short ID by scanning the tasks directory.
  */
 function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const entries = readdirSync(tasksDir);
   const match = entries.find((e: string) => e.startsWith(shortId));
   if (!match) {
@@ -35,13 +47,13 @@ function findFullTaskId(root: string, shortId: string): string {
  * Directly set a task's status in file storage.
  */
 function setTaskStatus(root: string, fullTaskId: string, status: string): void {
-  const taskPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
+  const taskPath = join(tasksDirFor(root), fullTaskId, 'task.json');
   const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
   task.status = status;
   writeFileSync(taskPath, JSON.stringify(task, null, 2));
 
   // Also update the session's last_interaction_at to bypass grace period
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   if (existsSync(sessionPath)) {
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     session.last_interaction_at = new Date(Date.now() - 60000).toISOString();
@@ -66,7 +78,7 @@ function createAcceptTag(ctx: TestContext, fullTaskId: string, commitish: string
  * Tests can't rely on CLI commands triggering reconciliation — only the daemon does that.
  */
 async function runReconcile(root: string): Promise<void> {
-  const storage = await createStorage(root);
+  const storage = await openProjectStorage(root);
   try {
     await reconcileTasks(storage, root);
   } finally {
@@ -79,7 +91,7 @@ async function runReconcile(root: string): Promise<void> {
  * Used to test timezone parsing edge cases in the grace period logic.
  */
 function setLastInteractionAt(root: string, fullTaskId: string, value: string): void {
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
   session.last_interaction_at = value;
   writeFileSync(sessionPath, JSON.stringify(session, null, 2));
@@ -135,10 +147,14 @@ describe('lazy reconciliation grace period', () => {
     // causing the task to be stuck in 'working' forever.
     const taskId = await createTask(ctx, 'Future timestamp test', 'Do the work');
 
-    // Start the task so it has a session and transitions to working/blocked
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    // Start the task so it has a session and transitions to working/blocked.
+    // INVARIANT: the mock must NOT commit here. This test asserts the *interrupt*
+    // path (no container + no response → interrupted). If the mock leaves real
+    // committed work behind, the later reconcile legitimately routes it through
+    // recoverStrandedCompletion → 'blocked' instead (that path exists precisely
+    // so committed work is never lost), which would mask the grace-period fix
+    // this test targets. No commit = nothing to recover = a clean interrupt.
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // Reconcile first to process any response
     await runReconcile(ctx.root);
@@ -397,7 +413,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
     // 3. Verify task is blocked before the merge
-    const taskPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'task.json');
+    const taskPath = join(tasksDirFor(ctx.root), fullTaskId, 'task.json');
     const taskBefore = JSON.parse(readFileSync(taskPath, 'utf-8'));
     expect(taskBefore.status).toBe('blocked');
 
@@ -570,7 +586,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
 
     // 3. Remove agent turns from turns.json — simulate a task where the agent never ran
     //    (only the initial human prompt turn exists)
-    const turnsPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'turns.json');
+    const turnsPath = join(tasksDirFor(ctx.root), fullTaskId, 'turns.json');
     const turnsData = JSON.parse(readFileSync(turnsPath, 'utf-8'));
     turnsData.turns = turnsData.turns.filter((t: { role: string }) => t.role !== 'agent');
     writeFileSync(turnsPath, JSON.stringify(turnsData, null, 2));
@@ -579,7 +595,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     setTaskStatus(ctx.root, fullTaskId, 'blocked');
 
     // Also clear session outcome so the sweep doesn't skip it
-    const sessionPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'session.json');
+    const sessionPath = join(tasksDirFor(ctx.root), fullTaskId, 'session.json');
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     session.outcome = null;
     session.ended_at = null;
@@ -622,7 +638,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
 
     // 4. Remove agent turns AND reset branch to only have the empty init commit
     //    This simulates the exact scenario: agent never ran, branch only has --allow-empty commit
-    const turnsPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'turns.json');
+    const turnsPath = join(tasksDirFor(ctx.root), fullTaskId, 'turns.json');
     const turnsData = JSON.parse(readFileSync(turnsPath, 'utf-8'));
     turnsData.turns = turnsData.turns.filter((t: { role: string }) => t.role !== 'agent');
     writeFileSync(turnsPath, JSON.stringify(turnsData, null, 2));
@@ -649,7 +665,7 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
 
     // 5. Set task to blocked with no outcome
     setTaskStatus(ctx.root, fullTaskId, 'blocked');
-    const sessionPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'session.json');
+    const sessionPath = join(tasksDirFor(ctx.root), fullTaskId, 'session.json');
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     session.outcome = null;
     session.ended_at = null;
@@ -849,7 +865,7 @@ describe('reconciliation error isolation', () => {
 
     // 6. Corrupt the middle task's session.json to cause errors during reconciliation
     // Do this AFTER setTaskStatus to avoid breaking the test helper
-    const sessionPath = join(ctx.root, '.lazy', 'tasks', fullTaskId2, 'session.json');
+    const sessionPath = join(tasksDirFor(ctx.root), fullTaskId2, 'session.json');
     writeFileSync(sessionPath, '{invalid json');
 
     // 7. Trigger reconciliation — sweep should continue despite task2 error

@@ -562,21 +562,25 @@ export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?:
 }
 
 export async function hasUncommittedChanges(cwd?: string): Promise<boolean> {
-  // Exclude .lazy-task-sandbox/ from dirty worktree checks — it contains lazy's own
-  // runtime artifacts (agent sessions, protocol files) and should never affect dirty state.
-  const result = await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd });
+  // Exclude lazy's own runtime/control artifacts from dirty worktree checks —
+  // they are not real uncommitted work and must never affect dirty state:
+  //   .lazy-task-sandbox/ — agent sessions, protocol files
+  //   .lazy-lock          — the per-worktree session lock. A CRASHED session
+  //     leaves a stale lock behind, so auto-resume's dirty check (which decides
+  //     whether to merge upstream before resuming) would otherwise always see
+  //     the worktree as dirty and skip the merge. See auto-resume.ts.
+  const result = await runGit(
+    ['status', '--porcelain', '--', ':!.lazy-task-sandbox', ':!.lazy-lock'],
+    { cwd },
+  );
   if (result.exitCode !== 0) {
     return false;
   }
   if (!result.stdout) return false;
 
-  // Filter out lazy-specific control files that are not real uncommitted work
+  // Any remaining porcelain line is a real uncommitted change.
   const lines = result.stdout.split('\n');
-  const hasRealChanges = lines.some(line => {
-    if (!line.trim()) return false; // Empty line
-    // All other changes are real
-    return true;
-  });
+  const hasRealChanges = lines.some(line => line.trim().length > 0);
 
   return hasRealChanges;
 }

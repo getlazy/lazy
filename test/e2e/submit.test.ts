@@ -112,7 +112,11 @@ describe('lazy submit', () => {
     expectFailure(submitResult);
     // Should fail at push step, not at validation
     expectError(submitResult, 'push');
-  });
+    // The push goes through withRemoteRetry (3 attempts, 2s + 4s progressive
+    // backoff — see CLAUDE.md "Fail hard on remote failures"), so the failing
+    // path takes ~6s. Bun's default per-test timeout is 5s, so this test must
+    // opt into a longer budget or it times out mid-retry before the assertion.
+  }, 20_000);
 
   test('submit shows usage when no task ID provided', async () => {
     const result = await lazy(['submit']);

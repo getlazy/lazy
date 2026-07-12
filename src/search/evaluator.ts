@@ -6,7 +6,7 @@
  */
 
 import type { QueryNode } from './parser';
-import type { Task, Comment, Turn, Commit } from '../types';
+import type { Task, Comment, Turn, Commit, FollowUp } from '../types';
 import type { SearchResult } from '../storage/types';
 
 /** All data associated with a single task, used for evaluation. */
@@ -15,6 +15,7 @@ export interface TaskData {
   turns: Turn[];
   commits: Commit[];
   comments: Comment[];
+  followUps: FollowUp[];
 }
 
 /**
@@ -71,7 +72,7 @@ function evaluateField(
 }
 
 function evaluateIn(
-  scope: 'turns' | 'commits' | 'comments' | 'conversations',
+  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations',
   value: string,
   data: TaskData
 ): boolean {
@@ -85,6 +86,9 @@ function evaluateIn(
     case 'comments':
       return data.comments.some(c => textContains(c.content, value));
 
+    case 'followups':
+      return data.followUps.some(f => textContains(f.content, value));
+
     case 'conversations':
       // Conversations are standalone entities, not associated with tasks.
       // They are searched separately in the search command.
@@ -93,7 +97,7 @@ function evaluateIn(
 }
 
 function evaluateHas(
-  scope: 'commits' | 'turns' | 'comments',
+  scope: 'commits' | 'turns' | 'comments' | 'followups',
   data: TaskData
 ): boolean {
   switch (scope) {
@@ -103,6 +107,8 @@ function evaluateHas(
       return data.turns.length > 0;
     case 'comments':
       return data.comments.length > 0;
+    case 'followups':
+      return data.followUps.length > 0;
   }
 }
 
@@ -138,6 +144,7 @@ function evaluateText(value: string, data: TaskData): boolean {
   if (data.turns.some(t => textContains(t.content, value))) return true;
   if (data.commits.some(c => textContains(c.message, value))) return true;
   if (data.comments.some(c => textContains(c.content, value))) return true;
+  if (data.followUps.some(f => textContains(f.content, value))) return true;
   return false;
 }
 
@@ -252,6 +259,21 @@ export function buildSearchResults(
           task_goal: taskGoal,
           content: comment.content,
           match_context: extractContext(comment.content, term),
+        });
+      }
+    }
+
+    // Follow-ups
+    for (const followUp of data.followUps) {
+      if (textContains(followUp.content, term)) {
+        results.push({
+          entity_type: 'followup',
+          entity_id: followUp.id,
+          task_id: data.task.id,
+          task_code: taskCode,
+          task_goal: taskGoal,
+          content: followUp.content,
+          match_context: extractContext(followUp.content, term),
         });
       }
     }

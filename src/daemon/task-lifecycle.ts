@@ -30,6 +30,7 @@ import { createDriver, LocalDriver } from '../remote';
 import { regenerateFidelity } from '../synthesis/fidelity';
 import { getSummarizer } from '../synthesis/summarizer';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
+import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { resolveAndPersistEffort } from './effort';
 import { getAgent } from '../agent/registry';
 import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag } from '../git/operations';
@@ -57,7 +58,7 @@ import { readdir, readFile } from 'fs/promises';
 
 import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, CompletedResponse, ErrorResponse } from '../protocol';
 import { PROTOCOL_VERSION } from '../protocol/types';
-import type { FileViolation, Task, TokenUsage, Session, TaskStatus } from '../types';
+import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor } from '../types';
 import type { Storage } from '../storage';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
@@ -230,6 +231,13 @@ export interface UnblockTaskParams {
    * rejects with 409 and the reviewer retains their typed question.
    */
   permissionMode?: 'plan' | 'default';
+  /**
+   * Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor()
+   * when absent. Set by the MCP boundary because this turn is persisted in the
+   * daemon, where the env-var default cannot see the caller's channel.
+   * See {@link MCP_ACTOR}.
+   */
+  actor?: Actor;
 }
 
 export interface UnblockTaskResult {
@@ -473,7 +481,11 @@ export async function launchUnblockTask(
     });
     const modelId = modelName;
 
-    if (!task.model) {
+    // An explicit --model override is a durable choice — persist it even when
+    // task.model is already set, so auto-resume/auto-deliver (which read
+    // task.model) relaunch on the new model. Without an override, only fill
+    // an empty task.model (a plain unblock must not clobber the existing one).
+    if (params.modelOverride || !task.model) {
       await storage.updateTaskModel(task.id, modelName);
       task.model = modelName;
     }
@@ -538,7 +550,10 @@ export async function launchUnblockTask(
       content: message.trim(),
       model: modelName,
       prompt: fullMessage,
-      actor: getActor(),
+      // Channel actor: MCP-relayed feedback is 'builder' even when it carries a
+      // human's words — the actor records who submitted (the channel), not who
+      // authored the content. Falls back to getActor() for CLI. See MCP_ACTOR.
+      actor: params.actor ?? getActor(),
     });
 
     // Transition to working. Unblock is only semantically valid from these
@@ -627,6 +642,8 @@ export interface AskTaskParams {
   taskId: string;
   message: string;
   effortOverride?: string;
+  /** Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface AskTaskResult {
@@ -782,7 +799,8 @@ export async function launchAskTask(
       content: params.message.trim(),
       model: modelName,
       prompt: fullMessage,
-      actor: getActor(),
+      // Channel actor: MCP-originated questions are 'builder', CLI 'human'.
+      actor: params.actor ?? getActor(),
       turnType: 'ask',
     });
 
@@ -1379,7 +1397,7 @@ export async function acceptTaskPreflight(
   // Skip in offline mode — there's no remote to validate against, and the
   // accept will go through LocalDriver anyway.
   if (!isChildTask) {
-    const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+    const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
     const driver = createDriver(config, undefined, { offline });
     if (driver.needsSync) {
       const syncCheck = await validateBranchInSyncWithRemote(mergeTargetBranch, config.remote.git_remote, projectRoot);
@@ -1443,15 +1461,37 @@ export interface AcceptTaskResult {
  * 6. Handle result: failed (conflict → error with sync hint), pending (set merging status), merged (cleanup)
  * 7. Fast-forward local branch, end session, post review
  * 8. Reparent children, cleanup worktree/container/protocol
+ *
+ * CONCURRENCY: the entire orchestration runs under a per-task lifecycle lock
+ * (see task-lifecycle-lock.ts). The daemon serves RPCs concurrently, so without
+ * this lock a human accept and a builder accept on the same task interleave at
+ * every await, both clear the preflight TOCTOU, and both run the merge — which
+ * is the field bug that left a task `blocked` while its merge was applied. The
+ * lock makes the loser re-run preflight after the winner commits, see the
+ * accepted session outcome, and return a clean "already accepted".
  */
 export async function acceptTask(
+  projectRoot: string,
+  params: AcceptTaskParams,
+): Promise<AcceptTaskResult> {
+  // Resolve to the canonical task id BEFORE taking the lock so two accepts that
+  // name the same task by different forms (code / short id / full id) serialize
+  // against the same key. Resolution failures fall through to the inner function,
+  // which throws the proper RpcError.
+  const storageForResolve = await getOrCreateStorage();
+  const resolved = await storageForResolve.resolveTask(params.taskId);
+  const lockKey = resolved.task?.id ?? params.taskId;
+  return withTaskLifecycleLock(lockKey, () => acceptTaskInner(projectRoot, params));
+}
+
+async function acceptTaskInner(
   projectRoot: string,
   params: AcceptTaskParams,
 ): Promise<AcceptTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
   const config = await loadConfig(projectRoot);
-  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
   // Pass a DriverContext so hosted-driver CLI calls (e.g. gh pr edit for
   // commit/PR fidelity) run against the project root and can read storage.
   const driver = createDriver(config, { storage, lazyRoot: projectRoot }, { offline });
@@ -2123,6 +2163,8 @@ async function regenerateParentFidelity(
 
 export interface SyncTaskParams {
   taskId: string;
+  /** Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface SyncTaskResult {
@@ -2224,7 +2266,7 @@ export async function syncTask(
 
   // --- Attempt to fetch upstream ref ---
   const config = await loadConfig(projectRoot, { cwd: worktreePath });
-  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
   if (offline && (config.remote.driver === 'gitlab' || config.remote.driver === 'github')) {
     warnings.push(
       'lazy is in offline mode. Sync will merge upstream changes from the local ' +
@@ -2321,18 +2363,16 @@ export async function syncTask(
     ensureProtocolDir(protoDir);
 
     // --- Persist state BEFORE launching supervisor ---
-    // Record a synthetic human turn so the supervisor's completed response
-    // doesn't collide with the idempotency check in handleCompletedResponse
-    // (which skips when the last turn is already an agent turn). This also
-    // gives users a visible record in `lazy show` that sync was requested.
-    const nextSeq = await storage.getNextTurnSequence(sess.id);
-    await storage.createTurn({
-      sessionId: sess.id,
-      sequence: nextSeq,
-      role: 'human',
-      content: `[built-in] Upstream merge requested (parent: ${resolvedParentBranch} @ ${resolvedUpstreamSha.substring(0, 8)})`,
-      actor: getActor(),
-    });
+    // No synthetic turn is pre-created here. Turn recording for sync is owned by
+    // the reconciler (handleCompletedResponses → recordSyncTurns), where the
+    // merge OUTCOME is known: a real merge becomes a `supervisor`-actored turn
+    // (plus the agent's conflict-resolution reply when there were conflicts),
+    // while a no-op merge records NO turn at all. Pre-creating a turn here — before
+    // the supervisor reports whether it actually merged anything — is exactly what
+    // made no-op syncs leave a spurious turn pair, so we defer it to the reconciler.
+    // (Upstream's per-channel actor refinement for the old synthetic turn is
+    // superseded: the sync turn is now `supervisor`-actored, not human/builder.
+    // SyncTaskParams.actor is retained on the interface for cross-command parity.)
 
     // Transition to 'working' so the reconciler picks up the supervisor's
     // response.json and records the agent turn / status transition when the
@@ -2651,7 +2691,8 @@ export async function submitTask(
   const task = resolveResult.task;
 
   // --- Offline check (before any other validation) ---
-  const offline = await isOfflineMode(join(projectRoot, '.lazy'));
+  const config = await loadConfig(projectRoot);
+  const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
   if (offline) {
     throw new RpcError(400, 'Cannot submit while in offline mode. Run `lazy system online` to restore remote operations, then retry.');
   }
@@ -2674,8 +2715,6 @@ export async function submitTask(
   }
 
   // --- Remote driver check ---
-  const config = await loadConfig(projectRoot);
-
   let driver;
   try {
     driver = createDriver(config);
@@ -2976,8 +3015,13 @@ export async function resumeTask(
     });
     const modelId = modelName;
 
-    if (!task.model) {
+    // An explicit --model override is a durable choice — persist it even when
+    // task.model is already set, so auto-resume/auto-deliver (which read
+    // task.model) relaunch on the new model. Without an override, only fill
+    // an empty task.model (a plain resume must not clobber the existing one).
+    if (params.modelOverride || !task.model) {
       await storage.updateTaskModel(task.id, modelName);
+      task.model = modelName;
     }
 
     const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
@@ -3084,6 +3128,8 @@ export async function resumeTask(
 export interface StopTaskParams {
   taskId: string;
   reason: string;
+  /** Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface StopTaskResult {
@@ -3143,7 +3189,8 @@ export async function stopTask(
     sequence: turnSeq,
     role: 'human',
     content: `[built-in] Stopped by user: ${reason}`,
-    actor: getActor(),
+    // Channel actor: MCP-originated stop is 'builder', CLI 'human'.
+    actor: params.actor ?? getActor(),
   });
   await storage.setUserStopped(sess.id, true);
 

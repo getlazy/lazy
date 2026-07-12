@@ -4,7 +4,8 @@
  * A task in `working` is otherwise opaque: a long post_turn_check, a hung
  * supervisor, and a dead supervisor all render identically. These tests assert
  * that `ls`/`status` surface the derived substate:
- *   - working(agent)            phase=work, run alive
+ *   - working(agent)            phase=work/start, run alive
+ *   - working(agent:answering)  phase=work/ask, run alive (lazy ask turn)
  *   - working(harness:<phase>)  a post-turn phase, run alive
  *   - working(not-alive)        no live run and no response (stranded candidate)
  *
@@ -192,5 +193,27 @@ describe('working-substate observability', () => {
     const result = await ctx.lazy(['status', taskId]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('working(not-alive)');
+  });
+
+  // INVARIANT: ask turns render as working(agent:answering) so it is
+  // distinguishable from regular agent work across all read surfaces.
+  test('ls shows working(agent:answering) when command_type=ask', async () => {
+    const taskId = await makeWorkingTask(ctx, 'answering task');
+    await writeStatusJson(taskId, baseStatus(taskId, { command_type: 'ask' }));
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['list']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(agent:answering)');
+  });
+
+  test('status shows working(agent:answering) for an ask-phase task', async () => {
+    const taskId = await makeWorkingTask(ctx, 'answering status');
+    await writeStatusJson(taskId, baseStatus(taskId, { command_type: 'ask' }));
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['status', taskId]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(agent:answering)');
   });
 });

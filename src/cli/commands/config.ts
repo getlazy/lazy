@@ -22,8 +22,11 @@ import {
   resetAutoReactCounters,
   getAutoReactSummary,
   readDailyBudget,
+  effectiveDailyLimit,
 } from '../../daemon/auto-react-budget';
-import { getOfflineStatus, setOfflineMode } from '../../utils/offline';
+import { setOfflineMode, resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
+import { loadConfig } from '../../config/loader';
+import { describeExpiry, nextLocalMidnight } from '../../utils/local-day';
 import { theme } from '../theme';
 
 /** Known config keys and their allowed values. */
@@ -171,16 +174,24 @@ async function getAutoReact(taskIdInput: string | undefined): Promise<void> {
   const dataDir = join(root, '.lazy');
 
   // Global status
+  const config = await loadConfig(root);
   const globalPause = await isGlobalAutoReactPaused(dataDir);
   const dailyBudget = await readDailyBudget(dataDir);
+  const limit = effectiveDailyLimit(dailyBudget, config.daemon.auto_react_daily_budget);
+  const reset = nextLocalMidnight();
 
   console.log(theme.label('Global auto-react status:'));
   if (globalPause.paused) {
-    console.log(`  ${theme.error('PAUSED')}${globalPause.reason ? `: ${globalPause.reason}` : ''}`);
+    const expiry =
+      globalPause.expiresAt !== undefined
+        ? ` — resumes ${describeExpiry(new Date(globalPause.expiresAt))}`
+        : ' — indefinite';
+    console.log(`  ${theme.error('PAUSED')}${globalPause.reason ? `: ${globalPause.reason}` : ''}${expiry}`);
   } else {
     console.log(`  ${theme.status('active')}`);
   }
-  console.log(`  ${theme.label('Daily budget:')} ${dailyBudget.used} used today (${dailyBudget.date})`);
+  const overrideNote = dailyBudget.capOverride !== undefined ? ' (today-only override)' : '';
+  console.log(`  ${theme.label('Daily budget:')} ${dailyBudget.used}/${limit} turns today${overrideNote} — resets ${describeExpiry(reset)}`);
 
   if (taskIdInput) {
     const storage = await requireStorage();
@@ -225,24 +236,39 @@ async function getAutoReact(taskIdInput: string | undefined): Promise<void> {
 async function setOffline(value: string): Promise<void> {
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
+  const config = await loadConfig(root);
 
   if (value === 'on') {
-    const status = await getOfflineStatus(dataDir);
-    if (status.enabled) {
-      console.log('Already in offline mode.');
+    const status = await resolveOfflineStatus(dataDir, config.remote.offline);
+    if (status.permanent) {
+      console.log('Already offline — permanently, via lazy.toml ([remote] offline = true).');
+      console.log('  Remove that flag from lazy.toml to go back online; this command would not change anything.');
       return;
     }
-    await setOfflineMode(dataDir, true);
-    console.log(theme.success('Offline mode enabled.'));
+    if (status.temporary) {
+      console.log(`Already in offline mode — ${formatOfflineExpiry(status)}.`);
+      return;
+    }
+    await setOfflineMode(dataDir, true, config.remote.driver);
+    const enabled = await resolveOfflineStatus(dataDir, config.remote.offline);
+    console.log(theme.success(`Offline mode enabled — ${formatOfflineExpiry(enabled)}.`));
     console.log('  The daemon will stop remote operations on the next tick.');
-    console.log(`\nRestore with: ${theme.command('lazy config set offline off')}`);
+    console.log('  This is temporary and auto-recovers at local midnight.');
+    console.log('  To stay offline permanently, set offline = true under [remote] in lazy.toml.');
+    console.log(`\nRestore now with: ${theme.command('lazy config set offline off')}`);
   } else {
-    const status = await getOfflineStatus(dataDir);
-    if (!status.enabled) {
+    const status = await resolveOfflineStatus(dataDir, config.remote.offline);
+    // Always clear any temporary file; never rewrite lazy.toml.
+    await setOfflineMode(dataDir, false);
+    if (status.permanent) {
+      console.log(theme.warning('Still offline — permanent offline is set in lazy.toml.'));
+      console.log('  Remove [remote] offline = true from lazy.toml to go back online.');
+      return;
+    }
+    if (!status.temporary) {
       console.log('Already online.');
       return;
     }
-    await setOfflineMode(dataDir, false);
     console.log(theme.success('Online mode restored.'));
     console.log('  The daemon will sync on the next tick.');
   }
@@ -251,14 +277,19 @@ async function setOffline(value: string): Promise<void> {
 async function getOffline(): Promise<void> {
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
-  const status = await getOfflineStatus(dataDir);
+  const config = await loadConfig(root);
+  const status = await resolveOfflineStatus(dataDir, config.remote.offline);
   console.log(theme.label('Offline mode:'));
-  if (status.enabled) {
-    console.log(`  ${theme.error('ENABLED')}${status.enabled_at ? ` since ${status.enabled_at}` : ''}`);
-    if (status.configured_driver && status.configured_driver !== 'local') {
-      console.log(`  ${theme.label('Suspended driver:')} ${status.configured_driver}`);
+  if (status.offline) {
+    console.log(`  ${theme.error('ENABLED')} — ${formatOfflineExpiry(status)}${status.enabledAt ? ` (since ${status.enabledAt})` : ''}`);
+    if (status.configuredDriver && status.configuredDriver !== 'local') {
+      console.log(`  ${theme.label('Suspended driver:')} ${status.configuredDriver}`);
     }
-    console.log(`\nRestore with: ${theme.command('lazy system online')}`);
+    if (status.permanent) {
+      console.log(`\nRemove ${theme.command('[remote] offline')} from lazy.toml to go back online.`);
+    } else {
+      console.log(`\nRestore with: ${theme.command('lazy system online')}`);
+    }
   } else {
     console.log(`  ${theme.status('off')}`);
   }

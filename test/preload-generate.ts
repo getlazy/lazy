@@ -10,6 +10,11 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 
+// Arm the stray-daemon safety net for the whole test process. Importing the
+// module installs its exit/SIGINT/SIGTERM handlers so daemons spawned by any
+// test are reaped even if that test's afterEach never runs.
+import './helpers/daemon-registry';
+
 const root = join(import.meta.dir, '..');
 
 // Generate src/version.ts if missing

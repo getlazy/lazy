@@ -208,9 +208,11 @@ Web dashboard server settings.
 
 | Key             | Type     | Default       | Description |
 |-----------------|----------|---------------|-------------|
-| `port`          | `number` | `26024`       | Port for the web dashboard server. |
+| `port`          | `number` | `26024`       | Starting port for the web dashboard server. If busy, the daemon tries the next few ports (a bounded window of 20) so several projects can run on one host. If the whole window is occupied — almost always stray daemons squatting the range — startup fails with an actionable error pointing at `lazy daemon kill-stray` rather than silently binding a far-off port. |
 | `bind`          | `string` | `"127.0.0.1"` | Network interface the daemon's TCP server binds to. Loopback by default so the unauthenticated dashboard and the `/mcp` + `/rpc` endpoints are not reachable from other machines. Set to `"0.0.0.0"` to expose on all interfaces (opt-in to LAN access — the dashboard is unauthenticated, so the daemon logs a warning). The dashboard URL printed by `lazy daemon status`/`lazy server` reflects this value; a `0.0.0.0` bind is shown as `127.0.0.1` for local convenience. |
 | `sync_interval` | `number` | `60`          | Interval in seconds for background sync when running `lazy server`. Set to `0` to disable. |
+
+**Native Linux Docker note:** When `bind` is left at the loopback default and a container runner (`docker`/`podman`) is configured, on Linux the daemon *additionally* binds the detected docker/podman bridge gateway (`docker0`, typically `172.17.0.1`) on the same port. This is required because containers reach the host via `host.docker.internal` → the bridge gateway (a non-loopback interface), which a loopback-only daemon would refuse. The bridge interface is host-local and reachable only from the container network — **not** routable from the LAN — so it does not widen LAN exposure. macOS/Windows Docker Desktop need nothing extra (`host.docker.internal` is proxied to the host's loopback). If you set `bind` explicitly, that value is used as-is with no extra interfaces; if the bridge can't be detected on Linux the daemon logs an actionable warning rather than letting agents fail to reach it.
 
 ---
 
@@ -242,6 +244,15 @@ Remote integration for push, PR/MR creation, and comment syncing.
 | `driver`       | `string` | `"local"`  | Remote driver: `"local"`, `"github"`, or `"gitlab"`. |
 | `git_remote`   | `string` | `"origin"` | Git remote name. Change if your remote is named differently. |
 | `auto_approve` | `bool`   | `false`    | If `true`, `lazy accept` on a protected target branch submits an approving review before merging. See behavior notes below. |
+| `offline`      | `bool`   | `false`    | Permanent offline mode. If `true`, all remote operations (push, fetch, sync, PR creation) are skipped **indefinitely**. See offline modes below. |
+
+### Offline modes
+
+There are two ways to be offline, with deliberately different lifetimes:
+
+- **Temporary — `lazy system offline`** (the command). Records an expiry at the **next local midnight** and auto-recovers: once that instant passes, lazy is online again and the daemon resumes remote ops, with no manual `lazy system online`. This prevents the common failure of forgetting to come back online and silently staying stranded. The expiry/countdown is always shown by the command, `lazy system status`, `lazy doctor`, and `lazy config get offline` (e.g. `OFFLINE — auto-resumes in 6h (00:00 local)`). Run `lazy system online` to restore remote ops sooner.
+
+- **Permanent — `offline = true`** (this config flag). For projects that genuinely want to stay offline (air-gapped, Ollama-only, etc.). It is **not** subject to the midnight auto-expiry — it stays in effect until you remove the flag. `lazy system online` will **not** clear it (it never rewrites your `lazy.toml`); remove `offline = true` from `[remote]` to go back online.
 
 ### `auto_approve` on protected branches
 
@@ -275,6 +286,7 @@ Available when `driver = "gitlab"`. Authentication is handled by `glab` CLI (`gl
 driver = "github"
 git_remote = "origin"
 auto_approve = false
+# offline = true   # stay offline permanently (no midnight auto-expiry)
 github_auto_push = true
 ```
 
@@ -327,6 +339,47 @@ Mount additional documents into agent containers.
 | Key    | Type     | Default | Description |
 |--------|----------|---------|-------------|
 | `path` | `string` | `""`    | Path to a directory of documents to mount into the agent container. |
+
+---
+
+## `[[mounts]]`
+
+Custom mounts injected into **task agent containers** (the worktree containers where agents run; the builder container is not affected). Array of tables — each entry is either a host **bind** mount or a container-local **volume**. Opt-in: none by default, and with no `[[mounts]]` configured container launch is exactly as before.
+
+The motivating case: the worktree (including its `node_modules`) is bind-mounted into the container, so container-installed Linux binaries fight the host's macOS ones. Shadowing `{worktree}/node_modules` with a volume gives the container its own `node_modules` that never clobbers the host's (Docker resolves overlapping mounts by longest container-path match, so the inner volume wins regardless of declaration order).
+
+Each entry's keys:
+
+| Key        | Type      | Default  | Description |
+|------------|-----------|----------|-------------|
+| `type`     | `string`  | `"bind"` | `"bind"` mounts a host path; `"volume"` uses a container-local Docker volume. |
+| `source`   | `string`  | —        | Host path for bind mounts. Absolute, or project-relative (resolved against the repo root). Required for bind; invalid for volume. |
+| `name`     | `string`  | —        | Volume name for a **named** volume (persists/reused across runs). Omit for an **anonymous** volume. Only valid for `type = "volume"`. |
+| `target`   | `string`  | —        | Absolute container path to mount at. Required. |
+| `readonly` | `boolean` | `false`  | Mount read-only. |
+
+**Placeholders** (expanded at launch time) are supported in `source` and `target`:
+
+| Placeholder  | Expands to |
+|--------------|------------|
+| `{worktree}` | The task's worktree path. |
+| `{repo}`     | The repo root. |
+
+Invalid entries fail loudly at config-load time with a message naming the offending entry (missing `target`, unknown `type`, a bind with no `source`, a volume that sets `source`, etc.) — they are never silently skipped.
+
+```toml
+# Bind a host path into the container
+[[mounts]]
+source = "/abs/or/project-relative/host/path"
+target = "/absolute/container/path"
+readonly = false
+
+# Shadow a worktree path with a container-local named volume (the node_modules case)
+[[mounts]]
+type = "volume"
+name = "myproj-node-modules"   # omit for an anonymous volume
+target = "{worktree}/node_modules"
+```
 
 ---
 
@@ -401,7 +454,7 @@ instructions = "Search for docs and update any that have gone out of date due to
 [[automation.maintain]]
 title = "changelog"
 pattern = "CHANGELOG.md"
-instructions = "Add a line that succinctly describes your work; skip if your work is intra-release."
+instructions = "Add ONE line to the next release section under Added/Changed/Fixed: bold feature/command name, one sentence of the user-visible effect (not the implementation, no internal type/function names), and your task code in parens as the depth pointer. Max ~25 words. Skip if your work is intra-release; update your existing line instead of adding a second."
 ```
 
 ---
@@ -433,7 +486,7 @@ Controls the daemon's auto-react behavior — automatically unblocking tasks in 
 | `auto_react_comments`     | `bool`   | `true`          | React to PR/MR comments (auto-unblock blocked tasks when humans comment). |
 | `auto_react_max_retries`  | `number` | `3`             | Max auto-unblocks per task *per trigger type* before the task is paused for human review. |
 | `auto_react_backoff`      | `string` | `"exponential"` | Backoff strategy between repeated auto-unblocks of the same trigger: `"none"`, `"linear"`, or `"exponential"`. |
-| `auto_react_daily_budget` | `number` | `50`            | Max auto-triggered turns per day across all tasks in the project. Resets at midnight UTC. |
+| `auto_react_daily_budget` | `number` | `50`            | Max auto-triggered turns per day across all tasks in the project. Resets at **local midnight** (machine timezone). |
 | `max_auto_turns`          | `number` | `3`             | Max *consecutive* auto-triggered turns per task before the task is paused for human review. The counter resets whenever a human manually unblocks the task or the task reaches a terminal state. |
 
 ```toml
@@ -445,3 +498,35 @@ auto_react_backoff = "exponential"
 auto_react_daily_budget = 100
 max_auto_turns = 3
 ```
+
+`auto_react_daily_budget` is the **permanent** cap. To steer the budget at runtime
+without editing `lazy.toml`, use `lazy daemon auto-budget`:
+
+- `lazy daemon auto-budget list` — today's used/limit, reset countdown, pause state,
+  and a log of what consumed budget today (timestamp, task, trigger).
+- `lazy daemon auto-budget update <+N|-N|=N>` — adjust **today's** effective cap only
+  (e.g. `+50`, `-20`, `=100`). This is ephemeral and resets at local midnight; it does
+  **not** change `lazy.toml`.
+- `lazy daemon auto-budget pause` — pause all auto-react until local midnight (then
+  auto-resumes); `resume` clears it early.
+
+"Today" rolls over at local midnight, and every reset/pause expiry is shown with a
+countdown anchored to `00:00 local`.
+
+### Inspecting and reaping daemons across projects
+
+`lazy daemon status` reports the daemon for the current project. To see and clean up
+daemons across **all** projects on the host:
+
+- `lazy daemon list` — every running daemon (pid, web port, version, age, project
+  root). A daemon whose project root has been deleted is marked `(stray)`, and dead-pid
+  state dirs left behind by crashes are reported as orphans.
+- `lazy daemon kill-stray` — reap only stray daemons (those whose project root no longer
+  exists). A daemon whose root still exists is **never** touched. Requires confirmation;
+  pass `--yes` for non-interactive callers and `--prune-dirs` to also remove orphaned
+  state dirs whose process is dead.
+
+Daemon state lives under `~/.lazy/daemon/<slug>/` by default. Set the
+`LAZY_DAEMON_BASE_DIR` environment variable to relocate it — useful for isolated test
+runs or custom operator setups. It is honored by every daemon path, including the
+`list`/`kill-stray` scan, so all daemons agree on a single location.

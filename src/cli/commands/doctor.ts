@@ -25,7 +25,7 @@ import { getKnownFeatures, getUnknownFlags, isFeatureEnabled } from '../../utils
 import { createDriver } from '../../remote';
 import type { ResolvedConfig } from '../../config/types';
 import type { RepositoryDriver } from '../../remote';
-import { getOfflineStatus } from '../../utils/offline';
+import { resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../../shell/detect';
 import type { ShellInfo } from '../../shell/detect';
 import { spawnSync } from '../../utils/spawn';
@@ -863,13 +863,17 @@ export async function commandDoctor(args: string[]): Promise<void> {
   if (root) {
     results.push(await checkDataDir(root));
 
-    // Offline mode status
-    const offlineStatus = await getOfflineStatus(join(root, '.lazy'));
-    if (offlineStatus.enabled) {
+    // Offline mode status — always surface when it expires (or that it won't).
+    const offlineStatus = await resolveOfflineStatus(join(root, '.lazy'), config!.remote.offline);
+    if (offlineStatus.offline) {
+      const suspended = offlineStatus.configuredDriver ? ` (${offlineStatus.configuredDriver} driver suspended)` : '';
+      const restore = offlineStatus.permanent
+        ? `Remove [remote] offline from lazy.toml to go back online.`
+        : `Run 'lazy system online' to restore remote operations now.`;
       results.push({
         ok: true,
         label: 'Offline mode',
-        warning: `ENABLED since ${offlineStatus.enabled_at ?? 'unknown'}${offlineStatus.configured_driver ? ` (${offlineStatus.configured_driver} driver suspended)` : ''}. Run 'lazy system online' to restore remote operations.`,
+        warning: `ENABLED — ${formatOfflineExpiry(offlineStatus)}${suspended}. ${restore}`,
       });
     } else {
       results.push({ ok: true, label: 'Offline mode: off' });

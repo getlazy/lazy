@@ -17,6 +17,8 @@ import type {
   Comment,
   CommentSource,
   Note,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   TaskTarget,
@@ -42,6 +44,8 @@ export type {
   Comment,
   CommentSource,
   Note,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   TaskTarget,
@@ -166,6 +170,23 @@ export interface CommentsFile {
 export type NotesFile = CommentsFile;
 
 /**
+ * Internal format for journal.json.
+ *
+ * Deliberately NOT named to collide with the legacy notes.json migration —
+ * journal entries are a distinct, prompt-immune entity from comments.
+ */
+export interface JournalFile {
+  journal: JournalEntry[];
+}
+
+/**
+ * Internal format for follow-ups.json (task-level orthogonal-work discoveries)
+ */
+export interface FollowUpsFile {
+  follow_ups: FollowUp[];
+}
+
+/**
  * Internal format for hunk-approvals.json (per-task review approvals)
  */
 export interface HunkApprovalsFile {
@@ -176,7 +197,7 @@ export interface HunkApprovalsFile {
  * Search result entry
  */
 export interface SearchResult {
-  entity_type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'conversation';
+  entity_type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'conversation';
   entity_id: string;
   task_id: string;
   task_code: string | null;

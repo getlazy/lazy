@@ -902,9 +902,80 @@ describe('lazy daemon', () => {
       expect(message).toContain('Daemon failed to bind web dashboard');
       expect(message).toContain(String(squattedPort));
       expect(message).toContain('host.docker.internal');
+      // The range-exhausted case leads with the exact remediation command
+      // (built in sibling task daemon-operator-tooling) and names stray
+      // daemons as the likely cause — this is the whole point of the task.
+      expect(message).toContain('stray daemon');
+      expect(message).toContain('lazy daemon kill-stray');
+      expect(message).toContain('lazy daemon list');
       expect(message).toContain('lsof -i');
       expect(message).toContain('lazy daemon stop');
       expect(message).toContain('[server]');
+    });
+
+    // INVARIANT: when the ENTIRE auto-increment window is occupied (the real
+    // port-exhaustion scenario — stray daemons squatting the range), the daemon
+    // fails with an actionable error that names the tried range and the exact
+    // remediation command (`lazy daemon kill-stray`). It must NOT hang, and it
+    // must NOT silently walk past the window onto a far-off port. This is the
+    // regression the task was created to prevent (97 e2e strays shoving the
+    // real daemon to a high port, clients landing on an empty-store stray).
+    test('daemon fails with actionable error when the whole port window is exhausted', async () => {
+      // Occupy a contiguous window of ports, then point the daemon at the
+      // bottom of that window with maxPortAttempts spanning exactly it. Every
+      // port in the walk is busy, so the bind must fail rather than escape the
+      // window. We bind port 0 first to learn a free base, then squat upward.
+      const WINDOW = 4;
+      const squatters: ReturnType<typeof Bun.serve>[] = [];
+      // Find a base port with a free contiguous window above it. Retry a few
+      // times to dodge the rare case where another process grabs a port
+      // mid-scan (ephemeral churn), so the test isn't flaky.
+      let basePort = 0;
+      for (let scan = 0; scan < 20 && squatters.length < WINDOW; scan++) {
+        // Tear down any partial window from a failed scan before retrying.
+        for (const s of squatters) s.stop(true);
+        squatters.length = 0;
+        const probe = Bun.serve({ port: 0, fetch: () => new Response('probe') });
+        basePort = probe.port!;
+        probe.stop(true);
+        try {
+          for (let i = 0; i < WINDOW; i++) {
+            squatters.push(Bun.serve({ port: basePort + i, fetch: () => new Response('squat') }));
+          }
+        } catch {
+          // A port in the window was taken between probe and squat — rescan.
+        }
+      }
+      expect(squatters.length).toBe(WINDOW);
+
+      try {
+        let thrown: unknown = null;
+        try {
+          await startDaemonServer({
+            projectRoot: ctx.root,
+            token: 'window-exhaust-token',
+            socketPath: join(tmpDir, 'window-exhaust.sock'),
+            webPort: basePort,
+            maxPortAttempts: WINDOW,
+            _forceBindWebInTest: true,
+          });
+        } catch (err) {
+          thrown = err;
+        }
+
+        expect(thrown).toBeInstanceOf(Error);
+        const message = (thrown as Error).message;
+        // Names the exact range that was tried, all busy.
+        expect(message).toContain(`${basePort}–${basePort + WINDOW - 1}`);
+        expect(message).toContain('all busy');
+        // Names stray daemons as the cause and the remediation command.
+        expect(message).toContain('stray daemon');
+        expect(message).toContain('lazy daemon kill-stray');
+        // Did NOT escape the window onto a far-off port.
+        expect(isDaemonRunning(ctx.root)).toBe(false);
+      } finally {
+        for (const s of squatters) s.stop(true);
+      }
     });
 
     // INVARIANT: after a web-bind failure, the daemon leaves no partial state

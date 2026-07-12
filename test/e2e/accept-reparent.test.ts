@@ -207,8 +207,42 @@ describe('accept re-parents unfinished children', () => {
     const acceptResult = await ctx.lazy(['accept', parentId, '--reason', 'LGTM']);
     expectSuccess(acceptResult);
 
-    // 4. Verify the log mentions 2 children and top-level
+    // 4. Verify the log mentions 2 children and top-level, and names the
+    //    branch the now-top-level children target (default branch: main).
     expectOutput(acceptResult, 'Re-parented 2 unfinished children');
     expectOutput(acceptResult, 'top-level');
+    expectOutput(acceptResult, 'main branch');
+  });
+
+  // INVARIANT: The pre-accept note about active children must describe what
+  // lazy actually does (automatic re-parent + sync, no manual action) and must
+  // NOT use the non-lazy "rebasing" concept or imply the user must act.
+  test('pre-accept note conveys no action needed and never mentions rebasing', async () => {
+    // 1. Create and start a parent task
+    const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
+    const parentStartResult = await ctx.lazyMocked(
+      ['start', parentId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(parentStartResult);
+
+    // 2. Create a backlog child so the active-children note fires
+    const childCreateResult = await ctx.lazy([
+      'create', '--goal', 'Child backlog task', '--parent', parentId,
+    ]);
+    expectSuccess(childCreateResult);
+
+    // 3. Remove parent worktree and accept
+    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
+    ctx.git('worktree', 'remove', '--force', parentWorktree);
+
+    const acceptResult = await ctx.lazy(['accept', parentId, '--reason', 'LGTM']);
+    expectSuccess(acceptResult);
+
+    // 4. Note must not use "rebasing" (not a lazy concept) and must tell the
+    //    user no manual action is required.
+    expectOutputExcludes(acceptResult, 'rebasing');
+    expectOutput(acceptResult, 'no action needed');
   });
 });

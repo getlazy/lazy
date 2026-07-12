@@ -344,6 +344,22 @@ Rules:
 - This ensures prompts are discoverable via `lazy prompts`, trackable in git diffs, and editable without touching code.
 - If a prompt needs variable substitution, use `{{placeholder}}` syntax and `.replace()` at the call site.
 
+## CHANGELOG style
+
+The CHANGELOG is for a 30-second human scan of what's new, changed, or fixed — not a record of *how* it was built. That depth already lives in each task's history and journal. Keep entries scannable:
+
+- **One line per entry.** No multi-sentence paragraphs. If you can't say it in a line, the depth belongs in the task, not here.
+- **State the user-visible effect, not the implementation.** What changed for someone using lazy — not the internal mechanism, guards, or plumbing that made it work.
+- **No internal type/function names.** No `TOCTOU` guards, `recordSyncTurns`, `CompletedResponse`, etc. Command names, config keys, and flags are fine — those are the user surface.
+- **Reference the task code in parens as the depth pointer**, e.g. `(daemon-operator-tooling)`. That's where a reader goes for the full rationale.
+- **Intro paragraph: 3 sentences max.** A quick framing of the release's theme, nothing more.
+
+Example entry:
+
+- **`lazy daemon list` / `kill-stray`** — see and reap stray daemons host-wide (`daemon-operator-tooling`)
+
+Keep the `Added` / `Changed` / `Fixed` structure. This sets the standard going forward — don't rewrite older sections to match.
+
 ## End-to-End Testing
 
 Lazy has an e2e test suite in `test/e2e/` that tests CLI commands as subprocesses with mocked agent responses. **Any new command or behavior change should have e2e test coverage.**

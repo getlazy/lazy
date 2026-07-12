@@ -112,7 +112,8 @@ Keep two kinds of additional work strictly separate:
 - To break THIS task's own work into executable parts, create subtasks with `lazy_create` (pass
   `parent` to scope them under your current task). That is decomposition of in-scope work.
 - For genuinely ORTHOGONAL discoveries (a different concern this task doesn't need), do NOT create a
-  task — that clutters the backlog. Surface them crisply and concretely in your final summary so the
-  human can decide. Keep each one short and actionable. Do NOT leave TODO comments in the code instead.
+  task — that clutters the backlog. Record each one with `lazy_add_followup` — a passive note on this
+  task that the human triages later (it starts no work and notifies no one). Keep each one short and
+  actionable, and also mention them in your final summary. Do NOT leave TODO comments in the code instead.
 
 ---

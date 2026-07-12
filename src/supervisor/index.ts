@@ -900,14 +900,39 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       : `Merged ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. HEAD: ${syncResult.preMergeSha.substring(0, 8)} → ${postMergeSha.substring(0, 8)}.`)
     : `Already up to date: HEAD (${syncResult.preMergeSha.substring(0, 8)}) already contains ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. No merge performed.`;
 
-  const response: CompletedResponse = {
+  // The sync response is a bundle: the `supervisor`-authored merge announcement,
+  // plus (only when the merge had conflicts) the agent's conflict-resolution reply
+  // as a second full response. The `sync` marker tells the reconciler how to
+  // record turns — a no-op merge (merged: false) records NO turn at all. For a
+  // CLEAN merge the merge commit belongs to the announcement turn (SHA window
+  // attached here); for a conflict merge the commit is the agent's and is
+  // attributed to the resolution turn instead.
+  const mergeResponse: CompletedResponse = {
     status: 'completed',
     result: resultMessage,
     session_id: '',
     usage: { input_tokens: 0, output_tokens: 0 },
+    sync: { merged: syncResult.merged, conflicts: syncResult.conflicts.length },
     ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
+    ...(syncResult.merged && syncResult.conflicts.length === 0
+      ? { start_sha_work: syncResult.preMergeSha, end_sha_work: postMergeSha }
+      : {}),
   };
-  writeResponse(protocolDir, response);
+
+  const responses: CompletedResponse[] = [mergeResponse];
+  if (syncResult.merged && syncResult.resolution) {
+    responses.push({
+      status: 'completed',
+      result: syncResult.resolution.result,
+      session_id: syncResult.resolution.session_id,
+      usage: syncResult.resolution.usage,
+      start_sha_work: syncResult.preMergeSha,
+      end_sha_work: postMergeSha,
+    });
+  }
+
+  const bundle: CompletedResponseBundle = { status: 'completed', responses };
+  writeResponse(protocolDir, bundle);
 }
 
 /**

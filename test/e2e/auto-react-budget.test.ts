@@ -68,11 +68,16 @@ describe('auto-react daily budget file', () => {
 
   test('daily budget file is created with correct format', async () => {
     const { incrementDailyBudget, readDailyBudget, isDailyBudgetExhausted } = await import('../../src/daemon/auto-react-budget');
+    const { localDayKey } = await import('../../src/utils/local-day');
 
     // Initial state: no budget file
     const initial = await readDailyBudget(tempDir);
     expect(initial.used).toBe(0);
-    expect(initial.date).toBe(new Date().toISOString().split('T')[0]);
+    // INVARIANT: the budget day key is the LOCAL calendar day, not UTC.
+    // "Today" must roll over at the user's local midnight so the budget tracks
+    // their wall clock (previously this asserted the UTC ISO date, which reset
+    // at an arbitrary offset from the user's day).
+    expect(initial.date).toBe(localDayKey());
 
     // Increment
     const count = await incrementDailyBudget(tempDir);
@@ -89,17 +94,19 @@ describe('auto-react daily budget file', () => {
     expect(await isDailyBudgetExhausted(tempDir, 1)).toBe(true);
   });
 
-  test('daily budget resets on new day', async () => {
+  test('daily budget resets on new (local) day', async () => {
     const { readDailyBudget } = await import('../../src/daemon/auto-react-budget');
+    const { localDayKey } = await import('../../src/utils/local-day');
 
     // Write a budget file with yesterday's date
     const budgetPath = join(tempDir, 'auto-react-budget.json');
     writeFileSync(budgetPath, JSON.stringify({ date: '2025-01-01', used: 42 }));
 
-    // Reading should reset because the date doesn't match today
+    // Reading should reset because the date doesn't match today's LOCAL day key.
+    // INVARIANT: day-boundary reset is anchored to local midnight, not UTC.
     const budget = await readDailyBudget(tempDir);
     expect(budget.used).toBe(0);
-    expect(budget.date).toBe(new Date().toISOString().split('T')[0]);
+    expect(budget.date).toBe(localDayKey());
   });
 
   // INVARIANT: Daily budget prevents runaway spending.
@@ -116,6 +123,47 @@ describe('auto-react daily budget file', () => {
     expect(budget.used).toBe(5);
     expect(await isDailyBudgetExhausted(tempDir, 5)).toBe(true);
     expect(await isDailyBudgetExhausted(tempDir, 6)).toBe(false);
+  });
+
+  test('today-only cap override changes the effective limit, not the config', async () => {
+    const { adjustDailyCap, readDailyBudget, effectiveDailyLimit, isDailyBudgetExhausted, incrementDailyBudget } =
+      await import('../../src/daemon/auto-react-budget');
+
+    // Absolute set
+    let cap = await adjustDailyCap(tempDir, 50, { kind: 'absolute', value: 100 });
+    expect(cap).toBe(100);
+    let state = await readDailyBudget(tempDir);
+    expect(effectiveDailyLimit(state, 50)).toBe(100);
+
+    // Relative add/subtract operate on the current effective cap
+    cap = await adjustDailyCap(tempDir, 50, { kind: 'relative', value: -30 });
+    expect(cap).toBe(70);
+
+    // Cap floors at 0
+    cap = await adjustDailyCap(tempDir, 50, { kind: 'relative', value: -999 });
+    expect(cap).toBe(0);
+
+    // Reset to a usable cap; exhaustion respects the override (not the config limit)
+    await adjustDailyCap(tempDir, 50, { kind: 'absolute', value: 2 });
+    await incrementDailyBudget(tempDir);
+    await incrementDailyBudget(tempDir);
+    expect(await isDailyBudgetExhausted(tempDir, 50)).toBe(true); // 2/2 even though config is 50
+  });
+
+  test('incrementDailyBudget appends an activity-log entry when given one', async () => {
+    const { incrementDailyBudget, readDailyBudget } = await import('../../src/daemon/auto-react-budget');
+
+    await incrementDailyBudget(tempDir, { taskId: 'abc12345', taskCode: 'fix-thing', trigger: 'ci_failure' });
+    await incrementDailyBudget(tempDir, { taskId: 'def67890', trigger: 'comment' });
+    // A bare increment (no entry) must still bump the counter without a log row.
+    await incrementDailyBudget(tempDir);
+
+    const state = await readDailyBudget(tempDir);
+    expect(state.used).toBe(3);
+    expect(state.log).toHaveLength(2);
+    expect(state.log![0]).toMatchObject({ taskId: 'abc12345', taskCode: 'fix-thing', trigger: 'ci_failure' });
+    expect(typeof state.log![0].ts).toBe('number');
+    expect(state.log![1]).toMatchObject({ taskId: 'def67890', trigger: 'comment' });
   });
 });
 

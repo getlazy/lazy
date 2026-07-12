@@ -137,9 +137,11 @@ export async function getActiveChildren(
 export function formatReparentWarning(reparented: Task[], parentTask: Task): string | null {
   if (reparented.length === 0) return null;
   const grandparentId = parentTaskIdOf(parentTask);
+  // Top-level case: children inherit the branch the accepted task targeted
+  // (mirrors reparentChildren's top-level path), so name it explicitly.
   const newParentDesc = grandparentId
     ? grandparentId.substring(0, 8)
-    : 'top-level';
+    : `top-level (${targetBranchOf(parentTask) ?? 'main'} branch)`;
   const plural = reparented.length === 1 ? 'child' : 'children';
   return `Re-parented ${reparented.length} unfinished ${plural} to ${newParentDesc}`;
 }

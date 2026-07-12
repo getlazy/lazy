@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { runReconcile as runReconcileSubprocess } from '../helpers/reconcile';
 import {
   writeResponse,
   consumeResponse,
@@ -16,8 +17,20 @@ import type { CompletedResponse, ErrorResponse, UnblockCommand } from '../../src
 // Helpers
 // ============================================================
 
+/**
+ * Resolve the tasks directory for a test project. Test projects init with
+ * external storage (external_path in lazy.toml), so tasks live outside the
+ * repo; fall back to the in-repo .lazy/tasks layout when no external_path.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
 function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const entries = readdirSync(tasksDir);
   const match = entries.find((e: string) => e.startsWith(shortId));
   if (!match) {
@@ -27,13 +40,13 @@ function findFullTaskId(root: string, shortId: string): string {
 }
 
 function setTaskStatus(root: string, fullTaskId: string, status: string): void {
-  const taskPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
+  const taskPath = join(tasksDirFor(root), fullTaskId, 'task.json');
   const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
   task.status = status;
   writeFileSync(taskPath, JSON.stringify(task, null, 2));
 
   // Also update the session's last_interaction_at to bypass grace period
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   if (existsSync(sessionPath)) {
     const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
     session.last_interaction_at = Date.now() - 60000;
@@ -42,12 +55,12 @@ function setTaskStatus(root: string, fullTaskId: string, status: string): void {
 }
 
 function readSession(root: string, fullTaskId: string): Record<string, unknown> {
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   return JSON.parse(readFileSync(sessionPath, 'utf-8'));
 }
 
 function writeSession(root: string, fullTaskId: string, session: Record<string, unknown>): void {
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
+  const sessionPath = join(tasksDirFor(root), fullTaskId, 'session.json');
   writeFileSync(sessionPath, JSON.stringify(session, null, 2));
 }
 
@@ -69,12 +82,10 @@ describe('interrupt diagnostics', () => {
   test('interrupted task captures diagnostic fields in session', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Diagnostics test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to move to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -86,7 +97,7 @@ describe('interrupt diagnostics', () => {
     consumeResponse(protoDir);
 
     // 4. Trigger reconciliation — task should be marked as interrupted with diagnostics
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Verify diagnostics were captured in session.json
     const session = readSession(ctx.root, fullTaskId);
@@ -99,12 +110,10 @@ describe('interrupt diagnostics', () => {
   test('lazy show displays interrupt reason when task is interrupted', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Show diagnostics test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to move to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -113,7 +122,7 @@ describe('interrupt diagnostics', () => {
     consumeResponse(getProtocolDir(fullTaskId));
 
     // 4. Trigger reconciliation to interrupt
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Verify lazy show displays interrupt information
     const showResult = await ctx.lazy(['show', taskId]);
@@ -126,12 +135,10 @@ describe('interrupt diagnostics', () => {
   test('lazy status displays interrupt history when task is interrupted', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Status diagnostics test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -140,7 +147,7 @@ describe('interrupt diagnostics', () => {
     consumeResponse(getProtocolDir(fullTaskId));
 
     // 4. Trigger reconciliation to interrupt
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Verify lazy status displays interrupt information
     const statusResult = await ctx.lazy(['status', taskId]);
@@ -152,12 +159,10 @@ describe('interrupt diagnostics', () => {
   test('error response records interrupt diagnostics', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Error diagnostics test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
     const protoDir = getProtocolDir(fullTaskId);
@@ -175,7 +180,7 @@ describe('interrupt diagnostics', () => {
     writeResponse(protoDir, errorResp);
 
     // 4. Trigger reconciliation
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Verify diagnostics captured with exit code info
     const session = readSession(ctx.root, fullTaskId);
@@ -202,12 +207,10 @@ describe('auto-resume on reconciliation', () => {
   test('interrupted task is auto-resumed by reconciler', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Auto-resume test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -219,8 +222,7 @@ describe('auto-resume on reconciliation', () => {
     //    In test mode, the mock launchSupervisorAsync writes a response immediately,
     //    so after this reconciliation the task might be 'working' (auto-resumed) or
     //    the mock may have written a new response.json already.
-    const listResult = await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
-    expectSuccess(listResult);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Check session was marked as auto-resumed
     const session = readSession(ctx.root, fullTaskId);
@@ -246,12 +248,10 @@ describe('auto-resume on reconciliation', () => {
   test('auto-resume sets parent_branch and sync_before_work on clean worktree', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Upstream merge test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -261,7 +261,7 @@ describe('auto-resume on reconciliation', () => {
 
     // 4. Trigger reconciliation — auto-resume should kick in and write a
     //    command.json with parent_branch and sync_before_work
-    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 5. Read the command.json written by auto-resume
     const protoDir = getProtocolDir(fullTaskId);
@@ -280,12 +280,10 @@ describe('auto-resume on reconciliation', () => {
   test('auto-resume skips upstream merge on dirty worktree', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Dirty worktree test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -298,7 +296,7 @@ describe('auto-resume on reconciliation', () => {
     writeFileSync(join(worktreePath, 'dirty-file.txt'), 'uncommitted work from crashed agent');
 
     // 5. Trigger reconciliation — auto-resume should skip upstream merge
-    await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 6. Read the command.json written by auto-resume
     const protoDir = getProtocolDir(fullTaskId);
@@ -315,12 +313,10 @@ describe('auto-resume on reconciliation', () => {
   test('consecutive_interruptions resets on successful turn completion', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Reset counter test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -340,7 +336,7 @@ describe('auto-resume on reconciliation', () => {
     writeResponse(getProtocolDir(fullTaskId), completedResp);
 
     // 5. Trigger reconciliation — should process the response and reset counter
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 6. Verify counter was reset
     const updatedSession = readSession(ctx.root, fullTaskId);
@@ -367,12 +363,10 @@ describe('circuit breaker', () => {
   test('circuit breaker stops auto-resume after 3 consecutive interruptions', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Circuit breaker test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 
@@ -388,8 +382,7 @@ describe('circuit breaker', () => {
 
     // 5. Trigger reconciliation — should interrupt but NOT auto-resume
     //    because consecutive_interruptions will be 3 after increment
-    const listResult = await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS);
-    expectSuccess(listResult);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     // 6. Verify task remains interrupted (circuit breaker prevented auto-resume)
     const showResult = await ctx.lazy(['show', taskId]);
@@ -404,12 +397,10 @@ describe('circuit breaker', () => {
   test('manual resume resets consecutive_interruptions counter', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Manual reset test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // 2. Reconcile to blocked
-    await ctx.lazy(['list']);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
 
     const fullTaskId = findFullTaskId(ctx.root, taskId);
 

@@ -20,6 +20,7 @@ export { commandReject, rejectUsage } from './reject';
 export { commandStop, stopUsage } from './stop';
 export { commandSearch, searchUsage } from './search';
 export { commandComment, commentUsage } from './comment';
+export { commandJournal, journalUsage } from './journal';
 export { commandLink, linkUsage } from './link';
 export { commandImportConversation, importConversationUsage } from './import-conversation';
 export { commandServer, serverUsage } from './server';

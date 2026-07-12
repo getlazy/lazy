@@ -10,13 +10,14 @@ import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './pr
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
-import type { Task, Session, Turn, Commit, Comment } from '../../types';
+import type { Task, Session, Turn, Commit, Comment, JournalEntry, FollowUp } from '../../types';
 import type { StatusChange } from '../../storage/types';
 import type { SupervisorStatus } from '../../protocol/types';
 import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
+import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
 import { logger } from '../../utils/logger';
 import { existsSync, readFileSync } from 'fs';
 
@@ -30,6 +31,8 @@ export interface TaskShowData {
   turns: Turn[];
   commits: Commit[];
   comments: Comment[];
+  journal: JournalEntry[];
+  followUps: FollowUp[];
   statusHistory: StatusChange[];
   children: Task[];
   childSessions: Map<string, Session | null>;
@@ -87,6 +90,8 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   const turns = sess ? await storage.getSessionTurns(sess.id) : [];
   const commits = sess ? await storage.getSessionCommits(sess.id) : [];
   const comments = await storage.getTaskComments(task.id);
+  const journal = await storage.getTaskJournal(task.id);
+  const followUps = await storage.getTaskFollowUps(task.id);
   const statusHistory = await storage.getStatusHistory(task.id);
   const proposals = readPendingProposals(storage, task.id);
 
@@ -115,15 +120,20 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
+  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
 }
 
 /**
  * Build the text output lines for a task.
  * Used by both the show command (for display) and the search command (for line number computation).
+ *
+ * When `showChunks` is true, the Turns section is grouped into review chunks
+ * (one human/builder boundary plus its following agent/supervisor/system turns)
+ * using the single source of truth in `src/utils/turn-chunks.ts`. The per-turn
+ * rendering is identical in both modes — only the grouping/headers differ.
  */
-export function buildTaskShowLines(data: TaskShowData, showFull: boolean): string[] {
-  const { task, session: sess, turns, commits, comments, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
+export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showChunks = false): string[] {
+  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
@@ -261,13 +271,11 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
 
     // Turns
     if (turns.length > 0) {
-      const autoTriggeredCount = turns.filter(t => t.auto_triggered).length;
-      const humanTriggeredCount = turns.length - autoTriggeredCount;
-      const turnSummary = autoTriggeredCount > 0
-        ? `${theme.count(String(turns.length))} total (${humanTriggeredCount} human, ${autoTriggeredCount} auto)`
-        : theme.count(String(turns.length));
-      outputLines.push(`\n  ${theme.label('Turns:')} ${turnSummary}`);
-      for (const turn of turns) {
+      // Render one turn's lines (identical in flat and chunked modes). Provenance
+      // — the authoring actor for non-human human-role turns, and the `auto` flag
+      // — is surfaced in the header so a reviewer can tell a real human/builder
+      // turn from an automation turn.
+      const renderTurn = (turn: typeof turns[number]) => {
         const isErrorTurn = turn.role === 'agent' && turn.content.startsWith('[Agent crashed]');
         const usageSuffix = turn.usage
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
@@ -316,6 +324,35 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
             outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
           }
         }
+      };
+
+      const autoTriggeredCount = turns.filter(t => t.auto_triggered).length;
+      const humanTriggeredCount = turns.length - autoTriggeredCount;
+      const turnSummary = autoTriggeredCount > 0
+        ? `${theme.count(String(turns.length))} total (${humanTriggeredCount} human, ${autoTriggeredCount} auto)`
+        : theme.count(String(turns.length));
+
+      if (showChunks) {
+        // Group by review boundary using the single source of truth. Each chunk
+        // header names its boundary turn (or "(no boundary)" for the leading
+        // automation-only chunk) so the grouping is legible.
+        const chunks = groupTurnsIntoChunks(turns);
+        outputLines.push(`\n  ${theme.label('Turns (chunked):')} ${turnSummary} in ${theme.count(String(chunks.length))} chunk${chunks.length === 1 ? '' : 's'}`);
+        for (const chunk of chunks) {
+          const b = chunk.boundary;
+          const boundaryDesc = b
+            ? `#${b.sequence} [${b.role === 'human' && b.actor && b.actor !== 'human' ? b.actor : b.role}]`
+            : '(no boundary — leading automation turns)';
+          outputLines.push(`\n  ${theme.separator('━')} ${theme.label(`Chunk ${chunk.index + 1}`)} ${dim(boundaryDesc)} ${dim(`(${chunk.turns.length} turn${chunk.turns.length === 1 ? '' : 's'})`)}`);
+          for (const turn of chunk.turns) {
+            renderTurn(turn);
+          }
+        }
+      } else {
+        outputLines.push(`\n  ${theme.label('Turns:')} ${turnSummary}`);
+        for (const turn of turns) {
+          renderTurn(turn);
+        }
       }
     }
 
@@ -357,6 +394,41 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean): strin
       } else {
         const preview = comment.content.substring(0, 80).replace(/\n/g, ' ');
         outputLines.push(`  [${theme.timestamp(formatDate(comment.created_at))}] ${preview}${comment.content.length > 80 ? '...' : ''}`);
+      }
+    }
+  }
+
+  // Journal (append-only, prompt-immune side channel — separate from Comments)
+  if (journal.length > 0) {
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Journal (${journal.length})`)} ${theme.separator('---')}`);
+
+    for (const entry of journal) {
+      const who = entry.actor ? ` ${theme.label(entry.actor)}` : '';
+      if (showFull) {
+        outputLines.push(`\n  [${theme.timestamp(formatDate(entry.created_at))}]${who}`);
+        for (const line of entry.content.split('\n')) {
+          outputLines.push(`    ${line}`);
+        }
+      } else {
+        const preview = entry.content.substring(0, 80).replace(/\n/g, ' ');
+        outputLines.push(`  [${theme.timestamp(formatDate(entry.created_at))}]${who} ${preview}${entry.content.length > 80 ? '...' : ''}`);
+      }
+    }
+  }
+
+  // Follow-ups (orthogonal-work discoveries recorded by the agent; for triage)
+  if (followUps.length > 0) {
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Follow-ups (${followUps.length})`)} ${theme.separator('---')}`);
+
+    for (const f of followUps) {
+      if (showFull) {
+        outputLines.push(`\n  [${theme.timestamp(formatDate(f.created_at))}]`);
+        for (const line of f.content.split('\n')) {
+          outputLines.push(`    ${line}`);
+        }
+      } else {
+        const preview = f.content.substring(0, 80).replace(/\n/g, ' ');
+        outputLines.push(`  [${theme.timestamp(formatDate(f.created_at))}] ${preview}${f.content.length > 80 ? '...' : ''}`);
       }
     }
   }
@@ -410,6 +482,7 @@ export async function commandShow(args: string[]): Promise<void> {
     { name: 'full', takesValue: false },
     { name: 'lines', takesValue: true },
     { name: 'json', takesValue: false },
+    { name: 'chunks', takesValue: false },
   ], 'show');
 
   const taskId = parsed.positional[0];
@@ -477,6 +550,7 @@ export async function commandShow(args: string[]): Promise<void> {
   }
 
   const showFull = parsed.flags.get('full') === true;
+  const showChunks = parsed.flags.get('chunks') === true;
 
   // Resolve as a task via daemon RPC
   const showResult = await queryTaskShow(taskId);
@@ -490,7 +564,7 @@ export async function commandShow(args: string[]): Promise<void> {
       return;
     }
 
-    const outputLines = buildTaskShowLines(data, showFull);
+    const outputLines = buildTaskShowLines(data, showFull, showChunks);
     let output = outputLines.join('\n');
     if (lineRange) {
       output = sliceLines(output, lineRange);
@@ -522,7 +596,7 @@ export async function commandShow(args: string[]): Promise<void> {
           return;
         }
 
-        const outputLines = buildTaskShowLines(resolved.data, showFull);
+        const outputLines = buildTaskShowLines(resolved.data, showFull, showChunks);
         let output = outputLines.join('\n');
         if (lineRange) {
           output = sliceLines(output, lineRange);
@@ -613,7 +687,7 @@ export async function commandShow(args: string[]): Promise<void> {
 
 /** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
 function buildShowJson(data: TaskShowData): Record<string, unknown> {
-  const { task, session: sess, turns, commits, comments, children, proposals, retryStatus, autoReactStatus } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, children, proposals, retryStatus, autoReactStatus } = data;
 
   const jsonData: Record<string, unknown> = {
     id: task.id,
@@ -666,6 +740,16 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       content: c.content,
       created_at: c.created_at,
     })),
+    journal: journal.map(j => ({
+      content: j.content,
+      created_at: j.created_at,
+      actor: j.actor ?? null,
+    })),
+    follow_ups: followUps.map(f => ({
+      content: f.content,
+      created_at: f.created_at,
+      session_id: f.session_id ?? null,
+    })),
     children: children.map(c => ({
       id: c.id,
       code: c.code,
@@ -693,7 +777,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
 }
 
 export function showUsage(): void {
-  console.log(`Usage: lazy show <id> [--full] [--lines N..M] [--json]
+  console.log(`Usage: lazy show <id> [--full] [--chunks] [--lines N..M] [--json]
 
 Show detailed information about a task, conversation, or file.
 
@@ -714,6 +798,8 @@ Arguments:
 
 Options:
   --full       Show complete turn and comment content instead of truncated preview
+  --chunks     Group turns into review chunks (one human/builder boundary plus its
+               following agent/supervisor/system turns) instead of a flat list
   --lines N..M Return only lines N through M of the output (1-indexed, inclusive)
                Formats: N..M (range), N.. (from N to end), ..M (start to M)
   --json       Output as structured JSON instead of human-readable text
@@ -722,6 +808,7 @@ Examples:
   lazy show abc12345                          # Show task by ID
   lazy show abc1                              # Prefix matching works
   lazy show abc1 --full                       # Show full turn and comment content
+  lazy show abc1 --chunks                     # Group turns by human/builder review boundary
   lazy show abc1 --lines 10..20               # Show only lines 10-20 of output
   lazy show abc1 --lines 50..                 # Show from line 50 to end
   lazy show abc1 --json                       # Output task as JSON

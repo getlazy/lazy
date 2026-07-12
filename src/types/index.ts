@@ -180,7 +180,7 @@ export interface Turn {
  * new turn flavors appear — storage and UI code should branch on this
  * rather than adding more boolean flags.
  */
-export type TurnType = 'work' | 'ask' | 'nudge';
+export type TurnType = 'work' | 'ask' | 'nudge' | 'sync';
 
 export interface Commit {
   id: string;
@@ -225,6 +225,54 @@ export interface Comment {
 
 /** @deprecated Use Comment instead */
 export type Note = Comment;
+
+/**
+ * A task journal entry — an append-only, free-form note about *managing* a task
+ * rather than *doing* it: orchestration metadata ("blocked on X landing"),
+ * decision rationale ("chose K=3 because…"), or an agent memory ("stubbed Z,
+ * revisit next run").
+ *
+ * INVARIANT: a journal entry is **prompt-immune** — it must NEVER be injected
+ * into the agent/LLM prompt. This is why the journal is a separate entity from
+ * {@link Comment} (which DOES enter the prompt as guidance) rather than a flag
+ * on it: with no shared code path, there is structurally no way for a journal
+ * entry to leak into a prompt. Do not add one.
+ *
+ * Entries are created and read, never edited or deleted through normal flows.
+ */
+export interface JournalEntry {
+  id: string;
+  task_id: string;
+  content: string;
+  created_at: number;
+  /** Who wrote this entry: human (CLI), builder/agent (MCP), or system. */
+  actor?: Actor;
+}
+
+/**
+ * A passive, task-level follow-up note recording genuinely ORTHOGONAL work an
+ * agent discovered while working a task — a different concern the task did not
+ * need in order to be correct and mergeable.
+ *
+ * INVARIANT: Follow-ups are task-level (they survive auto-turns/auto-resumes,
+ * unlike turn-level proposals) AND non-triggering (recording one fires NO
+ * auto-turn, auto-resume, or auto-react). That non-triggering property is what
+ * distinguishes them from comments: comments feed the comment auto-react loop,
+ * which would spuriously kick the agent into a new turn. Follow-ups are read
+ * and triaged by the human/builder at review time — never acted on
+ * automatically. See CLAUDE.md (passive notes; never lose human feedback).
+ */
+export interface FollowUp {
+  id: string;
+  task_id: string;
+  content: string;
+  created_at: number;
+  /**
+   * The session (agent run) that surfaced this follow-up, if known. Records
+   * which run discovered it; null when recorded outside a session context.
+   */
+  session_id?: string | null;
+}
 
 /**
  * Persistent record that a reviewer has marked a hunk as reviewed in

@@ -62,6 +62,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
   const tasks = await storage.listTasks();
   for (const task of tasks) {
     const comments = await storage.getTaskComments(task.id);
+    const followUps = await storage.getTaskFollowUps(task.id);
     const session = await storage.getSessionByTaskId(task.id);
 
     let turns: Turn[] = [];
@@ -71,7 +72,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
       commits = await storage.getSessionCommits(session.id);
     }
 
-    const data: TaskData = { task, turns, commits, comments };
+    const data: TaskData = { task, turns, commits, comments, followUps };
 
     if (evaluateQuery(ast, data)) {
       const results = buildSearchResults(ast, data);

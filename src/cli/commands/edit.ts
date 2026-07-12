@@ -49,21 +49,27 @@ export async function commandEdit(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Block editing once an agent has actually worked on the task (has turns).
-    // Linked tasks have a session but no turns — those should remain editable.
-    const turnCount = await storage.getTurnCountByTaskId(t.id);
-    if (turnCount > 0) {
-      console.error(`Cannot edit task ${displayId(t)}: task has already been started.`);
-      console.error(`Use 'lazy comment ${displayId(t)} --message "..."' to add annotations instead.`);
-      process.exit(1);
-    }
-
     const goalValue = parsed.flags.get('goal') as string | undefined;
     const promptValue = parsed.flags.get('prompt') as string | undefined;
     const modelValue = parsed.flags.get('model') as string | undefined;
     const typeValue = parsed.flags.get('type') as string | undefined;
     const codeValue = parsed.flags.get('code') as string | undefined;
     const parentValue = parsed.flags.get('parent') as string | undefined;
+
+    // Block editing once an agent has actually worked on the task (has turns).
+    // Linked tasks have a session but no turns — those should remain editable.
+    // Exception: a model-only edit is safe mid-flight (the agent's goal/prompt
+    // don't change) and is the supported way to durably switch a started
+    // task's model — auto-resume/auto-deliver relaunch from task.model.
+    const turnCount = await storage.getTurnCountByTaskId(t.id);
+    const isModelOnlyEdit = modelValue !== undefined
+      && goalValue === undefined && promptValue === undefined
+      && typeValue === undefined && codeValue === undefined && parentValue === undefined;
+    if (turnCount > 0 && !isModelOnlyEdit) {
+      console.error(`Cannot edit task ${displayId(t)}: task has already been started; only --model can be changed.`);
+      console.error(`Use 'lazy comment ${displayId(t)} --message "..."' to add annotations instead.`);
+      process.exit(1);
+    }
 
     let newGoal: string | null = null;
     let newPrompt: string | null = null;
@@ -142,8 +148,10 @@ export async function commandEdit(args: string[]): Promise<void> {
 
       if (promptValue !== undefined) {
         newPrompt = promptValue;
-      } else {
-        // Try piped stdin as prompt (when other flags are set but --prompt is not)
+      } else if (turnCount === 0) {
+        // Try piped stdin as prompt (when other flags are set but --prompt is not).
+        // Skipped on started tasks — only the model may change there, and piped
+        // stdin must not become a prompt edit that bypasses the guard above.
         const stdinContent = await readStdinIfPiped();
         if (stdinContent !== null) {
           newPrompt = stdinContent;
@@ -254,8 +262,9 @@ export function editUsage(): void {
   console.log(`Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>]
 
 Edit a task's goal, prompt, model, type, code, or parent. Interactive if no flags provided.
-Editing is not allowed once an agent has worked on the task.
-Linked tasks that haven't been agent-started are still editable.
+Once an agent has worked on the task, only --model can still be changed;
+goal/prompt/type/code/parent edits are rejected.
+Linked tasks that haven't been agent-started are still fully editable.
 Use 'lazy comment' to add annotations to started tasks.
 
 Arguments:

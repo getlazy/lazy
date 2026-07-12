@@ -217,6 +217,21 @@ export interface CompletedResponse {
     kind: 'permission_pushback' | 'maintain';
     prompt: string;
   };
+  /**
+   * Present ONLY on the upstream-merge (sync) response. Carries the outcome the
+   * reconciler needs to record turns:
+   *   - `merged: false` — nothing to merge (already up to date). NO turn is
+   *     recorded at all; the sync leaves no trace in the turn history.
+   *   - `merged: true` — a real merge happened → a single `supervisor`-actored
+   *     merge turn. When `conflicts > 0` the agent was invoked to resolve them,
+   *     and its conflict-resolution reply follows as responses[1] (a discrete
+   *     agent turn). The supervisor authors the merge itself, so the merge turn
+   *     is `supervisor`-actored — never `agent` and never `human`.
+   */
+  sync?: {
+    merged: boolean;
+    conflicts: number;
+  };
 }
 
 /**

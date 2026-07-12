@@ -20,7 +20,6 @@ import {
   registerConnection,
   hasConnection,
   _resetEventState,
-  type DaemonEvent,
 } from '../../src/daemon/events';
 import {
   createReconcileEventState,
@@ -59,9 +58,12 @@ describe('auto-deliver', () => {
 
   describe('detectAndDeliverEvents', () => {
     // INVARIANT: When a task transitions to 'complete' (accepted), the daemon
-    // detects the change and routes events to siblings. This creates the cascade:
-    // accept child A → child B gets upstream.updated.
-    test('detects task acceptance and routes events to connected siblings', async () => {
+    // detects the change and routes events to siblings. Delivery is signal-based:
+    // detectAndDeliverEvents EMITS an `upstream_change` signal (reason
+    // 'sibling_accepted') for each sibling, and the separate signal-delivery
+    // phase (runBlockedTaskCatchup) later syncs/unblocks eligible ones. Assert
+    // the emitted signal, not a direct SSE event.
+    test('detects task acceptance and emits upstream_change signals to siblings', async () => {
       const parentShortId = await createTask(ctx, 'Parent task');
       const childAShortId = await createTask(ctx, 'Child A task');
       const childBShortId = await createTask(ctx, 'Child B task');
@@ -77,26 +79,8 @@ describe('auto-deliver', () => {
         await storage.updateTaskTarget(childA.id, { kind: 'task' as const, parentTaskId: parentTask.id });
         await storage.updateTaskTarget(childB.id, { kind: 'task' as const, parentTaskId: parentTask.id });
 
-        // Child B is working with SSE connection
+        // Child B is working
         await storage.updateTaskStatus(childB.id, 'working', 'system');
-
-        // Set up SSE connection for child B to capture events
-        const childBEvents: DaemonEvent[] = [];
-        new ReadableStream({
-          start(controller) {
-            registerConnection(childB.id, controller);
-            const origEnqueue = controller.enqueue.bind(controller);
-            controller.enqueue = (chunk: any) => {
-              if (typeof chunk === 'string' && chunk.includes('"type"')) {
-                const dataMatch = chunk.match(/data: (.+)/);
-                if (dataMatch) {
-                  try { childBEvents.push(JSON.parse(dataMatch[1])); } catch {}
-                }
-              }
-              return origEnqueue(chunk);
-            };
-          },
-        });
 
         // First tick: populate state with child A as backlog
         const state = createReconcileEventState();
@@ -113,10 +97,13 @@ describe('auto-deliver', () => {
         // Detect and deliver events
         await detectAndDeliverEvents(storage, ctx.root, state);
 
-        // Child B should have received upstream.updated via SSE
-        const upstreamEvents = childBEvents.filter(e => e.type === 'upstream.updated');
-        expect(upstreamEvents.length).toBe(1);
-        expect(upstreamEvents[0].payload.reason).toBe('sibling_accepted');
+        // Child B should have a pending upstream_change signal for the accept.
+        const childBSignals = readSignals(childB.id);
+        const upstreamSignals = childBSignals.filter(
+          s => s.type === 'upstream_change' && s.details?.reason === 'sibling_accepted',
+        );
+        expect(upstreamSignals.length).toBe(1);
+        expect(upstreamSignals[0].details?.accepted_task_id).toBe(childA.id);
       } finally {
         await storage.close();
       }
@@ -280,10 +267,11 @@ describe('auto-deliver', () => {
           await recordAutoReact(storage, task.id, 'upstream_sync', dataDir);
         }
 
-        // Next auto-react should be blocked
+        // Next auto-react should be blocked once the per-task budget is spent.
         const decision = await shouldAutoReact(storage, task.id, 'upstream_sync', config, dataDir);
         expect(decision.allowed).toBe(false);
-        expect(decision.reason).toContain('retries exhausted');
+        // The block reason reports the exhausted per-task auto-turn budget.
+        expect(decision.reason).toContain('budget exhausted');
       } finally {
         await storage.close();
       }
@@ -302,9 +290,11 @@ describe('auto-deliver', () => {
         const config = await loadConfig(ctx.root, { cwd: ctx.root });
         const dataDir = join(ctx.root, '.lazy');
 
-        // Exhaust the daily budget
+        // Exhaust the daily budget. incrementDailyBudget is async (it does a
+        // read-modify-write of the budget file) — each call MUST be awaited, or
+        // the concurrent writes race and clobber each other (leaving used=0).
         for (let i = 0; i < config.daemon.auto_react_daily_budget; i++) {
-          incrementDailyBudget(dataDir);
+          await incrementDailyBudget(dataDir);
         }
 
         // Verify budget is exhausted

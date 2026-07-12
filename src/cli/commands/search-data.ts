@@ -10,7 +10,7 @@ import type { Storage } from '../../storage/interface';
 import Fuse from 'fuse.js';
 
 export interface SearchableItem {
-  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'conversation';
+  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'conversation';
   taskId: string;
   taskCode: string | null;
   taskGoal: string;
@@ -71,6 +71,18 @@ export async function getAllSearchableContent(storage: Storage): Promise<Searcha
         taskGoal: task.goal,
         content: comment.content,
         context: `Comment (${comment.created_at})`,
+      });
+    }
+
+    const followUps = await storage.getTaskFollowUps(task.id);
+    for (const followUp of followUps) {
+      items.push({
+        type: 'followup',
+        taskId: task.id,
+        taskCode: task.code,
+        taskGoal: task.goal,
+        content: followUp.content,
+        context: `Follow-up (${followUp.created_at})`,
       });
     }
 

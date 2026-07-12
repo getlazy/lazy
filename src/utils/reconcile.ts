@@ -739,6 +739,152 @@ export async function handleCompletedResponse(
 }
 
 /**
+ * Record the turns for a completed upstream-merge (sync) command.
+ *
+ * Sync is modeled differently from a work turn: the supervisor performs the merge
+ * itself, so its announcement is a `supervisor`-actored turn — never an agent turn
+ * and never a human turn. The merge OUTCOME (responses[0].sync) drives the shape:
+ *
+ *   - merged: false (no-op) → NO turn at all. A sync that merged nothing leaves no
+ *     trace in the turn history (skip-when-noop).
+ *   - merged: true, no conflicts → a single `supervisor` merge turn; the merge
+ *     commit is attributed to it (its own SHA window).
+ *   - merged: true, conflicts → the `supervisor` merge turn PLUS the agent's
+ *     conflict-resolution reply (responses[1]) as a discrete `agent` turn that owns
+ *     the merge commit and carries the agent's own usage (incl. cache tokens).
+ *
+ * INVARIANT: a no-op sync produces zero turns. This is exactly why sync turn
+ * creation moved OFF the daemon (which pre-created a turn before the outcome was
+ * known, leaving a spurious pair on no-ops) and ONTO the reconciler here, where
+ * the supervisor has reported whether it actually merged anything.
+ */
+async function recordSyncTurns(
+  storage: Storage,
+  taskId: string,
+  session: { id: string; agent_session_id: string | null; git_start_sha: string; container_name: string | null },
+  responses: CompletedResponse[],
+  worktreePath: string,
+  protoDir: string,
+): Promise<void> {
+  const taskShortId = shortId(taskId);
+  const mergeResp = responses[0];
+  const resolutionResp = responses[1]; // present only when the merge had conflicts
+  const sync = mergeResp.sync!;
+
+  // Store the upstream merge SHA for accurate diff scope (mirrors the work path).
+  // Idempotent (sets the same value), so it's safe outside the recorded guard.
+  const status = readStatus(protoDir);
+  if (status?.upstream_merge_sha) {
+    try {
+      await storage.updateSessionUpstreamMergeSha(session.id, status.upstream_merge_sha);
+    } catch {
+      logger.debug(`Task ${taskShortId}: could not store upstream merge SHA`);
+    }
+  }
+
+  // Reconcile the agent session id from the conflict-resolution invocation — the
+  // only `claude -p` a sync ever runs. A clean or no-op merge invokes no agent.
+  if (resolutionResp?.session_id && shouldReconcileAgentSessionId(session.agent_session_id, resolutionResp.session_id)) {
+    await storage.updateSessionClaudeId(session.id, resolutionResp.session_id);
+  }
+
+  if (sync.merged) {
+    // Idempotency: the merge message embeds the exact pre→post SHAs, so an existing
+    // `supervisor` sync turn with this content means we already recorded this merge.
+    // Guards a reconciler re-run before the response is consumed; usage rollup and
+    // commit recording live inside this guard so a re-run stays fully idempotent.
+    const existingTurns = await storage.getSessionTurns(session.id);
+    const alreadyRecorded = existingTurns.some(
+      t => t.actor === 'supervisor' && t.turn_type === 'sync' && t.content === mergeResp.result,
+    );
+
+    if (!alreadyRecorded) {
+      // The supervisor authored the merge → a `supervisor`-actored, auto-triggered
+      // turn (sync is never human-typed). A CLEAN merge's commit is attributed here
+      // via its SHA window; a conflict merge's commit is the agent's, attributed to
+      // the reply turn below (so this announcement carries no commit window).
+      const supSeq = await storage.getNextTurnSequence(session.id);
+      await storage.createTurn({
+        sessionId: session.id,
+        sequence: supSeq,
+        role: 'human',
+        content: mergeResp.result,
+        actor: 'supervisor',
+        autoTriggered: true,
+        turnType: 'sync',
+        mergeConflicts: mergeResp.merge_conflicts,
+        ...(resolutionResp
+          ? {}
+          : {
+              startSha: mergeResp.start_sha_work,
+              endSha: mergeResp.end_sha_work,
+              startShaWork: mergeResp.start_sha_work,
+              endShaWork: mergeResp.end_sha_work,
+            }),
+      });
+
+      // Conflict-resolution reply — a discrete agent turn, recorded ONLY when the
+      // agent was actually invoked (the merge had conflicts). Carries its own usage
+      // (incl. cache tokens) and the SHA window covering the merge commit.
+      if (resolutionResp) {
+        const replySeq = await storage.getNextTurnSequence(session.id);
+        await storage.createTurn({
+          sessionId: session.id,
+          sequence: replySeq,
+          role: 'agent',
+          content: enrichResponseWithPlanContent(resolutionResp.result, worktreePath),
+          usage: toTurnUsage(resolutionResp.usage),
+          startSha: resolutionResp.start_sha_work,
+          endSha: resolutionResp.end_sha_work,
+          startShaWork: resolutionResp.start_sha_work,
+          endShaWork: resolutionResp.end_sha_work,
+          turnType: 'sync',
+        });
+      }
+
+      // Roll up token usage from every invocation (the conflict-resolution agent,
+      // when present — the announcement carries zero).
+      for (const resp of responses) {
+        const usage = toTurnUsage(resp.usage);
+        if (!usage) continue;
+        try {
+          await storage.updateSessionUsage(session.id, usage);
+        } catch {
+          logger.debug(`Task ${taskShortId}: could not capture token usage`);
+        }
+      }
+
+      // Record the merge commit(s).
+      const existingCommits = await storage.getSessionCommits(session.id);
+      const lastKnownSha = existingCommits.length > 0
+        ? existingCommits[existingCommits.length - 1].sha
+        : session.git_start_sha;
+      try {
+        const newCommits = await getNewCommits(lastKnownSha, worktreePath);
+        for (const c of newCommits) {
+          await storage.createCommit(session.id, c.sha, c.message);
+        }
+      } catch (err) {
+        logger.debug(`Task ${taskShortId}: could not detect new commits after sync: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+  // merged: false → NO turn recorded (skip-when-noop). The task still transitions
+  // out of 'working' below so a no-op sync doesn't strand it.
+
+  // Sync completion returns the task to 'blocked' — the same terminal-of-turn status
+  // the work path uses. Sync runs no violation detection, so there is never a
+  // 'conflict' outcome here.
+  await storage.updateTaskStatus(taskId, 'blocked', 'system');
+
+  // A completed sync means the worktree is healthy.
+  await storage.resetConsecutiveInterruptions(session.id);
+
+  consumeResponse(protoDir);
+  clearStatus(protoDir);
+}
+
+/**
  * Finalize a completed command from its bundle of per-invocation responses.
  *
  *   responses[0]   — the WORK response → the work agent turn
@@ -759,6 +905,16 @@ export async function handleCompletedResponses(
   const taskShortId = shortId(taskId);
   const work = responses[0];
   const supervised = responses.slice(1);
+
+  // Sync (upstream-merge) responses are recorded by a dedicated path — the merge
+  // OUTCOME (responses[0].sync) determines the turns, including recording NONE for
+  // a no-op merge. Route here before any work-turn machinery runs, so every caller
+  // of handleCompletedResponses (reconcile, interrupted sweep, single-response
+  // wrapper) gets identical sync handling.
+  if (work?.sync) {
+    await recordSyncTurns(storage, taskId, session, responses, worktreePath, protoDir);
+    return;
+  }
 
   // Reconcile Claude session ID with what the agent actually wrote. With multiple
   // invocations the LAST one's session id points at the JSONL that exists now
@@ -1028,6 +1184,16 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
 
       if (response.status === 'completed') {
         logger.debug(`Task ${taskShortId}: found stale completed response for interrupted task, processing`);
+        // handleCompletedResponses transitions the task to 'blocked' (turn done),
+        // but 'interrupted' → 'blocked' is not a valid transition — only
+        // 'interrupted' → 'working' is (see VALID_TRANSITIONS). The completed
+        // response means the supervisor DID finish the turn, so move the task
+        // back through 'working' first (mirroring resume/auto-resume) and let
+        // handleCompletedResponses take it 'working' → 'blocked'. Without this the
+        // transition throws and the completed work is silently stranded in
+        // 'interrupted'. Regression: this path predates the state machine
+        // (added in a15bfc95, before updateTaskStatus validated transitions).
+        await storage.updateTaskStatus(task.id, 'working', 'system');
         await handleCompletedResponses(storage, task.id, session, completedResponses(response), worktreePath, protoDir);
       } else {
         // Error response on an already-interrupted task — record the error turn

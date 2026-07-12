@@ -48,6 +48,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
       driver: 'github',
       git_remote: 'origin',
       auto_approve: true,
+      offline: false,
     },
     storage: { backend: 'external', external_path: '' },
   }),

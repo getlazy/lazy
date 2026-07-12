@@ -14,7 +14,7 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import type { MergeConflict } from '../types';
+import type { MergeConflict, AgentResponse } from '../types';
 import { log, logError } from './log';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
@@ -73,6 +73,14 @@ export interface SyncWithUpstreamResult {
   /** SHA of the commit that was merged (or checked for reachability). */
   targetSha: string;
   conflicts: MergeConflict[];
+  /**
+   * The agent's conflict-resolution response, captured from `claude -p` when
+   * the merge had conflicts the agent had to resolve. Absent for a clean merge
+   * (no agent was invoked) and for a no-op. Carries the agent's own result
+   * text, session id, and token usage so the reconciler can record it as a
+   * discrete agent turn (the sync's conflict-resolution reply).
+   */
+  resolution?: AgentResponse;
 }
 
 /**
@@ -251,12 +259,29 @@ export async function runSyncWithUpstream(
 
     log(`[merge] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
     log('[merge] Merge-and-fix completed successfully.');
+
+    // Capture the agent's conflict-resolution response so the reconciler can
+    // record it as a discrete agent turn (its own text, session, and usage).
+    // Best-effort: if the JSON doesn't parse, fall back to the raw stdout so a
+    // conflict merge always yields an agent turn rather than silently dropping it.
+    let resolution: AgentResponse;
+    try {
+      resolution = JSON.parse(output) as AgentResponse;
+    } catch {
+      resolution = {
+        result: output.trim() || 'Resolved merge conflicts.',
+        session_id: agentSessionId ?? '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+      };
+    }
+
     return {
       merged: true,
       preMergeSha,
       postMergeSha,
       targetSha: resolvedTargetSha,
       conflicts,
+      resolution,
     };
   }
 

@@ -6,6 +6,18 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
+/**
+ * Resolve the tasks directory for a test project. Test projects use external
+ * storage (external_path in lazy.toml) with a fallback to the in-repo
+ * .lazy/tasks layout.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
 /** Extract a task short ID from `lazy link` output (which says "Linked task <id>") */
 function extractLinkedTaskId(output: string): string {
   const match = output.match(/Linked task ([a-f0-9]{8})/);
@@ -20,7 +32,7 @@ function extractLinkedTaskId(output: string): string {
  * Needed for linked tasks because `lazy edit` blocks when a session exists.
  */
 function setTaskPrompt(root: string, shortId: string, prompt: string): void {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const dirs = readdirSync(tasksDir);
   const taskDir = dirs.find(d => d.startsWith(shortId));
   if (!taskDir) {
@@ -36,7 +48,7 @@ function setTaskPrompt(root: string, shortId: string, prompt: string): void {
  * Read task metadata from task.json for a given task.
  */
 function getTaskMetadata(root: string, shortId: string): Record<string, string> | null {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const dirs = readdirSync(tasksDir);
   const taskDir = dirs.find(d => d.startsWith(shortId));
   if (!taskDir) {
@@ -52,7 +64,7 @@ function getTaskMetadata(root: string, shortId: string): Record<string, string> 
  * Used to verify that the linked task preamble is injected into the turn.
  */
 function getFirstTurnContent(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
+  const tasksDir = tasksDirFor(root);
   const dirs = readdirSync(tasksDir);
   const taskDir = dirs.find(d => d.startsWith(shortId));
   if (!taskDir) {
@@ -116,7 +128,12 @@ describe('lazy start', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // `start` requires a real daemon (post-v0.11 the CLI routes storage and
+    // turn reconciliation through the daemon). Running withDaemon also avoids a
+    // lock-contention deadlock: createTask() uses ctx.lazy which would otherwise
+    // auto-start a daemon that holds .storage-lock, while a LAZY_TEST start
+    // subprocess opening storage directly would spin retrying for that lock.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -156,11 +173,12 @@ describe('lazy start', () => {
 
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
-    // Mock supervisor writes response.json immediately, so reconciliation
-    // transitions the task from working → blocked when show triggers it
+    // The mock supervisor writes response.json immediately; the daemon's
+    // reconcile loop then transitions the task working → blocked. Wait for it.
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
     const showResult = await ctx.lazy(['show', taskId]);
     expectOutput(showResult, 'blocked');
-  });
+  }, 30_000);
 
   test('cannot start same task twice', async () => {
     const taskId = await createTask(ctx, 'Double start', 'Do work');
@@ -527,10 +545,12 @@ describe('lazy start', () => {
     expectSuccess(result);
     expectOutput(result, 'Started task');
 
-    // Verify remote_target_branch is set to main, not the feature branch
-    const metadata = getTaskMetadata(ctx.root, taskId);
-    expect(metadata).not.toBeNull();
-    expect(metadata!.remote_target_branch).toBe('main');
+    // NOTE: the legacy `metadata.remote_target_branch` field is no longer
+    // persisted — a parentless task's integration target is the canonical
+    // { kind: 'branch', branch } union, and the remote default is resolved at
+    // launch time rather than written back to metadata. The real invariant
+    // (the branch was created FROM the remote default, not the local checkout)
+    // is verified directly by the merge-base check below.
 
     // Verify the worktree was created from main, not the feature branch
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

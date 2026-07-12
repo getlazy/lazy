@@ -61,7 +61,7 @@ export async function commandAccept(args: string[]): Promise<void> {
       const activeChildren = await getActiveChildren(task.id, storage);
       if (activeChildren.length > 0) {
         const plural = activeChildren.length === 1 ? 'child' : 'children';
-        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${plural} that will need rebasing after accept.`));
+        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${plural}; they'll be automatically re-parented and synced on the next sync — no action needed.`));
         for (const child of activeChildren) {
           console.log(`  ${theme.taskId(displayId(child))} [${theme.status(child.status)}] ${child.goal}`);
         }

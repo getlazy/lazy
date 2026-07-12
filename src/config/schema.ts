@@ -34,7 +34,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   chattiness: ['default', 'builder', 'agent'],
   server: ['port', 'sync_interval', 'bind'],
   remote: [
-    'driver', 'git_remote', 'auto_approve',
+    'driver', 'git_remote', 'auto_approve', 'offline',
     // Driver-specific keys are also valid at the schema level — a user may
     // configure GitHub keys while temporarily using the local driver, and we
     // should not warn about them. Drivers extend this list at runtime too.
@@ -48,6 +48,9 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   worktree: ['include'],
   permissions: ['protected'],
   automation: ['maintain'],
+  // 'mounts' is an array of tables ([[mounts]]); its inner keys (type, source,
+  // name, target, readonly) are validated by the config loader, not this scan.
+  mounts: ['type', 'source', 'name', 'target', 'readonly'],
   checks: ['post_turn', 'post_turn_timeout'],
   daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
@@ -91,6 +94,12 @@ export function findUnknownConfigKeys(
 
     const sectionValue = raw[section];
     if (typeof sectionValue !== 'object' || sectionValue === null) continue;
+
+    // Array-of-tables sections (e.g. [[mounts]]) surface as arrays. Their
+    // section name is known; the inner table keys are validated by the config
+    // loader, not this one-level scan. Iterating an array here would mistake
+    // its numeric indices for unknown keys.
+    if (Array.isArray(sectionValue)) continue;
 
     const knownKeys = section === 'remote' ? remoteAllKnown : KNOWN_CONFIG_SCHEMA[section];
     for (const key of Object.keys(sectionValue)) {

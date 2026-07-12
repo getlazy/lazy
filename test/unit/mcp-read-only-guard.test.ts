@@ -13,7 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createCommitHandler, createProposeHandler, createCommentHandler, type McpToolContext } from '../../src/mcp/tools';
+import { createCommitHandler, createProposeHandler, createCommentHandler, createAddFollowUpHandler, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSync } from '../../src/utils/spawn';
 
@@ -66,6 +66,12 @@ describe('MCP write handlers honor LAZY_MCP_READ_ONLY=1', () => {
     const handler = createCommentHandler(ctx);
     await expect(handler({ message: 'note' })).rejects.toThrow(/ask mode/);
     await expect(handler({ message: 'note' })).rejects.toThrow(/lazy_comment/);
+  });
+
+  test('lazy_add_followup rejects with actionable message', async () => {
+    const handler = createAddFollowUpHandler(ctx);
+    await expect(handler({ note: 'orthogonal thing' })).rejects.toThrow(/ask mode/);
+    await expect(handler({ note: 'orthogonal thing' })).rejects.toThrow(/lazy_add_followup/);
   });
 
   test('error message instructs the agent to write the answer as text', async () => {

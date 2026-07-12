@@ -61,10 +61,25 @@ lazy-agent mcp --task-id <uuid> --worktree <path>
 The MCP server is spawned by Claude Code (not by the supervisor directly). It:
 
 1. Implements JSON-RPC 2.0 over stdio (no external dependencies)
-2. Exposes 7 tools: `lazy_search`, `lazy_show`, `lazy_create`, `lazy_comment`,
-   `lazy_propose`, `lazy_commit`, `lazy_status`
+2. Exposes agent tools including `lazy_search`, `lazy_show`, `lazy_create`, `lazy_comment`,
+   `lazy_add_followup`, `lazy_commit`, `lazy_status`
 3. Opens/closes storage per tool call to avoid stale state
 4. Runs as long as Claude Code keeps stdin open
+
+### Follow-ups: a passive, task-level store for orthogonal discoveries
+
+When an agent notices genuinely **orthogonal** work — a different concern the current task
+does not need in order to be correct and mergeable — it records it with `lazy_add_followup`
+rather than creating a backlog task or burying it in prose. Follow-ups are stored on the task
+(`follow-ups.json` / a `follow_ups` table), so they survive auto-turns and auto-resumes.
+
+The defining invariant is that recording a follow-up is **non-triggering**: it creates no
+comment, changes no task status, and writes no signal, so it can never kick off an auto-turn or
+auto-resume. This is exactly why follow-ups are a separate store and not comments — comments
+feed the comment auto-react loop, which would spuriously resume the agent. Follow-ups are
+read and triaged by the builder/human at review time (`lazy_show` surfaces them as `follow_ups`):
+each is folded back into the task, promoted to a vetted task, or dropped. The backlog only ever
+receives builder-vetted tasks.
 
 The MCP server replaces the old CLI-based agent commands. Instead of the agent
 calling `lazy search ...` as shell commands, it uses MCP tool calls which are

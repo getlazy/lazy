@@ -29,6 +29,7 @@ describe('GitHubDriver waitForChecks', () => {
       driver: 'github',
       git_remote: 'origin',
       auto_approve: false,
+      offline: false,
       github_auto_push: true,
       github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
       gitlab_auto_push: true,
@@ -41,6 +42,7 @@ describe('GitHubDriver waitForChecks', () => {
     worktree: { include: [] },
     permissions: { protected: [] },
   automation: { maintain: [] },
+  mounts: [],
     checks: { post_turn: '', post_turn_timeout: 300 },
     ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
     daemon: {

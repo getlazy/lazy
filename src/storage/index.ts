@@ -30,6 +30,8 @@ export type {
   ReviewVerdict,
   Comment,
   Note,
+  JournalEntry,
+  FollowUp,
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,

@@ -6,7 +6,7 @@ This document describes the task status state machine and the crash/resume lifec
 
 ### Status Definitions
 
-Lazy tasks can be in one of eleven statuses:
+Lazy tasks can be in one of the following statuses:
 
 - **`backlog`** — Task created but not yet started. No session exists.
 - **`working`** — Agent is actively working. Container/process is running.
@@ -17,13 +17,12 @@ Lazy tasks can be in one of eleven statuses:
 - **`merging`** — Pull/merge request submitted to remote, waiting for CI checks and merge.
 - **`zombie`** — System-only recovery state for tasks whose branch was merged but status wasn't updated (e.g., `lazy accept` crashed after merge but before status update). Reconciler detects this and transitions through zombie → complete.
 - **`complete`** — Task accepted and merged successfully.
-- **`abandoned`** — Task rejected by human.
-- **`closed`** — Task closed without accepting or rejecting (e.g., "won't do", duplicate).
+- **`abandoned`** — Task rejected (`lazy reject`) or closed (`lazy close`, e.g. "won't do", duplicate) by a human. Both commands resolve to this single terminal status; there is no distinct `closed` status.
 
 ### Status Categories
 
 **Terminal statuses** (task is finished, core fields frozen):
-- `complete`, `abandoned`, `closed`
+- `complete`, `abandoned`
 
 **Blocked statuses** (waiting for human action):
 - `blocked`, `conflict`
@@ -36,34 +35,34 @@ Lazy tasks can be in one of eleven statuses:
 ```
 backlog
   → working       lazy start (creates session, launches agent)
-  → closed        lazy close (task canceled before starting)
+  → abandoned     lazy close (task canceled before starting)
 
 working
   → blocked       reconciler (agent turn completes, response.json processed)
   → conflict      reconciler (agent turn completes with file permission violations)
   → interrupted   reconciler (container dies without response.json)
-  NOTE: working cannot transition to pairing, closed, or abandoned — the agent is running.
+  NOTE: working cannot transition to pairing or abandoned — the agent is running.
 
 blocked
   → working       lazy unblock (human gives feedback)
   → pairing       lazy pair (human wants to work interactively)
   → merging       lazy accept (begins merge process)
-  → abandoned     lazy reject (human rejects the work)
-  → closed        lazy close (task canceled without accept/reject)
+  → abandoned     lazy reject (rejects the work) | lazy close (canceled without accept/reject)
   → backlog       reconciler migration (blocked task with no session → backlog)
   NOTE: blocked cannot go directly to complete — must go through merging first.
 
 conflict
   → working       lazy unblock (human gives feedback to fix violations)
   → pairing       lazy pair (human wants to work interactively on violations)
-  → abandoned     lazy reject
-  → closed        lazy close
+  → abandoned     lazy reject | lazy close
 
 interrupted
   → working       auto-resume (reconciler, circuit breaker allows) | lazy resume
+                  | reconciler stale-completed-response sweep (recovers a response
+                    written after the task was marked interrupted; routes through
+                    working, then working → blocked)
   → pairing       lazy pair (human investigates interactively)
-  → abandoned     lazy reject
-  → closed        lazy close
+  → abandoned     lazy reject | lazy close
   NOTE: interrupted cannot go to merging or complete — must unblock/review first.
 
 pairing
@@ -72,7 +71,7 @@ pairing
 merging
   → complete      lazy accept (checks pass, merge succeeds) | reconciler (merge completed)
   → blocked       lazy accept (checks fail) | reconciler (PR/MR closed externally)
-  NOTE: merging cannot go to abandoned or closed — merge either succeeds or fails back to blocked.
+  NOTE: merging cannot go to abandoned — merge either succeeds or fails back to blocked.
 
 zombie (system-only)
   → complete      reconciler (merged branch sweep completes the task)
@@ -83,15 +82,47 @@ complete
   → backlog       lazy reopen (reopen accepted task with no session)
 
 abandoned
-  → backlog       lazy reopen (reopen rejected task with no agent work)
-  → blocked       lazy reopen (reopen rejected task with agent work)
-
-closed
-  → backlog       lazy reopen (reopen closed task with no agent work)
-  → blocked       lazy reopen (reopen closed task with agent work)
+  → backlog       lazy reopen (reopen rejected/closed task with no agent work)
+  → blocked       lazy reopen (reopen rejected/closed task with agent work)
 ```
 
+### Actors (turn & transition provenance)
+
+Every turn and status transition records an **actor** — who caused it. This is
+provenance metadata: it never gates behavior (a save is a save regardless of
+actor), it only records who did the thing.
+
+There are four actors (`Actor` in `src/types`):
+
+- **`human`** — a real person acting through the **CLI** boundary.
+- **`builder`** — the AI builder that drives Lazy through the **MCP** boundary
+  (the orchestrator that calls `lazy_start`, `lazy_unblock`, etc.).
+- **`system`** — the daemon acting on its own (reconciler transitions,
+  crash auto-resume). Not attributed to whoever happened to trigger the tick.
+- **`supervisor`** — the per-task supervisor authoring push-back/maintain
+  prompts as human-role turns.
+
+**The discriminator is the channel, not the content source.** A command that
+arrives over MCP is `builder`; the same command over the CLI is `human`. This is
+deliberate: when the builder relays a human's feedback via `lazy_unblock`, the
+turn is still `builder` — the actor records *who submitted* (pressed the
+button), not who authored the words. The human's content is persisted verbatim
+either way; the tag is orthogonal to it.
+
+Mechanically: CLI commands default to `getActor()` (env-var / `human`). MCP tool
+handlers set the actor to `MCP_ACTOR` (`builder`) at origination and thread it
+through the RPC layer, because turn-creating lifecycle ops (start, unblock, ask,
+resume, stop, sync) persist their turn in the **daemon** — a shared process that
+can't see the caller's channel from its own environment. Read surfaces
+(`lazy show`, the web dashboard, the MCP `lazy_show` turns section, fidelity /
+report digests) label a human-role turn by its authoring actor so `builder` and
+`supervisor` turns are distinguishable from what a person typed.
+
 ### Transition Triggers
+
+The CLI commands below are the `human`-channel triggers; each has an MCP
+equivalent (`lazy_start`, `lazy_unblock`, …) that drives the same transition but
+records the actor as `builder`.
 
 #### Human Actions (CLI commands)
 
@@ -120,18 +151,26 @@ closed
     - If checks pending or approval needed → merging
   - For local tasks: transitions to merging, squash-merges into parent/main → complete
   - Ends session, cleans up container/worktree/branch
+  - Concurrency: the whole accept orchestration runs under a process-level
+    per-task lifecycle lock (`src/daemon/task-lifecycle-lock.ts`). The daemon
+    serves RPCs concurrently, so without this a human accept and a builder
+    accept on the same task could both clear preflight and both run the merge —
+    leaving the task `blocked` while the merge was already applied. With the
+    lock the second accept waits, re-runs preflight, sees the accepted session
+    outcome, and returns "already accepted"; the merge runs exactly once.
 
 - **`lazy reject <task>`** — blocked|interrupted → abandoned
   - Opens $EDITOR for rejection reason
   - Ends session, cleans up container/worktree/branch
 
-- **`lazy close <task>`** — blocked|interrupted → closed
+- **`lazy close <task>`** — blocked|interrupted → abandoned
   - Opens $EDITOR for close reason
   - Ends session, cleans up container/worktree/branch
+  - Resolves to the same `abandoned` terminal status as `lazy reject`; the two differ only in intent/reason, not status
 
-- **`lazy reopen <task>`** — complete|abandoned|closed → blocked|backlog
+- **`lazy reopen <task>`** — complete|abandoned → blocked|backlog
   - For complete tasks: requires --reason, resets session, transitions to blocked
-  - For abandoned/closed tasks: resets session if it exists, transitions to blocked or backlog
+  - For abandoned tasks: resets session if it exists, transitions to blocked or backlog
 
 #### Agent Actions
 
@@ -161,7 +200,7 @@ The reconciler runs automatically before `lazy list`, `lazy blocked`, `lazy acti
    - If interrupted task has response.json → process it, transition to blocked
 
 3. **Terminal container sweep** — Clean up orphaned containers:
-   - Tasks in complete/abandoned/closed may have lingering containers if cleanup failed
+   - Tasks in complete/abandoned may have lingering containers if cleanup failed
    - Remove container, clear container_name from session
 
 4. **Merged branch sweep** — Detect zombie tasks (branch merged but status not updated):
@@ -483,7 +522,7 @@ Key files implementing the state machine and crash recovery:
 - **`src/cli/commands/pair.ts`** — blocked|interrupted → pairing transition
 - **`src/cli/commands/accept.ts`** — blocked|interrupted|merging → complete|merging transitions
 - **`src/cli/commands/reject.ts`** — blocked|interrupted → abandoned transition
-- **`src/cli/commands/close.ts`** — blocked|interrupted → closed transition
+- **`src/cli/commands/close.ts`** — blocked|interrupted → abandoned transition
 - **`src/cli/commands/reopen.ts`** — terminal → blocked|backlog transition
 - **`src/storage/interface.ts`** — Storage methods for status updates, interrupt recording
 
