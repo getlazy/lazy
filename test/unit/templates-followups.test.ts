@@ -16,6 +16,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     prompt: 'do the thing',
     type: 'task',
     status: 'blocked',
+    priority: 'normal',
     created_at: new Date('2026-06-19T10:00:00Z').getTime(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -23,7 +24,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     close_reason: null,
     model: null,
     agent_id: 'claude-code',
+    runner_type: null,
     metadata: null,
+    tags: [],
     pending_sync: 0,
     ...overrides,
   };

@@ -26,24 +26,55 @@ describe('accept re-parents unfinished children', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // INVARIANT: `start` + `accept` need a real daemon. `start` launches the
+    // supervisor asynchronously; the daemon reconciler is what moves the task
+    // out of 'working'. Daemonless, the task stays 'working' forever and accept
+    // refuses ("Task X is still working"). Mirrors the accept-gates /
+    // accept-auto-sync suites.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
     await ctx.cleanup();
   });
 
+  /**
+   * Start a task, wait for the reconciler to move it out of 'working' into
+   * 'blocked', then commit a file in its worktree so it has changes to merge.
+   *
+   * Under withDaemon the agent runs INSIDE the daemon process, which uses its
+   * own default mock response (no LAZY_MOCK_SHOULD_COMMIT) — so the per-test
+   * `LAZY_MOCK_SHOULD_COMMIT` on `lazyMocked` never reaches it and the branch
+   * ends up empty. The test therefore creates the commit itself, exactly like
+   * the accept-gates / accept-auto-sync suites. The explicit `wait` is
+   * mandatory because `start` launches the supervisor asynchronously.
+   */
+  async function startAndWait(taskId: string): Promise<void> {
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(startResult);
+
+    const waitResult = await ctx.lazy(['wait', taskId]);
+    if (waitResult.exitCode !== 0) {
+      throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+    }
+
+    // Give the task's branch a real commit so accept has something to merge.
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    writeFileSync(join(worktreePath, 'work.txt'), `work for ${taskId}\n`);
+    ctx.git('-C', worktreePath, 'add', 'work.txt');
+    ctx.git('-C', worktreePath, 'commit', '-m', 'Work commit');
+  }
+
   // INVARIANT: When a parent is accepted, its backlog children are re-parented
   // to the grandparent (or top-level if no grandparent exists).
   test('re-parents backlog children to top-level when parent is accepted', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
     // 2. Create a backlog child task (not started, no worktree)
     const childCreateResult = await ctx.lazy([
@@ -84,12 +115,7 @@ describe('accept re-parents unfinished children', () => {
   test('re-parents blocked children when parent is accepted', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
     // 2. Create a child task via branch (starts it, creates worktree)
     const branchResult = await ctx.lazyMocked(
@@ -118,22 +144,12 @@ describe('accept re-parents unfinished children', () => {
   // INVARIANT: When a parent has no unfinished children, accept proceeds
   // normally without any re-parenting noise.
   test('no re-parenting output when parent has no children', async () => {
-    // 1. Create and start a parent task with no children
+    // 1. Create and start a parent task with no children (startAndWait commits
+    //    a change in its worktree, so accept has something to merge).
     const parentId = await createTask(ctx, 'Lonely parent', 'Work alone');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
-    // 2. Add an extra commit to the worktree so accept can detect it
-    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
-    writeFileSync(join(parentWorktree, 'work.txt'), 'work content\n');
-    ctx.git('-C', parentWorktree, 'add', 'work.txt');
-    ctx.git('-C', parentWorktree, 'commit', '-m', 'Work commit');
-
-    // 3. Accept — no worktree removal needed for root tasks (merges into main)
+    // 2. Accept — no worktree removal needed for root tasks (merges into main)
     const acceptResult = await ctx.lazy(['accept', parentId, '--reason', 'LGTM']);
     expectSuccess(acceptResult);
 
@@ -146,12 +162,7 @@ describe('accept re-parents unfinished children', () => {
   test('does not re-parent terminal children', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
     // 2. Create a child and close it (making it terminal)
     const childCreateResult = await ctx.lazy([
@@ -182,12 +193,7 @@ describe('accept re-parents unfinished children', () => {
   test('log output mentions re-parenting count and destination', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
     // 2. Create two backlog children
     const child1Result = await ctx.lazy([
@@ -220,12 +226,7 @@ describe('accept re-parents unfinished children', () => {
   test('pre-accept note conveys no action needed and never mentions rebasing', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
-    const parentStartResult = await ctx.lazyMocked(
-      ['start', parentId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(parentStartResult);
+    await startAndWait(parentId);
 
     // 2. Create a backlog child so the active-children note fires
     const childCreateResult = await ctx.lazy([

@@ -6,7 +6,15 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
- * Helper: create a task, start it, make a commit in the worktree so accept has something to merge.
+ * Helper: create a task, start it, wait for the reconciler to move it out of
+ * 'working', then make a commit in the worktree so accept has something to merge.
+ *
+ * Under withDaemon the agent runs INSIDE the daemon process, which uses its own
+ * default mock response (no LAZY_MOCK_SHOULD_COMMIT) — so the per-test
+ * `LAZY_MOCK_SHOULD_COMMIT` never reaches it and the branch ends up empty. The
+ * test therefore creates the commit itself. The explicit `wait` is mandatory
+ * because `start` launches the supervisor asynchronously; without it the task
+ * stays 'working' and accept refuses ("Task X is still working").
  */
 async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Promise<string> {
   const taskId = await createTask(ctx, goal, 'Some work');
@@ -15,6 +23,11 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
     env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
   });
   expectSuccess(startResult);
+
+  const waitResult = await ctx.lazy(['wait', taskId]);
+  if (waitResult.exitCode !== 0) {
+    throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+  }
 
   // Add a non-conflicting file in the worktree
   const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -33,7 +46,12 @@ describe('lazy accept --reason', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // INVARIANT: `start` + `accept` need a real daemon. `start` launches the
+    // supervisor asynchronously; the daemon reconciler is what moves the task
+    // out of 'working'. Daemonless, the task stays 'working' forever and accept
+    // refuses ("Task X is still working"). Mirrors the accept-gates /
+    // accept-auto-sync suites.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {

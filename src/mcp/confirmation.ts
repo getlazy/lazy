@@ -81,6 +81,7 @@ export function pendingCount(): number {
 import acceptLightTemplate from '../prompts/confirmations/accept-light.md' with { type: 'text' };
 import acceptStandardTemplate from '../prompts/confirmations/accept-standard.md' with { type: 'text' };
 import acceptSternTemplate from '../prompts/confirmations/accept-stern.md' with { type: 'text' };
+import acceptGatedTemplate from '../prompts/confirmations/accept-gated.md' with { type: 'text' };
 import rejectTemplate from '../prompts/confirmations/reject.md' with { type: 'text' };
 import closeLightTemplate from '../prompts/confirmations/close-light.md' with { type: 'text' };
 import closeStandardTemplate from '../prompts/confirmations/close-standard.md' with { type: 'text' };
@@ -95,6 +96,7 @@ const templates: Record<string, string> = {
   'accept-light': acceptLightTemplate,
   'accept-standard': acceptStandardTemplate,
   'accept-stern': acceptSternTemplate,
+  'accept-gated': acceptGatedTemplate,
   'reject': rejectTemplate,
   'close-light': closeLightTemplate,
   'close-standard': closeStandardTemplate,

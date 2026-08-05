@@ -23,10 +23,12 @@ import type { Task, Session, TaskStatus } from '../types';
 import { loadConfig } from '../config/loader';
 import { resolveAgentModel } from '../utils/role-target';
 import { createRunner } from '../runner';
+import { stampSessionRunner } from '../runner/session-launch';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
 import { logger } from '../utils/logger';
+import { sanitizeUserText } from '../utils/sanitize-text';
 import { taskRef, getWorktreePathForRef } from '../cli/helpers';
 import { parentTaskIdOf } from '../task-target';
 import { branchExists } from '../git/operations';
@@ -35,6 +37,7 @@ import { runGit } from '../utils/git';
 import { emitSignal, readSignals, consumeSignals, consumeSignalsById } from './signals';
 import { writeDaemonMcpConfig } from './task-launcher';
 import { hasDaemonContext } from './context';
+import { tryAdmitAgentSlot, releaseAgentSlot, effectiveAgentLimit } from './concurrency';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -139,7 +142,7 @@ export async function autoUnblockTask(
     return false;
   }
 
-  const runner = await createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot, task.runner_type ?? undefined);
   try {
     await runner.checkAvailability();
   } catch {
@@ -159,6 +162,17 @@ export async function autoUnblockTask(
     return false;
   }
 
+  // Concurrency gate: auto-unblock must respect the agent cap. At the cap, defer
+  // (return false) — the reconciler retries and the trigger persists, so delivery
+  // happens once a slot frees. No durable queue needed for this autonomous path.
+  const slot = await tryAdmitAgentSlot(storage, task.id, effectiveAgentLimit(config));
+  if (!slot.admitted) {
+    logger.debug(`Auto-unblock ${taskShortId}: at agent cap (${slot.running}/${slot.limit}), deferring`);
+    return false;
+  }
+
+  try {
+
   // Acquire worktree lock
   try {
     await acquireLock(worktreePath, 'lazy auto-deliver');
@@ -166,6 +180,9 @@ export async function autoUnblockTask(
     logger.debug(`Auto-unblock ${taskShortId}: could not acquire worktree lock, skipping`);
     return false;
   }
+
+  // Bridge/stamp the resolved runner onto the session before launch.
+  await stampSessionRunner(storage, lazyRoot, session, worktreePath, runner.type);
 
   const containerName = runner.runNameForTask(tRef);
 
@@ -181,8 +198,12 @@ export async function autoUnblockTask(
 
     const sandbox = await setupSandbox(worktreePath);
 
-    // Build the full prompt with event context
-    const fullPrompt = message + '\n\n' + buildAutoDeliverPrompt(task.goal);
+    // Build the full prompt with event context.
+    // INTAKE BOUNDARY: the message is assembled from comment/CI text that may
+    // predate sanitization (older stored comments, external CI output). Escape
+    // control characters here too — this prompt becomes argv[2] of `claude -p`.
+    const safeMessage = sanitizeUserText(message);
+    const fullPrompt = safeMessage + '\n\n' + buildAutoDeliverPrompt(task.goal);
 
     // --- Persist state BEFORE launching container ---
 
@@ -192,9 +213,13 @@ export async function autoUnblockTask(
       sessionId: session.id,
       sequence: nextSeq,
       role: 'human',
-      content: `[system] ${message}`,
+      content: `[system] ${safeMessage}`,
       actor: 'system',
       autoTriggered: true,
+      // INVARIANT: the actor is 'system' (the daemon delivered it) but the
+      // CONTENT is human comments / CI output destined for the agent. A crash
+      // before consumption must re-deliver it, same as a manual unblock.
+      carriesFeedback: true,
     });
 
     // Transition to working
@@ -221,7 +246,7 @@ export async function autoUnblockTask(
     // Generate daemon MCP config so the supervisor can provide MCP tools
     let daemonConfigPath: string | undefined;
     if (runner.usesSandbox() && hasDaemonContext()) {
-      daemonConfigPath = await writeDaemonMcpConfig(lazyRoot, containerName, config.data.path);
+      daemonConfigPath = await writeDaemonMcpConfig(lazyRoot, containerName, { kind: 'task', taskId: task.id });
     }
 
     // Check if supervisor is already running
@@ -231,7 +256,7 @@ export async function autoUnblockTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef);
       } catch (err) {
         logger.warn(`Auto-unblock ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         await storage.updateTaskStatus(task.id, 'blocked', 'system');
@@ -255,6 +280,12 @@ export async function autoUnblockTask(
     return false;
   } finally {
     await removeLock(worktreePath);
+  }
+
+  } finally {
+    // Release the short-lived reservation: on success the task is now `working`
+    // (slot stays counted); on any early return/failure it is `blocked` (freed).
+    releaseAgentSlot(task.id);
   }
 }
 

@@ -13,6 +13,7 @@ import { writeFile, access } from 'fs/promises';
 import { join } from 'path';
 import { requireLazyRoot } from '../helpers';
 import { parseFlags } from '../helpers';
+import { writeStdout } from '../../utils/stdio';
 import { isTTY, promptYesNo } from '../editor';
 import { theme } from '../theme';
 import { DEFAULT_DOCKERFILE } from '../../capture/claude';
@@ -35,22 +36,20 @@ export async function commandExportDockerfile(args: string[]): Promise<void> {
       { name: 'force', aliases: ['f'], takesValue: false },
       { name: 'output', aliases: ['o'], takesValue: true },
       { name: 'stdout', takesValue: false },
-      { name: 'help', aliases: ['h'], takesValue: false },
     ],
     'system export-dockerfile'
   );
-
-  if (parsed.flags.get('help') === true) {
-    exportDockerfileUsage();
-    return;
-  }
 
   const output = parsed.flags.get('output') as string | undefined;
   const stdout = parsed.flags.get('stdout') === true || output === '-';
 
   // stdout mode: print the Dockerfile and write nothing.
   if (stdout) {
-    process.stdout.write(DEFAULT_DOCKERFILE);
+    // Drained write, not a bare process.stdout.write: this is bulk output and
+    // the CLI calls process.exit() immediately after, which on a pipe
+    // (`lazy export-dockerfile --stdout | docker build -f - .`) drops whatever
+    // is still queued. See src/utils/stdio.ts.
+    await writeStdout(DEFAULT_DOCKERFILE);
     return;
   }
 
@@ -96,7 +95,6 @@ Options:
   -o, --output <path>   Write to <path> instead of ${DEFAULT_OUTPUT}
       --stdout          Print to stdout instead of writing a file (also: -o -)
   -f, --force           Overwrite the target file if it already exists
-  -h, --help            Show this help
 
 Examples:
   lazy system export-dockerfile                 # Write ${DEFAULT_OUTPUT}

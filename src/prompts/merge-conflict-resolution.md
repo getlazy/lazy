@@ -1,15 +1,23 @@
-You must merge the branch "{{parentBranch}}" into the current branch and resolve all conflicts.
+A merge of the branch "{{parentBranch}}" into the current branch is ALREADY IN PROGRESS and has
+conflicts. Your job is to resolve them and conclude the merge.
+
+Do NOT run `git merge` — the merge has already been started for you. Do NOT run `git commit`,
+`git merge --abort`, `git reset`, `git branch -f`, or any other command that moves a branch, tag
+or HEAD: those are refused in this environment. Do NOT use `git stash` either — the stash stack
+is shared across every task's worktree, so stashing here can drop foreign changes on another task.
 
 Steps:
-1. Run: git merge {{parentBranch}} --no-ff -m "Merge {{parentBranch}}"
-2. If there are conflicts, resolve them carefully:
+1. List the conflicted files: `git diff --name-only --diff-filter=U`
+2. Resolve each conflict carefully:
    - Review each conflict to understand both sides
    - Make the correct resolution that preserves both sets of changes
-   - Stage resolved files with git add
-3. Once all conflicts are resolved, commit the merge
-4. Verify the result compiles and makes sense
+   - Stage resolved files with `git add`
+3. Verify the result compiles and makes sense
+4. Conclude the merge by calling the `lazy_commit` tool with the message
+   "Merge {{parentBranch}}". That call is what creates the merge commit — the job is not
+   done until it succeeds.
 
-IMPORTANT: Your ONLY job is to merge and resolve conflicts. Do NOT make any other changes.
+IMPORTANT: Your ONLY job is to resolve the conflicts. Do NOT make any other changes.
 Do NOT refactor, improve, or modify any code beyond what's needed for conflict resolution.
 
 When resolving conflicts, upstream ({{parentBranch}}) contains accepted work from other

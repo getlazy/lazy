@@ -419,3 +419,148 @@ describe('circuit breaker', () => {
     expect(updatedSession.consecutive_interruptions).toBe(0);
   });
 });
+
+// ============================================================
+// Section 4: Crash-safe feedback redelivery
+//
+// INVARIANT (CLAUDE.md — never lose human feedback): when a work phase crashes
+// AFTER feedback was persisted but BEFORE the agent consumed it, resuming with
+// the generic "you were interrupted, carry on" prompt effectively throws the
+// feedback away — it survives only implicitly via turn-history injection, and
+// in the live NUL incident it was never acted on. Auto-resume must re-deliver
+// the unconsumed feedback VERBATIM instead. This applies to every crash cause.
+// ============================================================
+
+describe('feedback redelivery on auto-resume', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  /** Crash the task mid-turn (working, no response) and let the reconciler auto-resume it. */
+  async function crashAndAutoResume(fullTaskId: string): Promise<UnblockCommand> {
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    consumeResponse(getProtocolDir(fullTaskId));
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+    const command = readCommand(getProtocolDir(fullTaskId)) as UnblockCommand;
+    expect(command).not.toBeNull();
+    expect(command.type).toBe('unblock');
+    return command;
+  }
+
+  test('unconsumed unblock feedback is re-delivered verbatim as the resume prompt', async () => {
+    const taskId = await createTask(ctx, 'Redelivery test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // Human feedback is persisted, then the turn crashes before any reconcile
+    // consumes the agent's response — so the feedback stays 'pending'.
+    const feedback ='Rename the widget module and keep the tests green';
+    await ctx.lazyMocked(['unblock', taskId, '--message', feedback], MOCK_CLAUDE_SUCCESS);
+
+    const command = await crashAndAutoResume(fullTaskId);
+
+    expect(command.prompt).toContain(feedback);
+    expect(command.prompt).toContain('Re-delivered feedback');
+    // The generic resume context must be REPLACED, not merely accompanied.
+    expect(command.prompt).not.toContain('Your previous session was interrupted');
+  });
+
+  // INVARIANT: idempotence — feedback the agent DID consume must never be
+  // re-delivered. A later, unrelated crash must fall back to the generic prompt.
+  test('consumed feedback is not re-delivered — generic resume prompt instead', async () => {
+    const taskId = await createTask(ctx, 'No redelivery test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    // The agent completed its turn, so the initial prompt is consumed.
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const command = await crashAndAutoResume(fullTaskId);
+
+    expect(command.prompt).toContain('Your previous session was interrupted');
+    expect(command.prompt).not.toContain('Re-delivered feedback');
+  });
+
+  // INVARIANT: the initial task prompt is the human's first and most important
+  // feedback. A crash on the very first turn must re-deliver it, not say
+  // "carry on" to an agent that never read it.
+  test('a crash on the first turn re-delivers the task prompt', async () => {
+    const taskId = await createTask(ctx, 'First turn crash', 'Implement the parser exactly as specified');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // Crash WITHOUT reconciling the start response — nothing consumed it.
+    const command = await crashAndAutoResume(fullTaskId);
+
+    expect(command.prompt).toContain('Implement the parser exactly as specified');
+    expect(command.prompt).toContain('Re-delivered feedback');
+  });
+
+  // INVARIANT: ordering is never lost when feedback queues up. The newest
+  // unconsumed feedback is re-delivered verbatim and the older ones are
+  // reported, never silently dropped.
+  test('queued feedback re-delivers the newest and reports the older ones', async () => {
+    const taskId = await createTask(ctx, 'Queued feedback', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // Two rounds of feedback, neither consumed (no reconcile in between).
+    await ctx.lazyMocked(['unblock', taskId, '--message', 'FIRST piece of feedback'], MOCK_CLAUDE_SUCCESS);
+    consumeResponse(getProtocolDir(fullTaskId));
+    setTaskStatus(ctx.root, fullTaskId, 'blocked');
+    await ctx.lazyMocked(['unblock', taskId, '--message', 'SECOND piece of feedback'], MOCK_CLAUDE_SUCCESS);
+
+    const command = await crashAndAutoResume(fullTaskId);
+
+    expect(command.prompt).toContain('SECOND piece of feedback');
+    expect(command.prompt).toContain('older piece');
+  });
+});
+
+// INVARIANT: manual `lazy resume` has the same gap as auto-resume — it must
+// re-deliver unconsumed feedback too, not just tell the agent to carry on.
+describe('feedback redelivery on manual resume', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  test('manual resume re-delivers unconsumed feedback verbatim', async () => {
+    const taskId = await createTask(ctx, 'Manual redelivery', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    const feedback = 'Revert the schema change and open a follow-up instead';
+    await ctx.lazyMocked(['unblock', taskId, '--message', feedback], MOCK_CLAUDE_SUCCESS);
+
+    // Crash: no reconcile consumed the response, task is stuck interrupted.
+    consumeResponse(getProtocolDir(fullTaskId));
+    setTaskStatus(ctx.root, fullTaskId, 'interrupted');
+
+    const resumeResult = await ctx.lazyMocked(['resume', taskId], MOCK_CLAUDE_SUCCESS);
+    expectSuccess(resumeResult);
+
+    const command = readCommand(getProtocolDir(fullTaskId)) as UnblockCommand;
+    expect(command).not.toBeNull();
+    expect(command.prompt).toContain(feedback);
+    expect(command.prompt).toContain('Re-delivered feedback');
+    expect(command.prompt).not.toContain('Your previous session was interrupted');
+  });
+});

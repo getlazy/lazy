@@ -63,6 +63,7 @@ export function stripAnsi(s: string): string {
 
 const STATUS_COLORS: Record<string, (s: string) => string> = {
   working: blue,
+  queued: dim,
   blocked: yellow,
   conflict: red,
   submitted: cyan,
@@ -87,6 +88,9 @@ export const theme = {
   },
 
   model(model: string): string { return magenta(model); },
+
+  /** A tag label, e.g. "#onboarding". Rendered in cyan to stand out in lists. */
+  tag(text: string): string { return cyan(text); },
 
   commitSha(sha: string): string { return yellow(sha); },
 

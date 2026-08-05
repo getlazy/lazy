@@ -3,7 +3,8 @@ import { rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { worktreePathFor } from '../helpers/storage';
 
 /**
  * Helper: create a task, start it, make a commit in the worktree.
@@ -11,13 +12,12 @@ import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Promise<string> {
   const taskId = await createTask(ctx, goal, 'Some work');
 
-  const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-    env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-  });
-  expectSuccess(startResult);
+  // Drive the reconcile pass too: daemonless, nothing else moves the task out
+  // of 'working', and accept/unblock refuse a working task.
+  await startAndReconcile(ctx, taskId);
 
   // Add a non-conflicting file in the worktree
-  const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+  const worktreePath = worktreePathFor(ctx.root, taskId);
   writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
 
   const gitAdd = ctx.git('-C', worktreePath, 'add', 'feature.txt');
@@ -34,6 +34,8 @@ describe('lazy status', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -63,7 +65,7 @@ describe('lazy status', () => {
     expectSuccess(acceptResult);
 
     // Remove the worktree directory to simulate cleanup
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
     rmSync(worktreePath, { recursive: true, force: true });
 
     // Run status command
@@ -104,7 +106,7 @@ describe('lazy status', () => {
     expectOutput(listResult, 'blocked');
 
     // Remove the worktree directory
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
     rmSync(worktreePath, { recursive: true, force: true });
 
     // Run status command - should show warning but continue rendering
@@ -127,7 +129,7 @@ describe('lazy status', () => {
     expectSuccess(rejectResult);
 
     // Remove the worktree directory
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
     rmSync(worktreePath, { recursive: true, force: true });
 
     // Run status command

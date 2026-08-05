@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
-import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -10,10 +10,13 @@ import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import type { RoleTarget } from '../config/types';
 import { buildMountArgs } from './mounts';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET } from '../utils/role-target';
+import { buildGitMountArgsFor } from './git-mounts';
+import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
 import { logger } from '../utils/logger';
 import { isOfflineMode } from '../utils/offline';
 import { spawn, spawnSync } from '../utils/spawn';
+import { safeArgvPrompt } from '../agent/argv-safety';
+import { markMachineOneshotPrompt } from '../import/machine-oneshot';
 import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
 
 // Re-export so other modules (e.g. `lazy system export-dockerfile`) can use the
@@ -142,17 +145,29 @@ export async function resolveImageName(lazyRoot: string): Promise<string> {
   return IMAGE_NAME;
 }
 
-function getImageDockerfileHash(imageName: string, binary: string = 'docker'): string | null {
-  const inspect = spawnSync(
+/**
+ * Async (not spawnSync) because this sits on the daemon's task-launch hot path:
+ * ensureImage() runs on every container start, and `docker image inspect` can
+ * take seconds under a loaded Docker daemon. A sync spawn there freezes the
+ * daemon's event loop — no HTTP handler, no reconciler tick — which is exactly
+ * the class of stall that made RPCs time out while turns were being launched.
+ */
+async function getImageDockerfileHash(imageName: string, binary: string = 'docker'): Promise<string | null> {
+  const inspect = spawn(
     [binary, 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${DOCKERFILE_HASH_LABEL}"}}`],
     { stdout: 'pipe', stderr: 'ignore' }
   );
 
-  if (inspect.exitCode !== 0) {
+  const [stdout, exitCode] = await Promise.all([
+    new Response(inspect.stdout).text(),
+    inspect.exited,
+  ]);
+
+  if (exitCode !== 0) {
     return null;
   }
 
-  const hash = inspect.stdout.toString().trim();
+  const hash = stdout.trim();
   return hash || null;
 }
 
@@ -290,7 +305,7 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
   const lazyRoot = getLazyRoot();
   const imageName = await resolveImageName(lazyRoot);
   const currentHash = await calculateDockerfileHash(lazyRoot);
-  const imageHash = getImageDockerfileHash(imageName, binary);
+  const imageHash = await getImageDockerfileHash(imageName, binary);
   const noCache = options?.noCache ?? false;
 
   if (imageHash === currentHash) {
@@ -384,46 +399,79 @@ function getLazySourceRoot(): string | null {
  * Returns the path to the extracted binary, or null if not in compiled mode
  * or the embedded binary is not available (e.g. dev mode placeholder).
  */
-function extractEmbeddedAgentBinary(destDir: string): string | null {
+export async function extractEmbeddedAgentBinary(
+  destDir: string,
+  // Parameterised so tests can drive the real function with a stand-in for the
+  // $bunfs-embedded binary, which only exists in a compiled build.
+  embeddedPath: string = embeddedAgentBinaryPath,
+): Promise<string | null> {
   // The embedded path starts with $bunfs/ when running as a compiled binary.
   // In dev mode it's a regular file path pointing to the placeholder.
-  if (!embeddedAgentBinaryPath || !existsSync(embeddedAgentBinaryPath)) {
+  if (!embeddedPath || !existsSync(embeddedPath)) {
+    return null;
+  }
+
+  // Read the embedded binary up front: every decision below needs its bytes,
+  // and it lives in the $bunfs virtual filesystem, so OS-level copy syscalls
+  // (copyFile) cannot touch it. ~100MB reads in tens of milliseconds, once per
+  // container launch, against a docker run that takes seconds.
+  let embedded: Buffer;
+  try {
+    embedded = readFileSync(embeddedPath);
+  } catch {
     return null;
   }
 
   // In dev mode, the import resolves to a tiny placeholder file.
   // Only proceed if the embedded file is a real binary (> MIN_AGENT_BINARY_SIZE).
-  try {
-    const embeddedSize = Bun.file(embeddedAgentBinaryPath).size;
-    if (embeddedSize < MIN_AGENT_BINARY_SIZE) {
-      return null;
-    }
-  } catch {
+  if (embedded.length < MIN_AGENT_BINARY_SIZE) {
     return null;
   }
 
-  mkdirSync(destDir, { recursive: true });
+  await mkdir(destDir, { recursive: true });
   const destPath = join(destDir, 'lazy-agent');
 
-  // Skip extraction if the binary is already there and matches
-  if (existsSync(destPath)) {
-    // Compare sizes as a quick check — if they match, assume it's current.
-    // The embedded binary changes only when lazy itself is upgraded.
-    try {
-      const embeddedSize = Bun.file(embeddedAgentBinaryPath).size;
-      const destSize = Bun.file(destPath).size;
-      if (embeddedSize === destSize) {
-        return destPath;
-      }
-    } catch {
-      // Fall through to re-extract
+  // Skip extraction only when the file on disk is BYTE-IDENTICAL to the
+  // embedded one.
+  //
+  // This used to compare sizes alone, on the theory that the embedded binary
+  // changes only when lazy is upgraded. Two builds of a ~100MB Bun executable
+  // that differ by a few source lines routinely land on the same size, and when
+  // they do, the stale extracted binary is kept and bind-mounted into every
+  // container — so a freshly upgraded daemon talks to agents running OLD agent
+  // code. That is silent and near-impossible to diagnose from inside a
+  // container: the daemon reports the new version while the agent-side MCP
+  // client behaves like the old one. Hashing costs a few milliseconds and makes
+  // the check exact.
+  try {
+    const existing = await Bun.file(destPath).arrayBuffer();
+    if (
+      existing.byteLength === embedded.length &&
+      Bun.hash(new Uint8Array(existing)) === Bun.hash(embedded)
+    ) {
+      return destPath;
     }
+  } catch {
+    // Missing or unreadable — fall through and (re-)extract.
   }
 
-  // Use readFileSync/writeFileSync instead of copyFileSync because the embedded
-  // path is a $bunfs virtual filesystem path that OS-level copy syscalls can't access.
-  writeFileSync(destPath, readFileSync(embeddedAgentBinaryPath));
-  chmodSync(destPath, 0o755);
+  // Write to a temp file and rename into place. Writing destPath directly would
+  // truncate and rewrite the very inode that already-running containers have
+  // bind-mounted at /usr/local/bin/lazy-agent, mutating the agent binary of a
+  // live builder mid-session. rename() is atomic: existing containers keep the
+  // old inode, new ones get the new binary.
+  const tmpPath = join(destDir, `.tmp-lazy-agent-${randomUUID()}`);
+  try {
+    await Bun.write(tmpPath, embedded);
+    chmodSync(tmpPath, 0o755);
+    renameSync(tmpPath, destPath);
+  } catch (err) {
+    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+    throw new Error(
+      `Failed to extract the embedded agent binary to ${destPath}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return destPath;
 }
 
@@ -447,7 +495,7 @@ export async function ensureAgentBinary(): Promise<string> {
   const binDir = getUserBinDir();
 
   // 1. Try to extract embedded binary (compiled mode)
-  const extracted = extractEmbeddedAgentBinary(binDir);
+  const extracted = await extractEmbeddedAgentBinary(binDir);
   if (extracted) {
     logger.debug(`Using embedded agent binary: ${extracted}`);
     return extracted;
@@ -578,31 +626,56 @@ export type { OllamaConfig } from '../config/types';
  * - proxy:  base URL override forwarded with the real Anthropic credential.
  * - anthropic (or no target): the real Anthropic credential (throws if absent,
  *   via ClaudeCodeAgent.getAuthEnvVars()).
+ *
+ * `surface` says whether the env is for a container or a host process — see
+ * {@link targetEnvVars}. It defaults to `'container'` because every caller in
+ * this module builds `docker run` argv; host launch paths pass `'host'`
+ * explicitly.
  */
-export function getAuthEnvVars(target?: RoleTarget): Array<{ key: string; value: string }> {
+export function getAuthEnvVars(
+  target?: RoleTarget,
+  hints?: ProxyAuditHints,
+  surface: LaunchSurface = 'container',
+): Array<{ key: string; value: string }> {
   const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
   if (resolved.backend === 'ollama') {
     // Ollama is self-contained — no real credential needed.
-    return targetEnvVars(resolved, []);
+    return targetEnvVars(resolved, [], surface, hints);
   }
   // anthropic / proxy: forward the real credential (throwing if absent).
-  return targetEnvVars(resolved, _agent.getAuthEnvVars());
+  return targetEnvVars(resolved, _agent.getAuthEnvVars(), surface, hints);
 }
 
-function buildDockerArgs(sandbox: SandboxConfig, claudeArgs: string[], agentBinaryPath: string, imageName: string, binary: string = 'docker', target?: RoleTarget): string[] {
-  const authEnvVars = getAuthEnvVars(target);
-  const repoRoot = getLazyRoot();
-
+/**
+ * Container argv for a one-shot agent run.
+ *
+ * Exported for test/unit/daemon-dir-never-mounted.test.ts, which asserts the
+ * mount set never exposes the daemon state dir — see the INVARIANT comment there.
+ *
+ * `gitMountArgs` carries the split `.git` mount (see src/capture/git-mounts.ts);
+ * callers build it with `buildGitMountArgsFor(worktreePath)`.
+ */
+export function buildDockerArgs(
+  sandbox: SandboxConfig,
+  claudeArgs: string[],
+  agentBinaryPath: string,
+  imageName: string,
+  binary: string = 'docker',
+  repoRoot: string = getLazyRoot(),
+  authEnvVars: Array<{ key: string; value: string }> = [],
+  gitMountArgs: string[] = [],
+): string[] {
   return [
     binary, 'run', '--rm', '--init',
     // Allow container to reach host services (daemon MCP, Ollama, etc.)
     '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only so agent can read source but not modify the main tree.
-    // The worktree and .git dir are mounted read-write on top (more specific mount wins).
+    // The worktree is mounted read-write on top (more specific mount wins).
     '-v', `${repoRoot}:${repoRoot}:ro`,
     '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
-    // Git worktrees need write access to <repoRoot>/.git for commits, refs, etc.
-    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
+    // Split .git mount: common dir read-only, only objects + this worktree's
+    // gitdir writable. See src/capture/git-mounts.ts.
+    ...gitMountArgs,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
@@ -635,7 +708,7 @@ export async function runClaude(
     model ?? (target && target.backend !== 'anthropic' ? target.model : undefined);
 
   const claudeArgs = [
-    'claude', '-p', prompt,
+    'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
     '--output-format', 'json',
     '--dangerously-skip-permissions',
   ];
@@ -649,7 +722,11 @@ export async function runClaude(
   }
 
   logger.debug('Setting up sandbox...');
-  const args = buildDockerArgs(sandbox, claudeArgs, agentBinaryPath, imageName, binary, target);
+  const args = buildDockerArgs(
+    sandbox, claudeArgs, agentBinaryPath, imageName, binary,
+    getLazyRoot(), getAuthEnvVars(target),
+    await buildGitMountArgsFor(sandbox.worktreePath),
+  );
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));
@@ -695,6 +772,14 @@ export async function runClaude(
  * Used by lightweight CLI commands that only need a single LLM call and don't
  * need a worktree, sandbox, or session continuity (e.g. `lazy report`).
  * Authentication comes from the same env vars as the agent runner.
+ *
+ * Every run here is MACHINE-GENERATED housekeeping — a fidelity summary, a
+ * report unit, a memory compaction — never a conversation anyone will read.
+ * Claude still writes a session JSONL for it into the shared projects dir, so
+ * the prompt is stamped with the one-shot marker (see src/import/machine-oneshot.ts)
+ * and conversation capture skips it. This is the ONLY place that stamps: every
+ * caller of this function is housekeeping by construction, so marking here means
+ * no caller can forget.
  */
 export async function runClaudeOneshot(
   prompt: string,
@@ -704,7 +789,8 @@ export async function runClaudeOneshot(
   // Claude CLI exit. Throws if no token / API key is available.
   _agent.getAuthEnvVars();
 
-  const args = ['claude', '-p', prompt, '--output-format', 'json'];
+  const marked = markMachineOneshotPrompt(prompt);
+  const args = ['claude', '-p', safeArgvPrompt(marked, 'prompt'), '--output-format', 'json'];
   if (model) {
     args.push('--model', model);
   }
@@ -957,6 +1043,81 @@ function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string)
   ].join('\n');
 }
 
+export interface SupervisorDockerArgsParams {
+  binary: string;
+  containerName: string;
+  imageName: string;
+  repoRoot: string;
+  sandbox: SandboxConfig;
+  protocolDir: string;
+  agentBinaryPath: string;
+  authEnvVars: Array<{ key: string; value: string }>;
+  /** Already-built `-v ...` args for user-configured [[mounts]]. */
+  customMountArgs: string[];
+  /**
+   * Already-built `-v ...` args for the split `.git` mount — common dir
+   * read-only, only objects + this worktree's gitdir writable.
+   * Build with `buildGitMountArgsFor(worktreePath)`; see src/capture/git-mounts.ts.
+   */
+  gitMountArgs: string[];
+  wrapperScript: string;
+  /** Path to this container's daemon MCP config, when the daemon minted one. */
+  daemonConfigPath?: string;
+}
+
+/**
+ * Container argv for a detached agent supervisor.
+ *
+ * Split out of launchSupervisorAsync so the mount set is inspectable without
+ * running Docker: test/unit/daemon-dir-never-mounted.test.ts asserts that no
+ * mount source exposes the daemon state dir — see the INVARIANT comment there.
+ */
+export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): string[] {
+  const {
+    binary, containerName, imageName, repoRoot, sandbox, protocolDir,
+    agentBinaryPath, authEnvVars, customMountArgs, gitMountArgs, wrapperScript,
+    daemonConfigPath,
+  } = params;
+
+  return [
+    binary, 'run', '-d', '--init',
+    '--name', containerName,
+    // Scope this container to the project so cross-project commands
+    // (e.g. `lazy upgrade`) can filter on the label. Kept in sync with
+    // PROJECT_LABEL in src/runner/docker-runner.ts.
+    '--label', `lazy.project=${repoRoot}`,
+    // Allow container to reach host services (daemon MCP, Ollama, etc.)
+    '--add-host=host.docker.internal:host-gateway',
+    // Mount repo read-only; worktree and protocol dir are mounted read-write on top.
+    '-v', `${repoRoot}:${repoRoot}:ro`,
+    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
+    // Split .git mount: the shared git dir (refs, packed-refs, config, hooks,
+    // sibling worktree gitdirs) is read-only; only objects and this worktree's
+    // own gitdir are writable. See src/capture/git-mounts.ts.
+    ...gitMountArgs,
+    '-v', `${protocolDir}:${protocolDir}`,
+    '-w', sandbox.worktreePath,
+    '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
+    '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
+    '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
+    '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+    // Pass daemon config to container for MCP proxy mode. The config file is the
+    // ONLY thing from the daemon state dir a container may ever see: a single
+    // file, read-only, holding just this container's own token.
+    ...(daemonConfigPath ? [
+      '-v', `${daemonConfigPath}:${daemonConfigPath}:ro`,
+      '-e', `LAZY_DAEMON_CONFIG=${daemonConfigPath}`,
+    ] : []),
+    // User-configured custom mounts. Appended after the standard worktree mount
+    // so a {worktree}/node_modules volume clearly shadows it (Docker resolves
+    // overlapping mounts by longest container-path match regardless of order).
+    ...customMountArgs,
+    imageName,
+    'sh', '-c', wrapperScript,
+  ];
+}
+
 /**
  * Launch the supervisor in a detached Docker container.
  * The supervisor watches for commands from the host via the protocol directory.
@@ -973,13 +1134,16 @@ export async function launchSupervisorAsync(
   binary: string = 'docker',
   daemonConfigPath?: string,
   target?: RoleTarget,
+  taskId?: string,
 ): Promise<void> {
   const [imageName, agentBinaryPath] = await Promise.all([
     ensureImage(binary),
     ensureAgentBinary(),
   ]);
 
-  const authEnvVars = getAuthEnvVars(target);
+  // Supervisor launches are always the `agent` role; the task turn it runs
+  // inherits this env, so proxied traffic is attributed to agent + task.
+  const authEnvVars = getAuthEnvVars(target, { role: 'agent', taskId });
   const repoRoot = getLazyRoot();
 
   // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
@@ -991,44 +1155,28 @@ export async function launchSupervisorAsync(
     repoRoot,
   });
 
+  const gitMountArgs = await buildGitMountArgsFor(sandbox.worktreePath);
+
   const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);
 
   // Daemon MCP config is provided by the caller (daemon task launcher).
   // The daemon always provides this when launching containers — it knows
   // its own webPort and token, so there's no fallback or race condition.
 
-  const args = [
-    binary, 'run', '-d', '--init',
-    '--name', containerName,
-    // Scope this container to the project so cross-project commands
-    // (e.g. `lazy upgrade`) can filter on the label. Kept in sync with
-    // PROJECT_LABEL in src/runner/docker-runner.ts.
-    '--label', `lazy.project=${repoRoot}`,
-    // Allow container to reach host services (daemon MCP, Ollama, etc.)
-    '--add-host=host.docker.internal:host-gateway',
-    // Mount repo read-only; worktree, .git, and protocol dir are mounted read-write on top.
-    '-v', `${repoRoot}:${repoRoot}:ro`,
-    '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
-    '-v', `${join(repoRoot, '.git')}:${join(repoRoot, '.git')}`,
-    '-v', `${protocolDir}:${protocolDir}`,
-    '-w', sandbox.worktreePath,
-    '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
-    '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
-    '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
-    '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
-    // Pass daemon config to container for MCP proxy mode
-    ...(daemonConfigPath ? [
-      '-v', `${daemonConfigPath}:${daemonConfigPath}:ro`,
-      '-e', `LAZY_DAEMON_CONFIG=${daemonConfigPath}`,
-    ] : []),
-    // User-configured custom mounts. Appended after the standard worktree mount
-    // so a {worktree}/node_modules volume clearly shadows it (Docker resolves
-    // overlapping mounts by longest container-path match regardless of order).
-    ...customMountArgs,
+  const args = buildSupervisorDockerArgs({
+    binary,
+    containerName,
     imageName,
-    'sh', '-c', wrapperScript,
-  ];
+    repoRoot,
+    sandbox,
+    protocolDir,
+    agentBinaryPath,
+    authEnvVars,
+    customMountArgs,
+    gitMountArgs,
+    wrapperScript,
+    daemonConfigPath,
+  });
 
   if (debug) {
     console.log('[DEBUG] Running container command:', args.join(' '));

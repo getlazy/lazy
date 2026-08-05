@@ -45,10 +45,42 @@ describe('DockerRunner.stopRun', () => {
     const ok = await result;
     expect(ok).toBe(true);
 
-    // INVARIANT: container stop is a hard kill. `docker stop` sends SIGTERM and
-    // waits out a grace period before SIGKILL; there is no graceful shutdown to
-    // wait for, so that grace period is pure latency. Use `docker kill`.
+    // INVARIANT: the DEFAULT container stop is a hard kill. `docker stop` sends
+    // SIGTERM and waits out a grace period before SIGKILL; a task supervisor has
+    // no shutdown work to wait for, so that grace period is pure latency in the
+    // daemon's hot path. Callers that DO have exit work (builders) must opt in
+    // explicitly via gracefulTimeoutSeconds.
     expect(calls).toEqual([['docker', 'kill', 'lazy-abc12345']]);
+  });
+
+  test('gracefulTimeoutSeconds opts into `stop --time <n>` (SIGTERM + grace)', async () => {
+    const calls: string[][] = [];
+    const timeouts: (number | undefined)[] = [];
+    await mockModule(SPAWN_PATH, () => ({
+      spawn: (cmd: string[], opts?: { timeout?: number }) => {
+        calls.push(cmd);
+        timeouts.push(opts?.timeout);
+        return { exited: Promise.resolve(0), kill: () => {} };
+      },
+      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
+    }));
+
+    const { DockerRunner } = await import('../../src/runner/docker-runner');
+    const runner = new DockerRunner('docker');
+
+    expect(await runner.stopRun('lazy-builder-abc12345', { gracefulTimeoutSeconds: 10 })).toBe(true);
+
+    // INVARIANT: a BUILDER must be stopped with SIGTERM and a grace period, never
+    // SIGKILL'd. Its supervisor's signal handler flushes the conversation capture
+    // and stamps the resume session id onto the builder-resume-intent; SIGKILL
+    // skips both, which is what left an upgrade-relaunched builder unable to
+    // resume the conversation it was killed out of.
+    expect(calls).toEqual([['docker', 'stop', '--time', '10', 'lazy-builder-abc12345']]);
+
+    // The spawn timeout must exceed the grace period, or we would kill the
+    // `docker stop` client while the daemon is still waiting out the grace.
+    expect(timeouts[0]).toBeGreaterThan(10_000);
   });
 
   test('resolves false when kill exits non-zero', async () => {

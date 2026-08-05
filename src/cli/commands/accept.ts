@@ -3,12 +3,15 @@ import { resolveDetachedHead } from '../../git/operations';
 import { targetBranchOf } from '../../task-target';
 import { isTTY, promptYesNo, promptLine, readStdinIfPiped } from '../editor';
 import { commandSyncTask } from './sync';
-import { loadConfig } from '../../config/loader';
+import { loadConfig, loadRawConfig } from '../../config/loader';
+import { protectionHintForAccept } from '../../protection/discovery';
+import { logger } from '../../utils/logger';
 import { createDriver } from '../../remote';
 import { getActiveChildren } from '../orphan';
 import { queryAcceptTaskPreflight, queryAcceptTask } from '../../daemon/rpc-fallback';
 
 import { theme } from '../theme';
+import { createPhaseDisplay } from '../phase-display';
 import { getActor } from '../../constants';
 
 export async function commandAccept(args: string[]): Promise<void> {
@@ -72,13 +75,39 @@ export async function commandAccept(args: string[]): Promise<void> {
     }
   }
 
+  // Heads-up about the pre-accept validation turn. The step is OPT-IN
+  // ([automation.pre_accept] enabled = true); when it is on, accept runs a
+  // final agent turn BEFORE the merge and the CLI blocks on it — so tell the
+  // user why this may take a while rather than letting them stare at a silent
+  // prompt. When it is off (the default) accept says nothing extra and merges
+  // straight away.
+  {
+    const config = await loadConfig(root);
+    const preAccept = config.automation.pre_accept;
+    if (preAccept.enabled) {
+      const gateNote = preAccept.commands.length > 0
+        ? ` running ${preAccept.commands.length} configured check(s) (re-run as the merge gate), plus maintained files and a post-mortem`
+        : ' updating maintained files and recording a post-mortem';
+      console.log(theme.separator(`Running pre-accept validation before merge —${gateNote}. This may take a while; the merge aborts if a check fails.`));
+    }
+  }
+
   // --- Delegate to daemon RPC ---
+  // The daemon narrates the accept phase by phase over the heartbeat envelope;
+  // the display below turns that into live terminal output. Without it accept
+  // is silent for its entire (multi-minute) run — see src/cli/phase-display.ts.
+  const display = createPhaseDisplay();
   try {
-    const result = await queryAcceptTask({
-      taskId,
-      reason: reason.trim(),
-      approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
-    });
+    let result;
+    try {
+      result = await queryAcceptTask({
+        taskId,
+        reason: reason.trim(),
+        approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
+      }, display.onProgress);
+    } finally {
+      display.close();
+    }
 
     // Print warnings
     for (const w of result.warnings) {
@@ -92,6 +121,8 @@ export async function commandAccept(args: string[]): Promise<void> {
       } else {
         console.log(theme.success(`\nTask ${result.displayId} accepted and merged.`));
       }
+
+      await printProtectionHint(taskId);
 
       // Check for continuation task offer (revert tasks)
       await handleContinuationTaskOffer(taskId, result.displayId, yes);
@@ -142,6 +173,51 @@ export async function commandAccept(args: string[]): Promise<void> {
 }
 
 /**
+ * Introduce branch protection after an accept that merged into the repo's
+ * default branch — the one moment the feature is obviously relevant and
+ * provably not in the way (the merge already happened).
+ *
+ * CLI-only on purpose: the equivalent MCP accept is run by a builder, which
+ * cannot turn protection on anyway (`lazy protect` has no MCP form, for the
+ * same reason it cannot run `lazy approve`).
+ *
+ * A tip must never be able to fail an accept that already succeeded, so a
+ * failure here is logged with its context and swallowed — the user has their
+ * merge, and losing an optional hint costs them nothing.
+ */
+async function printProtectionHint(taskId: string): Promise<void> {
+  try {
+    const root = requireLazyRoot();
+    const [config, rawConfig] = await Promise.all([loadConfig(root), loadRawConfig(root)]);
+
+    // Cheapest possible exit for the two states that need no storage access
+    // at all: protection already on, or an explicit opinion recorded.
+    const section = rawConfig?.protection as Record<string, unknown> | undefined;
+    if (config.protection.enabled || (section && 'enabled' in section)) return;
+
+    const storage = await requireStorage();
+    let targetBranch: string | undefined;
+    try {
+      // Deliberately NOT resolveTaskOrExit: that exits the process, and a task
+      // that has just been accepted must never die on the way to a tip.
+      const match = await storage.resolveTask(taskId);
+      if (!match.task) return;
+      targetBranch = targetBranchOf(match.task);
+    } finally {
+      await storage.close();
+    }
+
+    const hint = await protectionHintForAccept({ config, rawConfig, projectRoot: root, targetBranch });
+    if (hint) console.log(theme.separator(hint));
+  } catch (err) {
+    logger.debug(
+      `Skipped the branch-protection hint after accepting ${taskId}: ` +
+      `${err instanceof Error ? err.message : err}`,
+    );
+  }
+}
+
+/**
  * Handle --wait: poll CI checks and retry accept when they pass.
  * This is a CLI-only concern — the daemon doesn't do long-polling for CI.
  */
@@ -167,13 +243,19 @@ async function handleWaitForMerge(
       console.log(theme.success('All checks passed! Retrying merge...\n'));
       await storage.close();
 
-      // Retry accept via RPC
+      // Retry accept via RPC — narrated like the first attempt.
+      const retryDisplay = createPhaseDisplay();
       try {
-        const retryResult = await queryAcceptTask({
-          taskId,
-          reason: reason.trim(),
-          approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
-        });
+        let retryResult;
+        try {
+          retryResult = await queryAcceptTask({
+            taskId,
+            reason: reason.trim(),
+            approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
+          }, retryDisplay.onProgress);
+        } finally {
+          retryDisplay.close();
+        }
 
         for (const w of retryResult.warnings) {
           console.log(w);
@@ -186,6 +268,7 @@ async function handleWaitForMerge(
           } else {
             console.log(theme.success(`\nTask ${retryResult.displayId} merged.`));
           }
+          await printProtectionHint(taskId);
         } else {
           console.log(`Task ${retryResult.displayId} approved. Merge still pending: ${retryResult.reason}`);
           console.log('The reconciler will complete the merge when ready.');
@@ -325,6 +408,13 @@ Options:
 Reason input priority: --reason flag > piped stdin > interactive prompt > "LGTM"
 
 Behavior:
+  - Merges directly by default. If [automation.pre_accept] enabled = true is
+    set, accept first runs the pre-accept validation turn BEFORE merging: a
+    final agent turn that runs the configured commands, brings maintained files
+    up to date (e.g. CHANGELOG), and records a post-mortem. The supervisor
+    re-runs the commands as the merge gate — if any fails, the task returns to
+    blocked and the accept is aborted (never a silent merge). This can take a
+    while; the CLI waits for it.
   - Checks pre-merge gates (CI, reviews, unresolved comments) before merging.
     If any gates are failing, accept refuses to merge and prints a link to the
     PR/MR so the user can resolve the issues there.

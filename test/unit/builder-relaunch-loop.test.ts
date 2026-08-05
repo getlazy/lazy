@@ -16,6 +16,7 @@ import {
   matchIntentForBuilder,
   isUpgradeComplete,
   builderRunName,
+  formatWaited,
   type RelaunchStorage,
   type BuilderLaunchResult,
 } from '../../src/builder/relaunch';
@@ -75,10 +76,16 @@ function baseDeps(over: Partial<Parameters<typeof runBuilderRelaunchLoop>[0]>) {
     getStorage: async () => fakeStorage(),
     daemonStatus: async (): Promise<DaemonStatus> => ({ running: true, pid: 1, buildTime: 'b1', uptime: 100 }),
     ensureReady: async () => {},
+    refreshProxyTarget: async () => {},
     log: () => {},
     errorOut: () => {},
-    timeoutMs: 100,
     pollIntervalMs: 10,
+    reassureAfterMs: 100,
+    reassureIntervalMs: 50,
+    // Default: no upgrade pid on the intent → liveness unknown → wait forever.
+    // Tests that exercise the death path stamp a pid and script this.
+    isProcessAlive: () => true,
+    currentHost: () => 'test-host',
     sleep: noopSleep,
     ...over,
   };
@@ -148,6 +155,20 @@ describe('isUpgradeComplete', () => {
   });
 });
 
+describe('formatWaited', () => {
+  test('renders sub-minute waits in seconds', () => {
+    expect(formatWaited(30_000)).toBe('30s');
+  });
+
+  test('renders minutes', () => {
+    expect(formatWaited(5 * 60_000)).toBe('5m');
+  });
+
+  test('renders hours and minutes for very long rebuilds', () => {
+    expect(formatWaited(72 * 60_000)).toBe('1h 12m');
+  });
+});
+
 describe('runBuilderRelaunchLoop', () => {
   // INVARIANT: with no resume intent, the loop runs the child exactly once and
   // returns its exit code + sessionId for the footer — today's behavior. The
@@ -207,27 +228,162 @@ describe('runBuilderRelaunchLoop', () => {
     expect(storage.intents.size).toBe(0);
   });
 
-  // INVARIANT: the intent is consumed ONLY after committing to the relaunch.
-  // On timeout the loop must LEAVE the intent in place (recovery path) and print
-  // an actionable manual-resume command.
-  test('timeout → leaves intent, prints actionable fallback, suppresses footer', async () => {
+  // INVARIANT: the wait for an upgrade is UNBOUNDED. It previously gave up after
+  // 300s and killed the session ("Timed out waiting... Resume it manually"), which
+  // turned a slow-but-fine rebuild into a dead builder for no gain. A rebuild has
+  // no honest upper bound, so the loop must keep waiting and reassure instead.
+  // This drives the wait far past the old 5-minute budget and asserts it still
+  // relaunches.
+  test('waits well past the old 300s timeout and still relaunches', async () => {
     const storage = fakeStorage([intent({ sessionId: 'sess-resume' })]);
+    const resumeIds: (string | null)[] = [];
+    let polls = 0;
+    // 10s poll interval × 200 polls = ~33 minutes of simulated waiting.
+    const POLLS_BEFORE_RESTART = 200;
+    let call = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      pollIntervalMs: 10_000,
+      reassureAfterMs: 5 * 60_000,
+      reassureIntervalMs: 2 * 60_000,
+      launch: async (rid) => {
+        resumeIds.push(rid);
+        return ++call === 1
+          ? { exitCode: 137, sessionId: null, builderId: 'abcd1234' }
+          : { exitCode: 0, sessionId: 'sess-resume', builderId: 'abcd1234' };
+      },
+      daemonStatus: async () => (polls++ < POLLS_BEFORE_RESTART
+        ? { running: true, pid: 1, buildTime: 'dev' }
+        : { running: true, pid: 2, buildTime: 'dev' }),
+    }));
+    expect(resumeIds).toEqual([null, 'sess-resume']);
+    expect(result).toEqual({ exitCode: 0, sessionId: 'sess-resume' });
+    expect(storage.intents.size).toBe(0);
+    expect(polls).toBeGreaterThan(POLLS_BEFORE_RESTART);
+  });
+
+  // The reassurance line is the replacement for the timeout: it must appear
+  // periodically, name the manual resume as an OPTION, and never end the wait.
+  test('prints periodic reassurance while waiting, offering (not forcing) manual resume', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume' })]);
+    const logs: string[] = [];
+    let polls = 0;
+    let call = 0;
+    await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      pollIntervalMs: 10_000,
+      reassureAfterMs: 5 * 60_000,   // first line after 5 simulated minutes
+      reassureIntervalMs: 2 * 60_000, // then every 2
+      log: (m) => logs.push(m),
+      launch: async () => (++call === 1
+        ? { exitCode: 137, sessionId: null, builderId: 'abcd1234' }
+        : { exitCode: 0, sessionId: 'sess-resume', builderId: 'abcd1234' }),
+      // Restart after ~11 simulated minutes → 1 line at 5m, then 7m, 9m, 11m.
+      daemonStatus: async () => (polls++ < 66
+        ? { running: true, pid: 1, buildTime: 'dev' }
+        : { running: true, pid: 2, buildTime: 'dev' }),
+    }));
+    const reassurances = logs.filter(l => l.includes('Still waiting'));
+    expect(reassurances.length).toBeGreaterThanOrEqual(3);
+    expect(reassurances[0]).toContain('5m');
+    const all = logs.join('\n');
+    expect(all).toContain('This is not stuck');
+    expect(all).toContain('lazy builder --resume sess-resume');
+    // Reassurance is NOT an exit: the loop went on to relaunch.
+    expect(call).toBe(2);
+  });
+
+  // INVARIANT: the intent is consumed ONLY after committing to the relaunch.
+  // The one non-success exit is a DETECTABLY DEAD upgrade — the process that
+  // stopped this builder is gone and the daemon never came back with the new
+  // version. That is a real failure (missing credential, failed image build),
+  // so the loop reports THAT and leaves the intent in place for recovery.
+  test('upgrade process dies without completing → actionable failure, intent preserved', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume', upgradePid: 4242, upgradeHost: 'test-host' })]);
     const errors: string[] = [];
     let launches = 0;
     const result = await runBuilderRelaunchLoop(baseDeps({
       getStorage: async () => storage,
       launch: async () => { launches++; return { exitCode: 137, sessionId: null, builderId: 'abcd1234' }; },
-      // Daemon never restarts → upgrade never completes → timeout.
       daemonStatus: async () => ({ running: true, pid: 1, buildTime: 'dev' }),
+      isProcessAlive: () => false,
       errorOut: (m) => errors.push(m),
     }));
     expect(launches).toBe(1); // never relaunched
     expect(result.exitCode).toBe(1);
     expect(result.sessionId).toBeNull(); // footer suppressed
-    // Intent preserved for manual recovery.
-    expect(storage.intents.size).toBe(1);
-    // Actionable fallback printed with the resolved id.
-    expect(errors.join('\n')).toContain('lazy builder --resume sess-resume');
+    expect(storage.intents.size).toBe(1); // preserved for manual recovery
+    const text = errors.join('\n');
+    expect(text).toContain('exited without completing the upgrade');
+    // Never blames a timer — that was the misleading old message.
+    expect(text).not.toContain('Timed out');
+    expect(text).toContain('lazy builder --resume sess-resume');
+  });
+
+  // Race guard: `lazy upgrade` restarts the daemon and then exits, so "pid gone"
+  // and "daemon back" land nearly together in an order we don't control. A
+  // successful upgrade must NEVER be misreported as a dead one.
+  test('dead pid does not defeat a completing upgrade (completion is checked first)', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume', upgradePid: 4242, upgradeHost: 'test-host' })]);
+    let polls = 0;
+    let call = 0;
+    const errors: string[] = [];
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      isProcessAlive: () => false, // upgrade already exited
+      errorOut: (m) => errors.push(m),
+      launch: async () => (++call === 1
+        ? { exitCode: 137, sessionId: null, builderId: 'abcd1234' }
+        : { exitCode: 0, sessionId: 'sess-resume', builderId: 'abcd1234' }),
+      // baseline + one stale read, then the restarted daemon.
+      daemonStatus: async () => (polls++ < 2
+        ? { running: true, pid: 1, buildTime: 'dev' }
+        : { running: true, pid: 2, buildTime: 'dev' }),
+    }));
+    expect(result).toEqual({ exitCode: 0, sessionId: 'sess-resume' });
+    expect(errors).toEqual([]);
+  });
+
+  // A pid stamped on ANOTHER machine (shared/remote store) means nothing here —
+  // it must be ignored rather than used to declare the upgrade dead.
+  test('ignores an upgrade pid stamped on a different host', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume', upgradePid: 4242, upgradeHost: 'other-host' })]);
+    let polls = 0;
+    let call = 0;
+    let aliveChecked = false;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      currentHost: () => 'test-host',
+      isProcessAlive: () => { aliveChecked = true; return false; },
+      launch: async () => (++call === 1
+        ? { exitCode: 137, sessionId: null, builderId: 'abcd1234' }
+        : { exitCode: 0, sessionId: 'sess-resume', builderId: 'abcd1234' }),
+      daemonStatus: async () => (polls++ < 20
+        ? { running: true, pid: 1, buildTime: 'dev' }
+        : { running: true, pid: 2, buildTime: 'dev' }),
+    }));
+    expect(aliveChecked).toBe(false); // never probed a foreign-host pid
+    expect(result).toEqual({ exitCode: 0, sessionId: 'sess-resume' });
+  });
+
+  // An intent written by an older lazy carries no pid. Liveness is then unknown,
+  // and the safe default is to keep waiting — never to give up on a timer.
+  test('intent without an upgrade pid keeps waiting instead of failing', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume' })]);
+    let polls = 0;
+    let call = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      isProcessAlive: () => false, // would end the wait IF a pid were stamped
+      launch: async () => (++call === 1
+        ? { exitCode: 137, sessionId: null, builderId: 'abcd1234' }
+        : { exitCode: 0, sessionId: 'sess-resume', builderId: 'abcd1234' }),
+      daemonStatus: async () => (polls++ < 50
+        ? { running: true, pid: 1, buildTime: 'dev' }
+        : { running: true, pid: 2, buildTime: 'dev' }),
+    }));
+    expect(result).toEqual({ exitCode: 0, sessionId: 'sess-resume' });
+    expect(polls).toBeGreaterThan(50);
   });
 
   // sessionId resolution falls back to the newest captured conversation when the
@@ -290,6 +446,42 @@ describe('runBuilderRelaunchLoop', () => {
     expect(resumeIds).toEqual(['explicitly-resumed', 'explicitly-resumed']);
   });
 
+  // REGRESSION (fix-upgrade-relaunch-resume): the KILLED-builder path. When the
+  // container is SIGKILL'd, the in-container supervisor never runs its exit path,
+  // so the intent carries NO stamped sessionId. The host now recovers the id
+  // itself from the session JSONLs in the bind-mounted projects dir
+  // (src/builder/session-detect.ts) and reports it as the launch's sessionId —
+  // which the loop must prefer over the newest-conversation fallback, exactly as
+  // it prefers an explicit --resume id.
+  test('host-detected sessionId wins when the killed builder stamped nothing', async () => {
+    const storage = fakeStorage(
+      [intent({ sessionId: undefined })],
+      // A newer conversation from an unrelated session — the fallback would have
+      // resumed THIS, which is the bug ("relaunch does not resume").
+      [conv('unrelated-newest', '2026-05-31T23:00:00.000Z')],
+    );
+    const resumeIds: (string | null)[] = [];
+    let call = 0;
+    await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      launch: async (rid) => {
+        resumeIds.push(rid);
+        return ++call === 1
+          // Killed by `docker kill` (137) — but the host detected the session it
+          // was running from the JSONL mtimes.
+          ? { exitCode: 137, sessionId: 'host-detected', builderId: 'abcd1234' }
+          : { exitCode: 0, sessionId: 'host-detected', builderId: 'abcd1234' };
+      },
+      daemonStatus: (() => {
+        let n = 0;
+        return async () => (n++ === 0
+          ? { running: true, pid: 1 }
+          : { running: true, pid: 2 });
+      })(),
+    }));
+    expect(resumeIds).toEqual([null, 'host-detected']);
+  });
+
   // A storage hiccup during the peek must NOT turn a normal quit into an error:
   // a null storage handle is treated as "no intent" and the loop exits cleanly.
   test('null storage on peek → treated as no intent, clean single exit', async () => {
@@ -300,5 +492,84 @@ describe('runBuilderRelaunchLoop', () => {
     }));
     expect(launches).toBe(1);
     expect(result).toEqual({ exitCode: 0, sessionId: 'sid' });
+  });
+
+  /**
+   * INVARIANT (upgrade → relaunch → proxy env): the relaunched builder must
+   * resolve the proxy target AT RELAUNCH TIME, against the daemon that came
+   * back — not reuse the one resolved when `lazy builder` started.
+   *
+   * The daemon's proxy port is OS-assigned, so a restart moves it. The runner
+   * stamped the pre-upgrade address at createRunner time and nothing downstream
+   * re-resolves it (an already-set proxyUrl is treated as authoritative), so
+   * without this call the relaunched builder points ANTHROPIC_BASE_URL at a dead
+   * port and every model call fails until the human relaunches by hand.
+   *
+   * Ordering is part of the invariant: the refresh happens AFTER the upgrade is
+   * complete (so the new daemon is serving and the address is the live one) and
+   * BEFORE the child is launched with it.
+   */
+  test('re-resolves the live proxy target before each post-upgrade relaunch', async () => {
+    const events: string[] = [];
+    let launches = 0;
+    await runBuilderRelaunchLoop(baseDeps({
+      launch: async () => {
+        events.push('launch');
+        return launches++ === 0
+          ? { exitCode: 0, sessionId: null, builderId: 'abcd1234' }
+          : { exitCode: 0, sessionId: 'sid2', builderId: 'other' };
+      },
+      refreshProxyTarget: async () => { events.push('refresh-proxy'); },
+      ensureReady: async () => { events.push('ensure-ready'); },
+      getStorage: async () => fakeStorage([intent()]),
+      daemonStatus: (() => {
+        let n = 0;
+        return async () => (n++ === 0 ? { running: true, pid: 1 } : { running: true, pid: 2 });
+      })(),
+    }));
+    // The first launch is the pre-upgrade child (its target was resolved by
+    // createRunner); every relaunch is preceded by a fresh resolve.
+    expect(events).toEqual(['launch', 'refresh-proxy', 'ensure-ready', 'launch']);
+  });
+
+  /**
+   * INVARIANT: an unresolvable proxy at relaunch FAILS the relaunch — it never
+   * relaunches with the stale address (dead endpoint) and never drops the proxy
+   * (unaudited direct connection). The intent is left in place so the session
+   * stays recoverable by hand, and the guidance says so.
+   */
+  test('proxy refresh failure → no relaunch, intent preserved, actionable error', async () => {
+    const errors: string[] = [];
+    let launches = 0;
+    const storage = fakeStorage([intent()]);
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      launch: async () => { launches++; return { exitCode: 0, sessionId: null, builderId: 'abcd1234' }; },
+      refreshProxyTarget: async () => { throw new Error('[proxy] is enabled but lazy could not resolve the live proxy address.'); },
+      ensureReady: async () => { throw new Error('ensureReady must not run after a failed proxy refresh'); },
+      getStorage: async () => storage,
+      errorOut: (m) => errors.push(m),
+      daemonStatus: (() => {
+        let n = 0;
+        return async () => (n++ === 0 ? { running: true, pid: 1 } : { running: true, pid: 2 });
+      })(),
+    }));
+    expect(launches).toBe(1);
+    expect(result).toEqual({ exitCode: 1, sessionId: null });
+    // Intent NOT consumed — the human can still resume manually.
+    expect(storage.intents.has('abcd1234')).toBe(true);
+    const text = errors.join('\n');
+    expect(text).toContain('could not');
+    expect(text).toContain('lazy could not resolve the live proxy address');
+    expect(text).toContain('lazy builder --resume sess-resume');
+  });
+
+  // A normal quit must never touch the proxy: there is no relaunch to prepare.
+  test('no intent → the proxy target is never re-resolved', async () => {
+    let refreshes = 0;
+    await runBuilderRelaunchLoop(baseDeps({
+      refreshProxyTarget: async () => { refreshes++; },
+      getStorage: async () => fakeStorage([]),
+    }));
+    expect(refreshes).toBe(0);
   });
 });

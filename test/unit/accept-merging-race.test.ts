@@ -39,7 +39,16 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin', auto_approve: false, offline: false },
     storage: { backend: 'external', external_path: '' },
+    // ResolvedConfig always carries a fully-populated `automation` section, and
+    // acceptTask reads `config.automation.pre_accept` unguarded like every other
+    // required section. This test is about the merging-state race, not the
+    // pre-accept turn, so the step is disabled here.
+    automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
     models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    git: { default_branch_prefix: 'lazy' },
+    // Race behavior under test predates the edge gate; gate scenarios are
+    // covered by test/unit/edge-gate.test.ts + test/e2e/approve.test.ts.
+    protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true, passphrase_file: '.lazy/approve-passphrase' },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,

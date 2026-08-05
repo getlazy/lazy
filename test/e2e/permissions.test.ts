@@ -4,57 +4,24 @@
  * Verifies that the supervisor detects when agents modify or delete
  * protected files, while allowing pure additions.
  *
- * Tests use --follow so that `lazy start` waits for the mock supervisor
- * to write response.json, then reconciles before exiting. Without --follow,
- * `lazy start` returns immediately and no reconciliation happens — agent
- * turns and violations would never be recorded.
+ * Harness notes: this suite is daemonless, so every followed turn is a
+ * two-step dance.
+ *  - `--follow` makes `lazy start`/`lazy unblock` WAIT for the mock supervisor
+ *    to write response.json instead of returning the moment the agent launches.
+ *  - `runReconcile` then processes that response (records the agent turn,
+ *    detects violations, sets the status). Post-v0.11 only the daemon's
+ *    reconcile loop does this — `--follow` no longer reconciles on the way out,
+ *    so without the explicit pass no agent turn or violation is ever recorded.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { basename, join } from 'path';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from 'fs';
-import { homedir } from 'os';
+import { join } from 'path';
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-
-/**
- * Get the external storage directory for a test project.
- * In tests, there's no git remote, so getProjectName falls back to the
- * directory basename. External storage lives at ~/.lazy/<project-name>/.
- */
-function getStorageDir(root: string): string {
-  return join(homedir(), '.lazy', basename(root));
-}
-
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(getStorageDir(root), 'tasks');
-  const dirs = readdirSync(tasksDir);
-  const match = dirs.find(d => d.startsWith(shortId));
-  if (!match) throw new Error(`Task directory not found for ${shortId} in ${tasksDir}`);
-  return match;
-}
-
-function readTaskStatus(root: string, shortId: string): string {
-  const fullId = findFullTaskId(root, shortId);
-  const taskPath = join(getStorageDir(root), 'tasks', fullId, 'task.json');
-  const data = JSON.parse(readFileSync(taskPath, 'utf-8'));
-  return data.status;
-}
-
-function readTurns(root: string, shortId: string): Array<{
-  role: string;
-  content: string;
-  turn_type?: string;
-  actor?: string;
-  usage?: { cacheCreationTokens?: number; cacheReadTokens?: number };
-  violations?: Array<{ file: string; base_sha: string; status: string }>;
-}> {
-  const fullId = findFullTaskId(root, shortId);
-  const turnsPath = join(getStorageDir(root), 'tasks', fullId, 'turns.json');
-  const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
-  return data.turns;
-}
+import { createTask, disablePreAccept, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { runReconcile } from '../helpers/reconcile';
+import { readTaskStatus, readTurns, type StoredTurn } from '../helpers/storage';
 
 /**
  * The agent turn carrying the FINAL violation set. With the bundle model
@@ -62,7 +29,7 @@ function readTurns(root: string, shortId: string): Array<{
  * (a turn_type 'nudge' agent turn), NOT the work turn — so tests must look for the
  * latest agent turn that actually recorded violations.
  */
-function violationTurn(turns: ReturnType<typeof readTurns>) {
+function violationTurn(turns: StoredTurn[]) {
   return [...turns].reverse().find(t => t.role === 'agent' && t.violations && t.violations.length > 0);
 }
 
@@ -71,14 +38,13 @@ describe('file permission violations', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // The accept tests here assert on the violation gate, not on pre-accept;
+    // daemonless there is no runner to execute that extra agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
-    // Clean up external storage directory left at ~/.lazy/<project-name>
-    const storageDir = getStorageDir(ctx.root);
-    if (existsSync(storageDir)) {
-      rmSync(storageDir, { recursive: true, force: true });
-    }
+    // ctx.cleanup() removes the external storage dir too (see setup.ts).
     await ctx.cleanup();
   });
 
@@ -111,6 +77,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // Verify violations are stored on the push-back turn (the FINAL re-detected set)
@@ -155,6 +122,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // Verify no violations on the agent turn
@@ -198,6 +166,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     // Verify task is in conflict with pending violations
@@ -209,6 +178,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       {},
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
     // Verify violations are marked as rejected
@@ -253,6 +223,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
@@ -263,6 +234,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       {},
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
     // Verify violation statuses
@@ -308,6 +280,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
@@ -344,6 +317,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     // Resolve violations by unblocking (default = all rejected).
@@ -356,6 +330,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles2 } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
     // Now accept should work — violations are resolved
@@ -389,6 +364,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
@@ -432,6 +408,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
@@ -474,6 +451,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // Verify the custom pattern triggered a violation (on the push-back turn)
@@ -523,6 +501,7 @@ describe('file permission violations', () => {
         },
       },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // Verify NO violations remain on the work turn (agent reverted)
@@ -581,6 +560,7 @@ describe('file permission violations', () => {
         },
       },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // Violations persist on the PUSH-BACK turn (the final re-detected set), not
@@ -633,6 +613,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(result);
 
     // The turn completed (response was written) — push-back happened exactly once.
@@ -672,6 +653,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesTurn1 } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     // Verify turn 1: no violations (file is new — pure addition)
@@ -691,6 +673,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesTurn2 } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
     // Verify turn 2: still no violations — the file was created by this task (not pre-existing).
@@ -731,6 +714,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesFirstTurn } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
     // Verify first turn has no violations and status is 'blocked'
@@ -751,6 +735,7 @@ describe('file permission violations', () => {
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFilesSecondTurn } },
     );
+    await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
     // Verify the second turn's push-back carries the violations (detected on the

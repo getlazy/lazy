@@ -20,8 +20,28 @@ describe('lazy accept --wait', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // INVARIANT: `start` + `accept` need a real daemon. Daemonless, the task
+    // stays 'working' and accept refuses ("Task X is still working"). Mirrors
+    // accept-reason / accept-gates.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
+
+  /**
+   * Start a task and wait for the reconciler to move it out of 'working'. The
+   * explicit `wait` is mandatory because `start` launches the supervisor
+   * asynchronously under the daemon.
+   */
+  async function startAndWait(taskId: string): Promise<void> {
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+    expectSuccess(startResult);
+
+    const waitResult = await ctx.lazy(['wait', taskId]);
+    if (waitResult.exitCode !== 0) {
+      throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+    }
+  }
 
   afterEach(async () => {
     await ctx.cleanup();
@@ -31,10 +51,7 @@ describe('lazy accept --wait', () => {
   test('accept with --wait succeeds on clean merge (local driver)', async () => {
     const taskId = await createTask(ctx, 'Wait test', 'Add a file');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Add a non-conflicting file in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -53,10 +70,7 @@ describe('lazy accept --wait', () => {
   test('accept with --wait --yes --reason succeeds', async () => {
     const taskId = await createTask(ctx, 'Wait combined flags', 'Add a file');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     writeFileSync(join(worktreePath, 'combined.txt'), 'content\n');
@@ -74,10 +88,7 @@ describe('lazy accept --wait', () => {
   test('accept with --wait auto-invokes sync-with-upstream on conflict', async () => {
     const taskId = await createTask(ctx, 'Wait conflict test', 'Add a file');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Create conflicting content on main
     writeFileSync(join(ctx.root, 'conflict.txt'), 'main content\n');

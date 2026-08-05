@@ -5,14 +5,14 @@ import { createRunner } from '../../runner';
 import { theme, dim } from '../theme';
 import { renderStatusHeader } from '../status-header';
 import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
-import { readPendingProposals, type Proposal } from './propose';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
 import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
 import type { Task, Session, Turn, Commit, Comment, JournalEntry, FollowUp } from '../../types';
-import type { StatusChange } from '../../storage/types';
+import type { StatusChange, TagEvent } from '../../storage/types';
 import type { SupervisorStatus } from '../../protocol/types';
+import type { AgentFailureClass } from '../../agent/failure-taxonomy';
 import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
@@ -20,6 +20,7 @@ import { showFileViewer } from '../tui/file-viewer';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
 import { logger } from '../../utils/logger';
 import { existsSync, readFileSync } from 'fs';
+import { turnText } from '../../utils/turn-content';
 
 /**
  * Pre-loaded data for building task show output.
@@ -34,11 +35,19 @@ export interface TaskShowData {
   journal: JournalEntry[];
   followUps: FollowUp[];
   statusHistory: StatusChange[];
+  tagHistory: TagEvent[];
   children: Task[];
   childSessions: Map<string, Session | null>;
-  proposals: Proposal[];
   parent: Task | null;
-  retryStatus: { retryCount: number; errors: { count: number; message: string; firstSeen: string; lastSeen: string }[] } | null;
+  retryStatus: {
+    retryCount: number;
+    errors: { count: number; message: string; firstSeen: string; lastSeen: string; failure_class?: AgentFailureClass }[];
+    /** Taxonomy class of the latest failure — says WHY the turn is retrying. */
+    failureClass?: AgentFailureClass;
+    failureReason?: string;
+    /** Delay before the next attempt (ms), when the supervisor has scheduled one. */
+    nextDelayMs?: number;
+  } | null;
   orphanStatus: OrphanCheckResult | null;
   autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
   /** Supervisor status snapshot for working tasks (null when task is not working or status file is missing). */
@@ -69,6 +78,9 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
       retryStatus = {
         retryCount: status.retryCount ?? 0,
         errors: status.errors ?? [],
+        failureClass: status.retry_failure_class,
+        failureReason: status.retry_failure_reason,
+        nextDelayMs: status.retry_next_delay_ms,
       };
     }
 
@@ -93,7 +105,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   const journal = await storage.getTaskJournal(task.id);
   const followUps = await storage.getTaskFollowUps(task.id);
   const statusHistory = await storage.getStatusHistory(task.id);
-  const proposals = readPendingProposals(storage, task.id);
+  const tagHistory = await storage.getTagHistory(task.id);
 
   const parentId = parentTaskIdOf(task);
   const parent = parentId ? await storage.getTask(parentId) : null;
@@ -120,7 +132,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
+  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
 }
 
 /**
@@ -133,12 +145,18 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * rendering is identical in both modes — only the grouping/headers differ.
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showChunks = false): string[] {
-  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, children, childSessions, proposals, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
-  const taskStatusText = task.status === 'working' && workingSubstate
-    ? renderWorkingStatus(workingSubstate)
+  // Retry detail is stripped here: `show` already spells it out in the header
+  // line and the Retry State block, so repeating it in the status word would be
+  // the same error text three times on one screen.
+  const substateForStatus = workingSubstate && workingSubstate.kind === 'harness' && workingSubstate.retry
+    ? { ...workingSubstate, retry: undefined }
+    : workingSubstate;
+  const taskStatusText = task.status === 'working' && substateForStatus
+    ? renderWorkingStatus(substateForStatus)
     : task.status;
 
   // Supervisor status header (only for working tasks with a status file)
@@ -158,6 +176,9 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
   outputLines.push(`  ${theme.label('Model:')}   ${theme.model(task.model ?? '-')}`);
   outputLines.push(`  ${theme.label('Agent:')}   ${task.agent_id}`);
   outputLines.push(`  ${theme.label('Type:')}    ${task.type ?? 'task'}`);
+  if (task.tags && task.tags.length > 0) {
+    outputLines.push(`  ${theme.label('Tags:')}    ${task.tags.map(t => theme.tag('#' + t)).join(' ')}`);
+  }
 
   outputLines.push(`  ${theme.label('Created:')} ${theme.timestamp(formatDate(task.created_at))}`);
   if (task.completed_at) {
@@ -237,6 +258,14 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
     if (retryStatus) {
       outputLines.push(`\n  Retry State:`);
       outputLines.push(`    Retry Count:    ${retryStatus.retryCount}`);
+      if (retryStatus.failureClass) {
+        outputLines.push(
+          `    Failure:        ${retryStatus.failureClass}${retryStatus.failureReason ? ` — ${retryStatus.failureReason}` : ''}`,
+        );
+      }
+      if (retryStatus.nextDelayMs !== undefined) {
+        outputLines.push(`    Next Attempt:   in ${Math.round(retryStatus.nextDelayMs / 1000)}s`);
+      }
       if (retryStatus.errors.length > 0) {
         outputLines.push(`    Error Log (deduplicated, last 10):`);
         for (const err of retryStatus.errors) {
@@ -276,7 +305,8 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       // — is surfaced in the header so a reviewer can tell a real human/builder
       // turn from an automation turn.
       const renderTurn = (turn: typeof turns[number]) => {
-        const isErrorTurn = turn.role === 'agent' && turn.content.startsWith('[Agent crashed]');
+        const turnBody = turnText(turn);
+        const isErrorTurn = turn.role === 'agent' && turnBody.startsWith('[Agent crashed]');
         const usageSuffix = turn.usage
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
           : '';
@@ -297,7 +327,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
         if (showFull) {
           outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ---`);
           if (isErrorTurn) {
-            for (const line of turn.content.split('\n')) {
+            for (const line of turnBody.split('\n')) {
               outputLines.push(`    ${theme.error(line)}`);
             }
           } else {
@@ -306,7 +336,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
               outputLines.push(`\n    ${theme.label('--- Full prompt sent to agent ---')}\n`);
               outputLines.push(turn.prompt);
             } else {
-              outputLines.push(turn.content);
+              outputLines.push(turnBody);
             }
           }
           // Show check output in full view
@@ -317,11 +347,11 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
             }
           }
         } else {
-          const preview = turn.content.substring(0, 80).replace(/\n/g, ' ');
+          const preview = turnBody.substring(0, 80).replace(/\n/g, ' ');
           if (isErrorTurn) {
-            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${theme.error(preview)}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${theme.error(preview)}${turnBody.length > 80 ? '...' : ''}`);
           } else {
-            outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turn.content.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turnBody.length > 80 ? '...' : ''}`);
           }
         }
       };
@@ -447,21 +477,13 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
     }
   }
 
-  // Proposals
-  if (proposals.length > 0) {
-    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Proposals (${proposals.length} pending)`)} ${theme.separator('---')}`);
-    for (const p of proposals) {
-      const codeSuffix = p.code ? ` [${p.code}]` : '';
-      if (showFull) {
-        outputLines.push(`\n  ${theme.label('Goal:')} ${p.goal}${codeSuffix}`);
-        if (p.prompt) {
-          outputLines.push(`  ${theme.label('Prompt:')} ${p.prompt}`);
-        }
-        outputLines.push(`  ${theme.label('Created:')} ${theme.timestamp(formatDate(p.created_at))}`);
-      } else {
-        const goalPreview = p.goal.length > 60 ? p.goal.substring(0, 57) + '...' : p.goal;
-        outputLines.push(`  ${goalPreview}${codeSuffix}`);
-      }
+  // Tag History (append-only audit trail of every tag/untag, actor-attributed)
+  if (tagHistory.length > 0) {
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Tag History (${tagHistory.length})`)} ${theme.separator('---')}`);
+    for (const event of tagHistory) {
+      const verb = event.action === 'tag' ? theme.success('tagged') : theme.warning('untagged');
+      const actor = event.actor ? ` ${theme.label('by')} ${event.actor}` : '';
+      outputLines.push(`  [${theme.timestamp(formatDate(event.timestamp))}] ${verb} ${theme.tag('#' + event.tag)}${actor}`);
     }
   }
 
@@ -476,14 +498,15 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
   return outputLines;
 }
 
-export async function commandShow(args: string[]): Promise<void> {
+export async function commandShow(args: string[], invokedAs = 'show'): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
     { name: 'full', takesValue: false },
     { name: 'lines', takesValue: true },
     { name: 'json', takesValue: false },
     { name: 'chunks', takesValue: false },
-  ], 'show');
+    { name: 'flat', takesValue: false },
+  ], invokedAs);
 
   const taskId = parsed.positional[0];
   if (!taskId) {
@@ -506,10 +529,10 @@ export async function commandShow(args: string[]): Promise<void> {
 
   // Handle built-in prompt codes (lazy-prompt-* prefix)
   if (isBuiltinPromptCode(taskId)) {
-    const content = readBuiltinPrompt(taskId);
+    const content = await readBuiltinPrompt(taskId);
     if (!content) {
       // Show available prompts to help the user
-      const available = listBuiltinPrompts().map(p => p.code);
+      const available = (await listBuiltinPrompts()).map(p => p.code);
       console.error(`No built-in system prompt found for '${taskId}'.`);
       console.error(`\nAvailable prompts: ${available.join(', ')}`);
       console.error(`\nRun ${theme.command('lazy system prompts')} to see all built-in system prompts.`);
@@ -517,7 +540,7 @@ export async function commandShow(args: string[]): Promise<void> {
     }
 
     if (jsonOutput) {
-      const prompts = listBuiltinPrompts();
+      const prompts = await listBuiltinPrompts();
       const meta = prompts.find(p => p.code === taskId);
       console.log(JSON.stringify({
         type: 'prompt',
@@ -529,7 +552,7 @@ export async function commandShow(args: string[]): Promise<void> {
     }
 
     // Find the prompt metadata for display
-    const prompts = listBuiltinPrompts();
+    const prompts = await listBuiltinPrompts();
     const meta = prompts.find(p => p.code === taskId);
 
     const outputLines: string[] = [];
@@ -550,7 +573,17 @@ export async function commandShow(args: string[]): Promise<void> {
   }
 
   const showFull = parsed.flags.get('full') === true;
-  const showChunks = parsed.flags.get('chunks') === true;
+  // Turn grouping default depends on the invoked name: `lazy view` groups turns
+  // into review chunks by default (parity with `lazy review`, which groups by
+  // default), while the canonical `lazy show` stays flat by default so scripts
+  // reading its text output are undisturbed. `--chunks`/`--flat` force either
+  // mode explicitly on both; `--flat` wins if both are somehow passed.
+  const chunkedByDefault = invokedAs === 'view';
+  const showChunks = parsed.flags.get('flat') === true
+    ? false
+    : parsed.flags.get('chunks') === true
+      ? true
+      : chunkedByDefault;
 
   // Resolve as a task via daemon RPC
   const showResult = await queryTaskShow(taskId);
@@ -577,8 +610,11 @@ export async function commandShow(args: string[]): Promise<void> {
     // Build formatted options for each task
     const options: string[] = [];
     for (const t of showResult.matches) {
+      // Same columns as resolveTaskOrExit (src/cli/helpers.ts): the timestamp is
+      // what actually distinguishes two same-code tasks for a human, so `show`
+      // must not drop it while every other command shows it.
       const paddedStatus = t.status.padEnd(12);
-      options.push(`${shortId(t.id)}  ${paddedStatus}  ${t.goal}`);
+      options.push(`${shortId(t.id)}  ${paddedStatus}  ${formatDate(t.lastInteractionAt)}  ${t.goal}`);
     }
 
 
@@ -618,9 +654,22 @@ export async function commandShow(args: string[]): Promise<void> {
   const storage = await requireStorage();
   try {
     const conversations = await storage.listConversations();
-    const convMatch = conversations.find(
-      c => c.sessionId === taskId || c.sessionId.startsWith(taskId)
-    );
+    // Prefer an exact session-ID match; otherwise accept a unique prefix, the
+    // same way tasks resolve short IDs. A prefix matching more than one
+    // conversation is ambiguous — error rather than silently picking the first.
+    const exact = conversations.find(c => c.sessionId === taskId);
+    const prefixMatches = conversations.filter(c => c.sessionId.startsWith(taskId));
+    const convMatch = exact ?? (prefixMatches.length === 1 ? prefixMatches[0] : null);
+
+    if (!convMatch && prefixMatches.length > 1) {
+      console.error(`Multiple conversations match '${taskId}'. Use a longer prefix to disambiguate:`);
+      for (const c of prefixMatches) {
+        const firstUserMsg = c.messages.find(m => m.role === 'user');
+        const firstLine = firstUserMsg ? firstUserMsg.text.split('\n')[0].substring(0, 60) : '(no prompt)';
+        console.error(`  ${c.sessionId.substring(0, 8)}  ${firstLine}`);
+      }
+      process.exit(1);
+    }
 
     if (convMatch) {
       if (jsonOutput) {
@@ -646,7 +695,7 @@ export async function commandShow(args: string[]): Promise<void> {
         }
         return;
       }
-      await showConversationTranscript(storage, taskId, lineRange);
+      await showConversationTranscript(storage, convMatch.sessionId, lineRange);
       return;
     }
   } finally {
@@ -687,7 +736,7 @@ export async function commandShow(args: string[]): Promise<void> {
 
 /** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
 function buildShowJson(data: TaskShowData): Record<string, unknown> {
-  const { task, session: sess, turns, commits, comments, journal, followUps, children, proposals, retryStatus, autoReactStatus } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, children, retryStatus, autoReactStatus } = data;
 
   const jsonData: Record<string, unknown> = {
     id: task.id,
@@ -695,6 +744,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     goal: task.goal,
     status: task.status,
     type: task.type ?? 'task',
+    priority: task.priority ?? 'normal',
     model: task.model,
     agent_id: task.agent_id,
     prompt: task.prompt || null,
@@ -721,7 +771,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     turns: turns.map(t => ({
       sequence: t.sequence,
       role: t.role,
-      content: t.content,
+      content: turnText(t),
       prompt: t.prompt ?? null,
       timestamp: t.timestamp,
       usage: t.usage,
@@ -756,13 +806,6 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       goal: c.goal,
       status: c.status,
     })),
-    proposals: proposals.map(p => ({
-      goal: p.goal,
-      code: p.code || null,
-      prompt: p.prompt || null,
-      status: p.status,
-      created_at: p.created_at,
-    })),
   };
 
   if (retryStatus) {
@@ -777,7 +820,7 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
 }
 
 export function showUsage(): void {
-  console.log(`Usage: lazy show <id> [--full] [--chunks] [--lines N..M] [--json]
+  console.log(`Usage: lazy show|view <id> [--full] [--chunks] [--flat] [--lines N..M] [--json]
 
 Show detailed information about a task, conversation, or file.
 
@@ -796,10 +839,17 @@ Arguments:
   <id>         Task ID, task code, conversation session ID, file path,
                or built-in prompt code
 
+Turn grouping:
+  'lazy view' groups turns into review chunks by default (parity with the
+  'lazy review' TUI); the canonical 'lazy show' lists turns flat by default.
+  Use --chunks or --flat to force either mode regardless of how it was invoked.
+
 Options:
   --full       Show complete turn and comment content instead of truncated preview
   --chunks     Group turns into review chunks (one human/builder boundary plus its
                following agent/supervisor/system turns) instead of a flat list
+  --flat       List turns flat (the default for 'lazy show'; overrides the chunked
+               default of 'lazy view')
   --lines N..M Return only lines N through M of the output (1-indexed, inclusive)
                Formats: N..M (range), N.. (from N to end), ..M (start to M)
   --json       Output as structured JSON instead of human-readable text
@@ -809,6 +859,8 @@ Examples:
   lazy show abc1                              # Prefix matching works
   lazy show abc1 --full                       # Show full turn and comment content
   lazy show abc1 --chunks                     # Group turns by human/builder review boundary
+  lazy view abc1                              # Turns grouped into chunks by default
+  lazy view abc1 --flat                       # Force the flat turn list
   lazy show abc1 --lines 10..20               # Show only lines 10-20 of output
   lazy show abc1 --lines 50..                 # Show from line 50 to end
   lazy show abc1 --json                       # Output task as JSON

@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
 
 /** Latest commit body on the given branch. */
 function lastCommitBody(ctx: TestContext, branch: string): string {
@@ -23,12 +23,9 @@ function lastCommitBody(ctx: TestContext, branch: string): string {
 /** Start a root task that makes a commit, then return its id. */
 async function startCommittedTask(ctx: TestContext, goal: string): Promise<string> {
   const id = await createTask(ctx, goal, 'Do the work');
-  const start = await ctx.lazyMocked(
-    ['start', id, '--yes'],
-    MOCK_CLAUDE_SUCCESS,
-    { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-  );
-  expectSuccess(start);
+  // Reconcile too: accept refuses a task that is still 'working', and only a
+  // reconcile pass moves it to 'blocked'.
+  await startAndReconcile(ctx, id);
   return id;
 }
 
@@ -37,6 +34,9 @@ describe('commit/PR fidelity (local driver squash message)', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: no runner exists to execute the pre-accept agent turn,
+    // and these tests assert on the squash commit body, not on pre-accept.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {

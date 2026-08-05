@@ -24,9 +24,9 @@ export { startDaemonServer, type RunningDaemon, type DaemonServerOptions } from 
 export { formatDashboardUrl } from './dashboard-url';
 export { enumerateDaemons, writeDaemonRoot, type DaemonRecord } from './registry';
 export { ensureDaemon } from './auto-start';
-export { DaemonClient, DaemonNotRunningError, tryRpc } from './client';
+export { DaemonClient, DaemonNotRunningError, NotALazyProjectError, tryRpc } from './client';
 export { setDaemonContext, getDaemonContext } from './context';
-export { queryTaskList, queryBlockedTasks, queryActiveTasks, queryTaskShow, querySearch, queryDiff, queryWait, queryStartTask, queryDaemonMcpConfig } from './rpc-fallback';
-export type { ListResult, ShowResult, SearchQueryResult, DiffResult, WaitResult, StartTaskRpcResult, DaemonMcpConfigResult } from './rpc-fallback';
+export { queryTaskList, queryBlockedTasks, queryActiveTasks, queryTaskShow, querySearch, queryDiff, queryWait, queryStartTask, queryDaemonMcpConfig, queryRevokeDaemonMcpToken } from './rpc-fallback';
+export type { ListResult, ShowResult, SearchQueryResult, DiffResult, WaitResult, StartTaskRpcResult, DaemonMcpConfigResult, RevokeDaemonMcpTokenResult } from './rpc-fallback';
 export type { AutoReactTrigger, AutoReactDecision } from './auto-react-budget';
 export type { AutoReactBudgetEntry } from './lifecycle';

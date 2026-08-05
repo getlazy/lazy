@@ -9,48 +9,26 @@
  *
  * Like the permissions e2e tests, these run the MOCK supervisor
  * (test/mocks/claude.ts#launchSupervisorAsync), which mirrors the real
- * supervisor's maintain check. Tests use --follow so `lazy start` waits for the
- * mock to write response.json, then reconciles before exiting.
+ * supervisor's maintain check.
+ *
+ * Harness notes: this suite is daemonless, so every followed turn is a two-step
+ * dance.
+ *  - `--follow` makes `lazy start` WAIT for the mock supervisor to write
+ *    response.json instead of returning the moment the agent launches.
+ *  - `runReconcile` then processes that response (records the work turn and the
+ *    nudge turn pair, sets the status). Post-v0.11 only the daemon's reconcile
+ *    loop does this — `--follow` no longer reconciles on the way out, so without
+ *    the explicit pass no agent turn or nudge is ever recorded.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { basename, join } from 'path';
-import { readFileSync, writeFileSync, readdirSync, existsSync, rmSync } from 'fs';
-import { homedir } from 'os';
+import { join } from 'path';
+import { readFileSync, writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-
-function getStorageDir(root: string): string {
-  return join(homedir(), '.lazy', basename(root));
-}
-
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(getStorageDir(root), 'tasks');
-  const match = readdirSync(tasksDir).find(d => d.startsWith(shortId));
-  if (!match) throw new Error(`Task directory not found for ${shortId}`);
-  return match;
-}
-
-function readTaskStatus(root: string, shortId: string): string {
-  const fullId = findFullTaskId(root, shortId);
-  const taskPath = join(getStorageDir(root), 'tasks', fullId, 'task.json');
-  return JSON.parse(readFileSync(taskPath, 'utf-8')).status;
-}
-
-interface StoredTurn {
-  role: string;
-  content: string;
-  turn_type?: string;
-  actor?: string;
-  usage?: { cacheCreationTokens?: number; cacheReadTokens?: number };
-}
-
-function readTurns(root: string, shortId: string): StoredTurn[] {
-  const fullId = findFullTaskId(root, shortId);
-  const turnsPath = join(getStorageDir(root), 'tasks', fullId, 'turns.json');
-  return JSON.parse(readFileSync(turnsPath, 'utf-8')).turns as StoredTurn[];
-}
+import { runReconcile } from '../helpers/reconcile';
+import { readTaskStatus, readTurns } from '../helpers/storage';
 
 /** The first (work) agent turn's content — the clean task summary. */
 function readAgentTurnContent(root: string, shortId: string): string {
@@ -82,8 +60,7 @@ describe('maintained files automation', () => {
   });
 
   afterEach(async () => {
-    const storageDir = getStorageDir(ctx.root);
-    if (existsSync(storageDir)) rmSync(storageDir, { recursive: true, force: true });
+    // ctx.cleanup() removes the external storage dir too (see setup.ts).
     await ctx.cleanup();
   });
 
@@ -109,6 +86,7 @@ describe('maintained files automation', () => {
       },
     );
     expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
 
     const turns = readTurns(ctx.root, taskId);
 
@@ -161,6 +139,7 @@ describe('maintained files automation', () => {
       },
     );
     expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
 
     const content = readAgentTurnContent(ctx.root, taskId);
     expect(content).not.toContain('should-not-appear');
@@ -181,7 +160,11 @@ describe('maintained files automation', () => {
       { env: { LAZY_MOCK_MAINTAIN_RESPONSE: 'should-not-appear' } },
     );
     expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
 
+    // The work turn IS recorded — otherwise the nudge assertion below would pass
+    // vacuously on an empty turn list.
+    expect(readTurns(ctx.root, taskId).some(t => t.role === 'agent')).toBe(true);
     // No-op turn → no nudge turns at all.
     expect(readTurns(ctx.root, taskId).some(t => t.turn_type === 'nudge')).toBe(false);
   });
@@ -226,6 +209,7 @@ describe('maintained files automation', () => {
       },
     );
     expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
 
     // Violation kept → conflict (the push-back response carries the final set).
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
@@ -277,6 +261,7 @@ describe('maintained files automation', () => {
       },
     );
     expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
 
     // Violation resolved → blocked, not conflict. Maintain still fires.
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');

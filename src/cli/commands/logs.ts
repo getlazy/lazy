@@ -12,6 +12,7 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'fs';
 import { parseFlags, requireLazyRoot } from '../helpers';
 import { getLogPath } from '../../daemon/paths';
+import { writeStdout } from '../../utils/stdio';
 import { isDaemonRunning } from '../../daemon';
 
 export async function commandLogs(args: string[]): Promise<void> {
@@ -64,8 +65,11 @@ export async function commandLogs(args: string[]): Promise<void> {
     ? lines.filter(line => line.includes(filterPattern!))
     : lines;
 
-  for (const line of filtered) {
-    process.stdout.write(line + '\n');
+  // One drained write, not N bare ones: `lazy logs -n 50000 | grep …` exits via
+  // process.exit() the moment this returns, and anything still queued in the
+  // pipe is discarded (see src/utils/stdio.ts). Batching also avoids N syscalls.
+  if (filtered.length > 0) {
+    await writeStdout(filtered.join('\n') + '\n');
   }
 
   if (!follow) return;

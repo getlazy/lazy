@@ -6,12 +6,6 @@
 * A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
 * A [software development lifecycle](#the-task-manager) tool integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
 
-`lazy` is thus [my](https://github.com/ierceg) attempt to raise the abstraction on three different fronts at the same time:
-
-* **Agents**: rather than working interactively with *coding* agents, `lazy` offers a way to work asynchronously with them *and* interactively with the intelligent orchestrator which is *also* aware of the prompts repository *and* task management features.
-* **Prompts**: rather than throwing them away, `lazy` captures them so that both humans and agents can reference them and learn from them.
-* **Source control**: rather than dealing with low-level pinnings of `git`, `lazy` wraps these mechanics into a task lifecycle management.
-
 ## What are the main benefits
 
 * Prolonged autonomous horizon for agents (hours not tens of minutes)
@@ -40,6 +34,9 @@ lazy start <task-id>
 # Review the agent's work while chatting with agent itself
 lazy review -i <task-id>
 
+# Or ask a single read-only question without entering the review TUI
+lazy ask <task-id> --message "why did you drop the retry?"
+
 # On a rare (and they truly *ought* to be rare) occasion you may need to pair directly
 # with the agent, use `lazy pair` to the agent's session but now with you in control
 lazy pair <task-id>
@@ -50,6 +47,9 @@ lazy chat <finished-task-id>
 
 # Accept and merge to main
 lazy accept <task-id>
+
+# Protect tasks (or non-lazy git branches) you don't want to allow builders to merge into
+lazy protect <task-id or branch-name> on # And take off protection by passing `off` instead
 
 # Or reject if it's not right
 lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
@@ -108,7 +108,17 @@ On one hand I felt that by throwing away prompts, we are not raising the abstrac
 
 On the other hand, I was tired of "pair programming" with coding assistants but felt that current tooling was not optimal for what I was trying to do. I don't want to chat with agents and become a blocker. Instead, I want to give them actionable feedback, asynchronously, on my own good time, and let them do their thing in the meantime.
 
-For the record, I see a lot of people building and running their own orchestration layer and I think it's great. I expected this and I'm certainly not part of the 1st wave but more of "fine, I'll do it myself" wave. I expect this trend to continue leading to fragmentation the like of which we have not see since Linux distro ecosystem bloom.
+Finally, I felt that forges were just not able to deal with the way I wanted to work, with a *lot* of automated comments, reviews, etc. They were built for humans and it was obvious they were not designed to deal with the new workflows that were emerging.
+
+Finally, finally, I also decided to make an experiment of building a useful software system from scratch with **zero** coding on my part. At that at least I have succeeded.
+
+`lazy` is thus [my](https://github.com/ierceg) attempt to raise the abstraction on three different fronts at the same time:
+
+* **Prompts**: rather than throwing them away, `lazy` captures them so that both humans and agents can reference them and learn from them.
+* **Agents**: rather than working interactively with *coding* agents, `lazy` offers a way to work asynchronously with them *and* interactively with the intelligent orchestrator which is *also* aware of the prompts repository *and* task management features.
+* **Source control**: rather than dealing with low-level pinnings of `git`, `lazy` wraps these mechanics into a task lifecycle management.
+
+I see a lot of people building and running their own orchestration layer and I think it's great. I expected this and I'm certainly not part of the 1st wave but more of "fine, I'll do it myself" wave. I expect this trend to continue leading to fragmentation the likes of which we have not see since Linux distro ecosystem bloom.
 
 ### Why name it `lazy`?
 
@@ -162,6 +172,8 @@ I want to make the default onboarding path both safe and easy and I think docker
 - Captures interactions (prompts, comments, feedback) in a searchable data store that agents themselves query during their work for improved situational awareness
 - Enables search, for both you and all agents, across all task conversations, prompts, turns, and comments
 
+That said, `lazy` *also* sits between your coding agent and the LLM model provider it is using, monitoring all the requests that are going through. Right now this is used for collecting statistics and intercepting *some* malicious tool calls but over time there are other things that can be done at this layer (e.g. smart model routing, automatic token optimization and so on)
+
 ### The orchestrator
 
 AKA "the `builder`".
@@ -170,11 +182,44 @@ AKA "the `builder`".
 - Use deterministic CLI tools for that task and work management including agent feedback
 - Or do both at the same time!
 
-All `builder` and autonomous agent sessions run in isolated containers with only the repo being mounted on them. Each tasks is also isolated in its own worktree and `git` branch.
+All `builder` and autonomous agent sessions run in isolated containers with only the repo being mounted on them. Each task is also isolated in its own worktree and `git` branch. There are further differences:
+
+* `builder` sessions only have read-only access to repository. This is to prevent... builders too zealous to help with writing code. Builders are meant to orchestrate and that is enforced.
+* Agent sessions obviously get full access to the worktree and read-only access to the repository itself. But their access to repo's `.git` is split and they cannot move git refs on their own (they can only commit using `lazy_commit` MCP)
+* They are also isolated from one another in `lazy`'s daemon, each receiving a specific token to authenticate so that one agent cannot affect worktree of another agent.
 
 The process isolation is necessary as `lazy` runs **autonomous** agents which means that they are exposed to prompt injection risk. Furthermore, the `builder` agent, which while running interactively is not as exposed (you have to give it permissions to read things from the net), reviews summaries and code written by the autonomous agents which means that, through that channel, it is **also** exposed to prompt injections. The only entity *not* exposed to the prompt injection is the user. Hence it is the user that finally **must** accept the source code - after adequate reviews. I **strongly** encourage using deterministic security tools and review agents for the code written in this way.
 
 The current mechanism for this isolation is [Docker](https://docker.com). Docker is a lousy choice for *development* but it's easy to isolate. Alternative is to run `lazy` on its own VM and direct processes mode - but this is still highly experimental. I **strongly** discourage running `lazy` on the host in direct process mode as each agent runs fully autonomously and is therefore susceptible to prompt injections.
+
+#### Security posture — inherited account connectors are denied by default
+
+> **`lazy`'s model-traffic proxy denies inherited `mcp__claude_ai_*` account connectors by default.**
+
+**This is on by default.** All agent model traffic routes through `lazy`'s local Anthropic-native proxy (distinct from the orchestrator above) unless you turn it off — no configuration required, nothing to opt into. That chokepoint runs a **mechanistic, injection-proof policy engine** that inspects every `tool_use` an agent proposes *before it executes* and rewrites the response to block a violation — the call never runs, and the agent receives an explanatory denial so it course-corrects. The proxy is a passthrough: your existing credential is forwarded to the same upstream, so authentication is unchanged.
+
+The load-bearing reason this exists: an agent running under a **claude.ai account silently inherits that account's server-side connectors** — Gmail (read/draft/search), Google Drive, Calendar, Spotify and more — as live, callable tools. These `mcp__claude_ai_*` tools are injected by Anthropic from the authenticated account; **nothing in `lazy` or your local config enables them, and neither the OS sandbox nor Claude Code's own permission settings ever see them.** The proxy is the only place `lazy` controls where they can be stopped, so the default is closed:
+
+- **`mcp__claude_ai_*` connectors are denied by default**, allowlist-only. A denied connector call is blocked and the agent is told why.
+- **Secret/credential path reads are denied** (`~/.ssh`, `.env`, `.aws/credentials`, private keys, `.npmrc`, kubeconfig, …).
+- **Optional** path-glob denies and a WebFetch egress allowlist.
+
+These deterministic rules are the *real* security boundary — a prompt-injected agent cannot argue its way past a static rule, and the decision is identical for every backend (real Anthropic, Ollama, any Anthropic-native endpoint).
+
+To **allowlist** a specific connector you actually want an agent to use, name it exactly under `[proxy.policy]`:
+
+```toml
+[proxy.policy]
+enforce = true                    # default true
+connector_allowlist = [           # re-allow only these inherited connectors, by exact tool name
+  "mcp__claude_ai_gmail_search_threads",
+]
+deny_secret_path_reads = true     # default true
+# deny_path_globs = ["/etc/**", "**/*.key"]
+# egress_allowlist = ["api.github.com"]   # empty/unset = egress unrestricted
+```
+
+To opt out of the proxy entirely — direct connections, **no audit trail and no enforcement** — set `[proxy] enabled = false`. If the proxy cannot start, the daemon refuses to start rather than silently connecting direct, because a silent fallback would leave the audit trail lying by omission.
 
 #### My MO for polishing
 
@@ -253,6 +298,31 @@ export ANTHROPIC_API_KEY="your-key-here"
 claude setup-token
 # Then set CLAUDE_CODE_OAUTH_TOKEN
 ```
+
+The credential is **required for the daemon to run at all**. The daemon is what
+launches task containers, and those containers inherit its credential — so a
+daemon without one would spawn agents that cannot reach the model API. Every
+path that starts a daemon (`lazy daemon start`, `lazy daemon restart`, `lazy
+upgrade`, and the auto-start that fires on any ordinary `lazy` command) refuses
+with an actionable error when neither variable is set. A variable that is set
+but blank — what a failed `export CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)`
+leaves behind — counts as absent.
+
+The check is presence-only and never calls the API: daemon startup must not
+depend on network reachability, and a credential that is valid at start can
+expire an hour later anyway. A credential that is present but rejected surfaces
+as a 401/403 from the model API in the agent's own output.
+
+Because the daemon owns the credential, `lazy doctor` reports on the **daemon's**
+environment rather than the shell you run it in — so exporting the token only for
+the daemon no longer reads as "not authenticated", and a stale token lingering in
+your shell no longer reads as healthy. It asks the daemon over its local socket,
+which answers with presence and the variable *name* only; the credential itself
+never travels back. If the daemon cannot be asked, doctor still answers from your
+shell but labels the result `shell env: …` and says why.
+
+If you run a local model instead, enable `[models.roles.*]` in `lazy.toml` — the gate is
+skipped for Ollama-backed setups, which use local dummy credentials.
 
 For GitHub integration (optional):
 
@@ -338,7 +408,7 @@ Agents work in isolation — each runs in its own Docker container with a dedica
 Agents are harnessed into a deterministic turn lifecycle. On every turn, the agents will:
 
 * Merge upstream changes (changes on the branch of the parent task) and resolve conflicts
-* Work on the prompt as they see fit, fully autonomously, committing as they go along
+* Work on the prompt as they see fit, fully autonomously, committing as they go along through `lazy_commit` (direct `git` ref writes are forbidden in containers)
 * Stop their turn by leaving the summary of their work
 * Be automatically prompted back into action if they have made changes to protected paths (e.g. unit tests)
 * Be automatically prompted back into action if they have *not* made changes to maintained files (e.g. docs, architecture diagrams, changelog)
@@ -361,11 +431,14 @@ A unit of work consists of a **goal** (one-line description) and **prompt** (det
 - `interrupted` — Container crashed or was stopped
 - `complete` — Accepted and merged
 - `abandoned` — Rejected and closed
-- `closed` — Closed without work (cancelled)
+- `queued` - Queued for execution
+- `conflict` - Blocked and ready for review with a conflict on protected files
+- `submitted` - Submitted for the review on the remote repository
+- `merging` - In the process of being merged
 
-Tasks can have child tasks (created via branching or proposals) for exploring alternatives or follow-up work. These child tasks naturally merge into parent's branch. They also naturally merge advances from their parent's branch (`sync` in `lazy`'s parlance)
+Tasks can have child tasks, which can be created externally or by the agent itself decomposing its own work into subtasks (which it can then wait on, review, unblock, accept and so on) for exploring alternatives or follow-up work. These child tasks only ever merge into parent's branch and they also receive, when in blocked state, merges from the parent's branch and are thus always kept up to date (this is called `sync` in `lazy`'s parlance and can be invoked manually with `lazy sync`)
 
-#### Task Lifecycle Flow
+#### Basic Task Lifecycle Flow
 
 The happy path for a task:
 
@@ -389,9 +462,9 @@ A single message in the conversation which can come from the following actors:
 
 * Human/engineer (obviously)
 * Builder: engineer's "agentic team lead"
-* Supervisor: lazy's task harness which enforces mechanistic order in agent's work (merge first, then work, then run post-turn checks, etc.)
+* Supervisor: `lazy`'s task harness which enforces mechanistic order in agent's work (merge first, then work, then run post-turn checks, etc.)
 * Agent (the agent actually doing the development work)
-* System: actions that lazy takes independent of any supervisor/agent sessions (e.g. automatic syncs, resuming an interrupted task, etc.)
+* System: actions that `lazy` takes independent of any supervisor/agent sessions (e.g. automatic syncs, resuming an interrupted task, etc.)
 
 Each turn records:
  
@@ -422,6 +495,19 @@ lazy review -i <task-id>
 ```
 
 This allows you to read the agent's summary of the last turn, ask questions about parts of it (by splitting hunks similar to the way `git add -p` does) and provide direct feedback to the agent that it should take on the next turn.
+
+When you only have one question and don't want the TUI, `lazy ask` runs the same read-only, plan-mode turn from the command line:
+
+```
+lazy ask <task-id> --message "why did you drop the retry?"
+lazy ask <task-id>                                  # opens $EDITOR for the question
+echo "what changed in auth.ts?" | lazy ask <task-id>
+lazy ask <task-id> -m "summarize your diff" --json  # {taskId, answer, sessionId, turnNumber, ...}
+```
+
+The task must be `blocked` or `conflict` and must have run at least once. The answer goes to stdout and progress to stderr, so it pipes cleanly. The ask never unblocks the task, commits, or touches the worktree — the task's status is restored when the answer comes back.
+
+With no `--message` and nothing piped, `$EDITOR` opens for the question, so a pasted stack trace or diff hunk keeps its line breaks. As everywhere else in `lazy`, what you type is saved to `.lazy/recovery/` before it is sent and is only discarded once the agent has answered.
 
 ### Follow ups
 
@@ -457,7 +543,7 @@ Searches all tasks, turns, commits, comments, and imported conversations. Agents
 lazy search "code:a-task"
 ```
 
-Searches for all the tasks with `a-task` code. Codes are not unique so lazy will offer to disambiguate.
+Searches for all the tasks with `a-task` code. Codes are not unique so `lazy` will offer to disambiguate.
 
 For more details:
 
@@ -465,9 +551,37 @@ For more details:
 lazy search --help
 ```
 
+### Tags
+
+Tags group tasks into lightweight, non-hierarchical efforts — think `[onboarding]`, `[launch]`, `[infra]`. A task can carry several tags at once, so the same work can belong to multiple efforts without any parent/child relationship.
+
+```bash
+lazy tag add-auth onboarding launch     # Add one or more tags
+lazy untag add-auth launch              # Remove a tag
+lazy create --goal "Add SSO" --tag onboarding   # Tag at creation (repeatable)
+```
+
+Tags are normalized to lowercase alphanumerics and hyphens (`[Onboarding]` → `onboarding`). Every tag/untag is recorded as an append-only, actor-attributed history event (who did it, when) that `lazy show` surfaces alongside the status history — untagging never erases the earlier tagging event.
+
+Filter and search by tag:
+
+```bash
+lazy list --tag onboarding      # Non-terminal tasks tagged 'onboarding'
+lazy blocked --tag launch       # Blocked tasks tagged 'launch'
+lazy search 'tag:infra AND status:blocked'   # Combine with other filters
+```
+
+Builders manage tags over MCP with the `lazy_tag` / `lazy_untag` tools (attributed to the `builder` actor); CLI tagging is attributed to `human`.
+
+### Memory
+
+`lazy` automatically consolidates memories that builders are forming. Use `lazy memory` to see the list of the memories that have been captured in your project. You can list them, save them, remove them and so on. See `lazy memory --help` for more details.
+
+The memories are automatically injected into the agent's prompt and so they do use tokens automatically. See `lazy memory compact --help` for more details on how to manage that.
+
 ### Reports
 
-Usually I work on multiple initiatives within the same project and my knowledge is usually more shallow than engineering level. Hence I act more either as a lead engineer or engineering manager and `lazy report` allows me to deliberately pass over the details one more time by going over the lazy tasks *and* independent commits and summarizing them ()
+Usually I work on multiple initiatives within the same project and my knowledge is usually more shallow than engineering level. Hence I act more either as a lead engineer or engineering manager and `lazy report` allows me to deliberately pass over the details one more time by going over the `lazy` tasks *and* independent commits and summarizing them ()
 
 ```bash
 # To generate report and dump it as Markdown into stdout
@@ -685,10 +799,16 @@ Amen. He was (mostly) talking about runtime concurrency of a software system but
 To shell into the task's worktree just run:
 
 ```bash
-lazy shell task-id
+lazy shell <task-id>
 ```
 
-Note that in this case you will be shelling into the worktree on the **host** and not the agent's container. Same as `pair` this is an escape hatch for any issues with Docker: here you can build and run everything with your host tooling.
+Note that in this case you will be shelling into the worktree on the **host** and not the agent's container: here you can build and run everything with your host tooling.
+
+If you want to just execute something, also on the host side, you can use command form:
+
+```bash
+lazy shell <task-id> -- <command>
+```
 
 ### Remote Syncing
 
@@ -738,6 +858,22 @@ lazy upgrade
 It will warn you if any of the agents is working on a task.
 
 If you have an interactive `lazy builder` session open (docker/podman), `lazy upgrade` restarts it to apply the new image and the session **auto-resumes in place** — same conversation, same terminal, no manual `--resume`. Before it stops a live builder, upgrade warns you to submit any in-progress message first: the conversation is preserved, but a message you've typed into the builder and not yet sent cannot be recovered. Host-process builders aren't stopped by upgrade, so there's nothing to resume there.
+
+#### Non-disruptive image refresh
+
+When a new Claude Code version ships and you only want **future** sessions to pick it up — without interrupting anything currently running — use:
+
+```bash
+lazy upgrade --images
+```
+
+This rebuilds only the project's container image, with `--no-cache` so the newly-released Claude Code (installed inside the image) is actually re-fetched. It stops nothing, does not rebuild the agent binary, and does not restart the daemon, so running builders and agents keep working uninterrupted. Because a Docker container holds its image by ID once launched, only **newly-created** containers use the refreshed image:
+
+- **New / queued tasks**, and **interrupted tasks** that then auto-resume — immediately (their container is created fresh).
+- **Running builders** — on their next relaunch (a live builder keeps its image).
+- **Working agents** and **blocked tasks** — when their container is next recreated. A blocked task reuses its still-running supervisor on the next unblock, so it does *not* switch on the next turn; it adopts the new image only after its container is recreated (daemon restart, interruption, or crash).
+
+For an immediate, disruptive switch of everything (stop containers, rebuild image **and** agent binary, restart daemon), run a full `lazy upgrade`. `--images` only applies to docker/podman runners — with the host-process runner there is no container image, and Claude Code runs from your host installation. Add `--dry-run` to preview without building.
 
 ### Waiting on a Task
 
@@ -882,7 +1018,7 @@ lazy daemon list        # shows every daemon on the host; strays are marked (str
 lazy daemon kill-stray  # reaps only daemons whose project root no longer exists
 ```
 
-This can happen when there is a deamon from a deleted project squatting on a port.
+This can happen when there is a daemon from a deleted project squatting on a port.
 
 ## Support
 

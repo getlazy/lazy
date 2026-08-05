@@ -1,10 +1,19 @@
-import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync, rmSync, existsSync } from 'fs';
-import { join, basename } from 'path';
-import { homedir } from 'os';
+/**
+ * E2E tests for `lazy sync`.
+ *
+ * NOTE ON SCOPE: global `lazy sync` (fetch PR comments, check CI, export
+ * branches, post artifacts) no longer exists as a CLI command — it moved into
+ * the daemon's reconcile loop (src/daemon/remote-sync.ts). The only remaining
+ * CLI surface is `lazy sync <task_id>`: merge upstream into ONE task's
+ * worktree. These tests cover that surface plus the guidance the bare command
+ * now prints. Retry/backoff behavior lives in sync-retry.test.ts.
+ */
+
+import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, startAndReconcile } from '../helpers/fixtures';
+import { setTaskStatus } from '../helpers/storage';
 
 describe('lazy sync', () => {
   let ctx: TestContext;
@@ -17,90 +26,58 @@ describe('lazy sync', () => {
     await ctx.cleanup();
   });
 
-  test('sync requires a remote driver', async () => {
-    // Default config uses local driver
+  test('bare `lazy sync` points at the daemon and the per-task form', async () => {
     const result = await ctx.lazy(['sync']);
     expectFailure(result);
-    expectError(result, 'Sync requires a remote driver');
+    expectError(result, 'Global sync is now handled automatically by the daemon.');
+    expectError(result, 'lazy sync <task_id>');
+    expectError(result, 'lazy daemon start');
   });
 
   test('sync shows help', async () => {
     const result = await ctx.lazy(['sync', '--help']);
     expectSuccess(result);
-    expectOutput(result, 'Sync lazy tasks with your remote repository');
-    expectOutput(result, 'Fetches PR comments from remote');
-    expectOutput(result, 'Checks CI status and comments on tasks with failures');
-    expectOutput(result, 'Human review feedback');
-    expectOutput(result, 'Notes added via lazy comment');
+    expectOutput(result, 'Usage: lazy sync <task_id>');
+    expectOutput(result, "Merge upstream changes into a task's worktree by task ID.");
+    expectOutput(result, 'Task must be blocked/conflict/interrupted (not working)');
+    expectOutput(result, 'Global remote sync');
   });
 
-  test('sync with github driver prints sync messages', async () => {
-    // Configure github driver
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, '[remote]\ndriver = "github"\ngithub_auto_push = true\n');
-
-    // Sync will fail gracefully since gh CLI is not available in test env
-    // but it should at least try to run and show the right messages
-    const result = await ctx.lazy(['sync']);
-    const output = result.stdout + result.stderr;
-    // Should show sync header and export section
-    expect(output.includes('Syncing with remote')).toBe(true);
-    expect(output.includes('Exporting task branches')).toBe(true);
-    // Should show import and export sections
-    expect(output.includes('Fetching PR comments')).toBe(true);
-    expect(output.includes('Checking CI status')).toBe(true);
-    expect(output.includes('Posting task artifacts to PRs')).toBe(true);
+  test('sync rejects an unknown task', async () => {
+    const result = await ctx.lazy(['sync', 'deadbeef']);
+    expectFailure(result);
+    expectError(result, 'Task not found: deadbeef');
   });
 
-  test('sync always includes external change detection', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, '[remote]\ndriver = "github"\ngithub_auto_push = true\n');
+  test('sync rejects a task that was never started', async () => {
+    const taskId = await createTask(ctx, 'Never started', 'Do work');
 
-    const result = await ctx.lazy(['sync']);
-    const output = result.stdout;
-    // Should have both sections
-    expect(output.includes('Detecting external changes')).toBe(true);
-    expect(output.includes('Exporting task branches')).toBe(true);
+    const result = await ctx.lazy(['sync', taskId]);
+    expectFailure(result);
+    expectError(result, 'has no session');
+    expectError(result, `lazy start ${taskId}`);
   });
 
-  test('sync skips working tasks', async () => {
-    // Create and start a task so it has a session
+  test('sync refuses to run while the agent is working', async () => {
     const taskId = await createTask(ctx, 'Working task', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId);
 
-    // Manually set task status back to 'working' (simulates an agent actively running)
-    // External storage puts tasks in ~/.lazy/<project-name>/tasks/
-    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
-    const entries = readdirSync(tasksDir);
-    const fullId = entries.find(e => e.startsWith(taskId));
-    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
-    const taskJsonPath = join(tasksDir, fullId, 'task.json');
-    const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
-    taskData.status = 'working';
-    writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2) + '\n');
+    // Put the task back into `working` — the state sync must refuse, because
+    // merging upstream under a running agent would rewrite its worktree.
+    setTaskStatus(ctx.root, taskId, 'working');
 
-    // Remove the protocol response.json so reconciliation doesn't transition
-    // the task out of 'working' when sync runs
-    const protoTaskDir = join(ctx.protocolBase, fullId);
-    const responsePath = join(protoTaskDir, 'response.json');
-    if (existsSync(responsePath)) {
-      rmSync(responsePath);
-    }
+    const result = await ctx.lazy(['sync', taskId]);
+    expectFailure(result);
+    expectError(result, 'is currently working');
+    expectError(result, 'Cannot sync while agent is running');
+  });
 
-    // Configure github driver and run sync
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, '[remote]\ndriver = "github"\ngithub_auto_push = true\n');
+  test('sync reports a blocked task with no upstream changes as up to date', async () => {
+    const taskId = await createTask(ctx, 'Up to date task', 'Do work');
+    await startAndReconcile(ctx, taskId);
 
-    const syncResult = await ctx.lazy(['sync']);
-    const output = syncResult.stdout + syncResult.stderr;
-
-    // Sync should run (showing phase headers) but not crash
-    expect(output.includes('Syncing with remote')).toBe(true);
-    expect(output.includes('Sync complete')).toBe(true);
-
-    // Task should still be in 'working' state (sync did not change it)
-    const showResult = await ctx.lazy(['show', taskId]);
-    expectSuccess(showResult);
-    expectOutput(showResult, 'working');
+    const result = await ctx.lazy(['sync', taskId]);
+    expectSuccess(result);
+    expectOutput(result, 'Already up to date.');
   });
 });

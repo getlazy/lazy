@@ -7,35 +7,75 @@
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { readFileSync, writeFileSync, readdirSync } from 'fs';
+import { mkdtemp, rm } from 'fs/promises';
 import { join, basename } from 'path';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('per-task sync (syncTaskFromRemote)', () => {
   let ctx: TestContext;
+  const originDirs: string[] = [];
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // These tests `start` then `unblock`; `unblock` refuses a task that is
+    // still 'working'. Daemonless, nothing reconciles the task out of 'working'
+    // after start, so unblock always fails. A real daemon runs the reconciler
+    // that moves it to 'blocked'. Mirrors the accept-* withDaemon suites.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
     await ctx.cleanup();
+    await Promise.all(originDirs.splice(0).map(d => rm(d, { recursive: true, force: true })));
   });
 
-  test('unblock with github driver handles missing gh CLI gracefully', async () => {
-    // Configure github driver
+  /**
+   * Switch the project to the github remote driver, keeping the rest of
+   * lazy.toml intact (crucially external_path). The test env has no `gh` CLI,
+   * so the PR-comment path still exercises graceful degradation — but we point
+   * `origin` at a LOCAL bare repo so the launcher's `resolveUpstreamRef` git
+   * fetch resolves instantly instead of retrying (withRemoteRetry's 2s+4s
+   * backoff) against a nonexistent remote and blowing the per-test timeout.
+   */
+  async function configureGithubDriver(): Promise<void> {
+    const originPath = await mkdtemp(join(tmpdir(), 'lazy-e2e-origin-'));
+    originDirs.push(originPath);
+    ctx.git('init', '--bare', originPath);
+    ctx.git('remote', 'add', 'origin', originPath);
+    ctx.git('push', 'origin', 'main');
+
     const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, '[remote]\ndriver = "github"\n');
+    const toml = readFileSync(configPath, 'utf-8').replace('driver = "local"', 'driver = "github"');
+    writeFileSync(configPath, toml);
+  }
 
-    // Create and start a task
-    const taskId = await createTask(ctx, 'Sync test task', 'Do some work');
-
+  /**
+   * Start a task and wait for the reconciler to move it out of 'working' into
+   * 'blocked' — the state `unblock` requires. The explicit `wait` is mandatory
+   * because `start` launches the supervisor asynchronously under the daemon.
+   */
+  async function startAndWait(taskId: string): Promise<void> {
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
     expectSuccess(startResult);
+
+    const waitResult = await ctx.lazy(['wait', taskId]);
+    if (waitResult.exitCode !== 0) {
+      throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+    }
+  }
+
+  test('unblock with github driver handles missing gh CLI gracefully', async () => {
+    // Configure github driver (origin = local bare repo; no gh CLI)
+    await configureGithubDriver();
+
+    // Create and start a task
+    const taskId = await createTask(ctx, 'Sync test task', 'Do some work');
+
+    await startAndWait(taskId);
 
     // Unblock with message (imperative mode — doesn't call syncTaskFromRemote,
     // but tests that the github driver config doesn't break things)
@@ -55,10 +95,7 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     // Default config uses local driver — sync should be a no-op
     const taskId = await createTask(ctx, 'Local sync test', 'Do work');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     const unblockResult = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Looks good'],
@@ -72,10 +109,7 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     // This tests the note display pipeline that syncTaskFromRemote feeds into
     const taskId = await createTask(ctx, 'Comment display test', 'Add feature');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Add a comment (simulating what syncTaskFromRemote would do)
     const commentResult = await ctx.lazy([
@@ -96,10 +130,7 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     // Create and start a task
     const taskId = await createTask(ctx, 'No auto merge task', 'Do some work');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Advance main so upstream has changes
     ctx.git('checkout', 'main');
@@ -123,10 +154,7 @@ describe('per-task sync (syncTaskFromRemote)', () => {
     // Default config uses local driver — fetchBranch should be a no-op
     const taskId = await createTask(ctx, 'Local remote sync', 'Do work');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Unblock — sync-with-remote should silently skip (local driver)
     const unblockResult = await ctx.lazyMocked(
@@ -138,16 +166,12 @@ describe('per-task sync (syncTaskFromRemote)', () => {
   });
 
   test('sync-with-remote: github driver handles missing gh CLI gracefully during fetch', async () => {
-    // Configure github driver — no gh CLI available in test env
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, '[remote]\ndriver = "github"\n');
+    // Configure github driver (origin = local bare repo; no gh CLI available)
+    await configureGithubDriver();
 
     const taskId = await createTask(ctx, 'GitHub remote sync', 'Do work');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Unblock — sync-with-remote will try fetchBranch but gh/git ops may fail.
     // Should be non-fatal and proceed with stale data.
@@ -162,10 +186,7 @@ describe('per-task sync (syncTaskFromRemote)', () => {
   test('show task with PR-style notes includes comment content', async () => {
     const taskId = await createTask(ctx, 'PR notes test', 'Implement feature');
 
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Simulate what syncTaskFromRemote does: store a PR comment as a note
     const commentResult = await ctx.lazy([
@@ -333,7 +354,12 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
     // Snapshot the turn count BEFORE sync so we can assert none was pre-created.
     const turnsBefore = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8')).turns.length;
 
-    const result = await ctx.lazy(['sync', taskId]);
+    // Use lazyMocked so the in-process supervisor launch (createRunner →
+    // DockerRunner) is mocked and SUCCEEDS. syncTask transitions the task to
+    // 'working' before launching and reverts to the prior status if the launch
+    // throws — so a plain `ctx.lazy` (real DockerRunner, no docker in the
+    // sandbox) would revert to 'blocked' and this assertion would never hold.
+    const result = await ctx.lazyMocked(['sync', taskId], MOCK_CLAUDE_SUCCESS);
     const output = result.stdout + result.stderr;
     expect(output.includes('up to date')).toBe(false);
 

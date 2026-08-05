@@ -22,6 +22,21 @@ describe('config path validation', () => {
   let ctx: TestContext;
   const restoreDirs: string[] = [];
 
+  /**
+   * Run a command with the config-path validator ACTIVE.
+   *
+   * src/index.ts gates the validator (and the filesystem preflight) on
+   * `LAZY_TEST !== '1'`, and a daemonless suite's ctx.lazy sets LAZY_TEST=1 —
+   * so every test here was running with the very check it asserts on switched
+   * off, and saw the raw ENOENT/EEXIST/EACCES the validator exists to replace.
+   * Clearing the var restores the real startup path. Nothing leaks: validation
+   * exits before the daemon auto-start, and cleanup() stops an auto-started
+   * daemon anyway.
+   */
+  async function runWithValidation() {
+    return ctx.lazy(['list'], { env: { LAZY_TEST: '' } });
+  }
+
   beforeEach(async () => {
     ctx = await setupTestLazy();
   });
@@ -41,14 +56,18 @@ describe('config path validation', () => {
   // INVARIANT: a misconfigured path in lazy.toml fails with an error that
   // names the config key and path value, not an opaque ENOENT/EACCES.
   test('missing storage.external_path fails with named key and value', async () => {
-    const stalePath = '/tmp/lazy-nonexistent-path-1234567890';
+    // Must live under the (fresh, auto-removed) test root. A hardcoded
+    // /tmp/<fixed-name> is self-poisoning: the first run that reaches storage
+    // creates the directory, and every later run then finds it existing and
+    // sees no validation error.
+    const stalePath = join(ctx.root, 'lazy-nonexistent-path');
     await setConfig(ctx.root, `
 [storage]
 backend = "external"
 external_path = "${stalePath}"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('storage.external_path');
@@ -65,7 +84,7 @@ external_path = "${stalePath}"
 dockerfile = "./missing.Dockerfile"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('docker.dockerfile');
@@ -84,7 +103,7 @@ backend = "external"
 external_path = "${filePath}"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('storage.external_path');
@@ -103,7 +122,7 @@ backend = "external"
 external_path = "${readOnly}"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     // Process running as root bypasses unix DAC, so the W_OK access() call
     // succeeds and the validator reports nothing. Skip that environment.
@@ -127,7 +146,7 @@ backend = "external"
 external_path = "${stalePath}"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain(stalePath);
@@ -149,7 +168,7 @@ backend = "external"
 external_path = "${stalePath}"
 `);
 
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('storage.external_path');
@@ -161,7 +180,7 @@ external_path = "${stalePath}"
   // commands run normally.
   test('happy path: no configured paths produces no validation error', async () => {
     // setupTestLazy already wrote a default lazy.toml. Don't overwrite.
-    const result = await ctx.lazy(['list']);
+    const result = await runWithValidation();
     expect(result.stderr).not.toContain('points at a path that cannot be used');
     expect(result.stderr).not.toContain('storage.external_path');
   });

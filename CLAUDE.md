@@ -67,6 +67,33 @@ or scripts), use `--yes` flags to skip interactive confirmation prompts. Do NOT 
 the `LAZY_PROMPT_DEFAULTS` environment variable for this — that is a test-only mechanism.
 Each command that has a confirmation prompt should accept `--yes` to skip it.
 
+### Documented short flags must be registered as parseFlags aliases
+
+`parseFlags` registers `--<name>` only. A single-dash spelling exists **only** if the flag
+declares it explicitly:
+
+```typescript
+{ name: 'message', aliases: ['m'], takesValue: true }
+```
+
+Documenting `-f` in a usage string without the alias means the CLI rejects it as an unknown
+flag — that is exactly how `lazy unblock -f` shipped broken. Whenever you add a short flag to
+help text, add the alias, and vice versa. `test/unit/cli-flag-alias-coverage.test.ts` scans
+every `<name>Usage()` function against its `command<Name>()` flag table and fails on drift.
+
+Commands never register `--help`/`-h` as their own `parseFlags` flag: the dispatcher in
+`src/index.ts` intercepts both before the command runs, so such a flag is dead code and the
+`-h, --help` line in usage text is noise (every other command omits it).
+
+### Multiplexer subcommands must be listed in the parent's usage map
+
+`lazy system <sub>` and `lazy daemon <sub>` route `-h`/`--help` through
+`<parent>SubcommandUsage` in the dispatcher. A subcommand that ships its own `<name>Usage()`
+but isn't added to that map silently prints the PARENT's help — no error anywhere. Whenever
+you add a multiplexer subcommand with dedicated usage text, add the map entry.
+`test/unit/cli-subcommand-usage-coverage.test.ts` cross-checks each multiplexer's switch
+cases against its usage map in both directions and fails on drift.
+
 ### Prompts are for the user's project, not for lazy itself
 
 Agent system prompts (`src/prompts/`) are injected into agents working on the USER's codebase. They must not contain lazy-internal design decisions, invariants, or implementation details. Lazy-specific development guidelines live here in CLAUDE.md.
@@ -367,17 +394,76 @@ Lazy has an e2e test suite in `test/e2e/` that tests CLI commands as subprocesse
 ### Running Tests
 
 ```bash
-# Run all tests
-bun test
+# Run a specific test file (the supported mode — see below)
+bun test test/e2e/create.test.ts
 
-# Run all e2e tests
+# Run all e2e tests (best-effort; environmentally fragile under load)
 bun test test/e2e/
 
-# Run a specific test file
-bun test test/e2e/create.test.ts
+# Run the whole suite (slow suites skipped — see below)
+bun test
+
+# Run EVERYTHING, including the opt-in slow suites
+LAZY_SLOW_TESTS=1 bun test
+
+# Run one slow suite on its own
+LAZY_SLOW_TESTS=1 bun test test/e2e/daemon.test.ts
 ```
 
-Tests have a timeout configured in `bunfig.toml`.
+**Slow suites are opt-in.** Two e2e files each take >300s on their own —
+`test/e2e/daemon.test.ts` and `test/e2e/remote-storage.test.ts`. They are gated behind the test-only
+`LAZY_SLOW_TESTS=1` env var (same family as `LAZY_FORCE_TTY` /
+`LAZY_PROMPT_DEFAULTS` — never read it from production code) via
+`describe.skipIf(slowSuiteSkipped(...))` from `test/helpers/slow-suite.ts`.
+The gate is *gating only* — no test content was removed or weakened, and every
+skipped file prints one line (`skipped: slow suite "…" — set LAZY_SLOW_TESTS=1
+to run`) so a default run is never silently green-by-omission. Run them with
+`LAZY_SLOW_TESTS=1` before touching the daemon or RemoteStorage, and in any
+pre-accept/full-verification pass.
+
+**Linux prerequisite:** suites that exercise the host-process runner (`builder`,
+`host-sandbox-posture`) need `bwrap` and `socat` on PATH — install `bubblewrap` and
+`socat`. Without them `checkAvailability()` aborts before any assertion and a dozen
+tests fail on infrastructure rather than on code.
+
+Tests get a 30s default timeout from `setDefaultTimeout()` in `test/preload-generate.ts`
+(bunfig.toml's `[test] timeout` is not honored by the bun we run on — it silently left
+every test on bun's 5s default). A `test(name, fn, ms)` override still wins.
+
+**Per-file execution is the supported mode.** Each `withDaemon: true` suite starts
+a real daemon that binds a TCP port from a bounded window (26024+). A single full
+`bun test test/e2e/` run spins up many daemons; if any teardown is skipped (a crash,
+a SIGKILL timeout, an interrupted run) the leaked daemons exhaust the port window and
+later suites fail spuriously with bind/port errors — not real regressions. Verify a
+suite by running its file on its own; treat a green per-file run as authoritative and
+a red full-suite run as suspect until reproduced per-file. The `setupTestLazy` teardown
+and the `test/helpers/daemon-registry.ts` process-death safety net reap daemons on the
+happy path and on Ctrl-C, but they can't recover a hard-killed run.
+
+**Isolate daemon tests along three axes, or they pass in a container and fail on a Mac.**
+Every one of these has cost real debugging time:
+
+- **Daemon state → `LAZY_DAEMON_BASE_DIR`, not `HOME`.** It is the documented seam in
+  `src/daemon/paths.ts` and moves the socket/PID/token/log/lock together, and nothing
+  else. Redirecting `HOME` also redirects credential discovery, `~/.gitconfig`, tool
+  caches, and `createStorage`'s default path — differently on a developer machine (which
+  has a real `~/.claude`, a real `~/.lazy`, and a running daemon) than in CI. Helpers:
+  `test/helpers/daemon-base-dir.ts`.
+- **In-process daemons → pin `LAZY_CONFIG`.** `loadConfig` walks up from `process.cwd()`,
+  which under `bun test` is lazy's OWN worktree — so a test daemon silently adopts lazy's
+  `lazy.toml`, including `[storage] external_path` pointing at the developer's live store.
+  In a container that fails fast (`EACCES … mkdir '/Users/…'`); on the author's machine it
+  succeeds and contends the real store's `.storage-lock`. Use `pinConfig()` from
+  `test/helpers/pin-config.ts`; `process.chdir()` is the weaker older workaround, and an
+  unrelated earlier `chdir` can MASK the bug entirely.
+- **Port squatters must bind the exact host the daemon binds** (`DEFAULT_SERVER_BIND`),
+  never `Bun.serve`'s default wildcard. On Linux a wildcard listener blocks a later
+  specific bind; on macOS/BSD `SO_REUSEADDR` lets the specific bind through, so every
+  "the bind must fail" assertion silently inverts on a Mac.
+
+Also prefer a probed free port over the shared 26024+ window whenever a test needs a real
+`daemon start` to SUCCEED — on a box with stray daemons the window walk can come up empty
+and the test fails for reasons unrelated to its subject.
 
 ### How Tests Work
 
@@ -446,6 +532,50 @@ Import from `test/helpers/fixtures.ts`:
 - **`MOCK_CLAUDE_SUCCESS`** — A standard mock response for successful agent runs.
 - **`createTask(ctx, goal, prompt?)`** — Creates a task and returns its short ID.
 
+### Two agent seams: the module mock and the fake binary
+
+There are two ways to fake the agent, at different depths. Pick deliberately.
+
+**1. The module mock (default).** `test/mocks/claude.ts` replaces all of
+`src/capture/claude.ts` via Bun `--preload`, including `launchSupervisorAsync`. Fast, and
+right for anything that only needs "a turn happened and produced this response" — status
+transitions, accept/unblock flows, CLI output. Its limit is structural: everything
+downstream of `launchSupervisorAsync` — `execWithWatchdog`, the no-progress and wind-down
+kills, SIGTERM→SIGKILL escalation, stream-json parsing, response capture — is replaced, so
+no such test can ever reach it.
+
+**2. The fake binary (`setupTestLazy({ fakeClaude: true })`).** Installs a scriptable fake
+`claude` executable on PATH (`test/helpers/fake-claude.ts`) and switches the test project to
+the host-process runner. Nothing in `src/` is mocked: the daemon launches a real
+`lazy supervise` subprocess, which really spawns the fake agent. Use this whenever the
+behavior under test IS the supervisor — watchdog kills, the agent argv contract
+(`--resume`, `--output-format stream-json`), stream-event handling.
+
+```typescript
+ctx = await setupTestLazy({ fakeClaude: true });   // implies withDaemon: true
+await ctx.setClaudeScenario(successScenario({ result: 'done', sessionId: 's1' }));
+await ctx.lazy(['start', taskId, '--yes']);
+const invocations = await ctx.claudeInvocations();  // real argv the agent received
+```
+
+Scenario builders: `successScenario`, `hangAfterResultScenario` (wind-down),
+`goSilentScenario` (no-progress), `heartbeatOnlyScenario` (liveness without progress),
+`crashScenario` (non-zero exit). A scenario is a list of steps (`emit` / `stdout` /
+`stderr` / `sleep` / `commit` / `exit`), plus `ignoreSigterm` to force SIGKILL escalation;
+`{ sequence: [...] }` scripts consecutive turns. The fake reads its scenario from a file on
+every invocation, so tests can rescript a long-lived daemon between turns.
+
+Notes:
+- `fakeClaude: true` suppresses the `--preload` mock for every process the context spawns —
+  the two seams cannot be combined in one context.
+- The stream-json event shapes must stay in sync with `src/agent/activity-stream.ts`; they
+  are built in one place (`fake-claude.ts`) for that reason.
+- Watchdog guards are read from the task **worktree's** `lazy.toml`, so a test that tightens
+  them must commit the change before creating the task (see `setGuards` in
+  `test/e2e/agent-binary-seam.test.ts`).
+- A watchdog kill lands the task in `interrupted` (ungraceful, auto-resumable), not
+  `blocked`; the reason is on the session as `interrupt_reason`.
+
 ### Testing Interactive Prompts
 
 For tests that need to exercise interactive prompts (yes/no, choice selection), use these env vars:
@@ -455,8 +585,82 @@ For tests that need to exercise interactive prompts (yes/no, choice selection), 
   - `"accept"` — all `promptYesNo` return true
   - `"decline"` — all `promptYesNo` return false
   - `"1"` — returns the default value for each prompt
+- **`LAZY_FORCE_PROXY_GATE=1`** — Arms the proxy fail-loud gate even under
+  `LAZY_TEST=1`, which normally bypasses it (a daemonless test run has no daemon
+  to report a proxy address, so the gate is off by design). Only
+  `test/e2e/proxy-fail-loud.test.ts` and the proxy block of
+  `test/unit/auth-env.test.ts` need it — without the hatch the failure they
+  assert on can never fire.
+- **`LAZY_FORCE_CAPTURE_SWEEP=1`** — arms the daemon's conversation capture
+  sweep (and speeds its tick to 1s) under `LAZY_TEST=1`, where it is off by
+  default: left running it would race every suite that seeds session JSONLs and
+  then asserts they are still unimported (`doctor --reimport-conversations`).
+  Only `test/e2e/daemon-capture-sweep.test.ts` needs it.
+- **`LAZY_FORCE_PREFLIGHT=1`** — Runs the filesystem preflight check even under
+  `LAZY_TEST=1`, which normally skips it (test temp dirs are always accessible, so
+  preflight there would be noise). Only `test/e2e/preflight.test.ts` needs this — it
+  deliberately chmods those dirs inaccessible, and without the hatch the check it
+  asserts on never runs.
 
 These are **test-only** env vars. Never use them in production code paths.
+
+### A daemonless suite that calls `src/` in-process must declare test mode
+
+`setupTestLazy()` sets `LAZY_TEST=1` on every SUBPROCESS it spawns, and the
+subprocess reconcile driver (`test/helpers/reconcile.ts`) sets it too — but the
+`bun test` process itself does not have it. A suite that imports `reconcileTasks`
+(or anything else under `src/`) and awaits it **directly** therefore runs
+production code in NON-test mode, inside a project that has no daemon by design.
+
+That was invisible until the audit/policy proxy became on-by-default: `createRunner`
+now resolves the daemon's live proxy address up front and fails loud
+(`ProxyUnavailableError`), so every in-process reconcile pass aborted before doing
+any work — 20 failures across six suites, all looking like unrelated bugs.
+
+Call `enableInProcessTestMode()` from `test/helpers/in-process-test-mode.ts` at
+module scope in such a suite. Do NOT call it from a `withDaemon: true` suite —
+there `LAZY_TEST=1` must stay unset so the CLI really talks to the test daemon.
+
+### Test projects use EXTERNAL storage — never hardcode `<root>/.lazy/tasks`
+
+`lazy init` writes an `external_path` into the project's lazy.toml, so task state
+lives outside the temp repo. `test/helpers/storage.ts` is the ONE place that knows
+the layout (`tasksDirFor`, `taskFilePath`, `readTaskStatus`, `setTaskStatus`,
+`readSessionJson`, …). Suites that hand-rolled `join(root, '.lazy', 'tasks')`
+died with ENOENT when the backend changed; use the helpers.
+
+### Change a test's lazy.toml by EDITING the key, never by overwriting the file
+
+A test that needs a different setting must rewrite that key in the lazy.toml
+`lazy init` produced — `toml.replace('driver = "local"', 'driver = "github"')`,
+with an assertion that the replace actually changed something. The two shortcuts
+both fail quietly:
+
+- **Overwriting the file** with a two-line stub (`'[remote]\ndriver = "github"\n'`)
+  also throws away the `external_path` init wrote, so the command under test looks
+  at an empty default store. The assertion then passes for the wrong reason —
+  "no push happened" is trivially true when no task was found at all.
+- **Appending a section** that the init template already writes (`[remote]`,
+  `[runner]`, `[storage]`, …) is a TOML redefinition error; the command fails on
+  config parsing before it reaches the behavior under test.
+
+A literal `.replace()` that matches nothing is the same silent no-op, so assert
+the config changed (`expect(after).not.toBe(before)`) rather than trusting it.
+
+### A daemonless suite cannot `accept`, and `sync` still needs the agent mock
+
+`start` launches the supervisor asynchronously and the **daemon reconciler** is
+what moves a task out of `working`; daemonless the task stays `working` forever
+and accept refuses ("Task X is still working"). Accept tests therefore need
+`withDaemon: true`, an explicit `lazy wait`, and their own worktree commit — the
+in-daemon agent uses the daemon's own mock response, so a per-test
+`LAZY_MOCK_SHOULD_COMMIT` never reaches it. `test/e2e/accept-reason.test.ts` is
+the canonical pattern.
+
+Separately, any command whose implementation runs a **sync** (`lazy sync`,
+`lazy reparent`) relaunches the task's own agent, so it must be invoked through
+`ctx.lazyMocked` even in a daemonless suite. Under plain `ctx.lazy` it reaches a
+real runner and dies on `spawn failed: binary 'docker' not found`.
 
 ### When to Add Tests
 

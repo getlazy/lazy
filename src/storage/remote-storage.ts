@@ -12,6 +12,8 @@
 
 import type { DaemonClient } from '../daemon/client';
 import type { Storage, CreateTurnOptions } from './interface';
+import { normalizeTurnContent } from '../utils/turn-content';
+import type { SpanRecord } from '../tracing/types';
 import type {
   Task,
   Session,
@@ -34,8 +36,17 @@ import type {
   AgentSessionLog,
   BuilderResumeIntent,
   StatusChange,
+  ProxyAuditRecord,
+  ListAuditRecordsOptions,
+  TagEvent,
+  MemoryRecord,
+  MemoryEvent,
+  MemoryWriteInput,
+  MemoryCompact,
+  MemoryCompactInput,
 } from './types';
 import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage, TaskTarget } from '../types';
+import type { RunnerType } from '../config/types';
 
 export class RemoteStorage implements Storage {
   constructor(
@@ -123,6 +134,14 @@ export class RemoteStorage implements Storage {
     await this.call('updateTaskModel', { taskId, model });
   }
 
+  async updateTaskRunnerType(taskId: string, runnerType: RunnerType | null): Promise<void> {
+    await this.call('updateTaskRunnerType', { taskId, runnerType });
+  }
+
+  async updateTaskPriority(taskId: string, priority: string): Promise<void> {
+    await this.call('updateTaskPriority', { taskId, priority });
+  }
+
   async updateTaskType(taskId: string, type: string): Promise<void> {
     await this.call('updateTaskType', { taskId, type });
   }
@@ -197,6 +216,10 @@ export class RemoteStorage implements Storage {
     await this.call('updateSessionContainerName', { sessionId, containerName });
   }
 
+  async updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void> {
+    await this.call('updateSessionRunnerType', { sessionId, runnerType });
+  }
+
   async updateSessionInteraction(sessionId: string, durationMs: number): Promise<void> {
     await this.call('updateSessionInteraction', { sessionId, durationMs });
   }
@@ -228,7 +251,12 @@ export class RemoteStorage implements Storage {
   // --- Turns ---
 
   async createTurn(options: CreateTurnOptions): Promise<Turn> {
-    return this.call<Turn>('createTurn', { options });
+    // Normalize BEFORE the wire hop: JSON.stringify drops an undefined key, so
+    // the daemon would receive options with no `content` at all and could only
+    // report a stack pointing at its own RPC handler. Warning here names the
+    // real caller. See src/utils/turn-content.ts.
+    const content = normalizeTurnContent(options.content, 'remote-storage');
+    return this.call<Turn>('createTurn', { options: { ...options, content } });
   }
 
   async getSessionTurns(sessionId: string): Promise<Turn[]> {
@@ -245,6 +273,10 @@ export class RemoteStorage implements Storage {
 
   async updateTurnViolations(taskId: string, turnId: string, violations: FileViolation[]): Promise<void> {
     await this.call('updateTurnViolations', { taskId, turnId, violations });
+  }
+
+  async markFeedbackConsumed(sessionId: string): Promise<void> {
+    await this.call('markFeedbackConsumed', { sessionId });
   }
 
   // --- Commits ---
@@ -362,6 +394,10 @@ export class RemoteStorage implements Storage {
     return this.call<boolean>('isConversationImported', { sessionId });
   }
 
+  async deleteConversation(sessionId: string): Promise<boolean> {
+    return this.call<boolean>('deleteConversation', { sessionId });
+  }
+
   // --- Agent Session Logs ---
 
   async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
@@ -370,6 +406,16 @@ export class RemoteStorage implements Storage {
 
   async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
     return this.call<AgentSessionLog | null>('getAgentSessionLog', { taskId });
+  }
+
+  // --- Proxy Audit (Tier-1 passive audit plane) ---
+
+  async appendAuditRecord(record: ProxyAuditRecord): Promise<void> {
+    await this.call('appendAuditRecord', { record });
+  }
+
+  async listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]> {
+    return this.call<ProxyAuditRecord[]>('listAuditRecords', { options });
   }
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
@@ -386,6 +432,56 @@ export class RemoteStorage implements Storage {
     return this.call<BuilderResumeIntent[]>('listBuilderResumeIntents', { projectRoot });
   }
 
+  // --- Tags ---
+
+  async addTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    return this.call<Task>('addTaskTag', { taskId, tag, actor });
+  }
+
+  async removeTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    return this.call<Task>('removeTaskTag', { taskId, tag, actor });
+  }
+
+  async getTagHistory(taskId: string): Promise<TagEvent[]> {
+    return this.call<TagEvent[]>('getTagHistory', { taskId });
+  }
+
+  // --- Memory (lazy-owned shared knowledge) ---
+
+  async saveMemory(input: MemoryWriteInput, actor: Actor): Promise<MemoryRecord> {
+    return this.call<MemoryRecord>('saveMemory', { input, actor });
+  }
+
+  async getMemory(name: string): Promise<MemoryRecord | null> {
+    return this.call<MemoryRecord | null>('getMemory', { name });
+  }
+
+  async listMemories(options?: { includeDeleted?: boolean }): Promise<MemoryRecord[]> {
+    return this.call<MemoryRecord[]>('listMemories', { options });
+  }
+
+  async deleteMemory(name: string, actor: Actor): Promise<MemoryRecord | null> {
+    return this.call<MemoryRecord | null>('deleteMemory', { name, actor });
+  }
+
+  async getMemoryHistory(name?: string): Promise<MemoryEvent[]> {
+    return this.call<MemoryEvent[]>('getMemoryHistory', { name });
+  }
+
+  // --- Memory compact (derived) ---
+
+  async saveMemoryCompact(input: MemoryCompactInput, actor: Actor): Promise<MemoryCompact> {
+    return this.call<MemoryCompact>('saveMemoryCompact', { input, actor });
+  }
+
+  async getMemoryCompact(): Promise<MemoryCompact | null> {
+    return this.call<MemoryCompact | null>('getMemoryCompact', {});
+  }
+
+  async clearMemoryCompact(): Promise<boolean> {
+    return this.call<boolean>('clearMemoryCompact', {});
+  }
+
   // --- Status History ---
 
   async getStatusHistory(taskId: string): Promise<StatusChange[]> {
@@ -396,5 +492,15 @@ export class RemoteStorage implements Storage {
 
   async search(query: string): Promise<SearchResult[]> {
     return this.call<SearchResult[]>('search', { query });
+  }
+
+  // --- Tracing ---
+
+  async appendTraceSpans(spans: SpanRecord[]): Promise<void> {
+    await this.call<void>('appendTraceSpans', { spans });
+  }
+
+  async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
+    return this.call<SpanRecord[]>('readTraceSpans', { sinceMs });
   }
 }

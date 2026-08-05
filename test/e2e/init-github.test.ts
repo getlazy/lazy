@@ -70,9 +70,14 @@ describe('lazy init GitHub detection', () => {
     // Should NOT detect GitHub
     expect(result.stdout).not.toContain('Detected GitHub remote');
 
-    // Verify lazy.toml was NOT updated to github
+    // Verify lazy.toml was NOT set to the github driver. It is NOT left at
+    // "local" either: lazy also ships a GitLab driver, and a gitlab.com remote
+    // is correctly detected as gitlab. The assertion this test exists for is
+    // "GitHub detection does not fire on a non-GitHub remote" — pinning the
+    // literal "local" made it fail the day GitLab detection landed.
     const configContent = readFileSync(join(tmpDir, 'lazy.toml'), 'utf-8');
-    expect(configContent).toContain('driver = "local"');
+    expect(configContent).not.toContain('driver = "github"');
+    expect(configContent).toContain('driver = "gitlab"');
   });
 
   test('does not detect GitHub when no remote', async () => {

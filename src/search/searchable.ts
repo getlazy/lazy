@@ -6,9 +6,10 @@
  */
 
 import type { Storage } from '../storage/interface';
+import { turnText } from '../utils/turn-content';
 
 export interface SearchableItem {
-  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup';
+  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'memory';
   taskId: string;
   taskCode: string | null;
   taskGoal: string;
@@ -76,7 +77,7 @@ export async function getAllSearchableContent(storage: Storage): Promise<Searcha
           taskId: task.id,
           taskCode: task.code,
           taskGoal: task.goal,
-          content: turn.content,
+          content: turnText(turn),
           context: `Turn ${turn.sequence} (${turn.role})`,
         });
       }
@@ -93,6 +94,21 @@ export async function getAllSearchableContent(storage: Storage): Promise<Searcha
         });
       }
     }
+  }
+
+  // Memory records are project-level, not per-task. They carry no task context,
+  // so taskId/taskGoal are filled with the record's own identity — enough for
+  // the caller to show a useful result line.
+  const memories = await storage.listMemories();
+  for (const memory of memories) {
+    items.push({
+      type: 'memory',
+      taskId: memory.name,
+      taskCode: null,
+      taskGoal: `memory: ${memory.name}`,
+      content: `${memory.name}\n${memory.description}\n${memory.body}`,
+      context: `Memory (${memory.type}, updated by ${memory.updated_by})`,
+    });
   }
 
   return items;

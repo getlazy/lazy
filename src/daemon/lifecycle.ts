@@ -23,7 +23,7 @@
 
 import { existsSync, readFileSync, unlinkSync, mkdirSync, writeFileSync, openSync, closeSync, statSync, constants } from 'fs';
 import { randomBytes } from 'crypto';
-import { getPidPath, getSocketPath, getTokenPath, getDaemonDir, getDaemonLockPath, getStartLockPath } from './paths';
+import { getPidPath, getSocketPath, getTokenPath, getWebPortPath, getDaemonDir, getDaemonLockPath, getStartLockPath } from './paths';
 
 export interface AutoReactBudgetEntry {
   project: string;
@@ -49,11 +49,36 @@ export interface DaemonStatus {
   version?: string;
   /** UTC ISO timestamp the daemon binary was built, or 'dev' when run from source. */
   buildTime?: string;
+  /** Git short SHA of the source the daemon is running (dev mode only; null/absent
+   *  for compiled binaries). Used to detect a stale daemon vs the working tree. */
+  codeSha?: string;
   webPort?: number;
   /** Interface the web dashboard bound to (= config.server.bind). Used to
    *  print a dashboard URL that points at the real interface, not `localhost`. */
   bindHost?: string;
   autoReactBudget?: AutoReactBudgetEntry[];
+  /** Anthropic passthrough proxy status, when a `[proxy]` section is configured. */
+  proxy?: DaemonProxyStatus;
+}
+
+/** Live proxy status surfaced in `lazy daemon status` / GET /daemon/status. */
+export interface DaemonProxyStatus {
+  /** False only when `[proxy] enabled = false` — agent traffic connects directly. */
+  enabled: boolean;
+  /** Whether the proxy server is currently listening. */
+  running: boolean;
+  /** Bind address. */
+  bind: string;
+  /** Actual bound port (OS-assigned when `[proxy] port` was omitted), or null if not running. */
+  port: number | null;
+  /** Full base URL agents route through (`http://bind:port`), or null if not running. */
+  address: string | null;
+  /** Upstream the proxy forwards to. */
+  upstream: string;
+  /** Number of configured failover targets. */
+  fallbacks: number;
+  /** Whether the mechanistic policy engine is enforcing (vs pure passthrough/audit). */
+  policyEnforce: boolean;
 }
 
 /** Read the PID from the PID file. Returns null if file doesn't exist or is invalid. */
@@ -102,6 +127,45 @@ export function generateToken(projectRoot: string): string {
   const token = randomBytes(32).toString('hex');
   writeFileSync(getTokenPath(projectRoot), token, { mode: 0o600 });
   return token;
+}
+
+/**
+ * Read the last web port the daemon successfully bound. Returns null when the
+ * marker is missing or unparseable — the caller falls back to the configured
+ * or default port.
+ *
+ * Sync is intentional: this is one-shot daemon-startup code (called before the
+ * TCP bind, alongside readToken) and never runs on a hot path. Mirrors readToken.
+ */
+export function readWebPort(projectRoot: string): number | null {
+  const portPath = getWebPortPath(projectRoot);
+  if (!existsSync(portPath)) return null;
+  try {
+    const port = Number.parseInt(readFileSync(portPath, 'utf-8').trim(), 10);
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the web port the daemon just bound so the next start prefers it.
+ * Keeping the port stable across restarts is what lets a running builder's
+ * mounted daemon MCP config (target = host.docker.internal:<webPort>) stay
+ * valid — otherwise a restart that lands on a different port permanently breaks
+ * the builder's tool calls (they hit a stray/foreign daemon and get 401).
+ *
+ * Best-effort: a failure to persist only means the next start falls back to the
+ * default-port scan, so it must never block startup. Sync mirrors generateToken
+ * and runs once during startup.
+ */
+export function writeWebPort(projectRoot: string, port: number): void {
+  try {
+    mkdirSync(getDaemonDir(projectRoot), { recursive: true });
+    writeFileSync(getWebPortPath(projectRoot), String(port), { mode: 0o600 });
+  } catch {
+    // Non-fatal — see doc comment. Next start just re-scans from the default.
+  }
 }
 
 /**
@@ -181,7 +245,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { uptime?: number; version?: string; buildTime?: string; webPort?: number; bindHost?: string; autoReactBudget?: AutoReactBudgetEntry[] };
+    const data = await response.json() as { uptime?: number; version?: string; buildTime?: string; codeSha?: string; webPort?: number; bindHost?: string; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
     return {
       running: true,
       pid: pid ?? undefined,
@@ -189,9 +253,11 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       uptime: data.uptime,
       version: data.version,
       buildTime: data.buildTime,
+      codeSha: data.codeSha,
       webPort: data.webPort,
       bindHost: data.bindHost,
       autoReactBudget: data.autoReactBudget,
+      proxy: data.proxy,
     };
   } catch {
     return { running: false, pid: pid ?? undefined };

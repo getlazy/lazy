@@ -1,58 +1,29 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { join } from 'path';
-import { writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
+import { writeFileSync, existsSync, mkdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask } from '../helpers/fixtures';
+import { findFullTaskId, setTaskMetadata, setTaskStatus, taskFilePath, worktreePathFor } from '../helpers/storage';
 
-/**
- * Helper: find the full task UUID directory name from a short ID prefix.
- */
-function findFullTaskId(root: string, shortId: string): string | undefined {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const taskDirs = readdirSync(tasksDir);
-  return taskDirs.find(d => d.startsWith(shortId));
+/** The lock path lazy actually uses — see getPairingLockPath in src/utils/pairing-lock.ts. */
+function pairingLockPath(root: string, shortId: string): string {
+  return join(worktreePathFor(root, shortId), '.lazy-task-sandbox', 'pairing-lock');
 }
 
 /**
- * Helper: manually set a task's status in task.json.
- * Useful because the mock start + reconciliation may leave the task in a
- * different state than needed for a particular test scenario.
- */
-function setTaskStatus(root: string, shortId: string, status: string): void {
-  const fullTaskId = findFullTaskId(root, shortId);
-  if (!fullTaskId) throw new Error(`Task not found: ${shortId}`);
-  const taskJsonPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
-  const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
-  taskData.status = status;
-  writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2));
-}
-
-/**
- * Helper: set task metadata in task.json.
- */
-function setTaskMetadata(root: string, shortId: string, key: string, value: string): void {
-  const fullTaskId = findFullTaskId(root, shortId);
-  if (!fullTaskId) throw new Error(`Task not found: ${shortId}`);
-  const taskJsonPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
-  const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
-  if (!taskData.metadata) taskData.metadata = {};
-  taskData.metadata[key] = value;
-  writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2));
-}
-
-/**
- * Helper: place a pairing lock on a task's worktree that appears alive
- * (uses PID 1, which is always running on any Unix system).
+ * Helper: place a pairing lock on a task's worktree that appears alive.
+ *
+ * The lock MUST land in `.lazy-task-sandbox/`, not `.lazy/`: that directory is
+ * excluded from every dirty-worktree check (`git status --porcelain --
+ * ':!.lazy-task-sandbox'`), so a lock does not make the worktree dirty. Writing
+ * it to `.lazy/` instead both hid the lock from `checkPairingLock` and tripped
+ * accept/reject's dirty gate before their pairing gate could fire.
  */
 function placePairingLock(root: string, shortId: string): void {
-  const worktreePath = join(root, '.lazy', 'worktrees', shortId);
-  const lockDir = join(worktreePath, '.lazy');
-  if (!existsSync(lockDir)) {
-    mkdirSync(lockDir, { recursive: true });
-  }
-  const lockPath = join(lockDir, 'pairing-lock');
+  const lockPath = pairingLockPath(root, shortId);
+  mkdirSync(dirname(lockPath), { recursive: true });
   writeFileSync(lockPath, JSON.stringify({
     pid: process.pid, // Test runner PID — alive while subprocess runs
     started_at: new Date().toISOString(),
@@ -60,21 +31,43 @@ function placePairingLock(root: string, shortId: string): void {
   }, null, 2));
 }
 
+interface ManualSessionOptions {
+  /**
+   * Check `lazy/<shortId>` out in the MAIN repo and leave the worktree on a
+   * detached HEAD instead of on the branch.
+   *
+   * Only branch-detection tests need this. Git refuses to check out a branch
+   * that is already checked out in a worktree ("fatal: 'lazy/x' is already
+   * checked out at ..."), so with the default (attached) layout a
+   * `ctx.git('checkout', branch)` silently fails and the main repo stays on
+   * `main` — which is why those tests were exercising branchless pairing while
+   * claiming to exercise branch detection.
+   */
+  checkoutBranchInMainRepo?: boolean;
+}
+
 /**
  * Helper: create a session.json manually for a task (no Docker needed).
  * Also creates the worktree directory and git branch.
  */
-function createSessionManually(ctx: TestContext, shortId: string): void {
+function createSessionManually(ctx: TestContext, shortId: string, options: ManualSessionOptions = {}): void {
   const fullTaskId = findFullTaskId(ctx.root, shortId);
-  if (!fullTaskId) throw new Error(`Task not found: ${shortId}`);
 
   const branchName = `lazy/${shortId}`;
   const startSha = ctx.git('rev-parse', 'HEAD').stdout.trim();
 
   // Create the git worktree and branch
-  const worktreePath = join(ctx.root, '.lazy', 'worktrees', shortId);
-  mkdirSync(join(ctx.root, '.lazy', 'worktrees'), { recursive: true });
-  ctx.git('worktree', 'add', worktreePath, '-b', branchName);
+  const worktreePath = worktreePathFor(ctx.root, shortId);
+  mkdirSync(dirname(worktreePath), { recursive: true });
+  if (options.checkoutBranchInMainRepo) {
+    ctx.git('worktree', 'add', '--detach', worktreePath, 'HEAD');
+    const checkout = ctx.git('checkout', '-b', branchName);
+    if (checkout.exitCode !== 0) {
+      throw new Error(`failed to check out ${branchName} in the main repo: ${checkout.stderr}`);
+    }
+  } else {
+    ctx.git('worktree', 'add', worktreePath, '-b', branchName);
+  }
 
   // Write session.json
   const session = {
@@ -98,8 +91,7 @@ function createSessionManually(ctx: TestContext, shortId: string): void {
     consecutive_interruptions: 0,
     auto_resumed: false,
   };
-  const sessionPath = join(ctx.root, '.lazy', 'tasks', fullTaskId, 'session.json');
-  writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+  writeFileSync(taskFilePath(ctx.root, shortId, 'session.json'), JSON.stringify(session, null, 2));
 }
 
 describe('lazy pair', () => {
@@ -128,12 +120,9 @@ describe('lazy pair', () => {
   // INVARIANT: When on a lazy/* branch with no argument, pair detects the task.
   test('detects task from lazy/* branch', async () => {
     const taskId = await createTask(ctx, 'Branch detection task', 'Some work');
-    createSessionManually(ctx, taskId);
+    // Puts the main repo on lazy/<taskId> — the state branch detection reads.
+    createSessionManually(ctx, taskId, { checkoutBranchInMainRepo: true });
     setTaskStatus(ctx.root, taskId, 'blocked');
-
-    // Switch to the task branch in the main repo (not worktree)
-    const branchName = `lazy/${taskId}`;
-    ctx.git('checkout', branchName);
 
     // Running `lazy pair` without arguments should detect the task from the
     // branch. With a credential present (the default fake key, so the daemon
@@ -181,8 +170,7 @@ describe('lazy pair', () => {
     // Place a pairing lock that appears alive
     placePairingLock(ctx.root, taskId);
 
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
-    const lockPath = join(worktreePath, '.lazy', 'pairing-lock');
+    const lockPath = pairingLockPath(ctx.root, taskId);
 
     // Verify lock file exists
     expect(existsSync(lockPath)).toBe(true);
@@ -245,6 +233,13 @@ describe('lazy pair', () => {
   // refuses to start without a credential. So a missing credential surfaces as
   // the daemon's actionable error (clients pass through, they don't re-enforce).
   // This is the behavior that makes dropping the old client-side check safe.
+  //
+  // `LAZY_TEST: ''` is load-bearing: a daemonless suite runs the CLI with
+  // LAZY_TEST=1, under which ensureDaemon() returns early and no daemon is ever
+  // started — so the gate could never fire and the test would sail past into
+  // the launch step. Clearing it restores the real auto-start path (same
+  // technique as daemon.test.ts's credential-gate block). No daemon leaks: the
+  // gate is exactly what stops it from coming up.
   test('missing credential surfaces the daemon gate error, not a client check', async () => {
     const taskId = await createTask(ctx, 'No auth task', 'Some work');
     createSessionManually(ctx, taskId);
@@ -252,6 +247,7 @@ describe('lazy pair', () => {
 
     const result = await ctx.lazy(['pair', taskId], {
       env: {
+        LAZY_TEST: '',
         CLAUDE_CODE_OAUTH_TOKEN: '',
         ANTHROPIC_API_KEY: '',
       },
@@ -274,6 +270,7 @@ describe('lazy pair', () => {
 
     const result = await ctx.lazy(['pair', taskId, '--no-summary'], {
       env: {
+        LAZY_TEST: '',
         CLAUDE_CODE_OAUTH_TOKEN: '',
         ANTHROPIC_API_KEY: '',
       },
@@ -323,12 +320,9 @@ describe('lazy pair', () => {
 
   test('--resume fails when on task branch (detected task)', async () => {
     const taskId = await createTask(ctx, 'Branch-detected task', 'Some work');
-    createSessionManually(ctx, taskId);
+    // Puts the main repo on lazy/<taskId> — the state branch detection reads.
+    createSessionManually(ctx, taskId, { checkoutBranchInMainRepo: true });
     setTaskStatus(ctx.root, taskId, 'blocked');
-
-    // Switch to the task branch in the main repo
-    const branchName = `lazy/${taskId}`;
-    ctx.git('checkout', branchName);
 
     // Running `lazy pair --resume` should detect the task and reject the flag
     const result = await ctx.lazy(['pair', '--resume', 'abc123session']);
@@ -365,15 +359,32 @@ describe('pairing state blocks operations', () => {
     return taskId;
   }
 
-  test('pair requires task to be in blocked state', async () => {
+  // INVARIANT: pair accepts blocked | conflict | interrupted and nothing else
+  // (docs/state-machine.md: "lazy pair <task> — blocked|conflict|interrupted →
+  // pairing"). This test used to assert that `interrupted` was REJECTED, which
+  // has been wrong since v0.9 made interrupted pairable — it only ever passed
+  // because pair failed later for an unrelated reason.
+  test('pair refuses a task in a non-pairable state', async () => {
+    const taskId = await createTask(ctx, 'Backlog task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'backlog');
+
+    const result = await ctx.lazy(['pair', taskId]);
+
+    expectFailure(result);
+    expectError(result, "is in state 'backlog'");
+    expectError(result, 'Can only pair with blocked, conflict, or interrupted tasks');
+  });
+
+  test('pair accepts an interrupted task', async () => {
     const taskId = await createTask(ctx, 'Interrupted task', 'Some work');
     createSessionManually(ctx, taskId);
     setTaskStatus(ctx.root, taskId, 'interrupted');
 
     const result = await ctx.lazy(['pair', taskId]);
 
-    expectFailure(result);
-    expectError(result, "not 'blocked'");
+    // Reached the launch step — the state gate let `interrupted` through.
+    expectOutput(result, 'No existing Claude session to resume');
   });
 
   test('pair rejects task already in pairing state', async () => {
@@ -464,7 +475,7 @@ describe('pairing lock blocks other commands', () => {
 
   test('accept with dirty worktree refuses with uncommitted error (before pairing check)', async () => {
     const taskId = await createPairedTask();
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
 
     // Create a REAL uncommitted change (not just the pairing lock file)
     writeFileSync(join(worktreePath, 'dirty-file.txt'), 'uncommitted changes\n');
@@ -491,7 +502,7 @@ describe('pairing lock blocks other commands', () => {
 
   test('reject with dirty worktree refuses with uncommitted error (before pairing check)', async () => {
     const taskId = await createPairedTask();
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
 
     // Create a REAL uncommitted change (not just the pairing lock file)
     writeFileSync(join(worktreePath, 'dirty-file.txt'), 'uncommitted changes\n');

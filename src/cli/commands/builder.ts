@@ -24,15 +24,23 @@ import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES }
 import { isTTY, promptLine, promptYesNo } from '../editor';
 import { getProjectName } from '../../storage';
 import { theme } from '../theme';
-import { logger } from '../../utils/logger';
-import { createRunner, type Runner } from '../../runner';
+import { createRunner, refreshRunnerProxyTargets, type Runner } from '../../runner';
+import { buildBuilderPermissionArgs } from '../../runner/host-sandbox';
 import { generateBuilderConfig } from '../../builder/server';
-import { queryDaemonMcpConfig } from '../../daemon/rpc-fallback';
+import { queryDaemonMcpConfig, queryConcurrency } from '../../daemon/rpc-fallback';
 import { checkDaemonHealth } from '../../daemon/lifecycle';
 import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
-import { resolveBuilderProjectsDir, pruneStaleBuilderProjectsDirs } from '../../builder/projects-isolation';
+import { revokeBuilderMcpToken } from '../../builder/mcp-session';
+import {
+  resolveBuilderProjectsDirForLaunch,
+  isTrustedResumeProjectsDir,
+  classifyResumeSession,
+  type BuilderLaunchProjects,
+} from '../../builder/projects-isolation';
+import { detectBuilderLaunchSessionId } from '../../builder/session-detect';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { resolveBuilderChattiness, renderChattinessSnippet } from '../../config/chattiness';
+import { buildMemorySection } from '../../memory';
 
 // Embedded at build/compile time — changes to these files require rebuild
 import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
@@ -50,6 +58,19 @@ async function buildSystemPrompt(lazyRoot: string, runner: Runner): Promise<stri
   const chattinessSnippet = renderChattinessSnippet(resolveBuilderChattiness(config));
   prompt = prompt.replace('{{CHATTINESS}}', chattinessSnippet ? chattinessSnippet + '\n\n' : '');
   prompt = prompt.trimEnd();
+
+  // Auto-inject the shared-memory index (see src/memory). Empty when the
+  // project has no records, so nothing is appended until there is something to
+  // recall. Storage is opened just for this read and closed immediately.
+  const storage = await requireStorage();
+  try {
+    const memorySection = await buildMemorySection(storage, 'builder', { warnBytes: config.memory.warn_bytes });
+    if (memorySection) {
+      prompt += '\n\n' + memorySection;
+    }
+  } finally {
+    await storage.close();
+  }
 
   if (await hasExplicitModelConfig(lazyRoot)) {
     // User configured a default model — tell builder to respect it
@@ -168,6 +189,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'autonomous', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'resume', takesValue: true, optionalValue: true },
+    { name: 'import', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'model', takesValue: true },
   ];
@@ -175,6 +197,12 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const autonomous = parsed.flags.get('autonomous') === true;
   const yes = parsed.flags.get('yes') === true;
   const resumeArg = parsed.flags.get('resume') ?? null;
+  const importSession = parsed.flags.get('import') === true;
+
+  if (importSession && resumeArg === null) {
+    console.error('--import only applies to a resume: use it as `lazy builder --resume <id> --import`.');
+    process.exit(1);
+  }
 
   // --model overrides which model the BUILDER itself runs as (distinct from the
   // per-task --model used when starting tasks). No allow-list validation: new
@@ -211,11 +239,17 @@ export async function commandBuilder(args: string[]): Promise<void> {
     console.log('');
     console.log('⚠ Autonomous mode: the builder will run without permission prompts.');
 
-    // Additional warning for host-process runner
+    // Additional warning for host-process runner — severity depends on posture.
     if (runner.type === 'dangerously-host-process-without-any-isolation') {
-      console.log('⚠ DANGER: Running on the host WITHOUT isolation.');
-      console.log('  The agent has unrestricted access to your system.');
-      console.log('  Only proceed on an isolated/disposable machine.');
+      if (config.runner.permission_mode === 'bypass') {
+        console.log('⚠ DANGER: Running on the host WITHOUT isolation (permission_mode = "bypass").');
+        console.log('  The agent has unrestricted access to your system.');
+        console.log('  Only proceed on an isolated/disposable machine.');
+      } else {
+        console.log('⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
+        console.log('  Autonomous + sandbox: Bash is confined to the worktree and the');
+        console.log(`  network allowlist, but the agent will not prompt before acting.`);
+      }
     }
 
     console.log('');
@@ -246,6 +280,30 @@ export async function commandBuilder(args: string[]): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Error: ${msg}`);
     process.exit(1);
+  }
+
+  // Concurrency cap: fail fast when the builder limit is reached. An interactive
+  // session a human is waiting on must never be silently queued — tell them the
+  // count and how to raise the cap. The effective limit comes from the daemon so
+  // an ephemeral `lazy daemon config` override is honored. Best-effort: a daemon
+  // hiccup must not block launching a builder, so a failed query is non-fatal.
+  try {
+    const limits = await queryConcurrency();
+    if (limits.builders.running >= limits.builders.limit) {
+      console.error(
+        `Builder limit reached: ${limits.builders.running}/${limits.builders.limit} builder ` +
+        `container(s) already running.`,
+      );
+      console.error('Wait for one to exit, or raise the cap for this daemon session:');
+      console.error('  lazy daemon config set max_concurrent_builders <N>');
+      console.error('(ephemeral — resets on daemon restart; set [limits] max_concurrent_builders in lazy.toml to persist)');
+      process.exit(1);
+    }
+  } catch (err) {
+    // Non-fatal: never block an interactive builder on a limits-query failure.
+    if (config.session.debug) {
+      console.error(`[DEBUG] builder concurrency check skipped: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   const systemPrompt = await buildSystemPrompt(root, runner);
@@ -281,6 +339,27 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   const isResuming = resumeId !== null;
 
+  // Per-builder Claude projects-dir isolation lives under the data dir.
+  const dataDirAbs = join(root, config.data.path);
+
+  // Gate on ADOPTION before anything expensive or interactive runs. A session with
+  // no container-written copy in any overlay has never run under builder isolation
+  // — resuming it would silently make an overlay authoritative for it. Make that
+  // deliberate: error with the remedy, and let `--import` opt in. Sandbox runners
+  // only (host-process has no overlay to adopt into), and only for the id the USER
+  // asked for — the relaunch loop resolves its own ids and must never hit this.
+  if (resumeId && runner.usesSandbox() && !importSession) {
+    const provenance = await classifyResumeSession({ dataDirAbs, lazyRoot: root, resumeId });
+    if (provenance === 'needs-import') {
+      console.error(`Session ${resumeId} exists, but has never run under lazy's builder isolation.`);
+      console.error('Resuming it here would adopt it into this project\'s builder session history.');
+      console.error('');
+      console.error(`Adopt it deliberately:  lazy builder --resume ${resumeId} --import`);
+      console.error('Or pick a session that already ran under lazy: lazy builder list');
+      process.exit(1);
+    }
+  }
+
   // Session disclosure — skip on resume (user already saw it in the original session)
   if (!isResuming) {
     const agentName = config.agent.agent_id === 'claude-code' ? 'Claude Code' : config.agent.agent_id;
@@ -288,12 +367,18 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
     console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
 
-    // Warn about prompt injection risk when running on host without isolation
+    // Warn about prompt injection risk when running on the host.
     if (runner.type === 'dangerously-host-process-without-any-isolation') {
       console.log('');
-      console.log('WARNING: Builder is running on the host without isolation.');
-      console.log('Agent output may contain prompt injection from untrusted sources.');
-      console.log('Configure [runner] type = "docker" in lazy.toml for safe-by-default execution.');
+      if (config.runner.permission_mode === 'bypass') {
+        console.log('WARNING: Builder is running on the host with NO sandbox (permission_mode = "bypass").');
+        console.log('Agent output may contain prompt injection from untrusted sources.');
+        console.log('Use permission_mode = "sandbox" (default) or [runner] type = "docker" for safe-by-default execution.');
+      } else {
+        console.log('Builder is running on the host under the OS sandbox (permission_mode = "sandbox").');
+        console.log('Bash is confined to the worktree and the network allowlist; you will be');
+        console.log('prompted before any command escapes the sandbox.');
+      }
     }
 
     if (isTTY()) {
@@ -332,57 +417,64 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
   const builderEffort = effortOverride ?? config.builder.effort;
 
-  // Resolve the per-builder Claude projects-dir isolation ONCE, before the
-  // relaunch loop. The dir must be STABLE across the loop's iterations (so an
-  // upgrade relaunch's `--resume <id>` finds the prior segment's JSONL) yet
-  // DISTINCT between concurrent invocations. On resume we reuse the dir that
-  // already holds the target session; for a fresh run we mint a new one.
-  //
-  // SELF-HEALING: isolation is always attempted (docker/podman only — host-
-  // process can't isolate the real host home), but it must NEVER block the
-  // builder. This host-side step only creates/locates the dir; the docker
-  // runner does a write-probe as the container user and silently falls back to
-  // the shared ~/.claude/projects dir if the overlay won't work. Here we guard
-  // the host-side setup the same way: if the dir can't be created or the resume
-  // target lives in the shared dir (isolating would hide it and break --resume),
-  // we leave projectsDir undefined and Claude uses the shared dir as before.
-  const dataDirAbs = join(root, config.data.path);
-  let projectsDir: string | undefined;
-  if (runner.usesSandbox()) {
-    try {
-      const isolation = await resolveBuilderProjectsDir({ dataDirAbs, lazyRoot: root, resumeId });
-      projectsDir = isolation?.hostDir;
-      // Opportunistic cleanup so per-builder dirs don't accumulate. Best-effort —
-      // never block launching on a prune failure. Keep the active dir.
-      try {
-        const removed = await pruneStaleBuilderProjectsDirs(dataDirAbs, isolation?.id ?? null);
-        if (removed.length > 0) {
-          logger.info(`Cleaned up ${removed.length} stale builder session dir(s).`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(`Could not prune stale builder session dirs: ${msg}`);
-      }
-    } catch (err) {
-      // Host-side isolation setup failed (e.g. the dir couldn't be created).
-      // Degrade gracefully: run against the shared dir rather than failing.
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(
-        `Per-builder Claude projects isolation could not be set up (${msg}); ` +
-        `falling back to the shared ~/.claude/projects dir for this run. ` +
-        `Concurrent builders may cross-capture sessions.`,
-      );
-      projectsDir = undefined;
-    }
-  }
+  // Per-builder Claude projects-dir isolation is resolved PER LAUNCH (see below),
+  // not once up front: the relaunch loop re-launches with a resolved `--resume
+  // <id>` after an upgrade, and the mounted dir must be the one that actually
+  // holds THAT session — the same lookup a manual `lazy builder --resume <id>`
+  // performs. Resolving once and reusing the dir was the auto-resume bug (Claude
+  // printed "No conversation found with session ID"). Isolation is docker/podman
+  // only (host-process can't isolate the real host home) and self-healing: the
+  // helper degrades to the shared dir rather than blocking the launch.
 
   // Launch the builder child once for a given resume id. The relaunch loop calls
   // this repeatedly: after an upgrade stops the child it re-launches with the
-  // resolved --resume id. Each call builds its own args/config so the resume id
-  // (and a fresh container) is correct per iteration.
+  // resolved --resume id. Each call resolves its OWN projects dir + args/config
+  // so the resume id (and the dir that holds it) is correct per iteration.
+  //
+  // Permission posture for the builder launch.
+  //   - Host runner: default "sandbox" mode enables Claude Code's OS sandbox via
+  //     --settings. Interactive builders prompt on a sandbox escape; --autonomous
+  //     opts into sandbox + bypass (never prompts). "bypass" config = full
+  //     --dangerously-skip-permissions, no sandbox (previous behavior).
+  //   - Docker/Podman: the container is the boundary, so only --autonomous adds
+  //     --dangerously-skip-permissions (inside the container).
+  const isHostRunner = runner.type === 'dangerously-host-process-without-any-isolation';
+  const builderPermissionArgs = isHostRunner
+    ? buildBuilderPermissionArgs(
+        {
+          mode: config.runner.permission_mode,
+          allowedDomains: config.runner.sandbox_allowed_domains,
+          allowWeakerNested: config.runner.sandbox_allow_weaker_nested,
+          denyRead: config.runner.sandbox_deny_read,
+          denyWrite: config.runner.sandbox_deny_write,
+        },
+        autonomous,
+      )
+    : (autonomous ? ['--dangerously-skip-permissions'] : []);
+
   const launchOnce = async (rid: string | null): Promise<BuilderLaunchResult> => {
-    // Add --dangerously-skip-permissions when in autonomous mode,
-    // and --resume <id> when resuming a session.
+    // Locate the projects dir that holds this launch's resume target (or the
+    // shared dir when the session lives there). undefined outside sandbox mode.
+    // Pair it with a trustWritable signal so the runner can mount a known-writable
+    // resume dir even if the write-probe transiently fails (see docker-runner):
+    // trust ONLY a dir that holds a container-written copy of the resume target,
+    // never a host-seeded copy.
+    // `adopt` applies ONLY to the id the user passed --import for; ids the relaunch
+    // loop resolves on its own already have a container-written copy.
+    const hostDir = runner.usesSandbox()
+      ? await resolveBuilderProjectsDirForLaunch({
+          dataDirAbs,
+          lazyRoot: root,
+          resumeId: rid,
+          adopt: importSession && rid !== null && rid === resumeId,
+        })
+      : undefined;
+    const projects: BuilderLaunchProjects | undefined = hostDir
+      ? { hostDir, trustWritable: await isTrustedResumeProjectsDir({ hostDir, lazyRoot: root, resumeId: rid }) }
+      : undefined;
+    // Permission/sandbox flags first (see builderPermissionArgs above), then
+    // --resume <id>, then the resolved model and effort.
+    //
     // Resolve the builder's model via the per-role target. The explicit --model
     // flag is a hard override: it wins over a configured model on EVERY backend,
     // including ollama/proxy, while the backend+endpoint (the "server") stay as
@@ -410,7 +502,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     const resolvedModel = builderTarget.model || undefined;
 
     const claudeExtraArgs = [
-      ...(autonomous ? ['--dangerously-skip-permissions'] : []),
+      ...builderPermissionArgs,
       ...(rid ? ['--resume', rid] : []),
       ...(resolvedModel ? ['--model', resolvedModel] : []),
       '--effort', builderEffort,
@@ -419,8 +511,13 @@ export async function commandBuilder(args: string[]): Promise<void> {
     if (runner.usesSandbox()) {
       // Container mode: use daemon MCP proxy so tool calls route through the daemon.
       // The daemon generates the MCP config (it knows its own webPort and token).
+      // The name is this builder session's MCP identity label: the daemon binds
+      // the minted token to it, and we hand it back on exit to revoke that
+      // token (see revokeBuilderMcpToken). Keep it in a const — a second
+      // `builder-${Date.now()}` would be a different, unrevokable label.
+      const daemonMcpName = `builder-${Date.now()}`;
       const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
-        name: `builder-${Date.now()}`,
+        name: daemonMcpName,
       });
 
       // Still need a builder config for conversation capture (the supervisor reads it)
@@ -431,12 +528,33 @@ export async function commandBuilder(args: string[]): Promise<void> {
       const { configPath, config: builderConfig, id } = generateBuilderConfig(root, dataDir);
       writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
 
+      // Stamp the launch instant BEFORE the container starts: it is the cut that
+      // separates this run's session files from everything already on disk
+      // (including the history seeded into the projects dir above).
+      const launchedAtMs = Date.now();
+
       try {
         const result = await runner.launchBuilderInteractive(
-          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath, projectsDir,
+          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath, projects,
         );
-        return { exitCode: result.exitCode, sessionId: result.sessionId, builderId: id };
+        // In docker mode the runner always reports `sessionId: null` — only the
+        // in-container supervisor sees the id, and it can only stamp it when it
+        // gets to run its exit path. Recover it host-side from the session JSONL
+        // the container wrote into the mounted projects dir, so the id survives
+        // ANY death (upgrade stop, docker kill, crash, OOM) and the relaunch loop
+        // has something concrete to resume. See src/builder/session-detect.ts.
+        const sessionId = result.sessionId ?? await detectBuilderLaunchSessionId({
+          lazyRoot: root,
+          projectsHostDir: hostDir,
+          launchedAtMs,
+          resumeId: rid,
+        });
+        return { exitCode: result.exitCode, sessionId, builderId: id };
       } finally {
+        // The builder supervisor has exited (normally, by upgrade-stop, or by
+        // throwing) — its token must die with the session. Best effort: a
+        // crashed daemon must never break builder exit.
+        await revokeBuilderMcpToken(daemonMcpName);
         for (const tmpFile of [daemonConfigPath, configPath]) {
           try {
             if (existsSync(tmpFile)) unlinkSync(tmpFile);
@@ -468,6 +586,10 @@ export async function commandBuilder(args: string[]): Promise<void> {
     getStorage: () => tryRemoteStorage(root),
     daemonStatus: () => checkDaemonHealth(root),
     ensureReady: () => runner.ensureReady(),
+    // The daemon restarted during the upgrade and its proxy port is OS-assigned,
+    // so the address `createRunner` stamped on this runner at startup is dead.
+    // Re-resolve it against the daemon now serving, or fail loud.
+    refreshProxyTarget: () => refreshRunnerProxyTargets(runner, root),
     log: (m) => console.log(m),
     errorOut: (m) => console.error(m),
   });
@@ -502,6 +624,9 @@ Subcommands:
 Resume options:
   --resume             Resume the session from LAZY_LAST_SESSION_ID
   --resume <id>        Resume a specific session by Claude session ID
+  --import             Adopt a session that has never run under lazy's builder
+                       isolation (use with --resume <id>; without it such a
+                       resume errors instead of adopting silently)
 
 When a builder session exits, the session ID is printed so you can resume it
 with --resume <id>. Set LAZY_LAST_SESSION_ID in your shell to enable bare
@@ -519,7 +644,9 @@ Auto-resume across upgrade (docker/podman only):
   'lazy builder --resume <id>' to run.
 
 Flags:
-  --autonomous         Run without permission prompts (adds --dangerously-skip-permissions)
+  --autonomous         Run without permission prompts. Under the host sandbox (default) the
+                       OS sandbox still confines the builder; under permission_mode="bypass"
+                       or Docker this adds --dangerously-skip-permissions.
   --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
   --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
                        Defaults to lazy.toml [builder].effort (default "high")

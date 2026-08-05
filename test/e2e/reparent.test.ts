@@ -6,12 +6,16 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join, basename } from 'path';
-import { homedir } from 'os';
+import { readFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import {
+  findFullTaskId,
+  readTaskJson as readTaskJsonAt,
+  setTaskStatus as setTaskStatusAt,
+  taskFilePath,
+} from '../helpers/storage';
 import { parentTaskIdOf } from '../../src/task-target';
 
 describe('lazy reparent', () => {
@@ -25,28 +29,15 @@ describe('lazy reparent', () => {
     await ctx.cleanup();
   });
 
-  function tasksDir(): string {
-    return join(homedir(), '.lazy', basename(ctx.root), 'tasks');
-  }
-
-  function fullIdFor(shortId: string): string {
-    const entries = readdirSync(tasksDir());
-    const fullId = entries.find(e => e.startsWith(shortId));
-    if (!fullId) throw new Error(`No task directory starting with ${shortId}`);
-    return fullId;
-  }
-
-  function readTaskJson(shortId: string): any {
-    return JSON.parse(readFileSync(join(tasksDir(), fullIdFor(shortId), 'task.json'), 'utf-8'));
-  }
-
-  /** Force a task's status in storage (reconciliation may not have run). */
-  function setTaskStatus(shortId: string, status: string): void {
-    const taskJsonPath = join(tasksDir(), fullIdFor(shortId), 'task.json');
-    const taskData = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
-    taskData.status = status;
-    writeFileSync(taskJsonPath, JSON.stringify(taskData, null, 2) + '\n');
-  }
+  // Task state lives in EXTERNAL storage; test/helpers/storage.ts is the one
+  // place that knows the layout (CLAUDE.md). The hand-rolled
+  // `~/.lazy/<basename>/tasks` paths this file used to carry duplicated that
+  // knowledge and would break silently if the layout moved.
+  const fullIdFor = (shortId: string) => findFullTaskId(ctx.root, shortId);
+  const readTaskJson = (shortId: string) => readTaskJsonAt(ctx.root, shortId) as any;
+  const setTaskStatus = (shortId: string, status: string) => setTaskStatusAt(ctx.root, shortId, status);
+  const readTaskFile = (shortId: string, file: string) =>
+    JSON.parse(readFileSync(taskFilePath(ctx.root, shortId, file), 'utf-8'));
 
   // INVARIANT: reparent = repoint + sync, and it KEEPS the task. It must not
   // create a new task, reset the session, or discard history — only the parent
@@ -70,12 +61,17 @@ describe('lazy reparent', () => {
 
     // Capture identity before reparent.
     const beforeTask = readTaskJson(taskId);
-    const beforeTurns = JSON.parse(
-      readFileSync(join(tasksDir(), fullIdFor(taskId), 'turns.json'), 'utf-8'),
-    );
+    const beforeTurns = readTaskFile(taskId, 'turns.json');
     expect(parentTaskIdOf(beforeTask)).toBeNull();
 
-    const result = await ctx.lazy(['reparent', taskId, '--parent', parentId, '--yes']);
+    // Mocked: reparent's sync step relaunches the task's own agent to merge the
+    // new parent in, so this call really does reach the runner. Without the
+    // agent mock it tries to spawn a container and dies on `binary 'docker' not
+    // found` — the sync, not reparent's repoint, is what needs the fake agent.
+    const result = await ctx.lazyMocked(
+      ['reparent', taskId, '--parent', parentId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+    );
     expectSuccess(result);
     const output = result.stdout + result.stderr;
     expect(output).toContain('Reparented');
@@ -89,15 +85,11 @@ describe('lazy reparent', () => {
     expect(afterTask.code).toBe(beforeTask.code);
 
     // History preserved: the original turns are still present.
-    const afterTurns = JSON.parse(
-      readFileSync(join(tasksDir(), fullIdFor(taskId), 'turns.json'), 'utf-8'),
-    );
+    const afterTurns = readTaskFile(taskId, 'turns.json');
     expect(afterTurns.turns.length).toBeGreaterThanOrEqual(beforeTurns.turns.length);
 
     // A [Reparented] audit comment was recorded.
-    const comments = JSON.parse(
-      readFileSync(join(tasksDir(), fullIdFor(taskId), 'comments.json'), 'utf-8'),
-    );
+    const comments = readTaskFile(taskId, 'comments.json');
     const hasReparentComment = comments.comments.some(
       (c: any) => typeof c.content === 'string' && c.content.includes('[Reparented]'),
     );

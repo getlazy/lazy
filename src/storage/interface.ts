@@ -34,10 +34,20 @@ import type {
   BuilderResumeIntent,
   StatusChange,
   Actor,
+  TagEvent,
+  MemoryRecord,
+  MemoryEvent,
+  MemoryWriteInput,
+  MemoryCompact,
+  MemoryCompactInput,
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  ProxyAuditRecord,
+  ListAuditRecordsOptions,
 } from './types';
+import type { SpanRecord } from '../tracing/types';
+import type { RunnerType } from '../config/types';
 
 /**
  * Options for creating a new turn
@@ -69,6 +79,17 @@ export interface CreateTurnOptions {
    * omitted. Use 'ask' for read-only Q&A exchanges (e.g. `lazy review -i`).
    */
   turnType?: TurnType;
+  /**
+   * Mark this turn as carrying human/builder feedback that the agent has not
+   * consumed yet (persisted as `feedback_delivery: 'pending'`).
+   *
+   * INVARIANT (CLAUDE.md — never lose human feedback): set this on every turn
+   * whose content is real feedback destined for the agent (unblock, ask,
+   * initial task prompt, auto-delivered comments/CI). Do NOT set it on
+   * synthetic system notices, supervisor sync/nudge turns, or stop reasons —
+   * those must never trigger redelivery. See `findPendingFeedback()`.
+   */
+  carriesFeedback?: boolean;
 }
 
 export interface Storage {
@@ -169,9 +190,22 @@ export interface Storage {
   updateTaskModel(taskId: string, model: string): Promise<void>;
 
   /**
+   * Update a task's per-task runner override. Pass null to clear it (inherit
+   * the global `[runner] type`). Unlike model/goal/prompt, this is allowed at
+   * any time — including after work has begun — and takes effect on the next
+   * launch (see {@link Task.runner_type}).
+   */
+  updateTaskRunnerType(taskId: string, runnerType: RunnerType | null): Promise<void>;
+
+  /**
    * Update task type
    */
   updateTaskType(taskId: string, type: string): Promise<void>;
+
+  /**
+   * Update task queue priority (orders the concurrency drain sweep).
+   */
+  updateTaskPriority(taskId: string, priority: string): Promise<void>;
 
   /**
    * Reset the pending_sync counter to 0 (called when sync launches).
@@ -267,6 +301,13 @@ export interface Storage {
   updateSessionContainerName(sessionId: string, containerName: string | null): Promise<void>;
 
   /**
+   * Stamp the runner that actually launched this session. Recorded at launch as
+   * the resolved `task.runner_type ?? config.runner.type` and read by monitoring
+   * to discover/stop the run on the correct runner (see {@link Session.runner_type}).
+   */
+  updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void>;
+
+  /**
    * Update session interaction tracking
    */
   updateSessionInteraction(sessionId: string, durationMs: number): Promise<void>;
@@ -334,6 +375,19 @@ export interface Storage {
    * Used when a human approves or rejects file violations during unblock.
    */
   updateTurnViolations(taskId: string, turnId: string, violations: FileViolation[]): Promise<void>;
+
+  /**
+   * Mark every `feedback_delivery: 'pending'` turn in a session as 'consumed'.
+   *
+   * Called when an agent response completes normally (the agent turn is
+   * recorded) — at that point the agent has seen everything queued before it,
+   * so the whole pending backlog clears at once and ordering can't be lost.
+   *
+   * Idempotent: a session with no pending feedback is a no-op. Must NOT be
+   * called when recording an agent *error* turn — a crashed turn consumed
+   * nothing, and that is precisely the case redelivery exists for.
+   */
+  markFeedbackConsumed(sessionId: string): Promise<void>;
 
   // --- Commits ---
 
@@ -498,6 +552,19 @@ export interface Storage {
    */
   isConversationImported(sessionId: string): Promise<boolean>;
 
+  /**
+   * Delete a stored conversation. Returns true if a conversation was deleted,
+   * false if none existed under that session ID — so the operation is
+   * idempotent and callers can report "already gone" without a pre-check race.
+   *
+   * The only caller today is `lazy doctor --purge-housekeeping-conversations`,
+   * the one-time cleanup of machine-generated one-shots captured before they
+   * were excluded at the source. Deleting a conversation is not recoverable
+   * from lazy alone (Claude Code prunes the raw JSONL on disk over time), so
+   * any new caller must be explicitly human-confirmed.
+   */
+  deleteConversation(sessionId: string): Promise<boolean>;
+
   // --- Agent Session Logs (raw Claude Code JSONL) ---
 
   /**
@@ -512,6 +579,23 @@ export interface Storage {
    * if none has been captured (e.g. the task never ran an agent turn).
    */
   getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null>;
+
+  // --- Proxy Audit (Tier-1 passive audit plane) ---
+
+  /**
+   * Append one proxy audit record. Append-only: records are never updated or
+   * deleted. Written asynchronously by the passthrough proxy's audit queue
+   * (src/proxy/audit.ts) — must not block the proxy hot path, so keep this
+   * cheap and serial.
+   */
+  appendAuditRecord(record: ProxyAuditRecord): Promise<void>;
+
+  /**
+   * List proxy audit records in insertion order (oldest first). `limit` returns
+   * the most recent N. Used by tooling and a later model-economics / routing
+   * layer to query captured traffic.
+   */
+  listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]>;
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 
@@ -536,6 +620,109 @@ export interface Storage {
    */
   listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]>;
 
+  // --- Tags ---
+  //
+  // Tags are lightweight, non-hierarchical grouping labels. The current set
+  // lives on Task.tags; every add/remove is also appended to an immutable
+  // tag-history audit trail (see getTagHistory). History is never rewritten —
+  // untagging appends an 'untag' event, it does not erase the 'tag' event.
+
+  /**
+   * Add a tag to a task. The tag is normalized (lowercase, alphanumeric +
+   * hyphens) before storage. Idempotent: if the task already carries the
+   * normalized tag, this is a no-op and appends no history event. Otherwise the
+   * tag is added to Task.tags and a 'tag' event (with actor) is appended to the
+   * history. Returns the updated task.
+   */
+  addTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task>;
+
+  /**
+   * Remove a tag from a task. The tag is normalized before lookup. Idempotent:
+   * if the task does not carry the tag, this is a no-op and appends no history
+   * event. Otherwise the tag is removed from Task.tags and an 'untag' event
+   * (with actor) is appended to the history. Returns the updated task.
+   */
+  removeTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task>;
+
+  /**
+   * Get the append-only tag-history for a task, in chronological order.
+   * Every tag/untag ever performed, attributed to its actor. Returns [] for
+   * tasks that have never been tagged.
+   */
+  getTagHistory(taskId: string): Promise<TagEvent[]>;
+
+  // --- Memory (lazy-owned shared knowledge) ---
+  //
+  // Many small named records of curated, cross-task knowledge, plus an
+  // append-only, actor-attributed write history (who wrote/updated/removed what
+  // when — the same audit shape as tag history).
+  //
+  // INVARIANT: history is NEVER rewritten. An update supersedes the record by
+  // name and appends an event; a delete tombstones the record and appends an
+  // event. Neither erases what came before.
+  //
+  // INVARIANT (security boundary): task agents are read-only on memory. This
+  // interface does not encode that — the gate lives at the MCP boundary
+  // (`lazy_memory_save` rejects a non-empty ctx.taskId), because that is where
+  // caller identity exists. Do not add an agent-reachable write path.
+
+  /**
+   * Create or update a memory record, keyed by `name` (already normalized by
+   * the caller via `normalizeMemoryName`). Creating sets revision 1; updating
+   * supersedes the body/description/type and increments the revision. Saving a
+   * tombstoned name revives it as a new revision. Appends a history event.
+   */
+  saveMemory(input: MemoryWriteInput, actor: Actor): Promise<MemoryRecord>;
+
+  /**
+   * Get a live memory record by name, or null if it does not exist or has been
+   * tombstoned. Tombstoned records remain visible through getMemoryHistory.
+   */
+  getMemory(name: string): Promise<MemoryRecord | null>;
+
+  /**
+   * List memory records, newest-updated first. Tombstoned records are excluded
+   * unless `includeDeleted` is set.
+   */
+  listMemories(options?: { includeDeleted?: boolean }): Promise<MemoryRecord[]>;
+
+  /**
+   * Tombstone a memory record: it stops being listed, recalled, and injected,
+   * but its history is preserved. Returns the tombstoned record, or null if no
+   * live record with that name exists (idempotent).
+   */
+  deleteMemory(name: string, actor: Actor): Promise<MemoryRecord | null>;
+
+  /**
+   * Get the append-only memory write history in chronological order, for one
+   * record (when `name` is given) or for every record.
+   */
+  getMemoryHistory(name?: string): Promise<MemoryEvent[]>;
+
+  // --- Memory compact (derived, at most one per project) ---
+  //
+  // INVARIANT: the compact is DERIVED state. Records are never modified by
+  // compaction, a recompact is always generated from the live records (never
+  // from the previous compact), and losing the compact is harmless — injection
+  // falls back to the full index. That is why it is a single overwritable slot
+  // with no history: unlike records, nothing here is a source of truth.
+
+  /**
+   * Store (overwriting) the project's memory compact. Whatever compact existed
+   * before is replaced — a compact is regenerated from the records, so old
+   * versions carry no information worth keeping.
+   */
+  saveMemoryCompact(input: MemoryCompactInput, actor: Actor): Promise<MemoryCompact>;
+
+  /** Get the project's memory compact, or null if none has been generated. */
+  getMemoryCompact(): Promise<MemoryCompact | null>;
+
+  /**
+   * Delete the memory compact. Injection reverts to the full one-line-per-record
+   * index. Idempotent: returns false when there was nothing to delete.
+   */
+  clearMemoryCompact(): Promise<boolean>;
+
   // --- Status History ---
 
   /**
@@ -551,4 +738,19 @@ export interface Storage {
    * Full-text search across tasks, turns, commits, and conversations
    */
   search(query: string): Promise<SearchResult[]>;
+
+  // --- Tracing ---
+
+  /**
+   * Append finished trace spans to durable storage (JSONL). Called by the
+   * tracing span exporter — spans are persisted through Storage rather than
+   * written to `.lazy/` directly, per the storage-abstraction invariant.
+   */
+  appendTraceSpans(spans: SpanRecord[]): Promise<void>;
+
+  /**
+   * Read persisted trace spans, optionally filtered to those starting at or
+   * after `sinceMs` (epoch ms). Powers the `lazy timings` readout.
+   */
+  readTraceSpans(sinceMs?: number): Promise<SpanRecord[]>;
 }

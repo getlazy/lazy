@@ -31,6 +31,31 @@ import type { ShellInfo } from '../../shell/detect';
 import { spawnSync } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
 import { which } from 'bun';
+import {
+  listMissingConversations,
+  classifyMissingConversations,
+} from '../../import/reimport-conversations';
+import {
+  countImportableMemories,
+  importHarnessMemory,
+  formatLongDescriptionNotice,
+} from '../../import/import-harness-memory';
+import { findHousekeepingConversations } from '../../import/housekeeping-conversation';
+import { runReimportBulk } from './import-conversation';
+import { requireStorage, tryRemoteStorage } from '../helpers';
+import { unresolvedAuthRejection } from '../../proxy/auth-verdict';
+import { fetchDaemonCredentialState, ProxyUnavailableError } from '../../daemon/auth-env';
+import { credentialFromEnv } from '../../daemon/credential-gate';
+import {
+  assembleMemorySection,
+  formatBytes,
+  isLiveMemory,
+  recordsNewerThanCompact,
+  namesRemovedSinceCompact,
+} from '../../memory';
+import { isTTY, promptYesNo } from '../editor';
+import type { Storage } from '../../storage/interface';
+import { classifyProtectedTasks } from '../../protection/edge-gate';
 
 // ── types ────────────────────────────────────────────────────────────────
 
@@ -74,18 +99,151 @@ async function checkGitHasCommits(): Promise<CheckResult> {
   };
 }
 
-function checkAuth(): CheckResult {
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    return { ok: true, label: 'API auth configured (OAuth token)' };
+const AUTH_PRESENT_LABEL = 'Model credential present';
+
+const NO_CREDENTIAL_REMEDY =
+  `Set one in the DAEMON's environment and restart it:\n` +
+  `    ${theme.command('claude setup-token')}\n` +
+  `    ${theme.command('export CLAUDE_CODE_OAUTH_TOKEN=…')}   (or ANTHROPIC_API_KEY)\n` +
+  `    ${theme.command('lazy daemon restart')}`;
+
+/**
+ * Is a model credential present — in the environment that actually matters?
+ *
+ * That environment is the DAEMON's, not this CLI process's. The daemon is the
+ * single credential owner (credential-gate.ts) and every agent it launches
+ * inherits its env, so reading `process.env` here answered a different question
+ * and got it wrong in both directions: in a deployment where the token is
+ * exported only for the daemon, doctor reported "not authenticated" while
+ * everything worked; a stale token left in the user's shell made doctor report
+ * healthy auth the daemon never had.
+ *
+ * The daemon reports presence + source label only — the token itself never
+ * travels to the CLI just so we can print a checkmark (see
+ * `handleGetCredentialState`).
+ *
+ * Degraded mode: when the daemon cannot be reached we still answer, from this
+ * process's env, but the check output NAMES the environment consulted so the
+ * answer is never mistaken for the daemon's. Same shape as the other
+ * daemon-preferring checks here — a diagnostics hiccup must not masquerade as
+ * a verdict.
+ *
+ * PRESENCE, NOT VALIDITY. This check and `checkCredentialAccepted` are
+ * deliberately different questions: "a credential is present" vs "upstream
+ * accepts it". An expired token passes this one and fails that one — which is
+ * exactly the gap that made the builder /login loop unfindable.
+ */
+async function checkAuth(config: ResolvedConfig | null): Promise<CheckResult> {
+  let daemonReason = '';
+  try {
+    const state = await fetchDaemonCredentialState();
+    if (state) {
+      if (state.ollama) {
+        return { ok: true, label: `${AUTH_PRESENT_LABEL} (Ollama backend — no Anthropic credential needed)` };
+      }
+      if (state.present) {
+        return { ok: true, label: `${AUTH_PRESENT_LABEL} (daemon env: ${state.source})` };
+      }
+      // Practically unreachable: the gate refuses to start a daemon without a
+      // credential. Report it plainly rather than assuming it can't happen.
+      return {
+        ok: false,
+        label: AUTH_PRESENT_LABEL,
+        detail:
+          `The daemon is running but holds no model credential — every agent it launches will fail to reach the model API.\n  ` +
+          NO_CREDENTIAL_REMEDY,
+      };
+    }
+    // null = the daemon RPC is bypassed by design (test / daemon-self mode).
+    daemonReason = 'the daemon was not consulted';
+  } catch (err) {
+    // tryRpc's message is already actionable; keep its first line as the reason.
+    const msg = err instanceof Error ? err.message : String(err);
+    // Trailing period stripped: the reason is interpolated mid-sentence, in
+    // parentheses, and "(Daemon is not running.)" reads as a typo.
+    daemonReason = msg.split('\n')[0]!.trim().replace(/\.$/, '');
   }
-  if (process.env.ANTHROPIC_API_KEY) {
-    return { ok: true, label: 'API auth configured (API key)' };
+
+  // Degraded: answer from THIS process's env, and say so.
+  const caveat =
+    `Read from this shell's environment, not the daemon's (${daemonReason}). ` +
+    `The daemon is the credential owner — agents inherit ITS environment, so this may not be what lazy actually uses. ` +
+    `Check it with ${theme.command('lazy daemon status')} and re-run.`;
+
+  if (config?.ollama.enabled) {
+    return { ok: true, label: `${AUTH_PRESENT_LABEL} (Ollama backend — no Anthropic credential needed)` };
+  }
+  const source = credentialFromEnv();
+  if (source) {
+    return { ok: true, label: `${AUTH_PRESENT_LABEL} (shell env: ${source})`, warning: caveat };
   }
   return {
     ok: false,
-    label: 'API auth configured',
-    detail: `No authentication found. Set CLAUDE_CODE_OAUTH_TOKEN (run ${theme.command('claude setup-token')}) or ANTHROPIC_API_KEY.`,
+    label: AUTH_PRESENT_LABEL,
+    detail:
+      `No model credential found in this shell's environment, and the daemon could not be asked (${daemonReason}).\n  ` +
+      NO_CREDENTIAL_REMEDY,
   };
+}
+
+/**
+ * How far back to look for auth evidence. Enough to span a working day of
+ * traffic without paging the whole trail — the verdict only needs the tail.
+ */
+const AUTH_VERDICT_RECORDS = 200;
+
+/**
+ * Has the model API actually ACCEPTED lazy's credential lately?
+ *
+ * checkAuth above answers "is a credential set", which is all the daemon gate
+ * claims to know (credential-gate.ts: presence, not validity). That gap is what
+ * made the builder /login loop unfindable — an expired token is present, so
+ * every surface reported healthy while every request 401'd. The proxy records
+ * each upstream status, so the honest answer is already on disk; this reads it.
+ *
+ * Self-clearing by construction: a rejection only counts while no later request
+ * succeeded (see unresolvedAuthRejection), so re-exporting a good token and
+ * restarting the daemon silences it with no state to reset.
+ *
+ * Mirrors checkReimportableConversations: prefer the daemon's storage, fall back
+ * to a direct read-only handle, and degrade to a skipped check on any error —
+ * a diagnostics hiccup must not become a health failure.
+ */
+async function checkCredentialAccepted(root: string): Promise<CheckResult> {
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+    const records = await storage.listAuditRecords({ limit: AUTH_VERDICT_RECORDS });
+    const rejection = unresolvedAuthRejection(records);
+    if (!rejection) {
+      return { ok: true, label: 'Model API accepts lazy credential' };
+    }
+    const minutesAgo = Math.round((Date.now() - rejection.ts) / 60_000);
+    const who = rejection.role ? `${rejection.role} traffic` : 'lazy traffic';
+    return {
+      ok: false,
+      label: 'Model API accepts lazy credential',
+      detail:
+        `The model API rejected ${who} with HTTP ${rejection.status} ${minutesAgo}m ago and nothing has ` +
+        `succeeded since — lazy's credential is present but not valid.` +
+        (rejection.error ? `\n  Upstream said: ${rejection.error}` : '') +
+        `\n  Mint a new one and give it to the daemon:\n` +
+        `    ${theme.command('claude setup-token')}\n` +
+        `    ${theme.command('export CLAUDE_CODE_OAUTH_TOKEN=…')}\n` +
+        `    ${theme.command('lazy daemon restart')}\n` +
+        `  A ${theme.command('/login')} inside a builder fixes only that one session — the daemon keeps ` +
+        `handing out its own credential to everything else.`,
+    };
+  } catch {
+    return { ok: true, label: 'Model API accepts lazy credential (check skipped)' };
+  } finally {
+    if (storage && ownsStorage) await storage.close();
+  }
 }
 
 async function checkPostgresConnectivity(config: ResolvedConfig): Promise<CheckResult> {
@@ -790,6 +948,556 @@ function checkDiskSpace(root: string): CheckResult {
   }
 }
 
+/**
+ * Detect conversations whose raw JSONL is on disk (shared dir or a per-builder
+ * isolation dir) but which never reached the store, and — crucially — tell
+ * ROT from HISTORY:
+ *
+ *   - RECENT misses (modified in the last CAPTURE_ROT_WINDOW_MS, settled for at
+ *     least CAPTURE_SETTLE_MS) mean capture is broken RIGHT NOW. This is a
+ *     FAILING check: conversation capture has now silently rotted twice, and
+ *     both times it was found months later by accident. Failing loudly here is
+ *     the whole point.
+ *   - OLDER misses are recoverable history (the capture bug fixed in
+ *     `fix-conversation-capture`) — a warning, recovered on demand with
+ *     `lazy doctor --reimport-conversations`.
+ *
+ * A session modified within the settle window is ignored: it is probably still
+ * being written, and the daemon's capture sweep runs on its own timer.
+ *
+ * Report-only either way — recovery is never a silent write.
+ *
+ * Uses a direct read-only Storage (like the crashed-run check) so it works even
+ * when the daemon is down; degrades to "no issue" on any storage error rather
+ * than failing the health check.
+ */
+async function checkReimportableConversations(root: string, dataDirAbs: string): Promise<CheckResult> {
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    // Prefer the daemon (it owns storage) so we never open a second FileStorage
+    // that contends on the storage lock. Only when there's no daemon (or in
+    // test mode) do we fall back to a direct read-only handle we must close.
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+    const missing = await listMissingConversations({ lazyRoot: root, dataDirAbs, storage });
+    const { rotted, historical } = classifyMissingConversations(missing, Date.now());
+
+    if (rotted.length > 0) {
+      const newest = Math.max(...rotted.map(m => m.mtimeMs));
+      const minutesAgo = Math.round((Date.now() - newest) / 60_000);
+      return {
+        ok: false,
+        label: 'Conversation capture is live',
+        detail:
+          `${rotted.length} conversation(s) written in the last 24h (most recent ${minutesAgo}m ago) ` +
+          `are on disk but never reached the store — live capture is not running. ` +
+          `Check the daemon is up (${theme.command('lazy daemon status')}); it runs the capture sweep. ` +
+          `Recover the missing ones with: ${theme.command('lazy doctor --reimport-conversations')}`,
+      };
+    }
+
+    if (historical.length > 0) {
+      return {
+        ok: true,
+        label: 'Conversation capture is live',
+        warning:
+          `${historical.length} older conversation(s) found on disk but missing from the store ` +
+          `(recoverable capture from before ${theme.command('fix-conversation-capture')}). ` +
+          `Recover with: ${theme.command('lazy doctor --reimport-conversations')}`,
+      };
+    }
+
+    return { ok: true, label: 'All conversations captured' };
+  } catch {
+    // Storage or disk scan unavailable — don't turn a diagnostics hiccup into a
+    // health failure. Recovery is opt-in anyway.
+    return { ok: true, label: 'Builder conversations captured (check skipped)' };
+  } finally {
+    // Only close a handle we opened; the daemon-backed RemoteStorage is shared.
+    if (storage && ownsStorage) await storage.close();
+  }
+}
+
+/**
+ * Detect harness memory files on disk (shared dir or a per-builder isolation
+ * dir) that lazy's shared memory has no record for — the fallout of memory
+ * having lived in the Claude Code harness memory dir, inside a per-builder
+ * overlay that is never shared and eventually pruned. Report-only: the import
+ * is an explicit `lazy doctor --import-memory`, never a silent write.
+ *
+ * Mirrors checkReimportableConversations: prefers the daemon's storage, falls
+ * back to a direct read-only handle, and degrades to "no issue" on any error
+ * rather than failing the health check.
+ */
+async function checkImportableMemories(root: string, dataDirAbs: string): Promise<CheckResult> {
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+    const missing = await countImportableMemories({ lazyRoot: root, dataDirAbs, storage });
+    if (missing === 0) {
+      return { ok: true, label: 'Shared memory up to date' };
+    }
+    return {
+      ok: true,
+      label: 'Shared memory',
+      warning:
+        `${missing} Claude Code harness memory record(s) found on disk with no lazy counterpart. ` +
+        `They live in per-builder overlays: unshared, invisible to agents, and pruned over time. ` +
+        `Import with: ${theme.command('lazy doctor --import-memory')}`,
+    };
+  } catch {
+    return { ok: true, label: 'Shared memory (check skipped)' };
+  } finally {
+    if (storage && ownsStorage) await storage.close();
+  }
+}
+
+/**
+ * Report the size of the shared-memory context injected into every builder and
+ * agent launch, against `[memory] warn_bytes`.
+ *
+ * This is the ONLY place the memory-size advisory is spelled out. A launch that
+ * finds the context over the threshold prints one generic line pointing here
+ * (`MEMORY_CONTEXT_CTA`) — doctor is the single "check engine light" surface, so
+ * the diagnosis and the remedy live together here instead of every launch site
+ * growing its own bespoke warning.
+ *
+ * Report-only and never a hard failure, because the threshold itself is
+ * advisory: memory past it is still knowledge, so lazy never truncates it and
+ * never blocks a launch over it.
+ *
+ * Mirrors checkImportableMemories: prefers the daemon's storage, falls back to a
+ * direct read-only handle, and degrades to a skipped check on any error.
+ */
+async function checkMemoryContext(root: string, config: ResolvedConfig): Promise<CheckResult> {
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+
+    const records = await storage.listMemories();
+    const liveCount = records.filter(isLiveMemory).length;
+    if (liveCount === 0) {
+      return { ok: true, label: 'Injected memory context (no records)' };
+    }
+
+    const compact = await storage.getMemoryCompact();
+    const warnBytes = config.memory.warn_bytes;
+
+    // Measure BOTH launch surfaces and report the worst. The builder and agent
+    // templates differ in size, so a context can be over the threshold for one
+    // and under for the other; reporting a single surface could tell the human
+    // "all clear" while the other surface's launches keep warning.
+    const builder = assembleMemorySection(records, 'builder', { compact, warnBytes }).measured;
+    const agent = assembleMemorySection(records, 'agent', { compact, warnBytes }).measured;
+    const measured = builder.bytes >= agent.bytes ? builder : agent;
+
+    const written = compact ? recordsNewerThanCompact(records, compact).length : 0;
+    const removed = compact ? namesRemovedSinceCompact(records, compact).length : 0;
+    const compactState = compact
+      ? `Compact generated ${formatTimeSince(new Date(compact.generated_at).toISOString())} ` +
+        `(${compact.method}, covering ${compact.covered.length} record(s)); ` +
+        `${written} written since, ${removed} removed since`
+      : 'No compact — the full record index is injected';
+
+    if (!measured.overThreshold) {
+      const compactSummary = compact ? `${compact.method} compact` : 'no compact';
+      return {
+        ok: true,
+        label:
+          `Injected memory context ${formatBytes(measured.bytes)} of ${formatBytes(warnBytes)} ` +
+          `(${liveCount} record(s), ${compactSummary})`,
+      };
+    }
+
+    // Over the threshold: recompacting only helps if the compact is actually
+    // behind the records. A CURRENT compact that is still too big means the
+    // records themselves need curating — saying "run lazy memory compact" there
+    // would send the human in a circle.
+    const stale = compact ? written > 0 || removed > 0 : true;
+    const remedy = stale
+      ? `Regenerate it from the current records with: ${theme.command('lazy memory compact')} (records are never modified)`
+      : `The compact is already current, so recompacting will not shrink this — curate the records ` +
+        `(${theme.command('lazy memory save')} / ${theme.command('lazy memory rm')}) or raise [memory] warn_bytes`;
+
+    return {
+      ok: true,
+      label: 'Injected memory context',
+      warning:
+        `${formatBytes(measured.bytes)} injected into every launch, over the ` +
+        `${formatBytes(warnBytes)} advisory threshold ([memory] warn_bytes in lazy.toml). ` +
+        `Nothing is blocked or truncated.\n` +
+        `  ${liveCount} live record(s). ${compactState}.\n` +
+        `  ${remedy}`,
+    };
+  } catch (err) {
+    // A diagnostics hiccup must not become a health failure (same rule as the
+    // checks above) — but it is not silent either: the reason is surfaced.
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: true,
+      label: 'Injected memory context (check skipped)',
+      warning: `Could not measure the memory context: ${message}`,
+    };
+  } finally {
+    if (storage && ownsStorage) await storage.close();
+  }
+}
+
+/**
+ * Detect `[protection].protected_tasks` entries that resolve to no branch —
+ * the task was deleted, its code changed, the identifier became ambiguous, or
+ * it has never been started.
+ *
+ * Such an entry gates NOTHING: the accept path fails open rather than blocking
+ * every accept on a config typo. That is the dangerous half of the trade —
+ * the human believes a gate is armed when it is not — so doctor names each
+ * stale code and its fix. Report-only and never a hard failure (mirrors the
+ * reimportable-conversations check): the repo is healthy, the config is stale.
+ *
+ * Skipped entirely when protection is off or the list is empty, so the common
+ * case costs no storage access at all.
+ */
+async function checkProtectedTasksResolvable(root: string, config: ResolvedConfig): Promise<CheckResult> {
+  const listed = config.protection.protected_tasks;
+  if (listed.length === 0) {
+    return { ok: true, label: 'Protected tasks resolvable (none configured)' };
+  }
+
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    // Prefer the daemon (it owns storage) so we never open a second FileStorage
+    // that contends on the storage lock — same rule as the checks above.
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+
+    const { stale } = await classifyProtectedTasks(storage, listed);
+    if (stale.length === 0) {
+      return { ok: true, label: `Protected tasks resolvable (${listed.length})` };
+    }
+
+    const lines = stale.map((s) => `  - "${s.listedAs}" ${s.detail}`).join('\n');
+    return {
+      ok: true,
+      label: 'Protected tasks resolvable',
+      warning:
+        `${stale.length} of ${listed.length} entr${stale.length === 1 ? 'y' : 'ies'} in ` +
+        `[protection].protected_tasks gate nothing:\n${lines}\n` +
+        `  Remove each with: ${theme.command('lazy protect <code> off')}` +
+        `${config.protection.enabled ? '' : ' (protection is also globally disabled)'}`,
+    };
+  } catch {
+    // Storage unavailable — a diagnostics hiccup must not become a health
+    // failure, and the accept path warns about the same entries anyway.
+    return { ok: true, label: 'Protected tasks resolvable (check skipped)' };
+  } finally {
+    if (storage && ownsStorage) await storage.close();
+  }
+}
+
+/**
+ * Verify the IMPLICIT default-branch protection entry actually names the repo's
+ * default branch.
+ *
+ * `[protection].gate_default_branch` (on by default) protects a branch nobody
+ * ever typed: it is resolved at accept time from `refs/remotes/<remote>/HEAD`.
+ * When that ref is missing, `getRemoteDefaultBranch` falls back to the literal
+ * `"main"` — so on a `master` repo the human believes their default branch is
+ * gated while accepts into it sail straight through. Same failure mode as a
+ * stale `protected_tasks` entry (a gate believed armed but isn't), so it gets
+ * the same treatment: named, with its one-line fix, and never a hard failure.
+ *
+ * Skipped when protection is off or default-branch gating is off, so the
+ * common case costs no git call at all.
+ */
+async function checkDefaultBranchProtectionResolvable(
+  root: string,
+  config: ResolvedConfig,
+): Promise<CheckResult> {
+  const p = config.protection;
+  if (!p.enabled || !p.gate_default_branch) {
+    return { ok: true, label: 'Default-branch protection (not enabled)' };
+  }
+
+  const remote = config.remote.git_remote;
+  const result = await runGit(['symbolic-ref', `refs/remotes/${remote}/HEAD`], { cwd: root });
+  if (result.exitCode === 0) {
+    const branch = result.stdout.trim().replace(`refs/remotes/${remote}/`, '');
+    return { ok: true, label: `Default-branch protection resolvable (\`${branch}\`)` };
+  }
+
+  return {
+    ok: true,
+    label: 'Default-branch protection resolvable',
+    warning:
+      `[protection].gate_default_branch is on, but the default branch of remote '${remote}' ` +
+      `cannot be resolved — accept falls back to the literal "main". If this repo's default ` +
+      `branch is not \`main\`, that gate protects nothing.\n` +
+      `  Fix with: ${theme.command(`git remote set-head ${remote} --auto`)}\n` +
+      `  Or name the branch outright: ${theme.command('lazy protect --branch <branch> on')}`,
+  };
+}
+
+/**
+ * Detect the one combination that is likely a mistake: `[protection]` keys
+ * that configure gates (`protected_branches`, `protected_tasks`, …) while the
+ * master switch is off — because it was never set to true, or was explicitly
+ * set to false. Those keys are inert, and the human who typed them believes
+ * they are armed.
+ *
+ * Protection is OPT-IN, so an untouched project (and a bare `enabled = false`)
+ * is a normal, deliberate state and gets NO warning — nagging every project
+ * about a feature it never asked for is exactly the noise this check must not
+ * become. Report-only, never a hard failure.
+ *
+ * Reads the RAW config, not the resolved one: the point is which keys the
+ * human actually typed, not what defaults filled in.
+ */
+function checkProtectionConfigInert(rawConfig: Record<string, unknown>): CheckResult {
+  const section = rawConfig.protection as Record<string, unknown> | undefined;
+  if (!section || section.enabled === true) {
+    return { ok: true, label: 'Protection config coherent' };
+  }
+
+  const inert = Object.keys(section).filter((k) => k !== 'enabled');
+  if (inert.length === 0) {
+    // Nothing configured beyond (at most) the switch itself — the plain
+    // opt-in default, or a deliberate explicit opt-out. Both are fine.
+    return { ok: true, label: 'Protection off (opt-in; nothing configured)' };
+  }
+
+  const explicitOptOut = section.enabled === false;
+  return {
+    ok: true,
+    label: 'Protection config coherent',
+    warning:
+      `[protection] is ${explicitOptOut ? 'explicitly disabled (enabled = false)' : 'off (enabled is never set to true)'}, ` +
+      `so these keys have no effect: ${inert.map((k) => `\`${k}\``).join(', ')}.\n` +
+      `  Engage them with: ${theme.command('lazy protect <branch|task> on')} ` +
+      `(or set ${theme.command('enabled = true')} under [protection]), ` +
+      `or delete the inert keys if protection is meant to stay off.`,
+  };
+}
+
+/**
+ * `lazy doctor --import-memory`: the one-time migration from harness memory
+ * files into lazy-owned shared memory. Previews, confirms (unless --yes), then
+ * imports every record missing from the store. Idempotent — already-imported
+ * names are skipped, so re-running is safe.
+ */
+async function commandDoctorImportMemory(root: string, opts: { yes: boolean }): Promise<void> {
+  const config = await loadConfig(root);
+  const dataDirAbs = join(root, config.data.path);
+
+  // Writes go through the daemon (RemoteStorage) — the daemon owns storage.
+  const storage = await requireStorage();
+  try {
+    const missing = await countImportableMemories({ lazyRoot: root, dataDirAbs, storage });
+    if (missing === 0) {
+      console.log('No harness memory records found on disk that lazy is missing — nothing to import.');
+      return;
+    }
+
+    console.log(`Found ${missing} harness memory record(s) not yet in lazy's shared memory.`);
+    if (!opts.yes) {
+      if (!isTTY()) {
+        console.log(`Re-run with ${theme.command('--yes')} to import them (non-interactive).`);
+        return;
+      }
+      const proceed = await promptYesNo(`Import ${missing} memory record(s)?`, true);
+      if (!proceed) {
+        console.log('Aborted — nothing was imported.');
+        return;
+      }
+    }
+
+    const report = await importHarnessMemory({
+      lazyRoot: root,
+      dataDirAbs,
+      storage,
+      onImported: (info) => {
+        console.log(theme.success(`  Imported ${info.name}`) + `  (${info.type}) ${info.description}`);
+      },
+    });
+
+    console.log('');
+    console.log(
+      `Import complete: ${report.imported.length} imported, ` +
+      `${report.skippedExisting.length} already present, ` +
+      `${report.skippedEmpty.length} empty skipped.`,
+    );
+    // Curation hint, not a failure: over-long descriptions ARE imported.
+    const longNotice = formatLongDescriptionNotice(report);
+    if (longNotice) {
+      console.log(theme.warning(`  ${longNotice}`));
+    }
+    if (report.errors.length > 0) {
+      console.log(theme.error(`  ${report.errors.length} record(s) failed to import:`));
+      for (const { name, error } of report.errors) {
+        console.log(theme.error(`    ${name}: ${error.message}`));
+      }
+      process.exit(1);
+    }
+    console.log(`Review them with: ${theme.command('lazy memory list')}`);
+  } finally {
+    await storage.close();
+  }
+}
+
+/**
+ * `lazy doctor --reimport-conversations`: the built-in recovery. An alias for
+ * the bulk path of `lazy import-conversation` — scans every candidate Claude
+ * projects dir (shared + per-builder isolation dirs), dedupes sessions, and
+ * re-imports any missing from the store through the daemon. Report-only preview
+ * unless the user confirms (or passes --yes).
+ */
+/**
+ * `lazy doctor --purge-housekeeping-conversations`: the one-time cleanup of
+ * machine-generated `claude -p` one-shots that were captured before lazy
+ * started excluding them at the source.
+ *
+ * INVARIANT: this NEVER runs as part of a routine `lazy doctor` sweep, and
+ * never deletes without explicit human confirmation. It is the only caller of
+ * `Storage.deleteConversation`, and it is the only place in lazy that
+ * classifies a conversation by sniffing prompt wording — see the docblock in
+ * src/import/housekeeping-conversation.ts for why that trade is acceptable
+ * here and nowhere else.
+ *
+ * Without `--yes` the classified list is printed and NOTHING is deleted: a TTY
+ * is then asked to confirm (defaulting to NO, because deletion is not
+ * recoverable from lazy alone), and a non-TTY is told to re-run with `--yes`.
+ */
+async function commandDoctorPurgeHousekeeping(opts: { yes: boolean }): Promise<void> {
+  // Reads and writes both go through the daemon (RemoteStorage) — the daemon
+  // owns storage, and it is also the process running the capture sweep.
+  const storage = await requireStorage();
+  try {
+    const conversations = await storage.listConversations();
+    const matches = findHousekeepingConversations(conversations);
+
+    if (matches.length === 0) {
+      console.log(
+        `No machine-generated housekeeping conversations found among ${conversations.length} stored conversation(s).`,
+      );
+      return;
+    }
+
+    console.log(
+      `Found ${matches.length} of ${conversations.length} stored conversation(s) that look like ` +
+      `machine-generated lazy housekeeping:`,
+    );
+    console.log('');
+    for (const { conversation, kind, reason } of matches) {
+      const started = conversation.startedAt
+        ? conversation.startedAt.replace('T', ' ').substring(0, 16)
+        : 'unknown         ';
+      const firstLine = (conversation.summary ?? '').split('\n')[0].trim();
+      const elided = firstLine.length > 60 ? `${firstLine.substring(0, 57)}...` : firstLine;
+      console.log(
+        `  ${theme.taskId(conversation.sessionId.substring(0, 8))}  ${started}  ` +
+        `${kind.padEnd(16)}  ${elided}`,
+      );
+      console.log(`    ${theme.label('why:')} ${reason}`);
+    }
+    console.log('');
+
+    const byKind = new Map<string, number>();
+    for (const m of matches) byKind.set(m.kind, (byKind.get(m.kind) ?? 0) + 1);
+    console.log(
+      `By kind: ${[...byKind.entries()].map(([k, n]) => `${k} ${n}`).join(', ')}.`,
+    );
+
+    if (!opts.yes) {
+      if (!isTTY()) {
+        console.log('');
+        console.log(`Nothing was deleted. Re-run with ${theme.command('--yes')} to delete them (non-interactive).`);
+        return;
+      }
+      console.log('');
+      console.log(theme.warning('Deleting a conversation is permanent — lazy cannot restore it.'));
+      const proceed = await promptYesNo(`Delete ${matches.length} conversation(s) from the store?`, false);
+      if (!proceed) {
+        console.log('Aborted — nothing was deleted.');
+        return;
+      }
+    }
+
+    let deleted = 0;
+    let alreadyGone = 0;
+    const errors: { sessionId: string; error: Error }[] = [];
+    for (const { conversation } of matches) {
+      try {
+        if (await storage.deleteConversation(conversation.sessionId)) {
+          deleted++;
+        } else {
+          // Idempotent re-run, or something else purged it concurrently.
+          alreadyGone++;
+        }
+      } catch (err) {
+        errors.push({ sessionId: conversation.sessionId, error: err as Error });
+      }
+    }
+
+    console.log('');
+    console.log(
+      `Purge complete: ${deleted} deleted` +
+      (alreadyGone > 0 ? `, ${alreadyGone} already gone` : '') +
+      (errors.length > 0 ? `, ${errors.length} failed` : '') + '.',
+    );
+    if (errors.length > 0) {
+      for (const { sessionId, error } of errors) {
+        console.log(theme.error(`  ${sessionId.substring(0, 8)}: ${error.message}`));
+      }
+      process.exit(1);
+    }
+    console.log(
+      'This is a one-time cleanup: new housekeeping one-shots are marked at the source and never enter the store.',
+    );
+    // Least surprise: these conversations predate the on-disk marker, so the
+    // recovery path cannot tell them apart from real history. Say so here
+    // rather than letting the next `lazy doctor` quietly offer to undo this.
+    console.log(
+      theme.warning(
+        `  Note: purged conversations whose raw Claude JSONL is still on disk carry no marker, so ` +
+        `${theme.command('lazy doctor --reimport-conversations')} would bring them back.`,
+      ),
+    );
+  } finally {
+    await storage.close();
+  }
+}
+
+async function commandDoctorReimport(root: string, opts: { yes: boolean }): Promise<void> {
+  const config = await loadConfig(root);
+  const dataDirAbs = join(root, config.data.path);
+
+  // Writes go through the daemon (RemoteStorage) — the daemon owns storage.
+  const storage = await requireStorage();
+  try {
+    const { ok } = await runReimportBulk({ lazyRoot: root, dataDirAbs, storage, yes: opts.yes });
+    if (!ok) process.exit(1);
+  } finally {
+    await storage.close();
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────────────────
 
 export async function commandDoctor(args: string[]): Promise<void> {
@@ -798,16 +1506,60 @@ export async function commandDoctor(args: string[]): Promise<void> {
     { name: 'no-resume', takesValue: false },
     { name: 'dry-run', takesValue: false },
     { name: 'yes', aliases: ['y'], takesValue: false },
+    { name: 'reimport-conversations', takesValue: false },
+    { name: 'purge-housekeeping-conversations', takesValue: false },
+    { name: 'import-memory', takesValue: false },
   ], 'doctor');
 
   const noResume = parsed.flags.get('no-resume') === true;
   const dryRun = parsed.flags.get('dry-run') === true;
   const yes = parsed.flags.get('yes') === true;
+  const reimportConversationsFlag = parsed.flags.get('reimport-conversations') === true;
+  const purgeHousekeepingFlag = parsed.flags.get('purge-housekeeping-conversations') === true;
+  const importMemoryFlag = parsed.flags.get('import-memory') === true;
 
   // If a positional argument is provided, run task-specific diagnostics
   if (parsed.positional.length > 0) {
     const { commandDoctorTask } = await import('./doctor-task');
     await commandDoctorTask(parsed.positional[0], { dryRun, yes });
+    return;
+  }
+
+  // `--reimport-conversations` is a dedicated recovery flow, not part of the
+  // health-check sweep: it scans every candidate Claude projects dir and
+  // re-imports missing builder conversations into the store.
+  if (reimportConversationsFlag) {
+    const reimportRoot = findLazyRoot();
+    if (!reimportRoot) {
+      console.error('Not in a lazy project. Run `lazy init` first.');
+      process.exit(1);
+    }
+    await commandDoctorReimport(reimportRoot, { yes });
+    return;
+  }
+
+  // `--purge-housekeeping-conversations` is a one-time cleanup flow, never part
+  // of the health-check sweep: it deletes already-stored machine-generated
+  // one-shots that predate the capture-time exclusion.
+  if (purgeHousekeepingFlag) {
+    const purgeRoot = findLazyRoot();
+    if (!purgeRoot) {
+      console.error('Not in a lazy project. Run `lazy init` first.');
+      process.exit(1);
+    }
+    await commandDoctorPurgeHousekeeping({ yes });
+    return;
+  }
+
+  // `--import-memory` is likewise a dedicated migration flow, not part of the
+  // health-check sweep: it imports harness memory files into shared memory.
+  if (importMemoryFlag) {
+    const importRoot = findLazyRoot();
+    if (!importRoot) {
+      console.error('Not in a lazy project. Run `lazy init` first.');
+      process.exit(1);
+    }
+    await commandDoctorImportMemory(importRoot, { yes });
     return;
   }
 
@@ -821,10 +1573,59 @@ export async function commandDoctor(args: string[]): Promise<void> {
   const root = findLazyRoot();
   let crashedTasks: CrashedTask[] = [];
 
-  // Determine runner type for conditional checks
-  const config = root ? await loadConfig(root) : null;
+  // Determine runner type for conditional checks.
+  //
+  // loadConfig() throws when lazy.toml exists but does not parse. `lazy doctor`
+  // is THE surface for "my setup is broken", so it must not be the command that
+  // dies on a broken config — it catches the failure, reports it as a failed
+  // check with the parser's own message, and skips every check downstream of
+  // config (they would each report defaults as if the user had chosen them,
+  // which is precisely the misdiagnosis this whole change removes).
+  let config: Awaited<ReturnType<typeof loadConfig>> | null = null;
+  let configError: string | null = null;
+  if (root) {
+    try {
+      config = await loadConfig(root);
+    } catch (err) {
+      configError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  if (root) {
+    results.push(
+      configError
+        ? { ok: false, label: 'lazy.toml parses', detail: configError }
+        : { ok: true, label: 'lazy.toml parses' },
+    );
+  }
+
   const runnerType = config?.runner?.type ?? 'docker';
-  const runner = root ? await createRunner(root) : null;
+  // createRunner loads config itself, so it throws on the same broken file.
+  //
+  // It also RESOLVES the live proxy address up front and fails loud when it
+  // cannot (ProxyUnavailableError) — which, with the proxy on by default, is
+  // what a daemon that is down (or that lost its proxy) looks like. `lazy
+  // doctor` is THE surface for "my setup is broken", so it must not be the one
+  // command that dies in that state: that ONE error becomes a reported check
+  // (carrying the error's own actionable text) and the runner-dependent checks
+  // below are skipped, the same way a broken lazy.toml is handled just above.
+  //
+  // Deliberately narrow. Every other createRunner failure — an unknown runner
+  // type, an agent/runner mismatch — still aborts the command, because those
+  // are configuration errors the user must fix before any check means anything
+  // (see 'invalid runner config fails with error' in test/e2e/runner-config).
+  let runner: Runner | null = null;
+  let runnerError: string | null = null;
+  if (root && !configError) {
+    try {
+      runner = await createRunner(root);
+    } catch (err) {
+      if (!(err instanceof ProxyUnavailableError)) throw err;
+      runnerError = err.message;
+    }
+  }
+  if (runnerError) {
+    results.push({ ok: false, label: 'Runner available', detail: runnerError });
+  }
 
   const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
 
@@ -847,7 +1648,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
     }
   }
 
-  results.push(checkAuth());
+  results.push(await checkAuth(configError ? null : config ?? null));
 
   // Shell and completion checks
   const { result: shellResult, shell } = await checkShellDetected();
@@ -860,7 +1661,16 @@ export async function commandDoctor(args: string[]): Promise<void> {
     ? diag.every(c => c.state !== 'fail')
     : false;
 
-  if (root) {
+  if (root && configError) {
+    // Everything below needs a parsed config. Reporting those checks against
+    // defaults would be worse than skipping them: the user would read a green
+    // sweep as "my configured setup is healthy" when none of their settings
+    // were in force. One failed check, one cause, one remedy.
+    console.log(
+      "Note: lazy.toml could not be parsed — every config-dependent check is skipped. " +
+      "See the 'lazy.toml parses' result below.\n",
+    );
+  } else if (root) {
     results.push(await checkDataDir(root));
 
     // Offline mode status — always surface when it expires (or that it won't).
@@ -919,6 +1729,12 @@ export async function commandDoctor(args: string[]): Promise<void> {
     results.push(checkStaleLocks(root));
     results.push(checkStorageLock(root));
     results.push(await checkSplitStorage(root));
+    results.push(await checkReimportableConversations(root, join(root, config!.data.path)));
+    results.push(await checkImportableMemories(root, join(root, config!.data.path)));
+    results.push(await checkMemoryContext(root, config!));
+    results.push(await checkCredentialAccepted(root));
+    results.push(await checkProtectedTasksResolvable(root, config!));
+    results.push(await checkDefaultBranchProtectionResolvable(root, config!));
     results.push(await checkTaskBranchUpstreamTracking());
     results.push(checkDiskSpace(root));
 
@@ -930,6 +1746,9 @@ export async function commandDoctor(args: string[]): Promise<void> {
     // Config validation (uses driver to know valid/deprecated remote keys)
     if (rawConfig && driver) {
       results.push(...checkConfigKeys(rawConfig, driver));
+    }
+    if (rawConfig) {
+      results.push(checkProtectionConfigInert(rawConfig));
     }
 
     // Feature flags status
@@ -1010,26 +1829,51 @@ export async function commandDoctor(args: string[]): Promise<void> {
 
 export function doctorUsage(): void {
   console.log(`Usage: lazy doctor [--no-resume]
+       lazy doctor --reimport-conversations [--yes]
+       lazy doctor --purge-housekeeping-conversations [--yes]
+       lazy doctor --import-memory [--yes]
        lazy doctor <task-id> [--dry-run] [--yes]
 
 Check the health of your lazy installation, or diagnose a specific task.
 
 Options:
-  --no-resume   Report crashed containers without auto-resuming interrupted tasks
-  --dry-run     Show task issues without offering fixes (task mode only)
-  --yes, -y     Apply all fixes without prompting (task mode only)
+  --no-resume                Report crashed containers without auto-resuming interrupted tasks
+  --reimport-conversations   Recover builder conversations whose raw Claude logs are on
+                             disk (shared ~/.claude/projects + per-builder isolation dirs)
+                             but never reached the store; skips ones already imported
+  --purge-housekeeping-conversations
+                             Delete already-stored machine-generated lazy one-shots
+                             (accept fidelity summaries, 'lazy report', memory
+                             compaction, pairing summaries) from the conversation
+                             store. Lists what it classified and deletes nothing
+                             without --yes or an interactive confirmation. A ONE-TIME
+                             cleanup: newer one-shots are marked at the source and
+                             never reach the store
+  --import-memory            Import Claude Code harness memory files (shared ~/.claude/projects
+                             + per-builder isolation dirs) into lazy-owned shared memory;
+                             skips records already present
+  --dry-run                  Show task issues without offering fixes (task mode only)
+  --yes, -y                  Apply all fixes / skip the re-import, import-memory, or
+                             purge confirmation prompt
 
 Project-level checks (no task ID):
   - Git installed and functional
   - Repository has at least one commit
   - Docker installed and daemon running
-  - Anthropic API key or OAuth token configured
+  - Anthropic API key or OAuth token present in the DAEMON's environment
+    (falls back to this shell's, saying so, when the daemon can't be asked)
   - Shell detected and completions installed
   - tmux installed (soft recommendation)
   - Data directory structure valid
   - Container image exists and up to date
   - No stale locks or orphaned containers
   - No split storage (when external storage is configured)
+  - Recoverable builder conversations on disk but missing from the store
+  - Harness memory files on disk with no lazy shared-memory record
+  - Injected memory context size vs [memory] warn_bytes (compact staleness + remedy)
+  - Stale [protection].protected_tasks entries that gate nothing
+  - Default-branch protection resolves to a real branch (not the "main" fallback)
+  - [protection] gate keys configured while the master switch is off (inert)
   - Crashed task containers (auto-resumes interrupted tasks by default)
   - No task branches with upstream tracking (prevents git pull pollution)
   - Adequate disk space

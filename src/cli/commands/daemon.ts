@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'fs';
-import { rm } from 'fs/promises';
+import { rm, readFile } from 'fs/promises';
 import { parseFlags, requireLazyRoot } from '../helpers';
 import { formatDuration } from '../helpers';
 import { describeExpiry } from '../../utils/local-day';
@@ -33,14 +33,17 @@ import {
   cleanupStaleFiles,
   getSocketPath,
   getDaemonBaseDir,
+  getStartupErrorPath,
   formatDashboardUrl,
   enumerateDaemons,
   type DaemonRecord,
 } from '../../daemon';
 import { startDaemonBackground } from '../../daemon/auto-start';
+import { getRunningCodeSha } from '../../daemon/code-version';
 import { assertDaemonCredentials } from '../../daemon/credential-gate';
-import { commandLogs } from './logs';
-import { commandAutoBudget } from './auto-budget';
+import { commandLogs, logsUsage } from './logs';
+import { commandAutoBudget, autoBudgetUsage } from './auto-budget';
+import { commandDaemonConfig, daemonConfigUsage } from './daemon-config';
 
 export async function commandDaemon(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -70,6 +73,9 @@ export async function commandDaemon(args: string[]): Promise<void> {
       break;
     case 'auto-budget':
       await commandAutoBudget(subArgs);
+      break;
+    case 'config':
+      await commandDaemonConfig(subArgs);
       break;
     default:
       if (subcommand === '--help' || subcommand === '-h' || !subcommand) {
@@ -103,10 +109,10 @@ async function daemonStart(args: string[]): Promise<void> {
   const projectRoot = resolveProjectRoot(parsed.flags);
 
   if (foreground) {
-    // Credential gate (single enforcement point for auth). The background path
-    // checks this inside startDaemonBackground before spawning; the foreground
-    // path starts the server in-process, so gate here too. This also covers the
-    // detached child, which runs `daemon start --foreground`.
+    // Credential gate PRE-FLIGHT. startDaemonServer() enforces the same gate
+    // authoritatively, but running it here first means a foreground start
+    // refuses on the user's terminal before touching stale files or the log,
+    // with no marker-file round trip.
     await assertDaemonCredentials(projectRoot);
 
     // Foreground mode: startDaemonServer() acquires the flock internally.
@@ -190,6 +196,18 @@ async function daemonStop(args: string[]): Promise<void> {
 }
 
 async function daemonRestart(args: string[]): Promise<void> {
+  // Credential gate PRE-FLIGHT, before the stop. Without it, a restart run from
+  // a shell that has no credential would kill a perfectly good daemon and only
+  // then discover it cannot start a replacement — leaving the project with no
+  // daemon at all. Same reasoning as `lazy upgrade`'s preflight: check what can
+  // refuse us BEFORE doing anything destructive.
+  const parsed = parseFlags(args, [
+    { name: 'foreground', takesValue: false },
+    { name: 'background', takesValue: false },
+    { name: 'project', takesValue: true },
+  ], 'daemon restart');
+  await assertDaemonCredentials(resolveProjectRoot(parsed.flags));
+
   await daemonStop(args);
   await daemonStart(args);
 }
@@ -206,6 +224,17 @@ async function daemonStatus(args: string[]): Promise<void> {
   if (!isDaemonRunning(projectRoot)) {
     cleanupStaleFiles(projectRoot);
     console.log('Daemon is not running.');
+    // Surface the last startup-error marker if present — the daemon fails hard
+    // (and does not run) when the [proxy] server can't start, so this is where
+    // the "why isn't the proxy up?" reason lives once the daemon is down.
+    try {
+      const marker = (await readFile(getStartupErrorPath(projectRoot), 'utf-8')).trim();
+      if (marker) {
+        console.log('');
+        console.log('Last start attempt failed with:');
+        console.log(marker.split('\n').map((l) => `  ${l}`).join('\n'));
+      }
+    } catch { /* no marker (normal) — nothing to surface */ }
     return;
   }
 
@@ -227,6 +256,21 @@ async function daemonStatus(args: string[]): Promise<void> {
       // regress.
       console.log('  Web:     not bound (degraded — restart after freeing the port)');
     }
+    // Proxy: the primary way to find the (OS-assigned by default) proxy address.
+    // INVARIANT: always print this line. The proxy is on by default, so an absent
+    // line would be indistinguishable from a running one and would hide that
+    // agent traffic is flowing unaudited.
+    if (status.proxy) {
+      const p = status.proxy;
+      if (!p.enabled) {
+        console.log('  Proxy:   disabled ([proxy] enabled = false) — agent traffic connects directly, not audited');
+      } else if (p.running && p.address) {
+        const fb = `${p.fallbacks} fallback${p.fallbacks === 1 ? '' : 's'}`;
+        console.log(`  Proxy:   ${p.address} → ${p.upstream} (${fb}, policy ${p.policyEnforce ? 'on' : 'off'})`);
+      } else {
+        console.log('  Proxy:   enabled but not running (degraded — restart the daemon)');
+      }
+    }
     if (status.uptime !== undefined) {
       console.log(`  Uptime:  ${formatDuration(status.uptime)}`);
     }
@@ -237,6 +281,25 @@ async function daemonStatus(args: string[]): Promise<void> {
       // 'dev' when the daemon runs from source (no build step); otherwise the
       // UTC timestamp embedded into the compiled binary at build time.
       console.log(`  Built:   ${status.buildTime}${status.buildTime === 'dev' ? '' : ' (UTC)'}`);
+    }
+
+    // Staleness check (dev mode): the daemon serves whatever code it started
+    // with — it does not hot-reload on source changes. When the daemon's running
+    // SHA diverges from the working tree's current HEAD, its handlers are stale
+    // and on-disk fixes won't take effect until restart. Surface this loudly so
+    // the "why is the merged fix not working?" confusion is diagnosable.
+    if (status.codeSha) {
+      const currentSha = getRunningCodeSha();
+      if (currentSha && currentSha !== status.codeSha) {
+        console.log(`  Code:    ${status.codeSha} (running) — working tree at ${currentSha}`);
+        console.log('');
+        console.log(`  ⚠ Daemon is STALE: it is running code from ${status.codeSha}, but the`);
+        console.log(`    working tree is now at ${currentSha}. On-disk changes (merged fixes,`);
+        console.log('    new handlers) will NOT take effect until you restart the daemon:');
+        console.log('      lazy daemon restart');
+      } else {
+        console.log(`  Code:    ${status.codeSha}${currentSha ? ' (up to date)' : ''}`);
+      }
     }
 
     // Auto-react budget info
@@ -448,6 +511,21 @@ async function daemonLogs(args: string[]): Promise<void> {
   await commandLogs(args);
 }
 
+/**
+ * Usage functions for `lazy daemon <subcommand>`, keyed by subcommand name.
+ *
+ * The dispatcher in src/index.ts intercepts -h/--help before the command runs,
+ * so a subcommand's own usage is only reachable if it is listed here — without
+ * this map `lazy daemon logs -h` prints the parent's usage. Subcommands with no
+ * dedicated usage (start/stop/restart/status/list/kill-stray) are intentionally
+ * absent and fall back to daemonUsage().
+ */
+export const daemonSubcommandUsage: Record<string, () => void> = {
+  'logs': logsUsage,
+  'auto-budget': autoBudgetUsage,
+  'config': daemonConfigUsage,
+};
+
 export function daemonUsage(): void {
   console.log(`Usage: lazy daemon <subcommand> [options]
 
@@ -464,6 +542,7 @@ Subcommands:
   kill-stray  Reap daemons whose project root no longer exists on disk
   logs        Tail the daemon log file (primary debugging tool)
   auto-budget Control + inspect the auto-react daily budget (list/update/pause/resume)
+  config      Inspect + override concurrency caps at runtime (get/set/reset, ephemeral)
 
 Start options:
   --foreground    Run in foreground (don't detach)
@@ -486,5 +565,7 @@ Examples:
   lazy daemon list              # Show every daemon on the host
   lazy daemon kill-stray        # Reap daemons whose project root was deleted
   lazy daemon kill-stray --yes --prune-dirs  # Non-interactive full cleanup
-  lazy daemon auto-budget list  # Inspect today's auto-react budget`);
+  lazy daemon auto-budget list  # Inspect today's auto-react budget
+  lazy daemon config get        # Show concurrency caps + current usage
+  lazy daemon config set max_concurrent_agents 12  # Raise the agent cap (ephemeral)`);
 }

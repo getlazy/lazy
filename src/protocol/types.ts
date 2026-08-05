@@ -12,6 +12,7 @@
 
 import type { TokenUsage, MergeConflict, FileViolation } from '../types';
 import type { MaintainEntry } from '../config/types';
+import type { AgentFailureClass } from '../agent/failure-taxonomy';
 
 /**
  * Wire-protocol version between host CLI/daemon and supervisor.
@@ -32,7 +33,7 @@ export const PROTOCOL_VERSION = 2;
 
 // --- Command (host → supervisor) ---
 
-export type CommandType = 'start' | 'unblock' | 'ask' | 'sync' | 'stop';
+export type CommandType = 'start' | 'unblock' | 'ask' | 'sync' | 'stop' | 'pre_accept';
 
 export interface StartCommand {
   type: 'start';
@@ -51,11 +52,12 @@ export interface StartCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
-  graceful_exit_timeout_ms?: number;   // kill process this many ms after lazy_commit returns if it hasn't exited (0 = disabled)
+  wind_down_timeout_ms?: number;       // kill process this many ms after it emits its final result if it hasn't exited (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
 }
 
@@ -84,11 +86,12 @@ export interface UnblockCommand {
 
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
-  graceful_exit_timeout_ms?: number;   // kill process this many ms after lazy_commit returns if it hasn't exited (0 = disabled)
+  wind_down_timeout_ms?: number;       // kill process this many ms after it emits its final result if it hasn't exited (0 = disabled)
   protected_patterns?: string[];      // glob patterns for file permission violation detection
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
 }
 
@@ -129,6 +132,7 @@ export interface AskCommand {
   protected_patterns?: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];
 }
 
@@ -155,6 +159,14 @@ export interface SyncCommand {
   upstream_sha?: string;
   agent_session_id?: string;   // existing agent session for conflict resolution
   model_id?: string;           // model for conflict resolution (if needed)
+  /**
+   * Guard timeouts for the conflict-resolution agent turn. A sync that hits
+   * conflicts runs a real agent turn, so it gets the same two guards as work:
+   * kill on no forward progress, and a wind-down window that can only open
+   * once the agent's final result has landed.
+   */
+  watchdog_output_timeout_ms?: number;
+  wind_down_timeout_ms?: number;
 }
 
 export interface StopCommand {
@@ -163,7 +175,48 @@ export interface StopCommand {
   reason?: string;
 }
 
-export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand;
+/**
+ * Pre-accept command — the final agent turn before a task's merge.
+ *
+ * Dispatched synchronously by the daemon's accept path (launchPreAcceptTurn),
+ * daemon-owned end-to-end like an ask, but a WRITE turn: the agent runs the
+ * configured gate commands, fixes what they surface, updates any configured
+ * maintained-file groups against the FINAL diff, writes a built-in post-mortem
+ * to the task journal, and commits. After the agent's turn the
+ * supervisor RE-RUNS `commands` itself as the authoritative gate and reports the
+ * outcome in the response's `pre_accept` field — the agent cannot self-certify.
+ *
+ * Always resumes an existing session (a task being accepted has run at least
+ * once). `prompt` is fully rendered host-side (config lives on the daemon).
+ */
+export interface PreAcceptCommand {
+  type: 'pre_accept';
+  task_id: string;
+  goal: string;
+  prompt: string;
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
+  agent_id?: string;
+  system_prompt?: string;
+  model_id?: string;
+  effort?: string;
+  agent_session_id?: string;   // always set by the daemon — pre-accept always resumes
+  /** Gate commands the supervisor re-runs after the agent turn; first non-zero exit fails the gate. */
+  pre_accept_commands: string[];
+  /** Timeout in seconds for EACH gate command (default 600). */
+  pre_accept_timeout?: number;
+
+  turn_started_at?: string;
+  watchdog_output_timeout_ms?: number;
+  wind_down_timeout_ms?: number;
+  // Accepted so the command builder can share commonCommandFields; the maintain
+  // context is injected into the pre-accept prompt host-side instead.
+  protected_patterns?: string[];
+  post_turn_check?: string;
+  post_turn_timeout?: number;
+  maintain?: MaintainEntry[];
+}
+
+export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand | PreAcceptCommand;
 
 // --- Response (supervisor → host) ---
 
@@ -218,6 +271,22 @@ export interface CompletedResponse {
     prompt: string;
   };
   /**
+   * Present ONLY on the pre-accept response. The authoritative gate outcome: the
+   * supervisor re-ran `pre_accept_commands` after the agent's turn. `passed`
+   * false means the accept must abort and the task return to blocked; the daemon
+   * surfaces `failed_command` + `output` to the human. Absent → no gate ran
+   * (post-mortem-only turn), which the daemon treats as passed.
+   */
+  pre_accept?: {
+    passed: boolean;
+    /** The first command that exited non-zero (undefined when passed). */
+    failed_command?: string;
+    /** Exit code of the failed command (-1 exec error, -2 timeout). */
+    exit_code?: number;
+    /** Captured output of the failed command (truncated). */
+    output?: string;
+  };
+  /**
    * Present ONLY on the upstream-merge (sync) response. Carries the outcome the
    * reconciler needs to record turns:
    *   - `merged: false` — nothing to merge (already up to date). NO turn is
@@ -266,6 +335,29 @@ export interface ErrorResponse {
   /** How long the agent ran before crashing (ms) */
   duration_ms?: number;
   /**
+   * Taxonomy class of the failure that ended the turn, when the supervisor
+   * stopped retrying on purpose (src/agent/failure-taxonomy.ts). A `fatal_*`
+   * class tells the reconciler to BLOCK the task instead of auto-resuming it —
+   * auto-resume against a dead credential or a bad model id just re-crashes.
+   */
+  failure_class?: AgentFailureClass;
+  /** Human-readable reason paired with failure_class, shown in the error turn. */
+  failure_reason?: string;
+  /** How many launch attempts were made before giving up. */
+  failure_attempts?: number;
+  /**
+   * Set ONLY when the no-progress watchdog ended the turn: the guard's limit in
+   * ms, i.e. the effective `[agent] watchdog_output_timeout_ms`. Its presence is
+   * how the reconciler knows to render "killed by the watchdog" rather than the
+   * generic "agent crashed" — a 30-minute kill has to explain itself to whoever
+   * reads the task next.
+   */
+  watchdog_timeout_ms?: number;
+  /** Relaunch attempts the supervisor made after watchdog kills in this turn. */
+  watchdog_attempts?: number;
+  /** True when the killed turn had already captured a result or new commits. */
+  watchdog_captured_work?: boolean;
+  /**
    * Claude session id, when recoverable. Set by the supervisor on
    * GracefulExitTimeoutError so the human can `lazy unblock` after the kill
    * and pick up the conversation cleanly instead of orphaning it.
@@ -312,6 +404,8 @@ export interface RetryError {
   count: number;
   firstSeen: string;
   lastSeen: string;
+  /** Taxonomy class the agent assigned to this error (src/agent/failure-taxonomy.ts). */
+  failure_class?: AgentFailureClass;
 }
 
 export interface SupervisorStatus {
@@ -342,4 +436,14 @@ export interface SupervisorStatus {
   retryCount?: number;
   /** Deduplicated error log (only present when phase is 'retrying') */
   errors?: RetryError[];
+  /**
+   * Taxonomy class of the most recent failure (only when phase is 'retrying').
+   * Presentation surfaces (watch header, `lazy show`) render this so a human can
+   * tell "rate limited, still trying" from "can't reach the endpoint" at a glance.
+   */
+  retry_failure_class?: AgentFailureClass;
+  /** Human-readable reason paired with retry_failure_class. */
+  retry_failure_reason?: string;
+  /** Delay before the next attempt (ms) — lets the UI say when the retry lands. */
+  retry_next_delay_ms?: number;
 }

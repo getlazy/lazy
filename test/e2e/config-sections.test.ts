@@ -5,6 +5,32 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 
+// The `lazy init` template ALREADY writes [remote] and [docker]. Appending a
+// second copy of either is a TOML redefinition error, not a config change — and
+// it used to be invisible, because loadConfig warned and silently returned
+// DEFAULT_CONFIG. These tests then asserted that commands "work with a custom
+// [remote]/[docker] section" while lazy was in fact running on defaults with the
+// whole file discarded. So: set keys inside the section that is already there.
+
+/**
+ * Set `key = value` inside an existing TOML section, replacing the key (even if
+ * it is commented out) or inserting it just below the section header.
+ */
+function setConfigKey(config: string, section: string, key: string, value: string): string {
+  const lines = config.split('\n');
+  const header = lines.findIndex(l => l.trim() === `[${section}]`);
+  if (header === -1) throw new Error(`lazy init template no longer writes [${section}] — update this test`);
+
+  let end = header + 1;
+  while (end < lines.length && !lines[end].startsWith('[')) end++;
+
+  const keyPattern = new RegExp(`^\\s*#?\\s*${key}\\s*=`);
+  const existing = lines.slice(header + 1, end).findIndex(l => keyPattern.test(l));
+  if (existing === -1) lines.splice(header + 1, 0, `${key} = ${value}`);
+  else lines[header + 1 + existing] = `${key} = ${value}`;
+  return lines.join('\n');
+}
+
 describe('config remote and docker sections', () => {
   let ctx: TestContext;
 
@@ -28,14 +54,9 @@ describe('config remote and docker sections', () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = await readFile(configPath, 'utf-8');
 
-    const newConfig = existingConfig + `
-[remote]
-driver = "github"
-github_auto_push = false
-
-[docker]
-dockerfile = "Dockerfile.custom"
-`;
+    let newConfig = setConfigKey(existingConfig, 'remote', 'driver', '"github"');
+    newConfig = setConfigKey(newConfig, 'remote', 'github_auto_push', 'false');
+    newConfig = setConfigKey(newConfig, 'docker', 'dockerfile', '"Dockerfile.custom"');
     await writeFile(configPath, newConfig, 'utf-8');
 
     // Commands should still work with the new config sections
@@ -48,10 +69,7 @@ dockerfile = "Dockerfile.custom"
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = await readFile(configPath, 'utf-8');
 
-    const newConfig = existingConfig + `
-[remote]
-driver = "github"
-`;
+    const newConfig = setConfigKey(existingConfig, 'remote', 'driver', '"github"');
     await writeFile(configPath, newConfig, 'utf-8');
 
     const taskId = await createTask(ctx, 'Partial remote config task');

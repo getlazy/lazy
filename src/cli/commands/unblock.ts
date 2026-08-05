@@ -9,8 +9,6 @@ import { showTaskContext, runFeedbackFlow, getEditorFeedback, syncTaskFromRemote
 import { commandAccept } from './accept';
 import { commandReject } from './reject';
 import { commandRedo } from './redo';
-import { readPendingProposals, updateProposalStatus, type Proposal } from './propose';
-import { commandCreate } from './create';
 import { checkOrphanedChild } from '../orphan';
 import { isTerminalStatus } from '../../types';
 
@@ -20,6 +18,7 @@ import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../theme';
 import { parentTaskIdOf } from '../../task-target';
+import { sanitizeUserText } from '../../utils/sanitize-text';
 
 /**
  * Determine whether unblock should run in interactive mode.
@@ -27,7 +26,7 @@ import { parentTaskIdOf } from '../../task-target';
  */
 function isInteractiveMode(args: string[]): boolean {
   if (!process.stdin.isTTY) return false;
-  if (args.includes('--message')) return false;
+  if (args.includes('--message') || args.includes('-m')) return false;
   if (args.includes('--approve-file')) return false;
   if (args.includes('--yes')) return false;
   if (args.indexOf('-f') !== -1) return false;
@@ -37,8 +36,11 @@ function isInteractiveMode(args: string[]): boolean {
 export async function commandUnblock(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
-    { name: 'f', takesValue: true },
-    { name: 'message', takesValue: true },
+    // `-f` is the documented spelling (see unblockUsage) and the one
+    // isInteractiveMode checks for, but parseFlags only registers `--<name>`
+    // unless an alias is declared — so `-f` was rejected as an unknown flag.
+    { name: 'f', aliases: ['f'], takesValue: true },
+    { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'model', takesValue: true },
     { name: 'effort', takesValue: true },
     { name: 'follow', takesValue: false },
@@ -241,9 +243,6 @@ export async function commandUnblock(args: string[]): Promise<void> {
           }
         }
 
-        // Check for pending proposals
-        const pendingProposals = readPendingProposals(storage, task.id);
-
         // Detect staleness
         const STALE_THRESHOLD = 5;
         let commitsBehind = 0;
@@ -269,26 +268,18 @@ export async function commandUnblock(args: string[]): Promise<void> {
               `Accept anyway (agent hasn't seen ${unseenCount} comment${unseenCount === 1 ? '' : 's'})`,
               'Reject (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
-              ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ]
           : [
               'Give feedback (open editor)',
               'Accept (merge work)',
               'Reject (discard work)',
               ...(isStale ? [`Redo from scratch (lazy redo) — ${commitsBehind} commits behind`] : []),
-              ...(pendingProposals.length > 0 ? [`Review proposals (${pendingProposals.length} pending)`] : []),
             ];
 
         const choice = await promptChoice('What would you like to do?', menuOptions);
 
         let nextIdx = 3;
         const redoIdx = isStale ? nextIdx++ : -1;
-        const proposalsIdx = pendingProposals.length > 0 ? nextIdx++ : -1;
-
-        if (choice === proposalsIdx) {
-          await reviewProposals(root, task.id, pendingProposals, storage);
-          continue;
-        }
 
         // Close storage before delegating to accept/abandon/redo (they open their own)
         await storage.close();
@@ -399,6 +390,13 @@ export async function commandUnblock(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // INTAKE BOUNDARY: feedback becomes argv[2] of `claude -p` at the delivery
+    // seam, where a raw NUL is fatal. Escape non-printable control characters
+    // now — before persistence — so the feedback is delivered rather than
+    // crash-looping the turn and being silently dropped by the stale auto-resume.
+    // Sanitize-and-deliver, never reject: see src/utils/sanitize-text.ts.
+    message = sanitizeUserText(message);
+
     // Close storage before RPC call — daemon has its own storage
     await storage.close();
 
@@ -469,63 +467,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
   }
 }
 
-/**
- * Interactive review of pending proposals.
- * For each proposal, the human can accept (create a real task) or dismiss.
- */
-async function reviewProposals(
-  root: string,
-  taskId: string,
-  proposals: Proposal[],
-  storage: Awaited<ReturnType<typeof requireStorage>>,
-): Promise<void> {
-  console.log(`\n--- Reviewing ${proposals.length} proposal${proposals.length === 1 ? '' : 's'} ---\n`);
-
-  for (let i = 0; i < proposals.length; i++) {
-    const p = proposals[i];
-    console.log(`Proposal ${i + 1}/${proposals.length}:`);
-    console.log(`  Goal: ${p.goal}`);
-    if (p.code) {
-      console.log(`  Code: ${p.code}`);
-    }
-    if (p.prompt) {
-      const promptPreview = p.prompt.length > 120
-        ? p.prompt.substring(0, 117) + '...'
-        : p.prompt;
-      console.log(`  Prompt: ${promptPreview}`);
-    }
-    console.log('');
-
-    const choice = await promptChoice('What would you like to do with this proposal?', [
-      'Accept (create task)',
-      'Dismiss',
-      'Skip (decide later)',
-    ]);
-
-    if (choice === 0) {
-      const createArgs = ['--goal', p.goal];
-      if (p.code) {
-        createArgs.push('--code', p.code);
-      }
-      if (p.prompt) {
-        createArgs.push('--prompt', p.prompt);
-      }
-      await commandCreate(createArgs);
-      updateProposalStatus(storage, taskId, p.id, 'accepted');
-      console.log('');
-    } else if (choice === 1) {
-      updateProposalStatus(storage, taskId, p.id, 'dismissed');
-      console.log('Proposal dismissed.\n');
-    } else {
-      console.log('Skipped.\n');
-    }
-  }
-
-  console.log('--- Proposal review complete ---\n');
-}
-
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | --message <text>] [--model <model>] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -549,7 +492,7 @@ Arguments:
 
 Options:
   -f <file>           Read feedback from a file
-  --message <text>    Provide inline feedback
+  -m, --message <text>  Provide inline feedback
   --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-4-8)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.

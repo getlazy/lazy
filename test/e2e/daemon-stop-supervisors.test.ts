@@ -91,7 +91,7 @@ describe('daemon stop supervisor termination', () => {
     // Clean up any dummy processes that survived
     for (const p of dummyProcesses) { p.kill(); }
     if (daemon) {
-      try { daemon.stop(); } catch { /* may already be stopped */ }
+      try { await daemon.stop(); } catch { /* may already be stopped */ }
     }
     await ctx.cleanup();
     await rm(tmpDir, { recursive: true, force: true });
@@ -123,7 +123,7 @@ describe('daemon stop supervisor termination', () => {
     daemon.knownTaskIds.add(taskShortId);
 
     // Stop the daemon — should kill the supervisor process
-    daemon.stop();
+    await daemon.stop();
 
     // Give the process a moment to die (stopRun sends SIGTERM then waits)
     await new Promise(resolve => setTimeout(resolve, 500));
@@ -161,7 +161,7 @@ describe('daemon stop supervisor termination', () => {
     daemon.knownTaskIds.add(ownedTaskId);
 
     // Stop the daemon
-    daemon.stop();
+    await daemon.stop();
 
     await new Promise(resolve => setTimeout(resolve, 500));
 
@@ -191,7 +191,7 @@ describe('daemon stop supervisor termination', () => {
     });
     // knownTaskIds is not populated — no reconcile has run
 
-    daemon.stop();
+    await daemon.stop();
 
     await new Promise(resolve => setTimeout(resolve, 500));
 
@@ -216,7 +216,7 @@ describe('daemon stop supervisor termination', () => {
     });
 
     // Stop should complete without throwing, even though the PID doesn't exist
-    expect(() => daemon.stop()).not.toThrow();
+    await expect(daemon.stop()).resolves.toBeUndefined();
   });
 
   // INVARIANT: Daemon stop works when there are no active supervisors.
@@ -233,6 +233,6 @@ describe('daemon stop supervisor termination', () => {
     });
 
     // Stop should complete without issues
-    expect(() => daemon.stop()).not.toThrow();
+    await expect(daemon.stop()).resolves.toBeUndefined();
   });
 });

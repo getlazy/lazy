@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { which } from 'bun';
+import { assertArgvSafe } from './sanitize-text';
 
 /**
  * Default subprocess timeout in milliseconds.
@@ -75,6 +76,12 @@ function diagnoseEnoent(
  * DEFAULT_SUBPROCESS_TIMEOUT_MS (60s). Override with `timeout` in options
  * (in milliseconds), or pass 0 to disable. The timer is cleaned up when the
  * process exits normally.
+ *
+ * Argv safety: a NUL byte anywhere in argv makes the spawn fail with an opaque
+ * `The argument 'args[N]' must be a string without null bytes`. That message
+ * names no command and suggests no fix, and when it happens on an agent turn
+ * it fails instantly enough to trip crash-loop detection. We pre-check and
+ * raise an actionable error instead.
  */
 export function spawn<
   const In extends Bun.SpawnOptions.Writable = "ignore",
@@ -84,6 +91,8 @@ export function spawn<
   cmd: string[],
   options?: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { timeout?: number },
 ): Bun.Subprocess<In, Out, Err> {
+  assertArgvSafe(cmd, cmd[0]);
+
   // Extract timeout before passing to Bun.spawn (not a native Bun option)
   const timeout = (options as any)?.timeout ?? DEFAULT_SUBPROCESS_TIMEOUT_MS;
   const bunOptions = options ? { ...options } : undefined;
@@ -120,7 +129,8 @@ export function spawn<
 }
 
 /**
- * Drop-in replacement for Bun.spawnSync with ENOENT diagnosis.
+ * Drop-in replacement for Bun.spawnSync with ENOENT diagnosis and the same
+ * argv NUL guard as the async `spawn()` above.
  */
 export function spawnSync<
   const In extends Bun.SpawnOptions.Writable = "ignore",
@@ -130,6 +140,8 @@ export function spawnSync<
   cmd: string[],
   options?: Bun.SpawnOptions.SpawnSyncOptions<In, Out, Err>,
 ): Bun.SyncSubprocess<Out, Err> {
+  assertArgvSafe(cmd, cmd[0]);
+
   try {
     return Bun.spawnSync(cmd, options as any);
   } catch (err: unknown) {

@@ -10,41 +10,35 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
+import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+import { findFullTaskId, taskFilePath } from '../helpers/storage';
+
+// Storage lives at the project's `external_path`, NOT <root>/.lazy/tasks — see
+// test/helpers/storage.ts. This suite pokes raw task.json/comments.json to seed
+// legacy timestamp formats the CLI can no longer write, so it must resolve the
+// real layout rather than assume one.
 
 /** Read the raw task.json for a given short task ID from the test context */
 function readTaskJson(root: string, shortId: string): Record<string, unknown> {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const fullId = entries.find(e => e.startsWith(shortId));
-  if (!fullId) throw new Error(`No task directory starting with ${shortId}`);
-  const content = readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8');
-  return JSON.parse(content);
+  return JSON.parse(readFileSync(taskFilePath(root, shortId, 'task.json'), 'utf-8'));
 }
 
-/** Write a raw task.json for a given full task UUID */
-function writeTaskJson(root: string, fullId: string, data: Record<string, unknown>): void {
-  const path = join(root, '.lazy', 'tasks', fullId, 'task.json');
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
+/** Write a raw task.json for a given short task ID */
+function writeTaskJson(root: string, shortId: string, data: Record<string, unknown>): void {
+  writeFileSync(taskFilePath(root, shortId, 'task.json'), JSON.stringify(data, null, 2) + '\n');
 }
 
-/** Write comments.json for a given full task UUID */
-function writeCommentsJson(root: string, fullId: string, data: unknown): void {
-  const path = join(root, '.lazy', 'tasks', fullId, 'comments.json');
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
+/** Write comments.json for a given short task ID */
+function writeCommentsJson(root: string, shortId: string, data: unknown): void {
+  writeFileSync(taskFilePath(root, shortId, 'comments.json'), JSON.stringify(data, null, 2) + '\n');
 }
 
 /** Get the full task UUID from a short ID */
 function getFullId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const fullId = entries.find(e => e.startsWith(shortId));
-  if (!fullId) throw new Error(`No task directory starting with ${shortId}`);
-  return fullId;
+  return findFullTaskId(root, shortId);
 }
 
 describe('timestamp migration', () => {
@@ -74,12 +68,11 @@ describe('timestamp migration', () => {
   test('legacy ISO string created_at is migrated to number on read', async () => {
     // Create a task normally
     const taskId = await createTask(ctx, 'Legacy date migration');
-    const fullId = getFullId(ctx.root, taskId);
 
     // Overwrite task.json with a legacy ISO string date
     const raw = readTaskJson(ctx.root, taskId);
     raw.created_at = '2025-01-01T12:00:00.000Z';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     // Verify it was written as a string
     const beforeRead = readTaskJson(ctx.root, taskId);
@@ -98,12 +91,11 @@ describe('timestamp migration', () => {
 
   test('legacy "YYYY-MM-DD HH:MM:SS" format is migrated correctly', async () => {
     const taskId = await createTask(ctx, 'Custom format migration');
-    const fullId = getFullId(ctx.root, taskId);
 
     // Overwrite with the custom format that the old isoNow() used
     const raw = readTaskJson(ctx.root, taskId);
     raw.created_at = '2025-06-15 14:30:00';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     // Read via CLI to trigger migration
     const result = await ctx.lazy(['show', taskId]);
@@ -117,13 +109,12 @@ describe('timestamp migration', () => {
 
   test('display formatting shows readable date from numeric timestamp', async () => {
     const taskId = await createTask(ctx, 'Date display test');
-    const fullId = getFullId(ctx.root, taskId);
 
     // Set a known timestamp: 2025-03-15 09:45:00 UTC
     const knownTs = new Date('2025-03-15T09:45:00Z').getTime();
     const raw = readTaskJson(ctx.root, taskId);
     raw.created_at = knownTs;
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     // Show the task - should format the date nicely
     const result = await ctx.lazy(['show', taskId]);
@@ -136,17 +127,14 @@ describe('timestamp migration', () => {
     const taskId1 = await createTask(ctx, 'Older task AAA');
     const taskId2 = await createTask(ctx, 'Newer task BBB');
 
-    const fullId1 = getFullId(ctx.root, taskId1);
-    const fullId2 = getFullId(ctx.root, taskId2);
-
     // Set timestamps: task1 is older, task2 is newer
     const raw1 = readTaskJson(ctx.root, taskId1);
     raw1.created_at = new Date('2025-01-01T00:00:00Z').getTime();
-    writeTaskJson(ctx.root, fullId1, raw1);
+    writeTaskJson(ctx.root, taskId1, raw1);
 
     const raw2 = readTaskJson(ctx.root, taskId2);
     raw2.created_at = new Date('2025-06-01T00:00:00Z').getTime();
-    writeTaskJson(ctx.root, fullId2, raw2);
+    writeTaskJson(ctx.root, taskId2, raw2);
 
     // List tasks - they should be listed (sorted by last activity)
     const result = await ctx.lazy(['list']);
@@ -197,14 +185,14 @@ describe('timestamp migration', () => {
         },
       ],
     };
-    writeCommentsJson(ctx.root, fullId, legacyComments);
+    writeCommentsJson(ctx.root, taskId, legacyComments);
 
     // Read via show command (which reads comments and triggers timestamp migration)
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
 
     // After read, comments.json should have numeric timestamps
-    const commentsPath = join(ctx.root, '.lazy', 'tasks', fullId, 'comments.json');
+    const commentsPath = taskFilePath(ctx.root, taskId, 'comments.json');
     const afterRead = JSON.parse(readFileSync(commentsPath, 'utf-8'));
     expect(typeof afterRead.comments[0].created_at).toBe('number');
     expect(afterRead.comments[0].created_at).toBe(new Date('2025-04-10T08:30:00.000Z').getTime());
@@ -214,7 +202,6 @@ describe('timestamp migration', () => {
 
   test('already-numeric timestamps are not modified', async () => {
     const taskId = await createTask(ctx, 'No-op migration test');
-    const fullId = getFullId(ctx.root, taskId);
 
     // Read the current numeric timestamp
     const raw = readTaskJson(ctx.root, taskId);

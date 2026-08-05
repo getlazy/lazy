@@ -17,9 +17,12 @@
  */
 
 import { randomUUID } from 'crypto';
-import { cp, mkdir, readdir, readFile, writeFile, rename, rm, stat } from 'fs/promises';
+import { cp, mkdir, readdir, readFile, writeFile, appendFile, rename, rm, stat, unlink } from 'fs/promises';
 import { join } from 'path';
 import type { Storage, CreateTurnOptions } from './interface';
+import { normalizeTurnContent } from '../utils/turn-content';
+import type { SpanRecord } from '../tracing/types';
+import { appendSpansJsonl, readSpansJsonl } from './trace-spans';
 import { getDataDir } from '../cli/init';
 import type {
   Task,
@@ -58,13 +61,27 @@ import type {
   StatusChange,
   StatusChangelogFile,
   Actor,
+  TagEvent,
+  TagHistoryFile,
+  MemoryRecord,
+  MemoryEvent,
+  MemoryWriteInput,
+  MemoriesFile,
+  MemoryHistoryFile,
+  MemoryCompact,
+  MemoryCompactInput,
+  MemoryCompactFile,
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  ProxyAuditRecord,
+  ListAuditRecordsOptions,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
+import { normalizeTagOrThrow } from '../utils/tags';
 import { targetFromLegacy, parentTaskIdOf } from '../task-target';
 import type { TaskTarget } from '../types';
+import type { RunnerType } from '../config/types';
 import { assertValidTransition } from '../task-state-machine';
 import { StorageLock } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
@@ -204,15 +221,34 @@ export class FileStorage implements Storage {
       needsWrite = true;
     }
 
+    // Ensure tags field exists (backward compat: tasks created before tagging
+    // have no tags array — normalize to [] so no migration is needed)
+    if (raw.tags === undefined || raw.tags === null) {
+      raw.tags = [];
+      needsWrite = true;
+    }
+
     // Ensure type field exists (defaults to 'task')
     if (raw.type === undefined) {
       raw.type = 'task';
       needsWrite = true;
     }
 
+    // Ensure priority field exists (defaults to 'normal' for tasks predating it)
+    if (raw.priority === undefined) {
+      raw.priority = 'normal';
+      needsWrite = true;
+    }
+
     // Ensure agent_id field exists (defaults to 'claude-code' for backward compat)
     if (raw.agent_id === undefined) {
       raw.agent_id = 'claude-code';
+      needsWrite = true;
+    }
+
+    // Ensure runner_type field exists (null = inherit global [runner] type)
+    if (raw.runner_type === undefined) {
+      raw.runner_type = null;
       needsWrite = true;
     }
 
@@ -340,6 +376,11 @@ export class FileStorage implements Storage {
     }
     if (raw.user_stopped === undefined) {
       raw.user_stopped = false;
+    }
+    // Ensure runner_type field exists (null = legacy / no override → monitoring
+    // falls back to global config.runner.type)
+    if (raw.runner_type === undefined) {
+      raw.runner_type = null;
     }
 
     // Migrate claude_session_id to agent_session_id (backward compat)
@@ -664,6 +705,7 @@ export class FileStorage implements Storage {
         prompt: '',
         type: (type as Task['type']) ?? 'task',
         status: 'backlog',
+        priority: 'normal',
         created_at: now,
         completed_at: null,
         target: targetFromLegacy(parentTaskId ?? null, null),
@@ -671,7 +713,9 @@ export class FileStorage implements Storage {
         close_reason: null,
         model: null,
         agent_id: agentId ?? 'claude-code',
+        runner_type: null,
         metadata: null,
+        tags: [],
         pending_sync: 0,
       };
 
@@ -685,6 +729,7 @@ export class FileStorage implements Storage {
         'comments.json': { comments: [] },
         'follow-ups.json': { follow_ups: [] },
         'status-changelog.json': { changes: [{ status: 'backlog', timestamp: now }] },
+        'tag-history.json': { events: [] },
       });
 
       return task;
@@ -790,6 +835,9 @@ export class FileStorage implements Storage {
         return false;
       }
       if (options.workingOnly && task.status !== 'working') {
+        return false;
+      }
+      if (options.queuedOnly && task.status !== 'queued') {
         return false;
       }
       if (options.interruptedOnly && task.status !== 'interrupted') {
@@ -917,6 +965,24 @@ export class FileStorage implements Storage {
     });
   }
 
+  async updateTaskRunnerType(taskId: string, runnerType: RunnerType | null): Promise<void> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) return;
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) return;
+
+      // Allowed at any time while the task is live (changeable per design); the
+      // override takes effect on the next launch. Terminal tasks are immutable.
+      this.assertNotTerminal(task, 'update runner type');
+
+      task.runner_type = runnerType;
+
+      await this.atomicWriteTask(fullId, { 'task.json': task });
+    });
+  }
+
   async updateTaskType(taskId: string, type: string): Promise<void> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
@@ -928,6 +994,22 @@ export class FileStorage implements Storage {
       this.assertNotTerminal(task, 'update type');
 
       task.type = type as Task['type'];
+
+      await this.atomicWriteTask(fullId, { 'task.json': task });
+    });
+  }
+
+  async updateTaskPriority(taskId: string, priority: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) return;
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) return;
+
+      this.assertNotTerminal(task, 'update priority');
+
+      task.priority = priority as Task['priority'];
 
       await this.atomicWriteTask(fullId, { 'task.json': task });
     });
@@ -1153,6 +1235,7 @@ export class FileStorage implements Storage {
         auto_resumed: false,
         user_stopped: false,
         upstream_merge_sha: null,
+        runner_type: null,
       };
 
       await this.atomicWriteTask(fullId, { 'session.json': session });
@@ -1255,6 +1338,20 @@ export class FileStorage implements Storage {
       if (!session) return;
 
       session.container_name = containerName;
+
+      await this.atomicWriteTask(taskId, { 'session.json': session });
+    });
+  }
+
+  async updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) return;
+
+      const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
+      if (!session) return;
+
+      session.runner_type = runnerType;
 
       await this.atomicWriteTask(taskId, { 'session.json': session });
     });
@@ -1400,6 +1497,7 @@ export class FileStorage implements Storage {
         checkOutput,
         autoTriggered,
         turnType,
+        carriesFeedback,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1430,7 +1528,12 @@ export class FileStorage implements Storage {
         session_id: sessionId,
         sequence,
         role,
-        content,
+        // INVARIANT: a persisted turn ALWAYS has string content. JSON.stringify
+        // drops an `undefined` key entirely, which is how content-less turns
+        // reached disk and crashed accept + search. Coerce and warn rather than
+        // drop the turn — a crash/recovery turn is exactly the history a
+        // reviewer needs. See src/utils/turn-content.ts.
+        content: normalizeTurnContent(content, 'file-storage'),
         timestamp: now,
         usage: usage ?? null,
         start_sha: startSha ?? null,
@@ -1447,6 +1550,8 @@ export class FileStorage implements Storage {
         ...(autoTriggered ? { auto_triggered: true } : {}),
         // Only persist non-default turn types — missing field implies 'work'.
         ...(turnType && turnType !== 'work' ? { turn_type: turnType } : {}),
+        // Feedback starts life unconsumed; absent means "carries no feedback".
+        ...(carriesFeedback ? { feedback_delivery: 'pending' as const } : {}),
       };
 
       turns.push(turn);
@@ -1536,6 +1641,29 @@ export class FileStorage implements Storage {
       }
 
       throw new Error(`Turn not found: ${turnId}`);
+    });
+  }
+
+  async markFeedbackConsumed(sessionId: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) return;
+
+      const turnsFile = await this.readJson<TurnsFile>(join(this.taskDir(taskId), 'turns.json'));
+      if (!turnsFile?.turns) return;
+
+      let changed = false;
+      for (const turn of turnsFile.turns) {
+        if (turn.session_id === sessionId && turn.feedback_delivery === 'pending') {
+          turn.feedback_delivery = 'consumed';
+          changed = true;
+        }
+      }
+
+      // No pending feedback is the common case — skip the write entirely.
+      if (changed) {
+        await this.atomicWriteTask(taskId, { 'turns.json': turnsFile });
+      }
     });
   }
 
@@ -2120,6 +2248,22 @@ export class FileStorage implements Storage {
     }
   }
 
+  async deleteConversation(sessionId: string): Promise<boolean> {
+    try {
+      await unlink(join(this.conversationsPath, `${sessionId}.json`));
+      return true;
+    } catch (err) {
+      // ENOENT is the idempotent case: nothing there, nothing deleted. Any
+      // other failure (permissions, I/O) is a real problem the caller must see
+      // — silently reporting "deleted" would let a purge claim success while
+      // the store is untouched.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw new Error(
+        `Failed to delete conversation ${sessionId} from ${this.conversationsPath}: ${(err as Error).message}`,
+      );
+    }
+  }
+
   // --- Agent Session Logs (raw Claude Code JSONL) ---
 
   async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
@@ -2152,6 +2296,48 @@ export class FileStorage implements Storage {
     }
     const content = await readFile(join(taskDir, 'agent-session.jsonl'), 'utf-8');
     return { taskId: fullId, sessionId: meta.sessionId, capturedAt: meta.capturedAt, content };
+  }
+
+  // --- Proxy Audit (Tier-1 passive audit plane) ---
+
+  /** Append-only JSONL of proxy audit records, one record per line. */
+  private get auditPath(): string {
+    return join(this.basePath, 'proxy-audit.jsonl');
+  }
+
+  async appendAuditRecord(record: ProxyAuditRecord): Promise<void> {
+    // Append-only line-delimited JSON. The proxy's audit queue serializes calls
+    // to this method, so a plain append is safe (no interleaving). mkdir is
+    // cheap and idempotent; it guards against a brand-new project whose base
+    // dir does not exist yet.
+    await mkdir(this.basePath, { recursive: true });
+    await appendFile(this.auditPath, JSON.stringify(record) + '\n', 'utf-8');
+  }
+
+  async listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]> {
+    let raw: string;
+    try {
+      raw = await readFile(this.auditPath, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw new Error(`Failed to read proxy audit log at ${this.auditPath}: ${(err as Error).message}`);
+    }
+    const records: ProxyAuditRecord[] = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        records.push(JSON.parse(trimmed) as ProxyAuditRecord);
+      } catch {
+        // A single corrupt line (e.g. a partial write interrupted by a crash)
+        // must not make the whole audit log unreadable — skip it. The append
+        // path writes whole lines, so this is rare and self-limiting.
+      }
+    }
+    if (options?.limit !== undefined && options.limit >= 0 && records.length > options.limit) {
+      return records.slice(records.length - options.limit);
+    }
+    return records;
   }
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
@@ -2193,6 +2379,248 @@ export class FileStorage implements Storage {
   async listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]> {
     const intents = await this.readBuilderResumeIntents();
     return projectRoot ? intents.filter(i => i.projectRoot === projectRoot) : intents;
+  }
+
+  // --- Memory (lazy-owned shared knowledge) ---
+
+  private get memoriesPath(): string {
+    return join(this.basePath, 'memories.json');
+  }
+
+  private get memoryHistoryPath(): string {
+    return join(this.basePath, 'memory-history.json');
+  }
+
+  private async readMemories(): Promise<MemoryRecord[]> {
+    const file = await this.readJson<MemoriesFile>(this.memoriesPath);
+    return file?.memories ?? [];
+  }
+
+  private async readMemoryEvents(): Promise<MemoryEvent[]> {
+    const file = await this.readJson<MemoryHistoryFile>(this.memoryHistoryPath);
+    return file?.events ?? [];
+  }
+
+  async saveMemory(input: MemoryWriteInput, actor: Actor): Promise<MemoryRecord> {
+    // Locked: the read-modify-write of memories.json plus the history append
+    // must not interleave with a concurrent save/delete, or one write is lost
+    // and the history stops matching the records.
+    return this.lock.withLock(async () => {
+      const memories = await this.readMemories();
+      const now = Date.now();
+      const existing = memories.find(m => m.name === input.name);
+
+      const record: MemoryRecord = existing
+        ? {
+            ...existing,
+            description: input.description,
+            type: input.type,
+            body: input.body,
+            updated_at: now,
+            updated_by: actor,
+            revision: existing.revision + 1,
+            // Saving a tombstoned name revives it; history keeps the delete.
+            deleted_at: undefined,
+            deleted_by: undefined,
+          }
+        : {
+            name: input.name,
+            description: input.description,
+            type: input.type,
+            body: input.body,
+            created_at: now,
+            updated_at: now,
+            created_by: actor,
+            updated_by: actor,
+            revision: 1,
+          };
+
+      const next = existing
+        ? memories.map(m => (m.name === record.name ? record : m))
+        : [...memories, record];
+      await this.writeJson(this.memoriesPath, { memories: next } satisfies MemoriesFile);
+
+      // INVARIANT: append-only. Never rewrite or prune prior events.
+      const events = await this.readMemoryEvents();
+      events.push({
+        id: randomUUID(),
+        name: record.name,
+        action: existing ? 'update' : 'create',
+        actor,
+        timestamp: now,
+        revision: record.revision,
+        description: record.description,
+        type: record.type,
+        body: record.body,
+      });
+      await this.writeJson(this.memoryHistoryPath, { events } satisfies MemoryHistoryFile);
+
+      return record;
+    });
+  }
+
+  async getMemory(name: string): Promise<MemoryRecord | null> {
+    const memories = await this.readMemories();
+    const match = memories.find(m => m.name === name);
+    if (!match || match.deleted_at) return null;
+    return match;
+  }
+
+  async listMemories(options?: { includeDeleted?: boolean }): Promise<MemoryRecord[]> {
+    const memories = await this.readMemories();
+    const filtered = options?.includeDeleted ? memories : memories.filter(m => !m.deleted_at);
+    return filtered.sort((a, b) => b.updated_at - a.updated_at);
+  }
+
+  async deleteMemory(name: string, actor: Actor): Promise<MemoryRecord | null> {
+    return this.lock.withLock(async () => {
+      const memories = await this.readMemories();
+      const existing = memories.find(m => m.name === name);
+      if (!existing || existing.deleted_at) return null; // idempotent
+
+      const now = Date.now();
+      const tombstoned: MemoryRecord = { ...existing, deleted_at: now, deleted_by: actor };
+      await this.writeJson(
+        this.memoriesPath,
+        { memories: memories.map(m => (m.name === name ? tombstoned : m)) } satisfies MemoriesFile,
+      );
+
+      const events = await this.readMemoryEvents();
+      events.push({
+        id: randomUUID(),
+        name,
+        action: 'delete',
+        actor,
+        timestamp: now,
+        revision: existing.revision,
+      });
+      await this.writeJson(this.memoryHistoryPath, { events } satisfies MemoryHistoryFile);
+
+      return tombstoned;
+    });
+  }
+
+  async getMemoryHistory(name?: string): Promise<MemoryEvent[]> {
+    const events = await this.readMemoryEvents();
+    const filtered = name ? events.filter(e => e.name === name) : events;
+    return filtered.sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  // --- Memory compact (derived; single overwritable slot, no history) ---
+
+  private get memoryCompactPath(): string {
+    return join(this.basePath, 'memory-compact.json');
+  }
+
+  async saveMemoryCompact(input: MemoryCompactInput, actor: Actor): Promise<MemoryCompact> {
+    const compact: MemoryCompact = {
+      content: input.content,
+      generated_at: Date.now(),
+      generated_by: actor,
+      method: input.method,
+      ...(input.model ? { model: input.model } : {}),
+      covered: input.covered,
+    };
+    // No lock and no read-modify-write: the compact is a whole-value overwrite
+    // of derived state. Two concurrent compactions both regenerate from the same
+    // records, so last-writer-wins loses nothing.
+    await this.writeJson(this.memoryCompactPath, { compact } satisfies MemoryCompactFile);
+    return compact;
+  }
+
+  async getMemoryCompact(): Promise<MemoryCompact | null> {
+    const file = await this.readJson<MemoryCompactFile>(this.memoryCompactPath);
+    return file?.compact ?? null;
+  }
+
+  async clearMemoryCompact(): Promise<boolean> {
+    const existing = await this.readJson<MemoryCompactFile>(this.memoryCompactPath);
+    if (!existing) return false;
+    await rm(this.memoryCompactPath, { force: true });
+    return true;
+  }
+
+  // --- Tags ---
+
+  /**
+   * Append a tag-history event to a task's tag-history.json.
+   * Returns the updated file object for inclusion in an atomic multi-file write
+   * (mirrors readAndAppendStatusChange).
+   */
+  private async readAndAppendTagEvent(
+    taskId: string,
+    event: TagEvent,
+  ): Promise<TagHistoryFile> {
+    const historyPath = join(this.taskDir(taskId), 'tag-history.json');
+    const file = await this.readJson<TagHistoryFile>(historyPath);
+    const events = file?.events ?? [];
+    events.push(event);
+    return { events };
+  }
+
+  async addTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    const normalized = normalizeTagOrThrow(tag);
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) throw new Error(`Task not found: ${taskId}`);
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+
+      // Idempotent: already tagged → no state change, no history event.
+      if (task.tags.includes(normalized)) {
+        return task;
+      }
+
+      task.tags = [...task.tags, normalized];
+      const now = Date.now();
+      const history = await this.readAndAppendTagEvent(fullId, {
+        tag: normalized,
+        action: 'tag',
+        timestamp: now,
+        ...(actor ? { actor } : {}),
+      });
+      await this.atomicWriteTask(fullId, { 'task.json': task, 'tag-history.json': history });
+      return task;
+    });
+  }
+
+  async removeTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    const normalized = normalizeTagOrThrow(tag);
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) throw new Error(`Task not found: ${taskId}`);
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+
+      // Idempotent: not tagged → no state change, no history event.
+      if (!task.tags.includes(normalized)) {
+        return task;
+      }
+
+      task.tags = task.tags.filter(t => t !== normalized);
+      const now = Date.now();
+      // History is append-only: untagging appends an 'untag' event — it never
+      // erases the earlier 'tag' event.
+      const history = await this.readAndAppendTagEvent(fullId, {
+        tag: normalized,
+        action: 'untag',
+        timestamp: now,
+        ...(actor ? { actor } : {}),
+      });
+      await this.atomicWriteTask(fullId, { 'task.json': task, 'tag-history.json': history });
+      return task;
+    });
+  }
+
+  async getTagHistory(taskId: string): Promise<TagEvent[]> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return [];
+
+    const historyPath = join(this.taskDir(fullId), 'tag-history.json');
+    const file = await this.readJson<TagHistoryFile>(historyPath);
+    return file?.events ?? [];
   }
 
   // --- Status History ---
@@ -2427,13 +2855,34 @@ export class FileStorage implements Storage {
       // Conversations directory doesn't exist
     }
 
+    // Search live memory records (name, description, body). Tombstoned records
+    // are excluded: they are no longer part of the project's knowledge.
+    for (const memory of await this.listMemories()) {
+      const haystack = `${memory.name}\n${memory.description}\n${memory.body}`;
+      if (this.textMatches(haystack, query)) {
+        results.push({
+          entity_type: 'memory',
+          entity_id: memory.name,
+          task_id: memory.name,
+          task_code: null,
+          task_goal: `memory: ${memory.name}`,
+          content: memory.body,
+          match_context: this.extractContext(haystack, query),
+        });
+      }
+    }
+
     return results;
   }
 
   /**
    * Case-insensitive text match using regex (falls back to literal if invalid regex)
    */
-  private textMatches(text: string, pattern: string): boolean {
+  private textMatches(text: unknown, pattern: string): boolean {
+    // Tolerate a missing haystack: a stored record can lack the field the type
+    // declares (e.g. a crash turn persisted without `content`). Without this,
+    // `regex.test(undefined)` silently tests the literal string "undefined".
+    if (typeof text !== 'string') return false;
     try {
       const regex = new RegExp(pattern, 'i');
       return regex.test(text);
@@ -2470,5 +2919,15 @@ export class FileStorage implements Storage {
     if (end < text.length) result = result + '...';
 
     return result;
+  }
+
+  // --- Tracing ---
+
+  async appendTraceSpans(spans: SpanRecord[]): Promise<void> {
+    await appendSpansJsonl(this.basePath, spans);
+  }
+
+  async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
+    return readSpansJsonl(this.basePath, sinceMs);
   }
 }

@@ -127,10 +127,32 @@ describe('task codes', () => {
     expectOutput(result, `Code:   ${code40}`);
   });
 
+  /**
+   * Produce a genuinely ambiguous code.
+   *
+   * `createTask` REJECTS a duplicate code against a non-terminal task
+   * (src/storage/file-storage.ts), so two live tasks can no longer be created
+   * with the same code — the old "create twice" setup silently failed its
+   * second create and left the ambiguity paths untested. Nor is a terminal +
+   * live pair ambiguous: `findTaskIdWithDetails` resolves to the single
+   * non-terminal match.
+   *
+   * The collision is still reachable, and this is how it happens in real use:
+   * close a task, reuse its code for a new one, then reopen the old task. That
+   * is exactly the case `resolveTask`'s ambiguousMatches branch exists for.
+   */
+  async function createAmbiguousCode(code: string): Promise<string> {
+    const first = await ctx.lazy(['create', '--goal', 'First task', '--code', code]);
+    expectSuccess(first);
+    const firstId = extractTaskId(first.stdout);
+    expectSuccess(await ctx.lazy(['close', firstId, '--reason', 'making room', '--yes']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Second task', '--code', code]));
+    expectSuccess(await ctx.lazy(['reopen', firstId, '--reason', 'still needed']));
+    return firstId;
+  }
+
   test('ambiguous code produces helpful error', async () => {
-    // Create two tasks with the same code
-    await ctx.lazy(['create', '--goal', 'First task', '--code', 'dup-code']);
-    await ctx.lazy(['create', '--goal', 'Second task', '--code', 'dup-code']);
+    await createAmbiguousCode('dup-code');
 
     const result = await ctx.lazy(['show', 'dup-code']);
     expectFailure(result);
@@ -142,9 +164,7 @@ describe('task codes', () => {
   });
 
   test('ambiguous code prompts for choice in TTY mode', async () => {
-    // Create two tasks with the same code
-    await ctx.lazy(['create', '--goal', 'First task', '--code', 'tty-dup']);
-    await ctx.lazy(['create', '--goal', 'Second task', '--code', 'tty-dup']);
+    await createAmbiguousCode('tty-dup');
 
     // Run with LAZY_FORCE_TTY=1 and LAZY_PROMPT_DEFAULTS=1 to simulate TTY and auto-select first option
     const result = await ctx.lazy(['show', 'tty-dup'], {
@@ -185,9 +205,11 @@ describe('task codes', () => {
   });
 
   test('ambiguous code prompts for choice in comment command (TTY mode)', async () => {
-    // Create two tasks with the same code
+    // Two tasks sharing one code — only reachable by closing the first
+    // (see createAmbiguousCode above for why creating twice no longer works).
     const result1 = await ctx.lazy(['create', '--goal', 'First notable task', '--code', 'note-both']);
     const taskId1 = extractTaskId(result1.stdout);
+    expectSuccess(await ctx.lazy(['close', taskId1, '--reason', 'making room', '--yes']));
     const result2 = await ctx.lazy(['create', '--goal', 'Second notable task', '--code', 'note-both']);
     const taskId2 = extractTaskId(result2.stdout);
 

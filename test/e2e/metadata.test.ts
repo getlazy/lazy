@@ -1,9 +1,12 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
 import { readFile, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+// taskFilePath is the ONE place that knows tasks live at lazy.toml's
+// external_path; the per-test <root>/.lazy/tasks lookups this suite open-coded
+// died with ENOENT once storage moved out of the repo.
+import { taskFilePath } from '../helpers/storage';
 
 describe('task metadata', () => {
   let ctx: TestContext;
@@ -20,13 +23,7 @@ describe('task metadata', () => {
     const taskId = await createTask(ctx, 'Metadata test task');
 
     // Find the task directory and update task.json with metadata
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
-    const { readdir } = await import('fs/promises');
-    const dirs = await readdir(tasksDir);
-    const taskDir = dirs.find(d => d.startsWith(taskId));
-    if (!taskDir) throw new Error(`Task directory not found for ${taskId}`);
-
-    const taskJsonPath = join(tasksDir, taskDir, 'task.json');
+    const taskJsonPath = taskFilePath(ctx.root, taskId, 'task.json');
     const taskJson = JSON.parse(await readFile(taskJsonPath, 'utf-8'));
     taskJson.metadata = { pr_url: 'https://github.com/org/repo/pull/42', jira_key: 'PROJ-123' };
     await writeFile(taskJsonPath, JSON.stringify(taskJson, null, 2), 'utf-8');
@@ -50,13 +47,7 @@ describe('task metadata', () => {
     const taskId = await createTask(ctx, 'Empty metadata task');
 
     // Set metadata to empty object
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
-    const { readdir } = await import('fs/promises');
-    const dirs = await readdir(tasksDir);
-    const taskDir = dirs.find(d => d.startsWith(taskId));
-    if (!taskDir) throw new Error(`Task directory not found for ${taskId}`);
-
-    const taskJsonPath = join(tasksDir, taskDir, 'task.json');
+    const taskJsonPath = taskFilePath(ctx.root, taskId, 'task.json');
     const taskJson = JSON.parse(await readFile(taskJsonPath, 'utf-8'));
     taskJson.metadata = {};
     await writeFile(taskJsonPath, JSON.stringify(taskJson, null, 2), 'utf-8');
@@ -70,13 +61,7 @@ describe('task metadata', () => {
     const taskId = await createTask(ctx, 'Legacy task');
 
     // Remove metadata field from task.json to simulate legacy task
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
-    const { readdir } = await import('fs/promises');
-    const dirs = await readdir(tasksDir);
-    const taskDir = dirs.find(d => d.startsWith(taskId));
-    if (!taskDir) throw new Error(`Task directory not found for ${taskId}`);
-
-    const taskJsonPath = join(tasksDir, taskDir, 'task.json');
+    const taskJsonPath = taskFilePath(ctx.root, taskId, 'task.json');
     const taskJson = JSON.parse(await readFile(taskJsonPath, 'utf-8'));
     delete taskJson.metadata;
     await writeFile(taskJsonPath, JSON.stringify(taskJson, null, 2), 'utf-8');

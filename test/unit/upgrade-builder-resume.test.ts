@@ -18,7 +18,11 @@ import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
-import { writeBuilderResumeIntents, promptBuilderPreStop } from '../../src/cli/commands/upgrade';
+import {
+  writeBuilderResumeIntents,
+  promptBuilderPreStop,
+  stopBuilderContainers,
+} from '../../src/cli/commands/upgrade';
 
 describe('writeBuilderResumeIntents', () => {
   let storage: FileStorage;
@@ -155,5 +159,50 @@ describe('promptBuilderPreStop', () => {
     expect(out).toContain('submit it now');
     expect(out).toContain('Press Enter when ready to continue');
     expect(out).not.toContain('Proceeding without prompting');
+  });
+});
+
+describe('stopBuilderContainers', () => {
+  const origLog = console.log;
+  afterEach(() => { console.log = origLog; });
+
+  // INVARIANT: upgrade stops builders with SIGTERM + a grace period, NEVER with
+  // an immediate kill. The builder supervisor's signal handler is what flushes
+  // the conversation capture and stamps the resume sessionId onto the intent
+  // written moments earlier; `docker kill` skips both, and the relaunched
+  // builder then had no session to resume ("relaunch with resume does not work
+  // either way"). Do not "optimize away" this grace period.
+  test('stops each builder gracefully, with a non-zero grace period', async () => {
+    console.log = () => {};
+    const calls: { name: string; opts?: { gracefulTimeoutSeconds?: number } }[] = [];
+    const runner = {
+      stopRun: async (name: string, opts?: { gracefulTimeoutSeconds?: number }) => {
+        calls.push({ name, opts });
+        return true;
+      },
+    };
+
+    await stopBuilderContainers(runner, ['lazy-builder-aaaa1111', 'lazy-builder-bbbb2222']);
+
+    expect(calls.map(c => c.name)).toEqual(['lazy-builder-aaaa1111', 'lazy-builder-bbbb2222']);
+    for (const c of calls) {
+      expect(c.opts?.gracefulTimeoutSeconds).toBeGreaterThan(0);
+    }
+  });
+
+  // A failed stop is reported, not thrown: upgrade must continue to the rebuild
+  // (and the remaining builders) rather than abort half-way through.
+  test('reports failure and keeps going', async () => {
+    const logs: string[] = [];
+    console.log = (...a: unknown[]) => { logs.push(a.join(' ')); };
+    const runner = { stopRun: async (name: string) => name.endsWith('ok') };
+
+    await stopBuilderContainers(runner, ['lazy-builder-bad', 'lazy-builder-ok']);
+
+    const out = logs.join('\n');
+    expect(out).toContain('lazy-builder-bad');
+    expect(out).toContain('lazy-builder-ok');
+    expect(out).toContain('failed');
+    expect(out).toContain('stopped');
   });
 });

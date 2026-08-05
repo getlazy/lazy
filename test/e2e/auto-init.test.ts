@@ -42,6 +42,11 @@ describe('auto-init', () => {
     }
   });
 
+  // INVARIANT: outside a lazy project the error names the missing project, not
+  // the missing daemon. `lazy daemon start` cannot help here — a daemon is
+  // per-project and there is no project to bind to — so pointing the user at it
+  // is a dead end. Deliberately runs WITHOUT LAZY_TEST so the real daemon-backed
+  // path is what answers (nothing is started: no lazy root, no daemon).
   test('non-interactive: commands fail with error in uninitialized repo', async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-auto-init-'));
     initGitRepo(tmpDir);
@@ -51,6 +56,7 @@ describe('auto-init', () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('not in a lazy project');
+    expect(result.stderr).not.toContain('lazy daemon start');
   });
 
   test('help and version work without lazy project', async () => {
@@ -88,7 +94,13 @@ describe('auto-init', () => {
     const subDir = join(tmpDir, 'src', 'deep');
     Bun.spawnSync(['mkdir', '-p', subDir]);
 
-    const result = await runLazy(subDir, ['list']);
+    // LAZY_TEST=1: this test is about lazy-root discovery from a nested cwd,
+    // not about the daemon. Without it, `lazy list` auto-starts a REAL daemon
+    // bound to a temp dir this suite then deletes — a leaked daemon holding a
+    // port from the bounded window (see CLAUDE.md), and a hard failure on any
+    // machine without a model credential, since the daemon's credential gate
+    // refuses to start.
+    const result = await runLazy(subDir, ['list'], { LAZY_TEST: '1' });
     expect(result.exitCode).toBe(0);
   });
 });

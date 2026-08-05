@@ -13,7 +13,7 @@
  * 3. Error translation (RpcError → return types the CLI expects)
  */
 
-import { tryRpc } from './client';
+import { tryRpc, RpcApplicationError } from './client';
 import {
   handleList,
   handleBlocked,
@@ -27,19 +27,25 @@ import {
   handleAskTask,
   handleAcceptTaskPreflight,
   handleAcceptTask,
+  handleApproveTaskPreflight,
+  handleApproveTask,
   handleRejectTask,
   handleCloseTask,
   handleSyncTask,
   handleReparentTask,
   handleResumeTask,
   handleGetDaemonMcpConfig,
+  handleRevokeDaemonMcpToken,
+  handleConcurrency,
   RpcError,
 } from './rpc-handlers';
 import { requireLazyRoot } from '../cli/helpers';
 import type { TaskWithSession } from '../cli/commands/list';
 import type { TaskShowData } from '../cli/commands/show';
 import type { SearchResult } from '../storage';
+import type { RunnerType } from '../config/types';
 import type { Actor } from '../types';
+import type { ProgressEmitter } from './progress';
 
 // --- List ---
 
@@ -82,19 +88,49 @@ export async function queryBlockedTasks(): Promise<ListResult> {
 
 // --- Active ---
 
-export async function queryActiveTasks(): Promise<ListResult> {
-  const rpc = await tryRpc<ListResult>('active');
-  if (rpc) return rpc;
+export async function queryActiveTasks(params: { taskFilter?: string } = {}): Promise<ListResult> {
+  try {
+    const rpc = await tryRpc<ListResult>('active', { taskFilter: params.taskFilter });
+    if (rpc) return rpc;
+  } catch (err) {
+    // Same user-error treatment as the direct path below: an unknown or
+    // ambiguous task filter gets the handler's actionable message, not a stack.
+    if (err instanceof RpcApplicationError && (err.status === 404 || err.status === 400)) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
 
   const root = requireLazyRoot();
-  return await handleActive(root) as ListResult;
+  try {
+    return await handleActive(root, params) as ListResult;
+  } catch (err) {
+    // Unknown / ambiguous task filter is a user error, not a crash — print the
+    // handler's actionable message and exit, matching queryTaskList.
+    if (err instanceof RpcError && (err.status === 404 || err.status === 400)) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
 }
 
 // --- Show ---
 
 export type ShowResult =
   | { ambiguous: false; data: TaskShowData }
-  | { ambiguous: true; matches: Array<{ id: string; code: string | null; goal: string; status: string }> }
+  | {
+      ambiguous: true;
+      matches: Array<{
+        id: string;
+        code: string | null;
+        goal: string;
+        status: string;
+        /** Session's last_interaction_at, or created_at for an unstarted task. */
+        lastInteractionAt: number;
+      }>;
+    }
   | null; // not found
 
 /**
@@ -116,8 +152,18 @@ function deserializeShowResult(raw: Record<string, any>): ShowResult {
 }
 
 export async function queryTaskShow(taskId: string): Promise<ShowResult> {
-  const rpc = await tryRpc<Record<string, any>>('show', { taskId });
-  if (rpc) return deserializeShowResult(rpc);
+  try {
+    const rpc = await tryRpc<Record<string, any>>('show', { taskId });
+    if (rpc) return deserializeShowResult(rpc);
+  } catch (err) {
+    // A 404 from the daemon means "no such task". Return null so the caller can
+    // fall back to conversation/file resolution, matching the direct-path
+    // behavior below. Without this, `lazy show <conversation-session-id>` would
+    // fail with "Task not found" whenever the daemon is running, because the
+    // RPC error would propagate past the CLI's conversation fallback.
+    if (err instanceof RpcApplicationError && err.status === 404) return null;
+    throw err;
+  }
 
   const root = requireLazyRoot();
   try {
@@ -134,6 +180,8 @@ export async function queryTaskShow(taskId: string): Promise<ShowResult> {
 export interface SearchQueryResult {
   query: string;
   results: SearchResult[];
+  /** Present only on a zero-result tag query — explains why nothing matched. */
+  hint?: string;
 }
 
 export async function querySearch(params: {
@@ -169,15 +217,13 @@ export async function queryDiff(params: {
   if (rpc) return rpc;
 
   const root = requireLazyRoot();
-  try {
-    return await handleDiff(root, params) as DiffResult;
-  } catch (err) {
-    // Convert handler errors to renderable output for the CLI
-    if (err instanceof RpcError) {
-      return { output: err.message };
-    }
-    throw err;
-  }
+  // Errors PROPAGATE — they are not turned into diff output. Rendering
+  // "Worktree is gone and branch X not found locally or on remote." as if it
+  // were a diff exited 0 with the failure on STDOUT, so `lazy diff` looked
+  // successful to every script and to the human's eye. The daemon path already
+  // fails loud here (tryRpc throws RpcApplicationError); this fallback exists
+  // only for test/daemon-self mode and must behave identically.
+  return await handleDiff(root, params) as DiffResult;
 }
 
 // --- Wait ---
@@ -198,22 +244,32 @@ export async function queryWait(params: {
   taskId: string;
   timeout?: number;
 }): Promise<WaitResult> {
-  const rpc = await tryRpc<WaitResult>('wait', {
-    taskId: params.taskId,
-    timeout: params.timeout,
-  });
-  if (rpc) return rpc;
-
-  const root = requireLazyRoot();
   try {
-    return await handleWait(root, params) as WaitResult;
+    const rpc = await tryRpc<WaitResult>('wait', {
+      taskId: params.taskId,
+      timeout: params.timeout,
+    });
+    if (rpc) return rpc;
   } catch (err) {
-    // Convert RpcError to plain Error for callers that don't know about RpcError
-    if (err instanceof RpcError) {
-      throw new Error(err.message);
+    // The daemon answered with an application error. Re-shape it as an RpcError
+    // so the status survives for callers that map errors onto HTTP — same
+    // reasoning as the direct path below.
+    if (err instanceof RpcApplicationError) {
+      throw new RpcError(err.status, err.message);
     }
     throw err;
   }
+
+  const root = requireLazyRoot();
+  // INVARIANT: propagate the RpcError as-is — do NOT flatten it to a plain
+  // Error. This is the in-daemon path (LAZY_IS_DAEMON=1 bypasses tryRpc), so
+  // the caller is usually the daemon's own POST /mcp/:taskId/:toolName route,
+  // which maps `err.status` onto the HTTP status. Flattening turned every
+  // argument mistake (RpcError 400, e.g. a missing task_id) into an HTTP 500,
+  // which reads as "the daemon crashed" and sends the operator down the wrong
+  // path. RpcError extends Error, so callers that only read `.message` are
+  // unaffected.
+  return await handleWait(root, params) as WaitResult;
 }
 
 // --- Start Task ---
@@ -227,6 +283,10 @@ export interface StartTaskRpcResult {
   parentDisplayId: string | null;
   runnerType: string;
   warnings: string[];
+  /** Launch deferred at the concurrency cap — task is `queued`, reconciler drains it. */
+  queued?: boolean;
+  queueRunning?: number;
+  queueLimit?: number;
 }
 
 export async function queryStartTask(params: {
@@ -236,7 +296,10 @@ export async function queryStartTask(params: {
   forceLocal?: boolean;
   retargetOrphan?: boolean;
   effortOverride?: string;
+  runnerOverride?: RunnerType;
   actor?: Actor;
+  /** W3C trace context propagated from the CLI so daemon spans stitch onto the CLI trace. */
+  traceparent?: string;
 }): Promise<StartTaskRpcResult> {
   const rpc = await tryRpc<StartTaskRpcResult>('startTask', {
     taskId: params.taskId,
@@ -245,13 +308,50 @@ export async function queryStartTask(params: {
     forceLocal: params.forceLocal,
     retargetOrphan: params.retargetOrphan,
     effortOverride: params.effortOverride,
+    runnerOverride: params.runnerOverride,
     actor: params.actor,
+    traceparent: params.traceparent,
   });
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
   const root = requireLazyRoot();
   return await handleStartTask(root, params) as StartTaskRpcResult;
+}
+
+// --- Concurrency limits ---
+
+export interface ConcurrencyLimitState {
+  /** The lazy.toml value. */
+  configured: number;
+  /** The ephemeral daemon override, or null when none is set. */
+  override: number | null;
+  /** Effective cap: override if set, else configured. */
+  limit: number;
+  /** How many are running right now. */
+  running: number;
+}
+
+export interface ConcurrencyResult {
+  agents: ConcurrencyLimitState;
+  builders: ConcurrencyLimitState;
+}
+
+export async function queryConcurrency(params: {
+  action?: 'get' | 'set' | 'reset';
+  key?: string;
+  value?: number;
+} = {}): Promise<ConcurrencyResult> {
+  const rpc = await tryRpc<ConcurrencyResult>('concurrency', {
+    action: params.action,
+    key: params.key,
+    value: params.value,
+  });
+  if (rpc) return rpc;
+
+  // Test/daemon-self mode: execute directly
+  const root = requireLazyRoot();
+  return await handleConcurrency(root, params) as ConcurrencyResult;
 }
 
 // --- Get Daemon MCP Config ---
@@ -271,6 +371,30 @@ export async function queryDaemonMcpConfig(params: {
   // Test/daemon-self mode: execute directly
   const root = requireLazyRoot();
   return await handleGetDaemonMcpConfig(root, params) as DaemonMcpConfigResult;
+}
+
+// --- Revoke Daemon MCP Token ---
+
+export interface RevokeDaemonMcpTokenResult {
+  /** How many tokens were dropped (0 when already revoked). */
+  revoked: number;
+}
+
+/**
+ * Revoke the token minted for a builder session. Runs in the daemon, which owns
+ * the registry cache — see handleRevokeDaemonMcpToken.
+ */
+export async function queryRevokeDaemonMcpToken(params: {
+  name: string;
+}): Promise<RevokeDaemonMcpTokenResult> {
+  const rpc = await tryRpc<RevokeDaemonMcpTokenResult>('revokeDaemonMcpToken', {
+    name: params.name,
+  });
+  if (rpc) return rpc;
+
+  // Test/daemon-self mode: execute directly
+  const root = requireLazyRoot();
+  return await handleRevokeDaemonMcpToken(root, params) as RevokeDaemonMcpTokenResult;
 }
 
 // --- Unblock Task ---
@@ -400,22 +524,76 @@ export interface AcceptTaskRpcResult {
   warnings: string[];
 }
 
+/**
+ * `onProgress` receives the accept's phase narration (see daemon/progress.ts).
+ * Over RPC the frames arrive on the heartbeat envelope; on the in-process
+ * fallback path (LAZY_TEST / LAZY_IS_DAEMON) the emitter is handed straight to
+ * the handler, so the same output appears with or without a daemon.
+ */
 export async function queryAcceptTask(params: {
   taskId: string;
   reason?: string;
   approvedFiles?: string[];
   acceptDirtyWorktree?: boolean;
-}): Promise<AcceptTaskRpcResult> {
+  actor?: Actor;
+  callerTaskId?: string;
+}, onProgress?: ProgressEmitter): Promise<AcceptTaskRpcResult> {
   const rpc = await tryRpc<AcceptTaskRpcResult>('acceptTask', {
     taskId: params.taskId,
     reason: params.reason,
     approvedFiles: params.approvedFiles,
     acceptDirtyWorktree: params.acceptDirtyWorktree,
+    actor: params.actor,
+    callerTaskId: params.callerTaskId,
+  }, { onProgress });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleAcceptTask(root, params, onProgress) as AcceptTaskRpcResult;
+}
+
+// --- Approve Task (edge-gate human approval) ---
+
+export interface ApproveTaskRpcResult {
+  taskId: string;
+  displayId: string;
+  replacedPending: boolean;
+}
+
+export interface ApproveTaskPreflightRpcResult {
+  enrollment: 'enrolled' | 'not-enrolled' | 'unknown';
+  message: string | null;
+  sourceLabel: string | null;
+}
+
+/**
+ * Checks `lazy approve` runs BEFORE prompting the human for a passphrase —
+ * no token is sent, so this is safe to call before anything is typed.
+ */
+export async function queryApproveTaskPreflight(params: {
+  taskId: string;
+}): Promise<ApproveTaskPreflightRpcResult> {
+  const rpc = await tryRpc<ApproveTaskPreflightRpcResult>('approveTaskPreflight', {
+    taskId: params.taskId,
   });
   if (rpc) return rpc;
 
   const root = requireLazyRoot();
-  return await handleAcceptTask(root, params) as AcceptTaskRpcResult;
+  return await handleApproveTaskPreflight(root, params) as ApproveTaskPreflightRpcResult;
+}
+
+export async function queryApproveTask(params: {
+  taskId: string;
+  token: string;
+}): Promise<ApproveTaskRpcResult> {
+  const rpc = await tryRpc<ApproveTaskRpcResult>('approveTask', {
+    taskId: params.taskId,
+    token: params.token,
+  });
+  if (rpc) return rpc;
+
+  const root = requireLazyRoot();
+  return await handleApproveTask(root, params) as ApproveTaskRpcResult;
 }
 
 // --- Reject Task ---

@@ -2,22 +2,49 @@
  * MCP tool definitions and handlers for the agent.
  *
  * Tools fall into two categories:
- *   - Migrated: lazy_search, lazy_show, lazy_create, lazy_comment, lazy_propose
+ *   - Migrated: lazy_search, lazy_show, lazy_create, lazy_comment
  *     (replace former CLI commands that agents called via shell)
  *   - New: lazy_commit, lazy_status
  *     (new capabilities exposed only via MCP, not previously available as CLI commands)
+ *
+ * Agent ownership boundary: when a tool handler runs with a non-empty ctx.taskId,
+ * the caller is an agent acting on its own task. EVERY task-targeting tool an
+ * agent can reach enforces — server-side — that the target is the agent's OWN
+ * task or a DIRECT subtask of it:
+ *   - create/start subtasks (lazy_create is constrained to a direct child;
+ *     lazy_start to a direct child);
+ *   - review/iterate/complete a subtask (show, diff, wait, unblock, reject,
+ *     close, edit, stop, submit, resume, ask, sync, reopen) — each gated
+ *     via assertAgentMayTarget / gateAgentTarget (own task or direct child);
+ *   - accept a subtask — gated more tightly still, via
+ *     assertAgentMayTargetChildOnly: a DIRECT CHILD ONLY, never the agent's own
+ *     task. Accepting a child merges the child's work into the agent's own
+ *     branch (a human reviews it later, when the agent's task is accepted);
+ *     accepting itself would complete the agent's task and merge it upward
+ *     unreviewed.
+ *   - lazy_edit additionally refuses to change a task's parent (the reparent
+ *     backdoor).
+ * Tools that MANUFACTURE a task whose parent the agent cannot constrain to its
+ * own subtree are out of the agent surface entirely: lazy_reparent, lazy_clone
+ * (clone parents under the source), and lazy_redo (replacement parents under the
+ * original's parent). Agents create new work only via lazy_create.
+ *
+ * This is real, daemon-side friction enforced from the caller's task identity,
+ * independent of prompt guidance — it keeps a well-behaved agent inside its own
+ * subtree. It is NOT a cryptographic sandbox: an agent with shell access in its
+ * container has other routes (that broader isolation is the runner's job, not
+ * this gate's). The goal here is a clear, enforced ownership contract at the MCP
+ * boundary, not airtight containment.
  */
 
-import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { MCP_ACTOR } from '../constants';
+import { MCP_ACTOR, AGENT_ACTOR } from '../constants';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
-import { pathExists, ensureDir, writeFile } from '../utils/fs';
+import { pathExists } from '../utils/fs';
 import type { McpTool, McpToolHandler } from './types';
 import { protocolDir as taskProtocolDir } from '../protocol/io';
-import { writeTurnEndSignal } from '../protocol/turn-end-signal';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import type { Turn } from '../types';
 
@@ -25,8 +52,8 @@ import type { Turn } from '../types';
  * Ask-mode read-only guard for write-capable MCP tools.
  *
  * When the supervisor runs an ask turn, it sets LAZY_MCP_READ_ONLY=1 on the
- * agent process so MCP write tools (lazy_commit, lazy_propose, lazy_comment)
- * reject any attempted call. This is the last line of defense if the agent
+ * agent process so MCP write tools (lazy_commit, lazy_comment) reject any
+ * attempted call. This is the last line of defense if the agent
  * ignores the system prompt and the --disallowedTools lockdown.
  *
  * The error message must be actionable — tell the agent what to do instead
@@ -45,11 +72,20 @@ function rejectIfReadOnly(toolName: string): void {
 
 // Re-use storage and helpers from existing CLI infrastructure
 import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef } from '../cli/helpers';
+import { INTERNAL_GIT_TOOL_NAME, createInternalGitHandler } from './internal-git';
 import type { Storage } from '../storage';
-import type { Proposal } from '../cli/commands/propose';
-import type { TaskTarget } from '../types';
-import { parentTaskIdOf, taskTarget, branchTarget } from '../task-target';
-import { getAllSearchableContent, isStructuredQuery, structuredSearch, QueryParseError } from '../search';
+import type { Task, TaskTarget, TaskPriority } from '../types';
+import { VALID_TASK_PRIORITIES } from '../types';
+import { type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT } from '../config/types';
+import { createRunner } from '../runner';
+import type { Runner } from '../runner';
+import { computeWorkingSubstate, formatWorkingSubstate, readSupervisorStatusAsync } from '../utils/working-substate';
+import { formatRetrySummary } from '../utils/retry-summary';
+import { parentTaskIdOf, taskTarget, branchTarget, targetBranchOf, collectSubtreeIds } from '../task-target';
+import { loadConfig } from '../config/loader';
+import { resolveEdgeGateDecision, peekHumanApproval } from '../protection/edge-gate';
+import { getAllSearchableContent, isStructuredQuery, structuredSearch, buildTagHint, QueryParseError } from '../search';
+import { orderQueuedTasks } from '../daemon/concurrency';
 
 import {
   queryWait,
@@ -65,6 +101,7 @@ import {
   queryReparentTask,
 } from '../daemon/rpc-fallback';
 import { generateRedoCode } from '../cli/commands/redo';
+import { sanitizeUserText } from '../utils/sanitize-text';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
 import {
   acceptConfirmationLevel,
@@ -91,6 +128,7 @@ import {
 // in a builder/pairing process and falls back to the direct daemon function
 // under LAZY_IS_DAEMON=1 / LAZY_TEST=1 — without spawning a lazy subprocess.
 import { type StartTaskParams } from '../daemon/task-launcher';
+import { turnText } from '../utils/turn-content';
 import {
   type UnblockTaskParams,
   type AskTaskParams,
@@ -108,8 +146,14 @@ import {
  * Provides the task ID and worktree path that the agent is operating on.
  *
  * For the builder, taskId may be empty — the builder operates at the project level,
- * not on a specific task. Tools that require a taskId (lazy_commit, lazy_status,
- * lazy_propose) are unavailable when taskId is empty.
+ * not on a specific task. Tools that require a taskId (lazy_commit) are unavailable
+ * when taskId is empty.
+ *
+ * The taskId is also the agent-ownership signal: a non-empty taskId means the call
+ * comes from an agent acting on its OWN task. lazy_create / lazy_start / lazy_reparent
+ * use this to enforce that agents may only create and start subtasks of their own
+ * task, and may never reparent. See createCreateHandler / createStartHandler /
+ * createReparentHandler.
  */
 export interface McpToolContext {
   /** Full UUID of the current task (empty string for builder context) */
@@ -122,6 +166,13 @@ export interface McpToolContext {
    * handlers fall back to requireStorage().
    */
   storage?: import('../storage').Storage;
+  /**
+   * Optional phase-progress sink. Set when the call arrived over the daemon's
+   * heartbeat-framed MCP route: long tools (accept) narrate their phases into
+   * it and the frames travel back to the client as `notifications/progress`.
+   * Undefined everywhere else — narration is strictly observational.
+   */
+  progress?: import('../daemon/progress').ProgressEmitter;
 }
 
 /**
@@ -139,6 +190,95 @@ async function getStorage(ctx: McpToolContext): Promise<Storage> {
   return requireStorage();
 }
 
+/**
+ * Agent ownership gate for task-targeting MCP tools.
+ *
+ * When ctx.taskId is non-empty the caller is an agent acting on its own task; it
+ * may only target its OWN task or a DIRECT child of it (a subtask it owns). Any
+ * other task is rejected with an actionable message. The builder (ctx.taskId ===
+ * '') is unrestricted and this is a no-op.
+ *
+ * Call this once the target Task has been resolved. It is the shared enforcement
+ * point behind lazy_show / lazy_diff / lazy_wait / lazy_unblock / lazy_accept /
+ * lazy_reject / lazy_close / lazy_edit so an agent can run its OWN subtasks
+ * end-to-end (create → start → wait → review → unblock → accept) without reaching
+ * outside its subtree.
+ */
+function assertAgentMayTarget(ctx: McpToolContext, task: Task, action: string): void {
+  if (!ctx.taskId) return; // builder: unrestricted
+  if (task.id === ctx.taskId) return; // the agent's own task
+  if (parentTaskIdOf(task) === ctx.taskId) return; // a direct subtask of the agent's task
+  throw new Error(
+    `Agents may only ${action} their own task or its direct subtasks. ` +
+    `Task '${shortId(task.id)}' is neither your current task nor one of its children. ` +
+    `Use lazy_create to spin off a subtask of your own task instead.`,
+  );
+}
+
+/**
+ * Agent ownership gate for tools an agent may run ONLY on a DIRECT SUBTASK —
+ * never on its own task.
+ *
+ * `lazy_accept` is the one such tool today. Accepting means "merge this work
+ * into the parent branch and complete the task": on a subtask that lands the
+ * child's work on the agent's own branch, which a human still reviews later. On
+ * the agent's OWN task it would merge the agent's work into ITS parent and mark
+ * the task complete — the agent grading its own homework and skipping the review
+ * it exists to be subject to. That is refused server-side, not by prompt.
+ *
+ * `lazy_unblock` deliberately stays on the looser gate above: iterating on a
+ * subtask (or being told to iterate on its own task) merges nothing and
+ * completes nothing, so the review boundary is untouched. That keeps the whole
+ * self-orchestration loop — create → start → wait → show/diff → unblock →
+ * accept — reachable without widening what an agent can land.
+ */
+function assertAgentMayTargetChildOnly(ctx: McpToolContext, task: Task, action: string): void {
+  if (!ctx.taskId) return; // builder: unrestricted
+  if (parentTaskIdOf(task) === ctx.taskId) return; // a direct subtask of the agent's task
+  if (task.id === ctx.taskId) {
+    throw new Error(
+      `Agents may not ${action} their own task — that is the human's (or builder's) review decision. ` +
+      `You may only ${action} a direct subtask you created with lazy_create. ` +
+      `Finish your work, commit it, and end your turn; your task is reviewed from outside.`,
+    );
+  }
+  throw new Error(
+    `Agents may only ${action} their own direct subtasks. ` +
+    `Task '${shortId(task.id)}' is not a child of your current task. ` +
+    `Use lazy_create to spin off a subtask of your own task instead.`,
+  );
+}
+
+/**
+ * The actor to record for a command arriving over the MCP channel.
+ *
+ * Same channel, two callers, told apart by scope: a non-empty ctx.taskId means a
+ * TASK AGENT acting inside its own subtree (→ 'agent'); an empty one means the
+ * builder driving the project (→ 'builder'). Neither is 'human' — see MCP_ACTOR.
+ */
+function mcpActor(ctx: McpToolContext): typeof MCP_ACTOR | typeof AGENT_ACTOR {
+  return ctx.taskId ? AGENT_ACTOR : MCP_ACTOR;
+}
+
+/**
+ * Resolve a task id and apply {@link assertAgentMayTarget}. For handlers that do
+ * not otherwise open storage (e.g. lazy_wait, which hands straight to the daemon
+ * RPC). Skips the lookup entirely for the builder.
+ */
+async function gateAgentTarget(ctx: McpToolContext, taskIdInput: string, action: string): Promise<void> {
+  if (!ctx.taskId) return; // builder: unrestricted — avoid an unnecessary resolve
+  const storage = await getStorage(ctx);
+  try {
+    const resolved = await storage.resolveTask(taskIdInput);
+    if (!resolved.task) {
+      throw new Error(`Task not found: ${taskIdInput}`);
+    }
+    assertAgentMayTarget(ctx, resolved.task, action);
+  } finally {
+    await storage.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // lazy_search
 // ---------------------------------------------------------------------------
@@ -146,8 +286,9 @@ async function getStorage(ctx: McpToolContext): Promise<Storage> {
 export const searchTool: McpTool = {
   name: 'lazy_search',
   description:
-    'Search across tasks, prompts, conversation turns, commits, comments, and ' +
-    'follow-ups in the lazy project. Returns structured results with task context. ' +
+    'Search across tasks, prompts, conversation turns, commits, comments, ' +
+    'follow-ups, and shared memory records in the lazy project. Returns structured ' +
+    'results with task context. ' +
     'Use this to find rationale, decisions, and context from other tasks.\n\n' +
     'Use "offset" and "limit" to paginate through results. ' +
     'Response always includes "total" count of matching results.',
@@ -156,7 +297,15 @@ export const searchTool: McpTool = {
     properties: {
       query: {
         type: 'string',
-        description: 'Search query (regex pattern, case-insensitive)',
+        description:
+          'Search query. Plain text is a case-insensitive regex. Also supports a ' +
+          'Lucene-style structured syntax with field filters (status:, goal:, code:, ' +
+          'tag:, in:turns/commits/comments/followups/conversations/memories, has:*, created:/updated:), ' +
+          'boolean operators (AND, OR, NOT), and grouping. E.g. "tag:onboarding AND status:blocked". ' +
+          'Tag values are normalized on write and on query (lowercased, non-alphanumerics collapsed ' +
+          'to hyphens), so tag:#Launch == tag:launch; quote a multi-word tag (tag:"My Feature Work") ' +
+          'or only its first word is treated as the tag. A bare "#name" means tag:name OR the literal ' +
+          'text "#name". A zero-result tag query returns a "hint" field naming the tags that do not exist.',
         minLength: 1,
       },
       fuzzy: {
@@ -166,7 +315,7 @@ export const searchTool: McpTool = {
       filter: {
         type: 'string',
         description: 'Filter results to a specific type',
-        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments', 'followups'],
+        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments', 'followups', 'memories'],
       },
       offset: {
         type: 'number',
@@ -186,7 +335,9 @@ export function createSearchHandler(ctx: McpToolContext): McpToolHandler {
     const query = args.query as string;
     const fuzzy = args.fuzzy as boolean | undefined;
     const filter = args.filter as string | undefined;
-    const filterType = filter?.replace(/s$/, ''); // 'tasks' -> 'task'
+    // 'tasks' -> 'task'. 'memories' is irregular, so map it explicitly rather
+    // than letting the plural strip produce 'memorie' (which matches nothing).
+    const filterType = filter === 'memories' ? 'memory' : filter?.replace(/s$/, '');
     const offset = (args.offset as number | undefined) ?? 0;
     const limit = (args.limit as number | undefined) ?? 20;
 
@@ -234,11 +385,16 @@ export function createSearchHandler(ctx: McpToolContext): McpToolHandler {
           }
           const sliced = results.slice(offset, offset + limit);
 
+          // Same trap as on the CLI: a tag that was never applied, mistyped, or
+          // written unquoted returns an empty list with no way to tell which.
+          const hint = results.length === 0 ? await buildTagHint(storage, query) : null;
+
           return {
             query,
             fuzzy: false,
             count: sliced.length,
             total: results.length,
+            ...(hint ? { hint } : {}),
             results: sliced.map(r => ({
               type: r.entity_type,
               taskId: shortId(r.task_id),
@@ -295,6 +451,9 @@ export const showTool: McpTool = {
     'Use this to understand context and decisions from other tasks.\n\n' +
     'Any orthogonal follow-ups an agent recorded on the task are always included ' +
     '(as `follow_ups`) so you can triage them at review. ' +
+    'When the task\'s supervisor is stuck in the retry loop, `retry_status` reports ' +
+    'the attempt count, failure class, delay before the next attempt, and the ' +
+    'deduplicated error log — so you can tell a retrying task from a healthy one. ' +
     'Default response is a compact summary with counts. Use "sections" to ' +
     'drill down into specific data (turns, chunks, commits, comments, children). ' +
     'Use "offset" and "limit" to paginate within sections.\n\n' +
@@ -315,9 +474,9 @@ export const showTool: McpTool = {
         type: 'array',
         items: {
           type: 'string',
-          enum: ['turns', 'chunks', 'commits', 'comments', 'journal', 'children', 'status-history'],
+          enum: ['turns', 'chunks', 'commits', 'comments', 'journal', 'children', 'status-history', 'tag-history'],
         },
-        description: 'Sections to include in full (e.g. ["turns", "commits", "status-history"]). Without this, only counts are returned. "chunks" groups turns by human/builder review boundary (offset/limit page over chunks, not turns). "status-history" surfaces the audit trail of status transitions (from → to, actor, timestamp).',
+        description: 'Sections to include in full (e.g. ["turns", "commits", "status-history"]). Without this, only counts are returned. "chunks" groups turns by human/builder review boundary (offset/limit page over chunks, not turns). "status-history" surfaces the audit trail of status transitions (from → to, actor, timestamp). "tag-history" surfaces the append-only tag/untag audit trail (tag, action, actor, timestamp). Current tags are always included in the summary as `tags`.',
       },
       offset: {
         type: 'number',
@@ -347,12 +506,42 @@ function mapShowTurn(t: Turn): Record<string, unknown> {
     // ones a human typed — consistent with the status-history actor field.
     // Always present (null when absent) so consumers can rely on the field.
     actor: t.actor ?? null,
-    content: t.content,
+    content: turnText(t),
     timestamp: new Date(t.timestamp).toISOString(),
     ...(t.auto_triggered ? { auto_triggered: true } : {}),
     ...(t.turn_type !== undefined ? { turn_type: t.turn_type } : {}),
     ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
     ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
+  };
+}
+
+/**
+ * Retry state for lazy_show, read from the supervisor checkpoint.
+ *
+ * Returns null unless the task is `working` and its supervisor is currently in
+ * the retry loop. Shape mirrors what `lazy show` renders on the host: attempt
+ * count, failure classification, when the next attempt lands, and the
+ * deduplicated error log. `summary` is the same one-line phrase the watch header
+ * and list substate use, so all surfaces read identically.
+ */
+export async function buildRetryStatus(task: Task): Promise<Record<string, unknown> | null> {
+  if (task.status !== 'working') return null;
+  const status = await readSupervisorStatusAsync(taskProtocolDir(task.id));
+  if (!status || status.phase !== 'retrying') return null;
+
+  return {
+    summary: formatRetrySummary(status),
+    retry_count: status.retryCount ?? 0,
+    failure_class: status.retry_failure_class ?? null,
+    failure_reason: status.retry_failure_reason ?? null,
+    next_delay_ms: status.retry_next_delay_ms ?? null,
+    errors: (status.errors ?? []).map(e => ({
+      message: e.message,
+      count: e.count,
+      first_seen: e.firstSeen,
+      last_seen: e.lastSeen,
+      failure_class: e.failure_class ?? null,
+    })),
   };
 }
 
@@ -374,6 +563,8 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
       }
 
       const task = resolved.task;
+      // INVARIANT: an agent may only inspect its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'show');
       const session = await storage.getSessionByTaskId(task.id);
 
       // Always build compact summary
@@ -383,6 +574,7 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         goal: task.goal,
         status: task.status,
         model: task.model ?? null,
+        tags: task.tags ?? [],
         created_at: new Date(task.created_at).toISOString(),
         parent_task_id: parentTaskIdOf(task) ? shortId(parentTaskIdOf(task)!) : null,
       };
@@ -413,6 +605,14 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && allTurns.length > 0) {
           result.latest_turn = mapShowTurn(allTurns[allTurns.length - 1]);
         }
+
+        // Retry state — a task stuck retrying looks identical to a healthy
+        // working task over MCP unless we say so. Builders have no host CLI, so
+        // without this they cannot see WHAT is being retried.
+        const retryStatus = await buildRetryStatus(task);
+        if (retryStatus) {
+          result.retry_status = retryStatus;
+        }
       } else {
         result.turn_count = 0;
         result.commit_count = 0;
@@ -424,11 +624,13 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
       const allFollowUps = await storage.getTaskFollowUps(task.id);
       const allChildren = await storage.getChildTasks(task.id);
       const allStatusHistory = await storage.getStatusHistory(task.id);
+      const allTagHistory = await storage.getTagHistory(task.id);
       result.comment_count = allComments.length;
       result.journal_count = allJournal.length;
       result.follow_up_count = allFollowUps.length;
       result.children_count = allChildren.length;
       result.status_history_count = allStatusHistory.length;
+      result.tag_history_count = allTagHistory.length;
 
       // Follow-ups are the builder's triage queue at review — always surface
       // their content inline when present (they're short and few), so the
@@ -499,6 +701,18 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         }
       }
 
+      if (sectionsSet.has('tag-history')) {
+        if (allTagHistory.length > 0) {
+          const sliced = allTagHistory.slice(offset, offset + limit);
+          result.tag_history = sliced.map(e => ({
+            tag: e.tag,
+            action: e.action,
+            actor: e.actor ?? null,
+            timestamp: new Date(e.timestamp).toISOString(),
+          }));
+        }
+      }
+
       if (sectionsSet.has('children') && allChildren.length > 0) {
         const sliced = allChildren.slice(offset, offset + limit);
         result.children = sliced.map(c => ({
@@ -524,7 +738,10 @@ export const createTool: McpTool = {
   name: 'lazy_create',
   description:
     'Create a new task in the lazy project. Returns the created task ID. ' +
-    'Use this when you identify work that should be tracked as a separate task.',
+    'Use this when you identify work that should be tracked as a separate task. ' +
+    'When called by an agent, the new task is always created as a subtask of your ' +
+    'own current task — the `parent` argument may only point to your own task, and ' +
+    'creating top-level tasks or tasks under another parent/branch is not permitted.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -549,9 +766,19 @@ export const createTool: McpTool = {
         description: 'Model ID to use for this task (e.g., opus, sonnet, claude-opus-4-8)',
 
       },
+      runner: {
+        type: 'string',
+        enum: ['host', 'docker', 'container', 'podman'],
+        description: 'Runner to execute this task on, overriding the global [runner] type: "host" (host process, no container isolation), "docker"/"container", or "podman". Persists on the task. Omit to inherit the global default.',
+      },
       type: {
         type: 'string',
         description: 'Task type',
+      },
+      priority: {
+        type: 'string',
+        description: 'Queue priority: low, normal (default), high, or urgent. Orders which queued task starts next when the concurrency cap is hit.',
+        enum: ['low', 'normal', 'high', 'urgent'],
       },
       parent: {
         type: 'string',
@@ -572,12 +799,68 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
     const prompt = args.prompt as string | undefined;
     const code = args.code as string | undefined;
     const model = args.model as string | undefined;
+    const runnerArg = args.runner as string | undefined;
     const type = args.type as string | undefined;
+    const priority = args.priority as string | undefined;
     const parent = args.parent as string | undefined;
     const confirmationCode = args.confirmation_code as string | undefined;
 
+    // Validate the runner alias up front so bad input fails before any writes.
+    let runnerType: RunnerType | undefined;
+    if (runnerArg !== undefined) {
+      const resolved = resolveRunnerType(runnerArg);
+      if (!resolved) {
+        throw new Error(`Invalid runner '${runnerArg}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
+      }
+      runnerType = resolved;
+    }
+
+    if (priority !== undefined && !VALID_TASK_PRIORITIES.includes(priority as TaskPriority)) {
+      throw new Error(`Invalid priority '${priority}'. Must be one of: ${VALID_TASK_PRIORITIES.join(', ')}`);
+    }
+
     const storage = await getStorage(ctx);
     try {
+      // INVARIANT: Agents may only create subtasks of their OWN task.
+      // A non-empty ctx.taskId means an agent (acting on that task) is the
+      // caller. In that case the new task is ALWAYS parented to ctx.taskId:
+      // agents may not create top-level tasks, may not target a branch, and may
+      // not parent under any other task. This boundary is enforced here, in the
+      // daemon-side handler, so an agent cannot escape it even if it ignores the
+      // prompt. The builder (ctx.taskId === '') keeps the full create surface
+      // below.
+      if (ctx.taskId) {
+        if (parent !== undefined) {
+          const resolved = await storage.resolveTask(parent);
+          if (!resolved.task || resolved.task.id !== ctx.taskId) {
+            throw new Error(
+              'Agents may only create subtasks of their own task. ' +
+              "Omit 'parent' (the new task is created as a child of your current task) " +
+              'or pass your own task id. Creating a top-level task, targeting a branch, ' +
+              'or parenting under another task is not permitted.',
+            );
+          }
+        }
+
+        const task = await storage.createTask(goal, ctx.taskId, undefined, code, type);
+        if (prompt) {
+          await storage.updateTaskPrompt(task.id, prompt);
+        }
+        if (model) {
+          await storage.updateTaskModel(task.id, model);
+        }
+
+        return {
+          id: shortId(task.id),
+          full_id: task.id,
+          goal: task.goal,
+          status: task.status,
+          code: task.code ?? null,
+          model: model ?? null,
+          parent_task_id: shortId(ctx.taskId),
+        };
+      }
+
       // Resolve --parent: a task code/short-ID (creates a child) or a raw git
       // branch (top-level task targeting that branch). Same precedence as
       // `lazy reparent` / CLI `lazy create`: try task first, then branch.
@@ -673,6 +956,13 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
         await storage.updateTaskModel(task.id, model);
       }
 
+      if (runnerType) {
+        await storage.updateTaskRunnerType(task.id, runnerType);
+      }
+      if (priority) {
+        await storage.updateTaskPriority(task.id, priority);
+      }
+
       return {
         id: shortId(task.id),
         full_id: task.id,
@@ -680,6 +970,8 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
         status: task.status,
         code: task.code ?? null,
         model: model ?? null,
+        runner: runnerType ?? null,
+        priority: priority ?? task.priority,
         parent_task_id: parentTaskId ? shortId(parentTaskId) : null,
       };
     } finally {
@@ -736,7 +1028,7 @@ export function createCommentHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error('No task_id provided and no current task context. Specify a task_id explicitly.');
       }
 
-      const comment = await storage.createComment(taskId, message, MCP_ACTOR);
+      const comment = await storage.createComment(taskId, message, mcpActor(ctx));
 
       return {
         id: shortId(comment.id),
@@ -818,76 +1110,293 @@ export function createJournalHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
-// lazy_propose
+// lazy_memory_save / lazy_memory_recall (lazy-owned shared memory)
 // ---------------------------------------------------------------------------
 
-export const proposeTool: McpTool = {
-  name: 'lazy_propose',
+export const memorySaveTool: McpTool = {
+  name: 'lazy_memory_save',
   description:
-    'Propose a follow-up task. Use this when you identify work that is out of ' +
-    'scope for the current task but should be done later. Proposals are reviewed ' +
-    'by the human during task review — they are NOT tasks yet. ' +
-    'Do NOT just mention follow-up work in prose — use this tool instead.',
+    'Create or update a shared memory record — small, named, curated cross-task ' +
+    'knowledge that is auto-injected (as a one-line index) into every future ' +
+    'builder and agent launch. Saving an existing `name` supersedes that record ' +
+    'and appends to an actor-attributed write history (history is never rewritten). ' +
+    'Use this INSTEAD of your harness memory directory, which is per-session and ' +
+    'never shared. BUILDER/HUMAN ONLY: task agents are read-only on memory and ' +
+    'this tool is rejected for them. Types: user (who the human is), feedback ' +
+    '(guidance they gave, with the why), project (goals/constraints not derivable ' +
+    'from the code), reference (pointers to external resources).',
   inputSchema: {
     type: 'object',
     properties: {
-      goal: {
+      name: {
         type: 'string',
-        description: 'Short description of the proposed task',
+        description: 'Record name — a short kebab-case slug (normalized). Reusing a name updates that record.',
         minLength: 1,
       },
-      code: {
+      description: {
         type: 'string',
-        description: `Suggested task code (kebab-case identifier with optional dots, 2-${MAX_TASK_CODE_LENGTH} chars, optional)`,
-        pattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$',
-        minLength: 2,
-        maxLength: MAX_TASK_CODE_LENGTH,
+        description: 'One-line summary. This single line is what gets injected into future prompts, so make it self-explanatory.',
+        minLength: 1,
       },
-      prompt: {
+      type: {
         type: 'string',
-        description: 'Detailed description/instructions for the proposed task (optional)',
+        description: 'Record type',
+        enum: ['user', 'feedback', 'project', 'reference'],
+      },
+      body: {
+        type: 'string',
+        description: 'Full record body (markdown). For feedback/project records, include why it matters and how to apply it.',
+        minLength: 1,
       },
     },
-    required: ['goal'],
+    required: ['name', 'description', 'type', 'body'],
   },
 };
 
-export function createProposeHandler(ctx: McpToolContext): McpToolHandler {
+export function createMemorySaveHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
-    rejectIfReadOnly('lazy_propose');
-    if (!ctx.taskId) {
-      throw new Error('lazy_propose requires a task context. This tool is not available in builder mode.');
+    rejectIfReadOnly('lazy_memory_save');
+
+    // INVARIANT (security boundary — see MemoryRecord in src/types): task agents
+    // are READ-ONLY on shared memory, enforced HERE, server-side, from the
+    // caller's task identity — not by prompt guidance. Memory is injected into
+    // every future builder and agent launch, so an agent-writable store would be
+    // a prompt-injection channel into every later session. A non-empty
+    // ctx.taskId means the caller is a task agent. Do not relax this.
+    if (ctx.taskId) {
+      throw new Error(
+        'Shared memory is read-only for task agents — lazy_memory_save is rejected. ' +
+        'Memory records are injected into every future builder and agent session, so only ' +
+        'the human (via `lazy memory save`) and the builder may write them. ' +
+        'If you learned something worth remembering, say so in your final summary; ' +
+        'for task-local rationale use lazy_journal instead.',
+      );
     }
 
-    const goal = args.goal as string;
-    const code = args.code as string | undefined;
-    const prompt = args.prompt as string | undefined;
+    // AUTHORING surface: the description length budget is enforced here (and in
+    // `lazy memory save`), never on the import path — see
+    // MAX_MEMORY_DESCRIPTION_LENGTH in src/memory/index.ts.
+    const { normalizeMemoryName, normalizeAuthoredMemoryDescription, validateMemoryType } = await import('../memory');
+    const name = normalizeMemoryName(args.name as string);
+    const description = normalizeAuthoredMemoryDescription(args.description as string);
+    const type = validateMemoryType(args.type as string);
+    const body = (args.body as string).trim();
+    if (!body) {
+      throw new Error('A memory record needs a body — put the actual knowledge there.');
+    }
 
     const storage = await getStorage(ctx);
     try {
-      // Create proposals directory using storage driver path
-      const dir = join(storage.getTaskDir(ctx.taskId), 'proposals');
-      await ensureDir(dir);
-
-      const proposal: Proposal = {
-        id: randomUUID(),
-        goal,
-        code: code ?? '',
-        prompt: prompt ?? '',
-        created_at: Date.now(),
-        source_turn: null,
-        status: 'pending',
+      const existing = await storage.getMemory(name);
+      const record = await storage.saveMemory({ name, description, type, body }, MCP_ACTOR);
+      return {
+        name: record.name,
+        type: record.type,
+        description: record.description,
+        revision: record.revision,
+        action: existing ? 'updated' : 'created',
+        updated_at: new Date(record.updated_at).toISOString(),
+        updated_by: record.updated_by,
       };
+    } finally {
+      await storage.close();
+    }
+  };
+}
 
-      const filePath = join(dir, `${proposal.id}.json`);
-      await writeFile(filePath, JSON.stringify(proposal, null, 2) + '\n', 'utf-8');
+export const memoryRecallTool: McpTool = {
+  name: 'lazy_memory_recall',
+  description:
+    'Recall shared memory. With no `name`, returns the index of all records ' +
+    '(name, type, one-line description) — the same index injected into your ' +
+    'system prompt. With a `name`, returns that record\'s full body plus who ' +
+    'wrote it and when. To search inside record bodies, use ' +
+    'lazy_search(query="in:memories <text>").',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: {
+        type: 'string',
+        description: 'Record name to read in full. Omit to list the index of all records.',
+      },
+    },
+  },
+};
+
+export function createMemoryRecallHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const nameInput = args.name as string | undefined;
+    const storage = await getStorage(ctx);
+    try {
+      const { normalizeMemoryName, renderMemoryIndex } = await import('../memory');
+
+      if (!nameInput) {
+        const records = await storage.listMemories();
+        return {
+          total: records.length,
+          index: renderMemoryIndex(records) || '(no memory records yet)',
+          records: records.map(r => ({
+            name: r.name,
+            type: r.type,
+            description: r.description,
+            updated_at: new Date(r.updated_at).toISOString(),
+            updated_by: r.updated_by,
+          })),
+        };
+      }
+
+      const name = normalizeMemoryName(nameInput);
+      const record = await storage.getMemory(name);
+      if (!record) {
+        throw new Error(
+          `No memory record named '${name}'. Call lazy_memory_recall with no arguments to list all records.`,
+        );
+      }
+      const history = await storage.getMemoryHistory(name);
+      return {
+        name: record.name,
+        type: record.type,
+        description: record.description,
+        body: record.body,
+        revision: record.revision,
+        created_at: new Date(record.created_at).toISOString(),
+        created_by: record.created_by,
+        updated_at: new Date(record.updated_at).toISOString(),
+        updated_by: record.updated_by,
+        history: history.map(e => ({
+          action: e.action,
+          actor: e.actor,
+          revision: e.revision,
+          timestamp: new Date(e.timestamp).toISOString(),
+        })),
+      };
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// lazy_tag
+// ---------------------------------------------------------------------------
+
+export const tagTool: McpTool = {
+  name: 'lazy_tag',
+  description:
+    'Add a tag to a task for lightweight, non-hierarchical grouping (e.g. group ' +
+    'work into efforts like "onboarding", "launch", "infra"). A task can carry ' +
+    'multiple tags. Tags are normalized to lowercase alphanumerics + hyphens. ' +
+    'Idempotent — re-tagging an existing tag is a no-op. Every tag/untag is ' +
+    'recorded in an append-only, actor-attributed history. Returns the task\'s ' +
+    'current tags.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID to tag (short hex prefix or code). If omitted, tags the current task.',
+      },
+      tag: {
+        type: 'string',
+        description: 'The tag to add (normalized to lowercase alphanumerics + hyphens).',
+        minLength: 1,
+      },
+    },
+    required: ['tag'],
+  },
+};
+
+export function createTagHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    rejectIfReadOnly('lazy_tag');
+    const tag = args.tag as string;
+    const taskIdInput = args.task_id as string | undefined;
+
+    const storage = await getStorage(ctx);
+    try {
+      let taskId: string;
+      if (taskIdInput) {
+        const resolved = await storage.resolveTask(taskIdInput);
+        if (!resolved.task) {
+          throw new Error(`Task not found: ${taskIdInput}`);
+        }
+        taskId = resolved.task.id;
+      } else if (ctx.taskId) {
+        taskId = ctx.taskId;
+      } else {
+        throw new Error('No task_id provided and no current task context. Specify a task_id explicitly.');
+      }
+
+      // MCP channel → builder actor, or 'agent' when a task agent is the caller
+      // (see MCP_ACTOR / AGENT_ACTOR / builder-actor invariant).
+      const task = await storage.addTaskTag(taskId, tag, mcpActor(ctx));
 
       return {
-        proposal_id: shortId(proposal.id),
-        task_id: shortId(ctx.taskId),
-        goal: proposal.goal,
-        code: proposal.code || null,
-        status: 'pending',
+        task_id: shortId(taskId),
+        tags: task.tags,
+      };
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// lazy_untag
+// ---------------------------------------------------------------------------
+
+export const untagTool: McpTool = {
+  name: 'lazy_untag',
+  description:
+    'Remove a tag from a task. Idempotent — untagging a tag the task does not ' +
+    'have is a no-op. Untagging appends an \'untag\' event to the task\'s ' +
+    'append-only tag history; it never erases the earlier tagging event. ' +
+    'Returns the task\'s current tags.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID to untag (short hex prefix or code). If omitted, untags the current task.',
+      },
+      tag: {
+        type: 'string',
+        description: 'The tag to remove (normalized to lowercase alphanumerics + hyphens).',
+        minLength: 1,
+      },
+    },
+    required: ['tag'],
+  },
+};
+
+export function createUntagHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    rejectIfReadOnly('lazy_untag');
+    const tag = args.tag as string;
+    const taskIdInput = args.task_id as string | undefined;
+
+    const storage = await getStorage(ctx);
+    try {
+      let taskId: string;
+      if (taskIdInput) {
+        const resolved = await storage.resolveTask(taskIdInput);
+        if (!resolved.task) {
+          throw new Error(`Task not found: ${taskIdInput}`);
+        }
+        taskId = resolved.task.id;
+      } else if (ctx.taskId) {
+        taskId = ctx.taskId;
+      } else {
+        throw new Error('No task_id provided and no current task context. Specify a task_id explicitly.');
+      }
+
+      // MCP channel → builder actor, or 'agent' when a task agent is the caller
+      // (see MCP_ACTOR / AGENT_ACTOR / builder-actor invariant).
+      const task = await storage.removeTaskTag(taskId, tag, mcpActor(ctx));
+
+      return {
+        task_id: shortId(taskId),
+        tags: task.tags,
       };
     } finally {
       await storage.close();
@@ -1011,10 +1520,17 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     const statusResult = await runGit(['diff', '--no-color', '--cached', '--stat'], { cwd });
     const diffStat = statusResult.stdout;
     if (!diffStat) {
-      return {
-        committed: false,
-        message: 'Nothing to commit (no staged changes)',
-      };
+      // A merge in progress still has to be concluded even when the resolution
+      // happens to match HEAD exactly (e.g. every conflict resolved in favour of
+      // our side). The agent cannot run `git commit` itself — refs are read-only
+      // inside its container — so bailing out here would strand the merge.
+      const mergeHead = await runGit(['rev-parse', '--verify', 'MERGE_HEAD'], { cwd });
+      if (mergeHead.exitCode !== 0) {
+        return {
+          committed: false,
+          message: 'Nothing to commit (no staged changes)',
+        };
+      }
     }
 
     // Commit
@@ -1031,24 +1547,13 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     const diffLines = diffStat.split('\n');
     const filesChanged = Math.max(0, diffLines.length - 1);
 
-    // Signal end-of-turn to the supervisor. lazy_commit is the de-facto
-    // end-of-turn tool today: the prompt mandates committing as the agent's
-    // last action. The supervisor watches this marker and kills claude -p if
-    // it doesn't exit within graceful_exit_timeout_ms after this point —
-    // bounded waiting for plumbing to wind down once the agent considers
-    // itself done. See src/protocol/turn-end-signal.ts and the watchdog.
-    //
-    // Best-effort: a marker write failure must NOT fail the commit (the
-    // commit already landed). Log loudly so the supervisor-side timeout, if
-    // it never fires, is debuggable.
-    try {
-      await writeTurnEndSignal(taskProtocolDir(ctx.taskId), {
-        commit_sha: sha,
-        written_at: new Date().toISOString(),
-      });
-    } catch (err) {
-      logger.warn(`lazy_commit: failed to write end-of-turn signal: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // NOTE: lazy_commit deliberately does NOT signal end-of-turn. It used to
+    // write a marker the supervisor read as "the turn is over", which armed a
+    // kill timer — but agents commit mid-turn, and the final summary is
+    // produced after every tool call, so that fuse routinely killed healthy
+    // turns and discarded the summary they were writing. Turn end is now
+    // observed directly from the agent's own output stream.
+    // See src/supervisor/watchdog.ts.
 
     return {
       committed: true,
@@ -1417,7 +1922,9 @@ export const startTool: McpTool = {
   name: 'lazy_start',
   description:
     'Start working on an existing task. Creates a worktree, git branch, and ' +
-    'launches a supervisor to run the agent. To create a new task, use lazy_create first.',
+    'launches a supervisor to run the agent. To create a new task, use lazy_create first. ' +
+    'When called by an agent, you may only start your OWN subtasks (tasks whose ' +
+    'parent is your current task); starting any other task is not permitted.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1431,6 +1938,19 @@ export const startTool: McpTool = {
         description: 'Model override for this run (optional)',
 
       },
+      runner: {
+        type: 'string',
+        enum: ['host', 'docker', 'container', 'podman'],
+        description: 'Runner to execute this task on, overriding the global [runner] type: "host", "docker"/"container", or "podman". Persists on the task; takes effect this turn. Omit to use the task or global default.',
+      },
+      force_local: {
+        type: 'boolean',
+        description:
+          'Start from the parent/integration branch\'s local HEAD when its ref cannot ' +
+          'be fetched from the remote (e.g. a parent branch that was never pushed). ' +
+          'Offline mode already implies this — only needed while online when the ref ' +
+          'genuinely is not on the remote. Equivalent to the CLI `--force-local` flag.',
+      },
     },
     required: ['task_id'],
   },
@@ -1440,12 +1960,51 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
     const model = args.model as string | undefined;
+    const runnerArg = args.runner as string | undefined;
+
+    let runnerOverride: RunnerType | undefined;
+    if (runnerArg !== undefined) {
+      const resolved = resolveRunnerType(runnerArg);
+      if (!resolved) {
+        throw new Error(`Invalid runner '${runnerArg}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
+      }
+      runnerOverride = resolved;
+    }
+
+    const forceLocal = args.force_local === true;
+
+    // INVARIANT: Agents may only start their OWN subtasks. A non-empty
+    // ctx.taskId means an agent (acting on that task) is the caller; it may
+    // only start tasks whose parent is its own task. This is enforced here,
+    // server-side, before any worktree/branch/supervisor is created — an agent
+    // cannot start arbitrary tasks even if it ignores the prompt. The builder
+    // (ctx.taskId === '') may start any task.
+    if (ctx.taskId) {
+      const storage = await getStorage(ctx);
+      try {
+        const resolved = await storage.resolveTask(taskId);
+        if (!resolved.task) {
+          throw new Error(`Task not found: ${taskId}`);
+        }
+        if (parentTaskIdOf(resolved.task) !== ctx.taskId) {
+          throw new Error(
+            `Agents may only start their own subtasks. Task '${taskId}' is not a child ` +
+            'of your current task. Use lazy_create to create a subtask of your own task, ' +
+            'then start that.',
+          );
+        }
+      } finally {
+        await storage.close();
+      }
+    }
 
     const params: StartTaskParams = {
       taskId,
       modelOverride: model,
+      runnerOverride,
+      forceLocal,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
-      actor: MCP_ACTOR, // MCP boundary → 'builder'
+      actor: mcpActor(ctx), // MCP boundary → 'builder' (project-wide) or 'agent' (task-scoped)
     };
 
     // Route through queryStartTask (the RPC layer) rather than calling
@@ -1457,6 +2016,20 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
     // in both contexts: it forwards to the daemon via RPC when not in-daemon,
     // and falls back to the direct handler under LAZY_IS_DAEMON=1 / LAZY_TEST=1.
     const result = await queryStartTask(params);
+
+    // Queued at the concurrency cap — the daemon will launch it automatically
+    // when an agent slot frees up. Report it plainly (not an error).
+    if (result.queued) {
+      return {
+        output:
+          `Task queued (${result.queueRunning}/${result.queueLimit} agents running). ` +
+          `It will start automatically when an agent slot frees up (a running task finishes or a blocked one is reviewed). ` +
+          `Raise the cap for this daemon session with: lazy daemon config set max_concurrent_agents <N>`,
+        queued: true,
+        running: result.queueRunning,
+        limit: result.queueLimit,
+      };
+    }
 
     return {
       output: `Started task ${result.sessionId} on branch ${result.branchName}`,
@@ -1520,6 +2093,8 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only unblock its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'unblock');
 
       // Get violations if task is in conflict status
       let violations: Array<{ file: string; status: string }> = [];
@@ -1567,10 +2142,12 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       approvedFiles,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
       notesInEditor: false,
-      // MCP boundary → 'builder'. INVARIANT: actor = who submitted (the channel),
-      // NOT who authored — feedback the builder relays from a human is still
-      // 'builder' here. Content provenance is preserved separately; see MCP_ACTOR.
-      actor: MCP_ACTOR,
+      // MCP boundary → 'builder' (project-wide caller) or 'agent' (a task agent
+      // unblocking its own subtask). INVARIANT: actor = who submitted (the
+      // channel), NOT who authored — feedback the builder relays from a human is
+      // still 'builder' here. Content provenance is preserved separately; see
+      // MCP_ACTOR / AGENT_ACTOR.
+      actor: mcpActor(ctx),
     };
 
     const result = await queryUnblockTask(params);
@@ -1635,6 +2212,8 @@ export function createAskHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only ask its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'ask');
       const sess = await storage.getSessionByTaskId(task.id);
       if (!sess) {
         throw new Error(
@@ -1665,7 +2244,7 @@ export function createAskHandler(ctx: McpToolContext): McpToolHandler {
       taskId,
       message,
       effortOverride: effort,
-      actor: MCP_ACTOR, // MCP boundary → 'builder'
+      actor: mcpActor(ctx), // MCP boundary → 'builder' (project-wide) or 'agent' (task-scoped)
     };
 
     const result = await queryAskTask(params);
@@ -1716,6 +2295,7 @@ export const acceptTool: McpTool = {
 };
 
 async function executeAccept(
+  ctx: McpToolContext,
   taskId: string,
   reason: string | undefined,
   approvedFiles: string[] | undefined,
@@ -1725,9 +2305,15 @@ async function executeAccept(
     reason,
     approvedFiles,
     acceptDirtyWorktree: false,
+    actor: mcpActor(ctx),
+    // The agent's own task id, when an agent is the caller. The daemon uses it
+    // to recognise "the merge destination is the caller's own branch" — the one
+    // case where merging into a `working` parent is intentional rather than a
+    // race. Empty for the builder, which never gets that exemption.
+    callerTaskId: ctx.taskId || undefined,
   };
 
-  const result = await queryAcceptTask(params);
+  const result = await queryAcceptTask(params, ctx.progress);
 
   const statusMsg = result.status === 'merged'
     ? `Task ${result.displayId} accepted and merged`
@@ -1755,6 +2341,48 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may accept ONLY a DIRECT SUBTASK — never its own
+      // task. Accepting a subtask does the existing subtask→parent local merge:
+      // child work lands on the agent's OWN task branch, which a human still
+      // reviews when the agent's own task is accepted. Accepting its own task
+      // would let the agent complete itself and merge upward unreviewed, so
+      // that is refused here rather than left to prompt guidance.
+      assertAgentMayTargetChildOnly(ctx, task, 'accept');
+
+      // --- Branch-protection (edge-gate) check (P0.2d) ---
+      // INVARIANT: on a merge into a protected branch, the two-step
+      // confirmation is NOT authorization — the builder generates and echoes
+      // the code itself. When the merge is protected and no human approval is
+      // pending, refuse up front and never issue a code. The daemon's acceptTask
+      // gate is the authoritative enforcement; this check exists so the
+      // builder gets the honest story instead of a code that cannot work.
+      // 'merging'/'complete' are exempt: their merge was already authorized.
+      if (task.status !== 'merging' && task.status !== 'complete') {
+        const gateSession = await storage.getSessionByTaskId(task.id);
+        if (gateSession) {
+          const lazyRoot = requireLazyRoot();
+          const config = await loadConfig(lazyRoot);
+          const gatePid = parentTaskIdOf(task);
+          const gateTargetBranch = gatePid
+            ? (await storage.getSessionByTaskId(gatePid))?.git_branch ?? 'main'
+            : targetBranchOf(task) ?? 'main';
+          const decision = await resolveEdgeGateDecision(
+            { sourceBranch: gateSession.git_branch, targetBranch: gateTargetBranch },
+            config,
+            lazyRoot,
+            storage,
+          );
+          if (decision.gated && !(await peekHumanApproval(storage, task.id))) {
+            throw new Error(renderGuidance('accept-gated', {
+              task_code: task.code ?? shortId(task.id),
+              task_id: task.id,
+              source_branch: gateSession.git_branch,
+              target_branch: gateTargetBranch,
+              gate_reason: decision.reason,
+            }));
+          }
+        }
+      }
 
       // Step 2: validate confirmation code and execute
       if (confirmationCode) {
@@ -1776,7 +2404,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
           };
         }
 
-        return await executeAccept(taskId, reason, approvedFiles);
+        return await executeAccept(ctx, taskId, reason, approvedFiles);
       }
 
       // INVARIANT: The preview call (no confirmation_code) must not mutate
@@ -1801,7 +2429,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
 
       // If level is none (tiny diff with successful stat), execute directly
       if (level === 'none') {
-        return await executeAccept(taskId, reason, approvedFiles);
+        return await executeAccept(ctx, taskId, reason, approvedFiles);
       }
 
       const pid = parentTaskIdOf(task);
@@ -1881,6 +2509,8 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only reject its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'reject');
 
       // Step 2: validate confirmation code and execute
       if (confirmationCode) {
@@ -1979,6 +2609,8 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskId}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only close its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'close');
 
       // Step 2: validate confirmation code and execute
       if (confirmationCode) {
@@ -2072,11 +2704,13 @@ export function createStopHandler(ctx: McpToolContext): McpToolHandler {
       if (!resolved.task) {
         throw new Error(`Task not found: ${taskId}`);
       }
+      // INVARIANT: an agent may only stop its own task or a direct subtask.
+      assertAgentMayTarget(ctx, resolved.task, 'stop');
     } finally {
       await storage.close();
     }
 
-    const params: StopTaskParams = { taskId, reason: reason.trim(), actor: MCP_ACTOR };
+    const params: StopTaskParams = { taskId, reason: reason.trim(), actor: mcpActor(ctx) };
     const result = await queryStopTask(params);
 
     return {
@@ -2112,6 +2746,9 @@ export const submitTool: McpTool = {
 export function createSubmitHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
+
+    // INVARIANT: an agent may only submit its own task or a direct subtask.
+    await gateAgentTarget(ctx, taskId, 'submit');
 
     const params: SubmitTaskParams = {
       taskId,
@@ -2159,6 +2796,9 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const model = args.model as string | undefined;
 
+    // INVARIANT: an agent may only resume its own task or a direct subtask.
+    await gateAgentTarget(ctx, taskId, 'resume');
+
     // Resume is like unblock but for interrupted tasks, without a feedback message.
     // Use unblock with a standard resume message.
     const params: UnblockTaskParams = {
@@ -2167,7 +2807,7 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
       modelOverride: model,
       retargetOrphan: true,
       notesInEditor: false,
-      actor: MCP_ACTOR, // MCP boundary → 'builder'
+      actor: mcpActor(ctx), // MCP boundary → 'builder' (project-wide) or 'agent' (task-scoped)
     };
 
     const result = await queryUnblockTask(params);
@@ -2182,6 +2822,85 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// Working-substate decoration (shared by lazy_list / lazy_active)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the working-substate label (e.g. `agent`, `agent:answering`,
+ * `harness:post_turn_check (3m00s)`, `not-alive`) for a task, matching how the
+ * CLI (`lazy list`/`active`/`status`) renders substates via the shared
+ * derivation in `working-substate.ts`. Returns null for non-`working` tasks,
+ * tasks without a session, or when no substate can be derived. Never throws —
+ * a failed liveness probe degrades to no substate rather than failing the whole
+ * listing.
+ *
+ * `runner` is created once per handler call and shared across the batch so we
+ * don't spin up a runner per task.
+ */
+async function deriveTaskSubstateLabel(
+  storage: Storage,
+  runner: Runner,
+  task: Task,
+): Promise<string | null> {
+  if (task.status !== 'working') return null;
+  const session = await storage.getSessionByTaskId(task.id);
+  if (!session) return null;
+
+  let isAlive = false;
+  try {
+    const cn = session.container_name ?? runner.runNameForTask(taskRef(task));
+    const info = await runner.getRunInfo(cn);
+    isAlive = info?.running === true;
+  } catch (err) {
+    // Liveness probe is best-effort — degrade to no substate so one unreachable
+    // runner never fails the whole listing.
+    logger.debug(`lazy MCP: liveness probe failed for ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const substate = await computeWorkingSubstate(taskProtocolDir(task.id), isAlive);
+  return substate ? formatWorkingSubstate(substate) : null;
+}
+
+/** Drain position of a queued task, for MCP list output. */
+export interface QueueInfo {
+  position: number;
+  total: number;
+}
+
+/**
+ * Attach a `substate` label and (for queued tasks) a `queue` drain position to
+ * each task for MCP list output. Creates the runner once for the whole batch,
+ * and only when at least one task is `working` (substate is null for everything
+ * else), so listings with no working tasks skip runner setup entirely. Queue
+ * positions are computed once against ALL queued tasks in the project so
+ * "#N of M" is globally correct regardless of the filtered view.
+ */
+async function withSubstate<T extends { id: string; status: string }>(
+  storage: Storage,
+  tasks: Task[],
+  shape: (task: Task, substate: string | null, queue: QueueInfo | null) => T,
+): Promise<T[]> {
+  const anyWorking = tasks.some(t => t.status === 'working');
+  const runner = anyWorking ? await createRunner(requireLazyRoot()) : null;
+
+  const queuePos = new Map<string, QueueInfo>();
+  if (tasks.some(t => t.status === 'queued')) {
+    const ordered = orderQueuedTasks(await storage.listTasksWithOptions({ queuedOnly: true }));
+    ordered.forEach((t, i) => queuePos.set(t.id, { position: i + 1, total: ordered.length }));
+  }
+
+  return Promise.all(
+    tasks.map(async t =>
+      shape(
+        t,
+        runner ? await deriveTaskSubstateLabel(storage, runner, t) : null,
+        t.status === 'queued' ? queuePos.get(t.id) ?? null : null,
+      ),
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // lazy_list
 // ---------------------------------------------------------------------------
 
@@ -2190,7 +2909,9 @@ export const listTool: McpTool = {
   description:
     'List tasks in the lazy project. By default shows non-terminal tasks. ' +
     'Use "all" to include completed/closed tasks. Use "task_id" to filter ' +
-    'children of a specific task.',
+    'children of a specific task. Each task includes its status and, for working ' +
+    'tasks, a derived substate (e.g. "agent:answering", "harness:post_turn_check", ' +
+    '"not-alive").',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2229,11 +2950,17 @@ export function createListHandler(ctx: McpToolContext): McpToolHandler {
 
       return {
         count: tasks.length,
-        tasks: tasks.map(t => ({
+        tasks: await withSubstate(storage, tasks, (t, substate, queue) => ({
           id: shortId(t.id),
           code: t.code ?? null,
           goal: t.goal,
           status: t.status,
+          // Working-substate (e.g. `agent:answering`) so a `working` task's
+          // actual activity is visible; null for non-working tasks.
+          substate,
+          priority: t.priority,
+          // Drain position for a `queued` task ({position,total}); null otherwise.
+          queue,
           model: t.model ?? null,
           parent_task_id: parentTaskIdOf(t) ? shortId(parentTaskIdOf(t)!) : null,
         })),
@@ -2289,27 +3016,69 @@ export const activeTool: McpTool = {
   name: 'lazy_active',
   description:
     'List all non-terminal tasks (working, blocked, interrupted, conflict, etc.) ' +
-    'with active sessions. These are tasks currently being worked on or awaiting input.',
+    'with active sessions. These are tasks currently being worked on or awaiting input. ' +
+    'Each task includes its status and, for working tasks, a derived substate ' +
+    '(e.g. "agent:answering" while an ask is in flight, "agent:pre-accept" during ' +
+    'an accept\'s validation turn, "harness:post_turn_check", ' +
+    '"not-alive") so you can see what each active task is actually doing. ' +
+    'Pass "task_id" to narrow the listing to one task\'s subtree — that task plus ' +
+    'ALL its descendants (children, grandchildren, ...), unlike lazy_list\'s ' +
+    'direct-children filter.',
   inputSchema: {
     type: 'object',
-    properties: {},
+    properties: {
+      task_id: {
+        type: 'string',
+        description:
+          "Filter to this task's subtree: the task itself and all its descendants " +
+          '(short hex prefix or code)',
+      },
+    },
   },
 };
 
 export function createActiveHandler(ctx: McpToolContext): McpToolHandler {
-  return async (_args) => {
+  return async (args) => {
+    const taskIdInput = args.task_id as string | undefined;
     const storage = await getStorage(ctx);
     try {
 
-      const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
+      const active = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
+      // Queued tasks have no session yet (gated before session creation), so
+      // `withSessionsOnly` misses them — but a task waiting for a slot is
+      // in-flight and MUST be visible in `active` with its queue position.
+      const queued = await storage.listTasksWithOptions({ queuedOnly: true });
+      const seen = new Set(active.map(t => t.id));
+      let tasks = [...active, ...queued.filter(t => !seen.has(t.id))];
+
+      if (taskIdInput) {
+        const resolved = await storage.resolveTask(taskIdInput);
+        if (!resolved.task) {
+          throw new Error(`Task not found: ${taskIdInput}`);
+        }
+        // Subtree closure is computed against ALL tasks, not just the active
+        // ones: a terminal task in the middle of the hierarchy must not hide
+        // its still-active descendants.
+        const allowedIds = collectSubtreeIds(resolved.task.id, await storage.listTasks());
+        tasks = tasks.filter(t => allowedIds.has(t.id));
+      }
 
       return {
         count: tasks.length,
-        tasks: tasks.map(t => ({
+        tasks: await withSubstate(storage, tasks, (t, substate, queue) => ({
           id: shortId(t.id),
           code: t.code ?? null,
           goal: t.goal,
+          status: t.status,
+          // Working-substate (e.g. `agent:answering`) so an active task's actual
+          // activity is visible; null for non-working tasks.
+          substate,
+          priority: t.priority,
+          // Drain position for a `queued` task ({position,total}); null otherwise.
+          queue,
           model: t.model ?? null,
+          // Parent link so a subtree listing can be reassembled into a hierarchy.
+          parent_task_id: parentTaskIdOf(t) ? shortId(parentTaskIdOf(t)!) : null,
         })),
       };
     } finally {
@@ -2375,6 +3144,8 @@ export function createDiffHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskIdInput}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only diff its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'diff');
 
       const session = await storage.getSessionByTaskId(task.id);
       if (!session) {
@@ -2517,6 +3288,9 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
     const taskIdInput = args.task_id as string;
     const timeoutSecs = Math.min((args.timeout as number | undefined) ?? 600, 600);
 
+    // INVARIANT: an agent may only wait on its own task or a direct subtask.
+    await gateAgentTarget(ctx, taskIdInput, 'wait on');
+
     const result = await queryWait({ taskId: taskIdInput, timeout: timeoutSecs });
 
     return {
@@ -2592,6 +3366,18 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskIdInput}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only edit its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'edit');
+      // INVARIANT: agents may not reparent via lazy_edit — that is the
+      // lazy_reparent backdoor. Changing a task's parent is a builder/human
+      // operation. (Agents may still refine a subtask's goal/prompt/etc.)
+      if (ctx.taskId && parent !== undefined) {
+        throw new Error(
+          'Agents cannot change a task\'s parent. Reparenting is a builder/human ' +
+          'operation. Create subtasks with lazy_create (they are parented to your ' +
+          'own task automatically).',
+        );
+      }
 
       // Check terminal status
       const terminalStatuses = new Set(['complete', 'abandoned']);
@@ -2708,6 +3494,21 @@ export const cloneTool: McpTool = {
 
 export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    // INVARIANT: lazy_clone is NOT available to agents. A clone is created as a
+    // child of the SOURCE task — so cloning a direct subtask would manufacture a
+    // grandchild, which is outside the "agents create only direct children of
+    // their own task" boundary, and cloning the agent's own task is just a
+    // worse lazy_create. There is no parameter by which the agent constrains the
+    // clone's parent, so (like lazy_reparent) it stays a builder/human tool.
+    // Agents spin off new work with lazy_create instead.
+    if (ctx.taskId) {
+      throw new Error(
+        'Agents cannot clone tasks. Cloning creates a task whose parent is the ' +
+        'source task, which can fall outside your subtree. Use lazy_create to ' +
+        'spin off a subtask of your own task instead.',
+      );
+    }
+
     const taskIdInput = args.task_id as string;
     const goalOverride = args.goal as string | undefined;
     const promptOverride = args.prompt as string | undefined;
@@ -2802,6 +3603,8 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Task not found: ${taskIdInput}`);
       }
       const task = resolved.task;
+      // INVARIANT: an agent may only reopen its own task or a direct subtask.
+      assertAgentMayTarget(ctx, task, 'reopen');
 
       const terminalStatuses = new Set(['complete', 'abandoned']);
       if (!terminalStatuses.has(task.status)) {
@@ -2819,14 +3622,14 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
         }
 
         if (reason) {
-          await storage.createComment(task.id, `[Reopened] ${reason}`, MCP_ACTOR);
+          await storage.createComment(task.id, `[Reopened] ${reason}`, mcpActor(ctx));
         }
 
-        await storage.reopenTask(task.id, MCP_ACTOR);
+        await storage.reopenTask(task.id, mcpActor(ctx));
 
         const session = await storage.getSessionByTaskId(task.id);
         const newStatus = session ? 'blocked' : 'backlog';
-        await storage.updateTaskStatus(task.id, newStatus, MCP_ACTOR);
+        await storage.updateTaskStatus(task.id, newStatus, mcpActor(ctx));
 
         if (session) {
           await storage.resetSession(session.id);
@@ -2906,6 +3709,21 @@ export const redoTool: McpTool = {
 
 export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    // INVARIANT: lazy_redo is NOT available to agents. Redo abandons a task and
+    // creates a replacement parented at the SAME parent as the original — so
+    // redoing the agent's own task would manufacture a replacement under the
+    // agent's parent (outside its subtree). There is no parameter by which the
+    // agent constrains the replacement's parent, so (like lazy_reparent /
+    // lazy_clone) it stays a builder/human tool. To restart a subtask's work,
+    // an agent can lazy_close it and lazy_create a fresh one.
+    if (ctx.taskId) {
+      throw new Error(
+        'Agents cannot redo tasks. Redo creates a replacement task parented ' +
+        'outside your subtree. To restart, close the subtask and lazy_create a ' +
+        'new one under your own task instead.',
+      );
+    }
+
     const taskIdInput = args.task_id as string;
     const promptOverride = args.prompt as string | undefined;
     const model = args.model as string | undefined;
@@ -3027,9 +3845,12 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskId = args.task_id as string;
 
+    // INVARIANT: an agent may only sync its own task or a direct subtask.
+    await gateAgentTarget(ctx, taskId, 'sync');
+
     const params: SyncTaskParams = {
       taskId,
-      actor: MCP_ACTOR, // MCP boundary → 'builder'
+      actor: mcpActor(ctx), // MCP boundary → 'builder' (project-wide) or 'agent' (task-scoped)
     };
 
     const result = await querySyncTask(params);
@@ -3078,6 +3899,18 @@ export const reparentTool: McpTool = {
 
 export function createReparentHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
+    // INVARIANT: Agents may NOT reparent any task. Reparenting can move a task
+    // out from under (or onto) any parent, which would let an agent escape the
+    // "subtasks of my own task only" boundary that lazy_create / lazy_start
+    // enforce. A non-empty ctx.taskId means an agent is the caller — reject.
+    // Reparent stays a builder/human operation (ctx.taskId === '').
+    if (ctx.taskId) {
+      throw new Error(
+        'Agents cannot reparent tasks. Reparenting is a builder/human operation. ' +
+        'Agents may only create and start subtasks of their own task.',
+      );
+    }
+
     const taskId = args.task_id as string;
     const parent = args.parent as string;
 
@@ -3101,6 +3934,63 @@ export function createReparentHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_prioritize
+// ---------------------------------------------------------------------------
+
+export const prioritizeTool: McpTool = {
+  name: 'lazy_prioritize',
+  description:
+    "Set a task's queue priority. When the concurrency cap is hit, new starts " +
+    'queue; as agent slots free up the daemon launches the highest-priority ' +
+    'queued task first (ties break FIFO — oldest queued first). This is a ' +
+    'durable task edit, not a scheduler. Terminal tasks cannot be edited.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: {
+        type: 'string',
+        description: 'Task ID (short hex prefix or task code)',
+        minLength: 1,
+      },
+      priority: {
+        type: 'string',
+        description: 'Queue priority',
+        enum: ['low', 'normal', 'high', 'urgent'],
+      },
+    },
+    required: ['task_id', 'priority'],
+  },
+};
+
+export function createPrioritizeHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = args.task_id as string;
+    const priority = args.priority as string;
+
+    if (!VALID_TASK_PRIORITIES.includes(priority as TaskPriority)) {
+      throw new Error(`Invalid priority '${priority}'. Must be one of: ${VALID_TASK_PRIORITIES.join(', ')}`);
+    }
+
+    const storage = await getStorage(ctx);
+    try {
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+      await storage.updateTaskPriority(resolved.task.id, priority);
+      const label = resolved.task.code ?? shortId(resolved.task.id);
+      return {
+        output: `${label} priority set to ${priority}.`,
+        taskId: shortId(resolved.task.id),
+        priority,
+      };
+    } finally {
+      await storage.close();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Registration helper
 // ---------------------------------------------------------------------------
 
@@ -3112,8 +4002,11 @@ export const allTools: McpTool[] = [
   showTool,
   createTool,
   commentTool,
+  tagTool,
+  untagTool,
   journalTool,
-  proposeTool,
+  memorySaveTool,
+  memoryRecallTool,
   addFollowUpTool,
   commitTool,
   statusTool,
@@ -3140,19 +4033,89 @@ export const allTools: McpTool[] = [
   redoTool,
   syncTool,
   reparentTool,
+  prioritizeTool,
 ];
 
 /**
+ * Free-text MCP arguments that get rendered into an agent prompt or shown to a
+ * human as prose. These are annotated when sanitized, so the substitution is
+ * visible rather than a silent rewrite of what the caller wrote.
+ */
+const ANNOTATED_TEXT_ARGS = new Set([
+  'feedback', 'message', 'prompt', 'note', 'reason', 'question', 'goal_context',
+]);
+
+/**
+ * INTAKE BOUNDARY for every MCP tool call.
+ *
+ * MCP travels as JSON, and a JSON `\u0000` escape decodes to a real NUL. Any NUL that
+ * reaches a prompt ends up as argv[2] of `claude -p`, where it kills the spawn
+ * instantly — crash-looping the turn and (because auto-resume restarts with a
+ * generic prompt) silently losing the feedback. Escape at the door instead.
+ *
+ * Sanitize-and-deliver, never reject: rejecting here would throw away a
+ * builder's feedback at the moment it was written. See
+ * src/utils/sanitize-text.ts for the full rationale.
+ *
+ * Applied to every handler uniformly so a newly added tool is covered by
+ * default rather than by remembering to opt in.
+ *
+ * Nested values are covered too: several tools take string arrays (`files`,
+ * `approved_files`) whose elements become git argv, so a NUL inside an array
+ * element is just as fatal as one at the top level. Nested strings are never
+ * annotated — they are identifiers and paths, not prose, and appending a
+ * paragraph of explanation to a file path would corrupt it.
+ */
+function sanitizeNested(value: unknown): unknown {
+  if (typeof value === 'string') return sanitizeUserText(value, { annotate: false });
+  if (Array.isArray(value)) return value.map(sanitizeNested);
+  // Plain objects only — leave class instances and null alone rather than
+  // reconstructing something we don't understand.
+  if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    const nested: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) nested[k] = sanitizeNested(v);
+    return nested;
+  }
+  return value;
+}
+
+function sanitizeMcpArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    out[key] = typeof value === 'string'
+      ? sanitizeUserText(value, { annotate: ANNOTATED_TEXT_ARGS.has(key) })
+      : sanitizeNested(value);
+  }
+  return out;
+}
+
+/** Wrap a handler so its arguments are sanitized before it ever runs. */
+function withSanitizedArgs(handler: McpToolHandler): McpToolHandler {
+  return (args: Record<string, unknown>) => handler(sanitizeMcpArgs(args ?? {}));
+}
+
+/**
  * Create all tool handlers with the given context.
+ *
+ * Every handler is wrapped with `withSanitizedArgs` — see `sanitizeMcpArgs`.
  */
 export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandler> {
-  const handlers = new Map<string, McpToolHandler>();
+  const raw = new Map<string, McpToolHandler>();
+  const handlers = {
+    set(name: string, handler: McpToolHandler) {
+      raw.set(name, withSanitizedArgs(handler));
+      return this;
+    },
+  };
   handlers.set('lazy_search', createSearchHandler(ctx));
   handlers.set('lazy_show', createShowHandler(ctx));
   handlers.set('lazy_create', createCreateHandler(ctx));
   handlers.set('lazy_comment', createCommentHandler(ctx));
+  handlers.set('lazy_tag', createTagHandler(ctx));
+  handlers.set('lazy_untag', createUntagHandler(ctx));
   handlers.set('lazy_journal', createJournalHandler(ctx));
-  handlers.set('lazy_propose', createProposeHandler(ctx));
+  handlers.set('lazy_memory_save', createMemorySaveHandler(ctx));
+  handlers.set('lazy_memory_recall', createMemoryRecallHandler(ctx));
   handlers.set('lazy_add_followup', createAddFollowUpHandler(ctx));
   handlers.set('lazy_commit', createCommitHandler(ctx));
   handlers.set('lazy_status', createStatusHandler(ctx));
@@ -3179,5 +4142,12 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_redo', createRedoHandler(ctx));
   handlers.set('lazy_sync', createSyncHandler(ctx));
   handlers.set('lazy_reparent', createReparentHandler(ctx));
-  return handlers;
+  handlers.set('lazy_prioritize', createPrioritizeHandler(ctx));
+  // INVARIANT: lazy_internal_git is registered here but deliberately absent
+  // from `allTools` — it must never be advertised to, or pre-approved for, an
+  // agent. It exists so the SUPERVISOR can ask the daemon to perform the few
+  // ref-writing git operations its sync phase needs, now that the container
+  // mounts the git common dir read-only. See src/mcp/internal-git.ts.
+  handlers.set(INTERNAL_GIT_TOOL_NAME, createInternalGitHandler(ctx));
+  return raw;
 }

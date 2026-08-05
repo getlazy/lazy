@@ -9,6 +9,7 @@
 
 import type { SupervisorStatus } from '../protocol/types';
 import { elapsedFrom } from '../utils/elapsed';
+import { formatRetrySummary } from '../utils/retry-summary';
 
 export function renderStatusHeader(
   status: SupervisorStatus | null,
@@ -22,6 +23,15 @@ export function renderStatusHeader(
   const phaseElapsed = elapsedFrom(phaseStart, now);
 
   let header = `Supervisor: phase=${status.phase}`;
+
+  // A retrying phase without the attempt count and the error reads as "stuck,
+  // cause unknown" — the watch header repeats it every 5s while the human
+  // learns nothing. Say what is being retried and why, on the same line.
+  const retry = status.phase === 'retrying' ? formatRetrySummary(status) : null;
+  if (retry) {
+    header += ` ${retry}`;
+  }
+
   if (phaseElapsed !== null) {
     header += ` (${phaseElapsed})`;
   }

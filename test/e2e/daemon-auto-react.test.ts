@@ -236,9 +236,13 @@ describe('auto-react budget integration', () => {
       daemon: { ...DEFAULT_CONFIG.daemon, auto_react_daily_budget: 2 },
     };
 
-    // Exhaust the daily budget
-    incrementDailyBudget(tempDir);
-    incrementDailyBudget(tempDir);
+    // Exhaust the daily budget. `incrementDailyBudget` is async (it reads and
+    // rewrites the budget file with fs/promises) — un-awaited, both writes were
+    // still in flight when the gate below read the file, so it saw 0 used and
+    // allowed the turn. Awaited sequentially so the read-modify-write of the
+    // second increment sees the first.
+    await incrementDailyBudget(tempDir);
+    await incrementDailyBudget(tempDir);
 
     const metadata = new Map<string, string>();
     const mockStorage = {

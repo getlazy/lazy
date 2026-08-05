@@ -16,6 +16,8 @@
  * For example, "task manager" parses as "task AND manager".
  */
 
+import { normalizeTag } from '../utils/tags';
+
 // ─── AST Types ───────────────────────────────────────────
 
 export type QueryNode =
@@ -45,17 +47,17 @@ export interface NotNode {
   operand: QueryNode;
 }
 
-/** Field match: status:working, goal:"some text", code:fix-reconciler */
+/** Field match: status:working, goal:"some text", code:fix-reconciler, tag:onboarding */
 export interface FieldNode {
   type: 'field';
-  field: 'status' | 'goal' | 'code';
+  field: 'status' | 'goal' | 'code' | 'tag';
   value: string;
 }
 
-/** Scoped search: in:turns "reconciler", in:commits "wip", in:conversations "design" */
+/** Scoped search: in:turns "reconciler", in:commits "wip", in:memories "credentials" */
 export interface InNode {
   type: 'in';
-  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations';
+  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations' | 'memories';
   value: string;
 }
 
@@ -318,6 +320,21 @@ export function parseQuery(input: string): QueryNode {
   function parseFieldOrText(word: string, pos: number): QueryNode {
     const colonIdx = word.indexOf(':');
     if (colonIdx === -1) {
+      // A leading '#' is how lazy PRINTS tags ("Tagged probe with #onboarding",
+      // "Tags: #onboarding"), so a user who copies that spelling back into
+      // search must find the tagged task. Match the tag OR the literal text
+      // rather than replacing text search: '#1234' issue refs in commit
+      // messages must keep matching, so this stays a strict superset.
+      if (word.startsWith('#')) {
+        const tag = normalizeTag(word);
+        if (tag) {
+          return {
+            type: 'or',
+            left: { type: 'field', field: 'tag', value: tag },
+            right: { type: 'text', value: word },
+          };
+        }
+      }
       return { type: 'text', value: word };
     }
 
@@ -348,12 +365,34 @@ export function parseQuery(input: string): QueryNode {
       return { type: 'field', field: 'code', value: value.toLowerCase() };
     }
 
+    // tag:value — normalized the same way tags are stored (see normalizeTag)
+    if (field === 'tag') {
+      if (!value) {
+        throw new QueryParseError('tag: requires a value', pos);
+      }
+      const normalized = normalizeTag(value);
+      // The write side (normalizeTagOrThrow) rejects a tag that normalizes to
+      // nothing with an actionable error; the query side must not silently
+      // return zero matches for the same input.
+      if (!normalized) {
+        throw new QueryParseError(
+          `tag:${value} is not a valid tag — a tag must contain at least one letter ` +
+          `or digit (tags are normalized to lowercase alphanumerics and hyphens)`,
+          pos
+        );
+      }
+      return { type: 'field', field: 'tag', value: normalized };
+    }
+
     // in:scope — the next token is the search text
     if (field === 'in') {
       const scope = value.toLowerCase();
-      if (scope !== 'turns' && scope !== 'commits' && scope !== 'comments' && scope !== 'followups' && scope !== 'conversations') {
+      if (
+        scope !== 'turns' && scope !== 'commits' && scope !== 'comments' &&
+        scope !== 'followups' && scope !== 'conversations' && scope !== 'memories'
+      ) {
         throw new QueryParseError(
-          `in: scope must be "turns", "commits", "comments", "followups", or "conversations" (got "${value}")`,
+          `in: scope must be "turns", "commits", "comments", "followups", "conversations", or "memories" (got "${value}")`,
           pos
         );
       }
@@ -440,7 +479,13 @@ export function isStructuredQuery(input: string): boolean {
   if (/\bNOT\b/.test(input)) return true;
 
   // Check for field syntax
-  if (/\b(status|goal|code|in|has|created|updated):/.test(input)) return true;
+  if (/\b(status|goal|code|tag|in|has|created|updated):/.test(input)) return true;
+
+  // A bare '#name' token is the tag spelling lazy prints, and parseFieldOrText
+  // turns it into (tag:name OR text:"#name"). That only takes effect on the
+  // structured path, so route it there — the regex path would search for the
+  // literal text alone and never match the tag.
+  if (/(^|\s)#\S/.test(input)) return true;
 
   return false;
 }

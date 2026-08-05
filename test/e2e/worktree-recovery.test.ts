@@ -1,65 +1,65 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'fs';
+import { existsSync, writeFileSync, rmSync } from 'fs';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, fullTaskId, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import {
+  readSessionJson,
+  readTaskJson,
+  setTaskStatus as storeTaskStatus,
+  worktreePathFor,
+  writeSessionJson,
+  writeTaskJson,
+} from '../helpers/storage';
 
 // ============================================================
 // Helpers
 // ============================================================
 
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const match = entries.find((e: string) => e.startsWith(shortId));
-  if (!match) {
-    throw new Error(`Could not find full task ID for short ID: ${shortId}`);
-  }
-  return match;
-}
+/**
+ * Force a task into `status` and age its session so resume treats it as stale.
+ * Storage lives at the project's `external_path`, so path resolution goes
+ * through test/helpers/storage.ts rather than a hardcoded <root>/.lazy/tasks.
+ */
+function setTaskStatus(root: string, shortId: string, status: string): void {
+  storeTaskStatus(root, shortId, status);
 
-function setTaskStatus(root: string, fullTaskId: string, status: string): void {
-  const taskPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
-  const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
-  task.status = status;
-  writeFileSync(taskPath, JSON.stringify(task, null, 2));
-
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
-  if (existsSync(sessionPath)) {
-    const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
+  const session = readSessionJson(root, shortId);
+  if (session) {
     session.last_interaction_at = Date.now() - 60000;
-    writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+    writeSessionJson(root, shortId, session);
   }
 }
 
 function setTaskPrompt(root: string, shortId: string, prompt: string): void {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const dirs = readdirSync(tasksDir);
-  const taskDir = dirs.find(d => d.startsWith(shortId));
-  if (!taskDir) {
-    throw new Error(`No task directory found for short ID ${shortId} in ${tasksDir}`);
-  }
-  const taskJsonPath = join(tasksDir, taskDir, 'task.json');
-  const task = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
+  const task = readTaskJson(root, shortId);
   task.prompt = prompt;
-  writeFileSync(taskJsonPath, JSON.stringify(task, null, 2));
+  writeTaskJson(root, shortId, task);
 }
 
-/** Extract a task short ID from `lazy link` output */
-function extractLinkedTaskId(output: string): string {
-  const match = output.match(/Linked task ([a-f0-9]{8})/);
+/**
+ * Extract a linked task's display name from `lazy link` output.
+ *
+ * `lazy link` derives a task *code* from the PR branch (`feature/x` →
+ * `feature-x`) and prints/addresses the task by that code, not by a hex short
+ * id. The worktree directory is named by `taskRef()` (metadata.task_ref, which
+ * link does not set → the short UUID), so the two are NOT interchangeable:
+ * pass the code to the CLI and the short id to storage/worktree helpers.
+ */
+function extractLinkedTaskCode(output: string): string {
+  const match = output.match(/Linked task (\S+)/);
   if (!match) {
-    throw new Error(`Could not extract linked task ID from output: ${output}`);
+    throw new Error(`Could not extract linked task code from output: ${output}`);
   }
   return match[1];
 }
 
 /** Delete a worktree directory without going through git (simulates external cleanup) */
 function deleteWorktreeManually(root: string, shortId: string): void {
-  const worktreePath = join(root, '.lazy', 'worktrees', shortId);
+  const worktreePath = worktreePathFor(root, shortId);
   if (existsSync(worktreePath)) {
     rmSync(worktreePath, { recursive: true, force: true });
   }
@@ -102,7 +102,7 @@ async function linkTask(
     throw new Error(`lazy link failed: ${result.stderr}\n${result.stdout}`);
   }
 
-  return extractLinkedTaskId(result.stdout);
+  return extractLinkedTaskCode(result.stdout);
 }
 
 // ============================================================
@@ -122,12 +122,13 @@ describe('worktree recovery - start', () => {
 
   test('linked task recovers missing worktree from existing branch', async () => {
     const branch = 'feature/recover-linked';
-    const taskId = await linkTask(ctx, branch, 'Recover linked PR');
+    const taskCode = await linkTask(ctx, branch, 'Recover linked PR');
+    const taskId = (await fullTaskId(ctx, taskCode)).slice(0, 8);
 
     setTaskPrompt(ctx.root, taskId, 'Do some work on the linked PR');
 
     // Verify worktree exists after link
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
     expect(existsSync(worktreePath)).toBe(true);
 
     // Delete the worktree manually (simulates external cleanup)
@@ -143,7 +144,7 @@ describe('worktree recovery - start', () => {
     });
 
     const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes'],
+      ['start', taskCode, '--yes'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
     );
@@ -156,7 +157,8 @@ describe('worktree recovery - start', () => {
 
   test('linked task fails when branch is also gone', async () => {
     const branch = 'feature/gone-branch';
-    const taskId = await linkTask(ctx, branch, 'Gone branch PR');
+    const taskCode = await linkTask(ctx, branch, 'Gone branch PR');
+    const taskId = (await fullTaskId(ctx, taskCode)).slice(0, 8);
 
     setTaskPrompt(ctx.root, taskId, 'Do some work');
 
@@ -172,7 +174,7 @@ describe('worktree recovery - start', () => {
     });
 
     const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes'],
+      ['start', taskCode, '--yes'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
     );
@@ -185,18 +187,9 @@ describe('worktree recovery - start', () => {
   test('regular task recovers missing worktree from existing branch', async () => {
     const taskId = await createTask(ctx, 'Recover regular task', 'Do the work');
 
-    // Start the task first to create the worktree and session
-    const startResult = await ctx.lazyMocked(
-      ['start', taskId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(startResult);
-
-    // Reconcile to blocked, then set to a restartable state
-    await ctx.lazy(['list']);
-
-    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // Start the task first to create the worktree and session, and drive the
+    // reconcile pass that moves it out of `working` (daemonless suite).
+    await startAndReconcile(ctx, taskId);
 
     // The branch `lazy/<taskId>` should exist
     const branchCheck = ctx.git('rev-parse', '--verify', `lazy/${taskId}`);
@@ -204,7 +197,7 @@ describe('worktree recovery - start', () => {
 
     // Delete the worktree manually
     deleteWorktreeManually(ctx.root, taskId);
-    expect(existsSync(join(ctx.root, '.lazy', 'worktrees', taskId))).toBe(false);
+    expect(existsSync(worktreePathFor(ctx.root, taskId))).toBe(false);
 
     // Since the task already has a session, starting it again should try recovery.
     // But regular tasks with ended sessions get a "session has ended" error.
@@ -232,22 +225,16 @@ describe('worktree recovery - resume', () => {
   test('resume recovers missing worktree from existing branch', async () => {
     const taskId = await createTask(ctx, 'Resume recovery test', 'Do work');
 
-    // Start the task to create worktree and session
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Reconcile to blocked
-    await ctx.lazy(['list']);
-
-    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // Start the task to create worktree and session, then drive the reconcile
+    // pass that moves it out of `working` (daemonless suite).
+    await startAndReconcile(ctx, taskId);
 
     // Set task to interrupted (so resume will accept it)
-    setTaskStatus(ctx.root, fullTaskId, 'interrupted');
+    setTaskStatus(ctx.root, taskId, 'interrupted');
 
     // Delete the worktree manually
     deleteWorktreeManually(ctx.root, taskId);
-    expect(existsSync(join(ctx.root, '.lazy', 'worktrees', taskId))).toBe(false);
+    expect(existsSync(worktreePathFor(ctx.root, taskId))).toBe(false);
 
     // The branch should still exist
     const branchCheck = ctx.git('rev-parse', '--verify', `lazy/${taskId}`);
@@ -265,18 +252,12 @@ describe('worktree recovery - resume', () => {
   test('resume fails when branch is gone', async () => {
     const taskId = await createTask(ctx, 'Resume no branch test', 'Do work');
 
-    // Start the task
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Reconcile to blocked
-    await ctx.lazy(['list']);
-
-    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // Start the task, then drive the reconcile pass that moves it out of
+    // `working` (daemonless suite).
+    await startAndReconcile(ctx, taskId);
 
     // Set task to interrupted
-    setTaskStatus(ctx.root, fullTaskId, 'interrupted');
+    setTaskStatus(ctx.root, taskId, 'interrupted');
 
     // Delete both worktree and branch
     deleteWorktreeManually(ctx.root, taskId);
@@ -285,25 +266,20 @@ describe('worktree recovery - resume', () => {
     const result = await ctx.lazyMocked(['resume', taskId], MOCK_CLAUDE_SUCCESS);
 
     expectFailure(result);
-    expectError(result, 'no longer exists');
-    expectError(result, 'Cannot recover worktree');
+    // Resume recovery searches the remote too, so the failure names both places.
+    expectError(result, 'Worktree is gone');
+    expectError(result, `branch 'lazy/${taskId}' not found locally or on remote`);
   });
 
   test('resume reports dirty state after worktree recovery', async () => {
     const taskId = await createTask(ctx, 'Dirty resume test', 'Do work');
 
-    // Start the task
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Reconcile to blocked
-    await ctx.lazy(['list']);
-
-    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // Start the task, then drive the reconcile pass that moves it out of
+    // `working` (daemonless suite).
+    await startAndReconcile(ctx, taskId);
 
     // Create uncommitted changes in the worktree BEFORE deleting it
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const worktreePath = worktreePathFor(ctx.root, taskId);
     writeFileSync(join(worktreePath, 'dirty-file.txt'), 'uncommitted content');
     // Stage and commit so the branch has this file
     Bun.spawnSync(['git', 'add', 'dirty-file.txt'], { cwd: worktreePath });
@@ -315,7 +291,7 @@ describe('worktree recovery - resume', () => {
     // So the dirty state test is about what's already committed but with a dirty tree.
 
     // Set task to interrupted
-    setTaskStatus(ctx.root, fullTaskId, 'interrupted');
+    setTaskStatus(ctx.root, taskId, 'interrupted');
 
     // Delete the worktree
     deleteWorktreeManually(ctx.root, taskId);

@@ -1,18 +1,19 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS, startAndReconcile } from '../helpers/fixtures';
 
 /**
- * Helper: create a task, start it (so it becomes blocked with a session),
- * and return the short task ID.
+ * Helper: create a task, start it, and drive the reconcile pass that lands it
+ * in `blocked` with a session — the state `unblock` requires.
+ *
+ * The reconcile is not optional: this suite is daemonless, so nothing else
+ * moves the task out of `working`, and `unblock` refuses at the status gate
+ * ("Task X is still working").
  */
 async function createBlockedTask(ctx: TestContext, goal: string): Promise<string> {
   const taskId = await createTask(ctx, goal, 'Do work');
-  const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-    env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-  });
-  expectSuccess(startResult);
+  await startAndReconcile(ctx, taskId);
   return taskId;
 }
 

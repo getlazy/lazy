@@ -16,6 +16,7 @@ import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
 import { latestWorkAgentTurn } from '../../utils/turns';
+import { turnText } from '../../utils/turn-content';
 
 /**
  * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
@@ -109,6 +110,16 @@ export async function commandRedo(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // Validate: redo closes the old task and reruns it. A task that is already
+    // closed has nothing to close, and reopening is the operation the user
+    // actually wants. Without this guard redo ran on and failed further down
+    // with an unrelated message (e.g. "has no prompt").
+    if (oldTask.status === 'abandoned') {
+      console.error(`Task ${displayId(oldTask)} is already closed. Nothing to redo.`);
+      console.error(`To work on it again: lazy reopen ${displayId(oldTask)}`);
+      process.exit(1);
+    }
+
     // Check worktree for uncommitted changes
     const worktreePath = getWorktreePath(root, oldTask);
     if (existsSync(worktreePath) && (await hasUncommittedChanges(worktreePath))) {
@@ -130,9 +141,10 @@ export async function commandRedo(args: string[]): Promise<void> {
       const lastAgentTurn = latestWorkAgentTurn(turns);
       if (lastAgentTurn) {
         // Truncate to a reasonable size for context injection
-        const summary = lastAgentTurn.content.length > 4000
-          ? lastAgentTurn.content.substring(0, 4000) + '\n... (truncated)'
-          : lastAgentTurn.content;
+        const lastAgentText = turnText(lastAgentTurn);
+        const summary = lastAgentText.length > 4000
+          ? lastAgentText.substring(0, 4000) + '\n... (truncated)'
+          : lastAgentText;
         redoContext += `\n## Previous Attempt Context\n\nThis task is a redo of a previous attempt (${shortId(oldTask.id)}). The previous agent's last response:\n\n${summary}\n`;
       }
 
@@ -193,8 +205,12 @@ export async function commandRedo(args: string[]): Promise<void> {
     // Set redo_of metadata to link back to old task
     await storage.updateTaskMetadata(newTask.id, 'redo_of', oldTask.id);
 
-    // --- Now abandon old task (single call, with correct reason) ---
-    console.log(`Abandoning task ${theme.taskId(displayId(oldTask))}...`);
+    // --- Now close the old task (single call, with correct reason) ---
+    // "Closing" is the user-facing verb since `lazy abandon` was removed in
+    // favour of `lazy close`; the underlying terminal status is still
+    // 'abandoned'. Saying "Abandoning" here names a command that no longer
+    // exists.
+    console.log(`Closing task ${theme.taskId(displayId(oldTask))}...`);
 
     await storage.abandonTask(oldTask.id, `Redone as ${displayId(newTask)}`, getActor());
 

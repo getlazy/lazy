@@ -49,6 +49,18 @@ describe('deriveWorkingSubstate', () => {
     expect(s).toEqual({ kind: 'agent', answering: true });
   });
 
+  // INVARIANT: the accept path's pre-accept turn is its own substate. The task
+  // is genuinely `working` for the whole turn, and a bare `working` there is
+  // indistinguishable from a human having unblocked the task by hand — which is
+  // exactly the ambiguity accept observability exists to remove.
+  test('alive + work phase with command_type=pre_accept → agent:pre-accept', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, command_type: 'pre_accept' },
+      { isAlive: true, hasResponse: false },
+    );
+    expect(s).toEqual({ kind: 'agent', preAccept: true });
+  });
+
   // non-ask command_type during agent phases stays plain agent.
   test('alive + work phase with command_type=start → agent (not answering)', () => {
     const s = deriveWorkingSubstate(
@@ -77,6 +89,41 @@ describe('deriveWorkingSubstate', () => {
       currentCommand: 'cargo build',
       currentCommandStartedAt: '2026-05-17T10:01:00.000Z',
     });
+  });
+
+  // Retry fields from status.json must reach the substate so list/active/MCP can
+  // render them — the derivation is the only path those surfaces have.
+  test('alive + retrying phase carries the retry fields onto the substate', () => {
+    const s = deriveWorkingSubstate(
+      {
+        ...baseStatus,
+        phase: 'retrying',
+        retryCount: 4,
+        retry_failure_class: 'transient_network',
+        errors: [
+          {
+            message: 'socket hang up',
+            count: 4,
+            firstSeen: '2026-05-17T10:00:00.000Z',
+            lastSeen: '2026-05-17T10:02:00.000Z',
+          },
+        ],
+      },
+      { isAlive: true, hasResponse: false },
+    );
+    expect(s).toMatchObject({
+      kind: 'harness',
+      phase: 'retrying',
+      retry: { retryCount: 4, retry_failure_class: 'transient_network' },
+    });
+  });
+
+  test('non-retrying harness phases carry no retry payload', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, phase: 'post_turn_check', retryCount: 3 },
+      { isAlive: true, hasResponse: false },
+    );
+    expect((s as { retry?: unknown }).retry).toBeUndefined();
   });
 
   test('harness phaseStartedAt falls back to updated_at then started_at', () => {
@@ -125,6 +172,10 @@ describe('formatWorkingSubstate', () => {
     expect(formatWorkingSubstate({ kind: 'agent', answering: true }, now)).toBe('agent:answering');
   });
 
+  test('agent:pre-accept', () => {
+    expect(formatWorkingSubstate({ kind: 'agent', preAccept: true }, now)).toBe('agent:pre-accept');
+  });
+
   test('not-alive', () => {
     expect(formatWorkingSubstate({ kind: 'not-alive' }, now)).toBe('not-alive');
   });
@@ -150,6 +201,42 @@ describe('formatWorkingSubstate', () => {
         now,
       ),
     ).toBe('harness:post_turn_check cargo build (3m00s)');
+  });
+
+  // INVARIANT: a retrying task must say WHAT it is retrying. `harness:retrying`
+  // on its own is indistinguishable from any other stuck harness phase.
+  test('harness:retrying carries attempt, class, and latest error', () => {
+    expect(
+      formatWorkingSubstate(
+        {
+          kind: 'harness',
+          phase: 'retrying',
+          phaseStartedAt: '2026-05-17T10:00:00.000Z',
+          retry: {
+            retryCount: 7,
+            retry_failure_class: 'transient_overload',
+            errors: [
+              {
+                message: 'API Error: 529 overloaded',
+                count: 7,
+                firstSeen: '2026-05-17T10:00:00.000Z',
+                lastSeen: '2026-05-17T10:02:00.000Z',
+              },
+            ],
+          },
+        },
+        now,
+      ),
+    ).toBe('harness:retrying attempt 7 (transient_overload): API Error: 529 overloaded (3m00s)');
+  });
+
+  test('harness:retrying without retry details degrades to the bare phase', () => {
+    expect(
+      formatWorkingSubstate(
+        { kind: 'harness', phase: 'retrying', phaseStartedAt: '2026-05-17T10:00:00.000Z' },
+        now,
+      ),
+    ).toBe('harness:retrying (3m00s)');
   });
 
   test('harness without a parseable timestamp omits elapsed', () => {

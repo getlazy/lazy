@@ -1,4 +1,4 @@
-import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef } from '../helpers';
+import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef, resolveTaskOrExit } from '../helpers';
 import type { Task, Session, Storage } from '../../storage';
 
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
@@ -6,8 +6,10 @@ import { createRunner } from '../../runner';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
-import { parentTaskIdOf } from '../../task-target';
+import { parentTaskIdOf, collectSubtreeIds } from '../../task-target';
+import { normalizeTag } from '../../utils/tags';
 import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
+import { orderQueuedTasks } from '../../daemon/concurrency';
 
 export interface TaskWithSession {
   task: Task;
@@ -22,11 +24,26 @@ export interface TaskWithSession {
    * non-working tasks or when no substate can be derived.
    */
   workingSubstate?: WorkingSubstate;
+  /**
+   * 1-based drain position for a `queued` task (highest priority / oldest first),
+   * with the total queued count. Undefined for non-queued tasks. Computed against
+   * ALL queued tasks in the project, so it is correct in any filtered view.
+   */
+  queuePosition?: { position: number; total: number };
 }
 
 export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: string): Promise<TaskWithSession[]> {
   const runner = await createRunner(lazyRoot);
   const taskMap = new Map<string, TaskWithSession>();
+
+  // Drain-order positions for queued tasks, computed once against ALL queued
+  // tasks in the project (not just this view) so "#N of M" is globally correct.
+  const queuePos = new Map<string, { position: number; total: number }>();
+  if (tasks.some(t => t.status === 'queued')) {
+    const allQueued = await storage.listTasksWithOptions({ queuedOnly: true });
+    const ordered = orderQueuedTasks(allQueued);
+    ordered.forEach((t, i) => queuePos.set(t.id, { position: i + 1, total: ordered.length }));
+  }
 
   // Create nodes for all tasks
   for (const task of tasks) {
@@ -71,6 +88,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
       retryCount,
       crashed,
       workingSubstate,
+      queuePosition: task.status === 'queued' ? queuePos.get(task.id) : undefined,
     });
   }
 
@@ -154,8 +172,23 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = renderWorkingStatus(node.workingSubstate);
   }
 
-  // Add retry count to status if retrying
-  if (node.retryCount !== undefined && node.retryCount > 0) {
+  // Queued tasks: show drain position ("queued #2 of 3") and priority so a
+  // glance at list/active reveals which tasks are waiting and in what order.
+  if (task.status === 'queued') {
+    if (node.queuePosition) {
+      status = `queued #${node.queuePosition.position} of ${node.queuePosition.total}`;
+    }
+    if (task.priority !== 'normal') {
+      status = `${status} (${task.priority})`;
+    }
+  }
+
+  // Add retry count to status if retrying — unless the substate label already
+  // carries it (working(harness:retrying attempt N: ...)), which would otherwise
+  // print the same number twice on one line.
+  const substateHasRetry =
+    node.workingSubstate?.kind === 'harness' && node.workingSubstate.phase === 'retrying';
+  if (node.retryCount !== undefined && node.retryCount > 0 && !substateHasRetry) {
     status = `${status} (retry ${node.retryCount})`;
   }
 
@@ -199,6 +232,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   const goal = task.goal.length > 30
     ? task.goal.substring(0, 28) + '..'
     : task.goal;
+  const goalWithTags = `${goal}${tagSuffix(task)}`;
 
   const codeWithPrefix = `${prefix}${connector}${code}`;
   const fitsOnOneLine = codeWithPrefix.length <= 20;
@@ -206,7 +240,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   if (fitsOnOneLine) {
     // Code fits in CODE column — single line
     console.log(
-      `${prefix}${connector}${theme.pad(theme.taskId(code), 20 - prefix.length - connector.length)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goal}`
+      `${prefix}${connector}${theme.pad(theme.taskId(code), 20 - prefix.length - connector.length)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goalWithTags}`
     );
   } else {
     // Code too wide — code on first line, data on second
@@ -214,7 +248,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     const dataPrefix = prefix + childPrefix;
     const dataPad = Math.max(0, 20 - dataPrefix.length);
     console.log(
-      `${dataPrefix}${' '.repeat(dataPad)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goal}`
+      `${dataPrefix}${' '.repeat(dataPad)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goalWithTags}`
     );
   }
 
@@ -233,17 +267,51 @@ export async function commandList(args: string[]): Promise<void> {
     { name: 'flat', takesValue: false },
     { name: 'tree', takesValue: false },
     { name: 'ids-only', takesValue: false },
+    { name: 'tag', takesValue: true },
   ], 'list');
 
   const idsOnly = parsed.flags.get('ids-only') === true;
   const showAll = parsed.flags.get('all') === true;
-  const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  let showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  const tagFilter = normalizeFilterTag(parsed.flags.get('tag') as string | undefined);
 
-  const { tree } = await queryTaskList({
+  let { tree } = await queryTaskList({
     all: showAll,
     taskFilter: parsed.positional[0] || undefined,
   });
+
+  // A tag filter selects tasks across the hierarchy, so it renders as a flat
+  // list of matches (a partial tree would be misleading).
+  if (tagFilter) {
+    tree = filterTreeByTag(tree, tagFilter);
+    showTree = false;
+  }
+
   renderListOutput(tree, { idsOnly, showTree, showAll });
+}
+
+/** Normalize a --tag filter value; returns undefined when no filter was given. */
+function normalizeFilterTag(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const normalized = normalizeTag(raw);
+  return normalized || undefined;
+}
+
+/**
+ * Flatten a task tree and keep only tasks carrying `tag`, each returned as a
+ * flat (childless) node. Used by `--tag` filtering in list/blocked so the
+ * result is an unambiguous set of matches rather than a pruned hierarchy.
+ */
+function filterTreeByTag(tree: TaskWithSession[], tag: string): TaskWithSession[] {
+  return flattenTree(tree)
+    .filter(node => node.task.tags?.includes(tag))
+    .map(node => ({ ...node, children: [] }));
+}
+
+/** Render a task's tags as a " #a #b" suffix (empty string when untagged). */
+function tagSuffix(task: Task): string {
+  if (!task.tags || task.tags.length === 0) return '';
+  return ' ' + task.tags.map(t => theme.tag('#' + t)).join(' ');
 }
 
 /** Shared rendering for list command — used by both daemon and direct paths. */
@@ -289,7 +357,7 @@ function renderListOutput(
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
       );
     }
   }
@@ -305,6 +373,11 @@ function flatStatusText(node: TaskWithSession): string {
   if (node.task.status === 'working' && node.workingSubstate) {
     return renderWorkingStatus(node.workingSubstate);
   }
+  // Queued: drain position + non-default priority, matching the tree view.
+  if (node.task.status === 'queued' && node.queuePosition) {
+    const base = `queued #${node.queuePosition.position}/${node.queuePosition.total}`;
+    return node.task.priority !== 'normal' ? `${base} (${node.task.priority})` : base;
+  }
   return node.task.status;
 }
 
@@ -316,6 +389,22 @@ function flattenTree(nodes: TaskWithSession[]): TaskWithSession[] {
     result.push(...flattenTree(node.children));
   }
   return result;
+}
+
+/**
+ * The task set the `active` views show: non-terminal tasks with a session, plus
+ * queued tasks. Queued tasks have no session yet (they were gated before session
+ * creation), so `withSessionsOnly` misses them — but they ARE in flight and
+ * belong in the active view so a queued backlog is diagnosable.
+ *
+ * Shared by the daemon `active` RPC handler and the CLI's follow loop so both
+ * views always agree on what "active" means.
+ */
+export async function collectActiveTasks(storage: Storage): Promise<Task[]> {
+  const active = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
+  const queued = await storage.listTasksWithOptions({ queuedOnly: true });
+  const seen = new Set(active.map(t => t.id));
+  return [...active, ...queued.filter(t => !seen.has(t.id))];
 }
 
 export async function commandActive(args: string[]): Promise<void> {
@@ -330,23 +419,39 @@ export async function commandActive(args: string[]): Promise<void> {
   const idsOnly = parsed.flags.get('ids-only') === true;
   const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
   const follow = parsed.flags.get('follow') === true;
+  const taskFilter = parsed.positional[0] || undefined;
 
   // --follow needs continuous reconciliation with open storage — can't use RPC
   if (follow) {
     const root = requireLazyRoot();
     const storage = await requireStorage();
     try {
+      // Resolve the subtree filter ONCE, before the poll loop: resolution can
+      // prompt on an ambiguous code, and re-resolving every 3s would both
+      // re-prompt and repeat the work for an answer that cannot change.
+      let subtreeRootId: string | undefined;
+      let filterLabel: string | undefined;
+      if (taskFilter) {
+        const task = await resolveTaskOrExit(storage, taskFilter);
+        subtreeRootId = task.id;
+        filterLabel = displayId(task);
+      }
+
       const pollIntervalMs = 3000;
       let done = false;
       while (!done) {
         process.stdout.write('\x1B[2J\x1B[H');
-        const tasks = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
+        let tasks = await collectActiveTasks(storage);
+        if (subtreeRootId) {
+          const allowedIds = collectSubtreeIds(subtreeRootId, await storage.listTasks());
+          tasks = tasks.filter(t => allowedIds.has(t.id));
+        }
         if (tasks.length === 0) {
-          console.log('No active tasks.');
+          console.log(emptyActiveMessage(filterLabel));
           done = true;
         } else {
           const tree = await buildTaskTree(storage, tasks, root);
-          renderActiveOutput(tree, { idsOnly, showTree });
+          renderActiveOutput(tree, { idsOnly, showTree, filterLabel });
           console.log(`\n(following — press Ctrl+C to stop, polling every ${pollIntervalMs / 1000}s)`);
           await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
         }
@@ -357,14 +462,24 @@ export async function commandActive(args: string[]): Promise<void> {
     return;
   }
 
-  const { tree } = await queryActiveTasks();
-  renderActiveOutput(tree, { idsOnly, showTree });
+  const { tree } = await queryActiveTasks({ taskFilter });
+  renderActiveOutput(tree, { idsOnly, showTree, filterLabel: taskFilter });
+}
+
+/**
+ * Empty-state text for the active views. A filtered view says which subtree was
+ * empty — "no active tasks" alone would read as "nothing is running anywhere".
+ */
+function emptyActiveMessage(filterLabel: string | undefined): string {
+  return filterLabel
+    ? `No active tasks in ${filterLabel} (task and its descendants).`
+    : 'No active tasks.';
 }
 
 /** Shared rendering for active command. */
 function renderActiveOutput(
   tree: TaskWithSession[],
-  opts: { idsOnly: boolean; showTree: boolean },
+  opts: { idsOnly: boolean; showTree: boolean; filterLabel?: string },
 ): void {
   if (opts.idsOnly) {
     const allNodes = flattenTree(tree);
@@ -375,7 +490,7 @@ function renderActiveOutput(
   }
 
   if (tree.length === 0) {
-    console.log('No active tasks.');
+    console.log(emptyActiveMessage(opts.filterLabel));
     return;
   }
 
@@ -400,7 +515,7 @@ function renderActiveOutput(
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
       );
     }
   }
@@ -413,12 +528,21 @@ export async function commandBlocked(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'flat', takesValue: false },
     { name: 'tree', takesValue: false },
+    { name: 'tag', takesValue: true },
   ], 'blocked');
 
-  const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  let showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
+  const tagFilter = normalizeFilterTag(parsed.flags.get('tag') as string | undefined);
 
-  const { tree } = await queryBlockedTasks();
+  let { tree } = await queryBlockedTasks();
   sortByLastActive(tree);
+
+  // Tag filter → flat list of matches (see filterTreeByTag / commandList).
+  if (tagFilter) {
+    tree = filterTreeByTag(tree, tagFilter);
+    showTree = false;
+  }
+
   renderBlockedOutput(tree, showTree);
 }
 
@@ -450,7 +574,7 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
       );
     }
   }
@@ -459,7 +583,7 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
 }
 
 export function listUsage(): void {
-  console.log(`Usage: lazy list [<task_id>] [--all] [--flat]
+  console.log(`Usage: lazy list [<task_id>] [--all] [--flat] [--tag <tag>]
 
 List all non-terminal tasks (working + blocked + interrupted).
 
@@ -470,21 +594,28 @@ Options:
   --all       Show all tasks including completed/abandoned/closed
   --flat      Show flat list instead of tree structure
   --tree      Show tree structure (default)
+  --tag <tag> Show only tasks carrying this tag (flat list of matches)
   --ids-only  Output only task IDs, one per line (for shell completion)
 
-The tree view shows child tasks indented under their parents.
+The tree view shows child tasks indented under their parents. Tags are shown
+after each task's goal.
 
 Examples:
   lazy list                  # All non-terminal tasks in tree view
   lazy list release-v05      # Only release-v05 task and its descendants
   lazy list --all            # All tasks including terminal states
-  lazy list abc123de --all   # Task abc123de and descendants, including terminal states`);
+  lazy list --tag onboarding # Non-terminal tasks tagged 'onboarding'
+  lazy list --all --tag infra # All tasks (incl. terminal) tagged 'infra'`);
 }
 
 export function activeUsage(): void {
-  console.log(`Usage: lazy active [--flat] [--follow | -f]
+  console.log(`Usage: lazy active [<task_id>] [--flat] [--follow | -f]
 
 List all non-terminal tasks (working + blocked + interrupted).
+
+Arguments:
+  <task_id>   Optional task ID or code - shows only that task's subtree
+              (the task itself and all its descendants)
 
 Options:
   --flat         Show flat list instead of tree structure
@@ -497,21 +628,25 @@ The tree view shows child tasks indented under their parents.
 Examples:
   lazy active                # All active tasks in tree view
   lazy active --flat         # Active tasks in flat list
-  lazy active --follow       # Live-updating active tasks view`);
+  lazy active --follow       # Live-updating active tasks view
+  lazy active release-v020 -f # Live view of one release's subtree`);
 }
 
 export function blockedUsage(): void {
-  console.log(`Usage: lazy blocked [--flat]
+  console.log(`Usage: lazy blocked [--flat] [--tag <tag>]
 
 List blocked tasks (waiting for user input).
 
 Options:
-  --flat    Show flat list instead of tree structure
-  --tree    Show tree structure (default)
+  --flat      Show flat list instead of tree structure
+  --tree      Show tree structure (default)
+  --tag <tag> Show only blocked tasks carrying this tag (flat list of matches)
 
-The tree view shows child tasks indented under their parents.
+The tree view shows child tasks indented under their parents. Tags are shown
+after each task's goal.
 
 Examples:
-  lazy blocked           # Blocked tasks in tree view
-  lazy blocked --flat    # Blocked tasks in flat list`);
+  lazy blocked                 # Blocked tasks in tree view
+  lazy blocked --flat          # Blocked tasks in flat list
+  lazy blocked --tag onboarding # Blocked tasks tagged 'onboarding'`);
 }

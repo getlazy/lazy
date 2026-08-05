@@ -1,12 +1,15 @@
 import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, promptLine, removeRecoveryFile, readStdinIfPiped } from '../editor';
-import type { TaskType } from '../../types';
-import { VALID_TASK_TYPES } from '../../types';
+import type { TaskType, TaskPriority } from '../../types';
+import { VALID_TASK_TYPES, VALID_TASK_PRIORITIES } from '../../types';
 import { listAgents } from '../../agent/registry';
 import { loadConfig } from '../../config/loader';
-import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
+import { VALID_EFFORT_LEVELS, type EffortLevel, type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT } from '../../config/types';
 import { parentTaskIdOf, branchTarget } from '../../task-target';
+import { sanitizeUserText } from '../../utils/sanitize-text';
 import { runGit } from '../../utils/git';
+import { normalizeTag } from '../../utils/tags';
+import { getActor } from '../../constants';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -17,21 +20,37 @@ export async function commandCreate(args: string[]): Promise<void> {
     { name: 'prompt', takesValue: true },
     { name: 'model', takesValue: true },
     { name: 'type', takesValue: true },
+    { name: 'priority', takesValue: true },
     { name: 'code', takesValue: true },
     { name: 'parent', takesValue: true },
     { name: 'agent', takesValue: true },
     { name: 'effort', takesValue: true },
+    { name: 'runner', takesValue: true },
+    { name: 'tag', takesValue: true, accumulate: true },
   ], 'create');
 
   let goal: string;
   let prompt: string | null = null;
   let model: string | null = null;
   let taskType: TaskType | null = null;
+  let priority: TaskPriority | null = null;
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
   let agentId: string | undefined;
   let effort: EffortLevel | undefined;
+  let runnerType: RunnerType | undefined;
+
+  // Parse --runner flag (per-task runner override stored on the task)
+  const runnerValue = parsed.flags.get('runner') as string | undefined;
+  if (runnerValue !== undefined) {
+    const resolved = resolveRunnerType(runnerValue);
+    if (!resolved) {
+      console.error(`Invalid runner '${runnerValue}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
+      process.exit(1);
+    }
+    runnerType = resolved;
+  }
 
   // Parse --effort flag
   const effortValue = parsed.flags.get('effort') as string | undefined;
@@ -49,6 +68,19 @@ export async function commandCreate(args: string[]): Promise<void> {
     model = validateModel(modelValue);
   }
 
+  // Parse --tag flags (repeatable). Normalize + de-dupe up front so invalid
+  // input fails fast, before the task is created.
+  const rawTags = (parsed.flags.get('tag') as string[] | undefined) ?? [];
+  const tags: string[] = [];
+  for (const raw of rawTags) {
+    const normalized = normalizeTag(raw);
+    if (!normalized) {
+      console.error(`Invalid tag '${raw}': a tag must contain at least one letter or digit.`);
+      process.exit(1);
+    }
+    if (!tags.includes(normalized)) tags.push(normalized);
+  }
+
   // Parse --type flag
   const typeValue = parsed.flags.get('type') as string | undefined;
   if (typeValue !== undefined) {
@@ -57,6 +89,16 @@ export async function commandCreate(args: string[]): Promise<void> {
       process.exit(1);
     }
     taskType = typeValue as TaskType;
+  }
+
+  // Parse --priority flag
+  const priorityValue = parsed.flags.get('priority') as string | undefined;
+  if (priorityValue !== undefined) {
+    if (!VALID_TASK_PRIORITIES.includes(priorityValue as TaskPriority)) {
+      console.error(`Invalid priority '${priorityValue}'. Must be one of: ${VALID_TASK_PRIORITIES.join(', ')}`);
+      process.exit(1);
+    }
+    priority = priorityValue as TaskPriority;
   }
 
   // Parse --code flag
@@ -129,6 +171,14 @@ export async function commandCreate(args: string[]): Promise<void> {
       removeRecoveryFile(editResult.recoveryPath);
     }
   }
+
+  // INTAKE BOUNDARY: the goal and prompt are both rendered into the start
+  // prompt, which becomes argv[2] of `claude -p`. Escape non-printable control
+  // characters before persisting. The goal is a one-liner, so it is escaped
+  // without the explanatory note; the prompt gets the note so the substitution
+  // is visible to both the human and the agent.
+  goal = sanitizeUserText(goal, { annotate: false });
+  if (prompt) prompt = sanitizeUserText(prompt);
 
   const storage = await requireStorage();
   let explicitBranchTarget: string | undefined;
@@ -206,10 +256,33 @@ export async function commandCreate(args: string[]): Promise<void> {
       console.log(`  Model:  ${model}`);
     }
 
+    // Set priority if provided (default 'normal' is left implicit)
+    if (priority) {
+      await storage.updateTaskPriority(t.id, priority);
+      console.log(`  Priority: ${priority}`);
+    }
+
     // Set effort if provided (stored as metadata so it persists across resumes)
     if (effort) {
       await storage.updateTaskMetadata(t.id, 'effort', effort);
       console.log(`  Effort: ${effort}`);
+    }
+
+    // Set per-task runner override if provided
+    if (runnerType) {
+      await storage.updateTaskRunnerType(t.id, runnerType);
+      console.log(`  Runner: ${runnerType}`);
+    }
+
+    // Apply tags (already normalized + de-duped above). Attributed to the human
+    // actor since this is the CLI channel.
+    if (tags.length > 0) {
+      let applied: string[] = [];
+      for (const tag of tags) {
+        const updated = await storage.addTaskTag(t.id, tag, getActor());
+        applied = updated.tags;
+      }
+      console.log(`  Tags:   ${applied.map(tg => '#' + tg).join(' ')}`);
     }
 
     console.log(`\nStart working on it with: lazy start ${displayId(t)}`);
@@ -219,7 +292,7 @@ export async function commandCreate(args: string[]): Promise<void> {
 }
 
 export function createUsage(): void {
-  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <agent_id>] [--effort <level>]
+  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <agent_id>] [--effort <level>] [--runner <host|docker|container|podman>] [--tag <tag>]
 
 Create a new task. Interactive if no flags provided.
 
@@ -229,6 +302,9 @@ Options:
   --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
                      Default: task
+  --priority <level> Queue priority (low, normal, high, urgent). Orders which
+                     queued task starts next when a concurrency slot frees.
+                     Default: normal. Change later with: lazy prioritize <task> <level>
   --code <code>      Human-readable code (e.g. "fix-models", "add-auth")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <ref>     Parent: a task code/short-ID (creates a child task) or a
@@ -241,6 +317,11 @@ Options:
   --agent <agent_id> Agent to use for this task (default: from lazy.toml or "claude-code")
   --effort <level>   Claude Code reasoning effort for this task (low, medium, high, xhigh, max)
                      Persists across resumes. Default: from lazy.toml [agent].effort (medium)
+  --runner <type>    Run this task on a specific runner regardless of the global
+                     [runner] type: host, docker, container, or podman.
+                     Default: inherit lazy.toml [runner] type.
+  --tag <tag>        Add a tag for grouping (repeatable). Normalized to lowercase
+                     alphanumerics + hyphens. E.g. --tag onboarding --tag launch
 
 Prompt input priority: --prompt flag > piped stdin > $EDITOR (interactive)
 
@@ -248,6 +329,7 @@ Examples:
   lazy create                              # Interactive mode
   lazy create --goal "Add auth"            # Create with goal only
   lazy create --goal "Add auth" --code add-auth
+  lazy create --goal "Add auth" --tag onboarding --tag launch
   lazy create --goal "Add auth" --prompt "Implement OAuth2 login"
   lazy create --goal "Refactor" --model opus --type refactor
   lazy create --goal "Sub-task" --parent abc12345

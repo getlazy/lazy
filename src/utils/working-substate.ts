@@ -1,9 +1,10 @@
 /**
  * Working-substate derivation — the single source of truth for distinguishing
- * the three observable flavors of a `working` task:
+ * the observable flavors of a `working` task:
  *
  *   - working(agent)            the agent (claude/cursor) is doing real work
  *   - working(agent:answering)  the agent is answering a question (`lazy ask`)
+ *   - working(agent:pre-accept) the accept path is running its validation turn
  *   - working(harness:<phase>)  the supervisor is doing pre/post-turn work
  *   - not-alive                 no live run and no response — a stranded candidate
  *
@@ -23,10 +24,22 @@ import { join } from 'path';
 import { readFile, stat } from 'fs/promises';
 import type { SupervisorPhase, SupervisorStatus } from '../protocol/types';
 import { elapsedFrom } from './elapsed';
+import { formatRetrySummary, type RetrySummaryInput } from './retry-summary';
 import { logger } from './logger';
 
 export type WorkingSubstate =
-  | { kind: 'agent'; answering?: boolean }
+  | {
+      kind: 'agent';
+      /** The turn is an `lazy ask` question, not ordinary work. */
+      answering?: boolean;
+      /**
+       * The turn is the accept path's pre-accept validation turn. The task is
+       * genuinely `working` for its whole duration, and without this the only
+       * observable state during an accept was a bare `working` that looked
+       * exactly like the human having unblocked the task by hand.
+       */
+      preAccept?: boolean;
+    }
   | {
       kind: 'harness';
       /** The supervisor phase driving the work (e.g. `post_turn_check`). */
@@ -37,6 +50,12 @@ export type WorkingSubstate =
       currentCommand?: string;
       /** ISO timestamp the subprocess started. */
       currentCommandStartedAt?: string;
+      /**
+       * Retry state, when the phase is `retrying`. Carried on the substate so
+       * `list`/`active`/MCP say WHAT is being retried (attempt count, failure
+       * class, latest error) rather than a bare `harness:retrying`.
+       */
+      retry?: RetrySummaryInput;
     }
   | { kind: 'not-alive' };
 
@@ -75,8 +94,9 @@ export function deriveWorkingSubstate(
     // substate rather than guessing.
     if (!status) return null;
     if (AGENT_PHASES.has(status.phase)) {
-      const answering = status.command_type === 'ask';
-      return answering ? { kind: 'agent', answering: true } : { kind: 'agent' };
+      if (status.command_type === 'ask') return { kind: 'agent', answering: true };
+      if (status.command_type === 'pre_accept') return { kind: 'agent', preAccept: true };
+      return { kind: 'agent' };
     }
     return {
       kind: 'harness',
@@ -84,6 +104,13 @@ export function deriveWorkingSubstate(
       phaseStartedAt: status.phase_started_at ?? status.updated_at ?? status.started_at,
       currentCommand: status.current_command,
       currentCommandStartedAt: status.current_command_started_at,
+      retry: status.phase === 'retrying'
+        ? {
+            retryCount: status.retryCount,
+            errors: status.errors,
+            retry_failure_class: status.retry_failure_class,
+          }
+        : undefined,
     };
   }
 
@@ -97,14 +124,16 @@ export function deriveWorkingSubstate(
 }
 
 /**
- * Read the supervisor `status.json` for substate derivation.
+ * Read the supervisor `status.json` (async) for substate derivation and for any
+ * other read surface that needs the raw checkpoint without pulling in the sync
+ * `readStatus` from the protocol layer.
  *
  * Distinguishes "missing" (ENOENT — normal: container hasn't checkpointed, or
  * status was cleared) from "found but broken" (corrupt JSON — logged as a
  * warning so it's visible, but still degrades to null rather than crashing a
  * read command). Async — never blocks the daemon event loop.
  */
-async function readStatusForSubstate(protoDir: string): Promise<SupervisorStatus | null> {
+export async function readSupervisorStatusAsync(protoDir: string): Promise<SupervisorStatus | null> {
   const filePath = join(protoDir, 'status.json');
   let raw: string;
   try {
@@ -146,15 +175,20 @@ export async function computeWorkingSubstate(
   protoDir: string,
   isAlive: boolean,
 ): Promise<WorkingSubstate | null> {
-  const status = await readStatusForSubstate(protoDir);
+  const status = await readSupervisorStatusAsync(protoDir);
   const hasResponse = await responseExists(protoDir);
   return deriveWorkingSubstate(status, { isAlive, hasResponse });
 }
 
+/** Max error-snippet length inside a substate label (tighter than the watch header). */
+const SUBSTATE_SNIPPET_MAX = 60;
+
 /**
  * Format the inner label for a working substate (without the `working(...)`
  * wrapper), e.g. `agent`, `agent:answering`, `harness:post_turn_check (3m00s)`,
- * `harness:post_turn_check cargo build (3m00s)`, `not-alive`.
+ * `harness:post_turn_check cargo build (3m00s)`,
+ * `harness:retrying attempt 7 (transient_overload): API 529 overloaded (47s)`,
+ * `not-alive`.
  *
  * `now` is injectable for deterministic tests.
  */
@@ -164,7 +198,9 @@ export function formatWorkingSubstate(
 ): string {
   switch (substate.kind) {
     case 'agent':
-      return substate.answering ? 'agent:answering' : 'agent';
+      if (substate.answering) return 'agent:answering';
+      if (substate.preAccept) return 'agent:pre-accept';
+      return 'agent';
     case 'not-alive':
       return 'not-alive';
     case 'harness': {
@@ -172,6 +208,11 @@ export function formatWorkingSubstate(
       if (substate.currentCommand) {
         label += ` ${substate.currentCommand}`;
       }
+      // `harness:retrying` alone reads as "stuck for unknown reasons" — say
+      // which attempt this is and what failed. Snippet is kept short because
+      // this label sits inside a `working(...)` cell in list/active output.
+      const retry = formatRetrySummary(substate.retry, SUBSTATE_SNIPPET_MAX);
+      if (retry) label += ` ${retry}`;
       const elapsed = elapsedFrom(substate.phaseStartedAt, now);
       if (elapsed !== null) label += ` (${elapsed})`;
       return label;

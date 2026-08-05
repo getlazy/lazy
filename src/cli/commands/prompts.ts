@@ -1,6 +1,8 @@
-import { readdirSync, readFileSync } from 'fs';
+import { readdir, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join, basename } from 'path';
 import { theme } from '../theme';
+import { PROMPT_BUNDLE } from '../../prompts-bundle';
 
 /**
  * Represents a built-in prompt file from src/prompts/.
@@ -10,8 +12,11 @@ export interface BuiltinPrompt {
   code: string;
   /** Original filename, e.g. "system-instructions.md" */
   filename: string;
-  /** Absolute path to the file */
-  path: string;
+  /**
+   * Absolute path to the file on disk, or null when running from a compiled
+   * binary (the prompt content is embedded, there is no file on disk).
+   */
+  path: string | null;
   /** Short description derived from the first non-empty line of content */
   description: string;
 }
@@ -26,11 +31,32 @@ export function isBuiltinPromptCode(code: string): boolean {
 }
 
 /**
- * Get the directory containing built-in prompt files.
- * This resolves relative to this source file's location.
+ * Get the directory containing built-in prompt files, resolved relative to this
+ * source file's location.
+ *
+ * In dev (`bun run ./src/index.ts`) this points at the real src/prompts/
+ * directory. In a compiled binary there is no such directory on disk — see
+ * `usePromptFiles()`.
  */
 function getPromptsDir(): string {
   return join(__dirname, '../../prompts');
+}
+
+/**
+ * Whether to read built-in prompts from the real files on disk (dev) or from
+ * the compiled-in PROMPT_BUNDLE (compiled binary).
+ *
+ * We prefer the real files in dev so editing a prompt is instantly reflected by
+ * `lazy system prompts` / `lazy show`, per the "prompts are discoverable and
+ * editable" rule in CLAUDE.md. When src/prompts/ isn't on disk — i.e. a
+ * `bun build --compile` binary — we fall back to the embedded bundle.
+ *
+ * INVARIANT: dev reads live files; compiled mode reads the embedded bundle.
+ * `existsSync` here is a one-shot CLI-path check (mirrors getLazySourceRoot in
+ * src/capture/claude.ts); it does not run in any hot/async path.
+ */
+function usePromptFiles(): boolean {
+  return existsSync(getPromptsDir());
 }
 
 /**
@@ -64,44 +90,66 @@ function extractDescription(content: string): string {
 }
 
 /**
- * List all built-in prompts from src/prompts/.
+ * List all built-in prompts.
+ *
+ * In dev, reads the real files from src/prompts/. In a compiled binary, reads
+ * from the embedded PROMPT_BUNDLE (path is null since there is no file on disk).
  */
-export function listBuiltinPrompts(): BuiltinPrompt[] {
-  const dir = getPromptsDir();
-  const files = readdirSync(dir)
-    .filter(f => f.endsWith('.md'))
-    .sort();
+export async function listBuiltinPrompts(): Promise<BuiltinPrompt[]> {
+  if (usePromptFiles()) {
+    const dir = getPromptsDir();
+    const files = (await readdir(dir)).filter(f => f.endsWith('.md')).sort();
 
-  return files.map(filename => {
-    const filePath = join(dir, filename);
-    const content = readFileSync(filePath, 'utf-8');
-    return {
+    return Promise.all(
+      files.map(async filename => {
+        const filePath = join(dir, filename);
+        const content = await readFile(filePath, 'utf-8');
+        return {
+          code: filenameToCode(filename),
+          filename,
+          path: filePath,
+          description: extractDescription(content),
+        };
+      }),
+    );
+  }
+
+  // Compiled binary: source the list from the embedded bundle.
+  return Object.keys(PROMPT_BUNDLE)
+    .sort()
+    .map(filename => ({
       code: filenameToCode(filename),
       filename,
-      path: filePath,
-      description: extractDescription(content),
-    };
-  });
+      path: null,
+      description: extractDescription(PROMPT_BUNDLE[filename]!),
+    }));
 }
 
 /**
  * Read a built-in prompt by its code.
- * Returns the file content or null if not found.
+ * Returns the content or null if not found.
  */
-export function readBuiltinPrompt(code: string): string | null {
+export async function readBuiltinPrompt(code: string): Promise<string | null> {
   if (!isBuiltinPromptCode(code)) return null;
 
-  const dir = getPromptsDir();
   const stem = code.slice(BUILTIN_PROMPT_PREFIX.length);
-  try {
-    return readFileSync(join(dir, stem + '.md'), 'utf-8');
-  } catch {
-    return null;
+  const filename = stem + '.md';
+
+  if (usePromptFiles()) {
+    try {
+      return await readFile(join(getPromptsDir(), filename), 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw new Error(`Failed to read built-in prompt ${filename}: ${(err as Error).message}`);
+    }
   }
+
+  // Compiled binary: read from the embedded bundle.
+  return PROMPT_BUNDLE[filename] ?? null;
 }
 
-export function printBuiltinPrompts(): void {
-  const prompts = listBuiltinPrompts();
+export async function printBuiltinPrompts(): Promise<void> {
+  const prompts = await listBuiltinPrompts();
 
   if (prompts.length === 0) {
     console.log('No built-in system prompts found.');

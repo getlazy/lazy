@@ -12,6 +12,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     prompt: 'Use OAuth2 with JWT tokens',
     type: 'task',
     status: 'working',
+    priority: 'normal',
     created_at: new Date('2026-02-15T10:00:00Z').getTime(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -20,7 +21,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     model: 'claude-opus-4-6',
     agent_id: 'claude-code',
     metadata: null,
+    tags: [],
     pending_sync: 0,
+    runner_type: null,
     ...overrides,
   };
 }
@@ -149,6 +152,28 @@ describe('evaluateQuery', () => {
   test('code: does not match wrong code', () => {
     const ast = parseQuery('code:other-task');
     expect(evaluateQuery(ast, makeData())).toBe(false);
+  });
+
+  test('tag: matches a tag the task carries', () => {
+    const ast = parseQuery('tag:onboarding');
+    expect(evaluateQuery(ast, makeData({ task: makeTask({ tags: ['onboarding', 'launch'] }) }))).toBe(true);
+  });
+
+  test('tag: does not match a tag the task lacks', () => {
+    const ast = parseQuery('tag:infra');
+    expect(evaluateQuery(ast, makeData({ task: makeTask({ tags: ['onboarding'] }) }))).toBe(false);
+  });
+
+  test('tag: normalizes the query value the same way tags are stored', () => {
+    // "[Onboarding]" normalizes to "onboarding" at parse time, matching the
+    // stored normalized tag.
+    const ast = parseQuery('tag:[Onboarding]');
+    expect(evaluateQuery(ast, makeData({ task: makeTask({ tags: ['onboarding'] }) }))).toBe(true);
+  });
+
+  test('tag: does not match a task with no tags', () => {
+    const ast = parseQuery('tag:onboarding');
+    expect(evaluateQuery(ast, makeData({ task: makeTask({ tags: [] }) }))).toBe(false);
   });
 
   test('in:turns matches turn content', () => {

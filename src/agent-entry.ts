@@ -46,6 +46,27 @@ Options:
   --help, -h                  Show this help`);
 }
 
+// Self-identification guardrail.
+//
+// A fast, side-effect-free way to prove this binary is the compiled lazy agent
+// and not a bare Bun runtime (or a stale/placeholder file) mistakenly mounted at
+// /usr/local/bin/lazy-agent. When the wrong file is mounted there, Claude Code's
+// MCP child (`lazy-agent mcp …`) exits immediately — the builder silently loses
+// all lazy_* tools with only an opaque "Failed to reconnect to lazy: -32000" in
+// Claude's logs. The builder-startup preflight (see supervisor/builder.ts) execs
+// `lazy-agent selfcheck` and greps for this sentinel, turning that silent failure
+// into an actionable error.
+//
+// A bare Bun binary prints its own version for --version/--revision and errors
+// "Script not found selfcheck" for the subcommand — so both the presence of the
+// sentinel and the exit code distinguish the real agent from bare Bun.
+if (command === 'selfcheck' || command === '--version' || command === '-v' || command === '--revision') {
+  const { VERSION } = await import('./version');
+  // Sentinel string the preflight matches on. Keep 'lazy-agent ok' stable.
+  console.log(`lazy-agent ok ${VERSION}`);
+  process.exit(0);
+}
+
 // Handle builder subcommand
 if (command === 'builder') {
   if (args.includes('--help') || args.includes('-h')) {
@@ -129,7 +150,7 @@ per-session builder HTTP server over TCP.
 When neither proxy config is provided, tools execute locally.
 
 When --task-id is omitted, the MCP server runs in project-scoped (builder) mode.
-Tools that require a task context (lazy_commit, lazy_propose) are unavailable.
+Tools that require a task context (lazy_commit) are unavailable.
 
 The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
     process.exit(0);
@@ -148,8 +169,10 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
   // Daemon proxy mode (preferred): forward all tool calls to the daemon
   if (daemonConfigIdx !== -1 && daemonConfigIdx + 1 < args.length) {
     const daemonConfigPath = args[daemonConfigIdx + 1];
-    // Task ID override: the daemon config template has taskId='' (empty).
-    // The supervisor passes --task-id to scope tool calls to the correct task.
+    // Task ID override: the supervisor passes --task-id to scope tool calls to
+    // the correct task. A task config now also carries its own taskId (the
+    // identity its token is bound to); the two must agree, and the daemon
+    // refuses the call if the claim disagrees with the token.
     const taskIdOverride = (taskIdIdx !== -1 && taskIdIdx + 1 < args.length) ? args[taskIdIdx + 1] : undefined;
     const { startMcpServerDaemonProxy } = await import('./mcp/index');
     await startMcpServerDaemonProxy(daemonConfigPath, taskIdOverride);

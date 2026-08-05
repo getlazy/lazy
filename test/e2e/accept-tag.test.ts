@@ -1,12 +1,26 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { writeFileSync, readdirSync } from 'fs';
+import { writeFileSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
+/**
+ * Resolve the tasks directory for the test project. Test projects init with
+ * external storage (external_path in lazy.toml), so tasks live outside the
+ * repo — reading ctx.root/.lazy/tasks finds nothing. Fall back to the in-repo
+ * layout only when no external_path is configured. Mirrors tasksDirFor() in
+ * auto-react-budget.test.ts / reconcile.test.ts.
+ */
+function tasksDirFor(root: string): string {
+  const toml = readFileSync(join(root, 'lazy.toml'), 'utf-8');
+  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+  if (m && m[1]) return join(m[1], 'tasks');
+  return join(root, '.lazy', 'tasks');
+}
+
 function findFullTaskId(root: string, shortId: string): string {
-  const entries = readdirSync(join(root, '.lazy', 'tasks'));
+  const entries = readdirSync(tasksDirFor(root));
   const match = entries.find((e: string) => e.startsWith(shortId));
   if (!match) throw new Error(`Could not find full task ID for short ID: ${shortId}`);
   return match;
@@ -19,6 +33,14 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
   });
   expectSuccess(startResult);
 
+  // INVARIANT: `start` launches the supervisor asynchronously under the daemon;
+  // wait for the reconciler to move the task out of 'working' before accept, or
+  // accept refuses ("Task X is still working"). Mirrors accept-reason / accept-gates.
+  const waitResult = await ctx.lazy(['wait', taskId]);
+  if (waitResult.exitCode !== 0) {
+    throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+  }
+
   const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
   writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
   expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
@@ -30,7 +52,9 @@ describe('lazy accept creates the authoritative accept tag', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // INVARIANT: `start` + `accept` need a real daemon (see accept-reason /
+    // accept-gates). Daemonless, the task stays 'working' and accept refuses.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {

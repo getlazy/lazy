@@ -1,12 +1,24 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { join } from 'path';
 import { mkdir, writeFile } from 'fs/promises';
-import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
+import { getProjectName } from '../../src/storage';
+import { getHome } from '../../src/utils/home';
 
 /**
- * Create a fake stored conversation JSON file in .lazy/conversations/.
- * This simulates what builder auto-capture (and import-conversation) produce.
+ * Create a fake stored conversation in the location storage actually reads
+ * from: the external ~/.lazy/<project>/conversations dir. Writing into the
+ * repo's own .lazy/conversations/ no longer works — storage externalized its
+ * data dir, so a write there is invisible to listConversations().
+ *
+ * We write the JSON file directly rather than via FileStorage.saveConversation
+ * for two reasons: (1) saveConversation is itself just an mkdir + writeFile with
+ * no lock or index to keep in sync, so a direct write is behaviorally identical;
+ * (2) opening a FileStorage would call initialize(), which acquires the storage
+ * lock — and in withDaemon suites the daemon already holds it, so that would
+ * deadlock. This mirrors what builder auto-capture (and import-conversation)
+ * produce.
  */
 async function createFakeConversation(
   root: string,
@@ -17,9 +29,6 @@ async function createFakeConversation(
     gitBranch?: string;
   } = {}
 ): Promise<void> {
-  const convDir = join(root, '.lazy', 'conversations');
-  await mkdir(convDir, { recursive: true });
-
   const conversation = {
     sessionId,
     projectPath: '-test-project',
@@ -55,10 +64,18 @@ async function createFakeConversation(
     subagents: [],
   };
 
+  // Resolve the external storage path explicitly rather than reading a config
+  // file. In-process (bun test), config/root resolution keys off the test
+  // runner's CWD — the dev worktree — so it would otherwise pick up the
+  // worktree's real [storage] external_path instead of this temp project's. The
+  // subprocesses under test run with CWD=root and resolve to
+  // getHome()/.lazy/<projectName>; mirror that exactly here.
+  const convDir = join(getHome(), '.lazy', await getProjectName(root), 'conversations');
+  await mkdir(convDir, { recursive: true });
   await writeFile(
     join(convDir, `${sessionId}.json`),
     JSON.stringify(conversation, null, 2),
-    'utf-8'
+    'utf-8',
   );
 }
 
@@ -269,5 +286,86 @@ describe('lazy import-conversation --show', () => {
     expectSuccess(result);
     expectOutput(result, 'ffffffff');
     expectOutput(result, 'Listed conversation test');
+  });
+});
+
+// REGRESSION: `lazy show <session-id>` must resolve a captured conversation even
+// when the daemon is running. The daemon returns 404 for an unknown task; that
+// 404 must map to "not a task, try a conversation" — NOT propagate as a fatal
+// "Task not found". Without withDaemon these pass through LAZY_TEST=1 and never
+// exercise the RPC 404 path, which is exactly how this bug hid (the direct
+// handler path already returned null on 404). See queryTaskShow in rpc-fallback.
+describe('lazy show conversation via daemon RPC', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ withDaemon: true });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  test('resolves a conversation session ID prefix through the daemon', async () => {
+    await createFakeConversation(ctx.root, '98f4244f-31d5-4880-acdd-6947c5ea1e0c', {
+      summary: 'Wiring up the reconciler',
+      gitBranch: 'feature/reconciler',
+      messages: [
+        { role: 'user', text: 'How does the reconciler pick up new tasks?' },
+        { role: 'assistant', text: 'It polls the storage layer on an interval.' },
+      ],
+    });
+
+    // The builder-list hint ('lazy show <session-id>') must simply work.
+    const result = await ctx.lazy(['show', '98f4244f']);
+
+    expectSuccess(result);
+    expectOutput(result, '98f4244f');
+    expectOutput(result, 'Wiring up the reconciler');
+    expectOutput(result, 'feature/reconciler');
+    expectOutput(result, 'How does the reconciler pick up new tasks?');
+    expectOutput(result, 'It polls the storage layer on an interval.');
+  });
+
+  test('lazy view (show alias) resolves a conversation through the daemon', async () => {
+    await createFakeConversation(ctx.root, 'ad58b238-21fa-473f-8720-ca3b239e52aa', {
+      summary: 'Discussing the storage abstraction',
+      messages: [
+        { role: 'user', text: 'Why is storage behind an interface?' },
+        { role: 'assistant', text: 'So the backend can be swapped without touching callers.' },
+      ],
+    });
+
+    const result = await ctx.lazy(['view', 'ad58b238']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Discussing the storage abstraction');
+    expectOutput(result, 'Why is storage behind an interface?');
+  });
+
+  test('unknown id errors actionably, mentioning tasks and conversations', async () => {
+    const result = await ctx.lazy(['show', 'deadbeef']);
+
+    expectFailure(result);
+    expectError(result, 'No task, conversation, or file found matching');
+    expectError(result, 'deadbeef');
+  });
+
+  test('ambiguous conversation prefix errors instead of picking one', async () => {
+    // Two conversations sharing the '12345678' prefix — resolution must refuse
+    // to silently pick one, matching how task short-ID prefixes disambiguate.
+    await createFakeConversation(ctx.root, '12345678-0000-0000-0000-000000000001', {
+      summary: 'First ambiguous conversation',
+      messages: [{ role: 'user', text: 'First conversation prompt' }],
+    });
+    await createFakeConversation(ctx.root, '12345678-0000-0000-0000-000000000002', {
+      summary: 'Second ambiguous conversation',
+      messages: [{ role: 'user', text: 'Second conversation prompt' }],
+    });
+
+    const result = await ctx.lazy(['show', '12345678']);
+
+    expectFailure(result);
+    expectError(result, 'Multiple conversations match');
   });
 });

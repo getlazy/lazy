@@ -26,6 +26,7 @@ import { renderMarkdown } from '../../server/markdown';
 import reportTaskPrompt from '../../prompts/report-task.md' with { type: 'text' };
 import reportCommitPrompt from '../../prompts/report-commit.md' with { type: 'text' };
 import reportReducePrompt from '../../prompts/report-reduce.md' with { type: 'text' };
+import { turnText } from '../../utils/turn-content';
 
 interface Window {
   startMs: number;
@@ -272,7 +273,7 @@ function formatTaskActivityBundle(a: TaskActivity): string {
     for (const turn of a.turns) {
       const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
       lines.push(`  - ${formatIso(turn.timestamp)} [${who}]${turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : turn.turn_type === 'sync' ? ' (sync)' : ''}`);
-      lines.push(`    ${turn.content}`);
+      lines.push(`    ${turnText(turn)}`);
     }
   }
   if (a.commits.length > 0) {

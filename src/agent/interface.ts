@@ -9,8 +9,12 @@
  */
 
 import type { AgentResponse } from '../types';
+import type { AgentFailure, AgentFailureInput } from './failure-taxonomy';
+import type { AgentActivityStream } from './activity-stream';
 
 export type { AgentResponse };
+export type { AgentActivityStream, AgentActivityEvent, AgentActivityKind } from './activity-stream';
+export type { AgentFailure, AgentFailureInput, AgentFailureClass } from './failure-taxonomy';
 
 /**
  * Core agent contract — execution, parsing, and model resolution.
@@ -57,6 +61,12 @@ export interface Agent {
      * Agents that don't support plan mode should ignore this.
      */
     permissionMode?: 'plan' | 'default';
+    /**
+     * Extra CLI args appended after all other flags. Used to thread the host
+     * runner's OS-sandbox settings (`--settings <json>`) into the launch.
+     * See src/runner/host-sandbox.ts.
+     */
+    extraArgs?: string[];
   }): string[];
 
   /**
@@ -79,11 +89,42 @@ export interface Agent {
   isSessionNotFoundError(errorMessage: string): boolean;
 
   /**
+   * Map a failed launch to the shared failure taxonomy.
+   *
+   * This is the ONLY place agent-specific error text is interpreted for retry
+   * purposes — the supervisor branches on the returned class, never on strings.
+   * Implementations should match their own dialect first and fall back to
+   * `classifyCommonFailureSignals` for the shared HTTP/network signals.
+   *
+   * Return `unknown` rather than guessing: the supervisor retries `unknown`
+   * conservatively instead of stopping, so a wrong `fatal_*` is the more
+   * expensive mistake.
+   */
+  classifyFailure(input: AgentFailureInput): AgentFailure;
+
+  /**
    * Default watchdog output timeout in ms. 0 = disabled.
    * Used when the user hasn't set an explicit value in lazy.toml.
    * Agents that are known to hang (e.g., Cursor) return a non-zero default.
    */
   defaultWatchdogTimeoutMs(): number;
+
+  /**
+   * Parser for this agent's incremental stdout, or `null` if it has none.
+   *
+   * Returning a stream is a capability declaration, not a caller branch: the
+   * supervisor's watchdog asks once and adapts its own behavior. With a stream
+   * it can tell forward progress from a keep-alive and can see the agent's
+   * final result the moment it is emitted — which is what lets it arm a kill
+   * timer only AFTER the summary is safely captured. Without one it falls back
+   * to treating any byte of output as liveness, which is all Cursor supports.
+   *
+   * An agent that returns a stream MUST build exec args that actually produce
+   * that stream (e.g. `--output-format stream-json`).
+   *
+   * @see src/agent/activity-stream.ts
+   */
+  activityStream(): AgentActivityStream | null;
 
   /**
    * Discover session log files for conversation capture.

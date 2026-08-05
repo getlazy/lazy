@@ -290,11 +290,12 @@ describe('runWork retry with command check', () => {
       testRunner,
       '/tmp/fake-worktree',
       'test prompt',
-      undefined,
-      undefined,
-      tempProtoDir,
-      undefined,
-      mockExecute,
+      undefined,      // systemPrompt
+      undefined,      // modelId
+      undefined,      // claudeSessionId
+      tempProtoDir,   // protocolDir
+      undefined,      // onRetryStateChange
+      mockExecute,    // _executeOverride
     );
 
     expect(callCount).toBe(2);
@@ -339,11 +340,12 @@ describe('runWork retry with command check', () => {
         testRunner,
         '/tmp/fake-worktree',
         'test prompt',
-        undefined,
-        undefined,
-        tempProtoDir,
-        undefined,
-        mockExecute,
+        undefined,      // systemPrompt
+        undefined,      // modelId
+        undefined,      // claudeSessionId
+        tempProtoDir,   // protocolDir
+        undefined,      // onRetryStateChange
+        mockExecute,    // _executeOverride
       )
     ).rejects.toThrow('Retry canceled: new command arrived');
 

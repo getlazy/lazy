@@ -6,8 +6,16 @@ import { getDataDir } from '../init';
 import { spawnSync } from '../../utils/spawn';
 
 export async function commandShell(args: string[]): Promise<void> {
+  // Split argv on the first `--` separator. Everything before it is parsed as
+  // flags/positionals; everything after is an arbitrary command to run in the
+  // worktree non-interactively. parseFlags doesn't understand `--` (it would
+  // reject it as an unknown flag), so we split here before parsing.
+  const sepIndex = args.indexOf('--');
+  const preArgs = sepIndex === -1 ? args : args.slice(0, sepIndex);
+  const command = sepIndex === -1 ? [] : args.slice(sepIndex + 1);
+
   // Parse and validate flags (no flags supported, but validate against unknown flags)
-  const parsed = parseFlags(args, [], 'shell');
+  const parsed = parseFlags(preArgs, [], 'shell');
 
   const taskId = parsed.positional[0];
   if (!taskId) {
@@ -35,6 +43,33 @@ export async function commandShell(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    const env = {
+      ...process.env,
+      LAZY_TASK: shortId(task.id),
+    };
+
+    // `lazy shell <task> -- <command> [args...]` — run the command directly in
+    // the worktree, passing argv through (no `sh -c` string-join) so quoting and
+    // args are preserved. The child's exit code becomes lazy's exit code so it
+    // composes in scripts. No intro banner — keep output clean and scriptable.
+    if (sepIndex !== -1) {
+      if (command.length === 0) {
+        console.error(`No command given after '--'. Usage: lazy shell ${displayId(task)} -- <command> [args...]`);
+        process.exit(1);
+      }
+      // spawnSync (sync) so stdio is inherited and the exit code is available.
+      const result = spawnSync(command, {
+        cwd: worktreePath,
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+        env,
+      });
+      // Close storage before exiting (the finally block won't run after exit).
+      await storage.close();
+      process.exit(result.exitCode ?? 0);
+    }
+
     console.log(`Entering worktree for task ${displayId(task)}: ${task.goal}`);
     console.log(`  Branch: ${sess.git_branch}`);
     console.log(`  Path:   ${worktreePath}`);
@@ -48,10 +83,7 @@ export async function commandShell(args: string[]): Promise<void> {
       stdin: 'inherit',
       stdout: 'inherit',
       stderr: 'inherit',
-      env: {
-        ...process.env,
-        LAZY_TASK: shortId(task.id),
-      },
+      env,
     });
   } finally {
     await storage.close();
@@ -59,19 +91,25 @@ export async function commandShell(args: string[]): Promise<void> {
 }
 
 export function shellUsage(): void {
-  console.log(`Usage: lazy shell <task_id>
+  console.log(`Usage: lazy shell <task_id> [-- <command> [args...]]
 
-Open an interactive shell in a task's worktree.
+Open an interactive shell in a task's worktree, or run a one-off command in it.
 
 Arguments:
-  <task_id>    ID of the task
+  <task_id>           ID of the task (prefix matching works)
+  -- <command> ...    Run <command> in the worktree non-interactively and exit
+                      with the command's exit code. argv is passed through, so
+                      quoting and arguments are preserved (no shell wrapping).
 
-Environment variables set in the shell:
+Environment variables set for the shell/command:
   LAZY_TASK    Short ID of the task
 
-Use this to manually inspect or modify the worktree.
+Use this to manually inspect or modify the worktree, or to run tooling against it.
 
 Examples:
-  lazy shell abc123
-  lazy shell abc1        # Prefix matching works`);
+  lazy shell abc123                 # Interactive shell in the worktree
+  lazy shell abc1                   # Prefix matching works
+  lazy shell my-task -- code .      # Open an IDE in the worktree
+  lazy shell my-task -- npm test    # Run tests in the worktree
+  lazy shell abc1 -- git status     # Run a one-off command`);
 }

@@ -1,6 +1,6 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('lazy start --follow', () => {
@@ -29,14 +29,18 @@ describe('lazy start --follow', () => {
     expectOutput(result, taskId);
   });
 
-  test('start --follow with inline goal completes without crashing', async () => {
+  // `lazy start` no longer creates tasks: inline `--goal`/`--prompt` were removed
+  // in favor of `lazy create` + `lazy start <id>` (see startUsage(), which points
+  // at `lazy create`). The removal must stay LOUD — a silently-ignored `--goal`
+  // would start some other task while the human believes a new one was created.
+  test('start rejects the removed inline --goal flag with an actionable error', async () => {
     const result = await ctx.lazyMocked(
       ['start', '--goal', 'Inline follow test', '--prompt', 'Do the work', '--follow'],
       MOCK_CLAUDE_SUCCESS,
     );
 
-    expectSuccess(result);
-    expectOutput(result, 'Started task');
-    expectOutput(result, 'Inline follow test');
+    expectFailure(result);
+    expectError(result, 'Unknown flag: --goal');
+    expectError(result, 'lazy start --help');
   });
 });

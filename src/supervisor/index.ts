@@ -38,14 +38,16 @@ import type {
   AskCommand,
   SyncCommand,
   StopCommand,
+  PreAcceptCommand,
   SupervisorStatus,
   SupervisorPhase,
   CompletedResponse,
   ErrorResponse,
 } from '../protocol/types';
 import type { MergeConflict } from '../types';
-import { runSyncWithUpstream, runSyncWithRemote, hasMergeInProgress, hasUnmergedFiles, abortMergeIfInProgress } from './merge';
-import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, type RetryState } from './work';
+import { runSyncWithUpstream, runSyncWithRemote, type MergeGuardOptions, hasMergeInProgress, hasUnmergedFiles, abortMergeIfInProgress } from './merge';
+import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError } from './work';
+import { makeRetryStatusHandler } from './retry-status';
 import askSystemPrompt from '../prompts/ask-system-prompt.md' with { type: 'text' };
 import { runPostTurnCheck } from './post-turn-check';
 import { resolveWatchdogTimeout } from './watchdog';
@@ -59,9 +61,11 @@ import { PROTOCOL_VERSION } from '../protocol/types';
 import { VERSION } from '../version';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
+import { elevatedMergeAbort, elevatedResetHardHead, elevatedTag } from './elevated-git';
 import { detectViolations } from './permissions';
 import { runPermissionPushback } from './pushback';
 import { detectSkippedMaintainEntries, runMaintainFollowup, renderMaintainContext } from './maintain';
+import { runPreAcceptGate, DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from './pre-accept';
 import type { CompletedResponseBundle } from '../protocol/types';
 import { truncateLog } from '../utils/log-truncate';
 
@@ -173,8 +177,8 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     const command = await waitForCommand(protocolDir, pollIntervalMs);
     if (!command) continue; // timeout (shouldn't happen with default 0 timeout)
 
-    const turnStartedAt = (command.type === 'start' || command.type === 'unblock' || command.type === 'ask')
-      ? (command as StartCommand | UnblockCommand | AskCommand).turn_started_at
+    const turnStartedAt = (command.type === 'start' || command.type === 'unblock' || command.type === 'ask' || command.type === 'pre_accept')
+      ? (command as StartCommand | UnblockCommand | AskCommand | PreAcceptCommand).turn_started_at
       : undefined;
     resetTimer(turnStartedAt);
     log(`[supervisor] Received command: ${command.type} for task ${command.task_id}`);
@@ -258,8 +262,30 @@ async function recoverWorktreeState(worktreePath: string): Promise<void> {
   // Check for unmerged files (conflict markers without MERGE_HEAD — shouldn't happen but be safe)
   if (await hasUnmergedFiles(worktreePath)) {
     logWarn('[supervisor] Detected unmerged files in worktree. Resetting to clean state.');
-    await runGit(['reset', '--hard', 'HEAD'], { cwd: worktreePath });
+    await elevatedResetHardHead(worktreePath);
   }
+}
+
+/**
+ * Guard timeouts for merge-resolution agent turns.
+ *
+ * A merge turn is an ordinary agent turn — it edits files, runs tests, and
+ * commits — so it gets the same two guards as the work phase, from the same
+ * config. The merge phase shells out to `claude` directly rather than through
+ * the agent abstraction, so the "0 = use the agent default" fallback resolves
+ * against claude-code.
+ */
+function mergeGuards(cmd: {
+  watchdog_output_timeout_ms?: number;
+  wind_down_timeout_ms?: number;
+}): MergeGuardOptions {
+  return {
+    noProgressTimeoutMs: resolveWatchdogTimeout(
+      cmd.watchdog_output_timeout_ms ?? 0,
+      getAgent('claude-code').defaultWatchdogTimeoutMs(),
+    ),
+    windDownTimeoutMs: cmd.wind_down_timeout_ms ?? 0,
+  };
 }
 
 /**
@@ -281,6 +307,15 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   // a read-only Q&A turn owned end-to-end by the daemon.
   if (command.type === 'ask') {
     await handleAskCommand(command as AskCommand, config, runner);
+    return;
+  }
+
+  // Pre-accept commands run the agent's final validation turn (write mode), then
+  // re-run the configured gate commands as the authoritative merge gate. No
+  // upstream/post-turn sync or violation detection — the daemon owns this turn
+  // end-to-end and drives the merge from the response.
+  if (command.type === 'pre_accept') {
+    await handlePreAcceptCommand(command as PreAcceptCommand, config, runner);
     return;
   }
 
@@ -322,7 +357,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const remoteSyncSessionId = command.type === 'unblock'
         ? (command as UnblockCommand).agent_session_id
         : undefined;
-      const conflicts = await runSyncWithRemote(worktreePath, cmd.remote_branch, cmd.model_id, remoteSyncSessionId);
+      const conflicts = await runSyncWithRemote(
+        worktreePath,
+        cmd.remote_branch,
+        cmd.model_id,
+        remoteSyncSessionId,
+        mergeGuards(cmd),
+      );
       allMergeConflicts.push(...conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -363,7 +404,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const mergeSessionId = command.type === 'unblock'
         ? (command as UnblockCommand).agent_session_id
         : undefined;
-      const syncResult = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, mergeSessionId);
+      const syncResult = await runSyncWithUpstream(
+        worktreePath,
+        cmd.parent_branch,
+        cmd.model_id,
+        mergeSessionId,
+        undefined,
+        mergeGuards(cmd),
+      );
       allMergeConflicts.push(...syncResult.conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -416,25 +464,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       : undefined;
 
     // Callback to update status when entering retry mode
-    const onRetryStateChange = (retryState: RetryState | null) => {
-      if (retryState) {
-        // Entering or updating retry state
-        const retryNow = new Date().toISOString();
-        if (status.phase !== 'retrying') {
-          status.phase_started_at = retryNow;
-        }
-        status.phase = 'retrying';
-        status.retryCount = retryState.count;
-        status.errors = retryState.errors;
-        status.updated_at = retryNow;
-        writeStatus(protocolDir, status);
-        log(`[supervisor] Phase: retrying (attempt ${retryState.count})`);
-      } else {
-        // Exiting retry state (success)
-        delete status.retryCount;
-        delete status.errors;
-      }
-    };
+    const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
 
     // Resolve the agent from the command (defaults to claude-code for backward compat)
     const agent = getAgent(cmd.agent_id ?? 'claude-code');
@@ -471,7 +501,8 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       effectiveWatchdogMs,
       cmd.effort,
       permissionMode,
-      cmd.graceful_exit_timeout_ms,
+      cmd.wind_down_timeout_ms,
+      cmd.agent_extra_args,
     );
 
     updatePhase(status, 'work_done', protocolDir);
@@ -554,6 +585,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         violations,
         cmd.model_id,
         cmd.effort,
+        cmd.agent_extra_args,
       );
 
       // Re-check violations on the new HEAD (agent may have reverted some files).
@@ -702,7 +734,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       }
 
       try {
-        const postTurnSync = await runSyncWithUpstream(worktreePath, cmd.parent_branch, cmd.model_id, result.session_id);
+        const postTurnSync = await runSyncWithUpstream(
+          worktreePath,
+          cmd.parent_branch,
+          cmd.model_id,
+          result.session_id,
+          undefined,
+          mergeGuards(cmd),
+        );
         allMergeConflicts.push(...postTurnSync.conflicts);
         updatePhase(status, 'post_turn_sync_done', protocolDir);
       } catch (err) {
@@ -711,7 +750,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         logWarn(`[supervisor] Post-turn sync failed: ${errorMessage}. Skipping.`);
 
         // Abort any in-progress merge to leave the branch clean
-        await runGit(['merge', '--abort'], { cwd: worktreePath });
+        await elevatedMergeAbort(worktreePath);
       }
     }
 
@@ -755,13 +794,25 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     };
 
     // Enrich with crash details if available
-    if (err instanceof CrashError) {
+    if (err instanceof FatalAgentError) {
+      // The retry policy gave up on purpose. Put the classification on the wire
+      // so the reconciler blocks the task (reason visible to the human) instead
+      // of auto-resuming into the same unrecoverable condition.
+      errorResponse.failure_class = err.failureClass;
+      errorResponse.failure_reason = err.failureReason;
+      errorResponse.failure_attempts = err.attempts;
+    } else if (err instanceof CrashError) {
       errorResponse.exit_code = err.exitCode;
       errorResponse.stderr = err.stderr;
       errorResponse.stdout_error = err.stdoutError;
       errorResponse.duration_ms = err.durationMs;
     } else if (err instanceof WatchdogTimeoutError) {
+      // Presence of watchdog_timeout_ms is what makes the recorded turn say
+      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
       errorResponse.duration_ms = err.durationMs;
+      errorResponse.watchdog_timeout_ms = err.timeoutMs;
+      errorResponse.watchdog_attempts = err.attempts;
+      errorResponse.watchdog_captured_work = err.capturedWork;
     } else if (err instanceof GracefulExitTimeoutError) {
       // The agent already committed its work — the marker that triggered this
       // kill is written by lazy_commit. The commit is preserved in git either
@@ -866,6 +917,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       cmd.model_id,
       cmd.agent_session_id,
       commandUpstreamSha,
+      mergeGuards(cmd),
     );
     allMergeConflicts.push(...syncResult.conflicts);
   } catch (err) {
@@ -967,27 +1019,12 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       agent.defaultWatchdogTimeoutMs(),
     );
 
-    const onRetryStateChange = (retryState: RetryState | null) => {
-      if (retryState) {
-        const retryNow = new Date().toISOString();
-        if (status.phase !== 'retrying') {
-          status.phase_started_at = retryNow;
-        }
-        status.phase = 'retrying';
-        status.retryCount = retryState.count;
-        status.errors = retryState.errors;
-        status.updated_at = retryNow;
-        writeStatus(protocolDir, status);
-      } else {
-        delete status.retryCount;
-        delete status.errors;
-      }
-    };
+    const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
 
     // Ask mode locks down write tools at three layers (defense in depth):
     //   1. --disallowedTools Bash/Write/Edit (see ClaudeCodeAgent.buildExecArgs)
     //   2. LAZY_MCP_READ_ONLY=1 env var — write MCP tools (lazy_commit,
-    //      lazy_propose, lazy_comment) reject any call. The PID-1 wrapper
+    //      lazy_comment) reject any call. The PID-1 wrapper
     //      restarts the supervisor per turn, so this env override is per-turn.
     //   3. Stern ask-system-prompt steering the agent to answer in text only.
     process.env.LAZY_MCP_READ_ONLY = '1';
@@ -1010,6 +1047,8 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       effectiveWatchdogMs,
       cmd.effort,
       'plan',
+      undefined, // windDownTimeoutMs — n/a for read-only ask turns
+      cmd.agent_extra_args,
     );
     const agentDurationMs = Date.now() - agentStart;
 
@@ -1031,13 +1070,153 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       error: `Work phase failed: ${errorMessage}`,
       phase: 'work',
     };
-    if (err instanceof CrashError) {
+    if (err instanceof FatalAgentError) {
+      // The retry policy gave up on purpose. Put the classification on the wire
+      // so the reconciler blocks the task (reason visible to the human) instead
+      // of auto-resuming into the same unrecoverable condition.
+      errorResponse.failure_class = err.failureClass;
+      errorResponse.failure_reason = err.failureReason;
+      errorResponse.failure_attempts = err.attempts;
+    } else if (err instanceof CrashError) {
       errorResponse.exit_code = err.exitCode;
       errorResponse.stderr = err.stderr;
       errorResponse.stdout_error = err.stdoutError;
       errorResponse.duration_ms = err.durationMs;
     } else if (err instanceof WatchdogTimeoutError) {
+      // Presence of watchdog_timeout_ms is what makes the recorded turn say
+      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
       errorResponse.duration_ms = err.durationMs;
+      errorResponse.watchdog_timeout_ms = err.timeoutMs;
+      errorResponse.watchdog_attempts = err.attempts;
+      errorResponse.watchdog_captured_work = err.capturedWork;
+    }
+    writeResponse(protocolDir, errorResponse);
+  }
+}
+
+/**
+ * Handle a pre-accept command: run the agent's final validation turn (WRITE
+ * mode — it may fix failures, update maintained files, and commit), then re-run
+ * the configured gate commands as the AUTHORITATIVE merge gate.
+ *
+ * The agent's self-report is NOT trusted for the gate decision: after its turn,
+ * the supervisor runs `pre_accept_commands` itself and reports the outcome in
+ * `response.pre_accept`. The daemon aborts the merge when `passed` is false.
+ * Like ask, this is daemon-owned end-to-end — no upstream/post-turn sync, no
+ * violation detection.
+ */
+async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorConfig, runner: Runner): Promise<void> {
+  const { protocolDir, worktreePath } = config;
+
+  log(`[supervisor] Pre-accept command for task ${cmd.task_id.substring(0, 8)} (${cmd.pre_accept_commands.length} gate command(s), effort=${cmd.effort ?? 'default'})`);
+
+  // Pre-turn worktree health + SHA so the daemon can attribute this turn's commits.
+  await recoverWorktreeState(worktreePath);
+  const preTurnSha = await getHeadSha(worktreePath);
+
+  const now = new Date().toISOString();
+  const status: SupervisorStatus = {
+    phase: 'work',
+    task_id: cmd.task_id,
+    command_type: 'pre_accept',
+    started_at: now,
+    updated_at: now,
+    phase_started_at: now,
+    pre_turn_sha: preTurnSha,
+    pid: process.pid,
+  };
+  writeStatus(protocolDir, status);
+
+  try {
+    const agent = getAgent(cmd.agent_id ?? 'claude-code');
+    const effectiveWatchdogMs = resolveWatchdogTimeout(
+      cmd.watchdog_output_timeout_ms ?? 0,
+      agent.defaultWatchdogTimeoutMs(),
+    );
+
+    const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
+
+    // WRITE mode: no plan-mode lockdown, no LAZY_MCP_READ_ONLY — the agent must
+    // be able to run commands, edit files, commit, and journal the post-mortem.
+    const agentStart = Date.now();
+    const result = await runWork(
+      agent,
+      runner,
+      worktreePath,
+      cmd.prompt,
+      cmd.system_prompt,
+      cmd.model_id,
+      cmd.agent_session_id,
+      protocolDir,
+      onRetryStateChange,
+      undefined,
+      effectiveWatchdogMs,
+      cmd.effort,
+      undefined, // permissionMode: default (write)
+      cmd.wind_down_timeout_ms,
+    );
+    const agentDurationMs = Date.now() - agentStart;
+
+    const postWorkSha = await getHeadSha(worktreePath);
+    log(`[supervisor] Pre-accept post-work SHA: ${postWorkSha.substring(0, 8)}`);
+    status.post_work_sha = postWorkSha;
+    writeStatus(protocolDir, status);
+
+    // Authoritative gate: re-run the configured commands. Empty list passes.
+    updatePhase(status, 'post_turn_check', protocolDir);
+    const gate = await runPreAcceptGate(
+      cmd.pre_accept_commands,
+      worktreePath,
+      cmd.pre_accept_timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS,
+    );
+    updatePhase(status, 'post_turn_check_done', protocolDir);
+    log(`[supervisor] Pre-accept gate: ${gate.passed ? 'PASSED' : `FAILED (${gate.failedCommand})`}`);
+
+    updatePhase(status, 'writing_response', protocolDir);
+    const response: CompletedResponse = {
+      status: 'completed',
+      result: result.result,
+      session_id: result.session_id,
+      usage: result.usage,
+      agent_duration_ms: agentDurationMs,
+      start_sha_work: preTurnSha,
+      end_sha_work: postWorkSha,
+      pre_accept: {
+        passed: gate.passed,
+        ...(gate.failedCommand !== undefined ? { failed_command: gate.failedCommand } : {}),
+        ...(gate.exitCode !== undefined ? { exit_code: gate.exitCode } : {}),
+        ...(gate.output !== undefined ? { output: gate.output } : {}),
+      },
+    };
+    writeResponse(protocolDir, response);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logError(`[supervisor] Pre-accept work phase failed: ${errorMessage}`);
+
+    const errorResponse: ErrorResponse = {
+      status: 'error',
+      error: `Pre-accept turn failed: ${errorMessage}`,
+      phase: 'work',
+    };
+    if (err instanceof FatalAgentError) {
+      // The retry policy gave up on purpose. Put the classification on the wire
+      // so the reconciler blocks the task (reason visible to the human) instead
+      // of auto-resuming into the same unrecoverable condition.
+      errorResponse.failure_class = err.failureClass;
+      errorResponse.failure_reason = err.failureReason;
+      errorResponse.failure_attempts = err.attempts;
+    } else if (err instanceof CrashError) {
+      errorResponse.exit_code = err.exitCode;
+      errorResponse.stderr = err.stderr;
+      errorResponse.stdout_error = err.stdoutError;
+      errorResponse.duration_ms = err.durationMs;
+    } else if (err instanceof WatchdogTimeoutError) {
+      // Presence of watchdog_timeout_ms is what makes the recorded turn say
+      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
+      errorResponse.duration_ms = err.durationMs;
+      errorResponse.watchdog_timeout_ms = err.timeoutMs;
+      errorResponse.watchdog_attempts = err.attempts;
+      errorResponse.watchdog_captured_work = err.capturedWork;
     }
     writeResponse(protocolDir, errorResponse);
   }
@@ -1072,8 +1251,9 @@ async function getBranchSha(cwd: string, branch: string): Promise<string | null>
 }
 
 async function tagHead(cwd: string, tagName: string): Promise<void> {
-  // Best-effort tagging — don't fail the turn if tagging fails
-  const result = await runGit(['tag', '-f', tagName], { cwd });
+  // Best-effort tagging — don't fail the turn if tagging fails.
+  // Tags are refs, so this goes host-side (the container's refs are read-only).
+  const result = await elevatedTag(cwd, tagName);
   if (result.exitCode !== 0) {
     logWarn(`[supervisor] Failed to create tag ${tagName}: ${result.stderr}`);
   } else {

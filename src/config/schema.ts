@@ -29,7 +29,10 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   storage: ['backend', 'external_path', 'postgres_ssl'],
   git: ['default_branch_prefix'],
   output: ['shortid_length'],
-  agent: ['agent_id', 'watchdog_output_timeout_ms', 'graceful_exit_timeout_ms', 'effort'],
+  // `graceful_exit_timeout_ms` is the pre-rename spelling of
+  // `wind_down_timeout_ms`. Kept known (not unknown) so an existing lazy.toml
+  // doesn't trip `lazy doctor` — the loader maps it onto the new key.
+  agent: ['agent_id', 'watchdog_output_timeout_ms', 'wind_down_timeout_ms', 'graceful_exit_timeout_ms', 'effort'],
   builder: ['effort'],
   chattiness: ['default', 'builder', 'agent'],
   server: ['port', 'sync_interval', 'bind'],
@@ -42,16 +45,24 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
   docker: ['dockerfile'],
-  runner: ['type', 'docker_agent_no_network'],
+  runner: ['type', 'docker_agent_no_network', 'permission_mode', 'sandbox_allowed_domains', 'sandbox_deny_read', 'sandbox_deny_write', 'sandbox_allow_weaker_nested'],
   ollama: ['enabled', 'model', 'endpoint'],
+  // 'fallback' is an array of tables ([[proxy.fallback]]); its inner keys
+  // (upstream, model) are validated by the config loader, not this scan.
+  proxy: ['enabled', 'port', 'bind', 'upstream', 'fallback', 'retry_after_threshold'],
   documents: ['path'],
   worktree: ['include'],
   permissions: ['protected'],
-  automation: ['maintain'],
+  protection: ['enabled', 'protected_branches', 'protected_tasks', 'gate_default_branch', 'passphrase_file'],
+  // 'pre_accept' is a nested table ([automation.pre_accept]); its inner keys
+  // (enabled, commands, timeout) are validated by the config loader/defaults,
+  // not this one-level scan.
+  automation: ['maintain', 'pre_accept'],
   // 'mounts' is an array of tables ([[mounts]]); its inner keys (type, source,
   // name, target, readonly) are validated by the config loader, not this scan.
   mounts: ['type', 'source', 'name', 'target', 'readonly'],
   checks: ['post_turn', 'post_turn_timeout'],
+  limits: ['max_concurrent_agents', 'max_concurrent_builders', 'idle_grace_minutes'],
   daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };

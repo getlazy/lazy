@@ -26,6 +26,7 @@ import { log, logError, setLogFile } from './log';
 
 // JSONL discovery / capture for conversation capture
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
+import { safeArgvPrompt } from '../agent/argv-safety';
 import {
   snapshotSessionFiles,
   captureNewOrModifiedConversations,
@@ -67,6 +68,22 @@ export interface BuilderSupervisorConfig {
 export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Promise<void> {
   const { createStorage } = await import('../storage');
 
+  // Where captured conversations (and the resume-intent stamp) are persisted.
+  //
+  // The supervisor runs INSIDE the builder container. In daemon-proxy mode the
+  // configured storage backend's path is NOT reachable there: this project's
+  // external_path lives outside the repo and is never mounted, so a direct
+  // FileStorage would silently write every captured conversation to the
+  // container's ephemeral filesystem and lose it on `--rm` — the capture bug
+  // this fixes. Route through the daemon (the single storage owner) over its
+  // TCP web server instead, exactly as agent tasks do. Only the legacy,
+  // pre-daemon builder-server path (no daemonConfigPath) falls back to a local
+  // FileStorage.
+  const storageFactory: StorageFactory = buildBuilderStorageFactory(
+    config.daemonConfigPath,
+    createStorage,
+  );
+
   // Redirect log output to a file so it doesn't leak into the interactive
   // Claude session (stdout/stderr are Claude's territory during the session).
   // Use /tmp since the repo may be mounted read-only in Docker mode.
@@ -79,6 +96,15 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // Read system prompt from file
   const systemPrompt = await readFile(config.systemPromptFile, 'utf-8');
   log(`[builder] System prompt loaded (${systemPrompt.length} chars)`);
+
+  // Preflight: prove the `lazy-agent` binary Claude Code will spawn for its MCP
+  // server is the real compiled agent before handing off to the interactive
+  // session. If the wrong file is mounted at /usr/local/bin/lazy-agent (bare Bun,
+  // a stale build, or a placeholder), the MCP child dies on startup and the
+  // builder silently loses every lazy_* tool — the operator only sees an opaque
+  // "-32000" buried in Claude's logs. Failing loudly here turns that into an
+  // actionable error. See the `selfcheck` sentinel in agent-entry.ts.
+  await preflightAgentBinary('lazy-agent');
 
   // Read builder config for MCP proxy setup
   const builderConfig = JSON.parse(await readFile(config.builderConfigPath, 'utf-8'));
@@ -104,7 +130,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // Build Claude args
   const claudeArgs = [
     'claude',
-    '--append-system-prompt', systemPrompt,
+    '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
     ...(config.claudeExtraArgs ?? []),
   ];
 
@@ -116,7 +142,22 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // non-graceful exit (Ctrl-C / SIGTERM / container stop / crash): it persists
   // ALL new-or-modified session files on a timer and on signal, so a builder
   // killed before the final flush still gets its conversations saved.
-  const monitor = startCaptureMonitor(config.worktreePath, beforeSnapshot, createStorage, resumeSessionId);
+  //
+  // The monitor also owns the resume-intent STAMP (see onFinalSession below).
+  // That is deliberate: the stamp used to live only after `await proc.exited`,
+  // which a SIGTERM'd supervisor never reaches — its signal handler flushes
+  // capture and re-raises. So an upgrade that stopped the container lost the
+  // stamp entirely and the relaunched builder had nothing to resume. Hanging it
+  // off the monitor's memoized stop() makes the graceful path and the signal
+  // path converge on the SAME stamp, exactly once.
+  const builderId = config.builderId;
+  const monitor = startCaptureMonitor(
+    config.worktreePath, beforeSnapshot, storageFactory, resumeSessionId,
+    builderId
+      ? (storage, sessionId) =>
+          stampSessionIdOnStorage(storage, builderId, config.worktreePath, sessionId)
+      : undefined,
+  );
 
   log('[builder] Launching Claude Code interactively...');
 
@@ -132,26 +173,13 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const exitCode = await proc.exited;
   log(`[builder] Claude Code exited with code ${exitCode}`);
 
-  // Final capture
+  // Final capture. The resume-intent stamp happens inside monitor.stop() (see
+  // startCaptureMonitor's onFinalSession) so the signal path stamps too.
   const detectedSessionId = await monitor.stop();
   if (detectedSessionId) {
     log(`[builder] Captured conversation: ${detectedSessionId}`);
     // Print session ID to stderr (stdout is Claude's territory)
     console.error(`\nBuilder session: ${detectedSessionId}`);
-
-    // Stamp the sessionId onto a matching builder-resume-intent so the host
-    // relaunch loop can resume the exact same conversation. In docker mode the
-    // host gets sessionId: null from the runner — only the in-container
-    // supervisor knows the id — so this is the host's deterministic source.
-    // Best-effort and non-blocking: a failure here must not affect exit.
-    if (config.builderId) {
-      await stampSessionIdOntoResumeIntent(
-        config.builderId,
-        config.worktreePath,
-        detectedSessionId,
-        createStorage,
-      );
-    }
   }
 
   // Signal shutdown to host HTTP server (host-process mode without daemon MCP proxy)
@@ -169,6 +197,52 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   }
 
   process.exit(exitCode);
+}
+
+/**
+ * Verify the `lazy-agent` binary Claude Code will spawn for the MCP server is
+ * the real compiled lazy agent — not a bare Bun runtime, a stale build, or a
+ * placeholder mistakenly mounted at /usr/local/bin/lazy-agent.
+ *
+ * The check execs `<command> selfcheck` and matches the agent's sentinel line
+ * ('lazy-agent ok …'). A bare Bun binary errors "Script not found selfcheck"
+ * (non-zero, no sentinel); a placeholder/text file fails to exec. Either way we
+ * throw an actionable error rather than let Claude Code's MCP child fail
+ * silently with -32000 once the interactive session is already underway.
+ *
+ * Exported for testing.
+ */
+export async function preflightAgentBinary(command: string): Promise<void> {
+  let stdout = '';
+  let exitCode: number | null = null;
+  try {
+    const proc = spawn([command, 'selfcheck'], { stdout: 'pipe', stderr: 'pipe' });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    stdout = out;
+    exitCode = proc.exitCode;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Builder preflight failed: could not exec '${command} selfcheck' (${msg}). ` +
+      `The lazy-agent binary at /usr/local/bin/lazy-agent appears missing or not ` +
+      `executable — Claude Code's MCP server cannot start and the builder would have ` +
+      `no lazy_* tools. Rebuild/reinstall the agent binary and restart the builder.`,
+    );
+  }
+
+  if (exitCode !== 0 || !stdout.includes('lazy-agent ok')) {
+    const preview = stdout.trim().slice(0, 120) || '<no output>';
+    throw new Error(
+      `Builder preflight failed: '${command} selfcheck' did not identify the lazy ` +
+      `agent (exit ${exitCode}, output: ${preview}). The binary at ` +
+      `/usr/local/bin/lazy-agent is not the compiled lazy agent (likely bare Bun or a ` +
+      `stale/placeholder file). Claude Code's MCP server would fail to start (-32000) ` +
+      `and the builder would have no lazy_* tools. Rebuild/reinstall the agent binary ` +
+      `(e.g. 'lazy upgrade') and restart the builder.`,
+    );
+  }
+
+  log(`[builder] Preflight OK: ${stdout.trim()}`);
 }
 
 /**
@@ -194,18 +268,7 @@ export async function stampSessionIdOntoResumeIntent(
   let storage: import('../storage/interface').Storage | null = null;
   try {
     storage = await storageFactory(projectRoot);
-    const intents = await storage.listBuilderResumeIntents(projectRoot);
-    const existing = intents.find(i => i.builderId === builderId);
-    if (!existing) {
-      // No upgrade-written intent — normal exit, nothing to resume.
-      log(`[builder] No resume intent for ${builderId}; skipping sessionId stamp`);
-      return;
-    }
-    if (existing.sessionId === sessionId) {
-      return; // Already stamped (idempotent).
-    }
-    await storage.saveBuilderResumeIntent({ ...existing, sessionId });
-    log(`[builder] Stamped sessionId ${sessionId} onto resume intent ${builderId}`);
+    await stampSessionIdOnStorage(storage, builderId, projectRoot, sessionId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logError(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
@@ -214,6 +277,33 @@ export async function stampSessionIdOntoResumeIntent(
       await storage.close();
     }
   }
+}
+
+/**
+ * Same stamp against an ALREADY-OPEN storage handle, which it does not close.
+ *
+ * The capture monitor owns a live storage handle for the duration of its final
+ * flush; reopening one through the factory there would close the handle the
+ * monitor is still using (and close it twice). May throw — callers decide.
+ */
+export async function stampSessionIdOnStorage(
+  storage: import('../storage/interface').Storage,
+  builderId: string,
+  projectRoot: string,
+  sessionId: string,
+): Promise<void> {
+  const intents = await storage.listBuilderResumeIntents(projectRoot);
+  const existing = intents.find(i => i.builderId === builderId);
+  if (!existing) {
+    // No upgrade-written intent — normal exit, nothing to resume.
+    log(`[builder] No resume intent for ${builderId}; skipping sessionId stamp`);
+    return;
+  }
+  if (existing.sessionId === sessionId) {
+    return; // Already stamped (idempotent).
+  }
+  await storage.saveBuilderResumeIntent({ ...existing, sessionId });
+  log(`[builder] Stamped sessionId ${sessionId} onto resume intent ${builderId}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +429,62 @@ async function findActiveSessionFile(
 type StorageFactory = (lazyRoot: string) => Promise<import('../storage/interface').Storage>;
 
 /**
+ * Build a Storage that persists through the daemon over its TCP web server.
+ *
+ * The daemon MCP config (mounted into the container) carries the daemon's TCP
+ * `target` (`http://host.docker.internal:<webPort>`) and bearer token. The
+ * daemon exposes `/rpc/storage` on TCP, so a RemoteStorage over that target
+ * writes to the real host store — the same one `lazy builder list` reads —
+ * rather than to an unmounted, ephemeral in-container path. The daemon is the
+ * single storage owner, so this also honors the storage-ownership invariant.
+ */
+export async function daemonRemoteStorage(
+  daemonConfigPath: string,
+): Promise<import('../storage/interface').Storage> {
+  const { readDaemonMcpConfig } = await import('../daemon/mcp-proxy');
+  const { DaemonClient } = await import('../daemon/client');
+  const { RemoteStorage } = await import('../storage');
+  const cfg = readDaemonMcpConfig(daemonConfigPath);
+  // This client lives for the whole builder session — hours — so it WILL
+  // outlive daemon restarts. The daemon rewrites the mounted config in place
+  // when it restarts (refreshDaemonMcpConfigs), so re-reading that same trusted
+  // file on a 401 lets capture keep writing instead of silently 401ing away the
+  // rest of the session's conversations.
+  const client = DaemonClient.fromTarget(cfg.target, cfg.token, async () => {
+    const raw = await readFile(daemonConfigPath, 'utf-8');
+    const fresh = JSON.parse(raw) as { token?: string; target?: string };
+    return fresh.token && fresh.target ? { target: fresh.target, token: fresh.token } : null;
+  });
+  // getStoragePath doubles as a connectivity probe: if the daemon is
+  // unreachable this throws here, surfacing the failure instead of silently
+  // dropping the conversation. RemoteStorage needs the path for
+  // getStoragePath()/getTaskDir(); capture itself only uses saveConversation.
+  const storagePath = await client.rpc('storage', cfg.projectRoot, {
+    method: 'getStoragePath',
+    args: {},
+  }) as string;
+  return new RemoteStorage(client, cfg.projectRoot, storagePath);
+}
+
+/**
+ * Choose how the supervisor persists captured conversations.
+ *
+ * With a daemonConfigPath (daemon-proxy mode — every containerized builder),
+ * route through the daemon over TCP so writes reach the real host store. Only
+ * the legacy pre-daemon builder-server path falls back to a local FileStorage
+ * via `createStorage`. `createStorageFn` is injected for testability.
+ */
+export function buildBuilderStorageFactory(
+  daemonConfigPath: string | undefined,
+  createStorageFn: StorageFactory,
+): StorageFactory {
+  if (daemonConfigPath) {
+    return () => daemonRemoteStorage(daemonConfigPath);
+  }
+  return createStorageFn;
+}
+
+/**
  * Background conversation capture for the builder supervisor.
  *
  * Captures EVERY session file the run touches (Claude rolls to a new JSONL on
@@ -356,11 +502,21 @@ type StorageFactory = (lazyRoot: string) => Promise<import('../storage/interface
  * Capture errors are surfaced (logged at error level) — never swallowed — since
  * losing builder history silently is the bug this exists to prevent.
  */
-function startCaptureMonitor(
+export function startCaptureMonitor(
   lazyRoot: string,
   beforeSnapshot: SessionSnapshot,
   storageFactory: StorageFactory,
   resumeSessionId: string | null,
+  /**
+   * Called once, during the final flush, with the detected session id and the
+   * monitor's live (still-open) storage handle. The builder uses it to stamp the
+   * resume intent; running here rather than after `await proc.exited` is what
+   * makes the SIGTERM path stamp too (see the call site).
+   */
+  onFinalSession?: (
+    storage: import('../storage/interface').Storage,
+    sessionId: string,
+  ) => Promise<void>,
 ): { stop: () => Promise<string | null> } {
   const beforeTimes = snapshotToFileTimes(beforeSnapshot);
   // Tracks what we've already persisted so each pass only re-saves files that
@@ -449,11 +605,29 @@ function startCaptureMonitor(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logError(`[builder] Final capture failed: ${msg}`);
-    } finally {
-      if (storage) {
-        await storage.close();
-        storage = null;
+    }
+
+    // Resume-intent stamp. Deliberately OUTSIDE the capture try/catch and its own
+    // failure domain: a failed capture must not skip the stamp (the id comes from
+    // the filesystem scan, not from the save), and a failed stamp must not look
+    // like a capture failure. Both must run before storage closes below.
+    if (onFinalSession && lastDetectedSessionId) {
+      try {
+        await onFinalSession(await getStorage(), lastDetectedSessionId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logError(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
       }
+    }
+
+    if (storage) {
+      try {
+        await storage.close();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logError(`[builder] Failed to close storage after final capture: ${msg}`);
+      }
+      storage = null;
     }
     return lastDetectedSessionId;
   }

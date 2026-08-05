@@ -13,7 +13,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 export interface PairingLockInfo {
   pid: number;
@@ -93,7 +93,11 @@ export function acquirePairingLock(worktreePath: string): void {
   };
 
   const lockPath = getPairingLockPath(worktreePath);
-  const lockDir = join(worktreePath, '.lazy');
+  // Derive the directory from the lock path itself. This used to hardcode
+  // `<worktree>/.lazy`, which stopped being the lock's directory when the lock
+  // moved into `.lazy-task-sandbox/` — so on a worktree whose sandbox had not
+  // been created yet, pairing died with a raw ENOENT from writeFileSync.
+  const lockDir = dirname(lockPath);
   if (!existsSync(lockDir)) {
     mkdirSync(lockDir, { recursive: true });
   }

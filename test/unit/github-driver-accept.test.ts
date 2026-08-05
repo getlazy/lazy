@@ -16,7 +16,7 @@ const mockConfig: ResolvedConfig = {
   storage: { backend: 'external', external_path: '', postgres_ssl: false },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0, effort: 'medium' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
   server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
@@ -31,15 +31,17 @@ const mockConfig: ResolvedConfig = {
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '' },
-  runner: { type: 'docker' as const },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
-  automation: { maintain: [] },
+  protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true, passphrase_file: '.lazy/approve-passphrase' },
+  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
   mounts: [],
   checks: { post_turn: '', post_turn_timeout: 300 },
   ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10 },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -48,6 +50,8 @@ const mockConfig: ResolvedConfig = {
     auto_react_daily_budget: 50,
     max_auto_turns: 3,
   },
+  memory: { warn_bytes: 4096 },
+  proxy: null,
 };
 
 function makeTask(overrides?: Partial<Task>): Task {
@@ -58,6 +62,7 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Test prompt',
     type: 'task',
     status: 'working' as const,
+    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -67,6 +72,8 @@ function makeTask(overrides?: Partial<Task>): Task {
     agent_id: 'claude-code',
     metadata: { remote_ref_id: '42', remote_ref_url: 'https://github.com/o/r/pull/42' },
     pending_sync: 0,
+    runner_type: null,
+    tags: [],
     ...overrides,
   };
 }

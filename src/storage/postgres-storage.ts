@@ -8,6 +8,9 @@
 import postgres from 'postgres';
 import { randomUUID } from 'crypto';
 import type { Storage, CreateTurnOptions } from './interface';
+import { normalizeTurnContent } from '../utils/turn-content';
+import type { SpanRecord } from '../tracing/types';
+import { appendSpansJsonl, readSpansJsonl } from './trace-spans';
 import type {
   Task,
   TaskTarget,
@@ -32,14 +35,24 @@ import type {
   BuilderResumeIntent,
   StatusChange,
   Actor,
+  TagEvent,
+  MemoryRecord,
+  MemoryEvent,
+  MemoryWriteInput,
+  MemoryCompact,
+  MemoryCompactInput,
   FileViolation,
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  FeedbackDelivery,
 } from './types';
-import { isTerminalStatus, DEFAULT_TASK_TYPE, type TaskType } from '../types';
+import { isTerminalStatus, DEFAULT_TASK_TYPE, DEFAULT_TASK_PRIORITY, type TaskType } from '../types';
+import { normalizeTag } from '../utils/tags';
 import { targetFromLegacy, targetToLegacy } from '../task-target';
 import { assertValidTransition } from '../task-state-machine';
+import type { RunnerType } from '../config/types';
+import { turnText } from '../utils/turn-content';
 
 export interface PostgresStorageOptions {
   /** PostgreSQL connection URL (from LAZY_POSTGRES_URL env var) */
@@ -59,6 +72,69 @@ export interface PostgresStorageOptions {
   /** Connection pool size (default: 10) */
   max?: number;
 }
+
+/**
+ * INVARIANT (cross-backend row contract): an OPTIONAL (`?`) field on a domain
+ * type means "the key is absent when unset". FileStorage writes JSON that
+ * simply omits the key, and RemoteStorage forwards whatever the daemon's
+ * backend produced. A Postgres `SELECT *` instead hands back SQL NULL for
+ * every unset nullable column, so a consumer doing `'model' in turn` or
+ * `turn.model === undefined` would behave differently depending on which
+ * backend it happens to be talking to.
+ *
+ * Every Postgres reader therefore maps its rows through one of the
+ * `rowTo*`/`*_OPTIONAL_COLUMNS` pairs below, which delete the optional keys
+ * that came back NULL. Fields typed `| null` (start_sha, usage, outcome,
+ * session.ended_at, …) KEEP their null — null IS their unset value on every
+ * backend, and dropping it would be the same divergence in the other
+ * direction. `test/e2e/storage-contract.test.ts` pins both halves.
+ */
+function dropNullOptionals<T>(row: Record<string, unknown>, optionalColumns: readonly string[]): T {
+  for (const key of optionalColumns) {
+    if (row[key] === null) delete row[key];
+  }
+  return row as T;
+}
+
+/** Optional (`?`) fields of `Turn` — see `dropNullOptionals`. */
+const TURN_OPTIONAL_COLUMNS = [
+  'merge_conflicts',
+  'violations',
+  'model',
+  'prompt',
+  'actor',
+  'check_exit_code',
+  'check_output',
+  'auto_triggered',
+  'turn_type',
+  'feedback_delivery',
+] as const;
+
+/** JSONB columns on `turns` that must come back as structured values. */
+const TURN_JSON_COLUMNS = ['merge_conflicts', 'violations', 'usage'] as const;
+
+/** Optional (`?`) fields of `Comment`. */
+const COMMENT_OPTIONAL_COLUMNS = ['actor', 'source'] as const;
+
+/** Optional (`?`) fields of `JournalEntry`. */
+const JOURNAL_OPTIONAL_COLUMNS = ['actor'] as const;
+
+/** Optional (`?`) fields of `FollowUp`. */
+const FOLLOW_UP_OPTIONAL_COLUMNS = ['session_id'] as const;
+
+/** Optional (`?`) fields of `HunkApproval`. */
+const HUNK_APPROVAL_OPTIONAL_COLUMNS = [
+  'approved_by',
+  'parent_file',
+  'parent_lines',
+  'split_path',
+] as const;
+
+/** Optional (`?`) fields of `StatusChange` and `TagEvent`. */
+const ACTOR_ONLY_OPTIONAL_COLUMNS = ['actor'] as const;
+
+/** Optional (`?`) fields of `BuilderResumeIntent` (camelCase — see loadBuilderResumeIntent). */
+const BUILDER_RESUME_INTENT_OPTIONAL_COLUMNS = ['sessionId', 'upgradePid', 'upgradeHost'] as const;
 
 export class PostgresStorage implements Storage {
   private sql: ReturnType<typeof postgres>;
@@ -169,6 +245,24 @@ export class PostgresStorage implements Storage {
     if (version < 6) {
       await this.migrateToV6();
     }
+    if (version < 7) {
+      await this.migrateToV7();
+    }
+    if (version < 8) {
+      await this.migrateToV8();
+    }
+    if (version < 9) {
+      await this.migrateToV9();
+    }
+    if (version < 10) {
+      await this.migrateToV10();
+    }
+    if (version < 11) {
+      await this.migrateToV11();
+    }
+    if (version < 12) {
+      await this.migrateToV12();
+    }
   }
 
   private async migrateToV1(): Promise<void> {
@@ -193,10 +287,14 @@ export class PostgresStorage implements Storage {
           branched_from_sha TEXT,
           close_reason TEXT,
           metadata JSONB,
+          tags JSONB NOT NULL DEFAULT '[]'::jsonb,
           created_at BIGINT NOT NULL,
           completed_at BIGINT
         )
       `;
+
+      // Backfill the tags column on databases created before tagging existed.
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb`;
 
       await sql`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`;
       await sql`CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)`;
@@ -300,6 +398,18 @@ export class PostgresStorage implements Storage {
       await sql`
         DO $$ BEGIN
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS turn_type TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+
+      // Migration: add feedback_delivery column if missing (for existing
+      // databases). NULL means "this turn carries no redeliverable feedback",
+      // which is the correct reading for every pre-existing row — turns written
+      // before this column existed were already delivered or already crashed,
+      // and resurrecting them now would be a stale redelivery.
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS feedback_delivery TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
       `;
@@ -424,6 +534,20 @@ export class PostgresStorage implements Storage {
       `;
 
       await sql`CREATE INDEX IF NOT EXISTS idx_status_changelog_task_id ON status_changelog(task_id)`;
+
+      // Tag history table (append-only audit trail of every tag/untag)
+      await sql`
+        CREATE TABLE IF NOT EXISTS tag_history (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          tag TEXT NOT NULL,
+          action TEXT NOT NULL,
+          timestamp BIGINT NOT NULL,
+          actor TEXT
+        )
+      `;
+
+      await sql`CREATE INDEX IF NOT EXISTS idx_tag_history_task_id ON tag_history(task_id)`;
 
       // Conversations table
       await sql`
@@ -582,6 +706,162 @@ export class PostgresStorage implements Storage {
     });
   }
 
+  private async migrateToV7(): Promise<void> {
+    // Per-task runner override. NULL = inherit the global `[runner] type`.
+    // tasks.runner_type is the persisted override; sessions.runner_type is the
+    // runner the session actually launched on (the monitoring source of truth).
+    //
+    // Also add the `priority` column (queue ordering for concurrency-limited
+    // starts). NOT NULL DEFAULT 'normal' backfills every existing row in one
+    // statement.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS runner_type TEXT`;
+      await sql`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS runner_type TEXT`;
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (7, '6')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV8(): Promise<void> {
+    // Lazy-owned shared memory: named records + an append-only, actor-attributed
+    // write history. `memories.name` is the primary key — an update supersedes
+    // by name; `memory_history` is never rewritten (no UPDATE/DELETE on it).
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`
+        CREATE TABLE IF NOT EXISTS memories (
+          name TEXT PRIMARY KEY,
+          description TEXT NOT NULL,
+          type TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL,
+          created_by TEXT NOT NULL,
+          updated_by TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          deleted_at BIGINT,
+          deleted_by TEXT
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at DESC)`;
+      await sql`
+        CREATE TABLE IF NOT EXISTS memory_history (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          action TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          timestamp BIGINT NOT NULL,
+          revision INTEGER NOT NULL,
+          description TEXT,
+          type TEXT,
+          body TEXT
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS idx_memory_history_name ON memory_history(name)`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (8, '7')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV9(): Promise<void> {
+    // Builder resume intents gain the upgrade process's identity (pid + host).
+    // The builder wrapper now waits indefinitely for an upgrade to finish, and
+    // uses these to detect a DEAD upgrade instead of giving up on a timer.
+    // Nullable: intents written by an older lazy simply keep waiting.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE builder_resume_intents ADD COLUMN IF NOT EXISTS upgrade_pid INTEGER`;
+      await sql`ALTER TABLE builder_resume_intents ADD COLUMN IF NOT EXISTS upgrade_host TEXT`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (9, '8')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV10(): Promise<void> {
+    // The DERIVED memory compact: at most one per project, hence the
+    // single-row guard (`id` pinned to TRUE). No history table — a compact is
+    // regenerated from the live records, so a superseded one carries no
+    // information, and losing it only means injection falls back to the full
+    // index.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`
+        CREATE TABLE IF NOT EXISTS memory_compact (
+          id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+          content TEXT NOT NULL,
+          generated_at BIGINT NOT NULL,
+          generated_by TEXT NOT NULL,
+          method TEXT NOT NULL,
+          model TEXT,
+          covered JSONB NOT NULL
+        )
+      `;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (10, '9')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  /**
+   * Repair double-encoded JSONB on `turns`. createTurn/updateTurnViolations used to pass
+   * a JSON.stringify'd value into these JSONB columns, so postgres.js serialized it a
+   * second time: the column held a jsonb *string* scalar and read back as raw text
+   * instead of an object, silently corrupting violations, merge conflicts and usage.
+   * `#>> '{}'` extracts the inner text of such a scalar, which re-casts to real JSONB.
+   * Rows written correctly have jsonb_typeof <> 'string' and are left untouched.
+   */
+  private async migrateToV11(): Promise<void> {
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      for (const column of ['violations', 'merge_conflicts', 'usage'] as const) {
+        await sql`
+          UPDATE turns
+          SET ${sql(column)} = (${sql(column)} #>> '{}')::jsonb
+          WHERE ${sql(column)} IS NOT NULL AND jsonb_typeof(${sql(column)}) = 'string'
+        `;
+      }
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (11, '10')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV12(): Promise<void> {
+    // Two columns the domain types have always required but the Postgres
+    // schema never had:
+    //   - tasks.pending_sync — a required field of Task, and the target of
+    //     clearTaskPendingSync/incrementTaskPendingSync, which until now threw
+    //     `column "pending_sync" does not exist` on every call.
+    //   - turns.actor — CreateTurnOptions.actor was silently dropped, so
+    //     `turn.actor` (read by turn chunking, sync-turn detection, review,
+    //     report and show) was always undefined on this backend.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_sync INTEGER NOT NULL DEFAULT 0`;
+      await sql`ALTER TABLE turns ADD COLUMN IF NOT EXISTS actor TEXT`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (12, '11')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
   async createTask(
     goal: string,
     parentTaskId?: string,
@@ -635,12 +915,15 @@ export class PostgresStorage implements Storage {
       code: code ?? null,
       type: taskType,
       status: 'backlog',
+      priority: DEFAULT_TASK_PRIORITY,
       model: null,
       agent_id: resolvedAgentId,
+      runner_type: null,
       target,
       branched_from_sha: branchedFromSha ?? null,
       close_reason: null,
       metadata: null,
+      tags: [],
       created_at: now,
       completed_at: null,
       pending_sync: 0,
@@ -661,7 +944,12 @@ export class PostgresStorage implements Storage {
     const rawTarget = row.target as TaskTarget | null | undefined;
     const target = rawTarget ?? targetFromLegacy(parentTaskId, metadata?.remote_target_branch ?? null);
     const { parent_task_id: _parent, ...rest } = row as Record<string, unknown>;
-    return { ...rest, metadata, target } as unknown as Task;
+    // tags is a JSONB array; default to [] for rows predating the column.
+    const tags = Array.isArray(row.tags) ? (row.tags as string[]) : [];
+    // pending_sync is required on Task; rows predating the column read as
+    // undefined, which would make `task.pending_sync > 0` silently false.
+    const pendingSync = typeof row.pending_sync === 'number' ? row.pending_sync : 0;
+    return { ...rest, metadata, target, tags, pending_sync: pendingSync } as unknown as Task;
   }
 
   private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
@@ -730,6 +1018,7 @@ export class PostgresStorage implements Storage {
       ${options.blockedOnly ? this.sql`AND status IN ('blocked', 'conflict', 'submitted')` : this.sql``}
       ${options.backlogOnly ? this.sql`AND status = 'backlog'` : this.sql``}
       ${options.workingOnly ? this.sql`AND status = 'working'` : this.sql``}
+      ${options.queuedOnly ? this.sql`AND status = 'queued'` : this.sql``}
       ${options.interruptedOnly ? this.sql`AND status = 'interrupted'` : this.sql``}
       ${options.pairingOnly ? this.sql`AND status = 'pairing'` : this.sql``}
       ${options.mergingOnly ? this.sql`AND status = 'merging'` : this.sql``}
@@ -790,8 +1079,16 @@ export class PostgresStorage implements Storage {
     await this.sql`UPDATE tasks SET model = ${model} WHERE id = ${taskId}`;
   }
 
+  async updateTaskRunnerType(taskId: string, runnerType: RunnerType | null): Promise<void> {
+    await this.sql`UPDATE tasks SET runner_type = ${runnerType} WHERE id = ${taskId}`;
+  }
+
   async updateTaskType(taskId: string, type: string): Promise<void> {
     await this.sql`UPDATE tasks SET type = ${type} WHERE id = ${taskId}`;
+  }
+
+  async updateTaskPriority(taskId: string, priority: string): Promise<void> {
+    await this.sql`UPDATE tasks SET priority = ${priority} WHERE id = ${taskId}`;
   }
 
   async resetTaskPendingSync(taskId: string): Promise<void> {
@@ -920,6 +1217,7 @@ export class PostgresStorage implements Storage {
       upstream_merge_sha: null,
       agent_session_id: claudeSessionId ?? null,
       container_name: null,
+      runner_type: null,
       outcome: null,
       total_duration_ms: 0,
       total_usage: null,
@@ -936,29 +1234,47 @@ export class PostgresStorage implements Storage {
     };
   }
 
-  async getSession(sessionId: string): Promise<Session | null> {
-    const [exact] = await this.sql<Session[]>`SELECT * FROM sessions WHERE id = ${sessionId}`;
-    if (exact) return exact;
+  /**
+   * Map a raw `sessions` row into the domain Session. The column is still
+   * named `claude_session_id` (renaming it would need a migration on every
+   * deployment), but the domain field has been `agent_session_id` since the
+   * agent-agnostic rename — FileStorage rewrites the key on read, and this is
+   * the Postgres equivalent. Every `Session` field is required and nullable
+   * (`| null`), so there are no optional keys to drop here.
+   */
+  private rowToSession(row: Record<string, unknown>): Session {
+    const { claude_session_id: legacyId, ...rest } = row;
+    return {
+      ...rest,
+      agent_session_id: (rest.agent_session_id as string | null | undefined) ?? (legacyId as string | null | undefined) ?? null,
+    } as unknown as Session;
+  }
 
-    const prefixMatches = await this.sql<Session[]>`SELECT * FROM sessions WHERE id LIKE ${sessionId + '%'}`;
-    return prefixMatches.length === 1 ? prefixMatches[0] : null;
+  async getSession(sessionId: string): Promise<Session | null> {
+    const [exact] = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE id = ${sessionId}`;
+    if (exact) return this.rowToSession(exact);
+
+    const prefixMatches = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE id LIKE ${sessionId + '%'}`;
+    return prefixMatches.length === 1 ? this.rowToSession(prefixMatches[0]!) : null;
   }
 
   async getSessionByTaskId(taskId: string): Promise<Session | null> {
-    const [session] = await this.sql<Session[]>`SELECT * FROM sessions WHERE task_id = ${taskId}`;
-    return session ?? null;
+    const [session] = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE task_id = ${taskId}`;
+    return session ? this.rowToSession(session) : null;
   }
 
   async listSessions(taskId?: string, activeOnly?: boolean): Promise<Session[]> {
+    let rows: Record<string, unknown>[];
     if (taskId && activeOnly) {
-      return this.sql<Session[]>`SELECT * FROM sessions WHERE task_id = ${taskId} AND ended_at IS NULL`;
+      rows = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE task_id = ${taskId} AND ended_at IS NULL`;
     } else if (taskId) {
-      return this.sql<Session[]>`SELECT * FROM sessions WHERE task_id = ${taskId} ORDER BY started_at DESC`;
+      rows = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE task_id = ${taskId} ORDER BY started_at DESC`;
     } else if (activeOnly) {
-      return this.sql<Session[]>`SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC`;
+      rows = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC`;
     } else {
-      return this.sql<Session[]>`SELECT * FROM sessions ORDER BY started_at DESC`;
+      rows = await this.sql<Record<string, unknown>[]>`SELECT * FROM sessions ORDER BY started_at DESC`;
     }
+    return rows.map(row => this.rowToSession(row));
   }
 
   async endSession(sessionId: string, outcome: SessionOutcome): Promise<void> {
@@ -977,6 +1293,10 @@ export class PostgresStorage implements Storage {
 
   async updateSessionContainerName(sessionId: string, containerName: string | null): Promise<void> {
     await this.sql`UPDATE sessions SET container_name = ${containerName} WHERE id = ${sessionId}`;
+  }
+
+  async updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void> {
+    await this.sql`UPDATE sessions SET runner_type = ${runnerType} WHERE id = ${sessionId}`;
   }
 
   async updateSessionInteraction(sessionId: string, durationMs: number): Promise<void> {
@@ -1044,53 +1364,104 @@ export class PostgresStorage implements Storage {
     const id = randomUUID();
     const now = Date.now();
 
+    // INVARIANT: a persisted turn ALWAYS has string content. `content` is a NOT
+    // NULL column here, so an undefined would fail the insert outright and lose
+    // the turn — coerce and warn instead. See src/utils/turn-content.ts.
+    const content = normalizeTurnContent(options.content, 'postgres-storage');
+
     // Store NULL for the default 'work' so the column stays sparse — a
     // future 'comment' or 'hook' variant gets its own string value.
     const storedTurnType = options.turnType && options.turnType !== 'work' ? options.turnType : null;
+    // Feedback starts life unconsumed; NULL means "carries no feedback".
+    const storedFeedbackDelivery: FeedbackDelivery | null = options.carriesFeedback ? 'pending' : null;
+    // merge_conflicts/violations/usage are JSONB: pass the value through sql.json so
+    // postgres.js serializes it once. JSON.stringify here would double-serialize — the
+    // column ends up holding a jsonb *string* scalar and reads back as raw text, not an
+    // object (same trap documented on createConversation below).
     await this.sql`
       INSERT INTO turns (
-        id, session_id, sequence, role, content, model, prompt,
+        id, session_id, sequence, role, content, model, prompt, actor,
         start_sha, end_sha, start_sha_work, end_sha_work,
         merge_conflicts, violations, usage, timestamp,
-        check_exit_code, check_output, auto_triggered, turn_type
+        check_exit_code, check_output, auto_triggered, turn_type,
+        feedback_delivery
       )
       VALUES (
-        ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${options.content},
-        ${options.model ?? null}, ${options.prompt ?? null}, ${options.startSha ?? null}, ${options.endSha ?? null},
+        ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${content},
+        ${options.model ?? null}, ${options.prompt ?? null}, ${options.actor ?? null},
+        ${options.startSha ?? null}, ${options.endSha ?? null},
         ${options.startShaWork ?? null}, ${options.endShaWork ?? null},
-        ${options.mergeConflicts ? JSON.stringify(options.mergeConflicts) : null},
-        ${options.violations ? JSON.stringify(options.violations) : null},
-        ${options.usage ? JSON.stringify(options.usage) : null}, ${now},
+        ${options.mergeConflicts ? this.sql.json(options.mergeConflicts as any) : null},
+        ${options.violations ? this.sql.json(options.violations as any) : null},
+        ${options.usage ? this.sql.json(options.usage as any) : null}, ${now},
         ${options.checkExitCode ?? null}, ${options.checkOutput ?? null},
-        ${options.autoTriggered ?? false}, ${storedTurnType}
+        ${options.autoTriggered ?? false}, ${storedTurnType},
+        ${storedFeedbackDelivery}
       )
     `;
 
+    // Shape-identical to what getSessionTurns() returns for this row (and to
+    // FileStorage.createTurn): optional fields are omitted, not set to
+    // undefined — `'model' in turn` must agree with the reader.
     return {
       id,
       session_id: options.sessionId,
       sequence: options.sequence,
       role: options.role,
-      content: options.content,
-      model: options.model,
-      prompt: options.prompt,
+      content,
       start_sha: options.startSha ?? null,
       end_sha: options.endSha ?? null,
       start_sha_work: options.startShaWork ?? null,
       end_sha_work: options.endShaWork ?? null,
-      merge_conflicts: options.mergeConflicts,
-      violations: options.violations,
       usage: options.usage ?? null,
       timestamp: now,
+      ...(options.mergeConflicts ? { merge_conflicts: options.mergeConflicts } : {}),
+      ...(options.violations ? { violations: options.violations } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.prompt ? { prompt: options.prompt } : {}),
+      ...(options.actor ? { actor: options.actor } : {}),
       ...(options.checkExitCode !== undefined ? { check_exit_code: options.checkExitCode } : {}),
       ...(options.checkOutput !== undefined ? { check_output: options.checkOutput } : {}),
       ...(options.autoTriggered ? { auto_triggered: true } : {}),
       ...(storedTurnType ? { turn_type: storedTurnType } : {}),
+      ...(storedFeedbackDelivery ? { feedback_delivery: storedFeedbackDelivery } : {}),
     };
   }
 
+  /**
+   * Map a raw `turns` row into the domain Turn: SQL NULLs on optional columns
+   * become absent keys (see `dropNullOptionals`), and the JSONB columns come
+   * back as structured values rather than JSON text.
+   */
+  private rowToTurn(row: Record<string, unknown>): Turn {
+    // Legacy rows: merge_conflicts/violations/usage used to be written with
+    // JSON.stringify() into a JSONB column, which postgres.js stores as a JSON
+    // *string* — so the reader got '[{"file":…}]' where every other backend
+    // returns an array. New writes use sql.json (see createTurn); parse the
+    // old rows on read so both shapes converge.
+    for (const key of TURN_JSON_COLUMNS) {
+      if (typeof row[key] === 'string') {
+        try {
+          row[key] = JSON.parse(row[key] as string);
+        } catch (err) {
+          throw new Error(
+            `turn ${String(row.id)}: column "${key}" holds text that is not valid JSON: ${(err as Error).message}`
+          );
+        }
+      }
+    }
+    // auto_triggered is only meaningful when true. The column defaults to
+    // FALSE (and is NULL on rows predating it), where FileStorage omits the
+    // key entirely — consumers read it as a truthy flag.
+    if (row.auto_triggered !== true) delete row.auto_triggered;
+    return dropNullOptionals<Turn>(row, TURN_OPTIONAL_COLUMNS);
+  }
+
   async getSessionTurns(sessionId: string): Promise<Turn[]> {
-    return this.sql<Turn[]>`SELECT * FROM turns WHERE session_id = ${sessionId} ORDER BY sequence ASC`;
+    const rows = await this.sql<Record<string, unknown>[]>`
+      SELECT * FROM turns WHERE session_id = ${sessionId} ORDER BY sequence ASC
+    `;
+    return rows.map(row => this.rowToTurn(row));
   }
 
   async getNextTurnSequence(sessionId: string): Promise<number> {
@@ -1111,8 +1482,15 @@ export class PostgresStorage implements Storage {
 
   async updateTurnViolations(_taskId: string, turnId: string, violations: FileViolation[]): Promise<void> {
     await this.sql`
-      UPDATE turns SET violations = ${JSON.stringify(violations)}
+      UPDATE turns SET violations = ${this.sql.json(violations as any)}
       WHERE id = ${turnId}
+    `;
+  }
+
+  async markFeedbackConsumed(sessionId: string): Promise<void> {
+    await this.sql`
+      UPDATE turns SET feedback_delivery = 'consumed'
+      WHERE session_id = ${sessionId} AND feedback_delivery = 'pending'
     `;
   }
 
@@ -1238,11 +1616,18 @@ export class PostgresStorage implements Storage {
       VALUES (${id}, ${taskId}, ${content}, ${now}, ${actor ?? null}, ${source ?? null})
     `;
 
-    return { id, task_id: taskId, content, created_at: now, actor, source };
+    return {
+      id, task_id: taskId, content, created_at: now,
+      ...(actor ? { actor } : {}),
+      ...(source ? { source } : {}),
+    };
   }
 
   async getTaskComments(taskId: string): Promise<Comment[]> {
-    return this.sql<Comment[]>`SELECT * FROM comments WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+    const rows = await this.sql<Record<string, unknown>[]>`
+      SELECT * FROM comments WHERE task_id = ${taskId} ORDER BY created_at ASC
+    `;
+    return rows.map(row => dropNullOptionals<Comment>(row, COMMENT_OPTIONAL_COLUMNS));
   }
 
   async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
@@ -1254,11 +1639,14 @@ export class PostgresStorage implements Storage {
       VALUES (${id}, ${taskId}, ${content}, ${now}, ${actor ?? null})
     `;
 
-    return { id, task_id: taskId, content, created_at: now, actor };
+    return { id, task_id: taskId, content, created_at: now, ...(actor ? { actor } : {}) };
   }
 
   async getTaskJournal(taskId: string): Promise<JournalEntry[]> {
-    return this.sql<JournalEntry[]>`SELECT * FROM journal_entries WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+    const rows = await this.sql<Record<string, unknown>[]>`
+      SELECT * FROM journal_entries WHERE task_id = ${taskId} ORDER BY created_at ASC
+    `;
+    return rows.map(row => dropNullOptionals<JournalEntry>(row, JOURNAL_OPTIONAL_COLUMNS));
   }
 
   async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
@@ -1271,17 +1659,21 @@ export class PostgresStorage implements Storage {
       VALUES (${id}, ${taskId}, ${content}, ${now}, ${sessionId ?? null})
     `;
 
-    return { id, task_id: taskId, content, created_at: now, session_id: sessionId ?? null };
+    return { id, task_id: taskId, content, created_at: now, ...(sessionId ? { session_id: sessionId } : {}) };
   }
 
   async getTaskFollowUps(taskId: string): Promise<FollowUp[]> {
-    return this.sql<FollowUp[]>`SELECT * FROM follow_ups WHERE task_id = ${taskId} ORDER BY created_at ASC`;
+    const rows = await this.sql<Record<string, unknown>[]>`
+      SELECT * FROM follow_ups WHERE task_id = ${taskId} ORDER BY created_at ASC
+    `;
+    return rows.map(row => dropNullOptionals<FollowUp>(row, FOLLOW_UP_OPTIONAL_COLUMNS));
   }
 
   async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
-    return this.sql<HunkApproval[]>`
+    const rows = await this.sql<Record<string, unknown>[]>`
       SELECT * FROM hunk_approvals WHERE task_id = ${taskId} ORDER BY approved_at ASC
     `;
+    return rows.map(row => dropNullOptionals<HunkApproval>(row, HUNK_APPROVAL_OPTIONAL_COLUMNS));
   }
 
   async createHunkApproval(
@@ -1295,7 +1687,7 @@ export class PostgresStorage implements Storage {
     // Upsert without races: ON CONFLICT DO NOTHING returns the new row, or
     // nothing when an existing row already covers (task_id, hunk_hash). In
     // the latter case we SELECT the existing row.
-    const inserted = await this.sql<HunkApproval[]>`
+    const inserted = await this.sql<Record<string, unknown>[]>`
       INSERT INTO hunk_approvals (
         id, task_id, hunk_hash, approved_by, approved_at,
         parent_file, parent_lines, split_path
@@ -1307,11 +1699,11 @@ export class PostgresStorage implements Storage {
       ON CONFLICT (task_id, hunk_hash) DO NOTHING
       RETURNING *
     `;
-    if (inserted.length > 0) return inserted[0];
-    const [existing] = await this.sql<HunkApproval[]>`
+    if (inserted.length > 0) return dropNullOptionals<HunkApproval>(inserted[0]!, HUNK_APPROVAL_OPTIONAL_COLUMNS);
+    const [existing] = await this.sql<Record<string, unknown>[]>`
       SELECT * FROM hunk_approvals WHERE task_id = ${taskId} AND hunk_hash = ${hunkHash}
     `;
-    return existing;
+    return dropNullOptionals<HunkApproval>(existing!, HUNK_APPROVAL_OPTIONAL_COLUMNS);
   }
 
   async saveConversation(conversation: StoredConversation): Promise<void> {
@@ -1395,6 +1787,15 @@ export class PostgresStorage implements Storage {
     return (result?.count ?? 0) > 0;
   }
 
+  async deleteConversation(sessionId: string): Promise<boolean> {
+    // RETURNING makes the "did it exist?" answer part of the same statement —
+    // no pre-check, so two concurrent purges cannot both claim the same row.
+    const deleted = await this.sql<{ session_id: string }[]>`
+      DELETE FROM conversations WHERE session_id = ${sessionId} RETURNING session_id
+    `;
+    return deleted.length > 0;
+  }
+
   // --- Agent Session Logs (raw Claude Code JSONL) ---
 
   async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
@@ -1424,16 +1825,35 @@ export class PostgresStorage implements Storage {
     return row ?? null;
   }
 
+  // --- Proxy Audit (Tier-1 passive audit plane) ---
+  // PostgresStorage does not yet implement the audit plane — audit records are
+  // local to the daemon's FileStorage and are not replicated to Postgres. These
+  // stubs satisfy the Storage interface contract until a Postgres schema and
+  // migration are added.
+
+  async appendAuditRecord(_record: import('./types').ProxyAuditRecord): Promise<void> {
+    // No-op: Postgres audit plane not yet implemented.
+  }
+
+  async listAuditRecords(_options?: import('./types').ListAuditRecordsOptions): Promise<import('./types').ProxyAuditRecord[]> {
+    return [];
+  }
+
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 
   async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {
     await this.sql`
-      INSERT INTO builder_resume_intents (builder_id, project_root, session_id, created_at)
-      VALUES (${intent.builderId}, ${intent.projectRoot}, ${intent.sessionId ?? null}, ${intent.createdAt})
+      INSERT INTO builder_resume_intents (builder_id, project_root, session_id, created_at, upgrade_pid, upgrade_host)
+      VALUES (
+        ${intent.builderId}, ${intent.projectRoot}, ${intent.sessionId ?? null}, ${intent.createdAt},
+        ${intent.upgradePid ?? null}, ${intent.upgradeHost ?? null}
+      )
       ON CONFLICT (builder_id) DO UPDATE SET
         project_root = EXCLUDED.project_root,
         session_id = EXCLUDED.session_id,
-        created_at = EXCLUDED.created_at
+        created_at = EXCLUDED.created_at,
+        upgrade_pid = EXCLUDED.upgrade_pid,
+        upgrade_host = EXCLUDED.upgrade_host
     `;
   }
 
@@ -1447,12 +1867,16 @@ export class PostgresStorage implements Storage {
         builder_id AS "builderId",
         project_root AS "projectRoot",
         session_id AS "sessionId",
-        created_at AS "createdAt"
+        created_at AS "createdAt",
+        upgrade_pid AS "upgradePid",
+        upgrade_host AS "upgradeHost"
     `;
     if (!row) return null;
-    // Normalize SQL NULL session_id to an absent optional field.
-    if (row.sessionId === null) delete (row as { sessionId?: string }).sessionId;
-    return row;
+    // Normalize SQL NULLs to absent optional fields.
+    return dropNullOptionals<BuilderResumeIntent>(
+      row as unknown as Record<string, unknown>,
+      BUILDER_RESUME_INTENT_OPTIONAL_COLUMNS
+    );
   }
 
   async listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]> {
@@ -1462,7 +1886,9 @@ export class PostgresStorage implements Storage {
             builder_id AS "builderId",
             project_root AS "projectRoot",
             session_id AS "sessionId",
-            created_at AS "createdAt"
+            created_at AS "createdAt",
+            upgrade_pid AS "upgradePid",
+            upgrade_host AS "upgradeHost"
           FROM builder_resume_intents WHERE project_root = ${projectRoot} ORDER BY created_at DESC
         `
       : await this.sql<BuilderResumeIntent[]>`
@@ -1470,13 +1896,17 @@ export class PostgresStorage implements Storage {
             builder_id AS "builderId",
             project_root AS "projectRoot",
             session_id AS "sessionId",
-            created_at AS "createdAt"
+            created_at AS "createdAt",
+            upgrade_pid AS "upgradePid",
+            upgrade_host AS "upgradeHost"
           FROM builder_resume_intents ORDER BY created_at DESC
         `;
-    for (const row of rows) {
-      if (row.sessionId === null) delete (row as { sessionId?: string }).sessionId;
-    }
-    return rows;
+    return rows.map(row =>
+      dropNullOptionals<BuilderResumeIntent>(
+        row as unknown as Record<string, unknown>,
+        BUILDER_RESUME_INTENT_OPTIONAL_COLUMNS
+      )
+    );
   }
 
   private async recordStatusChange(taskId: string, status: string, timestamp: number, actor?: Actor): Promise<void> {
@@ -1488,16 +1918,242 @@ export class PostgresStorage implements Storage {
   }
 
   async getStatusHistory(taskId: string): Promise<StatusChange[]> {
-    return this.sql<StatusChange[]>`
+    const rows = await this.sql<Record<string, unknown>[]>`
       SELECT status, timestamp, actor FROM status_changelog WHERE task_id = ${taskId} ORDER BY timestamp ASC
     `;
+    return rows.map(row => dropNullOptionals<StatusChange>(row, ACTOR_ONLY_OPTIONAL_COLUMNS));
+  }
+
+  // --- Tags ---
+
+  private async recordTagEvent(taskId: string, event: TagEvent): Promise<void> {
+    const id = randomUUID();
+    await this.sql`
+      INSERT INTO tag_history (id, task_id, tag, action, timestamp, actor)
+      VALUES (${id}, ${taskId}, ${event.tag}, ${event.action}, ${event.timestamp}, ${event.actor ?? null})
+    `;
+  }
+
+  async addTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    const normalized = normalizeTag(tag);
+    if (!normalized) {
+      throw new Error(`Invalid tag '${tag}': normalizes to an empty string.`);
+    }
+    const task = await this.getTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+
+    // Idempotent: already tagged → no state change, no history event.
+    if (task.tags.includes(normalized)) {
+      return task;
+    }
+
+    const newTags = [...task.tags, normalized];
+    await this.sql`UPDATE tasks SET tags = ${this.sql.json(newTags)} WHERE id = ${task.id}`;
+    await this.recordTagEvent(task.id, {
+      tag: normalized,
+      action: 'tag',
+      timestamp: Date.now(),
+      ...(actor ? { actor } : {}),
+    });
+    return { ...task, tags: newTags };
+  }
+
+  async removeTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task> {
+    const normalized = normalizeTag(tag);
+    if (!normalized) {
+      throw new Error(`Invalid tag '${tag}': normalizes to an empty string.`);
+    }
+    const task = await this.getTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+
+    // Idempotent: not tagged → no state change, no history event.
+    if (!task.tags.includes(normalized)) {
+      return task;
+    }
+
+    const newTags = task.tags.filter(t => t !== normalized);
+    await this.sql`UPDATE tasks SET tags = ${this.sql.json(newTags)} WHERE id = ${task.id}`;
+    // Append-only: untag records an 'untag' event; it never erases the 'tag' event.
+    await this.recordTagEvent(task.id, {
+      tag: normalized,
+      action: 'untag',
+      timestamp: Date.now(),
+      ...(actor ? { actor } : {}),
+    });
+    return { ...task, tags: newTags };
+  }
+
+  async getTagHistory(taskId: string): Promise<TagEvent[]> {
+    const task = await this.getTask(taskId);
+    if (!task) return [];
+    const rows = await this.sql<Record<string, unknown>[]>`
+      SELECT tag, action, timestamp, actor FROM tag_history WHERE task_id = ${task.id} ORDER BY timestamp ASC
+    `;
+    return rows.map(row => dropNullOptionals<TagEvent>(row, ACTOR_ONLY_OPTIONAL_COLUMNS));
+  }
+
+  // --- Memory (lazy-owned shared knowledge) ---
+
+  /** Row → MemoryRecord: SQL NULLs become absent optional fields. */
+  private rowToMemory(row: Record<string, unknown>): MemoryRecord {
+    return {
+      name: row.name as string,
+      description: row.description as string,
+      type: row.type as MemoryRecord['type'],
+      body: row.body as string,
+      created_at: row.created_at as number,
+      updated_at: row.updated_at as number,
+      created_by: row.created_by as Actor,
+      updated_by: row.updated_by as Actor,
+      revision: row.revision as number,
+      ...(row.deleted_at != null ? { deleted_at: row.deleted_at as number } : {}),
+      ...(row.deleted_by != null ? { deleted_by: row.deleted_by as Actor } : {}),
+    };
+  }
+
+  async saveMemory(input: MemoryWriteInput, actor: Actor): Promise<MemoryRecord> {
+    const now = Date.now();
+
+    // Upsert + history append in one transaction so a record can never exist
+    // without the event that produced it (and vice versa). Saving a tombstoned
+    // name revives it (deleted_at/deleted_by cleared) — the delete event stays
+    // in history, which is append-only.
+    const record = await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      const [existing] = await sql<Record<string, unknown>[]>`
+        SELECT * FROM memories WHERE name = ${input.name} FOR UPDATE
+      `;
+      const revision = existing ? (existing.revision as number) + 1 : 1;
+      const createdAt = existing ? (existing.created_at as number) : now;
+      const createdBy = existing ? (existing.created_by as string) : actor;
+
+      const [row] = await sql<Record<string, unknown>[]>`
+        INSERT INTO memories (name, description, type, body, created_at, updated_at, created_by, updated_by, revision, deleted_at, deleted_by)
+        VALUES (${input.name}, ${input.description}, ${input.type}, ${input.body}, ${createdAt}, ${now}, ${createdBy}, ${actor}, ${revision}, NULL, NULL)
+        ON CONFLICT (name) DO UPDATE SET
+          description = EXCLUDED.description,
+          type = EXCLUDED.type,
+          body = EXCLUDED.body,
+          updated_at = EXCLUDED.updated_at,
+          updated_by = EXCLUDED.updated_by,
+          revision = EXCLUDED.revision,
+          deleted_at = NULL,
+          deleted_by = NULL
+        RETURNING *
+      `;
+
+      await sql`
+        INSERT INTO memory_history (id, name, action, actor, timestamp, revision, description, type, body)
+        VALUES (${randomUUID()}, ${input.name}, ${existing ? 'update' : 'create'}, ${actor}, ${now}, ${revision}, ${input.description}, ${input.type}, ${input.body})
+      `;
+
+      return row;
+    });
+
+    return this.rowToMemory(record as Record<string, unknown>);
+  }
+
+  async getMemory(name: string): Promise<MemoryRecord | null> {
+    const [row] = await this.sql<Record<string, unknown>[]>`
+      SELECT * FROM memories WHERE name = ${name} AND deleted_at IS NULL
+    `;
+    return row ? this.rowToMemory(row) : null;
+  }
+
+  async listMemories(options?: { includeDeleted?: boolean }): Promise<MemoryRecord[]> {
+    const rows = options?.includeDeleted
+      ? await this.sql<Record<string, unknown>[]>`SELECT * FROM memories ORDER BY updated_at DESC`
+      : await this.sql<Record<string, unknown>[]>`SELECT * FROM memories WHERE deleted_at IS NULL ORDER BY updated_at DESC`;
+    return rows.map(r => this.rowToMemory(r));
+  }
+
+  async deleteMemory(name: string, actor: Actor): Promise<MemoryRecord | null> {
+    const now = Date.now();
+    const record = await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      const [row] = await sql<Record<string, unknown>[]>`
+        UPDATE memories SET deleted_at = ${now}, deleted_by = ${actor}
+        WHERE name = ${name} AND deleted_at IS NULL
+        RETURNING *
+      `;
+      if (!row) return null; // absent or already tombstoned — idempotent
+
+      await sql`
+        INSERT INTO memory_history (id, name, action, actor, timestamp, revision)
+        VALUES (${randomUUID()}, ${name}, 'delete', ${actor}, ${now}, ${row.revision as number})
+      `;
+      return row;
+    });
+
+    return record ? this.rowToMemory(record as Record<string, unknown>) : null;
+  }
+
+  async getMemoryHistory(name?: string): Promise<MemoryEvent[]> {
+    const rows = name
+      ? await this.sql<Record<string, unknown>[]>`SELECT * FROM memory_history WHERE name = ${name} ORDER BY timestamp ASC`
+      : await this.sql<Record<string, unknown>[]>`SELECT * FROM memory_history ORDER BY timestamp ASC`;
+    return rows.map(row => ({
+      id: row.id as string,
+      name: row.name as string,
+      action: row.action as MemoryEvent['action'],
+      actor: row.actor as Actor,
+      timestamp: row.timestamp as number,
+      revision: row.revision as number,
+      ...(row.description != null ? { description: row.description as string } : {}),
+      ...(row.type != null ? { type: row.type as MemoryRecord['type'] } : {}),
+      ...(row.body != null ? { body: row.body as string } : {}),
+    }));
+  }
+
+  // --- Memory compact (derived; single row, overwritten on every recompact) ---
+
+  async saveMemoryCompact(input: MemoryCompactInput, actor: Actor): Promise<MemoryCompact> {
+    const now = Date.now();
+    await this.sql`
+      INSERT INTO memory_compact (id, content, generated_at, generated_by, method, model, covered)
+      VALUES (TRUE, ${input.content}, ${now}, ${actor}, ${input.method}, ${input.model ?? null},
+              ${this.sql.json(input.covered as any)})
+      ON CONFLICT (id) DO UPDATE SET
+        content = EXCLUDED.content,
+        generated_at = EXCLUDED.generated_at,
+        generated_by = EXCLUDED.generated_by,
+        method = EXCLUDED.method,
+        model = EXCLUDED.model,
+        covered = EXCLUDED.covered
+    `;
+    return {
+      content: input.content,
+      generated_at: now,
+      generated_by: actor,
+      method: input.method,
+      ...(input.model ? { model: input.model } : {}),
+      covered: input.covered,
+    };
+  }
+
+  async getMemoryCompact(): Promise<MemoryCompact | null> {
+    const [row] = await this.sql<Record<string, unknown>[]>`SELECT * FROM memory_compact WHERE id = TRUE`;
+    if (!row) return null;
+    return {
+      content: row.content as string,
+      generated_at: Number(row.generated_at),
+      generated_by: row.generated_by as Actor,
+      method: row.method as MemoryCompact['method'],
+      ...(row.model != null ? { model: row.model as string } : {}),
+      covered: (row.covered ?? []) as MemoryCompact['covered'],
+    };
+  }
+
+  async clearMemoryCompact(): Promise<boolean> {
+    const rows = await this.sql`DELETE FROM memory_compact WHERE id = TRUE RETURNING id`;
+    return rows.length > 0;
   }
 
   async search(query: string): Promise<SearchResult[]> {
     const pattern = `%${query}%`;
 
     // Run all queries in parallel since they're independent
-    const [taskRows, prompts, turns, commits, comments, followUps, conversations] = await Promise.all([
+    const [taskRows, prompts, turns, commits, comments, followUps, conversations, memories] = await Promise.all([
       this.sql`SELECT * FROM tasks WHERE goal ILIKE ${pattern}`,
 
       this.sql<(TaskPromptVersion & { task_goal: string; task_code: string | null })[]>`
@@ -1554,6 +2210,14 @@ export class PostgresStorage implements Storage {
           subagents
         FROM conversations WHERE summary ILIKE ${pattern}
       `,
+
+      // Live memory records only — a tombstoned record is no longer part of
+      // the project's knowledge (its content stays in memory_history).
+      this.sql<Record<string, unknown>[]>`
+        SELECT * FROM memories
+        WHERE deleted_at IS NULL
+          AND (name ILIKE ${pattern} OR description ILIKE ${pattern} OR body ILIKE ${pattern})
+      `,
     ]);
 
     const results: SearchResult[] = [];
@@ -1590,8 +2254,8 @@ export class PostgresStorage implements Storage {
         task_id: turn.task_id,
         task_code: turn.task_code,
         task_goal: turn.task_goal,
-        content: turn.content,
-        match_context: turn.content.slice(0, 200),
+        content: turnText(turn),
+        match_context: turnText(turn).slice(0, 200),
       });
     }
 
@@ -1631,6 +2295,19 @@ export class PostgresStorage implements Storage {
       });
     }
 
+    for (const row of memories) {
+      const memory = this.rowToMemory(row);
+      results.push({
+        entity_type: 'memory',
+        entity_id: memory.name,
+        task_id: memory.name,
+        task_code: null,
+        task_goal: `memory: ${memory.name}`,
+        content: memory.body,
+        match_context: memory.description,
+      });
+    }
+
     for (const conv of conversations) {
       results.push({
         entity_type: 'conversation',
@@ -1644,5 +2321,18 @@ export class PostgresStorage implements Storage {
     }
 
     return results;
+  }
+
+  // --- Tracing ---
+  // Spans are a local operational concern (daemon debugging), not shared
+  // domain state, so they persist as JSONL under the storage path rather than
+  // in Postgres — same format and location as the file backend.
+
+  async appendTraceSpans(spans: SpanRecord[]): Promise<void> {
+    await appendSpansJsonl(this.getStoragePath(), spans);
+  }
+
+  async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
+    return readSpansJsonl(this.getStoragePath(), sinceMs);
   }
 }

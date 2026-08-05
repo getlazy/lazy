@@ -11,6 +11,7 @@ import type { SandboxConfig } from '../capture/claude';
 import type { AgentResponse } from '../types';
 import type { RunnerType, RoleTarget } from '../config/types';
 import type { HealthCheck } from '../remote/driver';
+import type { BuilderLaunchProjects } from '../builder/projects-isolation';
 
 export type { RunnerType } from '../config/types';
 export type { HealthCheck };
@@ -34,6 +35,22 @@ export interface FollowHandle {
 
 export interface Runner {
   readonly type: RunnerType;
+
+  /**
+   * Whether an IDLE run of this runner holds enough resident host resources to
+   * justify the concurrency reaper's unconditional, grace-based **base reap**
+   * (bound RAM even with no queued demand).
+   *
+   * Container runners (docker/podman) keep a full resident container alive
+   * between turns (no idle reaper of their own) → true. The host-process runner
+   * leaves only a cheap idle Bun supervisor process → false, so its idle runs are
+   * exempt from base reaping.
+   *
+   * This flag governs BASE reaping only. DEMAND-driven reaping (free a slot for
+   * equal-or-higher-priority queued work) applies to every runner, since both are
+   * counted against the same concurrency cap — slot fairness is runner-agnostic.
+   */
+  readonly reapsIdleRuns: boolean;
 
   /**
    * Set the fully-resolved per-role model targets (from config.models.roles).
@@ -70,6 +87,13 @@ export interface Runner {
     protocolDir: string,
     debug?: boolean,
     daemonConfigPath?: string,
+    /**
+     * Short task id, threaded onto proxied agent traffic as `x-lazy-task-id` so
+     * the proxy audit plane can attribute each request to its task. Optional —
+     * omitted only where the caller lacks it (audit records then carry a null
+     * task id, as before).
+     */
+    taskId?: string,
   ): Promise<void>;
 
   /**
@@ -99,8 +123,20 @@ export interface Runner {
   /** Get logs from a run. */
   getRunLogs(runName: string, tailLines?: number): Promise<string | null>;
 
-  /** Stop a running process/container. Returns true if successfully stopped. */
-  stopRun(runName: string): Promise<boolean>;
+  /**
+   * Stop a running process/container. Returns true if successfully stopped.
+   *
+   * Default is an immediate kill: a task supervisor has no shutdown work to do,
+   * and a grace period there is pure latency in the daemon's hot path.
+   *
+   * `gracefulTimeoutSeconds` opts into a signalled shutdown instead — the run is
+   * asked to terminate and given that many seconds to exit before being killed.
+   * Pass it when the run has exit work worth waiting for; a BUILDER does (its
+   * supervisor flushes the conversation capture and stamps the resume session id
+   * from its signal handler — see src/supervisor/builder.ts), which is why
+   * `lazy upgrade` stops builders this way.
+   */
+  stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean>;
 
   /** Remove/cleanup a stopped run (container rm, PID file cleanup). */
   removeRun(runName: string): Promise<void>;
@@ -207,10 +243,12 @@ export interface Runner {
    * @param claudeExtraArgs    Additional args for Claude Code (e.g., --model)
    * @param debug              Enable debug logging
    * @param daemonConfigPath   Optional path to daemon MCP config (preferred over builder server)
-   * @param projectsDir        Optional host dir to mount at ~/.claude/projects so
-   *                           this builder gets an isolated Claude projects dir
-   *                           (per-builder session ownership). Ignored by runners
-   *                           that cannot isolate the projects dir (host-process).
+   * @param projects           Optional per-builder Claude projects dir to mount at
+   *                           ~/.claude/projects (session ownership isolation), with
+   *                           a trust signal telling the runner whether the dir is
+   *                           known-writable (holds the resume target) and so may be
+   *                           mounted despite a failing write-probe. Ignored by
+   *                           runners that cannot isolate the projects dir (host-process).
    * @returns Exit code and detected session ID (if available)
    */
   launchBuilderInteractive(
@@ -220,6 +258,6 @@ export interface Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
-    projectsDir?: string,
+    projects?: BuilderLaunchProjects,
   ): Promise<{ exitCode: number; sessionId: string | null }>;
 }

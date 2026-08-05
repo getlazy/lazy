@@ -4,4 +4,4 @@ export { evaluateQuery, buildSearchResults } from './evaluator';
 export type { TaskData } from './evaluator';
 export { getAllSearchableContent } from './searchable';
 export type { SearchableItem } from './searchable';
-export { structuredSearch } from './structured';
+export { structuredSearch, buildTagHint } from './structured';

@@ -53,9 +53,10 @@ function getLazyBinaryPath(): string {
 // Commands whose first positional is a task reference and that operate on
 // currently-active (working/blocked) tasks. Completed from `active --ids-only`.
 const ACTIVE_TASK_ID_COMMANDS = withAliases([
-  'show', 'start', 'edit', 'comment', 'journal', 'clone', 'unblock', 'review', 'resume',
+  'active',
+  'show', 'start', 'edit', 'comment', 'tag', 'untag', 'journal', 'clone', 'unblock', 'review', 'ask', 'resume',
   'branch', 'diff', 'status', 'shell', 'pair', 'accept', 'reject',
-  'close', 'submit', 'sync', 'wait', 'watch', 'doctor', 'stop', 'reparent',
+  'close', 'submit', 'sync', 'wait', 'watch', 'doctor', 'stop', 'reparent', 'approve',
 ]);
 
 // Commands whose first positional is a task reference but that operate on
@@ -63,7 +64,7 @@ const ACTIVE_TASK_ID_COMMANDS = withAliases([
 // would return nothing useful for these, so they complete from
 // `list --all --ids-only`, which includes terminal tasks.
 const ALL_TASK_ID_COMMANDS = withAliases([
-  'chat', 'reopen', 'revert', 'redo', 'rework',
+  'chat', 'reopen', 'revert', 'redo', 'rework', 'protect',
 ]);
 
 // Commands that dispatch to a fixed set of subcommands as their first
@@ -72,18 +73,19 @@ const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
   'system': ['prompts', 'build', 'status', 'offline', 'online', 'export-dockerfile'],
   'daemon': ['start', 'stop', 'restart', 'status', 'logs', 'auto-budget'],
   'config': ['set', 'get'],
+  'memory': ['list', 'show', 'save', 'rm', 'history'],
 });
 
 // All top-level commands. The literal is the canonical set (mirrors the
 // dispatcher in src/index.ts); withAliases() appends aliases like ls/tasks/
 // view/doc so they tab-complete too.
 const ALL_COMMANDS = withAliases([
-  'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'journal', 'clone',
+  'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'tag', 'untag', 'journal', 'memory', 'clone',
   'list', 'active', 'blocked', 'show', 'search', 'report',
-  'review', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
+  'review', 'ask', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
   'diff', 'status', 'shell', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
-  'close', 'redo', 'stop', 'reparent',
-  'link', 'import-conversation', 'propose', 'submit', 'sync',
+  'close', 'redo', 'stop', 'reparent', 'approve', 'protect',
+  'link', 'import-conversation', 'submit', 'sync',
   'daemon', 'server', 'config',
   'builder', 'init', 'doctor', 'upgrade', 'completion', 'system',
 ]);
@@ -91,20 +93,21 @@ const ALL_COMMANDS = withAliases([
 // Flags per command (only commands with flags are listed). Aliases inherit
 // their canonical command's flags via expandAliasKeys.
 const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
-  'create':              ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--agent'],
+  'create':              ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--agent', '--tag'],
   'start':               ['--model', '--agent', '--follow', '--yes', '--force-local'],
   'fix':                 ['--goal', '--prompt', '--model', '--code', '--parent'],
   'document':            ['--goal', '--prompt', '--model', '--code', '--parent'],
   'refactor':            ['--goal', '--prompt', '--model', '--code', '--parent'],
   'edit':                ['--goal', '--prompt', '--model', '--type', '--code', '--parent'],
   'clone':               ['--parent', '--default-parent', '--code', '--model'],
-  'list':                ['--all', '--flat', '--tree', '--ids-only'],
+  'list':                ['--all', '--flat', '--tree', '--ids-only', '--tag'],
   'active':              ['--flat', '--tree', '--follow', '--ids-only'],
-  'blocked':             ['--flat', '--tree'],
-  'show':                ['--full', '--lines', '--json'],
-  'search':              ['--fuzzy', '--group', '--json', '--tasks', '--prompts', '--turns', '--commits', '--notes', '--conversations'],
+  'blocked':             ['--flat', '--tree', '--tag'],
+  'show':                ['--full', '--chunks', '--flat', '--lines', '--json'],
+  'search':              ['--fuzzy', '--group', '--json', '--tasks', '--prompts', '--turns', '--commits', '--notes', '--conversations', '--memories'],
   'comment':             ['--message'],
   'journal':             ['--message', '--add'],
+  'memory':              ['--all', '--description', '--type', '--body', '--yes'],
   'close':               ['--yes', '--reason', '--accept-dirty-worktree'],
   'reject':              ['--yes', '--reason', '--accept-dirty-worktree'],
   'diff':                ['--turn', '--full', '--lines'],
@@ -114,6 +117,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'reopen':              ['--reason'],
   'revert':              ['--reason', '--yes'],
   'review':              ['--model', '--follow'],
+  'ask':                 ['--message', '--json'],
   'rework':              ['--goal', '--prompt', '--model', '--code', '--parent'],
   'redo':                ['--prompt', '--model', '--no-start', '--yes'],
   'pair':                ['--unlock', '--no-summary', '--resume', '--autonomous', '--yes'],
@@ -122,20 +126,20 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'wait':                ['--follow', '--next'],
   'submit':              ['--yes'],
   'link':                ['--parent', '--code'],
-  'import-conversation': ['--list', '--show-imported', '--show', '--all'],
+  'import-conversation': ['--list', '--show-imported', '--show', '--all', '--yes'],
   'builder':             ['--autonomous', '--yes', '--resume'],
   'daemon':              ['--foreground', '--background', '--project'],
   'server':              [],
   'config':              ['--task', '--reason'],
   'doctor':              ['--no-resume', '--dry-run', '--yes'],
   'init':                ['--toolchain', '--skip-auth-check', '--skip-remote-check', '--skip-github-check', '--skip-completion-check', '--non-interactive'],
-  'propose':             ['--goal', '--code', '--prompt', '--task'],
   'upgrade':             ['--force', '--dry-run'],
   'completion':          ['--bash', '--zsh'],
   'chat':                ['--effort'],
   'stop':                ['--reason', '--yes'],
   'reparent':            ['--parent', '--yes'],
   'report':              ['--start', '--end', '--pdf', '--out'],
+  'protect':             ['--branch', '--task'],
 });
 
 function generateBashScript(): string {

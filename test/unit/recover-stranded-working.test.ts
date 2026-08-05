@@ -23,12 +23,11 @@
  *      interrupted/auto-resume path — the sweep must not "recover" it to blocked.
  *
  *   3. Safety: liveness is authoritative. A genuinely-alive run (isRunning=true)
- *      is NEVER recovered — even with committed work and even with a stale
- *      turn-end marker present — because the marker means "the AGENT thinks it's
- *      done," not "the turn is done." The marker persists through legitimate
- *      post-turn finalization (post_turn_check / post_turn_sync / pushback)
- *      before the supervisor writes response.json; only that response finalizes
- *      a turn. Defense-in-depth: a not-alive run is still not recovered while its
+ *      is NEVER recovered, even with committed work — a live run is still inside
+ *      legitimate post-turn finalization (post_turn_check / post_turn_sync /
+ *      pushback) before the supervisor writes response.json, and only that
+ *      response finalizes a turn. No side channel may claim otherwise.
+ *      Defense-in-depth: a not-alive run is still not recovered while its
  *      status.json phase shows active harness work (a racy liveness probe guard).
  *
  *   4. The recovery transition `working → blocked` goes through the canonical
@@ -42,7 +41,6 @@ import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
 import { recoverStrandedWorkingTasks } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir, ensureProtocolDir, writeStatus } from '../../src/protocol';
-import { writeTurnEndSignal } from '../../src/protocol/turn-end-signal';
 import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
 import type { Runner } from '../../src/runner';
 import { spawnSync } from '../../src/utils/spawn';
@@ -193,31 +191,12 @@ describe('recoverStrandedWorkingTasks', () => {
     expect(task?.status).toBe('working');
   });
 
-  // INVARIANT 3 (regression): an ALIVE run with a STALE turn-end marker is still
-  // never recovered. The marker means "the agent thinks it's done" and persists
-  // through legitimate post-turn finalization (post_turn_check / post_turn_sync /
-  // pushback) before the supervisor writes response.json — recovering there would
-  // race the supervisor and corrupt the turn. Liveness, not the marker, decides.
-  test('does NOT recover an alive run even with a stale turn-end marker present', async () => {
-    const { ref, taskId } = await makeWorkingTask(env, 'finalizing, marker set', true);
-
-    // Simulate the agent having signalled end-of-turn a long time ago.
-    const protoDir = getProtocolDir(taskId);
-    ensureProtocolDir(protoDir);
-    await writeTurnEndSignal(protoDir, {
-      commit_sha: 'deadbeef',
-      written_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(), // 1h ago
-    });
-
-    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(true));
-
-    const task = await env.storage.getTask(ref);
-    expect(task?.status).toBe('working');
-
-    const session = await env.storage.getSessionByTaskId(ref);
-    const commits = await env.storage.getSessionCommits(session!.id);
-    expect(commits.length).toBe(0);
-  });
+  // The former companion test here fed a stale turn-end marker to an alive run.
+  // That marker no longer exists: `lazy_commit` stopped signalling end-of-turn
+  // (see src/supervisor/watchdog.ts), so there is nothing to make stale. The
+  // invariant it protected — liveness alone decides recovery, never a
+  // side-channel claim that the agent "is done" — is still covered by the test
+  // above and by the status-phase test below.
 
   // INVARIANT 3 (defense-in-depth): even with a dead-looking run, a task whose
   // status.json phase shows active post-work harness machinery is NOT recovered —

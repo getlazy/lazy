@@ -3,7 +3,8 @@ import { join } from 'path';
 import { readFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { taskDirFor } from '../helpers/storage';
 
 /**
  * Helper: create a task, start it (mocked), and accept it.
@@ -19,37 +20,19 @@ async function createAndAcceptTask(
   const createResult = await ctx.lazy(args);
   const taskId = extractTaskId(createResult.stdout);
 
-  // Start task (mock Claude making a commit)
-  await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-    env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-  });
-
-  // Accept task (merges to main)
-  const acceptResult = await ctx.lazy(['accept', taskId]);
-  if (acceptResult.exitCode !== 0) {
-    throw new Error(`Accept failed: ${acceptResult.stderr}\n${acceptResult.stdout}`);
-  }
+  // Start, drive the reconcile pass that moves the task out of 'working'
+  // (daemonless: nothing else does), then accept and merge to main.
+  await startAndAccept(ctx, taskId);
 
   return taskId;
-}
-
-/**
- * Helper: find a task directory by short ID prefix.
- */
-async function findTaskDir(root: string, taskShortId: string): Promise<string> {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const { readdir } = await import('fs/promises');
-  const dirs = await readdir(tasksDir);
-  const taskDir = dirs.find(d => d.startsWith(taskShortId));
-  if (!taskDir) throw new Error(`Task directory not found for ${taskShortId}`);
-  return join(tasksDir, taskDir);
 }
 
 /**
  * Helper: read task.json metadata for a task.
  */
 async function getTaskMetadata(root: string, taskShortId: string): Promise<Record<string, string> | null> {
-  const taskDir = await findTaskDir(root, taskShortId);
+  // Storage lives at the project's external_path, not <root>/.lazy/tasks.
+  const taskDir = taskDirFor(root, taskShortId);
   const taskJson = JSON.parse(await readFile(join(taskDir, 'task.json'), 'utf-8'));
   return taskJson.metadata ?? null;
 }
@@ -59,6 +42,8 @@ describe('lazy revert', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -86,7 +71,7 @@ describe('lazy revert', () => {
   test('fails for task with no session', async () => {
     const taskId = await createTask(ctx, 'No session task');
     // Manually update task to complete status via direct file manipulation
-    const taskDir = await findTaskDir(ctx.root, taskId);
+    const taskDir = taskDirFor(ctx.root, taskId);
     const taskJsonPath = join(taskDir, 'task.json');
     const taskJson = JSON.parse(await readFile(taskJsonPath, 'utf-8'));
     taskJson.status = 'complete';
@@ -188,6 +173,8 @@ describe('lazy accept revert task (continuation)', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -202,11 +189,9 @@ describe('lazy accept revert task (continuation)', () => {
     const revertResult = await ctx.lazy(['revert', taskId, '--reason', 'Needs fixes']);
     expectSuccess(revertResult);
 
-    // 3. Start and accept the revert task
-    const startResult = await ctx.lazyMocked(['start', 'revert-orig-work', '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    // 3. Start the revert task and drive the reconcile pass that moves it out
+    // of 'working' -- accept refuses a working task.
+    await startAndReconcile(ctx, 'revert-orig-work');
 
     // Accept the revert task (--yes will auto-create continuation)
     const acceptResult = await ctx.lazy(['accept', 'revert-orig-work', '--yes']);
@@ -222,9 +207,7 @@ describe('lazy accept revert task (continuation)', () => {
 
     await ctx.lazy(['revert', taskId, '--reason', 'Fix the approach']);
 
-    await ctx.lazyMocked(['start', 'revert-cont-test', '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, 'revert-cont-test');
     await ctx.lazy(['accept', 'revert-cont-test', '--yes']);
 
     // Show the continuation task
@@ -244,9 +227,7 @@ describe('lazy accept revert task (continuation)', () => {
 
     // Create and accept the revert
     await ctx.lazy(['revert', taskId, '--reason', 'V2 exists test']);
-    await ctx.lazyMocked(['start', 'revert-ver-test', '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, 'revert-ver-test');
     const acceptResult = await ctx.lazy(['accept', 'revert-ver-test', '--yes']);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'ver-test-v3');

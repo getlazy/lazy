@@ -5,29 +5,19 @@
  * its exit code and stderr output are captured, and the results
  * are attached to the turn for reviewers to see.
  *
- * Tests use --follow so that `lazy start` waits for the mock supervisor
- * to write response.json, then reconciles before exiting.
+ * The check runs as part of the reconcile pass that records the agent turn, so
+ * this daemonless suite drives that pass explicitly via `startAndReconcile`.
+ * `lazy start --follow` used to reconcile on the way out; post-v0.11 it does
+ * not, and only the daemon reconciles on its own.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { basename, join } from 'path';
-import { readFileSync, readdirSync, writeFileSync, existsSync, rmSync } from 'fs';
-import { homedir } from 'os';
+import { join } from 'path';
+import { readFileSync, writeFileSync, existsSync, rmSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-
-function getStorageDir(root: string): string {
-  return join(homedir(), '.lazy', basename(root));
-}
-
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(getStorageDir(root), 'tasks');
-  const dirs = readdirSync(tasksDir);
-  const match = dirs.find(d => d.startsWith(shortId));
-  if (!match) throw new Error(`Task directory not found for ${shortId} in ${tasksDir}`);
-  return match;
-}
+import { expectSuccess } from '../helpers/assertions';
+import { createTask, startAndReconcile } from '../helpers/fixtures';
+import { storageDirFor, taskFilePath } from '../helpers/storage';
 
 function readTurns(root: string, shortId: string): Array<{
   role: string;
@@ -35,8 +25,7 @@ function readTurns(root: string, shortId: string): Array<{
   check_exit_code?: number;
   check_output?: string;
 }> {
-  const fullId = findFullTaskId(root, shortId);
-  const turnsPath = join(getStorageDir(root), 'tasks', fullId, 'turns.json');
+  const turnsPath = taskFilePath(root, shortId, 'turns.json');
   const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
   return data.turns;
 }
@@ -49,7 +38,7 @@ describe('post-turn check', () => {
   });
 
   afterEach(async () => {
-    const storageDir = getStorageDir(ctx.root);
+    const storageDir = storageDirFor(ctx.root);
     if (existsSync(storageDir)) {
       rmSync(storageDir, { recursive: true, force: true });
     }
@@ -67,12 +56,9 @@ describe('post-turn check', () => {
 
     const taskId = await createTask(ctx, 'Do something', 'Do the thing');
 
-    const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(result);
+    // Daemonless: drive the reconcile pass that records the agent turn (and
+    // with it the post-turn check result). --follow no longer reconciles.
+    await startAndReconcile(ctx, taskId);
 
     const turns = readTurns(ctx.root, taskId);
     const agentTurn = turns.find(t => t.role === 'agent');
@@ -93,12 +79,9 @@ describe('post-turn check', () => {
 
     const taskId = await createTask(ctx, 'Do something', 'Do the thing');
 
-    const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(result);
+    // Daemonless: drive the reconcile pass that records the agent turn (and
+    // with it the post-turn check result). --follow no longer reconciles.
+    await startAndReconcile(ctx, taskId);
 
     const turns = readTurns(ctx.root, taskId);
     const agentTurn = turns.find(t => t.role === 'agent');
@@ -111,12 +94,9 @@ describe('post-turn check', () => {
   test('no check data when checks are not configured', async () => {
     const taskId = await createTask(ctx, 'Do something', 'Do the thing');
 
-    const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(result);
+    // Daemonless: drive the reconcile pass that records the agent turn (and
+    // with it the post-turn check result). --follow no longer reconciles.
+    await startAndReconcile(ctx, taskId);
 
     const turns = readTurns(ctx.root, taskId);
     const agentTurn = turns.find(t => t.role === 'agent');
@@ -141,12 +121,9 @@ describe('post-turn check', () => {
 
     const taskId = await createTask(ctx, 'Do something', 'Do the thing');
 
-    const result = await ctx.lazyMocked(
-      ['start', taskId, '--yes', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(result);
+    // Daemonless: drive the reconcile pass that records the agent turn (and
+    // with it the post-turn check result). --follow no longer reconciles.
+    await startAndReconcile(ctx, taskId);
 
     const turns = readTurns(ctx.root, taskId);
     const agentTurn = turns.find(t => t.role === 'agent');
@@ -172,11 +149,7 @@ describe('post-turn check', () => {
 
     const taskId = await createTask(ctx, 'Do something', 'Do the thing');
 
-    await ctx.lazyMocked(
-      ['start', taskId, '--yes', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
+    await startAndReconcile(ctx, taskId);
 
     const showResult = await ctx.lazy(['show', taskId, '--json']);
     expectSuccess(showResult);

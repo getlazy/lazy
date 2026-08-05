@@ -710,6 +710,14 @@ export async function recoverMissingWorktree(
 }
 
 /**
+ * Check whether a git remote is configured in this repo.
+ */
+export async function remoteExists(remoteName: string, cwd?: string): Promise<boolean> {
+  const result = await runGit(['remote', 'get-url', remoteName], { cwd });
+  return result.exitCode === 0;
+}
+
+/**
  * Fetch a branch from a remote and create a local tracking branch.
  *
  * Returns true if the branch was fetched and now exists locally,
@@ -721,6 +729,14 @@ export async function fetchRemoteBranch(
   remoteName: string = 'origin',
   cwd?: string,
 ): Promise<boolean> {
+  // A project with no such remote configured is a normal local-only setup, not
+  // a network failure — the branch simply isn't reachable anywhere. Retrying a
+  // fetch against a non-existent remote three times with backoff only delays a
+  // wrong, network-flavored error ("Check your network connection and retry").
+  if (!await remoteExists(remoteName, cwd)) {
+    return false;
+  }
+
   let branchNotOnRemote = false;
 
   await withRemoteRetry(
@@ -913,18 +929,68 @@ export async function getMergeBase(branch1: string, branch2: string, cwd?: strin
 }
 
 /**
+ * Simulate merging `sourceBranch` into `oursBranch` and report whether it
+ * conflicts — without touching the working tree or index.
+ *
+ * Uses `git merge-tree --write-tree` (git ≥2.38), which performs a real 3-way
+ * merge in-memory and communicates the outcome through its EXIT STATUS:
+ *   - exit 0  → clean merge
+ *   - exit 1  → merge conflict (conflicted paths are listed on stdout)
+ *   - exit ≥2 → error (bad ref, unsupported flag, corrupt repo, etc.)
+ *
+ * We deliberately do NOT scan stdout for the textual conflict markers (the
+ * 7-char "ours"/"theirs"/separator lines). Those sequences legitimately appear
+ * in committed file CONTENT — conflict-handling test fixtures, docs about merge
+ * conflicts — and a content grep false-positives on them, aborting accepts for
+ * merges that cannot actually conflict. The exit status reflects the merge
+ * algorithm's own verdict and is immune to content.
+ *
+ * (This comment itself avoids writing a literal 7-char marker run so that, until
+ * the fixed detector is deployed everywhere, the still-running pre-fix detector
+ * on the merging daemon does not false-positive on this very file.)
+ *
+ * Per CLAUDE.md (fail hard, no silent fallbacks): an error exit throws rather
+ * than being papered over as "no conflict" (which would let a broken check wave
+ * through an unmergeable branch) or as "conflict" (which would block a mergeable
+ * branch on a transient git error). Note that some git versions also return
+ * exit 1 when a ref cannot be resolved, so we validate both refs up front to
+ * keep exit 1 an unambiguous signal for a genuine conflict.
+ */
+async function mergeWouldConflict(oursBranch: string, sourceBranch: string, cwd?: string): Promise<boolean> {
+  // Resolve both refs first. merge-tree reports an unresolvable ref with the
+  // same exit 1 as a real conflict on some git versions (e.g. 2.39), so without
+  // this a typo'd branch would masquerade as a conflict. rev-parse --verify
+  // gives us a clear, actionable error naming the offending ref instead.
+  for (const ref of [oursBranch, sourceBranch]) {
+    const rev = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd });
+    if (rev.exitCode !== 0) {
+      throw new Error(
+        `Cannot check merge conflicts: ref '${ref}' does not resolve to a commit` +
+        `${cwd ? ` in ${cwd}` : ''}: ${rev.stderr || 'unknown ref'}`,
+      );
+    }
+  }
+
+  // With two commit args, merge-tree finds the merge base itself and performs
+  // the full recursive merge. `--write-tree` is the modern mode that surfaces
+  // conflicts via exit status; it is the default in git ≥2.38 but we pass it
+  // explicitly so behavior is pinned regardless of git's default mode.
+  const result = await runGit(['merge-tree', '--write-tree', oursBranch, sourceBranch], { cwd });
+
+  if (result.exitCode === 0) return false;
+  if (result.exitCode === 1) return true;
+
+  throw new Error(
+    `git merge-tree --write-tree ${oursBranch} ${sourceBranch} failed with exit code ${result.exitCode}` +
+    `${cwd ? ` in ${cwd}` : ''}: ${result.stderr || result.stdout || 'unknown error'}`,
+  );
+}
+
+/**
  * Check if merging fromBranch into current HEAD would result in conflicts.
- * Uses git merge-tree to detect conflicts without modifying the working directory.
  */
 export async function checkMergeConflicts(fromBranch: string, cwd?: string): Promise<boolean> {
-  // Get merge base between current HEAD and the branch we want to merge
-  const mergeBase = await getMergeBase('HEAD', fromBranch, cwd);
-
-  // Use git merge-tree to simulate the merge
-  const result = await runGit(['merge-tree', mergeBase, 'HEAD', fromBranch], { cwd });
-
-  // merge-tree outputs conflict markers if there are conflicts
-  return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
+  return await mergeWouldConflict('HEAD', fromBranch, cwd);
 }
 
 /**
@@ -932,14 +998,7 @@ export async function checkMergeConflicts(fromBranch: string, cwd?: string): Pro
  * Similar to checkMergeConflicts but allows specifying the target branch.
  */
 export async function checkMergeConflictsIntoTarget(sourceBranch: string, targetBranch: string, cwd?: string): Promise<boolean> {
-  // Get merge base between target branch and the source branch
-  const mergeBase = await getMergeBase(targetBranch, sourceBranch, cwd);
-
-  // Use git merge-tree to simulate the merge
-  const result = await runGit(['merge-tree', mergeBase, targetBranch, sourceBranch], { cwd });
-
-  // merge-tree outputs conflict markers if there are conflicts
-  return result.stdout.includes('<<<<<<<') || result.stdout.includes('>>>>>>>');
+  return await mergeWouldConflict(targetBranch, sourceBranch, cwd);
 }
 
 /**

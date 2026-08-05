@@ -28,18 +28,18 @@ import { theme, dim } from '../theme';
 import { getActor } from '../../constants';
 import { tmuxSessionName, killTmuxWatchSession } from '../../terminal';
 import { reparentChildren, formatReparentWarning } from '../orphan';
-import { readPendingProposals } from './propose';
 import { parentTaskIdOf } from '../../task-target';
+import { sanitizeUserText } from '../../utils/sanitize-text';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 
 import lazyToolInstructions from '../../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsText from '../../prompts/system-instructions.md' with { type: 'text' };
-import mergeInstructionsTemplate from '../../prompts/merge-instructions.md' with { type: 'text' };
 import goalContextContinueText from '../../prompts/goal-context-continue.md' with { type: 'text' };
 import { rm } from 'fs/promises';
 import { runGit } from '../../utils/git';
 import { latestWorkAgentTurn } from '../../utils/turns';
+import { turnText } from '../../utils/turn-content';
 
 const PROGRESS_POLL_MS = 1000;
 
@@ -69,7 +69,7 @@ export function buildTurnHistoryContext(turns: Turn[], maxChars: number = 80000)
 
   for (let i = turns.length - 1; i >= 0; i--) {
     const turn = turns[i];
-    const turnChars = turn.content.length + 50; // overhead for role label + formatting
+    const turnChars = turnText(turn).length + 50; // overhead for role label + formatting
     if (totalChars + turnChars > maxChars && selected.length > 0) break;
     selected.unshift(turn);
     totalChars += turnChars;
@@ -86,7 +86,7 @@ were made, and what feedback was given. Use this to continue the work effectivel
 
   const turnTexts = selected.map(t => {
     const role = t.role === 'human' ? 'HUMAN' : 'AGENT';
-    return `--- ${role} (turn ${t.sequence}) ---\n${t.content}`;
+    return `--- ${role} (turn ${t.sequence}) ---\n${turnText(t)}`;
   });
 
   return header + turnTexts.join('\n\n') + '\n\n--- END OF PREVIOUS CONVERSATION ---\n\n';
@@ -162,11 +162,20 @@ comments. Treat them as review feedback to consider alongside your task goal.
  * `chattinessSnippet` (when non-empty) is the rendered verbosity guidance and is
  * placed at the very TOP of the prompt so it gets the model's attention early.
  * Empty/omitted means no verbosity guidance is injected (unchanged behavior).
+ *
+ * `memorySection` (when non-empty) is the rendered shared-memory index — see
+ * `buildMemorySection` in src/memory. Agents are read-only on memory; the
+ * write gate is enforced server-side at the MCP boundary, not by this text.
  */
-export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet?: string): string {
+export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet?: string, memorySection?: string): string {
   let prompt = lazyToolInstructions + '\n' + systemInstructionsText;
   if (runnerInstructions) {
     prompt += '\n' + runnerInstructions;
+  }
+  // Shared-memory index (see src/memory). Empty when the project has no
+  // records, so nothing is injected until there is something to recall.
+  if (memorySection) {
+    prompt += '\n\n' + memorySection;
   }
   if (chattinessSnippet) {
     prompt = chattinessSnippet + '\n\n' + prompt;
@@ -175,26 +184,26 @@ export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet
 }
 
 /**
- * Build the full prompt sent to the agent, layering goal context,
- * merge instructions, and user feedback.
+ * Build the full prompt sent to the agent, layering goal context, turn
+ * history, notes, remote comments, and user feedback.
  * Does NOT include tool/system instructions (those go in the system prompt).
  *
  * Note: CLAUDE.md is NOT injected here — Claude Code reads it automatically.
+ *
+ * There is deliberately NO "merge upstream yourself" layer here. Upstream merge
+ * is sync's job, not unblock's, and agent containers mount .git in a mode that
+ * refuses ref-writing git commands — an agent told to run `git merge` would
+ * simply fail. The old merge-instructions.md prompt and its parentBranch
+ * parameter were removed once every caller was passing null.
  */
-export function buildPromptWithInstructions(userPrompt: string, goal: string, parentBranch: string | null, lazyRoot: string, turnHistory?: string, notesContext?: string, remoteCommentsContext?: string): string {
+export function buildPromptWithInstructions(userPrompt: string, goal: string, lazyRoot: string, turnHistory?: string, notesContext?: string, remoteCommentsContext?: string): string {
   // Layer 1: Goal context
   const goalContext = goalContextContinueText.replace(/\{\{goal\}\}/g, goal) + '\n\n';
-
-  // Layer 2: Sync-with-upstream instructions (if upstream has changes)
-  let mergeInstructions = '';
-  if (parentBranch) {
-    mergeInstructions = mergeInstructionsTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch) + '\n';
-  }
 
   const turnHistorySection = turnHistory ?? '';
   const notesSection = notesContext ?? '';
   const remoteCommentsSection = remoteCommentsContext ?? '';
-  return goalContext + turnHistorySection + notesSection + remoteCommentsSection + mergeInstructions + userPrompt;
+  return goalContext + turnHistorySection + notesSection + remoteCommentsSection + userPrompt;
 }
 
 /**
@@ -771,16 +780,6 @@ export async function showTaskContext(
     }
   }
 
-  // Show pending proposals
-  const pendingProposals = readPendingProposals(storage, taskId);
-  if (pendingProposals.length > 0) {
-    console.log(`\nProposals (${pendingProposals.length} pending):`);
-    for (const p of pendingProposals) {
-      const codeSuffix = p.code ? ` [${p.code}]` : '';
-      console.log(`  - ${p.goal}${codeSuffix}`);
-    }
-  }
-
   console.log('');
   return unseenNotes.length;
 }
@@ -791,6 +790,11 @@ export async function showTaskContext(
  * - { type: 'feedback', message, recoveryPath } - User provided feedback
  * - { type: 'accept' } - User wants to accept (interactive mode only)
  * - { type: 'return_to_menu' } - User declined, return to menu (interactive mode only)
+ *
+ * INTAKE BOUNDARY: every returned feedback message is passed through
+ * sanitizeUserText(). Editors can (and do) write raw control bytes; a NUL that
+ * survives to the delivery seam becomes argv[2] of `claude -p` and kills the
+ * spawn, crash-looping the turn and silently losing the human's feedback.
  */
 export async function getEditorFeedback(
   taskId: string,
@@ -860,7 +864,7 @@ export async function getEditorFeedback(
     // comparisonContent (with # placeholder where comments go).
     // The diff between comparison and edited produces comments as additions.
     const { editorContent, comparisonContent } = await buildEditorContentWithDiff(
-      lastAgentTurn.content, turnDiffResult, editorTaskId, taskGoal, newNotes, remoteUrl ?? undefined,
+      turnText(lastAgentTurn), turnDiffResult, editorTaskId, taskGoal, newNotes, remoteUrl ?? undefined,
     );
     console.log('Opening editor with agent\'s last response and code changes...');
     console.log('Edit the content to provide feedback, then save and close.\n');
@@ -909,7 +913,7 @@ export async function getEditorFeedback(
         if (fallback) {
           console.log('Enter feedback (Ctrl+D to finish):');
           const message = await readStdin();
-          return { type: 'feedback', message, recoveryPath: null, notesInEditor: newNotes.length > 0 };
+          return { type: 'feedback', message: sanitizeUserText(message), recoveryPath: null, notesInEditor: newNotes.length > 0 };
         } else {
           console.log('Cancelled.');
           process.exit(0);
@@ -917,7 +921,7 @@ export async function getEditorFeedback(
       }
     }
 
-    return { type: 'feedback', message: result.feedbackText, recoveryPath, notesInEditor: newNotes.length > 0 };
+    return { type: 'feedback', message: sanitizeUserText(result.feedbackText), recoveryPath, notesInEditor: newNotes.length > 0 };
   } else {
     // Even without agent turns, include unseen comments so the human can
     // review and forward them to the agent as part of the first feedback.
@@ -935,7 +939,7 @@ export async function getEditorFeedback(
     // For freeform, we also use the comparison baseline approach.
     // stripCommentLines removes # headers, then the diff captures comments.
     const message = stripCommentLines(edited);
-    return { type: 'feedback', message, recoveryPath, notesInEditor: allNotes.length > 0 };
+    return { type: 'feedback', message: sanitizeUserText(message), recoveryPath, notesInEditor: allNotes.length > 0 };
   }
 }
 

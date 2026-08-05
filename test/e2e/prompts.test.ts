@@ -20,7 +20,6 @@ describe('lazy system prompts', () => {
     expectSuccess(result);
     expectOutput(result, 'Built-in System Prompts');
     expectOutput(result, 'lazy-prompt-system-instructions');
-    expectOutput(result, 'lazy-prompt-merge-instructions');
     expectOutput(result, 'lazy-prompt-goal-context-start');
   });
 
@@ -32,10 +31,9 @@ describe('lazy system prompts', () => {
     expectOutput(result, 'lazy-prompt-goal-context-continue');
     expectOutput(result, 'lazy-prompt-goal-context-resume');
     expectOutput(result, 'lazy-prompt-goal-context-start');
-    expectOutput(result, 'lazy-prompt-system-prompt');
+    expectOutput(result, 'lazy-prompt-builder-system-prompt');
     expectOutput(result, 'lazy-prompt-tool-instructions');
     expectOutput(result, 'lazy-prompt-merge-conflict-resolution');
-    expectOutput(result, 'lazy-prompt-merge-instructions');
     expectOutput(result, 'lazy-prompt-model-guidance');
     expectOutput(result, 'lazy-prompt-remote-branch-merge');
     expectOutput(result, 'lazy-prompt-resume-context');
@@ -88,20 +86,26 @@ describe('lazy show <builtin-prompt>', () => {
   });
 
   test('shows another built-in prompt', async () => {
-    const result = await ctx.lazy(['show', 'lazy-prompt-merge-instructions']);
+    const result = await ctx.lazy(['show', 'lazy-prompt-goal-context-start']);
 
     expectSuccess(result);
     expectOutput(result, 'Prompt');
-    expectOutput(result, 'lazy-prompt-merge-instructions');
-    expectOutput(result, 'merge-instructions.md');
+    expectOutput(result, 'lazy-prompt-goal-context-start');
+    expectOutput(result, 'goal-context-start.md');
   });
 
-  test('shows a prompt whose filename used to start with lazy-', async () => {
-    const result = await ctx.lazy(['show', 'lazy-prompt-system-prompt']);
+  // The code is just BUILTIN_PROMPT_PREFIX + the filename stem, so a
+  // multi-word filename must round-trip verbatim — no stripping, no
+  // re-hyphenation. (This test used to target `lazy-prompt-system-prompt`;
+  // that file was renamed to builder-system-prompt.md in #138 and the code
+  // moved with it. Prompt codes are derived from filenames and have no
+  // rename aliases.)
+  test('shows a prompt whose filename has several hyphenated words', async () => {
+    const result = await ctx.lazy(['show', 'lazy-prompt-builder-system-prompt']);
 
     expectSuccess(result);
     expectOutput(result, 'Prompt');
-    expectOutput(result, 'lazy-prompt-system-prompt');
+    expectOutput(result, 'lazy-prompt-builder-system-prompt');
     expectOutput(result, 'builder-system-prompt.md');
   });
 

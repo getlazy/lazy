@@ -15,11 +15,17 @@
  */
 import { join } from 'path';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync } from 'fs';
-import { stat, readFile } from 'fs/promises';
+import { stat, readFile, mkdir, copyFile, access } from 'fs/promises';
 import { getHome } from '../../utils/home';
 import { encodeProjectPath } from '../../import/claude-code-logs';
+import type { RunnerType } from '../../config/types';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
+
+/** Container runners isolate the agent's `.claude` in the mounted sandbox dir. */
+function isContainerRunner(type: RunnerType): boolean {
+  return type === 'docker' || type === 'podman';
+}
 
 export interface BridgeResult {
   /** True if the session JSONL is accessible at the host's ~/.claude/projects/ */
@@ -297,4 +303,92 @@ export function bridgeSessionFiles(worktreePath: string, sessionId?: string): Br
   };
 
   return makeResult(accessible, cleanup, accessible ? [] : sandboxSessions);
+}
+
+/**
+ * Seed the sandbox with a host-written session JSONL so a container agent can
+ * `claude --resume <sessionId>` after a task switches from the host-process
+ * runner to a container runner.
+ *
+ * The reverse of {@link bridgeSessionFiles}: a symlink does NOT work here. The
+ * agent container is a separate mount namespace that mounts only the sandbox
+ * `.claude`; a symlink in the sandbox dir pointing at host `~/.claude` would
+ * dangle inside the container. So we COPY the real JSONL from
+ * `~/.claude/projects/<encoded>/<sid>.jsonl` into the mounted sandbox at
+ * `<worktree>/.lazy-task-sandbox/.claude/projects/<encoded>/<sid>.jsonl`.
+ */
+export async function seedSandboxFromHost(
+  worktreePath: string,
+  sessionId: string,
+): Promise<{ seeded: boolean; diagnostics: string[] }> {
+  const diagnostics: string[] = [];
+  const encodedPath = encodeProjectPath(worktreePath);
+  const hostSessionFile = join(getHome(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`);
+  const sandboxProjectDir = join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encodedPath);
+  const sandboxSessionFile = join(sandboxProjectDir, `${sessionId}.jsonl`);
+
+  diagnostics.push(`host session file:    ${hostSessionFile}`);
+  diagnostics.push(`sandbox session file: ${sandboxSessionFile}`);
+
+  try {
+    await access(hostSessionFile);
+  } catch {
+    diagnostics.push('host session file: not found — nothing to seed');
+    return { seeded: false, diagnostics };
+  }
+
+  // If the sandbox already has this session (e.g. shared inode via bind mount,
+  // or a prior seed), don't clobber it — the in-container agent may have
+  // appended turns the host copy doesn't have.
+  try {
+    await access(sandboxSessionFile);
+    diagnostics.push('sandbox session file: already present — leaving as-is');
+    return { seeded: true, diagnostics };
+  } catch {
+    // Not present — proceed to copy.
+  }
+
+  try {
+    await mkdir(sandboxProjectDir, { recursive: true });
+    await copyFile(hostSessionFile, sandboxSessionFile);
+    diagnostics.push('copied host session JSONL into sandbox');
+    return { seeded: true, diagnostics };
+  } catch (err) {
+    diagnostics.push(`failed to seed sandbox: ${err instanceof Error ? err.message : String(err)}`);
+    return { seeded: false, diagnostics };
+  }
+}
+
+/**
+ * Bridge an agent's session JSONL across a host↔container runner boundary so
+ * `claude --resume <sessionId>` finds it under the NEW runner before launch.
+ * Called at a launch point when a task switches runners since the session last
+ * ran. No-op when both runners are on the same side of the boundary.
+ *
+ *  - container → host: reuse {@link bridgeSessionFiles} (symlink sandbox→host).
+ *  - host → container: {@link seedSandboxFromHost} (copy host→sandbox).
+ */
+export async function bridgeSessionForRunnerSwitch(
+  worktreePath: string,
+  sessionId: string,
+  fromType: RunnerType,
+  toType: RunnerType,
+): Promise<{ bridged: boolean; diagnostics: string[] }> {
+  const fromContainer = isContainerRunner(fromType);
+  const toContainer = isContainerRunner(toType);
+
+  if (fromContainer === toContainer) {
+    // Same side of the boundary (host↔host or docker↔podman): the session file
+    // is already where the new runner looks for it. No bridging needed.
+    return { bridged: false, diagnostics: [`no boundary crossed (${fromType} → ${toType})`] };
+  }
+
+  if (fromContainer && !toContainer) {
+    const result = bridgeSessionFiles(worktreePath, sessionId);
+    return { bridged: result.accessible, diagnostics: result.diagnostics };
+  }
+
+  // host → container
+  const result = await seedSandboxFromHost(worktreePath, sessionId);
+  return { bridged: result.seeded, diagnostics: result.diagnostics };
 }

@@ -1,5 +1,6 @@
 import { requireStorage, shortId, displayId, formatDate, parseFlags, resolveTaskOrExit } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
+import { sanitizeUserText } from '../../utils/sanitize-text';
 import { getActor } from '../../constants';
 
 /**
@@ -18,7 +19,7 @@ import { getActor } from '../../constants';
  */
 export async function commandJournal(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
-    { name: 'message', takesValue: true },
+    { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'add', takesValue: false },
   ], 'journal');
 
@@ -95,7 +96,10 @@ export async function commandJournal(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const entry = await storage.appendJournalEntry(task.id, content.trim(), getActor());
+    // INTAKE BOUNDARY: journal entries are never injected into a prompt, but a
+    // raw NUL from a file/editor/pipe would still land in the store and corrupt
+    // every read surface. Escape at the door like every other text intake.
+    const entry = await storage.appendJournalEntry(task.id, sanitizeUserText(content).trim(), getActor());
     // Entry is now durably persisted — clean up recovery file. No signal is
     // emitted: journal entries are orchestration metadata, not agent guidance.
     if (recoveryPath) removeRecoveryFile(recoveryPath);
@@ -109,7 +113,7 @@ export async function commandJournal(args: string[]): Promise<void> {
 }
 
 export function journalUsage(): void {
-  console.log(`Usage: lazy journal <task_id> [--message "..."] [--add]
+  console.log(`Usage: lazy journal <task_id> [-m|--message "..."] [--add]
 
 Read or append to a task's journal — an append-only, prompt-immune side channel.
 
@@ -117,8 +121,8 @@ Arguments:
   <task_id>    ID of the task (can be shortened)
 
 Options:
-  --message "..."   Append this text as a journal entry
-  --add             Append a journal entry via \$EDITOR (interactive)
+  -m, --message "..."   Append this text as a journal entry
+  --add                 Append a journal entry via \$EDITOR (interactive)
 
 With no input, prints all journal entries (read mode).
 Append input priority: --message flag > piped stdin > --add (\$EDITOR).

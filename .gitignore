@@ -10,6 +10,9 @@ lazy-agent
 
 # But we DON'T want to track these:
 .lazy-task-sandbox/
+# Per-worktree session lock (src/utils/lock.ts). Never tracked: a tracked lock
+# makes every worktree that releases it show a spurious `D .lazy-lock`.
+.lazy-lock
 .lazy/worktrees/
 .lazy/bin/
 .lazy/logs/
@@ -28,6 +31,9 @@ src/version.ts
 
 # Generated build-info file (from scripts/generate-version.ts / scripts/build.ts)
 src/build-info.ts
+
+# Generated prompt bundle (from scripts/generate-prompt-bundle.ts)
+src/prompts-bundle.ts
 
 dist/
 

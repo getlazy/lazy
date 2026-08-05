@@ -3,13 +3,15 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('lazy reopen', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -20,9 +22,9 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to abandon then reopen');
 
     // Abandon the task
-    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Premature closure']);
-    expectSuccess(abandonResult);
-    expectOutput(abandonResult, 'abandoned');
+    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Premature closure']);
+    expectSuccess(closeResult);
+    expectOutput(closeResult, 'closed.');
 
     // Reopen it
     const reopenResult = await ctx.lazy(['reopen', taskId]);
@@ -40,14 +42,12 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to abandon then reopen', 'Do some work');
 
     // Start and let the mock agent "work"
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Abandon the task
-    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Wrong approach', '--yes']);
-    expectSuccess(abandonResult);
-    expectOutput(abandonResult, 'abandoned');
+    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Wrong approach', '--yes']);
+    expectSuccess(closeResult);
+    expectOutput(closeResult, 'closed.');
 
     // Reopen it
     const reopenResult = await ctx.lazy(['reopen', taskId]);
@@ -67,16 +67,14 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to start, abandon, then reopen', 'Do some work');
 
     // Start and let the mock agent "work"
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Abandon the task (should remove worktree but preserve branch)
-    const abandonResult = await ctx.lazy(['abandon', taskId, '--reason', 'Taking a different approach', '--yes']);
-    expectSuccess(abandonResult);
-    expectOutput(abandonResult, 'abandoned');
-    expectOutput(abandonResult, 'Worktree removed');
-    expectOutput(abandonResult, 'Branch preserved');
+    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Taking a different approach', '--yes']);
+    expectSuccess(closeResult);
+    expectOutput(closeResult, 'closed.');
+    expectOutput(closeResult, 'Worktree removed');
+    expectOutput(closeResult, 'Branch preserved');
 
     // Verify worktree directory is gone
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -96,16 +94,16 @@ describe('lazy reopen', () => {
   });
 
   test('fails to reopen a working task', async () => {
-    const taskId = await createTask(ctx, 'Working task');
+    const taskId = await createTask(ctx, 'Working task', 'Do some work');
 
-    // Start the task (it will be in working/blocked state)
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    // Start the task and reconcile it into a non-terminal (blocked) state.
+    await startAndReconcile(ctx, taskId);
 
     const result = await ctx.lazy(['reopen', taskId]);
     expectFailure(result);
-    expectError(result, 'only abandoned, closed, or complete tasks can be reopened');
+    // 'lazy close' is the CLI verb; the terminal STATUS it sets is still
+    // 'abandoned' (there is no 'closed' status in TaskStatus).
+    expectError(result, 'only abandoned or complete tasks can be reopened');
   });
 
   test('fails for nonexistent task', async () => {
@@ -118,9 +116,7 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to accept then reopen', 'Do some work');
 
     // Start and let the mock agent "work"
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Add a non-conflicting file in the worktree so accept has something to merge
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -155,9 +151,7 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to accept then reopen via stdin', 'Do some work');
 
     // Start and let the mock agent "work"
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Add a non-conflicting file in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -191,9 +185,7 @@ describe('lazy reopen', () => {
     const taskId = await createTask(ctx, 'Task to accept then reopen without reason', 'Do some work');
 
     // Start and let the mock agent "work"
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Add a non-conflicting file in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

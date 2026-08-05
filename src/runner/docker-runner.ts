@@ -10,7 +10,8 @@ import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RunnerType, RoleTarget } from '../config/types';
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { writeFile } from 'fs/promises';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
@@ -38,6 +39,14 @@ import {
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { encodeProjectPath } from '../import/claude-code-logs';
+import { shouldMountProjectsDir, type BuilderLaunchProjects } from '../builder/projects-isolation';
+import {
+  CONTAINER_CREDENTIAL_STORE,
+  builderClaudeConfigPath,
+  mergeBuilderClaudeConfig,
+  resolveBuilderClaudeConfigBase,
+  writeNeutralCredentialStore,
+} from '../builder/claude-home';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
@@ -69,6 +78,9 @@ const BUILDER_READ_ONLY_TOOLS = [
   'lazy_conversations',
   'lazy_conversation_search',
   'lazy_conversation_read',
+  // Reading shared memory is read-only; lazy_memory_save is a write and is
+  // deliberately absent, so it still requires user confirmation.
+  'lazy_memory_recall',
   'lazy_list',
   'lazy_blocked',
   'lazy_active',
@@ -86,6 +98,8 @@ export interface DockerRunnerOptions {
 export class DockerRunner implements Runner {
   readonly type: RunnerType;
   readonly runLabel = 'Container';
+  // An idle container stays fully resident between turns → eligible for base reap.
+  readonly reapsIdleRuns = true;
   protected readonly binary: string;
   private options: DockerRunnerOptions;
   private lazyRoot: string | undefined;
@@ -152,11 +166,12 @@ export class DockerRunner implements Runner {
     protocolDir: string,
     debug?: boolean,
     daemonConfigPath?: string,
+    taskId?: string,
   ): Promise<void> {
     // Fail hard before launch if the agent's backend is unreachable — never
     // silently fall back to a different backend (CLAUDE.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget());
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget(), taskId);
   }
 
   async runClaudeSync(
@@ -189,18 +204,35 @@ export class DockerRunner implements Runner {
     return getContainerLogs(runName, tailLines, this.binary);
   }
 
-  async stopRun(runName: string): Promise<boolean> {
+  async stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean> {
     try {
-      // Use `kill` (immediate SIGKILL), not `stop` (SIGTERM + ~10s grace + SIGKILL):
-      // there is no graceful shutdown to wait for — the agent's container is just
-      // being terminated. `stop`'s grace period is pure latency here.
+      // Default: `kill` (immediate SIGKILL), not `stop` (SIGTERM + ~10s grace +
+      // SIGKILL) — an agent's container has no graceful shutdown to wait for, and
+      // `stop`'s grace period is pure latency here.
       //
+      // `gracefulTimeoutSeconds` switches to `stop --time <n>`, which delivers
+      // SIGTERM (forwarded to the supervisor by the container's `--init` PID 1)
+      // and escalates to SIGKILL only if the container overstays. Builders are
+      // stopped this way by `lazy upgrade`: their supervisor's SIGTERM handler
+      // flushes the conversation capture and stamps the resume session id, and
+      // SIGKILL skipped both — which is what left an upgrade-relaunched builder
+      // with no session to resume.
+      const args = opts?.gracefulTimeoutSeconds != null
+        ? [this.binary, 'stop', '--time', String(opts.gracefulTimeoutSeconds), runName]
+        : [this.binary, 'kill', runName];
       // Async spawn (not spawnSync) because this runs in the daemon hot path
       // (stopTask in src/daemon/task-lifecycle.ts); a blocking spawn would freeze
       // the entire daemon event loop for the duration of the call.
+      //
+      // The docker CLI call itself must outlive the grace period it was asked to
+      // wait out, or the timeout would kill `docker stop` mid-wait and report a
+      // failure for a container that is shutting down exactly as instructed.
+      const timeout = opts?.gracefulTimeoutSeconds != null
+        ? DOCKER_TIMEOUT_MS + opts.gracefulTimeoutSeconds * 1000
+        : DOCKER_TIMEOUT_MS;
       const proc = spawn(
-        [this.binary, 'kill', runName],
-        { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+        args,
+        { stdout: 'ignore', stderr: 'ignore', timeout },
       );
       const exitCode = await proc.exited;
       return exitCode === 0;
@@ -457,7 +489,7 @@ export class DockerRunner implements Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
-    projectsDir?: string,
+    projects?: BuilderLaunchProjects,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
     // Fail hard before launch if the builder's backend is unreachable.
     await preflightRoleTarget('builder', this.builderTarget());
@@ -472,15 +504,22 @@ export class DockerRunner implements Runner {
     // credential from the daemon over RPC instead of from this process's env,
     // which in a daemon-only-env deployment legitimately has none. (Reading the
     // client env here was the cause of the spurious "Authentication required"
-    // failure on `lazy builder`.)
-    const authEnvVars = await resolveAuthEnvFromDaemon(this.builderTarget());
+    // failure on `lazy builder`.) Passing the config arms the proxy fail-loud
+    // gate on this last hop too: with [proxy] enabled, a builder that ends up
+    // with no proxy address fails instead of connecting direct.
+    const { loadConfig } = await import('../config/loader');
+    const config = await loadConfig(lazyRoot);
+    //
+    // The builder authenticates with the DAEMON's credential, exactly like a
+    // task agent and like pairing. It never falls back to the human's own
+    // ~/.claude/.credentials.json — see src/builder/claude-home.ts for why that
+    // store is deliberately shadowed inside the container.
+    const authEnvVars = await resolveAuthEnvFromDaemon(this.builderTarget(), { role: 'builder' }, 'container', config);
 
     // Read the builder config to get port for the container config
     const builderConfig = JSON.parse(readFileSync(builderConfigPath, 'utf-8'));
 
     // Get the data directory path for mounting
-    const { loadConfig } = await import('../config/loader');
-    const config = await loadConfig(lazyRoot);
     const dataDir = join(lazyRoot, config.data.path);
 
     // Write system prompt to a temp file in the data dir (accessible inside container)
@@ -519,31 +558,30 @@ export class DockerRunner implements Runner {
       mcpArgs = ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot];
     }
 
-    // Prepare merged Claude config: host's ~/.claude.json + lazy MCP server entry.
-    // Claude Code reads config from ~/.claude.json (at $HOME root, not inside ~/.claude/).
-    // We merge to a temp file so the host's real config is never modified.
-    const mergedConfigFile = join(tmpDir, `builder-claude-config-${Date.now()}.json`);
-    const hostConfigPath = join(getHome(), '.claude.json');
-    let hostConfig: Record<string, unknown> = {};
-    try {
-      if (existsSync(hostConfigPath)) {
-        hostConfig = JSON.parse(readFileSync(hostConfigPath, 'utf-8'));
-      }
-    } catch {
-      // Start fresh on parse error
-    }
-    const mergedConfig = {
-      ...hostConfig,
-      mcpServers: {
-        ...((hostConfig.mcpServers as Record<string, unknown>) ?? {}),
-        lazy: {
-          command: 'lazy-agent',
-          args: mcpArgs,
-        },
-      },
-    };
-    writeFileSync(mergedConfigFile, JSON.stringify(mergedConfig, null, 2) + '\n');
-    tempFilesToClean.push(mergedConfigFile);
+    // Prepare the builder's ~/.claude.json: persisted builder state (seeded once
+    // from the host's) + lazy's MCP server entry. Claude Code reads this at $HOME
+    // root, not inside ~/.claude/. It stays a separate file so the human's real
+    // config is never modified, but it is STABLE per project rather than a
+    // per-launch temp file — otherwise onboarding, folder-trust and model choices
+    // Claude Code writes during the session are discarded on exit and re-prompted
+    // on the next launch. Deliberately NOT added to tempFilesToClean.
+    const mergedConfigFile = builderClaudeConfigPath(dataDir);
+    const configBase = await resolveBuilderClaudeConfigBase(
+      mergedConfigFile,
+      join(getHome(), '.claude.json'),
+      (message) => logger.warn(message),
+    );
+    await writeFile(
+      mergedConfigFile,
+      JSON.stringify(mergeBuilderClaudeConfig(configBase, mcpArgs), null, 2) + '\n',
+    );
+
+    // Shadow the human's credential store inside the container. The builder runs
+    // on the daemon credential; leaving the host's ~/.claude/.credentials.json
+    // readable let Claude Code's 401-recovery path swap that credential for the
+    // host's stale one and then demand /login. See src/builder/claude-home.ts.
+    const neutralCredentialStore = await writeNeutralCredentialStore(tmpDir, builderId);
+    tempFilesToClean.push(neutralCredentialStore);
 
     // Pre-approve read-only lazy MCP tools so the builder doesn't prompt for permission.
     // Mutating tools (create, start, accept, etc.) still require user confirmation.
@@ -558,96 +596,52 @@ export class DockerRunner implements Runner {
     // started against an unwritable overlay it would fail to create session
     // JSONL — breaking the builder. So we PROBE first and fall back to the
     // shared ~/.claude/projects dir (today's behavior) when the probe fails.
+    //
+    // EXCEPTION (the residual auto-resume fix): when host-side resolution located
+    // this dir because it ALREADY HOLDS the resume target's session
+    // (projects.trustWritable), the dir is known-writable — Claude wrote that
+    // session's JSONL into it through a container user that could write there. A
+    // write-probe can transiently fail (e.g. a `docker run` timeout under upgrade
+    // load); letting that flip drop the mount would strand `--resume`, since the
+    // session lives ONLY in this dir. So we skip the probe and mount it. A fresh
+    // (untrusted) dir has no session at stake, so the probe still gates it.
     let useProjectsMount = false;
-    if (projectsDir) {
-      useProjectsMount = await this.probeProjectsDirWritable(projectsDir, imageName);
+    if (projects) {
+      const probeWritable = projects.trustWritable
+        ? true // known-writable — skip the probe (avoids a transient-failure flip)
+        : await this.probeProjectsDirWritable(projects.hostDir, imageName);
+      useProjectsMount = shouldMountProjectsDir({ trustWritable: projects.trustWritable, probeWritable });
       if (!useProjectsMount) {
         logger.warn(
           `Per-builder Claude projects isolation is disabled for this run: the container ` +
-          `user could not write the isolation dir (${projectsDir}). Falling back to the ` +
+          `user could not write the isolation dir (${projects.hostDir}). Falling back to the ` +
           `shared ~/.claude/projects dir. Concurrent builders may cross-capture sessions ` +
           `this run; single-builder /clear-resume is unaffected.`,
         );
       }
     }
 
-    // Build container args: launch lazy-agent in builder mode
-    // --init provides a proper PID 1 init process (tini/catatonit) that forwards
-    // signals and reaps zombies. Required for Podman where conmon doesn't provide
-    // PID 1 protection, and harmless for Docker. Without it, interactive applications
-    // (like Claude Code's trust prompt TUI) can hang in Podman after terminal mode
-    // switches — see https://github.com/google-gemini/gemini-cli/issues/17275.
-    const dockerArgs = [
-      this.binary, 'run', '-it', '--init', '--rm',
-      '--name', `lazy-builder-${builderId}`,
-      // Scope this container to the project. Other projects' `lazy upgrade`,
-      // discovery, and cleanup commands filter on this label to avoid
-      // cross-project interference (see discoverProjectBuilderRuns).
-      '--label', `${PROJECT_LABEL}=${lazyRoot}`,
-      // Allow container to reach host TCP server via host.docker.internal
-      // (built-in on macOS Docker Desktop; needs this flag on Linux)
-      '--add-host=host.docker.internal:host-gateway',
-      // Mount repo READ-ONLY — all writes happen on host via HTTP
-      '-v', `${lazyRoot}:${lazyRoot}:ro`,
-      // Mount data dir read-write (conversation capture needs write access)
-      '-v', `${dataDir}:${dataDir}`,
-      // Container-specific builder config (has host.docker.internal)
-      '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
-      // MCP binary for proxy tool access
-      '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
-      // Claude config dir (settings, conversations, credentials) — mount to container's home
-      // so Claude Code finds them at $HOME/.claude and $HOME/.claude.json without needing
-      // to override HOME (which would cause warnings about missing .local/bin).
-      '-v', `${getHome()}/.claude:/home/user/.claude`,
-      // Per-builder projects isolation: overlay a dedicated host dir at
-      // ~/.claude/projects (a deeper, more-specific bind than the ~/.claude mount
-      // above, so it shadows only the projects subtree). This gives THIS builder
-      // its own Claude session JSONL dir, so post-/clear session ownership is
-      // evidence-based and concurrent builders never cross-capture. Creds/settings/
-      // .claude.json stay shared via the ~/.claude mount. See projects-isolation.ts.
-      // Gated on the write-probe above so an unwritable overlay never breaks the run.
-      ...(useProjectsMount ? ['-v', `${projectsDir}:/home/user/.claude/projects`] : []),
-      // Merged Claude config with MCP server entry (writable — Claude Code updates it on startup)
-      '-v', `${mergedConfigFile}:/home/user/.claude.json`,
-      // Auth
-      ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
-      // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
-      '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
-      // Working directory
-      '-w', lazyRoot,
-    ];
-
-    // Mount daemon config file if using daemon proxy
-    if (useDaemonProxy && daemonConfigPath) {
-      dockerArgs.push('-v', `${daemonConfigPath}:${daemonConfigPath}:ro`);
-    }
-
-    dockerArgs.push(
+    // Build container args: launch lazy-agent in builder mode.
+    const dockerArgs = buildBuilderDockerArgs({
+      binary: this.binary,
+      builderId,
+      lazyRoot,
+      dataDir,
+      containerConfigFile,
+      agentBinaryPath,
+      home: getHome(),
+      projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
+      neutralCredentialStore,
+      mergedConfigFile,
+      authEnvVars,
       imageName,
-      // Run the builder supervisor (not Claude directly)
-      'lazy-agent', 'builder',
-      '--system-prompt-file', promptFile,
-      '--worktree', lazyRoot,
-      // Use container config (host.docker.internal) not the host config (127.0.0.1)
-      '--builder-config', containerConfigFile,
-      // Stable builder id so the supervisor can stamp the detected Claude
-      // sessionId onto this builder's resume intent on exit (host gets
-      // sessionId: null from the runner — only the supervisor knows the id).
-      '--builder-id', builderId,
-    );
-
-    // Pass daemon config to builder supervisor if available
-    if (useDaemonProxy && daemonConfigPath) {
-      dockerArgs.push('--daemon-config', daemonConfigPath);
-    }
-
-    // Pass through extra Claude args after --
-    if (claudeExtraArgs.length > 0) {
-      dockerArgs.push('--', ...claudeExtraArgs);
-    }
+      promptFile,
+      daemonConfigPath: useDaemonProxy ? daemonConfigPath : undefined,
+      claudeExtraArgs,
+      debug: debug ?? false,
+    });
 
     if (debug) {
-      dockerArgs.splice(dockerArgs.indexOf(imageName), 0, '-e', 'DEBUG=1');
       console.log('[DEBUG] Running builder container command:', dockerArgs.join(' '));
     }
 
@@ -673,4 +667,133 @@ export class DockerRunner implements Runner {
 
     return { exitCode, sessionId: null };
   }
+}
+
+export interface BuilderDockerArgsParams {
+  binary: string;
+  builderId: string;
+  lazyRoot: string;
+  dataDir: string;
+  containerConfigFile: string;
+  agentBinaryPath: string;
+  /** Host home dir — source of the ~/.claude mount. */
+  home: string;
+  /** Per-builder Claude projects dir, when the write-probe cleared it. */
+  projectsHostDir?: string;
+  neutralCredentialStore: string;
+  mergedConfigFile: string;
+  authEnvVars: Array<{ key: string; value: string }>;
+  imageName: string;
+  promptFile: string;
+  /** Path to this builder's daemon MCP config, when running in daemon proxy mode. */
+  daemonConfigPath?: string;
+  claudeExtraArgs: string[];
+  debug: boolean;
+}
+
+/**
+ * Container argv for an interactive builder.
+ *
+ * Split out of launchBuilderInteractive so the mount set is inspectable without
+ * running Docker: test/unit/daemon-dir-never-mounted.test.ts asserts that no
+ * mount source exposes the daemon state dir — see the INVARIANT comment there.
+ *
+ * --init provides a proper PID 1 init process (tini/catatonit) that forwards
+ * signals and reaps zombies. Required for Podman where conmon doesn't provide
+ * PID 1 protection, and harmless for Docker. Without it, interactive applications
+ * (like Claude Code's trust prompt TUI) can hang in Podman after terminal mode
+ * switches — see https://github.com/google-gemini/gemini-cli/issues/17275.
+ */
+export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[] {
+  const {
+    binary, builderId, lazyRoot, dataDir, containerConfigFile, agentBinaryPath,
+    home, projectsHostDir, neutralCredentialStore, mergedConfigFile, authEnvVars,
+    imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug,
+  } = params;
+
+  const dockerArgs = [
+    binary, 'run', '-it', '--init', '--rm',
+    '--name', `lazy-builder-${builderId}`,
+    // Scope this container to the project. Other projects' `lazy upgrade`,
+    // discovery, and cleanup commands filter on this label to avoid
+    // cross-project interference (see discoverProjectBuilderRuns).
+    '--label', `${PROJECT_LABEL}=${lazyRoot}`,
+    // Allow container to reach host TCP server via host.docker.internal
+    // (built-in on macOS Docker Desktop; needs this flag on Linux)
+    '--add-host=host.docker.internal:host-gateway',
+    // Mount repo READ-ONLY — all writes happen on host via HTTP
+    '-v', `${lazyRoot}:${lazyRoot}:ro`,
+    // Mount data dir read-write (conversation capture needs write access)
+    '-v', `${dataDir}:${dataDir}`,
+    // Container-specific builder config (has host.docker.internal)
+    '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
+    // MCP binary for proxy tool access
+    '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+    // Claude config dir (settings, conversations, credentials) — mount to container's home
+    // so Claude Code finds them at $HOME/.claude and $HOME/.claude.json without needing
+    // to override HOME (which would cause warnings about missing .local/bin).
+    '-v', `${home}/.claude:/home/user/.claude`,
+    // Per-builder projects isolation: overlay a dedicated host dir at
+    // ~/.claude/projects (a deeper, more-specific bind than the ~/.claude mount
+    // above, so it shadows only the projects subtree). This gives THIS builder
+    // its own Claude session JSONL dir, so post-/clear session ownership is
+    // evidence-based and concurrent builders never cross-capture. Creds/settings/
+    // .claude.json stay shared via the ~/.claude mount. See projects-isolation.ts.
+    // Gated on the write-probe above so an unwritable overlay never breaks the run.
+    ...(projectsHostDir ? ['-v', `${projectsHostDir}:/home/user/.claude/projects`] : []),
+    // Credential-store isolation: another deeper, more-specific bind over the
+    // ~/.claude mount, shadowing ONLY .credentials.json with an empty store.
+    // The builder authenticates from the daemon credential in its env; leaving
+    // the human's real record visible let a single transient 401 replace that
+    // credential with the host's stale token and strand the builder in /login.
+    // Writable, so an in-container /login still works for that container's
+    // lifetime — it just cannot reach through to the host record.
+    '-v', `${neutralCredentialStore}:${CONTAINER_CREDENTIAL_STORE}`,
+    // Persisted builder Claude config with MCP server entry (writable — Claude
+    // Code updates it on startup and when the human answers a trust/model prompt)
+    '-v', `${mergedConfigFile}:/home/user/.claude.json`,
+    // Auth
+    ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
+    // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
+    '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+    // Working directory
+    '-w', lazyRoot,
+  ];
+
+  // Mount daemon config file if using daemon proxy. This file is the ONLY
+  // thing from the daemon state dir a container may ever see: a single file,
+  // read-only, holding just this builder's own token.
+  if (daemonConfigPath) {
+    dockerArgs.push('-v', `${daemonConfigPath}:${daemonConfigPath}:ro`);
+  }
+
+  dockerArgs.push(
+    imageName,
+    // Run the builder supervisor (not Claude directly)
+    'lazy-agent', 'builder',
+    '--system-prompt-file', promptFile,
+    '--worktree', lazyRoot,
+    // Use container config (host.docker.internal) not the host config (127.0.0.1)
+    '--builder-config', containerConfigFile,
+    // Stable builder id so the supervisor can stamp the detected Claude
+    // sessionId onto this builder's resume intent on exit (host gets
+    // sessionId: null from the runner — only the supervisor knows the id).
+    '--builder-id', builderId,
+  );
+
+  // Pass daemon config to builder supervisor if available
+  if (daemonConfigPath) {
+    dockerArgs.push('--daemon-config', daemonConfigPath);
+  }
+
+  // Pass through extra Claude args after --
+  if (claudeExtraArgs.length > 0) {
+    dockerArgs.push('--', ...claudeExtraArgs);
+  }
+
+  if (debug) {
+    dockerArgs.splice(dockerArgs.indexOf(imageName), 0, '-e', 'DEBUG=1');
+  }
+
+  return dockerArgs;
 }

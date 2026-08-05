@@ -8,6 +8,7 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     prompt: '',
     type: 'task' as const,
     status: 'backlog' as const,
+    priority: 'normal',
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,
@@ -17,6 +18,8 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     metadata: null,
     code: null,
     pending_sync: 0,
+    runner_type: null,
+    tags: [],
     ...overrides,
   };
 }

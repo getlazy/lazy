@@ -44,11 +44,24 @@ function getStorageDir(root: string): string {
   return join(homedir(), '.lazy', basename(root));
 }
 
-function readTaskStatus(root: string, shortId: string): string {
+/**
+ * Resolve a short id to the full task UUID.
+ *
+ * `--task-id` is documented as the FULL uuid (see `lazy-agent mcp` usage) and
+ * that is what the runners pass in production. The MCP ownership gate compares
+ * it to `task.id` by identity, so handing the server a short id makes an agent
+ * fail to recognize its OWN task.
+ */
+function fullTaskId(root: string, shortId: string): string {
   const tasksDir = join(getStorageDir(root), 'tasks');
   const fullId = readdirSync(tasksDir).find(d => d.startsWith(shortId));
   if (!fullId) throw new Error(`Task directory not found for ${shortId}`);
-  return JSON.parse(readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8')).status;
+  return fullId;
+}
+
+function readTaskStatus(root: string, shortId: string): string {
+  const tasksDir = join(getStorageDir(root), 'tasks');
+  return JSON.parse(readFileSync(join(tasksDir, fullTaskId(root, shortId), 'task.json'), 'utf-8')).status;
 }
 
 /**
@@ -147,7 +160,9 @@ describe('lazy_ask on conflict tasks', () => {
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
     // Ask a question while the task sits in `conflict`.
-    const responses = await runMcpSession(ctx, taskId, [
+    // Agent context, scoped to this very task — the server needs the full uuid
+    // (what the runners pass) for the ownership gate to recognize it.
+    const responses = await runMcpSession(ctx, fullTaskId(ctx.root, taskId), [
       { method: 'initialize', id: 1, params: {} },
       {
         method: 'tools/call',

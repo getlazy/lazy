@@ -3,7 +3,7 @@ import { join } from 'path';
 import { writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('lazy diff --turn', () => {
   let ctx: TestContext;
@@ -20,12 +20,9 @@ describe('lazy diff --turn', () => {
     const taskId = await createTask(ctx, 'Turn diff test', 'Do work');
 
     // Start task with agent making a commit
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation to record the agent turn with SHAs
-    await ctx.lazy(['show', taskId]);
+    // Start with the agent making a commit, then drive the reconcile pass that
+    // records the agent turn and its SHAs. 'lazy show' no longer reconciles.
+    await startAndReconcile(ctx, taskId);
 
     // Run diff --turn latest
     const diffResult = await ctx.lazy(['diff', taskId, '--turn', 'latest']);
@@ -37,12 +34,7 @@ describe('lazy diff --turn', () => {
   test('--turn with specific sequence number shows that turn\'s changes', async () => {
     const taskId = await createTask(ctx, 'Specific turn diff', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation
-    await ctx.lazy(['show', taskId]);
+    await startAndReconcile(ctx, taskId);
 
     // The agent turn should be sequence 1 (human=0, agent=1)
     const diffResult = await ctx.lazy(['diff', taskId, '--turn', '1']);
@@ -53,9 +45,7 @@ describe('lazy diff --turn', () => {
   test('--turn for non-existent turn shows error', async () => {
     const taskId = await createTask(ctx, 'Bad turn number', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     await ctx.lazy(['show', taskId]);
 
@@ -68,7 +58,7 @@ describe('lazy diff --turn', () => {
     const taskId = await createTask(ctx, 'No changes turn', 'Do work');
 
     // Start without making commits (no LAZY_MOCK_SHOULD_COMMIT)
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId, { commit: false });
 
     await ctx.lazy(['show', taskId]);
 
@@ -80,9 +70,7 @@ describe('lazy diff --turn', () => {
   test('--turn excludes .lazy/ files from diff', async () => {
     const taskId = await createTask(ctx, 'Exclude lazy dir', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     await ctx.lazy(['show', taskId]);
 
@@ -95,7 +83,7 @@ describe('lazy diff --turn', () => {
   test('--turn with invalid value shows error', async () => {
     const taskId = await createTask(ctx, 'Invalid turn value', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId, { commit: false });
 
     await ctx.lazy(['show', taskId]);
 
@@ -128,12 +116,7 @@ describe('turn diff SHA tracking', () => {
   test('agent turns have start_sha and end_sha recorded', async () => {
     const taskId = await createTask(ctx, 'SHA tracking test', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation
-    await ctx.lazy(['show', taskId]);
+    await startAndReconcile(ctx, taskId);
 
     // Verify the turn has SHAs by checking that --turn latest works
     // (without SHAs it would fall back to full task diff with a note)
@@ -152,12 +135,7 @@ describe('turn diff SHA tracking', () => {
 
     const taskId = await createTask(ctx, 'Turn diff excludes upstream', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation
-    await ctx.lazy(['show', taskId]);
+    await startAndReconcile(ctx, taskId);
 
     // Turn diff should show only the agent's commit (agent-output-*),
     // NOT the upstream commit (upstream-change.txt)
@@ -182,12 +160,7 @@ describe('diff output has no ANSI escape codes', () => {
   test('turn diff contains no ANSI escape codes even with color.diff=always', async () => {
     const taskId = await createTask(ctx, 'No ANSI test', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation
-    await ctx.lazy(['show', taskId]);
+    await startAndReconcile(ctx, taskId);
 
     // Configure git to always use color (simulates user config)
     ctx.git('config', 'color.diff', 'always');

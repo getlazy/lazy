@@ -41,7 +41,8 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * and abandonTask across CLI commands, reconciler, and auto-resume.
  *
  * Key transitions by command/system:
- *   start:       backlog → working
+ *   start:       backlog → working (or backlog → queued at the concurrency cap)
+ *   drain:       queued → working (reconciler launches a queued task as a slot frees)
  *   reconciler:  working → blocked (turn completes)
  *                working → conflict (turn completes with violations)
  *                working → interrupted (container stopped/crashed)
@@ -51,6 +52,17 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  *   unblock:     blocked/conflict → working, merging → blocked
  *   submit:      blocked/conflict → submitted (creates PR, ready for review)
  *   accept:      blocked/conflict/submitted → merging → complete, merging → blocked (checks fail)
+ *                working → blocked/conflict/submitted (pre-accept turn ends, task
+ *                  restored to the status it had before the accept)
+ *                merging → conflict/submitted (merge phase aborts, same restore)
+ *
+ * INVARIANT (accept restores the TRUE prior status): an accept moves the task
+ * through `working` (pre-accept turn) and `merging` (merge phase). When it
+ * aborts, the task must return to the status it actually had — a task that was
+ * in `conflict` or `submitted` before the accept is NOT blocked, and silently
+ * rewriting it to `blocked` loses a real signal (unresolved violations, an open
+ * PR awaiting review). That is why `working` and `merging` can reach every
+ * blocked-family status rather than `blocked` alone.
  *   remote-sync: working/interrupted → merging → complete (externally merged MR)
  *   abandon:     blocked/conflict/interrupted/submitted/backlog → abandoned
  *   pair:        blocked/conflict/interrupted/submitted → pairing, pairing → blocked
@@ -59,14 +71,15 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  *   zombie:      any non-terminal → zombie (system only), zombie → complete
  */
 export const VALID_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
-  backlog:     ['working', 'blocked', 'abandoned'],
-  working:     ['blocked', 'conflict', 'interrupted', 'merging'],
+  backlog:     ['working', 'blocked', 'abandoned', 'queued'],
+  queued:      ['working', 'backlog', 'abandoned'],
+  working:     ['blocked', 'conflict', 'interrupted', 'merging', 'submitted'],
   blocked:     ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'backlog'],
   conflict:    ['working', 'submitted', 'merging', 'pairing', 'abandoned'],
   interrupted: ['working', 'merging', 'pairing', 'abandoned'],
   submitted:   ['working', 'merging', 'pairing', 'abandoned'],
   pairing:     ['blocked'],
-  merging:     ['complete', 'blocked'],
+  merging:     ['complete', 'blocked', 'conflict', 'submitted'],
   zombie:      ['complete'],
   complete:    ['blocked', 'backlog'],
   abandoned:   ['blocked', 'backlog'],

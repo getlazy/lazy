@@ -18,7 +18,7 @@
  * with an actionable error and NEVER silently falls back to a different backend.
  */
 
-import type { ResolvedConfig, RoleName, RoleTarget } from '../config/types';
+import type { ResolvedConfig, RoleName, RoleTarget, RunnerType } from '../config/types';
 import { spawn } from './spawn';
 
 export interface AuthEnvVar {
@@ -32,6 +32,8 @@ export interface ResolvedRoleTarget {
   model: string;
   /** ANTHROPIC_BASE_URL for ollama/proxy; empty for anthropic. */
   endpoint: string;
+  /** Live lazy-proxy base URL for an `anthropic` role (see {@link RoleTarget.proxyUrl}). */
+  proxyUrl?: string;
 }
 
 /**
@@ -41,9 +43,68 @@ export interface ResolvedRoleTarget {
  */
 export const ANTHROPIC_DEFAULT_TARGET: RoleTarget = { backend: 'anthropic', model: '', endpoint: '' };
 
+/**
+ * The base URL an agent should use to reach the daemon's passthrough proxy,
+ * given the runner it launches under and the proxy's actual (possibly
+ * OS-assigned) bound port. Container runners reach host services via
+ * `host.docker.internal`; the host-process runner reaches the proxy on its own
+ * bind address (loopback by default). Used to fill in a `backend = "proxy"`
+ * role that left `endpoint` unset, so the port need not be pinned in config.
+ */
+export function proxyBaseUrlForRunner(
+  runnerType: RunnerType,
+  proxyPort: number,
+  bind: string,
+): string {
+  const host =
+    runnerType === 'docker' || runnerType === 'podman'
+      ? 'host.docker.internal'
+      : bind && bind !== '0.0.0.0'
+        ? bind
+        : '127.0.0.1';
+  return `http://${host}:${proxyPort}`;
+}
+
 export type TargetCheckResult =
   | { reachable: true; endpoint: string }
   | { reachable: false; endpoint: string; reason: string };
+
+/**
+ * Where the process being launched will actually run.
+ *
+ * This is NOT the same thing as `[runner] type`. `lazy pair`, `lazy chat`, and
+ * the host-process runner all launch Claude Code as a HOST process even when
+ * the project's runner is docker — so they must be handed host-reachable
+ * addresses, not the Docker-internal ones a container would use.
+ *
+ * Every env-building call site must declare its surface (see {@link targetEnvVars}):
+ * the parameter is required precisely so a new launch path cannot silently
+ * inherit the wrong one.
+ */
+export type LaunchSurface = 'host' | 'container';
+
+/**
+ * Adapt a resolved target to the surface the process will run on.
+ *
+ * `host.docker.internal` is Docker's internal DNS alias for the host. It only
+ * resolves INSIDE a container; a host process handed that name dies with
+ * ENOTFOUND. So for a host launch every address on the target — the backend
+ * `endpoint` AND the injected `proxyUrl` — is rewritten to its host-reachable
+ * form. Container launches are returned untouched: they genuinely need the
+ * Docker-internal name, and blanket-converting would break them in the other
+ * direction.
+ *
+ * This is the SINGLE conversion point shared by the reachability preflight and
+ * by env building, which is what makes their agreement structural rather than a
+ * convention two call sites have to remember (see {@link preflightRoleTarget}).
+ */
+export function targetForSurface(target: RoleTarget, surface: LaunchSurface): RoleTarget {
+  if (surface !== 'host') return target;
+  const adapted: RoleTarget = { ...target };
+  if (adapted.endpoint) adapted.endpoint = endpointForHost(adapted.endpoint);
+  if (adapted.proxyUrl) adapted.proxyUrl = endpointForHost(adapted.proxyUrl);
+  return adapted;
+}
 
 /**
  * Read the Anthropic credential from the process environment.
@@ -73,6 +134,47 @@ const LOCAL_BACKEND_STABILITY_ENV: AuthEnvVar[] = [
 ];
 
 /**
+ * Audit routing hints attached to an agent's traffic when its role runs THROUGH
+ * the lazy proxy (`backend = "proxy"`). The proxy reads `x-lazy-role` /
+ * `x-lazy-task-id` off each request to attribute the audited call to the agent
+ * and task that made it, then strips them before forwarding upstream
+ * (`src/proxy/server.ts`). They reach Claude Code via `ANTHROPIC_CUSTOM_HEADERS`,
+ * which the CLI forwards on every request to its `ANTHROPIC_BASE_URL` — here, the
+ * proxy. Only the proxy backend emits them (real Anthropic / ollama must never
+ * receive lazy-internal headers).
+ */
+export interface ProxyAuditHints {
+  /** Whose traffic this is — `builder` or `agent`. */
+  role?: RoleName;
+  /** Short task id for per-task attribution. Omitted for the taskless builder. */
+  taskId?: string;
+}
+
+/**
+ * Values are interpolated into a header line, so a crafted id must not be able to
+ * inject a newline (a second header) or otherwise break the pair. Role is a fixed
+ * literal; task ids are short tokens — restrict to a simple safe charset and drop
+ * anything that doesn't match rather than emitting a malformed/injected header.
+ */
+const SAFE_HEADER_VALUE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Build the `ANTHROPIC_CUSTOM_HEADERS` env var carrying the audit hints, or null
+ * when there is nothing safe to emit. Claude Code parses this var as newline- or
+ * comma-separated `Name: Value` pairs and sends each header on every request to
+ * its base URL. We newline-separate (our values never contain commas) and skip
+ * any hint whose value isn't a simple token.
+ */
+export function proxyAuditHeaderEnv(hints: ProxyAuditHints | undefined): AuthEnvVar | null {
+  if (!hints) return null;
+  const lines: string[] = [];
+  if (hints.role && SAFE_HEADER_VALUE.test(hints.role)) lines.push(`x-lazy-role: ${hints.role}`);
+  if (hints.taskId && SAFE_HEADER_VALUE.test(hints.taskId)) lines.push(`x-lazy-task-id: ${hints.taskId}`);
+  if (lines.length === 0) return null;
+  return { key: 'ANTHROPIC_CUSTOM_HEADERS', value: lines.join('\n') };
+}
+
+/**
  * Compute the environment variables that point Claude Code at a resolved target.
  *
  * `anthropicCreds` is the Anthropic credential to forward — supplied by the
@@ -80,11 +182,29 @@ const LOCAL_BACKEND_STABILITY_ENV: AuthEnvVar[] = [
  * process env; client launches fetch it over RPC). It is ignored for the ollama
  * backend (which uses self-contained dummy credentials).
  *
+ * `surface` says where the launched process will run and is REQUIRED — a host
+ * process cannot resolve `host.docker.internal`, so an endpoint that is correct
+ * for a container is a guaranteed ENOTFOUND on the host. Making it a required
+ * parameter means a new launch path has to state which it is instead of
+ * inheriting whichever the previous caller happened to want. See
+ * {@link targetForSurface}.
+ *
+ * `hints` (optional) attach `x-lazy-role` / `x-lazy-task-id` audit headers via
+ * `ANTHROPIC_CUSTOM_HEADERS` — emitted ONLY for the proxy backend, so the audit
+ * plane can attribute proxied traffic to its role/task (§6.1). A no-op for
+ * anthropic/ollama, and for proxy when the hints carry nothing usable.
+ *
  * - ollama: dummy credentials + base URL + stability flags (fully self-contained).
- * - proxy: base URL override forwarded with the real Anthropic credential.
+ * - proxy: base URL override forwarded with the real Anthropic credential (+ audit headers).
  * - anthropic: the real Anthropic credential.
  */
-export function targetEnvVars(target: RoleTarget, anthropicCreds: AuthEnvVar[]): AuthEnvVar[] {
+export function targetEnvVars(
+  rawTarget: RoleTarget,
+  anthropicCreds: AuthEnvVar[],
+  surface: LaunchSurface,
+  hints?: ProxyAuditHints,
+): AuthEnvVar[] {
+  const target = targetForSurface(rawTarget, surface);
   switch (target.backend) {
     case 'ollama':
       return [
@@ -93,14 +213,47 @@ export function targetEnvVars(target: RoleTarget, anthropicCreds: AuthEnvVar[]):
         { key: 'ANTHROPIC_API_KEY', value: 'ollama' },
         ...LOCAL_BACKEND_STABILITY_ENV,
       ];
-    case 'proxy':
-      return [
+    case 'proxy': {
+      // Never point Claude Code at an empty base URL — that would silently send
+      // traffic to the default (real Anthropic), bypassing the proxy and its
+      // audit/policy plane. An empty endpoint here means the daemon's live proxy
+      // URL was never injected (proxy not running, or resolved outside daemon
+      // reach); fail hard with an actionable message (CLAUDE.md: fail hard).
+      if (!target.endpoint) {
+        throw new Error(
+          'backend = "proxy" role has no endpoint and the daemon did not supply a live proxy URL. ' +
+          'Ensure a [proxy] section is configured and the daemon is running, or set an explicit ' +
+          'endpoint on the role.',
+        );
+      }
+      const vars: AuthEnvVar[] = [
         { key: 'ANTHROPIC_BASE_URL', value: target.endpoint },
         ...anthropicCreds,
       ];
+      const header = proxyAuditHeaderEnv(hints);
+      if (header) vars.push(header);
+      return vars;
+    }
     case 'anthropic':
-    default:
-      return anthropicCreds;
+    default: {
+      // DEFAULT-ON PROXY: anthropic traffic used to go straight to
+      // api.anthropic.com. When the proxy is running (which is the default),
+      // `proxyUrl` is filled in at launch and this traffic flows through lazy's
+      // local audit/policy plane instead — the proxy forwards to the very same
+      // upstream, and the credential below is passed through untouched, so this
+      // is transparent to Claude Code. No proxyUrl = direct, which reaching
+      // here means `[proxy] enabled = false`: an enabled-but-unresolvable proxy
+      // fails the launch upstream rather than arriving here unset (see
+      // ProxyUnavailableError in daemon/auth-env.ts).
+      if (!target.proxyUrl) return anthropicCreds;
+      const vars: AuthEnvVar[] = [
+        { key: 'ANTHROPIC_BASE_URL', value: target.proxyUrl },
+        ...anthropicCreds,
+      ];
+      const header = proxyAuditHeaderEnv(hints);
+      if (header) vars.push(header);
+      return vars;
+    }
   }
 }
 
@@ -234,10 +387,18 @@ async function probeHttpStatus(url: string): Promise<string | null> {
 /**
  * Preflight reachability for a role target. Anthropic reachability is the
  * credential gate's concern, so it is always reported reachable here.
+ *
+ * The probe itself always runs in a HOST process (lazy's CLI or daemon), so it
+ * necessarily tests the host-reachable address — `targetForSurface(target,
+ * 'host')`, the very same conversion `targetEnvVars(..., 'host')` applies. That
+ * shared seam is what makes "the address we verified is the address we launch
+ * with" true by construction for host launches. For a container launch the
+ * address deliberately differs (`host.docker.internal`), but it names the same
+ * service on the same port, which is what the probe established.
  */
 export async function checkTargetConnectivity(target: RoleTarget): Promise<TargetCheckResult> {
   if (target.backend === 'ollama') {
-    const endpoint = endpointForHost(target.endpoint);
+    const endpoint = targetForSurface(target, 'host').endpoint;
     const status = await probeHttpStatus(`${endpoint}/api/tags`);
     if (status === '200') return { reachable: true, endpoint };
     return {
@@ -247,7 +408,7 @@ export async function checkTargetConnectivity(target: RoleTarget): Promise<Targe
     };
   }
   if (target.backend === 'proxy') {
-    const endpoint = endpointForHost(target.endpoint);
+    const endpoint = targetForSurface(target, 'host').endpoint;
     // Any HTTP response (even 4xx/5xx) proves the proxy is reachable; only a
     // connection failure (null) means it is down.
     const status = await probeHttpStatus(endpoint);
@@ -267,16 +428,20 @@ export async function checkTargetConnectivity(target: RoleTarget): Promise<Targe
  * to a different backend (CLAUDE.md: fail hard on remote failures).
  *
  * Anthropic targets are a no-op here (credential presence is the daemon gate's job).
+ *
+ * Returns the address that was actually probed (host-reachable form, or
+ * `'anthropic'` for the anthropic backend). A host launch site can hand this
+ * straight to the process it spawns; it is by construction identical to what
+ * `targetEnvVars(target, creds, 'host')` produces for the same target.
  */
-export async function preflightRoleTarget(role: RoleName, target: RoleTarget): Promise<void> {
-  if (target.backend === 'anthropic') return;
+export async function preflightRoleTarget(role: RoleName, target: RoleTarget): Promise<string> {
+  if (target.backend === 'anthropic') return 'anthropic';
   const check = await checkTargetConnectivity(target);
-  if (!check.reachable) {
-    throw new Error(
-      `Preflight failed for the "${role}" role: ${check.reason} ` +
-      `(backend = "${target.backend}", endpoint = "${check.endpoint}"). ` +
-      `Fix the backend or change [models.roles.${role}] in lazy.toml — ` +
-      `lazy will not silently fall back to a different backend.`,
-    );
-  }
+  if (check.reachable) return check.endpoint;
+  throw new Error(
+    `Preflight failed for the "${role}" role: ${check.reason} ` +
+    `(backend = "${target.backend}", endpoint = "${check.endpoint}"). ` +
+    `Fix the backend or change [models.roles.${role}] in lazy.toml — ` +
+    `lazy will not silently fall back to a different backend.`,
+  );
 }

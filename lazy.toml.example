@@ -1,6 +1,13 @@
 # lazy.toml - Configuration for lazy
 # Override the config filename with the LAZY_CONFIG environment variable
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
+#
+# A missing lazy.toml is fine — lazy uses its defaults. A lazy.toml that EXISTS
+# but does not parse is a hard failure: lazy names the offending line and stops,
+# rather than discarding every setting in the file and running on defaults that
+# look deliberate. The usual cause is a DUPLICATE table — each of the sections
+# below may appear only once, so edit the one that is already there instead of
+# appending a second copy. See docs/lazy-toml.md.
 
 [models]
 # Default model for sessions
@@ -11,8 +18,13 @@ default = "sonnet"
 # agents to different backends — backend = "anthropic" | "ollama" | "proxy".
 # All three are Anthropic-native; lazy never translates between API shapes.
 # When set, these override the legacy [ollama] block below for that role.
-#   - ollama/proxy require `model`; proxy also requires `endpoint`.
+#   - ollama/proxy require `model`.
 #   - ollama defaults `endpoint` to http://host.docker.internal:11434.
+#   - proxy `endpoint` is OPTIONAL: omit it and the daemon injects its own live
+#     proxy URL (see [proxy] below); set it only to point at a specific address.
+# NOTE: you do not need backend = "proxy" to get the audit/policy proxy — an
+# `anthropic` role already routes through it by default (see [proxy] below).
+# `ollama` roles are never proxied; they talk to the local model directly.
 # Lazy preflights each backend before launch and fails with an actionable
 # error if it is unreachable — it never silently falls back to another backend.
 # Example: keep the builder on real Anthropic, run agents on a local Ollama model.
@@ -59,10 +71,27 @@ shortid_length = 8
 # Default agent for task execution (default: "claude-code")
 agent_id = "claude-code"
 
-# Watchdog timeout for detecting hung agent processes (milliseconds)
-# Default: 7200000 (2 hours) — kills agent if no output for that duration
-# Set to 0 to disable, or override with a different timeout
-# watchdog_output_timeout_ms = 7200000
+# Hang backstop for agent processes (milliseconds). NOT a turn deadline: the
+# timer resets on every step the agent completes, so a turn made of many long
+# steps runs as long as it needs. What it bounds is a SINGLE step — an agent
+# that spends longer than this on one tool call without finishing it is killed.
+# (For Claude Code, steps are read from its output stream; the keep-alives a
+# stuck tool call emits are deliberately not counted as progress, otherwise a
+# wedged call would never be caught.)
+# A kill that captured nothing (no result, no new commits) is relaunched
+# automatically with backoff — that is the shape of a hung first model call. A
+# kill after the agent had captured work stops for a human instead.
+# This value also sets the daemon's backstop for a pre-accept turn (this + 5
+# minutes), so that wait always fires after the watchdog rather than racing it.
+# Default: 1800000 (30 minutes). Set to 0 to disable.
+# watchdog_output_timeout_ms = 1800000
+
+# Wind-down window (milliseconds): how long to wait for the agent process to
+# exit AFTER it has emitted its final result. The summary is already captured
+# at that point, so killing a CLI that won't exit costs nothing. This timer is
+# never armed before the result lands.
+# Default: 60000 (60s). Set to 0 to wait indefinitely.
+# wind_down_timeout_ms = 60000
 
 # Reasoning effort level passed to Claude Code via --effort for task agents.
 # Higher levels spend more tokens thinking before responding.
@@ -111,6 +140,32 @@ port = 26024
 # directly on the host — use **only** in VMs or other already-isolated environments.
 type = "docker"
 
+[memory]
+# Advisory size budget (bytes) for the shared-memory context injected into every
+# builder and agent launch. Over this, each launch logs one line pointing at
+# `lazy doctor`, which reports the actual size, this threshold, the compact's
+# staleness, and the fix; nothing is ever truncated and no launch is blocked.
+# warn_bytes = 4096
+
+[limits]
+# Concurrency caps for containers. When many tasks launch at once Docker
+# struggles (slow launches, probe timeouts), so lazy caps how many run at once.
+# Max live agent task containers (a blocked task awaiting review keeps its
+# container alive, so it counts too). New starts beyond this queue; the daemon
+# launches them automatically as slots free (highest priority first, then FIFO).
+# Set a task's priority with: lazy prioritize <task> <low|normal|high|urgent>
+# max_concurrent_agents = 8
+# Max concurrent interactive builder containers. New builders beyond this fail
+# fast (an interactive session a human is waiting on is never queued).
+# max_concurrent_builders = 8
+# Minutes an idle blocked container may linger (kept warm for a likely next turn)
+# before the reaper frees its slot. Same-or-higher-priority queued work overrides
+# this grace immediately. 0 = reap as soon as idle. Docker/podman only; an idle
+# host-process supervisor is a cheap process and is exempt from grace-based reaping.
+# idle_grace_minutes = 10
+# Override either cap for the running daemon only (ephemeral, no lazy.toml edit):
+#   lazy daemon config set max_concurrent_agents 12
+
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
 driver = "local"
@@ -157,6 +212,11 @@ dockerfile = ""
 # Invalid entries fail loudly at load time (missing target, unknown type, a bind
 # with no source, a volume that sets source) — never silently skipped.
 #
+# One source is refused outright: lazy's daemon state dir (~/.lazy/daemon/, or
+# LAZY_DAEMON_BASE_DIR) — and anything containing it, e.g. ~/.lazy or $HOME. It
+# holds the shared daemon token and the per-task MCP token registry, so a
+# container that could read it could act as any other task, or as the builder.
+#
 # Bind a host path into the container (source may be absolute or project-relative):
 # [[mounts]]
 # source = "/abs/or/project-relative/host/path"
@@ -181,6 +241,36 @@ dockerfile = ""
 # Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
 protected = ["README.md", "test/**/*.ts"]
 
+[protection]
+# Protected branches: accepting a task into a protected branch requires a
+# one-time human approval via `lazy approve <task>`. One approval unlocks
+# exactly one accept. This is friction against an over-eager builder, not
+# security — see docs/protected-branches.md. Distinct from
+# [permissions].protected, which guards FILES.
+#
+# OPT-IN: off by default, so nothing below has any effect until the master
+# switch is on. Turning it on protects the repo's DEFAULT branch (e.g. main)
+# with no branch listing needed:
+# enabled = true
+# Same thing from the CLI, which also lists the branch: lazy protect main on
+# When enabled, stop gating the default branch specifically:
+# gate_default_branch = false
+# On GitHub/GitLab, approving the task's PR/MR satisfies this same gate — no
+# separate "lazy approve" needed.
+# Additional protected branches (exact names, no globs) — merges INTO them
+# require approval:
+# protected_branches = ["release"]
+# Protected TASKS, by task code or short id — merging that task's work OUT
+# (upward, into any target) requires approval:
+# protected_tasks = ["add-auth"]
+#
+# Both lists are managed by `lazy protect <branch|task> on|off`, which edits
+# this section in place and preserves these comments. `lazy protect` with no
+# arguments prints the current state.
+# File holding the approval passphrase. Create it out-of-band (it's
+# gitignored); `lazy approve` checks typed/piped input against it:
+# passphrase_file = ".lazy/approve-passphrase"
+
 [automation]
 # Maintained files — the inverse of [permissions].protected. Patterns agents are
 # *expected* to keep up to date as they work (docs, CHANGELOG, architecture).
@@ -199,6 +289,28 @@ protected = ["README.md", "test/**/*.ts"]
 # pattern = "CHANGELOG.md"
 # instructions = "Add ONE line to the next release section under Added/Changed/Fixed: bold feature/command name, one sentence of the user-visible effect (not the implementation, no internal type/function names), and your task code in parens as the depth pointer. Max ~25 words. Skip if your work is intra-release; update your existing line instead of adding a second."
 
+# Pre-accept — OPT-IN (enabled = false by default). A single agent turn that
+# runs when a task is being accepted, BEFORE the merge. The home for expensive
+# one-time validation (full test suite, build) and for maintained-files
+# completeness — any configured [[automation.maintain]] groups brought up to
+# date once against the final diff. The turn's only built-in behavior is a short
+# post-mortem recorded to the task journal (not configurable); everything else
+# comes from config, so with no commands and no maintain groups the turn is the
+# post-mortem alone.
+#
+# The step costs a full agent turn on EVERY accept and the accept blocks on it,
+# so accept is fast by default: set enabled = true to turn the step on.
+#
+# `commands` is the merge GATE: after the agent's turn the supervisor re-runs
+# them, and if any exits non-zero the accept is ABORTED and the task returns to
+# blocked with the failure surfaced. Empty by default (a lightweight post-mortem
+# turn, plus any configured maintained-files work).
+#
+# [automation.pre_accept]
+# enabled = true
+# commands = ["bun test", "bun run build"]
+# timeout = 600
+
 [checks]
 # Command to run after each agent turn. Output is captured and attached to
 # the turn for reviewers to see. Does NOT block the agent or trigger retries.
@@ -216,3 +328,45 @@ post_turn_timeout = 300
 # enabled = true
 # model = "qwen3.5:35b-a3b-coding-nvfp4"
 # endpoint defaults to http://host.docker.internal:11434 if omitted
+
+# [proxy]
+# Built-in Anthropic-native passthrough proxy — ON BY DEFAULT.
+#
+# You do NOT need this section. With no [proxy] block at all, the daemon starts
+# the proxy on an OS-assigned port and routes all agent model traffic through it:
+# request-level audit logging (tool_use / tool_result contents, token usage,
+# role/task attribution) plus the mechanistic policy engine (inherited
+# mcp__claude_ai_* connectors denied by default). Credentials pass straight
+# through — the proxy forwards to the same upstream you'd otherwise call.
+#
+# Find the live address with `lazy daemon status` (also logged at daemon start).
+#
+# ESCAPE HATCH — restore direct, unproxied connections entirely (no proxy server,
+# no ANTHROPIC_BASE_URL injection, no audit trail, no policy enforcement):
+# enabled = false
+#
+# 'port' is OPTIONAL: omit it and the daemon binds an OS-assigned free port
+# (recommended — a hardcoded port conflicts across per-project daemons). Set a
+# port only to pin one. If the proxy cannot start, the daemon FAILS to start
+# rather than silently connecting direct (which would make the audit trail lie);
+# `enabled = false` is the documented way to get unblocked. The same rule holds
+# at launch time: if a launch cannot resolve the running proxy's live address
+# (daemon down, RPC blip), that LAUNCH fails with an actionable error — a
+# transient failure never silently downgrades traffic to a direct connection.
+# port = 8766                          # optional — omit for an OS-assigned port
+# bind = "127.0.0.1"
+# upstream = "https://api.anthropic.com"
+#
+# Smart routing (opt-in): on a primary 429/529 or an unreachable primary, the
+# proxy reroutes to the fallback targets below, in order — re-sending the same
+# request. Failover is EXPLICIT: with no [[proxy.fallback]] entries the proxy
+# fails hard as before. Every reroute is logged (logger.warn) and recorded in
+# the audit trail so you can see afterward which turns ran on a fallback.
+# Anthropic-native targets only. On a 429 with Retry-After ≤ retry_after_threshold
+# seconds, the proxy waits and retries the primary once before failing over
+# (default 5).
+# retry_after_threshold = 5
+#
+# [[proxy.fallback]]
+# upstream = "http://host.docker.internal:11434"   # e.g. local Ollama
+# model = "qwen3.5:35b-a3b-coding-nvfp4"           # optional model override

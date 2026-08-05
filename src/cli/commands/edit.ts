@@ -4,6 +4,7 @@ import { isTerminalStatus, VALID_TASK_TYPES } from '../../types';
 import type { Task, TaskType } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { parentTaskIdOf, taskTarget, branchTarget } from '../../task-target';
+import { resolveRunnerType, RUNNER_ALIAS_HINT } from '../../config/types';
 
 /**
  * Check if setting parentId as the parent of taskId would create a cycle.
@@ -29,6 +30,7 @@ export async function commandEdit(args: string[]): Promise<void> {
     { name: 'type', takesValue: true },
     { name: 'code', takesValue: true },
     { name: 'parent', takesValue: true },
+    { name: 'runner', takesValue: true },
   ], 'edit');
 
   const taskId = parsed.positional[0];
@@ -47,6 +49,36 @@ export async function commandEdit(args: string[]): Promise<void> {
       console.error(`Cannot edit task ${displayId(t)}: task is already ${t.status}.`);
       console.error(`Use 'lazy comment ${displayId(t)} --message "..."' to add annotations instead.`);
       process.exit(1);
+    }
+
+    // --- Runner override: changeable at ANY time, even after work begins ---
+    // Unlike goal/prompt/etc., the runner can be switched mid-task; it takes
+    // effect on the next turn (see Task.runner_type). Handle it up front so it
+    // bypasses the "already started" gate below (which allows only --model).
+    // Accepts "" to clear (inherit the global [runner] type).
+    const runnerValue = parsed.flags.get('runner') as string | undefined;
+    let runnerHandled = false;
+    if (runnerValue !== undefined) {
+      if (runnerValue === '') {
+        await storage.updateTaskRunnerType(t.id, null);
+        console.log(`Cleared runner override (inherits global [runner] type)`);
+      } else {
+        const resolved = resolveRunnerType(runnerValue);
+        if (!resolved) {
+          console.error(`Invalid runner '${runnerValue}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
+          process.exit(1);
+        }
+        await storage.updateTaskRunnerType(t.id, resolved);
+        console.log(`Updated runner: ${resolved} (takes effect next turn)`);
+      }
+      runnerHandled = true;
+    }
+
+    // If --runner was the only flag, we're done — don't fall through to the
+    // started-task gate or interactive mode.
+    const otherEditFlags = ['goal', 'prompt', 'model', 'type', 'code', 'parent'].some(f => parsed.flags.get(f) !== undefined);
+    if (runnerHandled && !otherEditFlags) {
+      return;
     }
 
     const goalValue = parsed.flags.get('goal') as string | undefined;
@@ -259,11 +291,12 @@ export async function commandEdit(args: string[]): Promise<void> {
 }
 
 export function editUsage(): void {
-  console.log(`Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>]
+  console.log(`Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--runner <host|docker|container|podman>]
 
-Edit a task's goal, prompt, model, type, code, or parent. Interactive if no flags provided.
-Once an agent has worked on the task, only --model can still be changed;
-goal/prompt/type/code/parent edits are rejected.
+Edit a task's goal, prompt, model, type, code, parent, or runner. Interactive if no flags provided.
+Once an agent has worked on the task, only --model and --runner can still be changed;
+goal/prompt/type/code/parent edits are rejected. The --runner override takes effect
+on the next turn.
 Linked tasks that haven't been agent-started are still fully editable.
 Use 'lazy comment' to add annotations to started tasks.
 
@@ -279,6 +312,9 @@ Options:
   --code <code>      Set or change the task code (pass "" to clear)
   --parent <task_id> Set or change parent task (pass "" to clear)
                      Parent must exist and not be in a terminal state
+  --runner <type>    Set the runner for this task: host, docker, container, or
+                     podman (pass "" to clear and inherit the global [runner]
+                     type). Allowed any time; takes effect next turn.
 
 Prompt input priority: --prompt flag > piped stdin > $EDITOR (interactive)
 

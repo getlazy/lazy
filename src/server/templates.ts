@@ -10,6 +10,7 @@ import { renderMarkdown } from './markdown';
 import { renderDiff, diffStyles, diffScripts } from './diff';
 import { parentTaskIdOf } from '../task-target';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
+import { turnText } from '../utils/turn-content';
 
 export interface TaskWithSession {
   task: Task;
@@ -583,7 +584,7 @@ export function taskDetailHtml(
   if (turns.length > 0) {
     const renderTurnHtml = (turn: Turn): string => {
       const turnLink = session ? `/tasks/${task.id}/turns/${turn.sequence}` : '#';
-      const preview = renderMarkdown(turn.content);
+      const preview = renderMarkdown(turnText(turn));
       const usageInfo = turn.usage
         ? ` <span class="turn-tokens">${escapeHtml(formatTokenCount(totalInputTokens(turn.usage)))} in, ${escapeHtml(formatTokenCount(turn.usage.outputTokens))} out</span>`
         : '';
@@ -871,7 +872,7 @@ export function turnDetailHtml(
     content += `
       <div class="detail-section">
         <h2>${authorHeading}</h2>
-        <div class="turn-content">${renderMarkdown(humanTurn.content)}</div>
+        <div class="turn-content">${renderMarkdown(turnText(humanTurn))}</div>
       </div>
     `;
   }
@@ -893,7 +894,7 @@ export function turnDetailHtml(
       <div class="detail-section">
         <h2>Agent</h2>
         ${agentUsageHtml}
-        <div class="turn-content">${renderMarkdown(agentTurn.content)}</div>
+        <div class="turn-content">${renderMarkdown(turnText(agentTurn))}</div>
       </div>
     `;
   }

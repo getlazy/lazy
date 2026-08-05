@@ -219,9 +219,16 @@ export interface SessionFileInfo {
  * or modified across a session — the basis for capturing ALL segments of a
  * builder run (Claude opens a fresh JSONL on /clear, compaction, and resume),
  * not just one.
+ *
+ * `projectsDir` defaults to the shared `~/.claude/projects` dir but can be
+ * pointed at any projects-dir-shaped root (e.g. a per-builder isolation dir,
+ * `<data>/builder-projects/<id>/`). The recovery command scans several roots to
+ * re-import conversations that never reached the store.
  */
-export async function discoverProjectSessionFiles(repoRootPath: string): Promise<SessionFileInfo[]> {
-  const projectsDir = getClaudeProjectsDir();
+export async function discoverProjectSessionFiles(
+  repoRootPath: string,
+  projectsDir: string = getClaudeProjectsDir(),
+): Promise<SessionFileInfo[]> {
   const encodedPrefix = encodeProjectPath(repoRootPath);
 
   const results: SessionFileInfo[] = [];
@@ -413,9 +420,16 @@ async function parseJsonlFile(filePath: string): Promise<JsonlParseState> {
  *
  * @param projectPath - Encoded project directory name (e.g., "-Users-foo-prg-myproject")
  * @param sessionId - UUID of the session
+ * @param projectsDir - Root that holds `<projectPath>/<sessionId>.jsonl`. Defaults
+ *   to the shared `~/.claude/projects` dir; the recovery command passes a
+ *   per-builder isolation dir so a session that never reached the store can still
+ *   be parsed from wherever its raw JSONL actually lives.
  */
-export async function parseConversation(projectPath: string, sessionId: string): Promise<ParsedConversation> {
-  const projectsDir = getClaudeProjectsDir();
+export async function parseConversation(
+  projectPath: string,
+  sessionId: string,
+  projectsDir: string = getClaudeProjectsDir(),
+): Promise<ParsedConversation> {
   const projectDir = join(projectsDir, projectPath);
 
   // Parse main conversation file

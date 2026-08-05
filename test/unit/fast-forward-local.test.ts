@@ -24,7 +24,7 @@ const githubConfig: ResolvedConfig = {
   },
   git: { default_branch_prefix: 'lazy' },
   output: { shortid_length: 8 },
-  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, graceful_exit_timeout_ms: 0, effort: 'medium' },
+  agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
   server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
@@ -39,15 +39,17 @@ const githubConfig: ResolvedConfig = {
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
   docker: { dockerfile: '' },
-  runner: { type: 'docker' as const },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
-  automation: { maintain: [] },
+  protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true, passphrase_file: '.lazy/approve-passphrase' },
+  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
   mounts: [],
   checks: { post_turn: '', post_turn_timeout: 300 },
   ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
+  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10 },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -56,6 +58,8 @@ const githubConfig: ResolvedConfig = {
     auto_react_daily_budget: 50,
     max_auto_turns: 3,
   },
+  memory: { warn_bytes: 4096 },
+  proxy: null,
 };
 
 const gitlabConfig: ResolvedConfig = {

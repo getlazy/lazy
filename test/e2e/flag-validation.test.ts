@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 
@@ -35,7 +36,10 @@ describe('flag validation', () => {
   });
 
   test('start rejects unknown flag', async () => {
-    const result = await ctx.lazy(['start', '--goal', 'Test', '--invalid']);
+    // `start` takes a task id positionally and has no --goal, so passing --goal
+    // here made parseFlags reject *that* flag first and the assertion below
+    // never exercised --invalid. Use a positional id instead.
+    const result = await ctx.lazy(['start', 'zzzzzzzz', '--invalid']);
 
     expectFailure(result);
     expectError(result, 'Unknown flag: --invalid');
@@ -155,6 +159,26 @@ describe('flag validation', () => {
     expectFailure(result);
     expectError(result, 'Unknown flag: --unknown');
     expectError(result, 'lazy import-conversation --help');
+  });
+
+  // REGRESSION: `-f` and `-m` are the documented spellings in `lazy unblock --help`,
+  // but parseFlags only registers `--<name>` unless an alias is declared — so `-f`
+  // used to be rejected as an unknown flag. Both must parse. The task has no session,
+  // so the commands still fail — just not at flag parsing.
+  test('unblock accepts the documented -f and -m short flags', async () => {
+    const createResult = await ctx.lazy(['create', '--goal', 'Test task']);
+    expectSuccess(createResult);
+    const taskId = createResult.stdout.match(/Created task (\w+)/)?.[1];
+
+    await Bun.write(join(ctx.root, 'feedback.md'), 'some feedback');
+
+    const fileResult = await ctx.lazy(['unblock', taskId!, '-f', 'feedback.md']);
+    expect(fileResult.stderr).not.toContain('Unknown flag');
+    expect(fileResult.stdout).not.toContain('Unknown flag');
+
+    const messageResult = await ctx.lazy(['unblock', taskId!, '-m', 'some feedback']);
+    expect(messageResult.stderr).not.toContain('Unknown flag');
+    expect(messageResult.stdout).not.toContain('Unknown flag');
   });
 
   // INVARIANT: Model names are raw model IDs — any non-empty string is accepted.

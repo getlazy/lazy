@@ -54,15 +54,29 @@ describe('buildMergeClaudeArgs', () => {
     expect(args).not.toContain('--resume');
   });
 
-  test('always includes base args: claude -p <prompt> --output-format json --dangerously-skip-permissions', () => {
+  test('always includes base args: claude -p <prompt> --output-format stream-json --verbose --dangerously-skip-permissions', () => {
     const args = buildMergeClaudeArgs(MERGE_PROMPT, undefined, undefined, false);
 
     expect(args[0]).toBe('claude');
     expect(args[1]).toBe('-p');
     expect(args[2]).toBe(MERGE_PROMPT);
     expect(args).toContain('--output-format');
-    expect(args).toContain('json');
+    expect(args).toContain('stream-json');
     expect(args).toContain('--dangerously-skip-permissions');
+  });
+
+  // INVARIANT: a merge turn is an ordinary agent turn — it edits files, runs
+  // tests, and commits — so it must stream like the work phase. Without
+  // stream-json there is no activity signal, which means no no-progress guard
+  // and no way to know the agent's result has landed. Dropping back to the
+  // single-blob `json` format would silently leave merge turns unguarded.
+  test('streams, so merge turns get the same two guards as the work phase', () => {
+    const args = buildMergeClaudeArgs(MERGE_PROMPT, undefined, undefined, false);
+
+    const formatIdx = args.indexOf('--output-format');
+    expect(args[formatIdx + 1]).toBe('stream-json');
+    // stream-json is only emitted per-event when --verbose is also passed.
+    expect(args).toContain('--verbose');
   });
 
   test('includes --model when modelId is provided', () => {

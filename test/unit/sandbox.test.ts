@@ -15,6 +15,14 @@ import { join } from 'path';
 import { setupSandbox, SANDBOX_DIR } from '../../src/utils/sandbox';
 
 const DEFAULT_GITCONFIG = '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n';
+/**
+ * Appended to every sandbox gitconfig by setupSandbox. The agent container sees
+ * the repository's shared git dir read-only (see src/capture/git-mounts.ts), so
+ * an auto-gc triggered in there could only fail — it wants to repack objects and
+ * rewrite packed-refs. Disabling it keeps that failure from surfacing as a
+ * confusing error on an unrelated git command.
+ */
+const GC_OFF = '\n[gc]\n\tauto = 0\n';
 
 describe('setupSandbox', () => {
   let worktree: string;
@@ -51,7 +59,7 @@ describe('setupSandbox', () => {
     expect(gitconfigStat.isFile()).toBe(true);
 
     const contents = await readFile(gitconfigPath, 'utf-8');
-    expect(contents).toBe(DEFAULT_GITCONFIG);
+    expect(contents).toBe(DEFAULT_GITCONFIG + GC_OFF);
   });
 
   // INVARIANT (fix-sync-sandbox-setup): setupSandbox MUST recover when
@@ -74,7 +82,7 @@ describe('setupSandbox', () => {
     expect(gitconfigStat.isFile()).toBe(true);
 
     const contents = await readFile(join(result.sandboxPath, '.gitconfig'), 'utf-8');
-    expect(contents).toBe(DEFAULT_GITCONFIG);
+    expect(contents).toBe(DEFAULT_GITCONFIG + GC_OFF);
   });
 
   test('writes default gitconfig when host has no .gitconfig', async () => {
@@ -82,16 +90,19 @@ describe('setupSandbox', () => {
     const result = await setupSandbox(worktree);
 
     const contents = await readFile(join(result.sandboxPath, '.gitconfig'), 'utf-8');
-    expect(contents).toBe(DEFAULT_GITCONFIG);
+    expect(contents).toBe(DEFAULT_GITCONFIG + GC_OFF);
   });
 
-  test('copies the host .gitconfig byte-for-byte when one exists', async () => {
+  test('preserves the host .gitconfig verbatim, appending only gc.auto=0', async () => {
     const sentinel = '[user]\n\tname = Alice Example\n\temail = alice@example.test\n[alias]\n\tst = status\n';
     await writeFile(join(fakeHome, '.gitconfig'), sentinel);
 
     const result = await setupSandbox(worktree);
 
     const contents = await readFile(join(result.sandboxPath, '.gitconfig'), 'utf-8');
-    expect(contents).toBe(sentinel);
+    // INVARIANT: the host's config is copied byte-for-byte — lazy never edits,
+    // reorders or drops the user's own git settings. The only addition is the
+    // appended gc.auto=0 stanza.
+    expect(contents).toBe(sentinel + GC_OFF);
   });
 });

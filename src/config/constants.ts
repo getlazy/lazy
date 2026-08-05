@@ -39,3 +39,15 @@ export const DEFAULT_SERVER_BIND = '127.0.0.1';
  * 20 concurrent daemons on one host is already far beyond realistic use.
  */
 export const MAX_PORT_ATTEMPTS = 20;
+
+/**
+ * Default advisory size (bytes) for the injected shared-memory context (the
+ * compact plus anything recorded since it, or the full index when there is no
+ * compact). Over this, every launch WARNS and suggests `lazy memory compact`.
+ *
+ * Advisory on purpose: memory past the threshold is still knowledge, so lazy
+ * never truncates it and never blocks a launch over it. Lives here rather than
+ * in src/memory so the config loader can default it without pulling the prompt
+ * templates in.
+ */
+export const DEFAULT_MEMORY_WARN_BYTES = 4096;

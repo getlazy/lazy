@@ -74,6 +74,46 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Describe the process currently holding the lock, for the failure message.
+ *
+ * Reads the lock file for the holder pid/acquired_at and asks `ps` for the
+ * holder's command line (which, for a lazy daemon, includes the project path it
+ * serves). Returns a human-readable one-liner. Best-effort: if the lock file is
+ * gone or `ps` is unavailable, it degrades to whatever it could learn so the
+ * error is never made worse by this diagnostic. Only called on the terminal
+ * acquire failure — not on the hot path — so the sync file read is acceptable.
+ */
+async function describeLockHolder(lockPath: string): Promise<string> {
+  let pid: number | null = null;
+  let acquiredAt: string | null = null;
+  try {
+    const content = readFileSync(lockPath, 'utf-8');
+    const lock = JSON.parse(content) as Partial<StorageLockFile>;
+    if (typeof lock.pid === 'number') pid = lock.pid;
+    if (typeof lock.acquired_at === 'string') acquiredAt = lock.acquired_at;
+  } catch {
+    // Lock file vanished or is unparseable — the holder may have just released.
+    return 'holder unknown (lock file could not be read — the holder may have just released it; retry)';
+  }
+  if (pid === null) return 'holder unknown (lock file has no pid)';
+
+  let command: string | null = null;
+  try {
+    const proc = spawn(['ps', '-o', 'command=', '-p', String(pid)], { stdout: 'pipe', stderr: 'ignore' });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const trimmed = out.trim();
+    if (trimmed) command = trimmed;
+  } catch {
+    // `ps` unavailable — pid alone still lets the user identify the holder.
+  }
+
+  const parts = [`held by process pid ${pid}`];
+  if (acquiredAt) parts.push(`since ${acquiredAt}`);
+  if (command) parts.push(`(${command})`);
+  return parts.join(' ');
+}
+
+/**
  * Storage lock manager.
  *
  * One instance per FileStorage. Uses a file-system lock for inter-process
@@ -112,9 +152,13 @@ export class StorageLock {
       await sleep(RETRY_DELAY_MS + jitter);
     }
 
+    const holder = await describeLockHolder(this.lockPath);
     throw new Error(
       `Failed to acquire storage lock after ${MAX_ATTEMPTS} attempts. ` +
-        `Lock file: ${this.lockPath}`
+        `Lock file: ${this.lockPath} — ${holder}.\n` +
+        `If that holder is a different project's daemon, your storage paths collide: ` +
+        `check [storage] external_path in lazy.toml — two projects must not share one store. ` +
+        `Run 'lazy daemon list' to see which project each daemon serves.`
     );
   }
 

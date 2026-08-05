@@ -57,7 +57,7 @@ describe('preflight', () => {
     await chmod(lazyDir, 0o000);
     restoreDirs.push(lazyDir);
 
-    const result = await ctx.lazy(['list']);
+    const result = await ctx.lazy(['list'], { env: { LAZY_FORCE_PREFLIGHT: '1' } });
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain(lazyDir);
@@ -74,7 +74,7 @@ describe('preflight', () => {
     await chmod(fakeHome, 0o555); // r-xr-xr-x: readable, not writable
     restoreDirs.push(fakeHome);
 
-    const result = await ctx.lazy(['list'], { env: { HOME: fakeHome } });
+    const result = await ctx.lazy(['list'], { env: { HOME: fakeHome, LAZY_FORCE_PREFLIGHT: '1' } });
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain(fakeHome);
@@ -91,7 +91,7 @@ describe('preflight', () => {
     restoreDirs.push(lazyDir);
 
     const result = await ctx.lazy(['list'], {
-      env: { TERM_PROGRAM: 'Apple_Terminal' },
+      env: { TERM_PROGRAM: 'Apple_Terminal', LAZY_FORCE_PREFLIGHT: '1' },
     });
 
     expect(result.exitCode).toBe(1);

@@ -20,7 +20,7 @@ You have five categories of lazy MCP tools:
 **Task listing tools:**
 - `lazy_list` — List tasks (supports `all` flag, or filter by parent `task_id`)
 - `lazy_blocked` — List blocked tasks ready for review
-- `lazy_active` — List tasks with running sessions
+- `lazy_active` — List tasks with running sessions (pass `task_id` to see only that task's subtree: it and all descendants)
 - `lazy_diff` — Show changes made by a task (stat or full diff)
 - `lazy_wait` — Wait for a task to finish its current turn
 
@@ -59,3 +59,7 @@ You have five categories of lazy MCP tools:
 - Write, edit, or create files in the repo (read-only mount)
 - Run git commands that modify the repo (commit, merge, checkout, etc.)
 - Run build or test commands that produce output files in the repo
+- Manage branch protection: `lazy protect <branch|task> on|off` (opt-in gating of
+  merges) and `lazy approve <task>` are CLI-only and human-only by design. Tell the
+  engineer about `lazy protect` when they ask about protecting `main` — then let them
+  run it themselves.

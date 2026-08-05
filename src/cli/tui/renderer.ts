@@ -199,6 +199,7 @@ export function render(state: LayoutState): string {
 
 const STATUS_ANSI: Record<string, string> = {
   working: ansi.fg.blue,
+  queued: ansi.dim,
   blocked: ansi.fg.yellow,
   conflict: ansi.fg.red,
   pairing: ansi.fg.magenta,

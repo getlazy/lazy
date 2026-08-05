@@ -1,34 +1,20 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { writeFileSync, readFileSync, readdirSync } from 'fs';
-import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+// Test projects init with EXTERNAL storage, so task state does NOT live at
+// `<root>/.lazy/tasks`. These helpers read `external_path` out of the project's
+// lazy.toml — the local copies this file used to carry hardcoded the in-repo
+// layout and died with ENOENT on `<root>/.lazy/tasks` once the backend changed.
+import { setTaskStatus, readSessionJson, writeSessionJson } from '../helpers/storage';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const match = entries.find((e: string) => e.startsWith(shortId));
-  if (!match) {
-    throw new Error(`Could not find full task ID for short ID: ${shortId}`);
-  }
-  return match;
-}
-
-function setTaskStatus(root: string, fullTaskId: string, status: string): void {
-  const taskPath = join(root, '.lazy', 'tasks', fullTaskId, 'task.json');
-  const task = JSON.parse(readFileSync(taskPath, 'utf-8'));
-  task.status = status;
-  writeFileSync(taskPath, JSON.stringify(task, null, 2));
-}
-
-function setContainerName(root: string, fullTaskId: string, containerName: string): void {
-  const sessionPath = join(root, '.lazy', 'tasks', fullTaskId, 'session.json');
-  const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
+function setContainerName(root: string, shortId: string, containerName: string): void {
+  const session = readSessionJson(root, shortId);
+  if (!session) throw new Error(`Task ${shortId} has no session.json — was it started?`);
   session.container_name = containerName;
-  writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+  writeSessionJson(root, shortId, session);
 }
 
 /**
@@ -59,14 +45,12 @@ describe('lazy list: crashed container indicators', () => {
 
   test('shows [CRASHED] indicator for interrupted task with dead container', async () => {
     const taskId = await createTask(ctx, 'Crash indicator test', 'Do the work');
-    const fullId = findFullTaskId(ctx.root, taskId);
-
     await startAndReconcile(ctx, taskId);
 
     // Set task to interrupted and set a known container name
     const containerName = `lazy-${taskId}`;
-    setTaskStatus(ctx.root, fullId, 'interrupted');
-    setContainerName(ctx.root, fullId, containerName);
+    setTaskStatus(ctx.root, taskId, 'interrupted');
+    setContainerName(ctx.root, taskId, containerName);
 
     // Run list with mocked crashed container
     const result = await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS, {
@@ -83,13 +67,11 @@ describe('lazy list: crashed container indicators', () => {
 
   test('shows [CRASHED] indicator in flat list mode', async () => {
     const taskId = await createTask(ctx, 'Flat crash test', 'Do the work');
-    const fullId = findFullTaskId(ctx.root, taskId);
-
     await startAndReconcile(ctx, taskId);
 
     const containerName = `lazy-${taskId}`;
-    setTaskStatus(ctx.root, fullId, 'interrupted');
-    setContainerName(ctx.root, fullId, containerName);
+    setTaskStatus(ctx.root, taskId, 'interrupted');
+    setContainerName(ctx.root, taskId, containerName);
 
     // The flat list doesn't show the [CRASHED] tag on individual rows since
     // it doesn't use printTaskTree, but the footnote should still appear
@@ -131,18 +113,16 @@ describe('lazy list: crashed container indicators', () => {
   test('shows count of multiple crashed tasks', async () => {
     const taskId1 = await createTask(ctx, 'Crashed task 1', 'Do work 1');
     const taskId2 = await createTask(ctx, 'Crashed task 2', 'Do work 2');
-    const fullId1 = findFullTaskId(ctx.root, taskId1);
-    const fullId2 = findFullTaskId(ctx.root, taskId2);
 
     await startAndReconcile(ctx, taskId1);
     await startAndReconcile(ctx, taskId2);
 
     const cn1 = `lazy-${taskId1}`;
     const cn2 = `lazy-${taskId2}`;
-    setTaskStatus(ctx.root, fullId1, 'interrupted');
-    setContainerName(ctx.root, fullId1, cn1);
-    setTaskStatus(ctx.root, fullId2, 'interrupted');
-    setContainerName(ctx.root, fullId2, cn2);
+    setTaskStatus(ctx.root, taskId1, 'interrupted');
+    setContainerName(ctx.root, taskId1, cn1);
+    setTaskStatus(ctx.root, taskId2, 'interrupted');
+    setContainerName(ctx.root, taskId2, cn2);
 
     const result = await ctx.lazyMocked(['list'], MOCK_CLAUDE_SUCCESS, {
       env: {

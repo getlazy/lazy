@@ -12,6 +12,62 @@ function setRunnerType(config: string, type: string): string {
 }
 
 /**
+ * Switch the project to the host-process runner.
+ *
+ * `lazy builder` runs `runner.checkAvailability()` BEFORE the disclosure /
+ * resume / --model logic (it refuses to walk a user through prompts only to
+ * die on missing infrastructure). Under the default docker runner that check
+ * aborts with "binary 'docker' not found" in any environment without Docker —
+ * so every test that asserts on output printed after it must pick a runner that
+ * is actually available.
+ */
+function useHostProcessRunner(root: string): void {
+  const lazyTomlPath = join(root, 'lazy.toml');
+  const existing = readFileSync(lazyTomlPath, 'utf-8');
+  writeFileSync(lazyTomlPath, setRunnerType(existing, 'dangerously-host-process-without-any-isolation'));
+}
+
+/**
+ * Make `lazy builder` actually reach the disclosure / resume / launch code, and
+ * return the env that gets it there.
+ *
+ * These tests used to prune `claude` off PATH and rely on "it fails at the
+ * launch step, after printing what we assert on". That stopped working: the
+ * pre-flight `runner.checkAvailability()` now runs BEFORE any of that output —
+ * it aborts on missing `docker` under the default runner, and on missing
+ * `claude` under the host-process one. So availability has to genuinely pass:
+ * host-process runner plus a fake `claude` that exits 0.
+ */
+function launchableBuilderEnv(root: string): Record<string, string> {
+  useHostProcessRunner(root);
+  const binDir = installFakeClaude(root, join(root, 'claude-args.log'));
+  return { PATH: `${binDir}:${process.env.PATH}` };
+}
+
+/**
+ * Serve just enough of the Ollama HTTP API for the role-target preflight.
+ *
+ * Enabling `[ollama]` makes the builder role resolve to the ollama backend, and
+ * preflightRoleTarget then probes `<endpoint>/api/tags` and FAILS HARD when it
+ * does not answer 200 (by design — lazy never silently falls back to another
+ * backend). Tests about *which model gets forwarded* would otherwise be
+ * asserting on a machine that happens to run `ollama serve`.
+ */
+function startFakeOllama(): { endpoint: string; stop: () => void } {
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) =>
+      new URL(req.url).pathname === '/api/tags'
+        ? Response.json({ models: [] })
+        : new Response('not found', { status: 404 }),
+  });
+  return {
+    endpoint: `http://127.0.0.1:${server.port}`,
+    stop: () => server.stop(true),
+  };
+}
+
+/**
  * Install a fake `claude` executable that records each argv entry (one per line)
  * to `logPath`, then exits 0. Used to capture exactly what flags the builder
  * passes to the Claude Code invocation. Returns the bin dir to prepend to PATH.
@@ -55,11 +111,9 @@ describe('lazy builder', () => {
   });
 
   test('shows session disclosure message', async () => {
-    // Builder shows disclosure before spawning claude.
-    // In non-TTY mode, it prints the message then proceeds.
-    // We use a PATH without claude to make it fail after disclosure.
+    // Builder shows disclosure before spawning claude, in non-TTY mode too.
     const result = await ctx.lazy(['builder'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     // Should show the disclosure message regardless of whether claude exists
@@ -67,9 +121,8 @@ describe('lazy builder', () => {
   });
 
   test('creates .builder-launched marker in ~/.lazy/<project>/ after first run', async () => {
-    // Run builder (it will fail if claude not available, but marker should be set)
     await ctx.lazy(['builder'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     // Check that the marker file was created in the user-local directory
@@ -117,13 +170,26 @@ describe('lazy builder', () => {
     expectOutput(result, '--resume');
     expectOutput(result, 'LAZY_LAST_SESSION_ID');
     expectOutput(result, 'Resume a specific session');
+    expectOutput(result, '--import');
+  });
+
+  // INVARIANT: --import is a modifier on a resume, not a mode of its own. Resuming
+  // a session that never ran under builder isolation ADOPTS it into an overlay;
+  // --import is how the user opts into that, so on its own it means nothing.
+  test('--import without --resume is rejected with the correct usage', async () => {
+    const result = await ctx.lazy(['builder', '--import'], {
+      env: launchableBuilderEnv(ctx.root),
+    });
+
+    expectFailure(result);
+    expectError(result, 'lazy builder --resume <id> --import');
   });
 
   // INVARIANT: --resume without LAZY_LAST_SESSION_ID errors clearly.
   // No file scanning — env var is the only source for bare --resume.
   test('--resume fails when LAZY_LAST_SESSION_ID is not set', async () => {
     const result = await ctx.lazy(['builder', '--resume'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     expectError(result, 'LAZY_LAST_SESSION_ID is not set');
@@ -135,7 +201,7 @@ describe('lazy builder', () => {
 
     const result = await ctx.lazy(['builder', '--resume'], {
       env: {
-        PATH: '/usr/local/bin:/usr/bin:/bin',
+        ...launchableBuilderEnv(ctx.root),
         LAZY_LAST_SESSION_ID: sessionId,
       },
     });
@@ -146,7 +212,7 @@ describe('lazy builder', () => {
   // INVARIANT: --resume <id> passes the ID directly to Claude.
   test('--resume with explicit ID uses that ID', async () => {
     const result = await ctx.lazy(['builder', '--resume', 'cafebabe-1234-5678-9abc-def012345678'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     expectOutput(result, 'Resuming session cafebabe');
@@ -156,7 +222,7 @@ describe('lazy builder', () => {
   // Users have already seen the warning in the original session.
   test('resume skips session disclosure message', async () => {
     const result = await ctx.lazy(['builder', '--resume', 'abcdef01-2345-6789-abcd-ef0123456789'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     // Should show the resume message
@@ -172,7 +238,7 @@ describe('lazy builder', () => {
 
     const result = await ctx.lazy(['builder'], {
       env: {
-        PATH: '/usr/local/bin:/usr/bin:/bin',
+        ...launchableBuilderEnv(ctx.root),
         LAZY_FORCE_TTY: '1',
         LAZY_PROMPT_DEFAULTS: 'accept',
         LAZY_LAST_SESSION_ID: sessionId,
@@ -193,7 +259,7 @@ describe('lazy builder', () => {
 
     const result = await ctx.lazy(['builder'], {
       env: {
-        PATH: '/usr/local/bin:/usr/bin:/bin',
+        ...launchableBuilderEnv(ctx.root),
         LAZY_FORCE_TTY: '1',
         LAZY_PROMPT_DEFAULTS: 'decline',
         LAZY_LAST_SESSION_ID: sessionId,
@@ -209,7 +275,7 @@ describe('lazy builder', () => {
   // INVARIANT: Without env var or flag, no resume prompt — straight to new session.
   test('no env var and no flag starts new session without prompting', async () => {
     const result = await ctx.lazy(['builder'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: launchableBuilderEnv(ctx.root),
     });
 
     // Should go straight to disclosure — no resume prompt
@@ -270,8 +336,11 @@ describe('lazy builder', () => {
     expect(result.exitCode).toBe(1);
   });
 
-  test('--autonomous with host-process runner shows additional danger warning', async () => {
-    // Configure host-process runner
+  // INVARIANT: --autonomous on the host runner always adds a second warning
+  // naming the isolation posture. The severity depends on permission_mode:
+  // the default 'sandbox' confines Bash, 'bypass' does not. Asserting only the
+  // DANGER wording would fail on the safe default, which is now the norm.
+  test('--autonomous on the host under the OS sandbox names the sandbox posture', async () => {
     const lazyTomlPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
     writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
@@ -280,10 +349,29 @@ describe('lazy builder', () => {
       env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
     });
 
-    // Should show autonomous warning
     expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
-    // Should show additional danger warning
-    expectOutput(result, '⚠ DANGER: Running on the host WITHOUT isolation.');
+    expectOutput(result, '⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
+    expectOutput(result, 'Bash is confined to the worktree');
+  });
+
+  test('--autonomous with permission_mode = "bypass" shows the full danger warning', async () => {
+    const lazyTomlPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
+    // permission_mode must land inside [runner], so insert it after the type key.
+    writeFileSync(
+      lazyTomlPath,
+      setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation').replace(
+        /^type\s*=\s*"dangerously-host-process-without-any-isolation"$/m,
+        'type = "dangerously-host-process-without-any-isolation"\npermission_mode = "bypass"',
+      ),
+    );
+
+    const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+
+    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
+    expectOutput(result, '⚠ DANGER: Running on the host WITHOUT isolation (permission_mode = "bypass").');
     expectOutput(result, 'The agent has unrestricted access to your system.');
     expectOutput(result, 'Only proceed on an isolated/disposable machine.');
   });
@@ -325,50 +413,60 @@ describe('lazy builder', () => {
   // Ollama-injected model. We must end up with exactly ONE --model arg (the
   // user's), never two — two would be ambiguous to Claude Code.
   test('explicit --model wins over the Ollama-injected model', async () => {
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    let cfg = readFileSync(lazyTomlPath, 'utf-8');
-    cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
-    // Enable Ollama with its own model — this would normally inject --model.
-    cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\n`;
-    writeFileSync(lazyTomlPath, cfg);
+    const ollama = startFakeOllama();
+    try {
+      const lazyTomlPath = join(ctx.root, 'lazy.toml');
+      let cfg = readFileSync(lazyTomlPath, 'utf-8');
+      cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
+      // Enable Ollama with its own model — this would normally inject --model.
+      cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\nendpoint = "${ollama.endpoint}"\n`;
+      writeFileSync(lazyTomlPath, cfg);
 
-    const logPath = join(ctx.root, 'claude-args.log');
-    const binDir = installFakeClaude(ctx.root, logPath);
+      const logPath = join(ctx.root, 'claude-args.log');
+      const binDir = installFakeClaude(ctx.root, logPath);
 
-    const result = await ctx.lazy(['builder', '--model', 'mythos'], {
-      env: { PATH: `${binDir}:${process.env.PATH}` },
-    });
-    expectSuccess(result);
+      const result = await ctx.lazy(['builder', '--model', 'mythos'], {
+        env: { PATH: `${binDir}:${process.env.PATH}` },
+      });
+      expectSuccess(result);
 
-    const args = readClaudeArgs(logPath);
-    const modelIndexes = args.flatMap((a, i) => (a === '--model' ? [i] : []));
-    // Exactly one --model arg, and it's the explicit user value.
-    expect(modelIndexes.length).toBe(1);
-    expect(args[modelIndexes[0] + 1]).toBe('mythos');
-    expect(args).not.toContain('ollama-local-model');
+      const args = readClaudeArgs(logPath);
+      const modelIndexes = args.flatMap((a, i) => (a === '--model' ? [i] : []));
+      // Exactly one --model arg, and it's the explicit user value.
+      expect(modelIndexes.length).toBe(1);
+      expect(args[modelIndexes[0] + 1]).toBe('mythos');
+      expect(args).not.toContain('ollama-local-model');
+    } finally {
+      ollama.stop();
+    }
   });
 
   // Guards the existing behavior: with no --model flag, Ollama's model is still
   // injected so Claude Code targets the local model rather than its opus default.
   test('Ollama model is still injected when no --model flag is given', async () => {
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    let cfg = readFileSync(lazyTomlPath, 'utf-8');
-    cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
-    cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\n`;
-    writeFileSync(lazyTomlPath, cfg);
+    const ollama = startFakeOllama();
+    try {
+      const lazyTomlPath = join(ctx.root, 'lazy.toml');
+      let cfg = readFileSync(lazyTomlPath, 'utf-8');
+      cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
+      cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\nendpoint = "${ollama.endpoint}"\n`;
+      writeFileSync(lazyTomlPath, cfg);
 
-    const logPath = join(ctx.root, 'claude-args.log');
-    const binDir = installFakeClaude(ctx.root, logPath);
+      const logPath = join(ctx.root, 'claude-args.log');
+      const binDir = installFakeClaude(ctx.root, logPath);
 
-    const result = await ctx.lazy(['builder'], {
-      env: { PATH: `${binDir}:${process.env.PATH}` },
-    });
-    expectSuccess(result);
+      const result = await ctx.lazy(['builder'], {
+        env: { PATH: `${binDir}:${process.env.PATH}` },
+      });
+      expectSuccess(result);
 
-    const args = readClaudeArgs(logPath);
-    const idx = args.indexOf('--model');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe('ollama-local-model');
+      const args = readClaudeArgs(logPath);
+      const idx = args.indexOf('--model');
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(args[idx + 1]).toBe('ollama-local-model');
+    } finally {
+      ollama.stop();
+    }
   });
 
   // INVARIANT: --model requires a non-empty value so we never append a dangling
@@ -385,6 +483,7 @@ describe('lazy builder', () => {
   // (claude-* and the known short names are accepted; a local server would allow
   // any name — that path is covered by the "wins over Ollama" test above.)
   test('--model with an unknown name and no local server is rejected up front', async () => {
+    useHostProcessRunner(ctx.root);
     const result = await ctx.lazy(['builder', '--model', 'qwen3-coder']);
     expectFailure(result, 1);
     expectError(result, 'Unknown --model');

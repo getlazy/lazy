@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS, startAndReconcile } from '../helpers/fixtures';
 
 describe('lazy search', () => {
   let ctx: TestContext;
@@ -370,12 +370,22 @@ describe('lazy search', () => {
       expectError(result, 'YYYY-MM-DD');
     });
 
-    // Missing operator between terms gives a parse error.
-    test('missing operator between field terms gives parse error', async () => {
+    // INVARIANT: adjacent terms with no operator are an implicit AND — NOT a
+    // parse error. This is the documented grammar ("and_expr → term ((AND |
+    // implicit_AND) term)*" in src/search/parser.ts) and documented user-facing
+    // behavior (docs/search.md, "adjacent tokens are an implicit AND", which is
+    // also why `tag:My Feature Work` silently matches nothing). This test
+    // previously asserted the opposite; implicit AND shipped in v0.9, after the
+    // assertion was written in v0.5, and the assertion was never updated.
+    test('missing operator between field terms is an implicit AND', async () => {
+      await createTask(ctx, 'Add auth to the gateway');
+      await createTask(ctx, 'Unrelated cleanup');
+
       const result = await ctx.lazy(['search', 'status:backlog goal:auth']);
 
-      expectFailure(result);
-      expectError(result, 'Query parse error');
+      expectSuccess(result);
+      expectOutput(result, 'Add auth to the gateway');
+      expectOutputExcludes(result, 'Unrelated cleanup');
     });
 
     // has: with invalid scope gives a parse error.
@@ -425,13 +435,10 @@ describe('lazy search', () => {
       const taskWithCommits = await createTask(ctx, 'Task with agent commits', 'Make the changes');
       await createTask(ctx, 'Task without commits', 'Nothing to do');
 
-      // Start with LAZY_MOCK_SHOULD_COMMIT=1 to create commits
-      const startResult = await ctx.lazyMocked(
-        ['start', taskWithCommits, '--yes'],
-        MOCK_CLAUDE_SUCCESS,
-        { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-      );
-      expectSuccess(startResult);
+      // Start with LAZY_MOCK_SHOULD_COMMIT=1 to create commits. The commit rows
+      // are written when the response is RECONCILED, not by `start` itself — so
+      // a daemonless suite has to drive that pass (see startAndReconcile).
+      await startAndReconcile(ctx, taskWithCommits);
 
       const result = await ctx.lazy(['search', 'has:commits']);
 
@@ -451,12 +458,9 @@ describe('lazy search', () => {
         usage: { input_tokens: 100, output_tokens: 200 },
       };
 
-      const startResult = await ctx.lazyMocked(
-        ['start', taskId, '--yes'],
-        mockResponse,
-        { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-      );
-      expectSuccess(startResult);
+      // The response text lands on the turn during reconciliation, so a
+      // daemonless suite must drive that pass before searching turn content.
+      await startAndReconcile(ctx, taskId, { mockResponse });
 
       const result = await ctx.lazy(['search', 'in:turns evaluator']);
 
@@ -474,12 +478,8 @@ describe('lazy search', () => {
     test('in:commits searches commit messages', async () => {
       const taskId = await createTask(ctx, 'Commit search task', 'Make some commits');
 
-      const startResult = await ctx.lazyMocked(
-        ['start', taskId, '--yes'],
-        MOCK_CLAUDE_SUCCESS,
-        { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-      );
-      expectSuccess(startResult);
+      // Commit rows are written at reconcile time (see has:commits above).
+      await startAndReconcile(ctx, taskId);
 
       // The mock creates commits with message "Mock agent commit (supervisor)"
       const result = await ctx.lazy(['search', 'in:commits "Mock agent commit"']);
@@ -589,6 +589,102 @@ describe('lazy search', () => {
       expectOutput(result, 'Text format');
       // Should NOT be valid JSON
       expect(() => JSON.parse(result.stdout)).toThrow();
+    });
+  });
+
+  // Searching by tag used to fail silently: every one of these inputs returned a
+  // bare "No matches found." with nothing to distinguish a typo from a tag that
+  // was never applied from a value the shell had split apart.
+  describe('tag search', () => {
+    test('tag: value is normalized the same way it is on write', async () => {
+      const tagged = await createTask(ctx, 'Normalized tag task');
+      expectSuccess(await ctx.lazy(['tag', tagged, 'My Feature Work']));
+
+      // Stored as 'my-feature-work'; all of these spellings must reach it.
+      for (const query of [
+        'tag:my-feature-work',
+        'tag:My-Feature-Work',
+        'tag:#my-feature-work',
+        'tag:"My Feature Work"',
+      ]) {
+        const result = await ctx.lazy(['search', query]);
+        expectSuccess(result);
+        expectOutput(result, 'Normalized tag task');
+      }
+    });
+
+    // The CLI PRINTS tags with a leading '#' ("Tagged x with #launch", "Tags: #launch"),
+    // so the spelling lazy shows the user must be a spelling search accepts.
+    test('bare #tag finds the tagged task', async () => {
+      const tagged = await createTask(ctx, 'Hash spelled task');
+      await createTask(ctx, 'Untagged other task');
+      expectSuccess(await ctx.lazy(['tag', tagged, 'launch']));
+
+      const result = await ctx.lazy(['search', '#launch']);
+      expectSuccess(result);
+      expectOutput(result, 'Hash spelled task');
+      expectOutputExcludes(result, 'Untagged other task');
+    });
+
+    // INVARIANT: '#foo' matches the TAG foo OR the literal text '#foo' — never the
+    // tag alone. Issue refs like '#1234' in goals and commit messages were findable
+    // before tags existed and must stay findable.
+    test('bare #text still finds literal text when no such tag exists', async () => {
+      await createTask(ctx, 'Fix issue #1234 in the parser');
+
+      const result = await ctx.lazy(['search', '#1234']);
+      expectSuccess(result);
+      expectOutput(result, 'Fix issue #1234 in the parser');
+    });
+
+    test('unmatched tag reports which tag is missing and lists known tags', async () => {
+      const tagged = await createTask(ctx, 'Tagged with launch');
+      expectSuccess(await ctx.lazy(['tag', tagged, 'launch']));
+
+      const result = await ctx.lazy(['search', 'tag:launhc']);
+      expectSuccess(result);
+      expectOutput(result, 'No matches found.');
+      expectOutput(result, 'No task is tagged #launhc');
+      // Close enough to suggest, and the full tag list is shown regardless.
+      expectOutput(result, '#launch');
+      expectOutput(result, 'Known tags:');
+    });
+
+    // An unquoted multi-word tag parses as `tag:<first-word> AND <rest as text>`,
+    // which is indistinguishable from a legitimate `tag:x some text` query — so it
+    // is not silently "fixed" in the parser, it is explained.
+    test('unquoted multi-word tag explains itself instead of failing silently', async () => {
+      const tagged = await createTask(ctx, 'Multi word tagged task');
+      expectSuccess(await ctx.lazy(['tag', tagged, 'My Feature Work']));
+
+      const result = await ctx.lazy(['search', 'tag:My Feature Work']);
+      expectSuccess(result);
+      expectOutput(result, 'No matches found.');
+      expectOutput(result, 'No task is tagged #my');
+      expectOutput(result, '#my-feature-work');
+      expectOutput(result, 'Quote a multi-word tag');
+    });
+
+    // The write side (normalizeTagOrThrow) rejects a tag with no alphanumerics;
+    // the query side must not silently return zero matches for the same input.
+    test('tag value with no alphanumerics is a parse error, not a silent miss', async () => {
+      await createTask(ctx, 'Some task');
+
+      const result = await ctx.lazy(['search', 'tag:###']);
+      expectFailure(result);
+      expectError(result, 'is not a valid tag');
+    });
+
+    test('no hint when the tag exists but the rest of the query excludes it', async () => {
+      const tagged = await createTask(ctx, 'Backlog tagged task');
+      expectSuccess(await ctx.lazy(['tag', tagged, 'launch']));
+
+      // The tag DOES exist — the status is what filtered it out, so a
+      // "no task is tagged #launch" hint would be actively wrong.
+      const result = await ctx.lazy(['search', 'tag:launch AND status:complete']);
+      expectSuccess(result);
+      expectOutput(result, 'No matches found.');
+      expectOutputExcludes(result, 'No task is tagged');
     });
   });
 });

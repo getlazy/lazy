@@ -9,6 +9,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve, join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -70,11 +71,29 @@ async function runMcpSession(
   return responses;
 }
 
+/** Resolve a task's full UUID from its short id via `lazy show --full`. */
+async function fullTaskId(ctx: TestContext, shortId: string): Promise<string> {
+  const showResult = await ctx.lazy(['show', shortId, '--full']);
+  const match = showResult.stdout.match(/ID:\s+([a-f0-9-]{36})/);
+  if (!match) {
+    throw new Error(`Could not extract full task id for ${shortId}: ${showResult.stdout}`);
+  }
+  return match[1];
+}
+
 describe('lazy-agent mcp', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // Storage-dependent MCP tools (lazy_status/create/show/comment/...) reach
+    // storage through requireStorage(). The MCP server is spawned WITHOUT
+    // LAZY_TEST=1 (see runMcpSession's `env: { ...process.env }`), so it must
+    // reach a real daemon over RPC — exactly like the pairing/builder MCP
+    // server does in production. A daemonless setup leaves those tools with no
+    // storage backend (requireStorage exits "Daemon is not running"), and the
+    // lazy_active test's start→wait lifecycle can't run without a daemon at all.
+    // Mirrors the sibling mcp-start / mcp-actor / mcp-lifecycle suites.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -124,9 +143,22 @@ describe('lazy-agent mcp', () => {
 
     const result = toolsResponse!.result as { tools: Array<{ name: string; description: string; inputSchema: unknown }> };
     expect(result.tools).toBeArray();
-    expect(result.tools.length).toBe(31);
+    // INVARIANT: this asserts the FULL set of MCP tools lazy exposes. If you
+    // add/remove a tool, update BOTH the count and the sorted name list below so
+    // the surface stays pinned (a silently-dropped tool is a regression).
+    // lazy_propose has been removed from every surface — agents and the builder
+    // decompose/run work via lazy_create + lazy_start (+ the self-orchestration
+    // tools); orthogonal work is recorded with lazy_add_followup / lazy_journal.
+    // lazy_propose must NOT reappear. Upstream's lazy_journal, lazy_add_followup,
+    // lazy_prioritize, lazy_tag, and lazy_untag are all present. The memory
+    // tools (lazy_memory_save / lazy_memory_recall) are registered for BOTH
+    // surfaces — the agent read-only gate lives inside lazy_memory_save's
+    // handler, not in tool registration, so agents still see the tool and get a
+    // clear server-side rejection instead of a mystery missing tool.
+    expect(result.tools.length).toBe(36);
 
     const toolNames = result.tools.map(t => t.name).sort();
+    expect(toolNames).not.toContain('lazy_propose');
     expect(toolNames).toEqual([
       'lazy_accept',
       'lazy_active',
@@ -143,8 +175,11 @@ describe('lazy-agent mcp', () => {
       'lazy_create',
       'lazy_diff',
       'lazy_edit',
+      'lazy_journal',
       'lazy_list',
-      'lazy_propose',
+      'lazy_memory_recall',
+      'lazy_memory_save',
+      'lazy_prioritize',
       'lazy_redo',
       'lazy_reject',
       'lazy_reopen',
@@ -157,7 +192,9 @@ describe('lazy-agent mcp', () => {
       'lazy_stop',
       'lazy_submit',
       'lazy_sync',
+      'lazy_tag',
       'lazy_unblock',
+      'lazy_untag',
       'lazy_wait',
     ]);
 
@@ -167,6 +204,29 @@ describe('lazy-agent mcp', () => {
       expect(tool.inputSchema).toBeDefined();
       expect((tool.inputSchema as Record<string, unknown>).type).toBe('object');
     }
+  });
+
+  // INVARIANT: lazy_start must expose the `force_local` escape hatch so a
+  // builder can start a task whose parent ref genuinely isn't on the remote
+  // (the CLI has --force-local; the MCP tool must offer the same). Offline mode
+  // implies it automatically, but the online missing-ref case needs it explicit.
+  test('lazy_start exposes an optional force_local boolean param', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/list', id: 2 },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as {
+      tools: Array<{ name: string; inputSchema: { properties?: Record<string, { type?: string }>; required?: string[] } }>;
+    };
+    const startTool = result.tools.find(t => t.name === 'lazy_start');
+    expect(startTool).toBeDefined();
+    expect(startTool!.inputSchema.properties?.force_local).toBeDefined();
+    expect(startTool!.inputSchema.properties?.force_local?.type).toBe('boolean');
+    // Optional — must not be in the required list.
+    expect(startTool!.inputSchema.required ?? []).not.toContain('force_local');
   });
 
   test('responds to ping', async () => {
@@ -296,10 +356,13 @@ describe('lazy-agent mcp', () => {
     expect(parsed.results.length).toBeGreaterThanOrEqual(1);
   });
 
-  test('lazy_create creates a new task', async () => {
-    const taskId = '00000000-0000-0000-0000-000000000001';
+  // When an agent (non-empty taskId) calls lazy_create, the new task is created
+  // as a subtask of the agent's OWN task — never a top-level task.
+  test('lazy_create creates a subtask of the calling agent task', async () => {
+    const parentShortId = await createTask(ctx, 'Parent agent task');
+    const parentFullId = await fullTaskId(ctx, parentShortId);
 
-    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+    const responses = await runMcpSession(ctx.root, parentFullId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },
       { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'MCP test task', code: 'mcp-test' } } },
     ]);
@@ -313,19 +376,290 @@ describe('lazy-agent mcp', () => {
     expect(parsed.code).toBe('mcp-test');
     expect(parsed.id).toBeTruthy();
     expect(parsed.status).toBe('backlog');
+    // The created task must be parented to the calling agent's task.
+    expect(parsed.parent_task_id).toBe(parentShortId);
 
-    // Verify via CLI
-    const showResult = await ctx.lazy(['show', parsed.id]);
+    // Verify via CLI that it shows up as a child of the parent
+    const showResult = await ctx.lazy(['show', parentShortId]);
     expect(showResult.stdout).toContain('MCP test task');
   });
 
+  // INVARIANT: Agents may only create subtasks of their OWN task. Passing a
+  // branch (e.g. 'main') as parent — which would make a top-level task — is
+  // rejected server-side. This is the create-ownership security boundary.
+  test('lazy_create rejects an agent creating a top-level task (parent=branch)', async () => {
+    const parentShortId = await createTask(ctx, 'Parent agent task');
+    const parentFullId = await fullTaskId(ctx, parentShortId);
+
+    const responses = await runMcpSession(ctx.root, parentFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'Top level attempt', parent: 'main' } } },
+    ]);
+
+    const createResponse = responses.find(r => r.id === 2);
+    expect(createResponse).toBeDefined();
+    const result = createResponse!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('own task');
+  });
+
+  // INVARIANT: Agents may only create subtasks of their OWN task. Parenting
+  // under a DIFFERENT existing task is rejected server-side.
+  test('lazy_create rejects an agent creating under a different parent', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const otherShortId = await createTask(ctx, 'Some other task');
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'Wrong parent attempt', parent: otherShortId } } },
+    ]);
+
+    const createResponse = responses.find(r => r.id === 2);
+    expect(createResponse).toBeDefined();
+    const result = createResponse!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('own task');
+  });
+
+  // An agent passing its OWN task id as parent is allowed (equivalent to omitting it).
+  test('lazy_create allows an agent passing its own task id as parent', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'Explicit own parent', parent: myShortId } } },
+    ]);
+
+    const createResponse = responses.find(r => r.id === 2);
+    const result = createResponse!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.parent_task_id).toBe(myShortId);
+  });
+
+  // INVARIANT: Agents may only START their own subtasks. Starting a task that
+  // is not a child of the calling agent's task is rejected server-side, before
+  // any worktree/branch/supervisor is created.
+  test('lazy_start rejects an agent starting a task it does not own', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const otherShortId = await createTask(ctx, 'Unrelated task', 'Do work');
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_start', arguments: { task_id: otherShortId } } },
+    ]);
+
+    const startResponse = responses.find(r => r.id === 2);
+    expect(startResponse).toBeDefined();
+    const result = startResponse!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('own subtasks');
+  });
+
+  // INVARIANT: Agents may NOT reparent any task. Reparent is a builder/human
+  // operation — allowing it would let an agent escape the create/start
+  // ownership boundary.
+  test('lazy_reparent rejects an agent caller', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const otherShortId = await createTask(ctx, 'Unrelated task');
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_reparent', arguments: { task_id: otherShortId, parent: 'main' } } },
+    ]);
+
+    const reparentResponse = responses.find(r => r.id === 2);
+    expect(reparentResponse).toBeDefined();
+    const result = reparentResponse!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('cannot reparent');
+  });
+
+  // ── Self-orchestration ownership boundary ────────────────────────────────
+  // An agent may run its OWN subtasks end-to-end, but every task-targeting
+  // self-orchestration tool is confined to the agent's own task or a direct
+  // child. These tests encode that security boundary.
+
+  // INVARIANT: each self-orchestration tool rejects a target the agent does
+  // not own (neither its own task nor a direct subtask), server-side.
+  // `phrase` defaults to the shared own-task-or-direct-child refusal. Accept is
+  // stricter (direct children ONLY — see the child-only tests below), so it
+  // carries its own phrase.
+  const GATED_TOOLS: Array<{ name: string; extraArgs: Record<string, unknown>; phrase?: string }> = [
+    { name: 'lazy_show', extraArgs: {} },
+    { name: 'lazy_diff', extraArgs: {} },
+    { name: 'lazy_wait', extraArgs: { timeout: 1 } },
+    { name: 'lazy_unblock', extraArgs: { feedback: 'do x' } },
+    { name: 'lazy_accept', extraArgs: {}, phrase: 'own direct subtasks' },
+    { name: 'lazy_reject', extraArgs: {} },
+    { name: 'lazy_close', extraArgs: { reason: 'nope' } },
+    { name: 'lazy_edit', extraArgs: { goal: 'changed' } },
+    { name: 'lazy_stop', extraArgs: { reason: 'x' } },
+    { name: 'lazy_submit', extraArgs: {} },
+    { name: 'lazy_resume', extraArgs: {} },
+    { name: 'lazy_ask', extraArgs: { message: 'q' } },
+    { name: 'lazy_sync', extraArgs: {} },
+    { name: 'lazy_reopen', extraArgs: {} },
+  ];
+
+  for (const tool of GATED_TOOLS) {
+    test(`${tool.name} rejects an agent targeting a task it does not own`, async () => {
+      const myShortId = await createTask(ctx, 'My agent task');
+      const myFullId = await fullTaskId(ctx, myShortId);
+      const otherShortId = await createTask(ctx, 'Unrelated task', 'Do work');
+
+      const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+        { method: 'initialize', id: 1, params: {} },
+        { method: 'tools/call', id: 2, params: { name: tool.name, arguments: { task_id: otherShortId, ...tool.extraArgs } } },
+      ]);
+
+      const resp = responses.find(r => r.id === 2);
+      expect(resp).toBeDefined();
+      const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      expect(result.isError).toBe(true);
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.error).toContain(tool.phrase ?? 'own task or its direct subtasks');
+    });
+  }
+
+  // INVARIANT: lazy_accept is stricter than the shared gate — a DIRECT SUBTASK
+  // only. An agent accepting its OWN task would merge its work upward and mark
+  // itself complete with no human review, which is exactly the boundary the
+  // review step exists to hold. Refused server-side, not by prompt guidance.
+  // (The merge behaviour itself lives in test/e2e/mcp-agent-accept.test.ts.)
+  test('lazy_accept rejects an agent accepting its own task', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_accept', arguments: { task_id: myShortId } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('may not accept their own task');
+  });
+
+  // INVARIANT: lazy_clone and lazy_redo are OUT of the agent surface entirely —
+  // both manufacture a task whose parent the agent cannot constrain to its own
+  // subtree (clone parents under the source; redo under the original's parent).
+  // An agent caller is rejected outright, even targeting its own task.
+  for (const tc of [
+    { name: 'lazy_clone', phrase: 'cannot clone' },
+    { name: 'lazy_redo', phrase: 'cannot redo' },
+  ]) {
+    test(`${tc.name} rejects an agent caller outright`, async () => {
+      const myShortId = await createTask(ctx, 'My agent task');
+      const myFullId = await fullTaskId(ctx, myShortId);
+      const otherShortId = await createTask(ctx, 'Unrelated task', 'Do work');
+
+      const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+        { method: 'initialize', id: 1, params: {} },
+        { method: 'tools/call', id: 2, params: { name: tc.name, arguments: { task_id: otherShortId } } },
+      ]);
+
+      const resp = responses.find(r => r.id === 2);
+      expect(resp).toBeDefined();
+      const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      expect(result.isError).toBe(true);
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.error).toContain(tc.phrase);
+    });
+  }
+
+  // An agent CAN review its own direct subtask (read gate passes).
+  test('lazy_show allows an agent to inspect its own subtask', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const childRes = await ctx.lazy(['create', '--goal', 'My subtask', '--prompt', 'do', '--parent', myShortId]);
+    const childShortId = extractTaskId(childRes.stdout);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: childShortId } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.goal).toBe('My subtask');
+  });
+
+  // An agent CAN inspect its own task.
+  test('lazy_show allows an agent to inspect its own task', async () => {
+    const myShortId = await createTask(ctx, 'My own agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: myShortId } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.goal).toBe('My own agent task');
+  });
+
+  // The ownership gate must NOT block a lifecycle tool on an own subtask. The
+  // accept then fails on task state (the subtask has no session yet) — a
+  // different error — proving the gate let it through.
+  test('lazy_accept lets an agent target its own subtask (gate passes)', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const childRes = await ctx.lazy(['create', '--goal', 'My subtask', '--prompt', 'do', '--parent', myShortId]);
+    const childShortId = extractTaskId(childRes.stdout);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_accept', arguments: { task_id: childShortId } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    if (result.isError) {
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.error).not.toContain('own direct subtasks');
+    }
+  });
+
+  // INVARIANT: agents cannot reparent via lazy_edit's `parent` field — even on
+  // their own task. That is the lazy_reparent backdoor and stays closed.
+  test('lazy_edit forbids an agent changing a task parent (reparent backdoor)', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_edit', arguments: { task_id: myShortId, parent: 'main' } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('cannot change a task\'s parent');
+  });
+
   test('lazy_show returns task details', async () => {
-    // Create a task first
+    // The agent shows its OWN task (ownership gate allows own + direct children).
     const taskShortId = await createTask(ctx, 'Show test task');
+    const taskFullId = await fullTaskId(ctx, taskShortId);
 
-    const taskId = '00000000-0000-0000-0000-000000000001';
-
-    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+    const responses = await runMcpSession(ctx.root, taskFullId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },
       { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: taskShortId } } },
     ]);
@@ -338,6 +672,23 @@ describe('lazy-agent mcp', () => {
     expect(parsed.goal).toBe('Show test task');
     expect(parsed.status).toBe('backlog');
     expect(parsed.id).toBe(taskShortId);
+  });
+
+  // INVARIANT: a builder driving tasks over MCP has no host CLI, so lazy_show
+  // must report retry state. The positive path lives in
+  // test/unit/mcp-retry-status.test.ts — forcing a `working` task here would
+  // need in-test Storage writes, and this suite's daemon holds the storage lock.
+  test('lazy_show omits retry_status when the task is not retrying', async () => {
+    const taskShortId = await createTask(ctx, 'Non-retrying show task');
+    const taskFullId = await fullTaskId(ctx, taskShortId);
+
+    const responses = await runMcpSession(ctx.root, taskFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: taskShortId } } },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ type: string; text: string }> };
+    expect(JSON.parse(result.content[0].text).retry_status).toBeUndefined();
   });
 
   test('lazy_show returns error for nonexistent task', async () => {
@@ -378,26 +729,23 @@ describe('lazy-agent mcp', () => {
     expect(parsed.task_id).toBe(taskShortId);
   });
 
-  test('lazy_propose creates a proposal', async () => {
-    // Create a task first
-    const taskShortId = await createTask(ctx, 'Propose test task');
-    const showResult = await ctx.lazy(['show', taskShortId, '--full']);
-    const idMatch = showResult.stdout.match(/ID:\s+([a-f0-9-]{36})/);
+  // INVARIANT: lazy_propose is no longer exposed as an MCP tool. Calling it
+  // must fail as an unknown tool — agents decompose/run work via lazy_create +
+  // lazy_start (and the self-orchestration tools) instead.
+  test('lazy_propose is no longer an available MCP tool', async () => {
+    const taskShortId = await createTask(ctx, 'Propose removed task');
+    const fullId = await fullTaskId(ctx, taskShortId);
 
-    const responses = await runMcpSession(ctx.root, idMatch![1], ctx.root, [
+    const responses = await runMcpSession(ctx.root, fullId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },
       { method: 'tools/call', id: 2, params: { name: 'lazy_propose', arguments: { goal: 'Add input validation', code: 'add-validation' } } },
     ]);
 
     const proposeResponse = responses.find(r => r.id === 2);
     expect(proposeResponse).toBeDefined();
-
-    const result = proposeResponse!.result as { content: Array<{ type: string; text: string }> };
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.goal).toBe('Add input validation');
-    expect(parsed.code).toBe('add-validation');
-    expect(parsed.status).toBe('pending');
-    expect(parsed.task_id).toBe(taskShortId);
+    expect(proposeResponse!.error).toBeDefined();
+    expect(proposeResponse!.error!.code).toBe(-32602);
+    expect(proposeResponse!.error!.message).toContain('lazy_propose');
   });
 
   test('handles malformed JSON gracefully', async () => {
@@ -805,5 +1153,74 @@ describe('lazy-agent mcp', () => {
 
     // Should NOT include backlog task without session
     expect(returnedIds).not.toContain(t3ShortId);
+
+    // Each task must carry its status and a substate field so consumers can see
+    // what an active task is actually doing — the gap this task closed. substate
+    // is a string for working tasks (agent / harness / not-alive) and null
+    // otherwise.
+    for (const task of parsed.tasks as Array<{ status: string; substate: string | null }>) {
+      expect(typeof task.status).toBe('string');
+      expect(task.status.length).toBeGreaterThan(0);
+      expect('substate' in task).toBe(true);
+    }
+
+    // The blocked task is not `working`, so its substate is null.
+    const blockedTask = parsed.tasks.find((t: { id: string }) => t.id === t2ShortId);
+    expect(blockedTask.status).toBe('blocked');
+    expect(blockedTask.substate).toBeNull();
+  });
+
+  // INVARIANT: lazy_active's optional task_id filters to the task's SUBTREE —
+  // it and ALL descendants — mirroring `lazy active <task_id>` on the CLI.
+  // (lazy_list's task_id is direct-children only; these are deliberately
+  // different filters.)
+  test('lazy_active task_id filters to the task subtree, including grandchildren', async () => {
+    const rootShortId = await createTask(ctx, 'Subtree root', 'Root work');
+    expect((await ctx.lazyMocked(['start', rootShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', rootShortId])).exitCode).toBe(0);
+    const rootFullId = await fullTaskId(ctx, rootShortId);
+
+    const childCreate = await ctx.lazy(['create', '--goal', 'Subtree child', '--prompt', 'Child work', '--parent', rootFullId]);
+    expect(childCreate.exitCode).toBe(0);
+    const childShortId = extractTaskId(childCreate.stdout);
+    expect((await ctx.lazyMocked(['start', childShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', childShortId])).exitCode).toBe(0);
+    const childFullId = await fullTaskId(ctx, childShortId);
+
+    const grandCreate = await ctx.lazy(['create', '--goal', 'Subtree grandchild', '--prompt', 'Grandchild work', '--parent', childFullId]);
+    expect(grandCreate.exitCode).toBe(0);
+    const grandShortId = extractTaskId(grandCreate.stdout);
+    expect((await ctx.lazyMocked(['start', grandShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', grandShortId])).exitCode).toBe(0);
+
+    // A started task outside the subtree — must be filtered out.
+    const outsiderShortId = await createTask(ctx, 'Outside the subtree', 'Other work');
+    expect((await ctx.lazyMocked(['start', outsiderShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', outsiderShortId])).exitCode).toBe(0);
+
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_active', arguments: { task_id: rootShortId } } },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_active', arguments: { task_id: 'no-such-task' } } },
+    ]);
+
+    const filtered = JSON.parse(
+      (responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> }).content[0].text,
+    );
+    const ids = filtered.tasks.map((t: { id: string }) => t.id);
+    expect(ids).toContain(rootShortId);
+    expect(ids).toContain(childShortId);
+    expect(ids).toContain(grandShortId);
+    expect(ids).not.toContain(outsiderShortId);
+    expect(filtered.count).toBe(3);
+
+    // Parent links come back so the subtree can be reassembled by a consumer.
+    const child = filtered.tasks.find((t: { id: string }) => t.id === childShortId);
+    expect(child.parent_task_id).toBe(rootShortId);
+
+    // An unknown task_id is an error, not a silently unfiltered listing.
+    const notFound = responses.find(r => r.id === 3)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(notFound.isError).toBe(true);
+    expect(notFound.content[0].text).toContain('Task not found: no-such-task');
   });
 });

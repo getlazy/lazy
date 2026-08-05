@@ -42,7 +42,7 @@ describe('MCP config', () => {
     }
 
     const { writeMcpConfig } = await import('../../src/mcp/config');
-    writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'test-task-uuid', '--worktree', '/test/worktree'] });
+    await writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'test-task-uuid', '--worktree', '/test/worktree'] });
 
     expect(existsSync(claudeConfigPath)).toBe(true);
     const content = JSON.parse(readFileSync(claudeConfigPath, 'utf-8'));
@@ -66,7 +66,7 @@ describe('MCP config', () => {
     writeFileSync(claudeConfigPath, JSON.stringify(existingConfig));
 
     const { writeMcpConfig } = await import('../../src/mcp/config');
-    writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'test-uuid', '--worktree', '/work'] });
+    await writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'test-uuid', '--worktree', '/work'] });
 
     const content = JSON.parse(readFileSync(claudeConfigPath, 'utf-8'));
 
@@ -93,7 +93,7 @@ describe('MCP config', () => {
     writeFileSync(claudeConfigPath, JSON.stringify(existingConfig));
 
     const { writeMcpConfig } = await import('../../src/mcp/config');
-    writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'new-uuid', '--worktree', '/new/path'] });
+    await writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'new-uuid', '--worktree', '/new/path'] });
 
     const content = JSON.parse(readFileSync(claudeConfigPath, 'utf-8'));
     expect(content.mcpServers['lazy'].args).toEqual(['mcp', '--task-id', 'new-uuid', '--worktree', '/new/path']);

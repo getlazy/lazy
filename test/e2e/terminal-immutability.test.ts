@@ -1,13 +1,15 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndAccept } from '../helpers/fixtures';
 
 describe('terminal task immutability', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -18,9 +20,9 @@ describe('terminal task immutability', () => {
 
   test('cannot abandon an already-abandoned task', async () => {
     const taskId = await createTask(ctx, 'Abandon once');
-    await ctx.lazy(['abandon', taskId, '--reason', 'First abandon']);
+    await ctx.lazy(['close', taskId, '--reason', 'First abandon']);
 
-    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Second abandon']);
+    const result = await ctx.lazy(['close', taskId, '--reason', 'Second abandon']);
     expectFailure(result);
     expectError(result, 'already abandoned');
   });
@@ -28,13 +30,9 @@ describe('terminal task immutability', () => {
   test('cannot abandon a completed task', async () => {
     const taskId = await createTask(ctx, 'Accept then abandon', 'Do the work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndAccept(ctx, taskId);
 
-    await ctx.lazy(['accept', taskId]);
-
-    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Try to abandon completed']);
+    const result = await ctx.lazy(['close', taskId, '--reason', 'Try to abandon completed']);
     expectFailure(result);
     expectError(result, 'already complete');
   });
@@ -43,7 +41,7 @@ describe('terminal task immutability', () => {
 
   test('can add comment to abandoned task', async () => {
     const taskId = await createTask(ctx, 'Abandoned with comment');
-    await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
+    await ctx.lazy(['close', taskId, '--reason', 'Done']);
 
     const result = await ctx.lazy(['comment', taskId, '--message', 'Annotation on abandoned task']);
     expectSuccess(result);
@@ -52,11 +50,7 @@ describe('terminal task immutability', () => {
   test('can add comment to completed task', async () => {
     const taskId = await createTask(ctx, 'Completed with comment', 'Do the work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['comment', taskId, '--message', 'Annotation on completed task']);
     expectSuccess(result);
@@ -66,7 +60,7 @@ describe('terminal task immutability', () => {
 
   test('cannot edit goal of abandoned task', async () => {
     const taskId = await createTask(ctx, 'Edit abandoned goal');
-    await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
+    await ctx.lazy(['close', taskId, '--reason', 'Done']);
 
     const result = await ctx.lazy(['edit', taskId, '--goal', 'New goal']);
     expectFailure(result);
@@ -77,10 +71,10 @@ describe('terminal task immutability', () => {
 
   test('abandon reason from first abandon is preserved', async () => {
     const taskId = await createTask(ctx, 'Preserve abandon reason');
-    await ctx.lazy(['abandon', taskId, '--reason', 'Original reason']);
+    await ctx.lazy(['close', taskId, '--reason', 'Original reason']);
 
     // Second abandon attempt fails
-    await ctx.lazy(['abandon', taskId, '--reason', 'Overwrite attempt']);
+    await ctx.lazy(['close', taskId, '--reason', 'Overwrite attempt']);
 
     // Verify original reason persists
     const showResult = await ctx.lazy(['show', taskId]);

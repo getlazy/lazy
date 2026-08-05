@@ -12,17 +12,16 @@ import { render, renderTreeOverlay, renderHelpOverlay, flattenNavItems, formatMa
 import { getDiffStat, getDiffFull, getCurrentBranch, getRemoteDefaultBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchName, getBranchNameFromId } from '../helpers';
 import type { TaskTreeNode } from '../../storage/types';
-import { readPendingProposals, updateProposalStatus } from '../commands/propose';
 import { getNewNotesSince } from '../commands/shared';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
 import type { Task, Session, Turn, Comment, Commit, JournalEntry, FollowUp } from '../../types';
 import { parentTaskIdOf } from '../../task-target';
-import type { Proposal } from '../commands/propose';
 import type { Storage } from '../../storage';
 import { getDataDir } from '../init';
 import { ansi } from './terminal';
 import { loadConfig } from '../../config/loader';
 import type { ResolvedConfig } from '../../config/types';
+import { turnText } from '../../utils/turn-content';
 
 // ── Review result ──────────────────────────────────────────────────────
 
@@ -49,7 +48,6 @@ export interface ReviewData {
   journal: JournalEntry[];
   /** Passive, agent-recorded orthogonal-work notes. Display-only — never triggers anything. */
   followUps: FollowUp[];
-  proposals: Proposal[];
   diffStat: string;
   diffFull: string;
   worktreePath: string;
@@ -86,13 +84,12 @@ export async function loadReviewData(
   }
 
   // Load all data in parallel (skip session-specific data if no session)
-  const [turns, commits, comments, journal, followUps, proposals, parentTask] = await Promise.all([
+  const [turns, commits, comments, journal, followUps, parentTask] = await Promise.all([
     session ? storage.getSessionTurns(session.id) : Promise.resolve([]),
     session ? storage.getSessionCommits(session.id) : Promise.resolve([]),
     storage.getTaskComments(task.id),
     storage.getTaskJournal(task.id),
     storage.getTaskFollowUps(task.id),
-    Promise.resolve(readPendingProposals(storage, task.id)),
     parentId ? storage.getTask(parentId) : Promise.resolve(null),
   ]);
 
@@ -191,7 +188,7 @@ export async function loadReviewData(
 
   return {
     task, session, turns, commits, comments, unseenComments, journal, followUps,
-    proposals, diffStat, diffFull, worktreePath, targetBranch, lastAgentTurn,
+    diffStat, diffFull, worktreePath, targetBranch, lastAgentTurn,
     turnInfoMap, taskTree, childTasks, parentTask,
   };
 }
@@ -232,7 +229,6 @@ async function loadReviewDataForSubtask(
       unseenComments: [],
       journal: await storage.getTaskJournal(task.id),
       followUps: await storage.getTaskFollowUps(task.id),
-      proposals: [],
       diffStat: '',
       diffFull: '',
       worktreePath,
@@ -293,7 +289,6 @@ async function loadReviewDataForSubtask(
     unseenComments: [],
     journal: await storage.getTaskJournal(task.id),
     followUps: await storage.getTaskFollowUps(task.id),
-    proposals: [],
     diffStat,
     diffFull,
     worktreePath,
@@ -521,27 +516,6 @@ export function buildNavItemsForTask(
     });
   }
 
-  // ── Proposals (top-level, peer of Turns) ─────────────────────────
-  if (data.proposals.length > 0) {
-    const proposalChildren: NavItem[] = data.proposals.map((p, i) => {
-      const preview = p.goal.length > 25 ? p.goal.substring(0, 22) + '...' : p.goal;
-      return {
-        key: `${keyPrefix}proposal:${p.id}`,
-        label: preview,
-        icon: `${i + 1}`,
-      };
-    });
-
-    items.push({
-      key: `${keyPrefix}proposals`,
-      label: 'Proposals',
-      icon: '💡',
-      badge: `${data.proposals.length}`,
-      children: proposalChildren,
-      expanded: false,
-    });
-  }
-
   // ── All Commits (descending — newest first) ────────────────────────
   if (data.commits.length > 0) {
     const descCommits = [...data.commits].reverse();
@@ -641,7 +615,7 @@ function buildTurnChildren(turn: Turn, data: ReviewData, keyPrefix: string = '')
 
   // Plan (agent turns only)
   if (turn.role === 'agent') {
-    const plan = extractPlanFromContent(turn.content);
+    const plan = extractPlanFromContent(turnText(turn));
     children.push({
       key: `${keyPrefix}turn-plan:${seq}`,
       label: 'Plan',
@@ -846,15 +820,6 @@ async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, 
     return getSingleFollowUpContent(mainData, followUpId);
   }
 
-  // Proposals
-  if (key === 'proposals') {
-    return getProposalsContent(mainData);
-  }
-  if (key.startsWith('proposal:')) {
-    const proposalId = key.substring(9);
-    return getSingleProposalContent(mainData, proposalId);
-  }
-
   // All Commits (top-level)
   if (key === 'commits') {
     return getCommitsOverview(mainData);
@@ -913,9 +878,9 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
   }
 
   if (turn.role === 'agent') {
-    lines.push(...formatMarkdown(turn.content));
+    lines.push(...formatMarkdown(turnText(turn)));
   } else {
-    lines.push(...turn.content.split('\n'));
+    lines.push(...turnText(turn).split('\n'));
   }
   return lines;
 }
@@ -923,7 +888,7 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
 function getTurnPlanContent(data: ReviewData, seq: number): string[] {
   const turn = data.turns.find(t => t.sequence === seq && t.role === 'agent');
   if (!turn) return ['Turn not found.'];
-  const plan = extractPlanFromContent(turn.content);
+  const plan = extractPlanFromContent(turnText(turn));
   if (plan) return formatMarkdown(plan);
   return [ansi.dim + 'No plan found in the agent response.' + ansi.reset];
 }
@@ -1160,44 +1125,6 @@ function getSingleFollowUpContent(data: ReviewData, followUpId: string): string[
   return lines;
 }
 
-function getProposalsContent(data: ReviewData): string[] {
-  const lines: string[] = [];
-  lines.push(ansi.bold + `Proposals (${data.proposals.length} pending)` + ansi.reset);
-  lines.push('');
-  lines.push(ansi.dim + 'Expand to see individual proposals.' + ansi.reset);
-  lines.push('');
-
-  for (let i = 0; i < data.proposals.length; i++) {
-    const p = data.proposals[i];
-    lines.push(ansi.bold + `${i + 1}. ${p.goal}` + ansi.reset);
-    if (p.code) {
-      lines.push(`   ${ansi.fg.cyan}Code: ${p.code}${ansi.reset}`);
-    }
-    lines.push('');
-  }
-
-  return lines;
-}
-
-function getSingleProposalContent(data: ReviewData, proposalId: string): string[] {
-  const p = data.proposals.find(p => p.id === proposalId);
-  if (!p) return ['Proposal not found.'];
-
-  const lines: string[] = [];
-  lines.push(ansi.bold + p.goal + ansi.reset);
-  lines.push('');
-  if (p.code) {
-    lines.push(ansi.fg.cyan + `Code: ${p.code}` + ansi.reset);
-  }
-  lines.push(ansi.dim + `Created: ${p.created_at}` + ansi.reset);
-  if (p.prompt) {
-    lines.push('');
-    lines.push(ansi.bold + 'Prompt:' + ansi.reset);
-    lines.push(...p.prompt.split('\n'));
-  }
-  return lines;
-}
-
 function getCommitsOverview(data: ReviewData): string[] {
   const lines: string[] = [];
   lines.push(ansi.bold + `Commits (${data.commits.length})` + ansi.reset);
@@ -1271,7 +1198,7 @@ function getTurnsOverview(data: ReviewData): string[] {
   for (const turn of data.turns) {
     const roleColor = turn.role === 'human' ? ansi.fg.green : ansi.fg.blue;
     const roleLabel = turn.role.toUpperCase();
-    const preview = turn.content.substring(0, 60).replace(/\n/g, ' ');
+    const preview = turnText(turn).substring(0, 60).replace(/\n/g, ' ');
     lines.push(roleColor + `#${turn.sequence} [${roleLabel}]` + ansi.reset + ` ${preview}...`);
   }
 
@@ -1302,7 +1229,7 @@ export function getChunkOverview(data: ReviewData, index: number): string[] {
       ? turn.actor.toUpperCase()
       : turn.role.toUpperCase();
     const autoSuffix = turn.auto_triggered ? ansi.dim + ' (auto)' + ansi.reset : '';
-    const preview = turn.content.substring(0, 60).replace(/\n/g, ' ');
+    const preview = turnText(turn).substring(0, 60).replace(/\n/g, ' ');
     lines.push(roleColor + `#${turn.sequence} [${actorLabel}]` + ansi.reset + autoSuffix + ` ${preview}...`);
   }
 
@@ -1409,7 +1336,7 @@ function getGoalAndPromptContent(data: ReviewData): string[] {
 
   // ── Prompt ────────────────────────────────────────────────────────
   // Show the task prompt (from task creation via `lazy create --prompt`).
-  // Per-turn prompts (which include goal context, merge instructions, etc.)
+  // Per-turn prompts (which include goal context, turn history, notes, etc.)
   // are visible under each turn's "Prompt" subsection.
   if (task.prompt) {
     lines.push(ansi.bold + ansi.fg.cyan + '── Prompt ──' + ansi.reset);
@@ -2117,9 +2044,6 @@ function buildStatusLine(data: ReviewData): string {
   }
   if (data.followUps.length > 0) {
     parts.push(`${data.followUps.length} follow-up(s)`);
-  }
-  if (data.proposals.length > 0) {
-    parts.push(`${data.proposals.length} proposal(s)`);
   }
   return parts.join('  │  ');
 }

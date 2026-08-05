@@ -52,6 +52,28 @@ function readGatesFromFile(): AcceptGateWarning[] | null {
   }
 }
 
+/**
+ * Per-call approval state, mirroring readGatesFromFile(). Protected-branch
+ * tests run against a daemon and must vary `hasRemoteRef` / `hasExternalApproval`
+ * per-test, but env can't change after daemon startup. Tests write approval JSON
+ * to <LAZY_PROTOCOL_BASE>/mock-approval.json and the mock re-reads it per call.
+ * Returns null when no file is present so callers fall back to the env consts.
+ */
+function readApprovalFromFile(): { hasRemoteRef?: boolean; hasExternalApproval?: boolean } | null {
+  const base = process.env.LAZY_PROTOCOL_BASE;
+  if (!base) return null;
+  try {
+    // Sync read is acceptable in test mocks (no event loop concerns).
+    const { readFileSync, existsSync } = require('fs');
+    const { join } = require('path');
+    const filePath = join(base, 'mock-approval.json');
+    if (!existsSync(filePath)) return null;
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
 function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
   const staticGateWarnings: AcceptGateWarning[] = mockAcceptGatesJson
     ? JSON.parse(mockAcceptGatesJson)
@@ -78,11 +100,19 @@ function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
     checkHealth: async () => [],
     getConfigOptions: () => ({ valid: [], deprecated: [] }),
     getTaskUrl: async () => null,
-    hasRemoteRef: () => false,
+    hasRemoteRef: () => {
+      // File overrides the env default so daemon-backed protected-branch tests
+      // can toggle a remote ref per-test (env can't change after daemon startup).
+      const approval = readApprovalFromFile();
+      return approval?.hasRemoteRef ?? mockHasExternalApproval;
+    },
     recoverRemoteRef: async () => null,
     validateAccept: () => null,
     isTargetBranchProtected: async () => mockProtectedBranch,
-    hasExternalApproval: async () => mockHasExternalApproval,
+    hasExternalApproval: async () => {
+      const approval = readApprovalFromFile();
+      return approval?.hasExternalApproval ?? mockHasExternalApproval;
+    },
     checkAcceptGates: async () => {
       // File overrides static env value — supports per-test injection in
       // daemon-backed tests where env can't change after daemon startup.

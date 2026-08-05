@@ -3,7 +3,9 @@ import { join } from 'path';
 import { readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+// Storage lives at the project's external_path, not <root>/.lazy/tasks.
+import { findFullTaskId } from '../helpers/storage';
 import { getNewNotesSince, buildNotesContext } from '../../src/cli/commands/shared';
 import { buildNotesSectionForEditor, buildFreeformEditorContentWithNotes, buildEditorContentWithDiff, extractSurvivingNotes, extractFeedbackFromDiff } from '../../src/utils/diff';
 import { readCommand, protocolDir as getProtocolDir } from '../../src/protocol';
@@ -196,13 +198,10 @@ describe('comments injected into agent prompts', () => {
   test('comments reach agent via unblock --message (imperative mode)', async () => {
     const taskId = await createTask(ctx, 'Imperative unblock comments', 'Do feature work');
 
-    // Start the task
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    // Trigger reconciliation so the agent turn is recorded
-    await ctx.lazy(['show', taskId]);
+    // Start the task and drive the reconcile pass that records the agent turn
+    // and moves it to 'blocked' -- unblock refuses a working task, and neither
+    // 'lazy show' nor 'lazy list' reconciles any more.
+    await startAndReconcile(ctx, taskId);
 
     // Wait so comment timestamps are strictly after the agent turn
     await Bun.sleep(1100);
@@ -226,14 +225,6 @@ describe('comments injected into agent prompts', () => {
     expect(command.prompt).toContain('DESIGN NOTE: Must handle edge case');
   });
 });
-
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const dirs = readdirSync(tasksDir);
-  const match = dirs.find(d => d.startsWith(shortId));
-  if (!match) throw new Error(`Task directory not found for ${shortId}`);
-  return match;
-}
 
 describe('buildNotesSectionForEditor', () => {
   const makeNote = (content: string, created_at: number): Comment => ({

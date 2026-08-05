@@ -15,10 +15,13 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import type { MergeConflict, AgentResponse } from '../types';
-import { log, logError } from './log';
-import { spawn } from '../utils/spawn';
-import { runGit } from '../utils/git';
+import { log, logError, logWarn } from './log';
+import { runGit, type GitResult } from '../utils/git';
+import { elevatedMerge, elevatedMergeAbort } from './elevated-git';
 import { hasUpstreamChanges } from '../git/operations';
+import { safeArgvPrompt } from '../agent/argv-safety';
+import { ClaudeCodeActivityStream } from '../agent/activity-stream';
+import { execWithWatchdog } from './watchdog';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
 import mergeConflictResolutionResumeTemplate from '../prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
 import remoteBranchMergeTemplate from '../prompts/remote-branch-merge.md' with { type: 'text' };
@@ -30,6 +33,12 @@ const MERGE_MAX_RETRIES = 2;
 /**
  * Build the CLI arguments for Claude Code merge conflict resolution.
  * Exported for testing — callers should use runSyncWithUpstream instead.
+ *
+ * Streams like the work phase (`stream-json --verbose`) so merge turns get the
+ * same two guards: a no-progress guard while the agent resolves conflicts, and
+ * a wind-down guard that can only arm once the agent's final result is in hand.
+ * A merge turn is an ordinary agent turn — it edits files, runs tests, and
+ * commits — so the single-blob format left it with no activity signal at all.
  *
  * @param prompt The merge prompt to use
  * @param modelId Optional model override
@@ -43,8 +52,8 @@ export function buildMergeClaudeArgs(
   useResume: boolean = false,
 ): string[] {
   const args = [
-    'claude', '-p', prompt,
-    '--output-format', 'json',
+    'claude', '-p', safeArgvPrompt(prompt, 'merge prompt'),
+    '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions',
   ];
 
@@ -57,6 +66,84 @@ export function buildMergeClaudeArgs(
   }
 
   return args;
+}
+
+/**
+ * Guard timeouts for a merge turn, threaded from the supervisor command so
+ * merge conflict resolution is bounded by exactly the same config the work
+ * phase uses (`[agent] watchdog_output_timeout_ms` / `wind_down_timeout_ms`).
+ *
+ * Omitted (the default in tests and older callers) means unguarded, which is
+ * how merge turns behaved before: `timeout: 0` and no watchdog at all.
+ */
+export interface MergeGuardOptions {
+  /** Kill after this long without forward progress. 0/omitted disables. */
+  noProgressTimeoutMs?: number;
+  /** Kill this long after the final result lands. 0/omitted disables. */
+  windDownTimeoutMs?: number;
+}
+
+interface MergeAgentRun {
+  /** Bounded stdout tail — diagnostics only. Use `resultLine` for the response. */
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  /** The agent's final result event, verbatim, if it emitted one. */
+  resultLine?: string;
+  sessionId?: string;
+  /** True when the no-progress guard fired — the agent was genuinely stuck. */
+  hung: boolean;
+}
+
+/**
+ * Run one merge-resolution agent process under the two guards.
+ *
+ * A wind-down kill is deliberately NOT reported as a failure: the agent's
+ * result was already captured, and the caller independently verifies the merge
+ * landed (no unmerged files, no MERGE_HEAD, HEAD advanced). Only a no-progress
+ * kill or a real non-zero exit is a failure.
+ */
+async function runMergeAgent(
+  claudeArgs: string[],
+  worktreePath: string,
+  logPrefix: string,
+  guards?: MergeGuardOptions,
+): Promise<MergeAgentRun> {
+  const activityStream = new ClaudeCodeActivityStream();
+  const result = await execWithWatchdog(claudeArgs, {
+    cwd: worktreePath,
+    env: process.env as Record<string, string>,
+    // 0 = unguarded, which is how merge turns ran before guards were threaded.
+    timeoutMs: guards?.noProgressTimeoutMs ?? 0,
+    activityStream,
+    windDownTimeoutMs: guards?.windDownTimeoutMs ?? 0,
+  });
+
+  if (result.killedDuringWindDown) {
+    log(
+      `${logPrefix} Agent did not exit within ${guards?.windDownTimeoutMs}ms of its final result; ` +
+      `killed during wind-down. Its resolution was captured — continuing with merge verification.`,
+    );
+    // The summary is in hand and the worktree state is what actually decides
+    // whether the merge succeeded, so do not let the kill's exit code fail it.
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: 0,
+      resultLine: result.resultLine,
+      sessionId: result.sessionId,
+      hung: false,
+    };
+  }
+
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    resultLine: result.resultLine,
+    sessionId: result.sessionId,
+    hung: result.killedByWatchdog,
+  };
 }
 
 /**
@@ -103,6 +190,7 @@ export async function runSyncWithUpstream(
   modelId?: string,
   agentSessionId?: string,
   upstreamSha?: string,
+  guards?: MergeGuardOptions,
 ): Promise<SyncWithUpstreamResult> {
   const target = upstreamSha ?? parentBranch;
   const targetLabel = upstreamSha
@@ -141,11 +229,10 @@ export async function runSyncWithUpstream(
     };
   }
 
-  // Attempt a clean merge first
-  const mergeResult = await runGit(
-    ['merge', target, '--no-ff', '-m', `Merge ${parentBranch}`],
-    { cwd: worktreePath },
-  );
+  // Attempt a clean merge first. The merge runs host-side (see elevated-git):
+  // the container's git common dir is read-only, so no ref can move from in here.
+  const mergeCommitMessage = `Merge ${parentBranch}`;
+  const mergeResult = await elevatedMerge(worktreePath, target, mergeCommitMessage);
 
   if (mergeResult.exitCode === 0) {
     const postMergeSha = await getHeadSha(worktreePath);
@@ -159,11 +246,13 @@ export async function runSyncWithUpstream(
     };
   }
 
-  // Merge has conflicts — capture conflicted files before aborting
+  // Merge has conflicts. The conflicted merge is LEFT IN PLACE for the agent to
+  // resolve: it cannot start the merge itself any more (moving HEAD needs the
+  // read-only common dir), so aborting here would leave it with nothing to
+  // resolve. It edits the conflicted files and concludes the merge with
+  // lazy_commit, which runs host-side.
   log('[merge] Merge has conflicts. Using Claude Code to resolve...');
   const conflicts = await captureConflicts(worktreePath, parentBranch);
-
-  await runGit(['merge', '--abort'], { cwd: worktreePath });
 
   // Run Claude Code with a scoped merge-only prompt (with retries)
   // When resuming an existing session, use a shorter prompt that leverages prior context
@@ -182,8 +271,14 @@ export async function runSyncWithUpstream(
   for (let attempt = 0; attempt <= MERGE_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       log(`[merge] Retrying Claude Code for conflict resolution (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})...`);
-      // Ensure any stale merge state is cleaned up before retry
-      await abortMergeIfInProgress(worktreePath);
+      // Clear stale merge state and re-create the conflicted merge for this
+      // attempt. The agent resolves an in-progress merge; it cannot start one.
+      const restarted = await restartConflictedMerge(worktreePath, target, mergeCommitMessage);
+      if (restarted.exitCode === 0) {
+        const postMergeSha = await getHeadSha(worktreePath);
+        log(`[merge] Re-attempted merge applied cleanly. Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
+        return { merged: true, preMergeSha, postMergeSha, targetSha: resolvedTargetSha, conflicts };
+      }
     } else {
       log('[merge] Running Claude Code for conflict resolution...');
     }
@@ -193,22 +288,21 @@ export async function runSyncWithUpstream(
     }
 
     const claudeArgs = buildClaudeArgs(useResume);
-    const proc = spawn(claudeArgs, {
-      cwd: worktreePath,
-      stdout: 'pipe',
-      stderr: 'pipe',
-      timeout: 0, // Long-running: merge conflict resolution can take minutes
-      env: process.env as Record<string, string>,
-    });
+    const { stderr, exitCode, resultLine, sessionId, hung } = await runMergeAgent(
+      claudeArgs,
+      worktreePath,
+      '[merge]',
+      guards,
+    );
 
-    const outputPromise = new Response(proc.stdout).text();
-    const stderrPromise = new Response(proc.stderr).text();
-
-    const [output, stderr, exitCode] = await Promise.all([
-      outputPromise,
-      stderrPromise,
-      proc.exited,
-    ]);
+    if (hung) {
+      // No forward progress for the configured window. Retrying a wedged agent
+      // just wedges again, so fail out rather than burning the retry budget.
+      await abortMergeIfInProgress(worktreePath);
+      throw new Error(
+        `Merge-and-fix agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+      );
+    }
 
     if (exitCode !== 0) {
       logError(`[merge] Claude Code failed with exit code ${exitCode} (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})`);
@@ -262,15 +356,23 @@ export async function runSyncWithUpstream(
 
     // Capture the agent's conflict-resolution response so the reconciler can
     // record it as a discrete agent turn (its own text, session, and usage).
-    // Best-effort: if the JSON doesn't parse, fall back to the raw stdout so a
-    // conflict merge always yields an agent turn rather than silently dropping it.
+    // The result event is byte-identical to the old single-blob output, so it
+    // parses the same way. Best-effort: if it is missing or unparseable, fall
+    // back to a placeholder so a conflict merge always yields an agent turn
+    // rather than silently dropping it. Deliberately NOT falling back to raw
+    // stdout — under stream-json that is an NDJSON transcript, not a summary.
     let resolution: AgentResponse;
     try {
-      resolution = JSON.parse(output) as AgentResponse;
-    } catch {
+      if (!resultLine) throw new Error('agent emitted no result event');
+      resolution = JSON.parse(resultLine) as AgentResponse;
+    } catch (err) {
+      logWarn(
+        `[merge] Could not read the agent's resolution summary ` +
+        `(${err instanceof Error ? err.message : String(err)}); recording a placeholder turn.`,
+      );
       resolution = {
-        result: output.trim() || 'Resolved merge conflicts.',
-        session_id: agentSessionId ?? '',
+        result: 'Resolved merge conflicts.',
+        session_id: sessionId ?? agentSessionId ?? '',
         usage: { input_tokens: 0, output_tokens: 0 },
       };
     }
@@ -309,6 +411,7 @@ export async function runSyncWithRemote(
   remoteBranch: string,
   modelId?: string,
   agentSessionId?: string,
+  guards?: MergeGuardOptions,
 ): Promise<MergeConflict[]> {
   log(`[remote-sync] Merging ${remoteBranch} into current branch...`);
 
@@ -319,22 +422,19 @@ export async function runSyncWithRemote(
     return [];
   }
 
-  // Attempt a clean merge first
-  const mergeResult = await runGit(
-    ['merge', remoteBranch, '--no-ff', '-m', `Merge ${remoteBranch}`],
-    { cwd: worktreePath },
-  );
+  // Attempt a clean merge first (host-side — see elevated-git).
+  const mergeCommitMessage = `Merge ${remoteBranch}`;
+  const mergeResult = await elevatedMerge(worktreePath, remoteBranch, mergeCommitMessage);
 
   if (mergeResult.exitCode === 0) {
     log('[remote-sync] Clean merge succeeded.');
     return [];
   }
 
-  // Merge has conflicts — capture conflicted files before aborting
+  // Conflicted merge is left in place for the agent to resolve and conclude
+  // with lazy_commit — see the equivalent comment in runSyncWithUpstream.
   log('[remote-sync] Merge has conflicts. Using Claude Code to resolve...');
   const conflicts = await captureConflicts(worktreePath, remoteBranch);
-
-  await runGit(['merge', '--abort'], { cwd: worktreePath });
 
   // Run Claude Code with a scoped merge-only prompt
   // When resuming an existing session, use a shorter prompt that leverages prior context
@@ -355,22 +455,19 @@ export async function runSyncWithRemote(
   const prompt = useResume ? resumePrompt : standalonePrompt;
   let claudeArgs = buildMergeClaudeArgs(prompt, modelId, agentSessionId, useResume);
 
-  const proc = spawn(claudeArgs, {
-    cwd: worktreePath,
-    stdout: 'pipe',
-    stderr: 'pipe',
-    timeout: 0, // Long-running: merge conflict resolution can take minutes
-    env: process.env as Record<string, string>,
-  });
+  const { stderr, exitCode, hung } = await runMergeAgent(
+    claudeArgs,
+    worktreePath,
+    '[remote-sync]',
+    guards,
+  );
 
-  const outputPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-
-  const [output, stderr, exitCode] = await Promise.all([
-    outputPromise,
-    stderrPromise,
-    proc.exited,
-  ]);
+  if (hung) {
+    await abortMergeIfInProgress(worktreePath);
+    throw new Error(
+      `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+    );
+  }
 
   if (exitCode !== 0) {
     logError(`[remote-sync] Claude Code failed with exit code ${exitCode}`);
@@ -384,22 +481,26 @@ export async function runSyncWithRemote(
       const fallbackPrompt = standalonePrompt;
       claudeArgs = buildMergeClaudeArgs(fallbackPrompt, modelId, undefined, false);
 
-      const fallbackProc = spawn(claudeArgs, {
-        cwd: worktreePath,
-        stdout: 'pipe',
-        stderr: 'pipe',
-        timeout: 0, // Long-running: merge conflict resolution can take minutes
-        env: process.env as Record<string, string>,
-      });
+      // Re-create the conflicted merge the fallback attempt is meant to resolve
+      // (the failure path above aborted it).
+      const restarted = await restartConflictedMerge(worktreePath, remoteBranch, mergeCommitMessage);
+      if (restarted.exitCode === 0) {
+        log('[remote-sync] Re-attempted merge applied cleanly.');
+        return conflicts;
+      }
 
-      const fallbackOutputPromise = new Response(fallbackProc.stdout).text();
-      const fallbackStderrPromise = new Response(fallbackProc.stderr).text();
+      const {
+        stderr: fallbackStderr,
+        exitCode: fallbackExitCode,
+        hung: fallbackHung,
+      } = await runMergeAgent(claudeArgs, worktreePath, '[remote-sync]', guards);
 
-      const [fallbackOutput, fallbackStderr, fallbackExitCode] = await Promise.all([
-        fallbackOutputPromise,
-        fallbackStderrPromise,
-        fallbackProc.exited,
-      ]);
+      if (fallbackHung) {
+        await abortMergeIfInProgress(worktreePath);
+        throw new Error(
+          `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+        );
+      }
 
       if (fallbackExitCode !== 0) {
         logError(`[remote-sync] Fallback Claude Code failed with exit code ${fallbackExitCode}`);
@@ -527,12 +628,28 @@ export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
   if (!await hasMergeInProgress(cwd)) {
     return false;
   }
-  const result = await runGit(['merge', '--abort'], { cwd });
+  const result = await elevatedMergeAbort(cwd);
   if (result.exitCode === 0) {
     log('[merge] Aborted in-progress merge.');
     return true;
   }
   logError(`[merge] Failed to abort merge: ${result.stderr}`);
   return false;
+}
+
+/**
+ * Clear any in-progress merge and start it again, host-side.
+ *
+ * Needed on every conflict-resolution retry: the agent can only RESOLVE an
+ * in-progress merge (it has no way to move HEAD from inside the container), so
+ * each attempt must be handed a freshly conflicted worktree.
+ */
+async function restartConflictedMerge(
+  worktreePath: string,
+  target: string,
+  message: string,
+): Promise<GitResult> {
+  await abortMergeIfInProgress(worktreePath);
+  return elevatedMerge(worktreePath, target, message);
 }
 

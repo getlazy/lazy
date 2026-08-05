@@ -14,6 +14,7 @@ import { theme } from '../theme';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, preflightRoleTarget, targetEnvVars, anthropicEnvVarsFromProcess } from '../../utils/role-target';
+import { withLiveProxyTarget } from '../../daemon/auth-env';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { logger } from '../../utils/logger';
 import { spawnSync } from '../../utils/spawn';
@@ -134,7 +135,15 @@ export async function commandChat(args: string[]): Promise<void> {
     if (chatTarget.model) {
       claudeArgs.push('--model', chatTarget.model);
     }
-    const chatEnvVars = targetEnvVars(chatTarget, anthropicEnvVarsFromProcess());
+    // 'host': chat runs Claude Code as a HOST process even on a docker-runner
+    // project, so every address it is handed must be host-reachable — the same
+    // conversion preflight probed. See LaunchSurface in utils/role-target.
+    const chatEnvVars = targetEnvVars(
+    await withLiveProxyTarget(chatTarget, config),
+    anthropicEnvVarsFromProcess(),
+    'host',
+    { role: "builder" },
+  );
 
     let exitCode = 0;
     try {

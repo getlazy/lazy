@@ -1,8 +1,8 @@
 import { printBuiltinPrompts } from './prompts';
-import { commandSystemBuild } from './system-build';
-import { commandOffline, commandOnline } from './offline';
-import { commandSystemStatus } from './system-status';
-import { commandExportDockerfile } from './export-dockerfile';
+import { commandSystemBuild, systemBuildUsage } from './system-build';
+import { commandOffline, commandOnline, offlineUsage, onlineUsage } from './offline';
+import { commandSystemStatus, systemStatusUsage } from './system-status';
+import { commandExportDockerfile, exportDockerfileUsage } from './export-dockerfile';
 
 export async function commandSystem(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -16,7 +16,7 @@ export async function commandSystem(args: string[]): Promise<void> {
 
   switch (subcommand) {
     case 'prompts':
-      printBuiltinPrompts();
+      await printBuiltinPrompts();
       break;
     case 'build':
       await commandSystemBuild(sub);
@@ -43,6 +43,24 @@ export async function commandSystem(args: string[]): Promise<void> {
       process.exit(1);
   }
 }
+
+/**
+ * Usage functions for `lazy system <subcommand>`, keyed by subcommand name.
+ *
+ * The dispatcher in src/index.ts intercepts -h/--help before the command runs,
+ * so a subcommand's own usage is only reachable if it is listed here — without
+ * this map `lazy system export-dockerfile -h` prints the parent's usage.
+ * Subcommands with no dedicated usage (e.g. `prompts`) are intentionally absent
+ * and fall back to systemUsage().
+ */
+export const systemSubcommandUsage: Record<string, () => void> = {
+  'build': systemBuildUsage,
+  'status': systemStatusUsage,
+  'offline': offlineUsage,
+  'online': onlineUsage,
+  'export-dockerfile': exportDockerfileUsage,
+  'eject-dockerfile': exportDockerfileUsage,
+};
 
 export function systemUsage(): void {
   console.log(`Usage: lazy system <subcommand>

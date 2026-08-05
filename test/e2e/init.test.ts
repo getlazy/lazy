@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { resolve } from 'path';
+import { loadConfig } from '../../src/config/loader';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 
@@ -55,6 +56,28 @@ describe('lazy init', () => {
     expect(result.stdout).toContain('Initialized');
     expect(existsSync(join(tmpDir, '.lazy')) || existsSync(join(tmpDir, '.workshop'))).toBe(true);
     expect(existsSync(join(tmpDir, 'lazy.toml'))).toBe(true);
+  });
+
+  // REGRESSION: getDefaultConfigTemplate() once emitted an uncommented "[proxy]"
+  // header with every key below it commented out (e.g. "# port = 8766"), and the
+  // loader then rejected the section for lacking a port — so a freshly
+  // `lazy init`'d project wrote a lazy.toml that failed to load on the very next
+  // command. loadConfig() must always succeed on the generated template.
+  //
+  // INVARIANT (default-on proxy): a fresh project gets the audit/policy proxy
+  // with NO configuration — `proxy` resolves to a defaulted object, not null.
+  test('generated lazy.toml loads without error and the proxy is on by default', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+
+    const result = await runLazy(tmpDir, ['init', '--non-interactive']);
+    expect(result.exitCode).toBe(0);
+
+    const config = await loadConfig(tmpDir, { cwd: tmpDir });
+    expect(config.proxy).not.toBeNull();
+    expect(config.proxy?.upstream).toBe('https://api.anthropic.com');
+    expect(config.proxy?.port).toBe(0); // OS-assigned
+    expect(config.proxy?.policy.enforce).toBe(true);
   });
 
   test('reports already initialized', async () => {

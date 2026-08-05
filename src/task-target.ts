@@ -105,6 +105,40 @@ export function parentTaskIdOf(task: Task): string | null {
 }
 
 /**
+ * Collect the ids of a task's whole subtree — the task itself plus every
+ * descendant (children, grandchildren, ...).
+ *
+ * `allTasks` should be the FULL task set, not a pre-filtered view: descent
+ * walks parent links, so a filtered set whose intermediate task was excluded
+ * (e.g. a completed task between an active release and its active
+ * grandchildren) would silently truncate the subtree. Callers filter the
+ * result, not the input.
+ */
+export function collectSubtreeIds(rootId: string, allTasks: Task[]): Set<string> {
+  const childrenByParent = new Map<string, Task[]>();
+  for (const task of allTasks) {
+    const parentId = parentTaskIdOf(task);
+    if (!parentId) continue;
+    const siblings = childrenByParent.get(parentId);
+    if (siblings) siblings.push(task);
+    else childrenByParent.set(parentId, [task]);
+  }
+
+  const ids = new Set<string>([rootId]);
+  const queue: string[] = [rootId];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    for (const child of childrenByParent.get(current) ?? []) {
+      // Guard against a cyclic parent link so a corrupt store can't hang us.
+      if (ids.has(child.id)) continue;
+      ids.add(child.id);
+      queue.push(child.id);
+    }
+  }
+  return ids;
+}
+
+/**
  * Projection for "what named branch does this top-level task integrate into".
  * Returns undefined when the task is stacked on another task (kind === 'task')
  * or when the branch slot is an unresolved sentinel ('' — see module docs),

@@ -6,7 +6,6 @@
  * - Parent branch change triggers auto-sync of blocked children
  * - task.completed notifies blocked parent
  * - Budget limits prevent infinite cascades
- * - Working tasks with SSE connections receive events (not auto-unblocked)
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -16,11 +15,6 @@ import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
-import {
-  registerConnection,
-  hasConnection,
-  _resetEventState,
-} from '../../src/daemon/events';
 import {
   createReconcileEventState,
   detectAndDeliverEvents,
@@ -47,11 +41,9 @@ describe('auto-deliver', () => {
   beforeEach(async () => {
     process.env.LAZY_TEST = '1';
     ctx = await setupTestLazy();
-    _resetEventState();
   });
 
   afterEach(async () => {
-    _resetEventState();
     resetSignalDb();
     await ctx.cleanup();
   });
@@ -62,7 +54,7 @@ describe('auto-deliver', () => {
     // detectAndDeliverEvents EMITS an `upstream_change` signal (reason
     // 'sibling_accepted') for each sibling, and the separate signal-delivery
     // phase (runBlockedTaskCatchup) later syncs/unblocks eligible ones. Assert
-    // the emitted signal, not a direct SSE event.
+    // the emitted signal — it is the only delivery mechanism.
     test('detects task acceptance and emits upstream_change signals to siblings', async () => {
       const parentShortId = await createTask(ctx, 'Parent task');
       const childAShortId = await createTask(ctx, 'Child A task');
@@ -131,8 +123,8 @@ describe('auto-deliver', () => {
 
   describe('deliverStateChangeEvents', () => {
     // INVARIANT: When a child completes (working → blocked) and parent is blocked,
-    // the parent is notified via auto-delivery (not SSE).
-    test('delivers task.completed to blocked parent without SSE', async () => {
+    // the parent is notified via auto-delivery.
+    test('delivers task.completed to blocked parent', async () => {
       const parentShortId = await createTask(ctx, 'Parent task');
       const childShortId = await createTask(ctx, 'Child task');
 
@@ -147,9 +139,6 @@ describe('auto-deliver', () => {
         // Parent is blocked (has a session but completed a turn)
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
         await storage.updateTaskStatus(parentTask.id, 'blocked', 'system');
-
-        // Parent has NO SSE connection (not running a supervisor)
-        expect(hasConnection(parentTask.id)).toBe(false);
 
         // Simulate child completing a turn
         const stateChanges = [{
@@ -172,7 +161,7 @@ describe('auto-deliver', () => {
     });
 
     // INVARIANT: task.failed (working → interrupted) notifies blocked parent.
-    test('delivers task.failed to blocked parent without SSE', async () => {
+    test('delivers task.failed to blocked parent', async () => {
       const parentShortId = await createTask(ctx, 'Parent task');
       const childShortId = await createTask(ctx, 'Child task');
 
@@ -188,9 +177,6 @@ describe('auto-deliver', () => {
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
         await storage.updateTaskStatus(parentTask.id, 'blocked', 'system');
 
-        // No SSE for parent
-        expect(hasConnection(parentTask.id)).toBe(false);
-
         const stateChanges = [{
           taskId: childTask.id,
           previousStatus: 'working' as const,
@@ -205,9 +191,10 @@ describe('auto-deliver', () => {
       }
     });
 
-    // INVARIANT: No delivery attempted when parent has SSE connection
-    // (events are already delivered via SSE by routeStateChangeEvents).
-    test('skips auto-delivery when parent has SSE connection', async () => {
+    // INVARIANT: Auto-delivery targets BLOCKED parents only. A parent still
+    // mid-turn ('working') is left alone — it picks the change up at its next
+    // turn boundary, when it transitions to blocked and the signal queue drains.
+    test('skips auto-delivery when parent is still working', async () => {
       const parentShortId = await createTask(ctx, 'Parent task');
       const childShortId = await createTask(ctx, 'Child task');
 
@@ -220,14 +207,6 @@ describe('auto-deliver', () => {
         await storage.updateTaskTarget(childTask.id, { kind: 'task' as const, parentTaskId: parentTask.id });
         await storage.updateTaskStatus(parentTask.id, 'working', 'system');
 
-        // Parent HAS SSE connection
-        new ReadableStream({
-          start(controller) {
-            registerConnection(parentTask.id, controller);
-          },
-        });
-        expect(hasConnection(parentTask.id)).toBe(true);
-
         const stateChanges = [{
           taskId: childTask.id,
           previousStatus: 'working' as const,
@@ -235,7 +214,6 @@ describe('auto-deliver', () => {
           parentTaskId: parentTask.id,
         }];
 
-        // Should skip auto-delivery since parent has SSE
         await deliverStateChangeEvents(storage, stateChanges, ctx.root);
 
         // Parent is still working (not auto-unblocked)

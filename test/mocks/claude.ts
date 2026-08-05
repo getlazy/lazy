@@ -187,6 +187,30 @@ export async function runClaudeOneshot(
     };
   }
 
+  // Memory compaction (`lazy memory compact`, LLM path). Deterministic and
+  // deliberately TINY so the real "a compact must be smaller than the index it
+  // replaces" guard is satisfied: one line naming every record in backticks.
+  //
+  //   LAZY_MOCK_COMPACT_FAIL=1        — throw (exercises the mechanical fallback)
+  //   LAZY_MOCK_COMPACT_RESPONSE=...  — return this verbatim (used to exercise the
+  //                                     omitted-name repair path with a summary
+  //                                     that skips names on purpose)
+  if (prompt.includes('LAZY_MEMORY_COMPACT')) {
+    if (process.env.LAZY_MOCK_COMPACT_FAIL === '1') {
+      throw new Error('mock claude failure (memory compaction)');
+    }
+    const override = process.env.LAZY_MOCK_COMPACT_RESPONSE;
+    if (override !== undefined) {
+      return { result: override, session_id: 'mock-compact', usage: { input_tokens: 1, output_tokens: 1 } };
+    }
+    const names = Array.from(prompt.matchAll(/^### `([a-z0-9-]+)`/gm)).map(mm => mm[1]);
+    return {
+      result: `## Mocked memory summary\n\n- ${names.map(n => `\`${n}\``).join(', ')}`,
+      session_id: 'mock-compact',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+  }
+
   if (prompt.includes('LAZY_REPORT_STAGE: reduce')) {
     // Always synthesize for the reduce stage — tests that need the
     // synthesized body to be observable shouldn't have to fight the
@@ -260,6 +284,71 @@ export async function resumeClaudeAsync(
 
 // --- Supervisor API ---
 
+/**
+ * Mock of the supervisor's pre-accept handler. The mock agent optionally commits
+ * (LAZY_MOCK_SHOULD_COMMIT), then the gate commands are re-run authoritatively —
+ * exactly like the real handlePreAcceptCommand. Writes a single CompletedResponse
+ * with the `pre_accept` gate outcome.
+ */
+async function handleMockPreAccept(
+  sandbox: SandboxConfig,
+  protocolDir: string,
+  cmd: Record<string, unknown>,
+  preTurnSha: string,
+): Promise<void> {
+  const { writeFileSync, mkdirSync } = await import('fs');
+  const { join } = await import('path');
+  const { truncateLog } = await import('../../src/utils/log-truncate');
+
+  // Mock agent "work" (fixes / CHANGELOG / post-mortem) — commit if configured.
+  await maybeCommit(sandbox.worktreePath, 'pre-accept');
+
+  const postWorkShaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
+    cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+  });
+  const postWorkSha = postWorkShaResult.exitCode === 0
+    ? postWorkShaResult.stdout.toString().trim()
+    : preTurnSha;
+
+  // Authoritative gate: run each configured command in order, stop at first failure.
+  const commands = (cmd.pre_accept_commands as string[] | undefined) ?? [];
+  let preAccept: Record<string, unknown> = { passed: true };
+  for (const command of commands) {
+    const r = Bun.spawnSync(['sh', '-c', command], {
+      cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+    });
+    if (r.exitCode !== 0) {
+      const out = (r.stderr?.toString() ?? '') + (r.stdout?.toString() ?? '');
+      preAccept = { passed: false, failed_command: command, exit_code: r.exitCode, output: truncateLog(out) };
+      break;
+    }
+  }
+
+  const mockResp = getMockResponse();
+  mkdirSync(protocolDir, { recursive: true });
+  writeFileSync(join(protocolDir, 'status.json'), JSON.stringify({
+    phase: 'work_done',
+    task_id: cmd.task_id ?? 'mock-task',
+    command_type: 'pre_accept',
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    pre_turn_sha: preTurnSha,
+    post_work_sha: postWorkSha,
+    pid: process.pid,
+  }, null, 2));
+
+  const response: Record<string, unknown> = {
+    status: 'completed',
+    result: process.env.LAZY_MOCK_PRE_ACCEPT_RESPONSE ?? mockResp.result,
+    session_id: mockResp.session_id,
+    usage: mockResp.usage,
+    start_sha_work: preTurnSha,
+    end_sha_work: postWorkSha,
+    pre_accept: preAccept,
+  };
+  writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));
+}
+
 export async function launchSupervisorAsync(
   sandbox: SandboxConfig,
   containerName: string,
@@ -276,6 +365,21 @@ export async function launchSupervisorAsync(
   const preTurnSha = preTurnShaResult.exitCode === 0
     ? preTurnShaResult.stdout.toString().trim()
     : 'unknown';
+
+  // Pre-accept turn: a WRITE turn (mock agent may commit) followed by the
+  // AUTHORITATIVE gate re-run. Mirrors src/supervisor/index.ts#handlePreAcceptCommand:
+  // a single CompletedResponse carrying `pre_accept`, not a start-style bundle.
+  {
+    const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
+    const commandPath = join(protocolDir, 'command.json');
+    if (existsFs(commandPath)) {
+      const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
+      if (cmd.type === 'pre_accept') {
+        await handleMockPreAccept(sandbox, protocolDir, cmd, preTurnSha);
+        return;
+      }
+    }
+  }
 
   // In mock mode, simulate the supervisor: make commits, then write response.json
   await maybeCommit(sandbox.worktreePath, 'supervisor');
@@ -336,7 +440,24 @@ export async function launchSupervisorAsync(
       const patterns = cmd.protected_patterns as string[] | undefined;
       if (patterns && patterns.length > 0 && preTurnSha !== 'unknown' && postWorkSha && preTurnSha !== postWorkSha) {
         const { detectViolations } = await import('../../src/supervisor/permissions');
-        const detected = await detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns);
+
+        // Compute the branch point exactly as the real supervisor does
+        // (src/supervisor/index.ts): merge-base with the parent branch, with
+        // cmd.branch_point_sha as the fallback. Files that did not exist at
+        // that point were created by the task and are EXEMPT from violations.
+        // Omitting it here made the mock flag task-created files that the real
+        // supervisor exempts.
+        let branchPointSha: string | undefined = cmd.branch_point_sha;
+        if (cmd.parent_branch) {
+          const mergeBase = Bun.spawnSync(['git', 'merge-base', cmd.parent_branch, 'HEAD'], {
+            cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+          });
+          if (mergeBase.exitCode === 0 && mergeBase.stdout.toString().trim()) {
+            branchPointSha = mergeBase.stdout.toString().trim();
+          }
+        }
+
+        const detected = await detectViolations(sandbox.worktreePath, preTurnSha, postWorkSha, patterns, branchPointSha);
         if (detected.length > 0) {
           pushbackTriggered = true;
           // Simulate push-back: give the agent one chance to self-correct.
@@ -362,7 +483,7 @@ export async function launchSupervisorAsync(
 
           // INVARIANT: status.post_work_sha stays pinned at the WORK end — NOT
           // advanced past push-back commits (no double-count on the work turn).
-          finalViolations = await detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns);
+          finalViolations = await detectViolations(sandbox.worktreePath, preTurnSha, postPushbackSha, patterns, branchPointSha);
 
           // The push-back is a FULL response: its own SHA window + usage + the
           // FINAL violation set (empty array when resolved). LAZY_MOCK_PUSHBACK_RESPONSE

@@ -9,7 +9,7 @@
  */
 
 import { join } from 'path';
-import { mkdir, copyFile, writeFile, rm } from 'fs/promises';
+import { mkdir, copyFile, writeFile, rm, appendFile } from 'fs/promises';
 import { getHome } from './home';
 import { pathExists, dirExists } from './fs';
 import type { SandboxConfig } from '../capture/claude';
@@ -17,6 +17,9 @@ import type { SandboxConfig } from '../capture/claude';
 export const SANDBOX_DIR = '.lazy-task-sandbox';
 
 const DEFAULT_GITCONFIG = '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n';
+
+/** Appended to every sandbox gitconfig — see setupSandbox. */
+const GC_OFF = '\n[gc]\n\tauto = 0\n';
 
 /**
  * Create the sandbox directory layout for a worktree and return its config.
@@ -41,6 +44,11 @@ export async function setupSandbox(worktreePath: string): Promise<SandboxConfig>
   } else {
     await writeFile(sandboxGitconfig, DEFAULT_GITCONFIG);
   }
+  // Belt and braces for the split .git mount: the container sees the shared git
+  // dir read-only, so an auto-gc triggered in there could only fail (it wants to
+  // repack objects and rewrite packed-refs). Disabling it keeps that failure from
+  // ever surfacing as a confusing error on an unrelated git command.
+  await appendFile(sandboxGitconfig, GC_OFF);
 
   return { worktreePath, sandboxPath };
 }

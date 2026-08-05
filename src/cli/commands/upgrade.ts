@@ -16,6 +16,7 @@
  */
 
 import { existsSync, unlinkSync } from 'fs';
+import { hostname } from 'os';
 import { join } from 'path';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
@@ -30,16 +31,73 @@ import type { Task } from '../../types';
 import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
 import { ensureDaemon } from '../../daemon/auto-start';
+import { checkDaemonCredentials } from '../../daemon/credential-gate';
 import { spawnSync } from '../../utils/spawn';
 import { VERSION } from '../../version';
 
 const DOCKER_TIMEOUT_MS = 10_000;
+
+/**
+ * Grace period given to a builder container to shut down cleanly on upgrade.
+ *
+ * Long enough for the supervisor's SIGTERM handler to finish a final conversation
+ * capture (a storage round-trip over the daemon's TCP web server) and stamp the
+ * resume session id; short enough that a wedged builder cannot stall the upgrade.
+ */
+const BUILDER_STOP_GRACE_SECONDS = 10;
 
 interface ContainerInfo {
   name: string;
   taskShortId: string;
   task: Task | null;
   isWorking: boolean;
+}
+
+/**
+ * Credential preflight for `lazy upgrade`.
+ *
+ * Step 4 of an upgrade restarts the daemon, and the daemon's credential gate
+ * (src/daemon/credential-gate.ts) refuses to start without a model credential
+ * in its environment. That gate used to fire only AFTER the upgrade had already
+ * stopped every container and rebuilt the image — leaving the project with no
+ * daemon, no builders, and a rebuild's worth of wasted time for a condition we
+ * could have detected in the first millisecond.
+ *
+ * So check it FIRST, before anything is stopped or rebuilt. The check is exact,
+ * not an approximation: the daemon child inherits this process's environment
+ * (see startDaemonBackground → spawn with `{ ...process.env }`), so evaluating
+ * the gate here evaluates the same env the daemon will be gated on.
+ *
+ * Why preflight rather than "inherit the credential from the daemon we are
+ * about to stop": reading another process's environment is not portable (Linux
+ * /proc only; macOS requires ptrace-level access) and would mean copying a live
+ * secret through lazy's own memory and IPC for no benefit — the human has to
+ * fix their shell environment either way, and telling them up front, with
+ * nothing yet broken, is strictly better than papering over it for one run.
+ *
+ * Returns the actionable message when the upgrade must abort, or null to proceed.
+ */
+export async function upgradeCredentialPreflight(projectRoot: string): Promise<string | null> {
+  // Test mode never starts a daemon (ensureDaemon bails on LAZY_TEST=1), so
+  // there is no gate to preflight and e2e suites need no credential. The
+  // LAZY_FORCE_CRED_PREFLIGHT hatch (test-only, same family as
+  // LAZY_FORCE_PREFLIGHT) lets the e2e suite exercise the real decision.
+  if (process.env.LAZY_TEST === '1' && process.env.LAZY_FORCE_CRED_PREFLIGHT !== '1') return null;
+
+  const gateMessage = await checkDaemonCredentials(projectRoot);
+  if (!gateMessage) return null;
+
+  return [
+    'Upgrade aborted before any changes were made.',
+    '',
+    'This upgrade would stop every container, rebuild the image and agent binary,',
+    'and then restart the daemon — but the daemon would refuse to start:',
+    '',
+    gateMessage,
+    '',
+    'Nothing was stopped, rebuilt, or changed. Your daemon and any live builder',
+    'sessions are still running. Set a credential and re-run `lazy upgrade`.',
+  ].join('\n');
 }
 
 /**
@@ -247,6 +305,11 @@ export async function writeBuilderResumeIntents(
   projectRoot: string,
 ): Promise<void> {
   const createdAt = new Date().toISOString();
+  // Stamp THIS upgrade process's identity so the waiting builder wrapper can
+  // tell "still rebuilding" from "the upgrade died" without resorting to a
+  // timeout (see BuilderResumeIntent.upgradePid).
+  const upgradePid = process.pid;
+  const upgradeHost = hostname();
   for (const name of builderNames) {
     // Strip the `lazy-builder-` run-name prefix to get the canonical short id.
     const builderId = name.replace(/^lazy-builder-/, '');
@@ -254,8 +317,125 @@ export async function writeBuilderResumeIntents(
       builderId,
       projectRoot,
       createdAt,
+      upgradePid,
+      upgradeHost,
     });
   }
+}
+
+/**
+ * Stop live builder containers GRACEFULLY (SIGTERM + grace, never SIGKILL).
+ *
+ * A builder's supervisor has real exit work: its signal handler flushes the
+ * conversation capture (otherwise the last up-to-CAPTURE_INTERVAL_MS of the
+ * human's session is lost from lazy's store) and stamps the detected Claude
+ * sessionId onto the resume intent written just before the stop — which is how
+ * the relaunched builder knows what to resume. `docker kill` ran neither, so an
+ * upgraded builder came back into a brand-new conversation. Waiting a few
+ * seconds once per builder is a trivial cost for not losing the session.
+ *
+ * Belt-and-braces with the host-side detection in src/builder/session-detect.ts:
+ * that recovers the id no matter HOW the container died; this additionally
+ * preserves the conversation tail.
+ *
+ * Builder containers run with `--rm`, so they auto-remove on stop.
+ */
+export async function stopBuilderContainers(
+  runner: Pick<Runner, 'stopRun'>,
+  builderNames: string[],
+): Promise<void> {
+  for (const name of builderNames) {
+    const stopped = await runner.stopRun(name, {
+      gracefulTimeoutSeconds: BUILDER_STOP_GRACE_SECONDS,
+    });
+    if (stopped) {
+      console.log(`  ${theme.success('stopped')} ${name}`);
+    } else {
+      console.log(`  ${theme.error('failed')} ${name}`);
+    }
+  }
+}
+
+/**
+ * Print the precise boundary of WHEN each kind of session begins using a
+ * freshly-rebuilt image. This is the load-bearing UX of `--images`: the refresh
+ * is non-disruptive, so nothing switches instantly except brand-new containers.
+ *
+ * The boundary is verified against the code, not assumed (see the task journal):
+ * - Docker containers hold their image by ID at launch; a rebuild/retag never
+ *   restarts a running container.
+ * - The supervisor container is long-lived (src/supervisor/index.ts — it polls
+ *   for the next command in a loop and stays alive across turns). On unblock the
+ *   daemon REUSES a still-running supervisor (task-lifecycle.ts), so a blocked
+ *   task does NOT pick up the new image on its next turn — only when its
+ *   container is next recreated.
+ */
+function printImageRefreshBoundary(): void {
+  console.log('When each session starts using the refreshed image:');
+  console.log(`  ${theme.success('now')}   New and queued tasks — their container is created fresh at launch.`);
+  console.log(`  ${theme.success('now')}   Interrupted tasks — on auto-resume their container is recreated.`);
+  console.log(`  ${theme.warning('later')} Running builders — on their next relaunch (a live builder keeps its image).`);
+  console.log(`  ${theme.warning('later')} Working agents — when their container is next recreated.`);
+  console.log(`  ${theme.warning('later')} Blocked tasks — NOT on the next unblock (the live supervisor is reused);`);
+  console.log('        they adopt the new image only when their container is recreated');
+  console.log('        (daemon restart, interruption, or crash).');
+  console.log('');
+  console.log('  Running builders and agents were NOT touched by this refresh.');
+  console.log(`  For an immediate, disruptive switch of everything, run ${theme.command('lazy upgrade')}.`);
+}
+
+/**
+ * Non-disruptive image refresh (`lazy upgrade --images`).
+ *
+ * Rebuilds ONLY the project's resolved container image, with `--no-cache` so a
+ * new Claude Code version (installed via `RUN curl … install.sh` in the image —
+ * see src/agent/claude-code-packaging.ts) is actually re-fetched. The Dockerfile
+ * content is static, so its hash is unchanged when a new Claude Code ships; a
+ * plain `ensureImage` would hash-match and skip. `--no-cache` busts that layer.
+ *
+ * This never stops a container, never restarts the daemon, and never rebuilds
+ * the agent binary. Running builders/agents are untouched — only newly-created
+ * containers pick up the new image (see printImageRefreshBoundary).
+ */
+async function refreshImagesOnly(root: string, dryRun: boolean): Promise<void> {
+  const config = await loadConfig(root);
+  const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
+  if (!isContainerRunner) {
+    console.error(`Error: \`lazy upgrade --images\` only applies to container runners (docker/podman).`);
+    console.error(`The current runner is '${config.runner.type}', which has no container image —`);
+    console.error(`Claude Code runs from your host installation. Update it there instead.`);
+    process.exit(1);
+  }
+
+  const binary = config.runner.type; // 'docker' or 'podman'
+
+  // Pre-flight: fail before doing anything if the runtime is unavailable.
+  const runner = await createRunner(root);
+  try {
+    await runner.checkAvailability();
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
+
+  const imageName = await resolveImageName(root);
+
+  if (dryRun) {
+    console.log(theme.header('Image refresh dry run:'));
+    console.log('');
+    console.log(`  Rebuild (--no-cache): ${imageName}`);
+    console.log('  No containers stopped, no daemon restart, agent binary untouched.');
+    console.log('');
+    printImageRefreshBoundary();
+    return;
+  }
+
+  console.log('\nRefreshing container image for future sessions (--no-cache)...');
+  const built = await forceRebuildImage(root, binary);
+  console.log(`  ${theme.success('rebuilt')} container image (${built})`);
+  console.log('');
+  printImageRefreshBoundary();
+  console.log(theme.success('\nImage refresh complete.'));
 }
 
 export async function commandUpgrade(args: string[]): Promise<void> {
@@ -263,11 +443,13 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     { name: 'force', takesValue: false },
     { name: 'wait', takesValue: false },
     { name: 'dry-run', takesValue: false },
+    { name: 'images', takesValue: false },
   ], 'upgrade');
 
   const force = parsed.flags.get('force') === true;
   const wait = parsed.flags.get('wait') === true;
   const dryRun = parsed.flags.get('dry-run') === true;
+  const images = parsed.flags.get('images') === true;
 
   if (force && wait) {
     console.error('Error: --force and --wait are mutually exclusive.');
@@ -275,6 +457,32 @@ export async function commandUpgrade(args: string[]): Promise<void> {
   }
 
   const root = requireLazyRoot();
+
+  // Non-disruptive image-only refresh: a separate, self-contained path that
+  // touches no running containers and never restarts the daemon. --force/--wait
+  // govern how running containers are stopped, which this path never does, so
+  // they are meaningless here — reject the combination rather than silently
+  // ignore it (principle of least surprise).
+  if (images) {
+    if (force || wait) {
+      console.error('Error: --images does not stop running containers, so --force and --wait do not apply.');
+      process.exit(1);
+    }
+    await refreshImagesOnly(root, dryRun);
+    return;
+  }
+
+  // Credential preflight — BEFORE the runner check, before storage, and above
+  // all before anything is stopped or rebuilt. A full upgrade always ends in a
+  // daemon restart, so a missing credential is fatal to the whole operation:
+  // say so now, while the running daemon and builders are still intact.
+  // --dry-run reports it as a warning instead (it changes nothing by design).
+  const credentialError = await upgradeCredentialPreflight(root);
+  if (credentialError && !dryRun) {
+    console.error(credentialError);
+    process.exit(1);
+  }
+
   const storage = await requireStorage();
 
   try {
@@ -336,6 +544,16 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log('');
       console.log('  After rebuild: daemon restarts and auto-resumes interrupted tasks (~10s).');
       console.log('  Running builder sessions resume in place after the upgrade.');
+
+      // A dry run changes nothing, so a failing credential preflight is a
+      // warning here rather than an error — but it must be surfaced, because it
+      // is exactly what a real run would abort on.
+      if (credentialError) {
+        console.log('');
+        console.log(theme.warning('  A real upgrade would abort immediately: no model credential in this'));
+        console.log(theme.warning('  environment, so the daemon could not be restarted afterwards.'));
+        console.log('  Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY before upgrading.');
+      }
       return;
     }
 
@@ -407,17 +625,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
         await writeBuilderResumeIntents(storage, builderContainers, root);
       }
 
-      // Stop builder containers
-      for (const name of builderContainers) {
-        const stopped = await runner.stopRun(name);
-        if (stopped) {
-          console.log(`  ${theme.success('stopped')} ${name}`);
-        } else {
-          console.log(`  ${theme.error('failed')} ${name}`);
-        }
-        // Builder containers use --rm flag, so they auto-remove on stop
-        // No need to call removeRun explicitly
-      }
+      await stopBuilderContainers(runner, builderContainers);
     } else {
       console.log('\nNo running containers to stop.');
     }
@@ -484,8 +692,23 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
 export function upgradeUsage(): void {
   console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run]
+       lazy upgrade --images [--dry-run]
 
 Rebuild the Docker image and agent binary, then restart the daemon.
+
+Non-disruptive image refresh (--images):
+  \`lazy upgrade --images\` rebuilds ONLY the project's container image, with
+  --no-cache so a newly-released Claude Code (installed inside the image) is
+  actually re-fetched. It stops nothing and does not restart the daemon, so
+  running builders and agents keep working uninterrupted. Only newly-created
+  containers use the refreshed image:
+    - New / queued tasks and interrupted-then-resumed tasks:  immediately
+    - Running builders:  on their next relaunch
+    - Working agents and blocked tasks:  when their container is next recreated
+      (a blocked task reuses its live supervisor on unblock, so it does NOT
+      switch on the next turn)
+  For an immediate, disruptive switch of everything, run a full \`lazy upgrade\`.
+  Only applies to docker/podman runners (host-process has no image).
 
 What happens:
   1. Live builder sessions are warned to submit any in-progress message
@@ -508,13 +731,17 @@ warning is printed but not blocked on, and unsent builder input may be lost.
 Options:
   --force     Don't prompt, stop everything including working containers
   --wait      Wait for all working tasks to block before upgrading
+  --images    Non-disruptive: rebuild only the container image (--no-cache) for
+              future sessions; stop nothing, don't restart the daemon
   --dry-run   Show what would be rebuilt and stopped, without doing anything
 
---force and --wait are mutually exclusive.
+--force and --wait are mutually exclusive. --images does not stop containers, so
+it cannot be combined with --force or --wait.
 
 Examples:
   lazy upgrade              # Interactive: prompt if working tasks exist
   lazy upgrade --force      # Non-interactive: stop everything and rebuild
   lazy upgrade --wait       # Non-interactive: wait for tasks to finish, then upgrade
+  lazy upgrade --images     # Non-disruptive: refresh the image for future sessions
   lazy upgrade --dry-run    # Preview what would happen`);
 }

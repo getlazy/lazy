@@ -51,34 +51,34 @@ describe('remote driver', () => {
 
     test('publishBranch is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.publishBranch({ branch: 'some-branch', targetBranch: 'main', task });
       expect(result).toEqual({});
     });
 
     test('syncComments returns empty array', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
     });
 
     test('getPRState returns null', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.getPRState(task);
       expect(result).toBeNull();
     });
 
     test('postTurnSummary is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       await driver.postTurnSummary(task, 'summary');
     });
 
     test('markReadyForReview is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       await driver.markReadyForReview(task);
     });
 
@@ -95,7 +95,7 @@ describe('remote driver', () => {
 
     test('validateAccept always returns null (no preconditions)', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
@@ -106,19 +106,19 @@ describe('remote driver', () => {
 
     test('getLastCommentSyncedAt returns undefined', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastCommentSyncedAt(task)).toBeUndefined();
     });
 
     test('getLastPostedTurnSeq returns -1', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedTurnSeq(task)).toBe(-1);
     });
 
     test('getLastPostedNoteAt returns undefined', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedNoteAt(task)).toBeUndefined();
     });
 
@@ -204,7 +204,7 @@ describe('remote driver', () => {
     test('syncComments returns empty array when no PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
     });
@@ -212,7 +212,7 @@ describe('remote driver', () => {
     test('postTurnSummary is a no-op when no PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       await driver.postTurnSummary(task, 'summary');
     });
 
@@ -236,7 +236,7 @@ describe('remote driver', () => {
     test('markReadyForReview surfaces gh pr create failure when no remote is configured', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       // Without a configured gh remote (or with gh missing), the driver must throw
       // a descriptive error rather than silently return empty metadata — otherwise
       // callers report a misleading "no remote reference" downstream.
@@ -246,7 +246,7 @@ describe('remote driver', () => {
     test('validateAccept returns error when no remote ref', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = driver.validateAccept(task);
       expect(result).toContain('no remote reference');
     });
@@ -254,7 +254,7 @@ describe('remote driver', () => {
     test('validateAccept returns null when remote ref exists', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' }, pending_sync: 0 };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
@@ -265,19 +265,19 @@ describe('remote driver', () => {
       const driver = new GitHubDriver(config);
 
       // New prefixed key takes precedence
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' }, pending_sync: 0 };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastCommentSyncedAt(task1)).toBe('2024-06-01T00:00:00Z');
 
       // Falls back to unprefixed key (backward compat)
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_comment_synced_at: '2024-05-01T00:00:00Z' }, pending_sync: 0 };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_comment_synced_at: '2024-05-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastCommentSyncedAt(task1b)).toBe('2024-05-01T00:00:00Z');
 
       // Falls back to old github_* key
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_comment_synced_at: '2024-01-01T00:00:00Z' }, pending_sync: 0 };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_comment_synced_at: '2024-01-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastCommentSyncedAt(task2)).toBe('2024-01-01T00:00:00Z');
 
       // Returns undefined when no metadata
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastCommentSyncedAt(task3)).toBeUndefined();
     });
 
@@ -285,16 +285,16 @@ describe('remote driver', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
 
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '5' }, pending_sync: 0 };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '5' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedTurnSeq(task1)).toBe(5);
 
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '4' }, pending_sync: 0 };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '4' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedTurnSeq(task1b)).toBe(4);
 
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '3' }, pending_sync: 0 };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '3' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedTurnSeq(task2)).toBe(3);
 
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 };
+      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedTurnSeq(task3)).toBe(-1);
     });
 
@@ -302,13 +302,13 @@ describe('remote driver', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
 
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_note_at: '2024-06-01' }, pending_sync: 0 };
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_note_at: '2024-06-01' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedNoteAt(task1)).toBe('2024-06-01');
 
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_note_at: '2024-05-01' }, pending_sync: 0 };
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_note_at: '2024-05-01' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedNoteAt(task1b)).toBe('2024-05-01');
 
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_note_at: '2024-01-01' }, pending_sync: 0 };
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_note_at: '2024-01-01' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.getLastPostedNoteAt(task2)).toBe('2024-01-01');
     });
 
@@ -341,7 +341,7 @@ describe('remote driver', () => {
       const result = await driver.merge({
         sourceBranch: 'test-branch',
         targetBranch: 'main',
-        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, pending_sync: 0 },
+        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null },
         taskShortId: 'test1234',
         root: '/tmp/nonexistent',
       });
@@ -419,6 +419,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
+        priority: 'normal' as const,
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -427,7 +428,8 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
-        pending_sync: 0,
+        runner_type: null,
+        tags: [], pending_sync: 0,
         ...overrides,
       };
     }
@@ -1086,6 +1088,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
+        priority: 'normal' as const,
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1094,7 +1097,8 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
-        pending_sync: 0,
+        runner_type: null,
+        tags: [], pending_sync: 0,
         ...overrides,
       };
     }
@@ -1400,6 +1404,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
+        priority: 'normal' as const,
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1408,7 +1413,8 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
-        pending_sync: 0,
+        runner_type: null,
+        tags: [], pending_sync: 0,
         ...overrides,
       };
     }
@@ -1508,6 +1514,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
+        priority: 'normal' as const,
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1516,7 +1523,8 @@ describe('remote driver', () => {
         model: null,
         agent_id: 'claude-code',
         metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
-        pending_sync: 0,
+        runner_type: null,
+        tags: [], pending_sync: 0,
         ...overrides,
       };
     }

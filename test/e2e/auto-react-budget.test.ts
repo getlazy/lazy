@@ -214,7 +214,12 @@ describe('auto-react budget (e2e)', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // These tests exercise `start` / `unblock` and assert on `blocked`-list
+    // and session-gated `show` output — all of which require a real daemon.
+    // Daemonless, `start` leaves the task stuck in 'working' (no reconciler
+    // moves it to 'blocked'), so `blocked` never lists it and `unblock`
+    // refuses. Mirrors the accept-* withDaemon suites.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -222,10 +227,45 @@ describe('auto-react budget (e2e)', () => {
   });
 
   /**
+   * Start a task and wait for the reconciler to move it out of 'working' into
+   * 'blocked' — the state that gives it a session (so `show` renders the
+   * session-gated auto-react section) and lists it under `blocked`. The
+   * explicit `wait` is mandatory because `start` launches the supervisor
+   * asynchronously under the daemon.
+   */
+  async function startAndWait(taskId: string): Promise<void> {
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(startResult);
+
+    const waitResult = await ctx.lazy(['wait', taskId]);
+    if (waitResult.exitCode !== 0) {
+      throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
+    }
+  }
+
+  /**
+   * Resolve the tasks directory for the test project. Test projects init with
+   * external storage (external_path in lazy.toml), so tasks live outside the
+   * repo — reading ctx.root/.lazy/tasks finds nothing ("Task dir not found").
+   * Fall back to the in-repo layout only when no external_path is configured.
+   * Mirrors tasksDirFor() in auto-resume.test.ts / reconcile.test.ts.
+   */
+  function tasksDirFor(): string {
+    const toml = readFileSync(join(ctx.root, 'lazy.toml'), 'utf-8');
+    const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
+    if (m && m[1]) return join(m[1], 'tasks');
+    return join(ctx.root, '.lazy', 'tasks');
+  }
+
+  /**
    * Read task.json directly from storage to inspect metadata.
    */
   function readTaskJson(taskShortId: string): Record<string, unknown> {
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
+    const tasksDir = tasksDirFor();
     const entries = Bun.spawnSync(['ls', tasksDir], { stdout: 'pipe' }).stdout.toString().trim().split('\n');
     const taskDir = entries.find(e => e.startsWith(taskShortId));
     if (!taskDir) throw new Error(`Task dir not found for ${taskShortId}`);
@@ -236,7 +276,7 @@ describe('auto-react budget (e2e)', () => {
    * Write task.json directly to storage (for test setup).
    */
   function writeTaskJson(taskShortId: string, data: Record<string, unknown>): void {
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
+    const tasksDir = tasksDirFor();
     const entries = Bun.spawnSync(['ls', tasksDir], { stdout: 'pipe' }).stdout.toString().trim().split('\n');
     const taskDir = entries.find(e => e.startsWith(taskShortId));
     if (!taskDir) throw new Error(`Task dir not found for ${taskShortId}`);
@@ -244,7 +284,10 @@ describe('auto-react budget (e2e)', () => {
   }
 
   test('show displays auto-react paused status when metadata is set', async () => {
-    const taskId = await createTask(ctx, 'Test auto-react display');
+    // Start the task so it has a session — the auto-react section in `show`'s
+    // text output only renders for tasks with a session (see show.ts).
+    const taskId = await createTask(ctx, 'Test auto-react display', 'Some work');
+    await startAndWait(taskId);
 
     // Set auto-react paused metadata directly on the task
     const taskJson = readTaskJson(taskId);
@@ -296,15 +339,10 @@ describe('auto-react budget (e2e)', () => {
   });
 
   test('blocked list shows AUTO-REACT PAUSED indicator', async () => {
-    const taskId = await createTask(ctx, 'Test blocked auto-react indicator');
+    const taskId = await createTask(ctx, 'Test blocked auto-react indicator', 'Some work');
 
     // Start and let it complete to get a session and blocked status
-    const startResult = await ctx.lazyMocked(
-      ['start', taskId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(startResult);
+    await startAndWait(taskId);
 
     // Set auto-react paused metadata
     const taskJson = readTaskJson(taskId);
@@ -325,15 +363,11 @@ describe('auto-react budget (e2e)', () => {
   // When a human manually provides feedback, the auto-react budget
   // resets because the human is taking over supervision.
   test('unblock resets auto-react counters', async () => {
-    const taskId = await createTask(ctx, 'Test counter reset on unblock');
+    const taskId = await createTask(ctx, 'Test counter reset on unblock', 'Some work');
 
-    // Start the task
-    const startResult = await ctx.lazyMocked(
-      ['start', taskId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
-    );
-    expectSuccess(startResult);
+    // Start the task (into blocked, with a session) so unblock has something to
+    // resume.
+    await startAndWait(taskId);
 
     // Set auto-react counters
     const taskJson = readTaskJson(taskId);
@@ -348,7 +382,7 @@ describe('auto-react budget (e2e)', () => {
 
     // Unblock the task (non-interactive, pipe feedback)
     const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '-m', 'please try again'],
+      ['unblock', taskId, '--message', 'please try again'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_PROMPT_DEFAULTS: 'accept', LAZY_MOCK_SHOULD_COMMIT: '1' } },
     );

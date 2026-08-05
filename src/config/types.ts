@@ -1,5 +1,14 @@
+import type { ProxyPolicyConfig } from '../proxy/policy';
+
 /** Ollama configuration for local model inference. */
 export type OllamaConfig = ResolvedConfig['ollama'];
+
+/**
+ * Fully-resolved mechanistic proxy policy (§6.3 layer 1). Alias of the engine's
+ * config shape (src/proxy/policy.ts) — the loader produces this and the proxy
+ * server consumes it directly.
+ */
+export type ResolvedProxyPolicy = ProxyPolicyConfig;
 
 /**
  * Model backend for a per-role target.
@@ -37,6 +46,22 @@ export interface RoleTarget {
   model: string;
   /** ANTHROPIC_BASE_URL for `ollama`/`proxy` backends. Empty for `anthropic`. */
   endpoint: string;
+  /**
+   * Live lazy-proxy base URL to route this role's traffic through, filled in at
+   * launch when the (default-on) proxy is running.
+   *
+   * Only meaningful for the `anthropic` backend: that traffic used to go straight
+   * to api.anthropic.com and now flows through lazy's local audit/policy proxy,
+   * which forwards to the same upstream. `proxy` roles carry their address in
+   * `endpoint` instead, and `ollama` roles are NEVER proxied (the proxy has a
+   * single Anthropic-native upstream; a local model is not it).
+   *
+   * Undefined = direct connection, which now means exactly one thing:
+   * `[proxy] enabled = false`. A proxy that is enabled but whose live address
+   * cannot be resolved FAILS the launch instead of leaving this undefined —
+   * see ProxyUnavailableError in daemon/auth-env.ts.
+   */
+  proxyUrl?: string;
 }
 
 /** Storage backend types — duplicated here to avoid circular dependency with storage module */
@@ -44,6 +69,49 @@ export type StorageBackendConfig = 'external' | 'postgres';
 
 /** Runner types for task execution */
 export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
+
+/** All canonical runner type values. */
+export const VALID_RUNNER_TYPES: readonly RunnerType[] = ['docker', 'podman', 'dangerously-host-process-without-any-isolation'] as const;
+
+/**
+ * Friendly CLI/MCP aliases mapped to canonical {@link RunnerType} values.
+ * Accepts the short, human-typeable names (`host`, `docker`, `container`,
+ * `podman`) as well as the canonical values themselves. The full
+ * `dangerously-host-process-without-any-isolation` string is intentionally
+ * verbose in lazy.toml, so `host` is the friendly alias for it.
+ */
+export const RUNNER_ALIASES: Readonly<Record<string, RunnerType>> = {
+  host: 'dangerously-host-process-without-any-isolation',
+  'dangerously-host-process-without-any-isolation': 'dangerously-host-process-without-any-isolation',
+  docker: 'docker',
+  container: 'docker',
+  podman: 'podman',
+};
+
+/**
+ * Resolve a friendly runner alias (or canonical value) to a {@link RunnerType}.
+ * Case-insensitive and whitespace-tolerant. Returns null for unknown values so
+ * callers can produce an actionable error listing the accepted aliases.
+ */
+export function resolveRunnerType(input: string): RunnerType | null {
+  return RUNNER_ALIASES[input.trim().toLowerCase()] ?? null;
+}
+
+/** Human-readable list of accepted runner aliases, for error messages. */
+export const RUNNER_ALIAS_HINT = 'host, docker, container, podman';
+
+/**
+ * Permission posture for HOST execution (host-process runner only; ignored for
+ * docker/podman, where the container is the boundary).
+ *   - 'sandbox' (default): Claude Code's OS sandbox (Seatbelt/bubblewrap) is the
+ *     hard boundary. Agents run sandbox + bypass (never hang); the interactive
+ *     builder runs sandbox + prompts on escape.
+ *   - 'bypass': full `--dangerously-skip-permissions`, no sandbox. Opt-in only.
+ * See src/runner/host-sandbox.ts.
+ */
+export type HostPermissionMode = 'sandbox' | 'bypass';
+
+export const VALID_HOST_PERMISSION_MODES: readonly HostPermissionMode[] = ['sandbox', 'bypass'] as const;
 
 /**
  * Claude Code `--effort` levels. Controls how hard the model thinks before responding.
@@ -88,6 +156,30 @@ export interface MaintainEntry {
  * `{repo}` placeholders, expanded at launch time. See `src/capture/mounts.ts`
  * for validation and `docker run -v` argument construction.
  */
+/**
+ * Accept-time validation ([automation.pre_accept]). OPT-IN: `enabled` defaults
+ * to false, because the step costs a full agent turn on every accept and the
+ * accept path blocks on it.
+ *
+ * A single agent turn that
+ * runs when a task is being accepted, BEFORE the merge — the home for expensive
+ * one-time validation (full test suite, build) and for maintained-files
+ * completeness (the CHANGELOG entry, written once against the final diff). The
+ * turn always includes a built-in post-mortem (recorded to the task journal);
+ * that is not configurable.
+ *
+ * `commands` are the merge GATE: the supervisor re-runs them after the agent's
+ * turn, and a non-zero exit aborts the accept and returns the task to blocked.
+ */
+export interface PreAcceptConfig {
+  /** Run the pre-accept turn at all. Default false — opt in to pay a turn per accept. */
+  enabled?: boolean;
+  /** Gate commands run (in order) after the agent turn; first non-zero exit aborts the merge. */
+  commands?: string[];
+  /** Timeout in seconds for EACH gate command (default: 600). */
+  timeout?: number;
+}
+
 export interface MountConfigEntry {
   /** "bind" (default) mounts a host path; "volume" uses a container-local Docker volume. */
   type?: 'bind' | 'volume';
@@ -132,11 +224,23 @@ export interface LazyConfig {
   };
   agent?: {
     agent_id?: string;
-    /** Kill agent process if no output for this many ms. 0 = use agent default. */
+    /**
+     * Kill the agent process after this many ms without progress. For agents
+     * with an activity stream (Claude Code) "progress" means a forward-progress
+     * event, not merely bytes; for others it means any output.
+     * 0 = use agent default.
+     */
     watchdog_output_timeout_ms?: number;
     /**
-     * Max time to wait for the agent process to exit after it signals end-of-turn
-     * (lazy_commit). 0 = disabled. Default 60000 (60s).
+     * Max time to wait for the agent process to exit AFTER it emitted its final
+     * result. The summary is already captured at that point, so this kill loses
+     * nothing. 0 = disabled. Default 60000 (60s).
+     */
+    wind_down_timeout_ms?: number;
+    /**
+     * @deprecated Renamed to `wind_down_timeout_ms`. Still read (and mapped) so
+     * existing lazy.toml files keep working — the old name described a timer
+     * armed by `lazy_commit`, which no longer signals end-of-turn.
      */
     graceful_exit_timeout_ms?: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
@@ -180,6 +284,26 @@ export interface LazyConfig {
   };
   runner?: RunnerType | {
     type?: RunnerType;
+    /** Host execution permission posture: "sandbox" (default) or "bypass". */
+    permission_mode?: HostPermissionMode;
+    /** Network allowlist for the host sandbox (default ["*.anthropic.com"]). */
+    sandbox_allowed_domains?: string[];
+    /**
+     * EXTRA paths to deny the Read tool, merged with the built-in sensitive
+     * defaults (~/.ssh, ~/.aws, …). Confines the file tools, which bypass the
+     * OS sandbox. See src/runner/host-sandbox.ts.
+     */
+    sandbox_deny_read?: string[];
+    /**
+     * EXTRA paths to deny the Write/Edit tools, merged with the built-in
+     * sensitive defaults. See src/runner/host-sandbox.ts.
+     */
+    sandbox_deny_write?: string[];
+    /**
+     * Allow Claude Code's weaker nested sandbox so bubblewrap runs inside an
+     * unprivileged container (no user namespaces). Weakens isolation — opt-in.
+     */
+    sandbox_allow_weaker_nested?: boolean;
   };
   documents?: {
     path?: string;
@@ -191,9 +315,39 @@ export interface LazyConfig {
   permissions?: {
     protected?: string[];
   };
+  /**
+   * Protected branches: merges into a protected branch require a
+   * human-recorded approval (`lazy approve <task>`) before `lazy accept`
+   * will complete. This is friction against an over-eager builder, not a
+   * security boundary — see docs/protected-branches.md.
+   */
+  protection?: {
+    /**
+     * Master switch for branch protection. OPT-IN: defaults to false, and
+     * while false nothing in [protection] has any effect — accepts behave
+     * exactly as before the feature existed. Set true to engage protection
+     * (`lazy protect <branch> on` does it for you).
+     */
+    enabled?: boolean;
+    /** Additional protected branch names (merges into them require approval, on top of the default branch). */
+    protected_branches?: string[];
+    /**
+     * Protected TASKS, by task code or short id. Merging a listed task's own
+     * branch upward requires human approval regardless of the target branch —
+     * the outgoing counterpart to `protected_branches`. Managed with
+     * `lazy protect <task> on|off`.
+     */
+    protected_tasks?: string[];
+    /** When protection is enabled, protect the repo's default branch (e.g. `main`). Default: true — flipping `enabled` on protects the default branch without further config. */
+    gate_default_branch?: boolean;
+    /** Path (relative to the project root) of the file holding the approval passphrase. Default: ".lazy/approve-passphrase". */
+    passphrase_file?: string;
+  };
   automation?: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain?: MaintainEntry[];
+    /** Accept-time validation step: heavy checks + maintained-files completeness + built-in post-mortem. */
+    pre_accept?: PreAcceptConfig;
   };
   /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
   mounts?: MountConfigEntry[];
@@ -209,6 +363,79 @@ export interface LazyConfig {
     model?: string;
     /** Ollama API endpoint (e.g., "http://host.docker.internal:11434") */
     endpoint?: string;
+  };
+  /**
+   * Built-in Anthropic-native passthrough proxy (Tier-1 audit plane).
+   * When set, the daemon starts the proxy server on `port` and forwards
+   * all traffic to `upstream`. Set `backend = "proxy"` on role targets
+   * to route that role's traffic through this proxy.
+   */
+  proxy?: {
+    /**
+     * Master switch. DEFAULT TRUE — the proxy is how lazy runs by default, the
+     * same way the daemon is: with no `[proxy]` section at all the daemon still
+     * starts the proxy (defaults below) and routes agent traffic through it.
+     *
+     * Set `enabled = false` to restore direct-to-Anthropic connections entirely:
+     * no proxy server is started and no `ANTHROPIC_BASE_URL` is injected. This is
+     * the escape hatch — there is deliberately no partial mode.
+     */
+    enabled?: boolean;
+    /**
+     * TCP port the proxy server listens on. OPTIONAL — omit it to let the daemon
+     * pick a free OS-assigned port at start (avoids conflicts across per-project
+     * daemons). Set it only to pin a specific port.
+     */
+    port?: number;
+    /** Bind address (default: "127.0.0.1"). */
+    bind?: string;
+    /** Upstream Anthropic-compatible base URL (default: "https://api.anthropic.com"). */
+    upstream?: string;
+    /**
+* Smart-routing failover chain, as `[[proxy.fallback]]` array-of-tables.
+     * On a primary 429/529 or unreachable primary, the proxy reroutes to these
+     * targets in order. Empty/absent = fail hard (no failover). Each Anthropic-
+     * native target may override the model for a different tier/backend.
+     */
+    fallback?: Array<{ upstream?: string; model?: string }>;
+    /**
+     * On a primary 429 whose `Retry-After` is ≤ this many seconds, wait and
+     * retry the primary once before failing over (default 5).
+     */
+    retry_after_threshold?: number;
+    /**
+     * Mechanistic policy plane (§6.3 layer 1). Deterministic, injection-proof
+     * deny-rules applied to each `tool_use` before it executes. Absent =
+     * the decided default posture (enforce on, connectors deny-by-default).
+     */
+    policy?: {
+      /** Master switch (default: true). false = pure passthrough/audit, no enforcement. */
+      enforce?: boolean;
+      /** `mcp__claude_ai_*` tool names to re-allow despite the default-deny posture. */
+      connector_allowlist?: string[];
+      /** Deny reads of well-known secret paths (~/.ssh, .env, credentials). Default: true. */
+      deny_secret_path_reads?: boolean;
+      /** Extra absolute-path glob patterns to deny for read/write tools. */
+      deny_path_globs?: string[];
+      /** Allowlisted egress hosts for WebFetch. Empty/absent = egress unrestricted. */
+      egress_allowlist?: string[];
+    };
+  };
+  memory?: {
+    /**
+     * Advisory size (bytes) for the injected memory context. Over this, launches
+     * WARN and suggest `lazy memory compact` (default: 4096). Never an error and
+     * never a truncation — memory over the threshold is still knowledge.
+     */
+    warn_bytes?: number;
+  };
+  limits?: {
+    /** Max live agent task containers before new starts queue (default: 8). */
+    max_concurrent_agents?: number;
+    /** Max concurrent interactive builder containers before new builders fail fast (default: 8). */
+    max_concurrent_builders?: number;
+    /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
+    idle_grace_minutes?: number;
   };
   daemon?: {
     /** React to CI failures (default: true). */
@@ -261,13 +488,16 @@ export interface ResolvedConfig {
   };
   agent: {
     agent_id: string;
-    /** Kill agent process if no output for this many ms. 0 = use agent default. */
+    /**
+     * Kill the agent process after this many ms without progress.
+     * 0 = use agent default.
+     */
     watchdog_output_timeout_ms: number;
     /**
-     * Max time to wait for the agent process to exit after it signals end-of-turn
-     * (lazy_commit). 0 = disabled.
+     * Max time to wait for the agent process to exit AFTER it emitted its final
+     * result. 0 = disabled.
      */
-    graceful_exit_timeout_ms: number;
+    wind_down_timeout_ms: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
     effort: EffortLevel;
   };
@@ -315,7 +545,22 @@ export interface ResolvedConfig {
   };
   runner: {
     type: RunnerType;
-
+    /** Host execution permission posture: "sandbox" (default) or "bypass". */
+    permission_mode: HostPermissionMode;
+    /** Network allowlist for the host sandbox (default ["*.anthropic.com"]). */
+    sandbox_allowed_domains: string[];
+    /**
+     * EXTRA paths to deny the Read tool, merged with the built-in sensitive
+     * defaults. Confines the file tools, which bypass the OS sandbox.
+     */
+    sandbox_deny_read: string[];
+    /** EXTRA paths to deny the Write/Edit tools, merged with the defaults. */
+    sandbox_deny_write: string[];
+    /**
+     * Allow Claude Code's weaker nested sandbox so bubblewrap runs inside an
+     * unprivileged container (no user namespaces). Weakens isolation — opt-in.
+     */
+    sandbox_allow_weaker_nested: boolean;
   };
   documents: {
     path: string;
@@ -327,9 +572,23 @@ export interface ResolvedConfig {
   permissions: {
     protected: string[];
   };
+  /** Protected-branches config (see LazyConfig.protection). */
+  protection: {
+    enabled: boolean;
+    protected_branches: string[];
+    protected_tasks: string[];
+    gate_default_branch: boolean;
+    passphrase_file: string;
+  };
   automation: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain: MaintainEntry[];
+    /** Accept-time validation step. Always present after loadConfig; opt-in (enabled defaults false). */
+    pre_accept: {
+      enabled: boolean;
+      commands: string[];
+      timeout: number;
+    };
   };
   /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
   mounts: MountConfigEntry[];
@@ -345,6 +604,46 @@ export interface ResolvedConfig {
     model: string;
     /** Ollama API endpoint (e.g., "http://host.docker.internal:11434") */
     endpoint: string;
+  };
+  /**
+   * Resolved proxy config. Non-null by DEFAULT — the proxy runs unless it was
+   * explicitly turned off. `null` means and only means `[proxy] enabled = false`
+   * (direct connections, no proxy server, no base-URL injection); every other
+   * config, including no `[proxy]` section at all, resolves to a live object.
+   */
+  proxy: {
+    /**
+     * Requested TCP port. `0` means "OS-assigned at bind time" (the default when
+     * no port is configured); the actual bound port is read back from the running
+     * server and advertised in daemon status/startup output.
+     */
+    port: number;
+    /** Bind address. */
+    bind: string;
+    /** Upstream Anthropic-compatible base URL. */
+    upstream: string;
+    /** Ordered failover targets (empty = fail hard, no failover). */
+    fallbacks: { upstream: string; model?: string }[];
+    /** Retry-After threshold (seconds) below which the primary is waited-out and retried before failover. */
+    retryAfterThreshold: number;
+    /** Fully-resolved mechanistic policy (§6.3 layer 1). Always present. */
+    policy: ResolvedProxyPolicy;
+  } | null;
+  memory: {
+    /**
+     * Advisory size (bytes) for the injected memory context. Over this, launches
+     * WARN and suggest `lazy memory compact` (default: 4096). Never an error and
+     * never a truncation.
+     */
+    warn_bytes: number;
+  };
+  limits: {
+    /** Max live agent task containers before new starts queue (default: 8). */
+    max_concurrent_agents: number;
+    /** Max concurrent interactive builder containers before new builders fail fast (default: 8). */
+    max_concurrent_builders: number;
+    /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
+    idle_grace_minutes: number;
   };
   daemon: {
     /** React to CI failures (default: true). */

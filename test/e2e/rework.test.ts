@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /** Extract new task ID from rework output that contains "Created rework task XXXXXXXX" */
 function extractReworkTaskId(output: string): string {
@@ -17,6 +17,9 @@ describe('lazy rework', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn, and
+    // these tests assert on rework, not on pre-accept.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -29,10 +32,7 @@ describe('lazy rework', () => {
     const taskId = await createTask(ctx, 'Original auth feature', 'Implement OAuth login');
 
     // Start and accept the task
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     // Verify task is complete
     const showBefore = await ctx.lazy(['show', taskId]);
@@ -62,10 +62,7 @@ describe('lazy rework', () => {
     const taskId = extractTaskId(createResult.stdout);
 
     // Start and accept
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     // Rework without --model
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix something']);
@@ -77,10 +74,7 @@ describe('lazy rework', () => {
   test('rework with --model override', async () => {
     const taskId = await createTask(ctx, 'Task to rework with model', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--model', 'claude-haiku-4-5-20251001']);
     expectSuccess(result);
@@ -91,10 +85,7 @@ describe('lazy rework', () => {
   test('rework with --goal override', async () => {
     const taskId = await createTask(ctx, 'Original goal here', 'Do work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--goal', 'Custom rework goal']);
     expectSuccess(result);
@@ -108,10 +99,7 @@ describe('lazy rework', () => {
     // Use the code directly since displayId returns code when set
     const taskId = 'fix-auth';
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix edge case']);
     expectSuccess(result);
@@ -126,10 +114,7 @@ describe('lazy rework', () => {
   test('rework with --code override', async () => {
     const taskId = await createTask(ctx, 'Task to rework', 'Work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--code', 'custom-rework']);
     expectSuccess(result);
@@ -154,9 +139,9 @@ describe('lazy rework', () => {
   test('fails for blocked task', async () => {
     const taskId = await createTask(ctx, 'Blocked task', 'Work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    // Drive the reconcile pass: post-v0.11 only a reconcile moves a started
+    // task working -> blocked, and this test is about the blocked state.
+    await startAndReconcile(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it']);
     expectFailure(result);
@@ -190,10 +175,7 @@ describe('lazy rework', () => {
   test('rework task has type rework', async () => {
     const taskId = await createTask(ctx, 'Task for type check', 'Work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it']);
     expectSuccess(result);
@@ -208,10 +190,7 @@ describe('lazy rework', () => {
   test('multiple reworks of same task are allowed', async () => {
     const taskId = await createTask(ctx, 'Task to rework twice', 'Work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result1 = await ctx.lazy(['rework', taskId, '--prompt', 'First rework']);
     expectSuccess(result1);
@@ -229,10 +208,7 @@ describe('lazy rework', () => {
   test('accepts prompt from piped stdin', async () => {
     const taskId = await createTask(ctx, 'Task for stdin test', 'Work');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId], {
       input: 'Fix the race condition in auth',
@@ -244,10 +220,7 @@ describe('lazy rework', () => {
   test('rework prompt includes original task context', async () => {
     const taskId = await createTask(ctx, 'Context test task', 'Implement the feature');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix edge case']);
     expectSuccess(result);
@@ -270,10 +243,7 @@ describe('lazy rework', () => {
 
     // Create and accept a task to rework (no parent on original)
     const taskId = await createTask(ctx, 'Task to rework', 'Work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     // Rework with --parent
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--parent', 'release-v1']);
@@ -291,33 +261,29 @@ describe('lazy rework', () => {
   // INVARIANT: --parent rejects terminal parent tasks (consistent with lazy create).
   // Terminal tasks cannot receive new child tasks.
   test('rework fails when --parent points to terminal task', async () => {
-    // Create and abandon a potential parent
-    const parentResult = await ctx.lazy(['create', '--goal', 'Abandoned parent', '--code', 'abandoned-par']);
+    // Create and close a potential parent (`lazy abandon` was removed; `close`
+    // is the no-session terminal transition that replaced it).
+    const parentResult = await ctx.lazy(['create', '--goal', 'Closed parent', '--code', 'closed-par']);
     expectSuccess(parentResult);
     const parentId = extractTaskId(parentResult.stdout);
-    await ctx.lazy(['abandon', parentId, '--reason', 'Done']);
+    const closeResult = await ctx.lazy(['close', parentId, '--reason', 'Done']);
+    expectSuccess(closeResult);
 
     // Create and accept a task to rework
     const taskId = await createTask(ctx, 'Task to rework', 'Work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     // Rework with --parent pointing to abandoned task
-    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--parent', 'abandoned-par']);
+    const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it', '--parent', 'closed-par']);
     expectFailure(result);
     expectError(result, 'Cannot use task');
-    expectError(result, 'abandoned');
+    expectError(result, 'closed');
   });
 
   // INVARIANT: rework without --parent on a parentless task creates a parentless rework.
   test('rework without parent creates parentless task', async () => {
     const taskId = await createTask(ctx, 'Standalone task', 'Work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it']);
     expectSuccess(result);

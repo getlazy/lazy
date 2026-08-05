@@ -14,13 +14,13 @@ import { join } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import type { Storage } from '../storage';
 import { TERMINAL_STATUSES } from '../types';
-import type { TokenUsage } from '../types';
+import { isBlockedStatus } from '../task-state-machine';
+import type { TokenUsage, Task } from '../types';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus, removeProtocolDir } from '../protocol';
 import type { CompletedResponse, ErrorResponse } from '../protocol';
 import { completedResponses } from '../protocol';
-import { clearTurnEndSignal } from '../protocol/turn-end-signal';
 import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
 import { checkLock, removeLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
@@ -31,10 +31,17 @@ import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import type { AutoReactTrigger } from '../daemon/auto-react-budget';
+import { tryAdmitAgentSlot, releaseAgentSlot, countActiveAgents, effectiveAgentLimit, orderQueuedTasks, selectContainersToReap } from '../daemon/concurrency';
 import { loadConfig } from '../config/loader';
 import { runGit } from './git';
 import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { readAgentReportFromSessionLog } from '../import/recover-agent-report';
+import {
+  isWatchdogKill,
+  watchdogTurnLines,
+  watchdogInterruptReason,
+  WATCHDOG_TURN_HEADING,
+} from './watchdog-turn';
 
 /**
  * Grace period in milliseconds for newly-working tasks.
@@ -206,7 +213,7 @@ export async function reconcileTasks(
     // reconcileTask was skipped (transient worktree lock) or threw for a task, a
     // task whose agent finished and committed real work can sit in `working`
     // forever — turns/commits unpersisted, no blocked transition, no notification.
-    // This independent net re-checks liveness/turn-end signal and backfills the
+    // This independent net re-checks run liveness and backfills the
     // committed work to `blocked`. It re-reads current git/task state, so it
     // survives daemon restarts (mirrors recoverBacklogWithCommits).
     try {
@@ -214,6 +221,141 @@ export async function reconcileTasks(
     } catch (err) {
       logger.warn(`Recover stranded working tasks failed: ${err instanceof Error ? err.message : err}`);
     }
+
+    // Sweep 8: reap idle blocked containers that are eating concurrency slots.
+    // A blocked task keeps a live (idle-polling) supervisor container with no
+    // idle reaper of its own — this is that reaper. Runs BEFORE the drain so a
+    // freed slot is filled by a queued task in the same tick.
+    try {
+      await reapIdleContainers(storage, lazyRoot, runner);
+    } catch (err) {
+      logger.warn(`Reap idle containers failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // Sweep 9: drain queued tasks as agent slots free up.
+    // Tasks queued at the concurrency cap (backlog→queued in launchTask) wait
+    // here until a slot frees (a working turn ends or an idle container is reaped).
+    try {
+      await drainQueuedTasks(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Drain queued tasks failed: ${err instanceof Error ? err.message : err}`);
+    }
+}
+
+/**
+ * Reap idle blocked containers to bound Docker load and free concurrency slots.
+ *
+ * A blocked task keeps its supervisor container alive (idle-polling with an
+ * infinite command wait) until the next unblock/review — potentially forever.
+ * The reap decision ({@link selectContainersToReap}) is priority-aware: it frees
+ * a warm container after a grace period (RAM bound) OR immediately when
+ * equal-or-higher-priority work is queued and starved. Reaping is safe: all
+ * durable state lives in storage + the on-disk Claude session, and the next
+ * unblock does removeRun-before-relaunch anyway, so reaping only costs a
+ * container cold-start on the next turn.
+ *
+ * Applies via the Runner (`removeRun`) and clears `container_name`, so the
+ * existing slot accounting frees the slot with no special-case counting.
+ */
+export async function reapIdleContainers(storage: Storage, lazyRoot: string, runner: Runner): Promise<void> {
+  const config = await loadConfig(lazyRoot);
+  const graceMs = config.limits.idle_grace_minutes * 60_000;
+  const limit = effectiveAgentLimit(config);
+
+  const nonTerminal = await storage.listTasksWithOptions({ nonTerminalOnly: true });
+  const working: { taskId: string; priority: Task['priority'] }[] = [];
+  const queued: { taskId: string; priority: Task['priority']; created_at: number }[] = [];
+  const blocked: { taskId: string; priority: Task['priority']; idleSinceMs: number }[] = [];
+  const sessionByTask = new Map<string, { id: string; container_name: string | null }>();
+
+  for (const t of nonTerminal) {
+    if (t.status === 'working') {
+      working.push({ taskId: t.id, priority: t.priority });
+      continue;
+    }
+    if (t.status === 'queued') {
+      queued.push({ taskId: t.id, priority: t.priority, created_at: t.created_at });
+      continue;
+    }
+    // Only turn-done, container-idle statuses are reap candidates. `pairing`,
+    // `merging`, `interrupted` are excluded (transient, or container already cleared).
+    if (!isBlockedStatus(t.status)) continue;
+    const session = await storage.getSessionByTaskId(t.id);
+    if (!session?.container_name) continue; // no live container to reap
+    sessionByTask.set(t.id, session);
+    // Idle-since = the last turn's timestamp (turn end ≈ when the container went
+    // idle). Falls back to session timestamps for a sessionless-but-containered edge.
+    const turns = await storage.getSessionTurns(session.id);
+    const idleSinceMs = turns.length > 0
+      ? turns[turns.length - 1].timestamp
+      : session.last_interaction_at ?? session.started_at;
+    blocked.push({ taskId: t.id, priority: t.priority, idleSinceMs });
+  }
+
+  if (blocked.length === 0) return;
+
+  const toReap = selectContainersToReap({
+    blocked,
+    queued,
+    working,
+    limit,
+    graceMs,
+    nowMs: Date.now(),
+    baseReapEnabled: runner.reapsIdleRuns,
+  });
+
+  for (const taskId of toReap) {
+    const session = sessionByTask.get(taskId);
+    if (!session?.container_name) continue;
+    try {
+      if (await runner.runExists(session.container_name)) {
+        await runner.removeRun(session.container_name);
+      }
+      await storage.updateSessionContainerName(session.id, null);
+      killTmuxWatchSession(tmuxSessionName(shortId(taskId)));
+      logger.info(`Reaped idle container for task ${shortId(taskId)} — freed a concurrency slot`);
+    } catch (err) {
+      logger.warn(`Failed to reap idle container for task ${shortId(taskId)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
+/**
+ * Launch queued tasks as agent slots free up.
+ *
+ * A task lands in `queued` when `launchTask` hit the concurrency cap. This sweep
+ * re-enters `launchTask` for each queued task (oldest first) while slots remain;
+ * launchTask's own gate is authoritative, so a task that still can't get a slot
+ * simply stays `queued`. Stops early once the cap is reached to avoid churn.
+ */
+async function drainQueuedTasks(storage: Storage, lazyRoot: string): Promise<void> {
+  const queued = await storage.listTasksWithOptions({ queuedOnly: true });
+  if (queued.length === 0) return;
+
+  const config = await loadConfig(lazyRoot);
+  const limit = effectiveAgentLimit(config);
+
+  // Highest priority first, FIFO within a priority — the same pure ordering the
+  // "queued #N of M" display uses. Kept out of this loop so a future scheduler
+  // can reuse it (see src/daemon/concurrency.ts).
+  const ordered = orderQueuedTasks(queued);
+
+  // Lazy import to avoid a module-load cycle (task-launcher → rpc-handlers).
+  const { launchTask } = await import('../daemon/task-launcher');
+
+  for (const task of ordered) {
+    if (await countActiveAgents(storage) >= limit) break; // no free slots
+    try {
+      // actor 'system': the reconciler launches on the human's behalf; the
+      // original start's model/effort overrides were persisted on the task at
+      // queue time, so this taskId-only relaunch reuses them.
+      const result = await launchTask(lazyRoot, { taskId: task.id, actor: 'system' });
+      if (result.queued) break; // gate re-queued it — cap reached, stop trying
+      logger.info(`Drained queued task ${shortId(task.id)} → working`);
+    } catch (err) {
+      logger.warn(`Failed to launch queued task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 }
 
 async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string, runner: Runner): Promise<void> {
@@ -224,6 +366,14 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   if (!task) return;
   const tRef = taskRef(task);
   const taskShortId = shortId(taskId);
+
+  // Monitor on the runner the session actually ran on. docker vs host discover
+  // runs differently (container names vs PID files), so a host task monitored by
+  // a docker-configured reconciler would be misread as crashed. Falls back to
+  // the global runner for legacy/no-override sessions (runner_type null).
+  const taskRunner = session.runner_type && session.runner_type !== runner.type
+    ? await createRunner(lazyRoot, session.runner_type)
+    : runner;
 
   // Skip tasks that are being actively worked on by another process (e.g., lazy start/unblock)
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
@@ -238,7 +388,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     return;
   }
 
-  const containerName = session.container_name ?? runner.runNameForTask(tRef);
+  const containerName = session.container_name ?? taskRunner.runNameForTask(tRef);
 
   // Step 1: Check if supervisor has written a response
   const protoDir = getProtocolDir(taskId);
@@ -280,12 +430,12 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   }
 
   // Step 3: Grace period expired — check if run is still alive.
-  // INVARIANT: a live run means the turn may still be finalizing (the agent's
-  // turn-end marker persists through post_turn_check / post_turn_sync / pushback
-  // before the supervisor writes response.json). We must NOT recover here — only
+  // INVARIANT: a live run means the turn may still be finalizing (the agent has
+  // stopped, but post_turn_check / post_turn_sync / pushback still run before the
+  // supervisor writes response.json). We must NOT recover here — only
   // the supervisor's response.json finalizes a turn. Stranded recovery is for
   // when that response will NEVER come, i.e. the run is dead (handled below).
-  if (await runner.isRunning(containerName)) {
+  if (await taskRunner.isRunning(containerName)) {
     logger.debug(`Task ${taskShortId}: run ${containerName} still running, no response yet`);
     return; // Still working
   }
@@ -298,16 +448,16 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   if (await recoverStrandedCompletion(storage, taskId, session, worktreePath, protoDir)) {
     await storage.updateSessionContainerName(session.id, null);
     killTmuxWatchSession(tmuxSessionName(taskShortId));
-    if (await runner.runExists(containerName)) {
-      await runner.removeRun(containerName);
+    if (await taskRunner.runExists(containerName)) {
+      await taskRunner.removeRun(containerName);
     }
     return;
   }
 
   // Step 4: Run not active and no response — check status.json for context
-  if (await runner.runExists(containerName)) {
-    const exitCode = await runner.getRunExitCode(containerName);
-    const logs = await runner.getRunLogs(containerName, 50);
+  if (await taskRunner.runExists(containerName)) {
+    const exitCode = await taskRunner.getRunExitCode(containerName);
+    const logs = await taskRunner.getRunLogs(containerName, 50);
     const status = readStatus(protoDir);
     const reason = exitCodeToReason(exitCode);
 
@@ -319,7 +469,7 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     await storage.updateSessionContainerName(session.id, null);
     killTmuxWatchSession(tmuxSessionName(taskShortId));
     clearStatus(protoDir);
-    await runner.removeRun(containerName);
+    await taskRunner.removeRun(containerName);
 
     // Auto-resume if circuit breaker allows
     await maybeAutoResume(storage, taskId, session.id, lazyRoot);
@@ -410,6 +560,23 @@ async function maybeAutoResume(
     logger.debug(`Task ${taskShortId}: auto-react budget check failed: ${err instanceof Error ? err.message : err}`);
   }
 
+  // Concurrency gate: auto-resume must respect the agent cap too. At the cap,
+  // defer — the reconciler retries every tick, so the resume happens naturally
+  // once a slot frees (no durable queue needed for this autonomous path).
+  let slotAdmitted = false;
+  try {
+    const config = await loadConfig(lazyRoot, { cwd: lazyRoot });
+    const decision = await tryAdmitAgentSlot(storage, taskId, effectiveAgentLimit(config));
+    if (!decision.admitted) {
+      logger.debug(`Task ${taskShortId}: at agent cap (${decision.running}/${decision.limit}), deferring auto-resume`);
+      return;
+    }
+    slotAdmitted = true;
+  } catch (err) {
+    // Fail open on a cap-check error — do not block recovery on a config read.
+    logger.debug(`Task ${taskShortId}: agent cap check failed (proceeding): ${err instanceof Error ? err.message : err}`);
+  }
+
   try {
     const success = await autoResumeTask(storage, task, session, lazyRoot);
     if (success) {
@@ -425,6 +592,11 @@ async function maybeAutoResume(
     }
   } catch (err) {
     logger.debug(`Task ${taskShortId}: auto-resume error: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    // autoResumeTask flips the task to `working` on success (slot stays counted)
+    // or leaves it interrupted on failure (slot freed) — either way release the
+    // short-lived reservation now that storage reflects the outcome.
+    if (slotAdmitted) releaseAgentSlot(taskId);
   }
 }
 
@@ -626,6 +798,14 @@ async function recoverStrandedCompletion(
     });
   }
 
+  // The agent ran to completion here (only the finalize handshake was lost), so
+  // its feedback backlog is consumed — same rule as handleCompletedResponse.
+  try {
+    await storage.markFeedbackConsumed(session.id);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not mark feedback consumed during recovery: ${err instanceof Error ? err.message : err}`);
+  }
+
   // Canonical working→blocked transition (validated by src/task-state-machine.ts).
   await storage.updateTaskStatus(taskId, 'blocked', 'system');
 
@@ -642,12 +822,7 @@ async function recoverStrandedCompletion(
     logger.debug(`Task ${taskShortId}: could not reset auto-react counters during recovery: ${err instanceof Error ? err.message : err}`);
   }
 
-  // Clear the consumed turn-end marker and stale status so a future turn starts clean.
-  try {
-    await clearTurnEndSignal(protoDir);
-  } catch (err) {
-    logger.debug(`Task ${taskShortId}: could not clear turn-end marker during recovery: ${err instanceof Error ? err.message : err}`);
-  }
+  // Clear stale status so a future turn starts clean.
   clearStatus(protoDir);
 
   return true;
@@ -995,6 +1170,19 @@ export async function handleCompletedResponses(
     }
   }
 
+  // INVARIANT (CLAUDE.md — never lose human feedback): the agent responded, so
+  // everything queued before this turn has now been seen. Clearing the whole
+  // pending backlog at once is what makes redelivery idempotent — a turn that
+  // DID consume its feedback can never be re-delivered into. Deliberately
+  // OUTSIDE the `else` above so a reconciler re-run still converges, and
+  // deliberately absent from handleErrorResponse — a crashed turn consumed
+  // nothing. See src/utils/feedback-redelivery.ts.
+  try {
+    await storage.markFeedbackConsumed(session.id);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not mark feedback consumed: ${err instanceof Error ? err.message : err}`);
+  }
+
   // Accumulate token usage into session totals — sum EVERY invocation's usage
   // (work + each supervised follow-up), so per-turn token costs roll up fully.
   for (const resp of responses) {
@@ -1070,7 +1258,13 @@ export async function handleCompletedResponses(
  * Records an agent error turn so crash details are visible in lazy show,
  * then transitions the task to 'interrupted'.
  */
-async function handleErrorResponse(
+/**
+ * Process an error response from the supervisor.
+ *
+ * Exported for unit tests (same as `handleCompletedResponse`) — the fatal /
+ * ordinary-crash split below is a decision worth pinning directly.
+ */
+export async function handleErrorResponse(
   storage: Storage,
   taskId: string,
   session: { id: string },
@@ -1080,8 +1274,35 @@ async function handleErrorResponse(
 ): Promise<void> {
   const taskShortId = shortId(taskId);
 
+  // A classified failure the supervisor deliberately stopped retrying. It
+  // cannot heal by itself, so the task must land in `blocked` (human's queue),
+  // not `interrupted` (auto-resume's queue) — auto-resuming into a dead
+  // credential or a bad model id just re-crashes on a timer.
+  // `failure_class` is set ONLY when the supervisor stopped on purpose (a
+  // `fatal_*` class, or `transient_unreachable` that outlived its bounded
+  // retries) — so its mere presence is the signal. Absent means an ordinary
+  // crash, which keeps the pre-existing interrupted + auto-resume behavior.
+  const fatalClass = response.failure_class;
+
   // Build a human-readable error turn content
-  const lines: string[] = ['[Agent crashed]', ''];
+  const watchdogKill = isWatchdogKill(response);
+  const heading = fatalClass
+    ? '[Agent stopped — unrecoverable failure]'
+    : watchdogKill
+      ? WATCHDOG_TURN_HEADING
+      : '[Agent crashed]';
+  const lines: string[] = [heading, ''];
+  if (watchdogKill) {
+    lines.push(...watchdogTurnLines(response), '');
+  }
+  if (fatalClass) {
+    lines.push(`Failure class: ${fatalClass}`);
+    if (response.failure_reason) lines.push(`Reason: ${response.failure_reason}`);
+    if (response.failure_attempts !== undefined) {
+      lines.push(`Attempts before giving up: ${response.failure_attempts}`);
+    }
+    lines.push('');
+  }
   lines.push(`Error: ${response.error}`);
   if (response.exit_code !== undefined) {
     lines.push(`Exit code: ${response.exit_code}`);
@@ -1120,12 +1341,43 @@ async function handleErrorResponse(
 
   consumeResponse(protoDir);
   clearStatus(protoDir);
+
+  if (fatalClass) {
+    // Blocked, not interrupted: `maybeAutoResume` only acts on interrupted
+    // tasks, so this is what actually stops the reconciler from burning time.
+    //
+    // The stale-response sweep calls this for tasks ALREADY in 'interrupted',
+    // and 'interrupted' → 'blocked' is not a valid transition (only
+    // 'interrupted' → 'working' is). Route through 'working' first, mirroring
+    // the same hop the completed-response sweep makes; without it the throw
+    // would be swallowed by the sweep's catch and the task would sit in
+    // 'interrupted' — the exact auto-resume queue this branch exists to avoid.
+    const current = await storage.getTask(taskId);
+    if (current?.status === 'interrupted') {
+      await storage.updateTaskStatus(taskId, 'working', 'system');
+    }
+    await storage.updateTaskStatus(taskId, 'blocked', 'system');
+    await storage.recordInterrupt(session.id, {
+      reason: `${fatalClass}: ${response.failure_reason ?? response.error}`,
+      exit_code: response.exit_code ?? null,
+      logs: response.stderr ?? null,
+    });
+    logger.warn(
+      `Task ${taskShortId}: unrecoverable agent failure (${fatalClass}) — blocked for human attention, not auto-resuming`,
+    );
+    return;
+  }
+
   await storage.updateTaskStatus(taskId, 'interrupted', 'system');
 
-  // Record interrupt diagnostics
-  const reason = response.exit_code !== undefined
-    ? exitCodeToReason(response.exit_code)
-    : `Agent error: ${response.error}`;
+  // Record interrupt diagnostics. A watchdog kill gets its own reason: the
+  // process was killed deliberately by lazy, and `lazy show` must say so rather
+  // than translate a signal exit code into a generic crash.
+  const reason = watchdogKill
+    ? watchdogInterruptReason(response)
+    : response.exit_code !== undefined
+      ? exitCodeToReason(response.exit_code)
+      : `Agent error: ${response.error}`;
   await storage.recordInterrupt(session.id, {
     reason,
     exit_code: response.exit_code ?? null,
@@ -1228,9 +1480,15 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
 
       const containerName = session.container_name;
 
-      if (await runner.runExists(containerName)) {
+      // Use the runner the session ran on (fallback: global) so a host run isn't
+      // checked for under docker (and vice versa).
+      const taskRunner = session.runner_type && session.runner_type !== runner.type
+        ? await createRunner(lazyRoot, session.runner_type)
+        : runner;
+
+      if (await taskRunner.runExists(containerName)) {
         logger.warn(`Task ${taskShortId}: removing orphaned run ${containerName} for ${task.status} task`);
-        await runner.removeRun(containerName);
+        await taskRunner.removeRun(containerName);
       }
 
       // Clear container_name so future sweeps skip this task

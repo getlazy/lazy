@@ -23,6 +23,15 @@ import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with {
 /**
  * Start the MCP server with the given task context.
  * This is a long-running process that reads from stdin and writes to stdout.
+ *
+ * LIVENESS BOUNDARY: tools here execute locally, so there is no heartbeat
+ * stream to relay and long calls emit no `notifications/progress` — a call that
+ * outlives the client's idle budget is abandoned by the client (the daemon-proxy
+ * mode below does not have this gap). Every production agent and builder uses
+ * the daemon proxy; this local mode is the no-daemon fallback. Closing the gap
+ * here means threading a per-call progress channel through
+ * tools.ts → rpc-fallback → daemon/client.ts, which is a bigger change on a
+ * legacy path — deliberately not done, and stated rather than left implicit.
  */
 export async function startMcpServer(ctx: McpToolContext): Promise<void> {
   const server = new McpServer(
@@ -47,12 +56,15 @@ export async function startMcpServer(ctx: McpToolContext): Promise<void> {
  * Start the MCP server in daemon proxy mode.
  * All tool calls are forwarded to the daemon's /mcp/:taskId/:toolName routes.
  *
- * @param daemonConfigPath - Path to daemon MCP config file (template with taskId='')
- * @param taskIdOverride - Optional task ID to override the config's taskId.
- *   The daemon config template has an empty taskId. The supervisor passes the
- *   real task ID via --task-id CLI arg so the MCP server can scope tool calls
- *   without writing a task-specific config file (which would fail in read-only
- *   container filesystems).
+ * @param daemonConfigPath - Path to the daemon MCP config file. It carries the
+ *   caller's OWN token (bound server-side to one identity) and that identity's
+ *   task id — `''` for the builder.
+ * @param taskIdOverride - Optional task ID to override the config's taskId. The
+ *   supervisor passes the real task ID via the --task-id CLI arg so the MCP
+ *   server can scope tool calls without writing a task-specific config file
+ *   (which would fail in read-only container filesystems). It must name the same
+ *   task the token belongs to: the daemon derives identity from the token and
+ *   refuses (403) a claim that disagrees.
  */
 export async function startMcpServerDaemonProxy(daemonConfigPath: string, taskIdOverride?: string): Promise<void> {
   const { readDaemonMcpConfig, createAllDaemonProxyHandlers } = await import('../daemon/mcp-proxy');

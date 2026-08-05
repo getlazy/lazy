@@ -3,8 +3,13 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { handleGetAuthEnv } from '../../src/daemon/rpc-handlers';
-import { resolveAuthEnvFromDaemon } from '../../src/daemon/auth-env';
-import { assertDaemonCredentials } from '../../src/daemon/credential-gate';
+import {
+  resolveAuthEnvFromDaemon,
+  resolveLiveProxyUrl,
+  withLiveProxyTarget,
+  ProxyUnavailableError,
+} from '../../src/daemon/auth-env';
+import { assertDaemonCredentials, credentialFromEnv } from '../../src/daemon/credential-gate';
 import type { RoleTarget } from '../../src/config/types';
 
 /**
@@ -101,6 +106,100 @@ describe('daemon auth env', () => {
       const result = await resolveAuthEnvFromDaemon();
       expect(result).toEqual([{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'local-token' }]);
     });
+
+    // INVARIANT: the surface is carried all the way down to the env layer. The
+    // daemon reports its addresses in the form the CONFIGURED RUNNER would use,
+    // so a docker-runner project reports `host.docker.internal` — correct for a
+    // container, a guaranteed ENOTFOUND for a host process. A caller launching
+    // on the host says so and gets the host-reachable address.
+    test('propagates the launch surface to the injected endpoint', async () => {
+      const dockerInternal: RoleTarget = {
+        backend: 'ollama',
+        model: 'qwen',
+        endpoint: 'http://host.docker.internal:11434',
+      };
+      const hostEnv = await resolveAuthEnvFromDaemon(dockerInternal, undefined, 'host');
+      expect(hostEnv.find(v => v.key === 'ANTHROPIC_BASE_URL')?.value).toBe('http://localhost:11434');
+
+      const containerEnv = await resolveAuthEnvFromDaemon(dockerInternal, undefined, 'container');
+      expect(containerEnv.find(v => v.key === 'ANTHROPIC_BASE_URL')?.value)
+        .toBe('http://host.docker.internal:11434');
+    });
+  });
+
+  /**
+   * INVARIANT (the audit plane must not silently degrade): with `[proxy]`
+   * enabled — the DEFAULT — a launch that cannot resolve the live proxy address
+   * FAILS. It must never fall through to a direct api.anthropic.com connection:
+   * that traffic would be unaudited and unenforced while the trail recorded
+   * nothing, and being silent it would rot unnoticed (daemon RPC blips are
+   * real). `[proxy] enabled = false` is the only opt-out.
+   *
+   * The gate is armed off an EXPLICIT signal, never off "the RPC returned
+   * null": under LAZY_TEST the harness deliberately runs without a daemon, so
+   * treating null as failure would break every test. `LAZY_FORCE_PROXY_GATE=1`
+   * (test-only) re-arms it, which is what these tests use.
+   */
+  describe('resolveLiveProxyUrl / withLiveProxyTarget (proxy fail-loud gate)', () => {
+    const anthropicRole: RoleTarget = { backend: 'anthropic', model: '', endpoint: '' };
+
+    beforeEach(() => {
+      // Deterministic: tryRpc must not reach out to any real daemon from a unit test.
+      process.env.LAZY_TEST = '1';
+    });
+
+    afterEach(() => {
+      delete process.env.LAZY_FORCE_PROXY_GATE;
+    });
+
+    async function configWith(toml: string) {
+      const configPath = join(projectRoot, 'lazy.toml');
+      await writeFile(configPath, toml);
+      process.env.LAZY_CONFIG = configPath;
+      const { loadConfig } = await import('../../src/config/loader');
+      return loadConfig(projectRoot, { cwd: projectRoot });
+    }
+
+    test('fails with an actionable error when the proxy is on and no address resolves', async () => {
+      process.env.LAZY_FORCE_PROXY_GATE = '1';
+      const config = await configWith('');       // no [proxy] section = proxy ON (default)
+      await expect(resolveLiveProxyUrl(config)).rejects.toThrow(ProxyUnavailableError);
+      await expect(resolveLiveProxyUrl(config)).rejects.toThrow('lazy daemon status');
+      await expect(resolveLiveProxyUrl(config)).rejects.toThrow('enabled = false');
+    });
+
+    // The explicit opt-out — NOT a fallback. Direct connection stays exactly as-is.
+    test('returns undefined and leaves targets alone when [proxy] enabled = false', async () => {
+      process.env.LAZY_FORCE_PROXY_GATE = '1';
+      const config = await configWith('[proxy]\nenabled = false\n');
+      expect(await resolveLiveProxyUrl(config)).toBeUndefined();
+      expect(await withLiveProxyTarget(anthropicRole, config)).toEqual(anthropicRole);
+    });
+
+    // The test harness (and the daemon talking to itself) must keep working
+    // without a daemon — that is why the gate keys off an explicit signal.
+    test('does not fire under the explicit daemon-RPC bypass (LAZY_TEST)', async () => {
+      const config = await configWith('');
+      expect(await resolveLiveProxyUrl(config)).toBeUndefined();
+      expect(await withLiveProxyTarget(anthropicRole, config)).toEqual(anthropicRole);
+    });
+
+    // ollama roles are never proxied (the proxy has one Anthropic-native
+    // upstream), so an unreachable proxy must not block a local-model launch.
+    test('does not fire for an ollama role', async () => {
+      process.env.LAZY_FORCE_PROXY_GATE = '1';
+      const config = await configWith('');
+      const ollama: RoleTarget = { backend: 'ollama', model: 'qwen', endpoint: 'http://localhost:11434' };
+      expect(await withLiveProxyTarget(ollama, config)).toEqual(ollama);
+    });
+
+    // An explicitly-pointed role needs nothing from the daemon.
+    test('does not fire for a proxy role with an explicit endpoint', async () => {
+      process.env.LAZY_FORCE_PROXY_GATE = '1';
+      const config = await configWith('');
+      const explicit: RoleTarget = { backend: 'proxy', model: 'm', endpoint: 'http://127.0.0.1:9999' };
+      expect(await withLiveProxyTarget(explicit, config)).toEqual(explicit);
+    });
   });
 
   describe('assertDaemonCredentials (the single enforcement point)', () => {
@@ -115,6 +214,51 @@ describe('daemon auth env', () => {
       await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(
         'Daemon refuses to start',
       );
+    });
+
+    // INVARIANT: a set-but-blank credential counts as ABSENT. `export
+    // CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)` leaves exactly this behind
+    // when the inner command fails, and a presence-only check let it through —
+    // producing the failure this gate exists to prevent: a daemon that runs,
+    // answers RPC, and hands every container a credential the API rejects.
+    test('throws when the credential is set but blank', async () => {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = '   ';
+      await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(
+        'Daemon refuses to start',
+      );
+    });
+
+    // A blank OAuth token must not mask a real API key — the gate looks for ANY
+    // usable credential, not just the first one that happens to be set.
+    test('passes when a blank OAuth token is accompanied by a real API key', async () => {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = '';
+      process.env.ANTHROPIC_API_KEY = 'sk-ant-real';
+      await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
+    });
+
+    // INVARIANT: Ollama-backed setups talk to a local model with dummy
+    // credentials, so the gate must not demand an Anthropic token — mirroring
+    // runner.checkAvailability().
+    test('is skipped when [ollama] is enabled', async () => {
+      await writeFile(
+        join(projectRoot, 'lazy.toml'),
+        '[ollama]\nenabled = true\nmodel = "qwen3:8b"\n',
+      );
+      await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
+    });
+  });
+
+  describe('credentialFromEnv', () => {
+    test('names the var holding the credential, OAuth first', () => {
+      expect(credentialFromEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'a', ANTHROPIC_API_KEY: 'b' }))
+        .toBe('CLAUDE_CODE_OAUTH_TOKEN');
+      expect(credentialFromEnv({ ANTHROPIC_API_KEY: 'b' })).toBe('ANTHROPIC_API_KEY');
+    });
+
+    test('treats missing, empty, and whitespace-only values as absent', () => {
+      expect(credentialFromEnv({})).toBeNull();
+      expect(credentialFromEnv({ CLAUDE_CODE_OAUTH_TOKEN: '' })).toBeNull();
+      expect(credentialFromEnv({ CLAUDE_CODE_OAUTH_TOKEN: '  \n\t ' })).toBeNull();
     });
   });
 });

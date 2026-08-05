@@ -50,12 +50,21 @@ export function evaluateQuery(node: QueryNode, data: TaskData): boolean {
   }
 }
 
-function textContains(haystack: string, needle: string): boolean {
+/**
+ * Substring match, tolerant of a missing haystack.
+ *
+ * Search runs over EVERY task in the project, so one defective stored record
+ * (e.g. a crash turn persisted without `content` — see src/utils/turn-content.ts)
+ * would otherwise break search project-wide. A non-string haystack simply
+ * matches nothing.
+ */
+function textContains(haystack: unknown, needle: string): boolean {
+  if (typeof haystack !== 'string') return false;
   return haystack.toLowerCase().includes(needle.toLowerCase());
 }
 
 function evaluateField(
-  field: 'status' | 'goal' | 'code',
+  field: 'status' | 'goal' | 'code' | 'tag',
   value: string,
   data: TaskData
 ): boolean {
@@ -68,11 +77,17 @@ function evaluateField(
 
     case 'code':
       return data.task.code !== null && data.task.code.toLowerCase() === value.toLowerCase();
+
+    case 'tag':
+      // Exact match against the task's normalized tags. The parser already
+      // normalized `value`, and stored tags are normalized, so a plain equality
+      // check is correct.
+      return (data.task.tags ?? []).includes(value);
   }
 }
 
 function evaluateIn(
-  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations',
+  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations' | 'memories',
   value: string,
   data: TaskData
 ): boolean {
@@ -92,6 +107,11 @@ function evaluateIn(
     case 'conversations':
       // Conversations are standalone entities, not associated with tasks.
       // They are searched separately in the search command.
+      return false;
+
+    case 'memories':
+      // Memory records are project-level, not per-task — searched separately
+      // in structuredSearch, so they never match a task here.
       return false;
   }
 }
@@ -163,19 +183,8 @@ export function buildSearchResults(
   // Collect all text terms from the query for context extraction
   const textTerms = extractTextTerms(node);
 
-  if (textTerms.length === 0) {
-    // No text terms (e.g., pure status/has/date query) — return a task-level result
-    results.push({
-      entity_type: 'task',
-      entity_id: data.task.id,
-      task_id: data.task.id,
-      task_code: taskCode,
-      task_goal: taskGoal,
-      content: taskGoal,
-      match_context: taskGoal,
-    });
-    return results;
-  }
+  // A query with no text terms at all (pure status/tag/has/date) falls through
+  // the loop below and is caught by the task-level fallback after it.
 
   // Check each content area for text matches
   for (const term of textTerms) {
@@ -277,6 +286,23 @@ export function buildSearchResults(
         });
       }
     }
+  }
+
+  // The caller only builds results for a task evaluateQuery() already matched,
+  // so producing no row at all would silently drop a genuine match. That
+  // happens whenever the matching part of the query carries no text term but
+  // some other branch does — e.g. `#launch` is (tag:launch OR text:"#launch"):
+  // the tag matches, yet "#launch" appears in no goal, turn, or commit.
+  if (results.length === 0) {
+    results.push({
+      entity_type: 'task',
+      entity_id: data.task.id,
+      task_id: data.task.id,
+      task_code: taskCode,
+      task_goal: taskGoal,
+      content: taskGoal,
+      match_context: taskGoal,
+    });
   }
 
   // Deduplicate by entity_type + entity_id

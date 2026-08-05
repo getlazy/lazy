@@ -2,11 +2,12 @@ import { requireStorage, requireLazyRoot, shortId, displayId, parseFlags, resolv
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { getActor } from '../../constants';
 import { emitSignal, initSignalDb } from '../../daemon/signals';
+import { sanitizeUserText } from '../../utils/sanitize-text';
 
 export async function commandComment(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
-    { name: 'message', takesValue: true },
+    { name: 'message', aliases: ['m'], takesValue: true },
   ], 'comment');
 
   const taskId = parsed.positional[0];
@@ -59,6 +60,11 @@ export async function commandComment(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // INTAKE BOUNDARY: comments are auto-delivered to the agent as prompt text,
+    // which becomes argv of `claude -p`. Escape control characters here so a
+    // NUL from a file/editor/pipe can never reach the spawn seam.
+    content = sanitizeUserText(content);
+
     const comment = await storage.createComment(task.id, content.trim(), getActor());
     // Comment is now durably persisted — clean up recovery file
     if (commentRecoveryPath) removeRecoveryFile(commentRecoveryPath);
@@ -95,7 +101,7 @@ export async function commandComment(args: string[]): Promise<void> {
 }
 
 export function commentUsage(): void {
-  console.log(`Usage: lazy comment <task_id> [--message "..."]
+  console.log(`Usage: lazy comment <task_id> [-m|--message "..."]
 
 Add a freeform comment/annotation to a task.
 
@@ -103,7 +109,7 @@ Arguments:
   <task_id>    ID of the task to annotate (can be shortened)
 
 Options:
-  --message "..."   Provide comment text inline instead of opening editor
+  -m, --message "..."   Provide comment text inline instead of opening editor
 
 Input priority: --message flag > piped stdin > $EDITOR (interactive)
 

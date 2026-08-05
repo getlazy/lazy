@@ -207,6 +207,60 @@ describe('working-substate observability', () => {
     expect(result.stdout).toContain('working(agent:answering)');
   });
 
+  // INVARIANT: a retrying task must say WHAT it is retrying. `harness:retrying`
+  // with only a ticking elapsed counter is what sent a human to read supervisor
+  // logs to find out the agent was being rate-limited.
+  test('ls shows the attempt count and latest error for a retrying task', async () => {
+    const taskId = await makeWorkingTask(ctx, 'retrying task');
+    const startedAt = new Date(Date.now() - 47_000).toISOString();
+    await writeStatusJson(taskId, baseStatus(taskId, {
+      phase: 'retrying',
+      phase_started_at: startedAt,
+      retryCount: 7,
+      retry_failure_class: 'transient_overload',
+      errors: [{
+        message: 'API Error: 529 overloaded',
+        count: 7,
+        firstSeen: startedAt,
+        lastSeen: new Date().toISOString(),
+      }],
+    }));
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['list']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(harness:retrying attempt 7 (transient_overload): API Error: 529 overloaded');
+    // The old standalone "(retry 7)" suffix would now be a duplicate.
+    expect(result.stdout).not.toContain('(retry 7)');
+  });
+
+  test('show renders the retry header and the retry state block', async () => {
+    const taskId = await makeWorkingTask(ctx, 'retrying show task');
+    const startedAt = new Date(Date.now() - 47_000).toISOString();
+    await writeStatusJson(taskId, baseStatus(taskId, {
+      phase: 'retrying',
+      phase_started_at: startedAt,
+      retryCount: 7,
+      retry_failure_class: 'transient_overload',
+      retry_failure_reason: 'API returned 529',
+      retry_next_delay_ms: 30_000,
+      errors: [{
+        message: 'API Error: 529 overloaded',
+        count: 7,
+        firstSeen: startedAt,
+        lastSeen: new Date().toISOString(),
+      }],
+    }));
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['show', taskId]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('phase=retrying attempt 7 (transient_overload): API Error: 529 overloaded');
+    expect(result.stdout).toContain('Retry Count:    7');
+    expect(result.stdout).toContain('transient_overload — API returned 529');
+    expect(result.stdout).toContain('Next Attempt:   in 30s');
+  });
+
   test('status shows working(agent:answering) for an ask-phase task', async () => {
     const taskId = await makeWorkingTask(ctx, 'answering status');
     await writeStatusJson(taskId, baseStatus(taskId, { command_type: 'ask' }));

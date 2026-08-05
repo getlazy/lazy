@@ -32,6 +32,7 @@ import { getActor } from '../constants';
 import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { emitSignal } from './signals';
 import type { Storage } from '../storage';
+import { turnText } from '../utils/turn-content';
 
 /**
  * SyncLogger abstracts how sync progress is reported.
@@ -300,7 +301,7 @@ async function postTurnSummaries(storage: Storage, driver: RepositoryDriver, sum
 
         if (turn.role === 'agent') {
           const turnNumber = Math.floor(turn.sequence / 2) + 1;
-          body = formatAgentTurnSummary(turn.content, turnNumber, turn.sequence, taskShortId);
+          body = formatAgentTurnSummary(turnText(turn), turnNumber, turn.sequence, taskShortId);
         } else {
           // Human review turn — skip the initial prompt (sequence 0) since
           // it's already in the PR body as the task goal/prompt
@@ -309,7 +310,7 @@ async function postTurnSummaries(storage: Storage, driver: RepositoryDriver, sum
             continue;
           }
           const turnNumber = Math.floor(turn.sequence / 2) + 1;
-          body = formatHumanReviewTurn(turn.content, turnNumber, turn.sequence, taskShortId);
+          body = formatHumanReviewTurn(turnText(turn), turnNumber, turn.sequence, taskShortId);
         }
 
         await driver.postTurnSummary(task, body);

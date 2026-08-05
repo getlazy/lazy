@@ -1,61 +1,31 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
-import { readFileSync, readdirSync } from 'fs';
+import { readFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+// The shared helper is the ONE place that knows tasks live at lazy.toml's
+// external_path; the per-suite <root>/.lazy/tasks copies below died with ENOENT
+// once storage moved out of the repo.
+import { readTurns, taskFilePath } from '../helpers/storage';
 
-/**
- * Find the full task UUID from a short (8-char) prefix.
- */
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const dirs = readdirSync(tasksDir);
-  const match = dirs.find(d => d.startsWith(shortId));
-  if (!match) throw new Error(`Task directory not found for ${shortId}`);
-  return match;
+/** Read a task's JSON record file, or [] when it was never written. */
+function readRecords<T>(root: string, shortId: string, file: string, key: string): T[] {
+  try {
+    const data = JSON.parse(readFileSync(taskFilePath(root, shortId, file), 'utf-8'));
+    return data[key];
+  } catch {
+    return [];
+  }
 }
 
-/**
- * Read comments.json for a task and return the parsed comments array.
- */
+/** Read comments.json for a task and return the parsed comments array. */
 function readComments(root: string, shortId: string): Array<{ content: string; actor?: string }> {
-  const fullId = findFullTaskId(root, shortId);
-  const commentsPath = join(root, '.lazy', 'tasks', fullId, 'comments.json');
-  try {
-    const data = JSON.parse(readFileSync(commentsPath, 'utf-8'));
-    return data.comments;
-  } catch {
-    return [];
-  }
+  return readRecords(root, shortId, 'comments.json', 'comments');
 }
 
-/**
- * Read status-changelog.json for a task and return the parsed changes array.
- */
+/** Read status-changelog.json for a task and return the parsed changes array. */
 function readStatusChangelog(root: string, shortId: string): Array<{ status: string; actor?: string }> {
-  const fullId = findFullTaskId(root, shortId);
-  const changelogPath = join(root, '.lazy', 'tasks', fullId, 'status-changelog.json');
-  try {
-    const data = JSON.parse(readFileSync(changelogPath, 'utf-8'));
-    return data.changes;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Read turns.json for a task and return the parsed turns array.
- */
-function readTurns(root: string, shortId: string): Array<{ role: string; actor?: string; content: string }> {
-  const fullId = findFullTaskId(root, shortId);
-  const turnsPath = join(root, '.lazy', 'tasks', fullId, 'turns.json');
-  try {
-    const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
-    return data.turns;
-  } catch {
-    return [];
-  }
+  return readRecords(root, shortId, 'status-changelog.json', 'changes');
 }
 
 describe('actor tracking', () => {
@@ -101,10 +71,10 @@ describe('actor tracking', () => {
 
   // INVARIANT: Status transitions record the actor who triggered them.
   // This enables usage stats on human vs builder workflow balance.
-  test('abandon from CLI records actor=human on status changelog', async () => {
+  test('close from CLI records actor=human on status changelog', async () => {
     const taskId = await createTask(ctx, 'Status actor test');
 
-    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Done']);
+    const result = await ctx.lazy(['close', taskId, '--reason', 'Done']);
     expectSuccess(result);
 
     const changelog = readStatusChangelog(ctx.root, taskId);
@@ -115,10 +85,10 @@ describe('actor tracking', () => {
   });
 
   // INVARIANT: Status transitions via LAZY_ACTOR=builder record actor=builder.
-  test('abandon with LAZY_ACTOR=builder records actor=builder on status changelog', async () => {
-    const taskId = await createTask(ctx, 'Builder abandon test');
+  test('close with LAZY_ACTOR=builder records actor=builder on status changelog', async () => {
+    const taskId = await createTask(ctx, 'Builder close test');
 
-    const result = await ctx.lazy(['abandon', taskId, '--reason', 'Builder abandon'], {
+    const result = await ctx.lazy(['close', taskId, '--reason', 'Builder close'], {
       env: { LAZY_ACTOR: 'builder' },
     });
     expectSuccess(result);
@@ -167,15 +137,10 @@ describe('actor tracking', () => {
   test('reconciler transitions record actor=system', async () => {
     const taskId = await createTask(ctx, 'Reconciler actor test', 'Do work');
 
-    // Start the task — this creates working status
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
-
-    // Run list to trigger reconciliation (working → blocked transition)
-    const listResult = await ctx.lazy(['list']);
-    expectSuccess(listResult);
+    // Start the task, then drive the reconcile pass that makes the
+    // working → blocked transition. `lazy list` used to reconcile on the way
+    // through; post-v0.11 only the daemon's loop (or an explicit pass) does.
+    await startAndReconcile(ctx, taskId);
 
     // After start + reconciliation, the task should have gone through:
     // backlog → working → blocked

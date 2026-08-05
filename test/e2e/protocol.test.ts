@@ -30,6 +30,7 @@ import {
   ensureProtocolDir,
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
+import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import type {
   StartCommand,
   UnblockCommand,
@@ -38,6 +39,9 @@ import type {
   ErrorResponse,
   SupervisorStatus,
 } from '../../src/protocol';
+
+// This suite awaits `reconcileTasks` in-process against a daemonless project.
+enableInProcessTestMode();
 
 // ============================================================
 // Section 1: Protocol I/O round-trips

@@ -19,21 +19,26 @@
  */
 
 import { join } from 'path';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
 import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
+import type { RunnerType } from '../config/types';
 import { resolveAgentModel } from '../utils/role-target';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
+import { stampSessionRunner } from '../runner/session-launch';
 import { createDriver } from '../remote';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
+import { mintMcpToken, type McpIdentity } from './mcp-tokens';
+import { getMcpConfigDir } from './paths';
 import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt } from '../cli/commands/shared';
+import { buildMemorySection } from '../memory';
 import { checkOrphanedChild, retargetOrphanedChild } from '../cli/orphan';
 import { parentTaskIdOf, branchTarget } from '../task-target';
 import { getAgent, listAgents } from '../agent/registry';
@@ -43,9 +48,11 @@ import { logger } from '../utils/logger';
 import { getActor } from '../constants';
 import type { Actor } from '../types';
 import { runGit } from '../utils/git';
+import { withSpan } from '../tracing';
 import { RpcError } from './rpc-handlers';
 import { isOfflineMode } from '../utils/offline';
 import { resolveAndPersistEffort } from './effort';
+import { tryAdmitAgentSlot, releaseAgentSlot, effectiveAgentLimit } from './concurrency';
 import type { StartCommand } from '../protocol';
 import type { Task, Storage } from '../storage';
 
@@ -64,6 +71,13 @@ export interface StartTaskParams {
   /** CLI `--effort` override. Persists on the task so resumes see the same value. */
   effortOverride?: string;
   /**
+   * Per-task runner override (already resolved to a canonical RunnerType by the
+   * CLI/MCP boundary). Highest precedence at launch and PERSISTED onto the task
+   * so subsequent turns stay on the chosen runner (avoiding a cross-runner
+   * flip-flop). null/undefined → fall back to `task.runner_type ?? global`.
+   */
+  runnerOverride?: RunnerType;
+  /**
    * Who submitted this command, by channel: MCP boundary → 'builder', CLI → 'human'.
    * When absent, falls back to getActor() (env-var / 'human'). Set explicitly by
    * the MCP boundary because the turn is persisted in the daemon process, where
@@ -81,6 +95,16 @@ export interface StartTaskResult {
   parentDisplayId: string | null;
   runnerType: string;
   warnings: string[];
+  /**
+   * Set when the launch was deferred at the concurrency cap: the task is now in
+   * `queued` status and the reconciler will launch it as a slot frees up. When
+   * true, the container/session/worktree fields are placeholders (empty/null).
+   */
+  queued?: boolean;
+  /** Agent slots in use at the moment this task was queued (for "N/N running"). */
+  queueRunning?: number;
+  /** The effective agent cap this task was queued against. */
+  queueLimit?: number;
 }
 
 // --- Helper functions ---
@@ -149,26 +173,150 @@ async function buildLinkedTaskPreamble(worktreePath: string, branchName: string,
 /**
  * Generate daemon MCP config for a container.
  *
- * The daemon knows its own webPort and token — no health check or fallback
- * needed. This is the key advantage of daemon-owned launch: the MCP config
- * is always correct because the daemon IS the server.
+ * The daemon knows its own webPort — no health check or fallback needed. This
+ * is the key advantage of daemon-owned launch: the MCP config is always correct
+ * because the daemon IS the server.
+ *
+ * The token written here is NOT the shared daemon token: it is minted for, and
+ * bound server-side to, `identity` alone (see src/daemon/mcp-tokens.ts). The
+ * daemon derives the caller's identity from it and refuses a request whose
+ * claimed `:taskId` disagrees, so a stolen or copied config cannot be used to
+ * act as another task.
  */
-export async function writeDaemonMcpConfig(projectRoot: string, containerName: string, dataDir: string): Promise<string> {
-  const { webPort, token } = getDaemonContext();
+export async function writeDaemonMcpConfig(
+  projectRoot: string,
+  containerName: string,
+  identity: McpIdentity,
+): Promise<string> {
+  const { webPort } = getDaemonContext();
+  const token = await mintMcpToken(projectRoot, identity, containerName);
 
-  const tmpDir = join(projectRoot, dataDir, 'tmp');
-  await mkdir(tmpDir, { recursive: true });
-  const configPath = join(tmpDir, `daemon-mcp-${containerName}.json`);
+  const configDir = daemonMcpConfigDir(projectRoot);
+  await mkdir(configDir, { recursive: true });
+  const configPath = join(configDir, `${DAEMON_MCP_CONFIG_PREFIX}${containerName}.json`);
 
   const config = {
     token,
     projectRoot,
-    taskId: '', // Template — filled per-task by mcpServerConfig()
-    target: `http://host.docker.internal:${webPort}`,
+    // Task tokens carry their own task id; the supervisor still passes
+    // --task-id, and the daemon refuses any claim that isn't this identity.
+    taskId: identity.kind === 'task' ? identity.taskId : '',
+    target: daemonMcpTarget(webPort),
   };
-  await writeFile(configPath, JSON.stringify(config, null, 2));
+  // 0600: the file carries a bearer credential. It is bind-mounted read-only
+  // into exactly one container, by absolute path.
+  await writeFile(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
 
   return configPath;
+}
+
+/** Filename prefix for daemon MCP config files. */
+export const DAEMON_MCP_CONFIG_PREFIX = 'daemon-mcp-';
+
+/**
+ * Directory holding this project's daemon MCP config files.
+ *
+ * SECURITY: this is the daemon's own state dir (~/.lazy/daemon/<slug>/mcp/),
+ * NOT `<project>/.lazy/tmp/` where these files used to live. Task containers
+ * bind-mount the whole repo read-only, so an in-repo config was readable by
+ * every other agent — any agent could have lifted another task's (or the
+ * builder's) token straight off disk, which would defeat per-task tokens
+ * entirely. Each config is bind-mounted into its one container by absolute
+ * path, so nothing needs it to be inside the repo.
+ */
+export function daemonMcpConfigDir(projectRoot: string): string {
+  return getMcpConfigDir(projectRoot);
+}
+
+/** The TCP target a container uses to call back into the daemon. */
+export function daemonMcpTarget(webPort: number): string {
+  return `http://host.docker.internal:${webPort}`;
+}
+
+export interface McpConfigRefreshResult {
+  scanned: number;
+  updated: number;
+  skipped: number;
+}
+
+/**
+ * Bring every previously-minted daemon MCP config up to date with the daemon's
+ * CURRENT web port.
+ *
+ * Why this exists: a config is minted once at launch and bind-mounted into a
+ * container (`-v <path>:<path>:ro`). If the daemon later restarts onto a
+ * different port — which happens whenever another project's daemon has taken
+ * the port in the shared 26024+ window — every running container keeps calling
+ * the old port, where a FOREIGN daemon answers and rejects our token with a
+ * permanent 401 on every tool, read-only ones included. The token is right; the
+ * daemon is wrong, so only the ADDRESS needs correcting.
+ *
+ * The token is deliberately preserved, never rewritten: it is bound to one
+ * identity in the token registry (src/daemon/mcp-tokens.ts), which survives
+ * daemon restarts precisely so a running container stays valid. Overwriting it
+ * with some other token would hand a container an identity that isn't its own.
+ *
+ * A single-file bind mount pins the inode, so rewriting the file IN PLACE
+ * (open + truncate, never rename) is visible inside the running container. The
+ * container-side proxy re-reads it on 401 and retries once, so a live session
+ * heals itself instead of losing every lazy tool until relaunch.
+ *
+ * Never fails the caller: a daemon must start even if this housekeeping can't.
+ */
+export async function refreshDaemonMcpConfigs(
+  projectRoot: string,
+  current: { webPort: number },
+  log: { info: (m: string) => void; warn: (m: string) => void },
+): Promise<McpConfigRefreshResult> {
+  const result: McpConfigRefreshResult = { scanned: 0, updated: 0, skipped: 0 };
+  const configDir = daemonMcpConfigDir(projectRoot);
+
+  let entries: string[];
+  try {
+    entries = await readdir(configDir);
+  } catch (err) {
+    // No config dir yet (fresh project, nothing ever launched) is the normal
+    // case — not an error. Anything else is worth a warning but not a failure.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`Could not scan ${configDir} to refresh daemon MCP configs: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return result;
+  }
+
+  const target = daemonMcpTarget(current.webPort);
+
+  for (const name of entries) {
+    if (!name.startsWith(DAEMON_MCP_CONFIG_PREFIX) || !name.endsWith('.json')) continue;
+    result.scanned++;
+    const path = join(configDir, name);
+    try {
+      const parsed = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+      if (parsed.target === target && parsed.projectRoot === projectRoot) {
+        result.skipped++;
+        continue;
+      }
+      // Preserve every other field — above all the per-identity token. Only
+      // the address (and the project it names) are ours to correct.
+      const next = { ...parsed, projectRoot, target };
+      // writeFile truncates in place and keeps the inode, which is what makes
+      // the change visible through an already-established bind mount. Do NOT
+      // switch this to a write-temp-then-rename: rename breaks the mount.
+      await writeFile(path, JSON.stringify(next, null, 2));
+      result.updated++;
+    } catch (err) {
+      // A single unreadable/corrupt leftover must not stop the others.
+      log.warn(`Could not refresh daemon MCP config ${path}: ${err instanceof Error ? err.message : String(err)}`);
+      result.skipped++;
+    }
+  }
+
+  if (result.updated > 0) {
+    log.info(
+      `Refreshed ${result.updated} daemon MCP config${result.updated === 1 ? '' : 's'} ` +
+      `to ${target} — running containers pick this up on their next 401`,
+    );
+  }
+  return result;
 }
 
 // --- Pre-flight validation ---
@@ -196,28 +344,36 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
     }
   }
 
-  // Check parent worktree exists for child tasks
-  const tParentId = parentTaskIdOf(t);
-  if (tParentId) {
-    const parentTask = await storage.getTask(tParentId);
-    if (!parentTask) {
-      throw new RpcError(400, `Parent task not found: ${tParentId}`);
-    }
-    const parentWorktreePath = getWorktreePath(root, parentTask);
-    if (!await pathExists(parentWorktreePath)) {
-      throw new RpcError(400, `Cannot start child task: parent task has no worktree. Start the parent first with: lazy start ${displayId(parentTask)}`);
-    }
-  }
-
-  // Handle orphaned child (parent accepted, branch gone).
+  // Handle orphaned child (parent accepted, branch gone) FIRST.
   // CLI prompts the user and passes retargetOrphan=true if confirmed.
   // Daemon only retargets when explicitly told to.
+  //
+  // This must precede the parent-worktree check below: an orphaned child's
+  // parent is complete and its worktree is gone, so checking the worktree
+  // first rejected every orphan with "start the parent first" — advice the
+  // user cannot follow, and exactly the case retargeting exists to fix.
+  const tParentId = parentTaskIdOf(t);
   if (tParentId && retargetOrphan) {
     const orphanStatus = await checkOrphanedChild(t, storage, root);
     if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
       await retargetOrphanedChild(t, storage, orphanStatus.retargetBranch);
       // Refresh task
       t = (await storage.getTask(t.id))!;
+    }
+  }
+
+  // Check parent worktree exists for child tasks. Re-derive the parent from the
+  // (possibly retargeted) task: a retargeted orphan now targets a branch and
+  // has no parent left to check.
+  const parentIdAfterRetarget = parentTaskIdOf(t);
+  if (parentIdAfterRetarget) {
+    const parentTask = await storage.getTask(parentIdAfterRetarget);
+    if (!parentTask) {
+      throw new RpcError(400, `Parent task not found: ${parentIdAfterRetarget}`);
+    }
+    const parentWorktreePath = getWorktreePath(root, parentTask);
+    if (!await pathExists(parentWorktreePath)) {
+      throw new RpcError(400, `Cannot start child task: parent task has no worktree. Start the parent first with: lazy start ${displayId(parentTask)}`);
     }
   }
 
@@ -251,7 +407,9 @@ export async function launchTask(
   const warnings: string[] = [];
 
   // --- Validate task ---
-  let t = await validateTask(storage, params.taskId, projectRoot, params.agentId, params.retargetOrphan);
+  let t = await withSpan('start.validate', { 'lazy.task_id': params.taskId }, () =>
+    validateTask(storage, params.taskId, projectRoot, params.agentId, params.retargetOrphan),
+  );
 
   // Apply agent override
   if (params.agentId) {
@@ -259,9 +417,16 @@ export async function launchTask(
   }
 
   // --- Runner pre-flight ---
-  const runner = await createRunner(projectRoot);
+  // Per-task runner resolution: explicit start override > stored task override >
+  // global config default. A start --runner override is persisted onto the task
+  // so the next turn doesn't flip back to the global default.
+  if (params.runnerOverride && t.runner_type !== params.runnerOverride) {
+    await storage.updateTaskRunnerType(t.id, params.runnerOverride);
+    t = { ...t, runner_type: params.runnerOverride };
+  }
+  const runner = await createRunner(projectRoot, t.runner_type ?? undefined);
 
-  // Validate runner/agent compatibility
+  // Validate runner/agent compatibility against the RESOLVED runner.
   if (t.agent_id !== 'claude-code' && runner.type !== 'dangerously-host-process-without-any-isolation') {
     throw new RpcError(400, `Agent "${t.agent_id}" only supports host-process runner. Set runner type to "dangerously-host-process-without-any-isolation" in lazy.toml.`);
   }
@@ -278,15 +443,65 @@ export async function launchTask(
 
   const config = await loadConfig(projectRoot);
 
+  // --- Concurrency gate (agent slot) ---
+  // A slot is held by each *working* agent task. At the cap, queue instead of
+  // launching: mark the task `queued` and let the reconciler drain it when a
+  // slot frees (respecting the cap). Re-entrant for an already-working task, so
+  // an idempotent relaunch never trips the cap. See src/daemon/concurrency.ts.
+  const agentLimit = effectiveAgentLimit(config);
+  const slot = await tryAdmitAgentSlot(storage, t.id, agentLimit);
+  // Only backlog/queued tasks can transition to `queued`. `lazy start` is a
+  // backlog operation; a task that already has a session falls through to the
+  // session check below, which returns the proper "already has a session" error
+  // rather than an invalid-transition crash.
+  const queueEligible = t.status === 'backlog' || t.status === 'queued';
+  if (!slot.admitted && queueEligible) {
+    // Persist model/effort overrides so the drained relaunch reuses them — the
+    // reconciler re-enters launchTask with only the taskId.
+    if (params.modelOverride) await storage.updateTaskModel(t.id, params.modelOverride);
+    if (params.effortOverride) {
+      await resolveAndPersistEffort(t, params.effortOverride, config.agent.effort, storage);
+    }
+    if (t.status !== 'queued') {
+      await storage.updateTaskStatus(t.id, 'queued', params.actor ?? getActor());
+    }
+    logger.info(`Task ${displayId(t)} queued (${slot.running}/${slot.limit} agents running)`);
+    return {
+      queued: true,
+      queueRunning: slot.running,
+      queueLimit: slot.limit,
+      sessionId: '',
+      containerName: '',
+      worktreePath: '',
+      branchName: '',
+      parentBranch: null,
+      parentDisplayId: null,
+      runnerType: runner.type,
+      warnings,
+    };
+  }
+
+  // Slot reserved — release it once the launch settles. Success flips the task
+  // to `working` (which keeps the slot counted); any failure frees it. The
+  // whole launch body runs inside this try so an early throw can't leak a slot.
+  try {
+
   // --- Offline mode: auto-enable forceLocal and use local driver ---
+  // Mirrors sync/reparent: when offline we branch from the LOCAL parent/integration
+  // branch and never touch the remote. createDriver({ offline }) returns a
+  // LocalDriver whose resolveUpstreamRef resolves the branch locally (no fetch),
+  // so the parent-ref resolution below cannot make a network call. forceLocal is
+  // also set so that if the local branch is missing we degrade to the parent
+  // worktree HEAD rather than failing on a remote we're not allowed to reach.
   const offline = await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline);
   if (offline) {
     params.forceLocal = true;
     if (config.remote.driver === 'gitlab' || config.remote.driver === 'github') {
       warnings.push(
-        'Note: lazy is in offline mode. Accepts will not create ' +
-        `${config.remote.driver === 'gitlab' ? 'MRs' : 'PRs'}, and remote sync will be ` +
-        'skipped. Run `lazy system online` to restore remote operations.',
+        'lazy is in offline mode. Starting from the local parent branch only — ' +
+        'no remote fetch will be performed. ' +
+        `Accepts will not create ${config.remote.driver === 'gitlab' ? 'MRs' : 'PRs'}, ` +
+        'and remote sync will be skipped. Run `lazy system online` to restore remote operations.',
       );
     } else {
       warnings.push('Offline mode: starting from local HEAD (remote operations skipped)');
@@ -406,12 +621,21 @@ export async function launchTask(
   } else if (isLinkedTask || existingSession) {
     const recovery = await recoverMissingWorktree(worktreePath, branchName, projectRoot);
     if (recovery.recovered) {
+      // Recreating someone's worktree is a side effect they didn't ask for —
+      // say so rather than doing it silently.
+      warnings.push(`Worktree was missing, recreated from branch ${branchName}.`);
+      if (recovery.dirty) {
+        warnings.push('Recovered worktree has uncommitted changes.');
+      }
       worktreeExisted = true;
     } else {
       throw new RpcError(500, `Branch '${branchName}' no longer exists. Cannot recover worktree.`);
     }
   } else {
-    await createWorktreeFromSha(worktreePath, branchName, startSha, projectRoot);
+    await withSpan('git.worktree.create', {
+      'git.branch': branchName,
+      'git.start_sha': startSha,
+    }, () => createWorktreeFromSha(worktreePath, branchName, startSha, projectRoot));
   }
 
   // Empty initial commit
@@ -438,7 +662,7 @@ export async function launchTask(
   const containerName = runner.runNameForTask(tRef);
 
   try {
-    const sandbox = await setupSandbox(worktreePath);
+    const sandbox = await withSpan('sandbox.setup', {}, () => setupSandbox(worktreePath));
 
     // --- Model resolution ---
     // Per-role model resolution: a local backend (ollama/proxy) forces its
@@ -466,7 +690,7 @@ export async function launchTask(
       turnPrompt = preamble + '\n---\n\n' + t.prompt;
     }
 
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)));
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }));
     const fullPrompt = buildPromptWithInstructions(turnPrompt, t.goal, true, projectRoot, notesCtx);
 
     // --- Persist state BEFORE launch (crash-safe) ---
@@ -476,6 +700,11 @@ export async function launchTask(
     } else {
       sess = await storage.createSession(t.id, t.agent_id, branchName, startSha);
     }
+
+    // Stamp the resolved runner onto the session (monitoring source of truth).
+    // For a linked task reusing an existing session, this also bridges the agent
+    // session across a runner boundary if the runner changed since it last ran.
+    await stampSessionRunner(storage, projectRoot, sess, worktreePath, runner.type);
 
     await storage.createTurn({
       sessionId: sess.id,
@@ -487,6 +716,10 @@ export async function launchTask(
       // Channel actor: MCP-originated starts are 'builder', CLI 'human'.
       // Falls back to getActor() for CLI (env-var / 'human').
       actor: params.actor ?? getActor(),
+      // INVARIANT: the task prompt is the human's first and most important
+      // feedback. If the very first turn crashes before the agent reads it,
+      // resume must re-deliver it verbatim rather than say "carry on".
+      carriesFeedback: true,
     });
 
     await storage.updateTaskStatus(t.id, 'working', params.actor ?? getActor());
@@ -509,11 +742,14 @@ export async function launchTask(
       }
 
       try {
-        const publishResult = await driver.publishBranch({
+        const publishResult = await withSpan('remote.publish_branch', {
+          'git.branch': branchName,
+          'git.target': mergeTarget,
+        }, () => driver.publishBranch({
           branch: branchName,
           targetBranch: mergeTarget,
           task: t,
-        });
+        }));
         if (publishResult.metadata) {
           for (const [key, value] of Object.entries(publishResult.metadata)) {
             await storage.updateTaskMetadata(t.id, key, value);
@@ -579,7 +815,7 @@ export async function launchTask(
     // there's no daemon for the container to connect to.
     let daemonConfigPath: string | null = null;
     if (runner.usesSandbox() && hasDaemonContext()) {
-      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, config.data.path);
+      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: t.id });
     }
 
     // --- Launch supervisor ---
@@ -589,7 +825,10 @@ export async function launchTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+        await withSpan('docker.launch_supervisor', {
+          'lazy.runner': runner.type,
+          'lazy.container': containerName,
+        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef));
       } catch (err) {
         await storage.updateTaskStatus(t.id, 'interrupted', getActor());
         if (!worktreeExisted) {
@@ -620,5 +859,9 @@ export async function launchTask(
     };
   } finally {
     await removeLock(worktreePath);
+  }
+
+  } finally {
+    releaseAgentSlot(t.id);
   }
 }

@@ -261,7 +261,13 @@ async function printHeader(
     try {
       const info = await runner.getRunInfo(runName);
       const substate = await computeWorkingSubstate(protoDir, info?.running === true);
-      if (substate) line += `  [${formatWorkingSubstate(substate)}]`;
+      // Drop the retry detail from the substate suffix — the header half already
+      // renders it, and repeating "attempt 7: <error>" twice on one line makes a
+      // long line longer without adding anything.
+      const suffix = substate && substate.kind === 'harness' && substate.retry
+        ? formatWorkingSubstate({ ...substate, retry: undefined })
+        : substate && formatWorkingSubstate(substate);
+      if (suffix) line += `  [${suffix}]`;
     } catch {
       // Liveness probe failed (runner hiccup) — the supervisor header is still
       // useful on its own, so render it without the substate suffix.

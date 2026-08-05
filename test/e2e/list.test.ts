@@ -1,13 +1,16 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
 
 describe('lazy list', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: it asserts only on list membership, so the pre-accept
+    // agent turn (on by default) is noise with no runner to execute it.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -42,7 +45,7 @@ describe('lazy list', () => {
   test('blocked shows tasks in blocked state', async () => {
     // Create and start a task so it transitions from backlog → working → blocked
     const taskId = await createTask(ctx, 'Blocked task', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId);
 
     const result = await ctx.lazy(['blocked']);
     expectSuccess(result);
@@ -67,7 +70,7 @@ describe('lazy list', () => {
   test('active shows started task that is blocked', async () => {
     // Create and start a task with mocked response
     const taskId = await createTask(ctx, 'Started task', 'Do something');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId);
 
     const result = await ctx.lazy(['active']);
     expectSuccess(result);
@@ -80,7 +83,7 @@ describe('lazy list', () => {
 
     // Create and start another task
     const startedId = await createTask(ctx, 'Started task for active', 'Do work');
-    await ctx.lazyMocked(['start', startedId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, startedId);
 
     // Check list first to see both tasks
     const listResult = await ctx.lazy(['list']);
@@ -98,10 +101,10 @@ describe('lazy list', () => {
   test('active shows multiple started tasks', async () => {
     // Start multiple tasks
     const task1 = await createTask(ctx, 'First task', 'Do first');
-    await ctx.lazyMocked(['start', task1, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, task1);
 
     const task2 = await createTask(ctx, 'Second task', 'Do second');
-    await ctx.lazyMocked(['start', task2, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, task2);
 
     const result = await ctx.lazy(['active']);
     expectSuccess(result);
@@ -115,7 +118,7 @@ describe('lazy list', () => {
 
     // Create and start a task (blocked, has session, waiting for review)
     const startedId = await createTask(ctx, 'Started and blocked', 'Do something');
-    await ctx.lazyMocked(['start', startedId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, startedId);
 
     const result = await ctx.lazy(['blocked']);
     expectSuccess(result);
@@ -127,9 +130,7 @@ describe('lazy list', () => {
   test('active does not show accepted task even with session', async () => {
     // Create and start a task with commit (needed for accept to work)
     const taskId = await createTask(ctx, 'Task to accept', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in active
     let result = await ctx.lazy(['active']);
@@ -149,9 +150,7 @@ describe('lazy list', () => {
   test('active does not show rejected task even with session', async () => {
     // Create and start a task with commit (needed for reject to work)
     const taskId = await createTask(ctx, 'Task to reject', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in active
     let result = await ctx.lazy(['active']);
@@ -171,7 +170,7 @@ describe('lazy list', () => {
   test('active does not show closed task even with session', async () => {
     // Create and start a task
     const taskId = await createTask(ctx, 'Task to close', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in active
     let result = await ctx.lazy(['active']);
@@ -190,7 +189,7 @@ describe('lazy list', () => {
   test('active shows working task with session', async () => {
     // Create and start a task - it will be in blocked state after MOCK_CLAUDE_SUCCESS
     const taskId = await createTask(ctx, 'Working task', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await startAndReconcile(ctx, taskId);
 
     // Should appear in active (blocked is non-terminal)
     const result = await ctx.lazy(['active']);
@@ -200,9 +199,7 @@ describe('lazy list', () => {
 
   test('blocked does not show accepted task', async () => {
     const taskId = await createTask(ctx, 'Task for blocked accept test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in blocked
     let result = await ctx.lazy(['blocked']);
@@ -221,9 +218,7 @@ describe('lazy list', () => {
 
   test('blocked does not show rejected task', async () => {
     const taskId = await createTask(ctx, 'Task for blocked reject test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in blocked
     let result = await ctx.lazy(['blocked']);
@@ -312,9 +307,7 @@ describe('lazy list', () => {
 
   test('list does not show accepted task by default', async () => {
     const taskId = await createTask(ctx, 'Task for list accept test', 'Do work');
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, taskId);
 
     // Verify it appears in list
     let result = await ctx.lazy(['list']);
@@ -383,12 +376,15 @@ describe('lazy list', () => {
   test('list with task ID and --all flag shows terminal descendants', async () => {
     // Create parent and child
     const parentId = await createTask(ctx, 'Parent for all test', 'Work');
-    await ctx.lazy(['create', '--goal', 'Child task', '--code', 'child-all', '--parent', parentId.substring(0, 8)]);
+    // A prompt is required: `lazy start` refuses a prompt-less task.
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Child task', '--prompt', 'Do child work', '--code', 'child-all', '--parent', parentId.substring(0, 8)]));
+
+    // The parent must be started first: a child branches off the parent's
+    // worktree, so `start` refuses while the parent has none.
+    await startAndReconcile(ctx, parentId);
 
     // Start and accept the child task
-    await ctx.lazyMocked(['start', 'child-all', '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
+    await startAndReconcile(ctx, 'child-all');
     await ctx.lazy(['accept', 'child-all']);
 
     // Without --all, accepted child should not appear even when filtering by parent
@@ -405,11 +401,14 @@ describe('lazy list', () => {
   });
 
   test('list filters recursively to include nested descendants', async () => {
-    // Create grandparent -> parent -> child hierarchy
-    await ctx.lazy(['create', '--goal', 'Grandparent', '--code', 'gp']);
-    await ctx.lazy(['create', '--goal', 'Parent', '--code', 'p', '--parent', 'gp']);
-    await ctx.lazy(['create', '--goal', 'Child', '--code', 'c', '--parent', 'p']);
-    await ctx.lazy(['create', '--goal', 'Unrelated', '--code', 'unrel']);
+    // Create grandparent -> parent -> child hierarchy.
+    // Codes must be at least 2 characters, so the old single-letter 'p'/'c'
+    // codes are rejected — and because these creates were unasserted, the
+    // rejection silently produced a one-node tree instead of a failure.
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Grandparent', '--code', 'gp']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Parent', '--code', 'pp', '--parent', 'gp']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Child', '--code', 'cc', '--parent', 'pp']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Unrelated', '--code', 'unrel']));
 
     // Filter by grandparent - should show all three levels
     const result = await ctx.lazy(['list', 'gp']);

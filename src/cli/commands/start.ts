@@ -15,11 +15,12 @@ import { protocolDir as getProtocolDir } from '../../protocol';
 
 import { listAgents } from '../../agent/registry';
 import { queryStartTask } from '../../daemon/rpc-fallback';
-import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
+import { VALID_EFFORT_LEVELS, type EffortLevel, type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT } from '../../config/types';
 
 import { theme } from '../theme';
 import { parentTaskIdOf } from '../../task-target';
 import { formatMarkdown } from '../../utils/markdown';
+import { initTracing, shutdownTracing, withSpan, currentTraceparent } from '../../tracing';
 
 
 export async function commandStart(args: string[]): Promise<void> {
@@ -31,6 +32,7 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
     { name: 'effort', takesValue: true },
+    { name: 'runner', takesValue: true },
 
   ], 'start');
 
@@ -54,6 +56,18 @@ export async function commandStart(args: string[]): Promise<void> {
       process.exit(1);
     }
     effortOverride = effortValue as EffortLevel;
+  }
+
+  // Parse --runner flag (per-task runner override; persists onto the task)
+  let runnerOverride: RunnerType | undefined;
+  const runnerValue = parsed.flags.get('runner') as string | undefined;
+  if (runnerValue !== undefined) {
+    const resolved = resolveRunnerType(runnerValue);
+    if (!resolved) {
+      console.error(`Invalid runner '${runnerValue}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
+      process.exit(1);
+    }
+    runnerOverride = resolved;
   }
 
   // Parse --agent flag
@@ -184,19 +198,57 @@ export async function commandStart(args: string[]): Promise<void> {
   }
 
   // --- Delegate to daemon RPC ---
+  // The CLI's `lazy.start` span is the true user-perceived request boundary;
+  // its `traceparent` is propagated to the daemon so the daemon's launch spans
+  // stitch under it into one trace.
+  initTracing('cli', async (spans) => {
+    const s = await requireStorage();
+    try {
+      await s.appendTraceSpans(spans);
+    } finally {
+      await s.close();
+    }
+  });
   try {
-    const result = await queryStartTask({
+    const result = await withSpan('lazy.start', {
+      'lazy.command': 'start',
+      'lazy.task_id': taskId,
+    }, () => queryStartTask({
       taskId,
       modelOverride,
       agentId,
       forceLocal,
       retargetOrphan,
       effortOverride,
-    });
+      runnerOverride,
+      traceparent: currentTraceparent() ?? undefined,
+    }));
+    // Flush the CLI root span before we continue (CLI is short-lived).
+    await shutdownTracing();
 
     // Print warnings
     for (const w of result.warnings) {
       console.log(w);
+    }
+
+    // Queued at the concurrency cap — the daemon will launch it automatically
+    // when a slot frees up. Not an error: surface it plainly and return.
+    if (result.queued) {
+      const storage = await requireStorage();
+      try {
+        const t = await resolveTaskOrExit(storage, taskId);
+        console.log(
+          theme.warning(
+            `\nTask ${displayId(t)} queued (${result.queueRunning}/${result.queueLimit} agents running).`,
+          ),
+        );
+        console.log('It will start automatically when an agent slot frees up (a running task finishes or a blocked one is reviewed).');
+        console.log(`  Watch the queue: ${theme.command('lazy active')}`);
+        console.log(`  Raise the cap for this daemon session: ${theme.command('lazy daemon config set max_concurrent_agents <N>')}`);
+      } finally {
+        await storage.close();
+      }
+      return;
     }
 
     // Print summary — task is now running asynchronously
@@ -230,13 +282,15 @@ export async function commandStart(args: string[]): Promise<void> {
       await storage.close();
     }
   } catch (err) {
+    // Flush any recorded spans (e.g. the failed root span) before exiting.
+    await shutdownTracing();
     console.error(`Error: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
   }
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--effort <level>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--effort <level>] [--runner <host|docker|container|podman>] [--follow] [--yes] [--force-local]
 
 Start an existing task. The daemon handles worktree creation, agent launch,
 and lifecycle management.
@@ -254,6 +308,9 @@ Options:
   --agent <agent_id> Agent to use for this task (default: from task or lazy.toml)
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
                      Persists on the task so resumes use the same value.
+  --runner <type>    Run this task on a specific runner regardless of the global
+                     [runner] type: host, docker, container, or podman.
+                     Persists on the task; takes effect this turn.
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompts
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)
@@ -270,6 +327,8 @@ Notes:
   - If the task already has a session, use 'lazy unblock' instead
   - Tasks automatically fetch the latest remote state before creating worktrees.
     If the remote fetch fails, 'lazy start' will abort unless --force-local is used.
+  - In offline mode ('lazy system offline' or offline = "on"), the remote fetch is
+    skipped automatically and the task branches from the local parent HEAD.
   - For child tasks, the worktree starts from the parent's branch HEAD (fetched from remote)
   - The human turn is recorded before the container launches, so it's
     crash-safe — if the process dies, the turn is preserved

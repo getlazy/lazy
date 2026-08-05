@@ -1,5 +1,6 @@
-import { isAbsolute, resolve } from 'path';
+import { isAbsolute, resolve, relative } from 'path';
 import type { MountConfigEntry } from '../config/types';
+import { getDaemonBaseDir } from '../daemon/paths';
 
 /**
  * Custom mounts ([[mounts]]) injected into task agent containers.
@@ -29,6 +30,60 @@ export interface MountPaths {
 /** A 1-based label for an entry, used in error messages. */
 function entryLabel(index: number): string {
   return `lazy.toml [[mounts]] entry #${index + 1}`;
+}
+
+/** True when `child` is inside `parent`, or IS `parent`. */
+function isWithin(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * INVARIANT: no container may see the daemon state dir (`~/.lazy/daemon/<slug>/`).
+ *
+ * It holds the shared daemon bearer token — which authenticates every `/rpc/*`
+ * call — and `mcp-tokens.json`, the registry binding each per-task MCP token to
+ * its identity. An agent that could read it would not need to impersonate anyone
+ * over `/mcp`: it could call `/rpc/acceptTask` directly with the shared token, or
+ * lift another task's (or the builder's) token straight out of the registry. The
+ * whole per-task identity boundary rests on that directory being unreachable
+ * from inside a container.
+ *
+ * Lazy's own launch paths honor that (asserted by
+ * test/unit/daemon-dir-never-mounted.test.ts). `[[mounts]]` is the one remaining
+ * way the directory could reach a container, so a mount that exposes it is
+ * refused here — including a mount of an ANCESTOR (`~/.lazy`, `$HOME`), which
+ * exposes it just as completely.
+ *
+ * The forbidden path is derived from src/daemon/paths.ts, never hardcoded, so it
+ * follows `LAZY_DAEMON_BASE_DIR` and any future relocation. The base dir (not one
+ * project's slug dir) is the boundary: another project's daemon dir is someone
+ * else's shared token, which is no better.
+ *
+ * Lazy's own per-container MCP config mount is unaffected — it is added by the
+ * launch paths themselves (a single `:ro` file under `<daemonDir>/mcp/`), never
+ * routed through `[[mounts]]`.
+ */
+function assertSourceOutsideDaemonState(source: string, where: string): void {
+  const daemonBaseDir = getDaemonBaseDir();
+  const why =
+    `The daemon state directory holds the shared daemon token (which authenticates every ` +
+    `/rpc call) and the per-task MCP token registry. Mounting it into an agent container ` +
+    `would let an agent bypass per-task identity entirely — acting as any other task, or as ` +
+    `the builder. Mount a specific directory that does not contain it.`;
+
+  if (isWithin(daemonBaseDir, source)) {
+    throw new Error(
+      `${where}: refusing source "${source}" — it is inside lazy's daemon state directory ` +
+      `(${daemonBaseDir}). ${why}`,
+    );
+  }
+  if (isWithin(source, daemonBaseDir)) {
+    throw new Error(
+      `${where}: refusing source "${source}" — it CONTAINS lazy's daemon state directory ` +
+      `(${daemonBaseDir}), so the container would see it. ${why}`,
+    );
+  }
 }
 
 /**
@@ -73,6 +128,14 @@ export function validateMount(entry: MountConfigEntry, index: number): void {
         `${where}: "name" is only valid for type = "volume", not for bind mounts. ` +
         `Remove "name" or set type = "volume".`,
       );
+    }
+    // A daemon-state mount is refused at LOAD time when the source is already a
+    // plain absolute path — the user hears about it from any lazy command, not
+    // only at launch. Placeholder and relative sources are only knowable once
+    // the worktree/repo paths exist; buildMountArgs checks those (and re-checks
+    // these) after expansion.
+    if (isAbsolute(entry.source as string) && !(entry.source as string).includes('{')) {
+      assertSourceOutsideDaemonState(entry.source as string, where);
     }
   } else {
     // type === 'volume'
@@ -134,6 +197,11 @@ export function buildMountArgs(mounts: MountConfigEntry[], paths: MountPaths): s
       if (!isAbsolute(source)) {
         source = resolve(paths.repoRoot, source);
       }
+      // Authoritative daemon-state check: this is the fully resolved host path
+      // that would reach `docker run -v`, so a placeholder or a `..` traversal
+      // that lands in the daemon dir is caught here even though load-time
+      // validation could not see it.
+      assertSourceOutsideDaemonState(source, entryLabel(index));
       args.push('-v', `${source}:${target}${ro}`);
     }
   });

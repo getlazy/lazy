@@ -16,8 +16,11 @@ import { RemoteStorage } from '../../src/storage/remote-storage';
 import { DaemonClient } from '../../src/daemon/client';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
+import { slowSuiteSkipped } from '../helpers/slow-suite';
 
-describe('RemoteStorage', () => {
+// Slow suite (>300s per file): opt in with LAZY_SLOW_TESTS=1. Gating only —
+// no test content is weakened or removed.
+describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
   let daemon: RunningDaemon;
   let ctx: TestContext;
   let tmpDir: string;
@@ -34,7 +37,7 @@ describe('RemoteStorage', () => {
 
   afterAll(async () => {
     if (daemon) {
-      try { daemon.stop(); } catch { /* may already be stopped */ }
+      try { await daemon.stop(); } catch { /* may already be stopped */ }
     }
     if (ctx) {
       await ctx.cleanup();
@@ -279,6 +282,27 @@ describe('RemoteStorage', () => {
     const history = await remote.getStatusHistory(task.id);
     expect(history.length).toBeGreaterThan(0);
     expect(history[0].status).toBe('backlog');
+  });
+
+  // INVARIANT: RemoteStorage correctly proxies the tag methods (add/remove/
+  // history) through the daemon, including actor attribution.
+  test('addTaskTag / removeTaskTag / getTagHistory round-trip through RPC', async () => {
+    const remote = await makeRemoteStorage();
+    const task = await remote.createTask('Tag proxy test');
+
+    // Add normalizes and returns the updated task.
+    const tagged = await remote.addTaskTag(task.id, '[Onboarding]', 'builder');
+    expect(tagged.tags).toEqual(['onboarding']);
+
+    // Remove returns the task with the tag gone.
+    const untagged = await remote.removeTaskTag(task.id, 'onboarding', 'builder');
+    expect(untagged.tags).toEqual([]);
+
+    // History is append-only and actor-attributed.
+    const history = await remote.getTagHistory(task.id);
+    expect(history).toHaveLength(2);
+    expect(history[0]).toMatchObject({ tag: 'onboarding', action: 'tag', actor: 'builder' });
+    expect(history[1]).toMatchObject({ tag: 'onboarding', action: 'untag', actor: 'builder' });
   });
 
   // INVARIANT: Void-returning storage methods work through RPC.

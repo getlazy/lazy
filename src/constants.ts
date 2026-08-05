@@ -30,5 +30,22 @@ export function getActor(): Actor {
  * MCP tool handlers thread this through the RPC layer so the turn is tagged
  * correctly even though it is persisted in the daemon process (where the env-var
  * `getActor()` default would otherwise report `human`).
+ *
+ * The MCP channel has two callers, told apart by SCOPE, not by channel: the
+ * builder (no task of its own — this constant) and a task agent driving its own
+ * subtree (`AGENT_ACTOR`). See {@link AGENT_ACTOR} and `mcpActor` in
+ * src/mcp/tools.ts, which picks between them from the tool context.
  */
 export const MCP_ACTOR: Actor = 'builder';
+
+/**
+ * The actor for commands originating at the MCP boundary from a TASK AGENT —
+ * a call whose tool context carries a task id, i.e. an agent acting inside its
+ * own subtree (creating, starting, reviewing, unblocking, or accepting its own
+ * subtasks).
+ *
+ * Same channel as {@link MCP_ACTOR}, different hand on the button: an accept
+ * driven by a parent agent must not read back as the builder's (or a human's)
+ * decision when someone later audits how a subtask landed.
+ */
+export const AGENT_ACTOR: Actor = 'agent';

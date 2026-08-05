@@ -62,7 +62,12 @@ describe('lazy_ask MCP tool', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // A real daemon is required: `runMcpSession` spawns the MCP server WITHOUT
+    // LAZY_TEST=1 (same as every other MCP suite — mcp-start, confirm-protocol,
+    // mcp-accept-gated, mcp-lifecycle-storage-init), so its `requireStorage()`
+    // reaches the daemon over RPC. Daemonless, the server exits 1 with "Daemon
+    // is not running" and never answers the tools/call.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -93,7 +98,9 @@ describe('lazy_ask MCP tool', () => {
     // Create a task so the daemon/storage is initialized — we then ask about
     // an unrelated short id that won't match.
     await createTask(ctx, 'unrelated');
-    const taskId = '00000000-0000-0000-0000-000000000001';
+    // Builder context (empty task id) — lazy_ask is builder-facing and the
+    // builder surface is unrestricted, so the ownership gate does not apply.
+    const taskId = '';
 
     const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },
@@ -114,7 +121,9 @@ describe('lazy_ask MCP tool', () => {
   test('returns actionable error when task has no session', async () => {
     // Create a task but don't start it — no session row exists yet.
     const taskShortId = await createTask(ctx, 'Ask without session');
-    const taskId = '00000000-0000-0000-0000-000000000001';
+    // Builder context (empty task id) — unrestricted, so we reach the
+    // no-session check rather than the agent ownership gate.
+    const taskId = '';
 
     const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },

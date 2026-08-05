@@ -23,12 +23,71 @@ import {
   releaseStartLock,
 } from '../../src/daemon/lifecycle';
 import { getStartLockPath, getDaemonDir } from '../../src/daemon/paths';
+import { DEFAULT_SERVER_BIND } from '../../src/config/constants';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
+import { slowSuiteSkipped } from '../helpers/slow-suite';
+import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { pinConfig } from '../helpers/pin-config';
 
-describe('lazy daemon', () => {
+/**
+ * The address a port squatter must bind to actually block the daemon.
+ *
+ * Several tests below force a web-bind failure by occupying the port the daemon
+ * is about to take. The daemon binds a SPECIFIC address (DEFAULT_SERVER_BIND,
+ * 127.0.0.1) — so a squatter MUST bind that same address. `Bun.serve` defaults
+ * to the wildcard (`::`), and a wildcard listener only reliably blocks a later
+ * specific bind on Linux: on macOS/BSD, SO_REUSEADDR permits binding a more
+ * specific address over an existing wildcard, so the daemon bound successfully
+ * and every "the bind must fail" assertion in this file failed on a Mac while
+ * passing in Linux CI. Squat the exact bind host, never the wildcard.
+ */
+const SQUAT_HOST = DEFAULT_SERVER_BIND;
+
+/**
+ * Where a test that chdir()s puts the process back.
+ *
+ * Not `process.cwd()`: restoring to whatever the cwd happened to be when a test
+ * started is unsafe — an earlier suite may have left the process inside a temp
+ * project that has since been removed, and chdir()ing back to a deleted path
+ * throws ENOENT and fails an otherwise-passing test (that cascade cost this file
+ * three tests). Not the repo root either: config and storage resolve from cwd, so
+ * landing there makes later cwd-sensitive tests pick up lazy's OWN lazy.toml.
+ * The system temp dir is both guaranteed to exist and free of any lazy project.
+ */
+const STABLE_CWD = tmpdir();
+
+/**
+ * Rewrite a test project's `[server] port` to a port the OS reports free, so a
+ * real `lazy daemon start` does not depend on the shared 26024+ window being
+ * available on the machine running the suite.
+ *
+ * The generated lazy.toml already has a `[server]` section with `port = 26024`;
+ * appending a second one would be a duplicate key, so the existing line is
+ * rewritten in place (same reasoning as `forceBindFailure` below). A
+ * non-default configured port is authoritative over the persisted one, so this
+ * genuinely steers the bind.
+ */
+async function pinFreeServerPort(projectRoot: string): Promise<number> {
+  const probe = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('probe') });
+  const port = probe.port!;
+  probe.stop(true);
+
+  const configPath = join(projectRoot, 'lazy.toml');
+  const existing = await readFile(configPath, 'utf-8');
+  const updated = existing.replace(/^port\s*=\s*\d+/m, `port = ${port}`);
+  if (updated === existing) {
+    throw new Error('pinFreeServerPort: failed to rewrite port in lazy.toml');
+  }
+  await writeFile(configPath, updated);
+  return port;
+}
+
+// Slow suite (>300s per file): opt in with LAZY_SLOW_TESTS=1. Gating only —
+// no test content is weakened or removed.
+describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
   describe('server module (unit-level)', () => {
     let daemon: RunningDaemon;
     let ctx: TestContext;
@@ -43,7 +102,7 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemon) {
-        daemon.stop();
+        await daemon.stop();
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
@@ -115,7 +174,35 @@ describe('lazy daemon', () => {
       expect(data.ok).toBe(true);
 
       // Manually stop since shutdown schedules async exit
-      daemon.stop();
+      await daemon.stop();
+    });
+
+    // INVARIANT: a [proxy] startup failure is a CONTROLLED startup error, not an
+    // unhandled rejection that half-starts the daemon. When [proxy] is configured
+    // but the proxy cannot bind (here: its port is already taken), startDaemonServer
+    // must reject with an actionable message AND tear down the partial daemon so no
+    // stale socket/lock is left behind. Regression guard for the live-testing crash
+    // where a failed proxy start took the whole daemon down ~6s after boot.
+    test('proxy startup failure is a controlled error that tears down the daemon', async () => {
+      // Occupy a port so the proxy's bind fails with EADDRINUSE.
+      const squatter = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response('ok') });
+      const takenPort = squatter.port;
+      try {
+        // Enable the proxy on the already-taken port.
+        const configPath = join(ctx.root, 'lazy.toml');
+        const original = await readFile(configPath, 'utf-8');
+        await writeFile(configPath, `${original}\n[proxy]\nport = ${takenPort}\n`);
+
+        await expect(
+          startDaemonServer({ socketPath, token: 'proxy-fail-token', projectRoot: ctx.root }),
+        ).rejects.toThrow(/failed to start the \[proxy\] server/i);
+
+        // Controlled teardown: no running daemon, no stale unix socket.
+        expect(existsSync(socketPath)).toBe(false);
+        expect(await isDaemonRunning(ctx.root)).toBe(false);
+      } finally {
+        squatter.stop();
+      }
     });
   });
 
@@ -374,7 +461,7 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemon) {
-        try { daemon.stop(); } catch { /* may already be stopped */ }
+        try { await daemon.stop(); } catch { /* may already be stopped */ }
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
@@ -396,7 +483,7 @@ describe('lazy daemon', () => {
       expect(data.status).toBe('running');
 
       // Stop
-      daemon.stop();
+      await daemon.stop();
 
       // Verify socket is cleaned up
       // Note: stop() calls cleanupStaleFiles which removes PID and socket
@@ -432,9 +519,37 @@ describe('lazy daemon', () => {
     let tmpDir: string;
     let socketPath: string;
     let token: string;
+    let fixtureTaskId: string;
+
+    // A single backlog task, created BEFORE the daemon starts. The daemon holds
+    // the project's .storage-lock for its whole lifetime, so a `lazy create`
+    // subprocess launched while it is running can NEVER acquire the lock — it
+    // burns its retry budget and fails. Every test here that needs a task uses
+    // this one. The goal contains "daemon" so the search test matches it.
+    const FIXTURE_GOAL = 'Searchable daemon fixture task';
+
+    // A second fixture: a task that HAS a session and is in a terminal status.
+    // `wait` refuses a task with no session (nothing to wait for, ever), so the
+    // no-session fixture above cannot exercise its immediate-return path. Terminal
+    // rather than blocked/backlog so it stays out of /rpc/active and /rpc/blocked,
+    // which assert empty trees.
+    let settledTaskId: string;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
+      fixtureTaskId = await createTask(ctx, FIXTURE_GOAL);
+      settledTaskId = await createTask(ctx, 'Settled daemon fixture task');
+      const setupStorage = await openProjectStorage(ctx.root);
+      try {
+        const settled = (await setupStorage.listTasks()).find(t => t.id.startsWith(settledTaskId));
+        expect(settled).toBeDefined();
+        const startSha = ctx.git('rev-parse', 'HEAD').stdout.trim();
+        await setupStorage.createSession(settled!.id, 'test-agent', `lazy/fix.${settledTaskId}`, startSha);
+        // 'abandoned' is the one terminal status reachable directly from backlog.
+        await setupStorage.updateTaskStatus(settled!.id, 'abandoned', 'system');
+      } finally {
+        await setupStorage.close();
+      }
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-rpc-'));
       socketPath = join(tmpDir, 'rpc-test.sock');
       token = 'rpc-test-token';
@@ -443,7 +558,7 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemon) {
-        try { daemon.stop(); } catch { /* may already be stopped */ }
+        try { await daemon.stop(); } catch { /* may already be stopped */ }
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
@@ -490,9 +605,6 @@ describe('lazy daemon', () => {
     // INVARIANT: /rpc/list returns a task tree with correct structure.
     // This is the primary read path for the CLI list command.
     test('rpc/list returns task tree', async () => {
-      // Create a task so there's something to list
-      const taskId = await createTask(ctx, 'Test list via RPC');
-
       const { status, data } = await rpc('list', { all: true });
       expect(status).toBe(200);
       expect(data.tree).toBeArray();
@@ -508,11 +620,9 @@ describe('lazy daemon', () => {
 
     // INVARIANT: /rpc/list with default params returns only non-terminal tasks.
     test('rpc/list defaults to non-terminal tasks', async () => {
-      const taskId = await createTask(ctx, 'Non-terminal test');
-
       const { status, data } = await rpc('list');
       expect(status).toBe(200);
-      // Task is in backlog (non-terminal), should appear
+      // The fixture task is in backlog (non-terminal), so it should appear
       expect(data.tree.length).toBeGreaterThan(0);
     });
 
@@ -535,18 +645,15 @@ describe('lazy daemon', () => {
     // INVARIANT: /rpc/show returns structured task data.
     // The CLI reconstructs TaskShowData from this to render locally.
     test('rpc/show returns task data', async () => {
-      const taskId = await createTask(ctx, 'Test show via RPC');
-
-      const { status, data } = await rpc('show', { taskId });
+      const { status, data } = await rpc('show', { taskId: fixtureTaskId });
       expect(status).toBe(200);
       expect(data.task).toBeDefined();
-      expect(data.task.goal).toBe('Test show via RPC');
+      expect(data.task.goal).toBe(FIXTURE_GOAL);
       expect(data.turns).toBeArray();
       expect(data.commits).toBeArray();
       expect(data.comments).toBeArray();
       expect(data.children).toBeArray();
       expect(data.childSessions).toBeDefined();
-      expect(data.proposals).toBeArray();
     });
 
     // INVARIANT: /rpc/show returns 404 for unknown tasks.
@@ -566,8 +673,6 @@ describe('lazy daemon', () => {
     // INVARIANT: /rpc/search returns matching results.
     // Search is one of the most latency-sensitive commands — daemon routing helps.
     test('rpc/search returns results', async () => {
-      await createTask(ctx, 'Searchable daemon test task');
-
       const { status, data } = await rpc('search', { query: 'daemon' });
       expect(status).toBe(200);
       expect(data.query).toBe('daemon');
@@ -584,8 +689,8 @@ describe('lazy daemon', () => {
 
     // INVARIANT: /rpc/diff returns 400 when task has no session.
     test('rpc/diff returns error for task without session', async () => {
-      const taskId = await createTask(ctx, 'No session task');
-      const { status, data } = await rpc('diff', { taskId });
+      // The fixture task has never been started, so it has no session.
+      const { status, data } = await rpc('diff', { taskId: fixtureTaskId });
       expect(status).toBe(400);
       expect(data.error).toContain('no session');
     });
@@ -600,14 +705,21 @@ describe('lazy daemon', () => {
     // INVARIANT: /rpc/wait returns immediately for non-working tasks.
     // No polling needed when task is already in a terminal or blocked state.
     test('rpc/wait returns immediately for non-working task', async () => {
-      const taskId = await createTask(ctx, 'Non-working wait test');
-
-      const { status, data } = await rpc('wait', { taskId, timeout: 2 });
+      const { status, data } = await rpc('wait', { taskId: settledTaskId, timeout: 2 });
       expect(status).toBe(200);
-      // Task is in 'backlog' status (not 'working'), should return immediately
+      // Task has a session but is not 'working', so wait returns without polling
       expect(data.task_id).toBeDefined();
       expect(data.status).not.toBe('working');
       expect(data.timed_out).toBe(false);
+    });
+
+    // INVARIANT: /rpc/wait refuses a task that was never started. Waiting on a
+    // task with no session can never terminate on its own, so the daemon says so
+    // instead of reporting "now backlog" behind a bare non-zero exit.
+    test('rpc/wait returns 400 for a task with no session', async () => {
+      const { status, data } = await rpc('wait', { taskId: fixtureTaskId, timeout: 2 });
+      expect(status).toBe(400);
+      expect(data.error).toContain('no session');
     });
 
     // INVARIANT: /rpc/wait returns 400 when taskId is missing.
@@ -634,6 +746,9 @@ describe('lazy daemon', () => {
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
+      // Before the daemon starts — it holds .storage-lock for its lifetime, so a
+      // `lazy create` subprocess can never acquire the lock while it is running.
+      await createTask(ctx, 'Matching project task');
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-mismatch-'));
       socketPath = join(tmpDir, 'mismatch-test.sock');
       token = 'mismatch-token';
@@ -642,7 +757,7 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemon) {
-        try { daemon.stop(); } catch { /* may already be stopped */ }
+        try { await daemon.stop(); } catch { /* may already be stopped */ }
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
@@ -686,7 +801,6 @@ describe('lazy daemon', () => {
 
     // INVARIANT: Requests matching the daemon's project root succeed.
     test('accepts RPC for matching project', async () => {
-      const taskId = await createTask(ctx, 'Matching project task');
       const response = await fetch('http://localhost/rpc/list', {
         method: 'POST',
         unix: socketPath,
@@ -716,10 +830,10 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemonA) {
-        try { daemonA.stop(); } catch { /* may already be stopped */ }
+        try { await daemonA.stop(); } catch { /* may already be stopped */ }
       }
       if (daemonB) {
-        try { daemonB.stop(); } catch { /* may already be stopped */ }
+        try { await daemonB.stop(); } catch { /* may already be stopped */ }
       }
       await ctxA.cleanup();
       await ctxB.cleanup();
@@ -749,7 +863,7 @@ describe('lazy daemon', () => {
       expect(respB.ok).toBe(true);
 
       // Stop one daemon, the other should still work
-      daemonA.stop();
+      await daemonA.stop();
 
       const respB2 = await fetch('http://localhost/daemon/status', {
         unix: socketB,
@@ -766,6 +880,8 @@ describe('lazy daemon', () => {
     let socketPath: string;
     let token: string;
 
+    let workingTaskId: string;
+
     beforeEach(async () => {
       // Set LAZY_TEST so the reconcile grace period is 0 (evaluated at call time)
       process.env.LAZY_TEST = '1';
@@ -773,13 +889,32 @@ describe('lazy daemon', () => {
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-reconcile-'));
       socketPath = join(tmpDir, 'reconcile-test.sock');
       token = 'reconcile-test-token';
+
+      // Create the task and put it in 'working' with a session BEFORE the daemon
+      // starts. Two reasons, both load-bearing: the reconcile loop must see the
+      // state on its first tick, and the daemon holds .storage-lock for its whole
+      // lifetime — neither `lazy create` (a subprocess) nor openProjectStorage()
+      // here can acquire the lock once it is running.
+      workingTaskId = await createTask(ctx, 'Reconcile test task');
+      const storage = await openProjectStorage(ctx.root);
+      try {
+        const allTasks = await storage.listTasks();
+        const task = allTasks.find(t => t.id.startsWith(workingTaskId));
+        expect(task).toBeDefined();
+        const startSha = ctx.git('rev-parse', 'HEAD').stdout.trim();
+        await storage.createSession(task!.id, 'test-agent', `lazy/fix.${workingTaskId}`, startSha);
+        await storage.updateTaskStatus(task!.id, 'working', 'system');
+      } finally {
+        await storage.close();
+      }
+
       // Use a short reconcile interval for tests
       daemon = await startDaemonServer({ socketPath, token, reconcileIntervalSeconds: 1, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
       if (daemon) {
-        try { daemon.stop(); } catch { /* may already be stopped */ }
+        try { await daemon.stop(); } catch { /* may already be stopped */ }
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
@@ -808,39 +943,22 @@ describe('lazy daemon', () => {
     // running container to interrupted. Without this, crashed containers leave
     // tasks stuck in 'working' forever.
     test('reconcile loop moves working task with no container to interrupted', async () => {
-      // 1. Create a task and set it to 'working' with a session BEFORE registering
-      //    the project with the daemon, so the reconcile loop sees it on its first tick.
-      const shortTaskId = await createTask(ctx, 'Reconcile test task');
-
-      const storage = await openProjectStorage(ctx.root);
-      const allTasks = await storage.listTasks();
-      const task = allTasks.find(t => t.id.startsWith(shortTaskId));
-      expect(task).toBeDefined();
-
-      const gitResult = ctx.git('rev-parse', 'HEAD');
-      const startSha = gitResult.stdout.trim();
-
-      await storage.createSession(task!.id, 'test-agent', `lazy/fix.${shortTaskId}`, startSha);
-      await storage.updateTaskStatus(task!.id, 'working', 'system');
-      await storage.close();
-
-      // 2. The project is already registered at daemon start. Trigger an RPC
-      //    to ensure storage is initialized for the reconcile loop.
+      // The task is already 'working' with a session (see beforeEach). Trigger an
+      // RPC to ensure storage is initialized for the reconcile loop.
       await rpc('list');
 
-      // 3. Poll until the reconcile loop transitions the task to 'interrupted'.
-      //    With 1s interval, this typically takes 1-2 ticks.
-      //    WORKING_GRACE_PERIOD_MS is 0 in tests.
+      // Poll until the reconcile loop transitions the task to 'interrupted'.
+      // With 1s interval, this typically takes 1-2 ticks.
+      // WORKING_GRACE_PERIOD_MS is 0 in tests.
       let finalStatus = 'working';
       for (let i = 0; i < 8; i++) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
-        const { status, data } = await rpc('show', { taskId: shortTaskId });
+        const { status, data } = await rpc('show', { taskId: workingTaskId });
         expect(status).toBe(200);
         finalStatus = data.task.status;
         if (finalStatus === 'interrupted') break;
       }
 
-      // 4. Verify the task moved to 'interrupted'
       expect(finalStatus).toBe('interrupted');
     }, 15_000); // 15s timeout for this test
   });
@@ -848,17 +966,19 @@ describe('lazy daemon', () => {
   describe('web binding failure', () => {
     let ctx: TestContext;
     let tmpDir: string;
-    let originalHome: string | undefined;
+    let originalBaseDir: string | undefined;
     let squatter: ReturnType<typeof Bun.serve> | undefined;
 
     beforeEach(async () => {
       process.env.LAZY_TEST = '1';
       ctx = await setupTestLazy();
-      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-webbind-'));
-      originalHome = process.env.HOME;
       // Isolate daemon state (PID, lock, token, socket) from the real
       // ~/.lazy/daemon to avoid colliding with a developer's running daemon.
-      process.env.HOME = tmpDir;
+      // LAZY_DAEMON_BASE_DIR (not HOME) is the documented seam: it moves daemon
+      // paths and nothing else — see test/helpers/daemon-base-dir.ts.
+      tmpDir = await makeDaemonBaseDir();
+      originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
     });
 
     afterEach(async () => {
@@ -866,9 +986,10 @@ describe('lazy daemon', () => {
         try { squatter.stop(true); } catch { /* ignore */ }
         squatter = undefined;
       }
-      process.env.HOME = originalHome;
+      if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+      else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
       await ctx.cleanup();
-      await rm(tmpDir, { recursive: true, force: true });
+      await removeDaemonBaseDir(tmpDir);
     });
 
     // INVARIANT: failing to bind the web dashboard port is a HARD startup failure.
@@ -879,7 +1000,7 @@ describe('lazy daemon', () => {
     // "fail hard on remote failures" and "principle of least surprise".
     test('daemon refuses to start with actionable error when web port is busy', async () => {
       // Squat an ephemeral port that the daemon will then try to bind.
-      squatter = Bun.serve({ port: 0, fetch: () => new Response('squatter') });
+      squatter = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('squatter') });
       const squattedPort = squatter.port;
 
       let thrown: unknown = null;
@@ -935,12 +1056,12 @@ describe('lazy daemon', () => {
         // Tear down any partial window from a failed scan before retrying.
         for (const s of squatters) s.stop(true);
         squatters.length = 0;
-        const probe = Bun.serve({ port: 0, fetch: () => new Response('probe') });
+        const probe = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('probe') });
         basePort = probe.port!;
         probe.stop(true);
         try {
           for (let i = 0; i < WINDOW; i++) {
-            squatters.push(Bun.serve({ port: basePort + i, fetch: () => new Response('squat') }));
+            squatters.push(Bun.serve({ hostname: SQUAT_HOST, port: basePort + i, fetch: () => new Response('squat') }));
           }
         } catch {
           // A port in the window was taken between probe and squat — rescan.
@@ -983,7 +1104,7 @@ describe('lazy daemon', () => {
     // subsequent start (once the port is freed) must succeed without manual
     // cleanup, and isDaemonRunning() must report false in the interim.
     test('no stale daemon state remains after failed startup', async () => {
-      squatter = Bun.serve({ port: 0, fetch: () => new Response('squatter') });
+      squatter = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('squatter') });
       const squattedPort = squatter.port;
       const sockPath = join(tmpDir, 'webbind-stale.sock');
 
@@ -1026,7 +1147,7 @@ describe('lazy daemon', () => {
         } as any);
         expect(resp.ok).toBe(true);
       } finally {
-        fresh.stop();
+        await fresh.stop();
       }
     });
 
@@ -1063,7 +1184,7 @@ describe('lazy daemon', () => {
       logger.setLogFile(logPath);
 
       try {
-        squatter = Bun.serve({ port: 0, fetch: () => new Response('squatter') });
+        squatter = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('squatter') });
         const squattedPort = squatter.port;
 
         const startTime = Date.now();
@@ -1138,7 +1259,7 @@ describe('lazy daemon', () => {
 
     afterEach(async () => {
       if (daemon) {
-        try { daemon.stop(); } catch { /* ignore */ }
+        try { await daemon.stop(); } catch { /* ignore */ }
         daemon = undefined;
       }
       process.env.HOME = originalHome;
@@ -1256,11 +1377,12 @@ describe('lazy daemon', () => {
       // Test the CLI's formatting decision directly. We spin up a real
       // daemon with noWeb:true (which leaves status.webPort undefined) and
       // invoke the status command against it through the default socket
-      // path. This requires routing HOME so the default socket path lands
-      // in our temp dir.
-      const tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-status-web-'));
-      const originalHome = process.env.HOME;
-      process.env.HOME = tmpDir;
+      // path. This requires routing LAZY_DAEMON_BASE_DIR so the default
+      // socket path lands in our temp dir (see test/helpers/daemon-base-dir.ts).
+      const tmpDir = await makeDaemonBaseDir();
+      const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+      const unpinConfig = pinConfig(ctx.root);
       process.env.LAZY_TEST = '1';
 
       try {
@@ -1279,7 +1401,7 @@ describe('lazy daemon', () => {
           // Pass --project explicitly so the subprocess doesn't walk up to
           // the outer worktree's lazy.toml and look at the wrong daemon dir.
           const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
-            env: { HOME: tmpDir, LAZY_TEST: '1' },
+            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
           });
           expectSuccess(result);
           expectOutput(result, 'Daemon is running');
@@ -1287,11 +1409,168 @@ describe('lazy daemon', () => {
           expectOutput(result, 'Web:');
           expectOutput(result, 'not bound');
         } finally {
-          daemon.stop();
+          await daemon.stop();
         }
       } finally {
-        process.env.HOME = originalHome;
-        await rm(tmpDir, { recursive: true, force: true });
+        unpinConfig();
+        if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+        await removeDaemonBaseDir(tmpDir);
+      }
+    });
+  });
+
+  describe('daemon status shows proxy state', () => {
+    let ctx: TestContext;
+
+    beforeEach(async () => {
+      ctx = await setupTestLazy();
+    });
+
+    afterEach(async () => {
+      await ctx.cleanup();
+    });
+
+    // INVARIANT: `lazy daemon status` must surface the proxy — its address (with
+    // the OS-assigned port), upstream, fallback count, and policy state. With the
+    // port auto-assigned by default, this is the primary way to find the proxy,
+    // so the line must always appear when a [proxy] section is configured.
+    test('daemonStatus output includes the Proxy line with an OS-assigned port', async () => {
+      // Route the DEFAULT daemon paths into a private dir. LAZY_DAEMON_BASE_DIR
+      // (not HOME) is the targeted seam — see test/helpers/daemon-base-dir.ts.
+      const tmpDir = await makeDaemonBaseDir();
+      const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+      const unpinConfig = pinConfig(ctx.root);
+      process.env.LAZY_TEST = '1';
+      // The daemon starting the proxy touches storage via getOrCreateStorage,
+      // which (like loadConfig) resolves from cwd. A real daemon chdir()s to the
+      // project root at startup, but that's skipped under LAZY_TEST (shared
+      // process), so mimic it here to isolate storage to ctx.root.
+      process.chdir(ctx.root);
+
+      try {
+        // A [proxy] section with NO port → OS-assigned. Starting the proxy only
+        // binds a local port; it never contacts the upstream, so this is offline-safe.
+        const configPath = join(ctx.root, 'lazy.toml');
+        const existing = await readFile(configPath, 'utf-8');
+        await writeFile(configPath, `${existing}\n[proxy]\nupstream = "https://api.anthropic.com"\n`);
+
+        const { getSocketPath } = await import('../../src/daemon/paths');
+        const defaultSocket = getSocketPath(ctx.root);
+        const daemon = await startDaemonServer({
+          projectRoot: ctx.root,
+          socketPath: defaultSocket,
+        });
+        try {
+          const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
+            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
+          });
+          expectSuccess(result);
+          expectOutput(result, 'Daemon is running');
+          expectOutput(result, 'Proxy:');
+          expectOutput(result, 'https://api.anthropic.com');
+          expectOutput(result, 'policy on');
+          // The advertised port must be the real bound one, never the config 0.
+          expectOutput(result, `http://127.0.0.1:${daemon.proxyServer?.port}`);
+        } finally {
+          await daemon.stop();
+        }
+      } finally {
+        process.chdir(STABLE_CWD);
+        unpinConfig();
+        if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+        await removeDaemonBaseDir(tmpDir);
+      }
+    });
+
+    // INVARIANT (default-on proxy): a project with NO [proxy] section still gets
+    // the proxy. This is the headline v0.20 behavior change — if this regresses,
+    // agent traffic silently stops being audited.
+    test('daemon with NO [proxy] config still starts the proxy and reports it', async () => {
+      // Route the DEFAULT daemon paths into a private dir. LAZY_DAEMON_BASE_DIR
+      // (not HOME) is the targeted seam — see test/helpers/daemon-base-dir.ts.
+      const tmpDir = await makeDaemonBaseDir();
+      const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+      const unpinConfig = pinConfig(ctx.root);
+      process.env.LAZY_TEST = '1';
+      process.chdir(ctx.root);
+
+      try {
+        // Deliberately do NOT write a [proxy] section.
+        const { getSocketPath } = await import('../../src/daemon/paths');
+        const daemon = await startDaemonServer({
+          projectRoot: ctx.root,
+          socketPath: getSocketPath(ctx.root),
+        });
+        try {
+          // The proxy is listening on an OS-assigned port with no config at all.
+          expect(daemon.proxyServer).toBeDefined();
+          expect(daemon.proxyServer?.port).toBeGreaterThan(0);
+
+          const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
+            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
+          });
+          expectSuccess(result);
+          expectOutput(result, 'Proxy:');
+          expectOutput(result, 'https://api.anthropic.com'); // defaulted upstream
+          expectOutput(result, 'policy on');                 // defaulted closed posture
+        } finally {
+          await daemon.stop();
+        }
+      } finally {
+        process.chdir(STABLE_CWD);
+        unpinConfig();
+        if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+        await removeDaemonBaseDir(tmpDir);
+      }
+    });
+
+    // INVARIANT: `enabled = false` is the escape hatch — it must start NOTHING,
+    // and must say so rather than going quiet (silence would be indistinguishable
+    // from a running proxy and would hide that traffic is unaudited).
+    test('[proxy] enabled = false starts no proxy and says so', async () => {
+      // Route the DEFAULT daemon paths into a private dir. LAZY_DAEMON_BASE_DIR
+      // (not HOME) is the targeted seam — see test/helpers/daemon-base-dir.ts.
+      const tmpDir = await makeDaemonBaseDir();
+      const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+      const unpinConfig = pinConfig(ctx.root);
+      process.env.LAZY_TEST = '1';
+      process.chdir(ctx.root);
+
+      try {
+        const configPath = join(ctx.root, 'lazy.toml');
+        const existing = await readFile(configPath, 'utf-8');
+        await writeFile(configPath, `${existing}\n[proxy]\nenabled = false\n`);
+
+        const { getSocketPath } = await import('../../src/daemon/paths');
+        const daemon = await startDaemonServer({
+          projectRoot: ctx.root,
+          socketPath: getSocketPath(ctx.root),
+        });
+        try {
+          // No proxy server at all.
+          expect(daemon.proxyServer).toBeUndefined();
+
+          const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
+            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
+          });
+          expectSuccess(result);
+          expectOutput(result, 'Daemon is running');
+          expectOutput(result, 'disabled');
+        } finally {
+          await daemon.stop();
+        }
+      } finally {
+        process.chdir(STABLE_CWD);
+        unpinConfig();
+        if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+        await removeDaemonBaseDir(tmpDir);
       }
     });
   });
@@ -1319,11 +1598,17 @@ describe('lazy daemon', () => {
   describe('background startup error UX', () => {
     let ctx: TestContext;
     let tmpHome: string;
+    // Daemon state goes here rather than under tmpHome. tmpHome exists to hide
+    // the developer's real ~/.claude from the credential gate; it should NOT
+    // also be deciding where the socket, PID and log live — that is
+    // LAZY_DAEMON_BASE_DIR's job. See test/helpers/daemon-base-dir.ts.
+    let daemonBaseDir: string;
     let squatter: ReturnType<typeof Bun.serve> | undefined;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
       tmpHome = await mkdtemp(join(tmpdir(), 'lazy-daemon-startup-ux-'));
+      daemonBaseDir = await makeDaemonBaseDir();
     });
 
     afterEach(async () => {
@@ -1333,6 +1618,7 @@ describe('lazy daemon', () => {
       }
       await ctx.cleanup();
       await rm(tmpHome, { recursive: true, force: true });
+      await removeDaemonBaseDir(daemonBaseDir);
     });
 
     /**
@@ -1348,7 +1634,7 @@ describe('lazy daemon', () => {
      * instead.
      */
     async function forceBindFailure(projectRoot: string): Promise<void> {
-      squatter = Bun.serve({ port: 65535, fetch: () => new Response('squatter') });
+      squatter = Bun.serve({ hostname: SQUAT_HOST, port: 65535, fetch: () => new Response('squatter') });
       const configPath = join(projectRoot, 'lazy.toml');
       const existing = await readFile(configPath, 'utf-8');
       const updated = existing.replace(/^port\s*=\s*\d+/m, 'port = 65535');
@@ -1378,23 +1664,23 @@ describe('lazy daemon', () => {
       // suite — with LAZY_TEST=1 inherited, ensureDaemon() short-circuits
       // and the bind path we need to exercise never runs.
       const result = await ctx.lazy(['daemon', 'start'], {
-        env: { HOME: tmpHome, LAZY_TEST: '' },
+        env: { HOME: tmpHome, LAZY_DAEMON_BASE_DIR: daemonBaseDir, LAZY_TEST: '' },
       });
 
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain('Daemon failed to bind web dashboard');
 
-      // Locate the daemon log under the isolated HOME — getDaemonDir hashes
+      // Locate the daemon log under the isolated base dir — getDaemonDir hashes
       // the project root, so we reuse the same helpers the code uses.
       const { getLogPath } = await import('../../src/daemon/paths');
-      const origHome = process.env.HOME;
-      process.env.HOME = tmpHome;
+      const origBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = daemonBaseDir;
       let logContent: string;
       try {
         logContent = await readFile(getLogPath(ctx.root), 'utf-8');
       } finally {
-        if (origHome === undefined) delete process.env.HOME;
-        else process.env.HOME = origHome;
+        if (origBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = origBaseDir;
       }
 
       // Count occurrences of the signature phrase. The phrase only appears
@@ -1424,7 +1710,7 @@ describe('lazy daemon', () => {
       // suite — with LAZY_TEST=1 inherited, ensureDaemon() short-circuits
       // and the bind path we need to exercise never runs.
       const result = await ctx.lazy(['daemon', 'start'], {
-        env: { HOME: tmpHome, LAZY_TEST: '' },
+        env: { HOME: tmpHome, LAZY_DAEMON_BASE_DIR: daemonBaseDir, LAZY_TEST: '' },
       });
 
       expect(result.exitCode).not.toBe(0);
@@ -1452,15 +1738,22 @@ describe('lazy daemon', () => {
   describe('credential gate', () => {
     let ctx: TestContext;
     let tmpHome: string;
+    // HOME stays a temp dir (it is what hides the developer's real ~/.claude
+    // credential from the gate), but daemon state belongs under the targeted
+    // LAZY_DAEMON_BASE_DIR seam, not wherever HOME happens to point.
+    // See test/helpers/daemon-base-dir.ts.
+    let daemonBaseDir: string;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
       tmpHome = await mkdtemp(join(tmpdir(), 'lazy-daemon-credgate-'));
+      daemonBaseDir = await makeDaemonBaseDir();
     });
 
     afterEach(async () => {
       await ctx.cleanup();
       await rm(tmpHome, { recursive: true, force: true });
+      await removeDaemonBaseDir(daemonBaseDir);
     });
 
     // INVARIANT: the daemon refuses to start when no Claude Code OAuth token /
@@ -1470,6 +1763,7 @@ describe('lazy daemon', () => {
       const result = await ctx.lazy(['daemon', 'start'], {
         env: {
           HOME: tmpHome,
+          LAZY_DAEMON_BASE_DIR: daemonBaseDir,
           LAZY_TEST: '',
           ANTHROPIC_API_KEY: '',
           CLAUDE_CODE_OAUTH_TOKEN: '',
@@ -1481,6 +1775,47 @@ describe('lazy daemon', () => {
       // Actionable: names both credential env vars and how to set them.
       expect(result.stderr).toContain('CLAUDE_CODE_OAUTH_TOKEN');
       expect(result.stderr).toContain('ANTHROPIC_API_KEY');
+    });
+
+    // INVARIANT: `daemon restart` pre-flights the gate BEFORE it stops anything.
+    // A restart run from a credential-less shell must leave the existing daemon
+    // ALIVE — the destructive half must not happen when the rebuild half is
+    // going to be refused, or the project is left with no daemon at all.
+    test('daemon restart refuses without a credential and leaves the running daemon alive', async () => {
+      // Unlike the test above, this one needs the first `daemon start` to
+      // SUCCEED — which means really binding a TCP web port. Left on the
+      // default, the daemon walks the 26024+ window, which is shared by every
+      // lazy project on the machine: on a developer box with a pile of running
+      // (or stray) daemons the walk can come up empty and the start fails for
+      // reasons that have nothing to do with the credential gate this test is
+      // about. Pin a port the OS just told us is free instead.
+      await pinFreeServerPort(ctx.root);
+
+      const withCredential = {
+        HOME: tmpHome,
+        LAZY_DAEMON_BASE_DIR: daemonBaseDir,
+        LAZY_TEST: '',
+        ANTHROPIC_API_KEY: 'sk-ant-fake-for-test',
+        CLAUDE_CODE_OAUTH_TOKEN: '',
+      };
+
+      const started = await ctx.lazy(['daemon', 'start'], { env: withCredential });
+      expect(started.exitCode).toBe(0);
+
+      try {
+        const restart = await ctx.lazy(['daemon', 'restart'], {
+          env: { ...withCredential, ANTHROPIC_API_KEY: '' },
+        });
+        expect(restart.exitCode).not.toBe(0);
+        expect(restart.stderr).toContain('Daemon refuses to start');
+
+        // The pre-existing daemon survived the refused restart.
+        const status = await ctx.lazy(['daemon', 'status'], { env: withCredential });
+        expect(status.exitCode).toBe(0);
+        expect(status.stdout).toContain('running');
+      } finally {
+        await ctx.lazy(['daemon', 'stop'], { env: withCredential });
+      }
     });
   });
 
@@ -1499,9 +1834,12 @@ describe('lazy daemon', () => {
     });
 
     test('status output includes the Built line', async () => {
-      const tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-status-build-'));
-      const originalHome = process.env.HOME;
-      process.env.HOME = tmpDir;
+      // Route the DEFAULT daemon paths into a private dir. LAZY_DAEMON_BASE_DIR
+      // (not HOME) is the targeted seam — see test/helpers/daemon-base-dir.ts.
+      const tmpDir = await makeDaemonBaseDir();
+      const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+      const unpinConfig = pinConfig(ctx.root);
       process.env.LAZY_TEST = '1';
 
       try {
@@ -1514,19 +1852,36 @@ describe('lazy daemon', () => {
         });
         try {
           const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
-            env: { HOME: tmpDir, LAZY_TEST: '1' },
+            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
           });
           expectSuccess(result);
           expectOutput(result, 'Daemon is running');
           expectOutput(result, 'Built:');
-          // No build step in tests → graceful 'dev' fallback.
-          expectOutput(result, 'dev');
+          // The real invariant is that status ALWAYS resolves a build stamp and
+          // never crashes on a missing one — either the compile-time timestamp
+          // or the graceful 'dev' fallback (src/daemon/server.ts).
+          //
+          // This used to assert 'dev' unconditionally, on the premise "no build
+          // step in tests". That premise is false for the project's own test
+          // entry points: `bun run test` / `test:e2e` / `test:all` all run
+          // `generate:version` first (package.json), which writes a REAL ISO
+          // timestamp into the gitignored src/build-info.ts. So the assertion
+          // passed only under bare `bun test` in a worktree that had never been
+          // built, and failed for everyone else — invisibly, since this suite is
+          // behind LAZY_SLOW_TESTS=1.
+          const builtLine = result.stdout.split('\n').find(l => l.includes('Built:'));
+          expect(builtLine).toBeDefined();
+          expect(
+            /Built:\s+(dev|\d{4}-\d{2}-\d{2}T[\d:.]+Z \(UTC\))\s*$/.test(builtLine!),
+          ).toBe(true);
         } finally {
-          daemon.stop();
+          await daemon.stop();
         }
       } finally {
-        process.env.HOME = originalHome;
-        await rm(tmpDir, { recursive: true, force: true });
+        unpinConfig();
+        if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+        await removeDaemonBaseDir(tmpDir);
       }
     });
   });

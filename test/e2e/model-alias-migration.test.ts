@@ -6,35 +6,24 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+import { taskFilePath } from '../helpers/storage';
+
+// Storage lives at the project's `external_path`, NOT <root>/.lazy/tasks — see
+// test/helpers/storage.ts. This suite seeds legacy model aliases the CLI can no
+// longer write, so it must resolve the real layout rather than assume one.
 
 /** Read the raw task.json for a given short task ID from the test context */
 function readTaskJson(root: string, shortId: string): Record<string, unknown> {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const fullId = entries.find(e => e.startsWith(shortId));
-  if (!fullId) throw new Error(`No task directory starting with ${shortId}`);
-  const content = readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8');
-  return JSON.parse(content);
+  return JSON.parse(readFileSync(taskFilePath(root, shortId, 'task.json'), 'utf-8'));
 }
 
-/** Write a raw task.json for a given full task UUID */
-function writeTaskJson(root: string, fullId: string, data: Record<string, unknown>): void {
-  const path = join(root, '.lazy', 'tasks', fullId, 'task.json');
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
-}
-
-/** Get the full task UUID from a short ID */
-function getFullId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const fullId = entries.find(e => e.startsWith(shortId));
-  if (!fullId) throw new Error(`No task directory starting with ${shortId}`);
-  return fullId;
+/** Write a raw task.json for a given short task ID */
+function writeTaskJson(root: string, shortId: string, data: Record<string, unknown>): void {
+  writeFileSync(taskFilePath(root, shortId, 'task.json'), JSON.stringify(data, null, 2) + '\n');
 }
 
 describe('model alias migration', () => {
@@ -50,12 +39,11 @@ describe('model alias migration', () => {
 
   test('apprentice is migrated to haiku on read', async () => {
     const taskId = await createTask(ctx, 'Apprentice model task');
-    const fullId = getFullId(ctx.root, taskId);
 
     // Overwrite task.json with legacy model name
     const raw = readTaskJson(ctx.root, taskId);
     raw.model = 'apprentice';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     // Verify it was written as apprentice
     const beforeRead = readTaskJson(ctx.root, taskId);
@@ -72,11 +60,10 @@ describe('model alias migration', () => {
 
   test('journeyman is migrated to sonnet on read', async () => {
     const taskId = await createTask(ctx, 'Journeyman model task');
-    const fullId = getFullId(ctx.root, taskId);
 
     const raw = readTaskJson(ctx.root, taskId);
     raw.model = 'journeyman';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
@@ -87,11 +74,10 @@ describe('model alias migration', () => {
 
   test('master is migrated to opus on read', async () => {
     const taskId = await createTask(ctx, 'Master model task');
-    const fullId = getFullId(ctx.root, taskId);
 
     const raw = readTaskJson(ctx.root, taskId);
     raw.model = 'master';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
@@ -102,11 +88,10 @@ describe('model alias migration', () => {
 
   test('current model names are not modified', async () => {
     const taskId = await createTask(ctx, 'Current model task');
-    const fullId = getFullId(ctx.root, taskId);
 
     const raw = readTaskJson(ctx.root, taskId);
     raw.model = 'sonnet';
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
@@ -117,11 +102,10 @@ describe('model alias migration', () => {
 
   test('null model is not modified', async () => {
     const taskId = await createTask(ctx, 'Null model task');
-    const fullId = getFullId(ctx.root, taskId);
 
     const raw = readTaskJson(ctx.root, taskId);
     raw.model = null;
-    writeTaskJson(ctx.root, fullId, raw);
+    writeTaskJson(ctx.root, taskId, raw);
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);

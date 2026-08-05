@@ -21,6 +21,7 @@ import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
 import { PROTOCOL_VERSION } from './types';
 import type { ResolvedConfig, MaintainEntry } from '../config/types';
+import { buildAgentSandboxArgs } from '../runner/host-sandbox';
 
 /**
  * Common policy fields for every start/unblock command.
@@ -35,10 +36,11 @@ export function commonCommandFields(config: ResolvedConfig): {
   protocol_version: number;
   turn_started_at: string;
   watchdog_output_timeout_ms?: number;
-  graceful_exit_timeout_ms?: number;
+  wind_down_timeout_ms?: number;
   protected_patterns: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  agent_extra_args?: string[];
   maintain?: MaintainEntry[];
 } {
   return {
@@ -47,20 +49,52 @@ export function commonCommandFields(config: ResolvedConfig): {
     ...(config.agent.watchdog_output_timeout_ms !== 0 && {
       watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
     }),
-    // graceful_exit_timeout_ms is included even when 0 (disabled) so the
+    // wind_down_timeout_ms is included even when 0 (disabled) so the
     // supervisor sees the explicit opt-out instead of falling back to a default.
-    graceful_exit_timeout_ms: config.agent.graceful_exit_timeout_ms,
+    wind_down_timeout_ms: config.agent.wind_down_timeout_ms,
     protected_patterns: config.permissions.protected,
     ...(config.checks.post_turn !== '' && {
       post_turn_check: config.checks.post_turn,
       post_turn_timeout: config.checks.post_turn_timeout,
     }),
+    ...computeAgentExtraArgs(config),
     // Maintained-file groups (opt-in). Only sent when configured — omitted
     // entirely on the default empty config so the supervisor skips the check.
     ...(config.automation.maintain.length > 0 && {
       maintain: config.automation.maintain,
     }),
   };
+}
+
+/**
+ * Compute the extra `claude` CLI args that confine a headless agent turn under
+ * the host OS sandbox.
+ *
+ * Only the host-process runner running Claude Code in "sandbox" mode gets these
+ * (a `--settings <json>` enabling the OS sandbox). They are intentionally NOT
+ * emitted for:
+ *   - docker/podman runners — the container is already the boundary, and the
+ *     in-container agent keeps plain `--dangerously-skip-permissions`;
+ *   - permission_mode = "bypass" — the explicit full-bypass opt-in;
+ *   - non-Claude agents (cursor, qa) — `--settings` is Claude-Code-specific.
+ *
+ * Returns `{}` (no field) in every other case so the command stays unchanged.
+ */
+function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_args?: string[] } {
+  // Optional chaining: callers (and tests) may pass partial configs. Anything
+  // other than a host-process Claude agent in sandbox mode gets no extra args.
+  const isHost = config.runner?.type === 'dangerously-host-process-without-any-isolation';
+  const isClaude = config.agent?.agent_id === 'claude-code';
+  if (!isHost || !isClaude) return {};
+
+  const extra = buildAgentSandboxArgs({
+    mode: config.runner.permission_mode,
+    allowedDomains: config.runner.sandbox_allowed_domains,
+    allowWeakerNested: config.runner.sandbox_allow_weaker_nested,
+    denyRead: config.runner.sandbox_deny_read,
+    denyWrite: config.runner.sandbox_deny_write,
+  });
+  return extra.length > 0 ? { agent_extra_args: extra } : {};
 }
 
 /**

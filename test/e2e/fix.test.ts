@@ -80,11 +80,18 @@ describe('lazy fix', () => {
     expectOutput(result, 'claude-opus-4-6');
   });
 
-  test('fails with invalid model', async () => {
-    const result = await ctx.lazy(['fix', '--goal', 'Fix bug', '--model', 'invalid']);
+  // RETARGETED: there is no model allowlist any more. Ollama support (5649fcc2)
+  // removed it deliberately so arbitrary local model ids work, leaving only the
+  // empty-value check. Asserting 'Invalid model' for an unknown name would
+  // assert the absence of that feature.
+  test('accepts an arbitrary model id but rejects an empty one', async () => {
+    const ok = await ctx.lazy(['fix', '--goal', 'Fix bug', '--model', 'my-local-model']);
+    expectSuccess(ok);
+    expectOutput(ok, 'my-local-model');
 
-    expectFailure(result);
-    expectError(result, 'Invalid model');
+    const empty = await ctx.lazy(['fix', '--goal', 'Fix bug', '--model', ' ']);
+    expectFailure(empty);
+    expectError(empty, 'Model name cannot be empty');
   });
 
   test('fails with invalid code', async () => {
@@ -140,7 +147,8 @@ describe('lazy fix', () => {
     const childId = extractTaskId(childResult.stdout);
     const showResult = await ctx.lazy(['show', childId]);
     expectSuccess(showResult);
-    expectOutput(showResult, `Parent: ${parentId}`);
+    expectOutput(showResult, 'Parent Task:');
+    expectOutput(showResult, parentId);
   });
 
   test('fails when parent task is in terminal status', async () => {
@@ -148,13 +156,16 @@ describe('lazy fix', () => {
     expectSuccess(parentResult);
     const parentId = extractTaskId(parentResult.stdout);
 
-    // Close the parent task to put it in terminal status
-    await ctx.lazy(['close', parentId]);
+    // Close the parent task to put it in terminal status. --reason is required
+    // in non-TTY mode; without it close fails and the parent stays in backlog.
+    const closeResult = await ctx.lazy(['close', parentId, '--reason', 'Done']);
+    expectSuccess(closeResult);
 
     const childResult = await ctx.lazy([
       'fix', '--goal', 'Fix with closed parent', '--parent', parentId,
     ]);
     expectFailure(childResult);
-    expectError(childResult, 'task is closed');
+    // 'lazy close' is the CLI verb for the 'abandoned' terminal status.
+    expectError(childResult, 'task is abandoned');
   });
 });

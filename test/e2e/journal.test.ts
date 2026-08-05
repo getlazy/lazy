@@ -25,6 +25,18 @@ describe('lazy journal', () => {
     expectOutput(result, 'Added journal entry to task');
   });
 
+  test('accepts -m as a short alias for --message', async () => {
+    const taskId = await createTask(ctx, 'Task with -m alias');
+
+    const result = await ctx.lazy(['journal', taskId, '-m', 'Short-flag journal entry']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Added journal entry to task');
+
+    const showResult = await ctx.lazy(['show', taskId]);
+    expectOutput(showResult, 'Short-flag journal entry');
+  });
+
   test('appends a journal entry from piped stdin', async () => {
     const taskId = await createTask(ctx, 'Task with piped journal');
 

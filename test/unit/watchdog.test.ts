@@ -7,6 +7,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { execWithWatchdog, resolveWatchdogTimeout, WatchdogTimeoutError } from '../../src/supervisor/watchdog';
+import { formatWatchdogMs } from '../../src/utils/watchdog-turn';
 
 describe('resolveWatchdogTimeout', () => {
   test('returns config value when non-zero', () => {
@@ -133,9 +134,31 @@ describe('execWithWatchdog', () => {
 describe('WatchdogTimeoutError', () => {
   test('has descriptive message with timeout duration', () => {
     const err = new WatchdogTimeoutError(30000, 45000);
-    expect(err.message).toBe('Agent process killed by watchdog (no output for 30s)');
+    expect(err.message).toBe(
+      'Agent process killed by watchdog: no output for 30s ([agent] watchdog_output_timeout_ms = 30000)',
+    );
     expect(err.timeoutMs).toBe(30000);
     expect(err.durationMs).toBe(45000);
     expect(err.name).toBe('WatchdogTimeoutError');
+  });
+
+  // The human reading the turn configured `watchdog_output_timeout_ms = 1800000`.
+  // "1800s" makes them do arithmetic to recognize their own setting; "30m" does not.
+  test('renders the window in human units, not raw seconds', () => {
+    expect(new WatchdogTimeoutError(1_800_000, 1_800_100, { progressBased: true }).message)
+      .toContain('no forward progress for 30m');
+    expect(formatWatchdogMs(7_200_000)).toBe('2h');
+    expect(formatWatchdogMs(5_400_000)).toBe('1h30m');
+    expect(formatWatchdogMs(90_000)).toBe('1m30s');
+    expect(formatWatchdogMs(30_000)).toBe('30s');
+    expect(formatWatchdogMs(250)).toBe('250ms');
+  });
+
+  // Defaults matter: every existing construction site omits these, and the
+  // retry decision must not read `undefined` as "work was captured".
+  test('defaults to capturedResult=false and attempts=1', () => {
+    const err = new WatchdogTimeoutError(30000, 45000);
+    expect(err.capturedResult).toBe(false);
+    expect(err.attempts).toBe(1);
   });
 });

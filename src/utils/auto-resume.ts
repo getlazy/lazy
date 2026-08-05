@@ -17,6 +17,7 @@ import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
 import { loadConfig } from '../config/loader';
 import { resolveAgentModel } from './role-target';
 import { createRunner } from '../runner';
+import { stampSessionRunner } from '../runner/session-launch';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
@@ -26,6 +27,7 @@ import { getRemoteDefaultBranch, hasUncommittedChanges, getTaskTargetBranch } fr
 import { parentTaskIdOf } from '../task-target';
 import { writeDaemonMcpConfig } from '../daemon/task-launcher';
 import { hasDaemonContext } from '../daemon/context';
+import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from './feedback-redelivery';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -49,9 +51,17 @@ export function exitCodeToReason(exitCode: number | null): string {
   }
 }
 
-function buildResumePrompt(goal: string): string {
+/**
+ * Build the resume prompt.
+ *
+ * INVARIANT (CLAUDE.md — never lose human feedback): when `redeliveredFeedback`
+ * is present it REPLACES the generic "you were interrupted, carry on" context.
+ * The generic prompt leaves unconsumed feedback available only implicitly via
+ * turn history, and in practice the agent never acts on it.
+ */
+function buildResumePrompt(goal: string, redeliveredFeedback?: string): string {
   const goalContext = goalContextResumeText.replace(/\{\{goal\}\}/g, goal) + '\n\n';
-  const resumeContext = resumeContextText + '\n';
+  const resumeContext = (redeliveredFeedback ?? resumeContextText) + '\n';
   const lazyBinaryInstructions = lazyToolInstructions + '\n';
   const systemInstructions = systemInstructionsResumeText + '\n';
   return goalContext + resumeContext + lazyBinaryInstructions + systemInstructions;
@@ -129,7 +139,7 @@ export async function autoResumeTask(
     return false;
   }
 
-  const runner = await createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot, task.runner_type ?? undefined);
 
   try {
     await runner.checkAvailability();
@@ -145,6 +155,9 @@ export async function autoResumeTask(
     logger.debug(`Auto-resume ${taskShortId}: could not acquire worktree lock, skipping`);
     return false;
   }
+
+  // Bridge/stamp the resolved runner onto the session before launch.
+  await stampSessionRunner(storage, lazyRoot, session, worktreePath, runner.type);
 
   const containerName = runner.runNameForTask(tRef);
 
@@ -173,8 +186,21 @@ export async function autoResumeTask(
       }
     }
 
-    // Build resume prompt
-    const fullPrompt = buildResumePrompt(task.goal);
+    // Build resume prompt.
+    //
+    // INVARIANT (CLAUDE.md — never lose human feedback): if the interrupted turn
+    // crashed before the agent consumed its feedback, re-deliver that feedback
+    // verbatim instead of the generic resume prompt. Applies to EVERY crash
+    // cause, not just any particular one.
+    const pendingFeedback = findPendingFeedback(await storage.getSessionTurns(session.id));
+    const fullPrompt = buildResumePrompt(
+      task.goal,
+      pendingFeedback ? buildFeedbackRedeliveryPrompt(pendingFeedback) : undefined,
+    );
+    if (pendingFeedback) {
+      logger.info(`Auto-resume ${taskShortId}: re-delivering unconsumed feedback from turn ${pendingFeedback.turn.sequence}` +
+        (pendingFeedback.olderPendingCount > 0 ? ` (${pendingFeedback.olderPendingCount} older also pending)` : ''));
+    }
 
     // --- Persist state BEFORE launching container ---
 
@@ -182,12 +208,18 @@ export async function autoResumeTask(
     // NOT autoTriggered: resume continues an interrupted turn — it's the same
     // logical turn, not a new auto-react trigger. Does not count against the
     // auto-turn budget.
+    //
+    // Deliberately NOT carriesFeedback: this notice is not new feedback, and the
+    // re-delivered turn stays 'pending' until the agent actually completes a
+    // turn — so a crash during the resume re-delivers it again.
     const nextSeq = await storage.getNextTurnSequence(session.id);
     await storage.createTurn({
       sessionId: session.id,
       sequence: nextSeq,
       role: 'human',
-      content: '[system] Session interrupted and auto-resumed',
+      content: pendingFeedback
+        ? '[system] Session interrupted and auto-resumed (unconsumed feedback re-delivered)'
+        : '[system] Session interrupted and auto-resumed',
       actor: 'system',
     });
 
@@ -256,7 +288,7 @@ export async function autoResumeTask(
     // Generate daemon MCP config so the supervisor can provide MCP tools
     let daemonConfigPath: string | undefined;
     if (runner.usesSandbox() && hasDaemonContext()) {
-      daemonConfigPath = await writeDaemonMcpConfig(lazyRoot, containerName, config.data.path);
+      daemonConfigPath = await writeDaemonMcpConfig(lazyRoot, containerName, { kind: 'task', taskId: task.id });
     }
 
     // Check if supervisor is already running
@@ -266,7 +298,7 @@ export async function autoResumeTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef);
       } catch (err) {
         logger.warn(`Auto-resume ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         await storage.updateTaskStatus(task.id, 'interrupted', 'system');

@@ -13,10 +13,27 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve, join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, fullTaskId, startAndWait } from '../helpers/fixtures';
+import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
+
+/**
+ * MCP tool errors arrive as a JSON document in the content text
+ * (`{"error": "<human-readable message>"}`). Return the inner message; fall
+ * back to the raw text for tools that emit a bare string.
+ */
+function unwrapErrorText(text: string | undefined): string | undefined {
+  if (!text) return text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed.error === 'string') return parsed.error;
+  } catch {
+    // Not JSON — the tool emitted a bare message; use it as-is.
+  }
+  return text;
+}
 
 /** Extract a confirmation code (e.g. "rj-abcd") from error text. */
 function extractConfirmationCode(errorText: string): string {
@@ -43,9 +60,16 @@ class McpSession {
   private buffer = '';
   private nextId = 1;
 
-  constructor(root: string, taskId: string, worktreePath: string) {
+  /**
+   * `taskId` selects the server's scope:
+   *  - a task UUID → AGENT mode, where every tool call is restricted to that
+   *    task or one of its direct subtasks;
+   *  - null → project-scoped BUILDER mode, the only mode where builder-only
+   *    tools (lazy_redo, lazy_reparent, lazy_clone) are exposed at all.
+   */
+  constructor(root: string, taskId: string | null, worktreePath: string) {
     this.proc = Bun.spawn(
-      ['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', taskId, '--worktree', worktreePath],
+      ['bun', 'run', AGENT_ENTRY, 'mcp', ...(taskId ? ['--task-id', taskId] : []), '--worktree', worktreePath],
       {
         cwd: root,
         stdin: 'pipe',
@@ -121,8 +145,11 @@ class McpSession {
     }
     const result = response.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
     if (result.isError) {
-      // Return the error result so tests can inspect it
-      return { _isError: true, _errorText: result.content[0]?.text };
+      // Return the error result so tests can inspect it. The tool encodes its
+      // error as JSON (`{"error": "..."}`), so unwrap it — otherwise every
+      // assertion runs against the JSON-escaped blob and the confirmation code
+      // hides behind an escaped quote (`confirmation_code: \"ro-2f77\"`).
+      return { _isError: true, _errorText: unwrapErrorText(result.content[0]?.text) };
     }
     return JSON.parse(result.content[0].text);
   }
@@ -183,7 +210,13 @@ describe('MCP confirmation protocol', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // The MCP server is spawned WITHOUT LAZY_TEST=1 (see runMcpSession /
+    // McpSession: `env: { ...process.env }`), so every storage-backed tool it
+    // exposes must reach a real daemon over RPC — exactly like the pairing and
+    // builder MCP servers do in production. Daemonless, requireStorage() exits
+    // with "Daemon is not running" and the server dies before answering the
+    // first tool call ("MCP process exited before response"). Mirrors mcp.test.ts.
+    ctx = await setupTestLazy({ withDaemon: true });
   });
 
   afterEach(async () => {
@@ -194,14 +227,9 @@ describe('MCP confirmation protocol', () => {
   // This prevents the builder from accidentally abandoning work instead of giving feedback.
   test('lazy_close requires confirmation (two-step)', async () => {
     const taskShortId = await createTask(ctx, 'Task to abandon', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -213,7 +241,11 @@ describe('MCP confirmation protocol', () => {
 
       expect(step1._isError).toBe(true);
       const errorText = step1._errorText as string;
-      expect(errorText).toContain('lazy_unblock');
+      // The guidance must halt the agent and name the work at stake. (It used
+      // to point at `lazy_unblock`; no close-* template mentions that tool now
+      // — the wording moved on, the two-step gate it guards did not.)
+      expect(errorText).toContain('Do NOT call lazy_close again yet');
+      expect(errorText).toContain('will be lost');
       const closeCode = extractConfirmationCode(errorText);
       expect(closeCode).toMatch(/^cl-[0-9a-f]{4}$/);
 
@@ -233,14 +265,9 @@ describe('MCP confirmation protocol', () => {
   // INVARIANT: Confirmation codes are single-use. A consumed code cannot be replayed.
   test('confirmation code cannot be reused', async () => {
     const taskShortId = await createTask(ctx, 'Task for reuse test', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -277,14 +304,14 @@ describe('MCP confirmation protocol', () => {
   // Codes are scoped to (operation, taskId).
   test('abandon code cannot confirm accept', async () => {
     const taskShortId = await createTask(ctx, 'Task for cross-op test', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    // BUILDER mode (no --task-id): the subject here is the confirmation
+    // protocol, not the agent ownership gate. An agent may not accept its OWN
+    // task at all (that gate fires before any code check — see
+    // test/e2e/mcp-agent-accept.test.ts), so the cross-operation code rejection
+    // this test asserts is only reachable from the builder surface.
+    const session = new McpSession(ctx.root, null, ctx.root);
     try {
       await session.initialize();
 
@@ -313,18 +340,25 @@ describe('MCP confirmation protocol', () => {
   // Unknown risk defaults to the safest option.
   test('accept requires stern confirmation when diff stat is unavailable', async () => {
     const taskShortId = await createTask(ctx, 'Unknown diff task', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    // Make the diff genuinely uncomputable. This used to happen by accident
+    // (the old harness could never compute a diff at all); now the daemon
+    // computes it fine and a zero-diff task takes the `none` path and merges
+    // straight through. Dropping the worktree AND the branch is the "worktree
+    // gone" case the product names when it defaults to stern.
+    const branch = `lazy/${taskShortId}`;
+    ctx.git('worktree', 'remove', '--force', join(ctx.root, '.lazy', 'worktrees', taskShortId));
+    ctx.git('branch', '-D', branch);
+
+    // BUILDER mode (no --task-id): an agent may not accept its own task, so the
+    // stern-by-default behaviour asserted here is only reachable from the
+    // builder surface. See the note on the cross-operation test above.
+    const session = new McpSession(ctx.root, null, ctx.root);
     try {
       await session.initialize();
 
-      // With no computable diff (test env), accept defaults to stern.
+      // With no computable diff, accept defaults to stern.
       const result = await session.callTool('lazy_accept', {
         task_id: taskShortId,
       });
@@ -341,7 +375,7 @@ describe('MCP confirmation protocol', () => {
   test('abandon requires confirmation and scales with commits', async () => {
     const taskShortId = await createTask(ctx, 'Empty task to abandon', 'Do the work');
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -363,7 +397,7 @@ describe('MCP confirmation protocol', () => {
   test('abandon confirmation code allows execution', async () => {
     const taskShortId = await createTask(ctx, 'Task to abandon', 'Do the work');
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -391,14 +425,12 @@ describe('MCP confirmation protocol', () => {
   // INVARIANT: Redo always requires confirmation (at least standard level).
   test('redo requires confirmation', async () => {
     const taskShortId = await createTask(ctx, 'Task to redo', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    // BUILDER mode (no --task-id): lazy_redo is refused outright in agent mode
+    // ("Agents cannot redo tasks" — redo would parent the replacement outside
+    // the agent's subtree), so its confirmation flow only exists for the builder.
+    const session = new McpSession(ctx.root, null, ctx.root);
     try {
       await session.initialize();
 
@@ -419,18 +451,17 @@ describe('MCP confirmation protocol', () => {
   // INVARIANT: Redo confirmation code allows execution.
   test('redo confirmation code allows execution', async () => {
     const taskShortId = await createTask(ctx, 'Task to redo and confirm', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    // After mocked start, the task may still be in 'working' state.
-    // Unblock it so it reaches 'blocked' — the state from which redo can close it.
-    await ctx.lazy(['unblock', taskShortId, '--message', 'preparing redo'], { input: 'n\n' });
+    // startAndWait already leaves the task 'blocked' — the state redo needs in
+    // order to close it. The old extra `unblock` here was a workaround for the
+    // start-leaves-it-working rot and now actively breaks the test by pushing
+    // the task back to 'working' ("Invalid status transition: working → abandoned").
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    // BUILDER mode (no --task-id): lazy_redo is refused outright in agent mode
+    // ("Agents cannot redo tasks" — redo would parent the replacement outside
+    // the agent's subtree), so its confirmation flow only exists for the builder.
+    const session = new McpSession(ctx.root, null, ctx.root);
     try {
       await session.initialize();
 
@@ -462,7 +493,7 @@ describe('MCP confirmation protocol', () => {
     const closeResult = await ctx.lazy(['close', taskShortId, '--reason', 'test']);
     expect(closeResult.exitCode).toBe(0);
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -485,7 +516,7 @@ describe('MCP confirmation protocol', () => {
     const closeResult = await ctx.lazy(['close', taskShortId, '--reason', 'test']);
     expect(closeResult.exitCode).toBe(0);
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -544,14 +575,9 @@ describe('MCP confirmation protocol', () => {
   test('confirmation codes use correct verb prefixes', async () => {
     // Test reject prefix
     const taskShortId = await createTask(ctx, 'Prefix test task', 'Do the work');
-    const startResult = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_PROMPT_DEFAULTS: 'accept' } },
-    );
-    expect(startResult.exitCode).toBe(0);
+    await startAndWait(ctx, taskShortId, { env: { LAZY_PROMPT_DEFAULTS: 'accept' } });
 
-    const session = new McpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root);
+    const session = new McpSession(ctx.root, await fullTaskId(ctx, taskShortId), ctx.root);
     try {
       await session.initialize();
 
@@ -562,15 +588,25 @@ describe('MCP confirmation protocol', () => {
       expect(closeResult._isError).toBe(true);
       expect(extractConfirmationCode(closeResult._errorText as string)).toMatch(/^cl-/);
 
-      // Test redo prefix
-      const redoResult = await session.callTool('lazy_redo', {
-        task_id: taskShortId,
-      });
-      expect(redoResult._isError).toBe(true);
-      expect(extractConfirmationCode(redoResult._errorText as string)).toMatch(/^rd-/);
+      // Test redo prefix — builder-only tool, so it needs its own builder-mode
+      // session (agent mode refuses lazy_redo outright).
+      const builderSession = new McpSession(ctx.root, null, ctx.root);
+      try {
+        await builderSession.initialize();
+        const redoResult = await builderSession.callTool('lazy_redo', {
+          task_id: taskShortId,
+        });
+        expect(redoResult._isError).toBe(true);
+        expect(extractConfirmationCode(redoResult._errorText as string)).toMatch(/^rd-/);
+      } finally {
+        await builderSession.close();
+      }
 
       // Test reopen prefix — abandon a task first
-      const reopenTaskId = await createTask(ctx, 'Reopen prefix test', 'Do the work');
+      // Must be a DIRECT SUBTASK: the MCP server only lets an agent act on its
+      // own task or a child of it.
+      const reopenCreate = await ctx.lazy(['create', '--goal', 'Reopen prefix test', '--prompt', 'Do the work', '--parent', taskShortId]);
+      const reopenTaskId = extractTaskId(reopenCreate.stdout);
       await ctx.lazy(['close', reopenTaskId, '--reason', 'test']);
       const reopenResult = await session.callTool('lazy_reopen', {
         task_id: reopenTaskId,

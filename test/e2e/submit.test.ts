@@ -6,6 +6,10 @@ import { expectSuccess, expectFailure, expectOutput, expectError } from '../help
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { reconcileTasks } from '../../src/utils/reconcile';
 import { createStorage } from '../../src/storage';
+import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
+
+// This suite awaits `reconcileTasks` in-process against a daemonless project.
+enableInProcessTestMode();
 
 /**
  * Read the external_path from the test project's lazy.toml.

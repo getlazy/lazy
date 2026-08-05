@@ -23,6 +23,7 @@ function makeTask(): Task {
     prompt: 'Do work',
     type: 'task',
     status: 'complete',
+    priority: 'normal',
     created_at: 0,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },
@@ -31,7 +32,8 @@ function makeTask(): Task {
     model: null,
     agent_id: 'claude-code',
     metadata: null,
-    pending_sync: 0,
+    runner_type: null,
+    tags: [], pending_sync: 0,
   };
 }
 

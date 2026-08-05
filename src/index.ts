@@ -8,6 +8,7 @@ import {
   commandBranch, branchUsage,
   commandClone, cloneUsage,
   commandStart, startUsage,
+  commandTimings, timingsUsage,
   commandUnblock, unblockUsage,
   commandList, listUsage,
   commandActive, activeUsage,
@@ -19,12 +20,17 @@ import {
   commandPair, pairUsage,
   commandChat, chatUsage,
   commandAccept, acceptUsage,
+  commandApprove, approveUsage,
+  commandProtect, protectUsage,
   commandClose, closeUsage,
   commandReject, rejectUsage,
   commandStop, stopUsage,
   commandSearch, searchUsage,
   commandComment, commentUsage,
+  commandAsk, askUsage,
+  commandTag, tagUsage, commandUntag, untagUsage,
   commandJournal, journalUsage,
+  commandMemory, memoryUsage, memorySubcommandUsage,
   commandLink, linkUsage,
   commandImportConversation, importConversationUsage,
   commandServer, serverUsage,
@@ -35,20 +41,20 @@ import {
   commandDoctor, doctorUsage,
   commandLoop, loopUsage,
   commandRevert, revertUsage,
-  commandPropose, proposeUsage,
   commandSubmit, submitUsage,
   commandSync, syncUsage,
   commandReparent, reparentUsage,
+  commandPrioritize, prioritizeUsage,
   commandCompletion, completionUsage,
   commandReview, reviewUsage,
   commandRedo, redoUsage,
   commandUpgrade, upgradeUsage,
-  commandSystem, systemUsage,
+  commandSystem, systemUsage, systemSubcommandUsage,
   commandDocument, documentUsage,
   commandRefactor, refactorUsage,
   commandFix, fixUsage,
   commandRework, reworkUsage,
-  commandDaemon, daemonUsage,
+  commandDaemon, daemonUsage, daemonSubcommandUsage,
   commandWatch, watchUsage,
   commandConfig, configUsage,
   commandReport, reportUsage,
@@ -75,16 +81,21 @@ Task Management:
   refactor               Create a refactoring task (restructure, no behavior change)
   edit <task_id>         Edit a task's goal or prompt
   comment <task_id>      Add a comment/annotation to a task
+  tag <task_id> <tag>    Add a tag to a task (grouping label)
+  untag <task_id> <tag>  Remove a tag from a task
   clone <task_id>        Duplicate task with optional reparenting
+  prioritize <task> <lvl> Set queue priority (low/normal/high/urgent)
   list / tasks           List all non-terminal tasks
   active                 List active tasks (with sessions)
   blocked                List blocked tasks (waiting for user)
   show <task_id>         Show task details
-  search <query>         Search tasks, prompts, turns, commits, comments
+  search <query>         Search tasks, prompts, turns, commits, comments, memory
   report                 LLM-summarized markdown digest of recent activity
+  memory                 Shared, curated cross-task knowledge (list/show/save/rm)
 
 Working on Tasks:
   review <task_id>       TUI review: full-screen artifact browser
+  ask <task_id>          Ask a paused task's agent a question (read-only)
   loop                   Review all blocked tasks sequentially
   unblock <task_id>      Unblock task: interactive review or feedback
   resume <task_id>       Resume an interrupted task
@@ -107,14 +118,13 @@ Inspect:
   pair <task_id>         Pair program with Claude in task's worktree
   chat <task_id>         Read-only chat with a finished task's agent session
   accept <task_id>       Merge task's work
+  approve <task_id>      Record a human approval for accepting into a protected branch
+  protect <branch|task>  Protect a branch or task ('on'/'off'; no args shows state)
   close <task_id>        Close a task (no session required)
   reject <task_id>       Reject a task's work and close its PR
   revert <task_id>       Undo an accepted task (create revert task)
   rework <task_id>       Create follow-up task for accepted work that needs changes
   redo <task_id>         Abandon stale task and restart fresh on current main
-
-Proposals:
-  propose                Propose a follow-up task
 
 Link:
   link <url>             Link an external resource (e.g., GitHub PR) as a task
@@ -148,7 +158,14 @@ Run 'lazy <command> --help' for more information on a command.`);
 }
 
 // Command dispatch table: maps command names to their handler and usage functions.
-const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage: () => void }> = {
+const commandMap: Record<string, {
+  run: (args: string[], invokedAs: string) => Promise<void>;
+  usage: () => void;
+  // Multiplexer commands (system, daemon, ...) map each subcommand name to that
+  // subcommand's own usage function. dispatch() consults this so
+  // `lazy <cmd> <sub> --help` shows the subcommand's help, not the parent's.
+  subcommands?: Record<string, () => void>;
+}> = {
   'link':     { run: commandLink, usage: linkUsage },
   'import-conversation': { run: commandImportConversation, usage: importConversationUsage },
   'init':     {
@@ -180,8 +197,12 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'show':     { run: commandShow, usage: showUsage },
   'search':   { run: commandSearch, usage: searchUsage },
   'comment':  { run: commandComment, usage: commentUsage },
+  'tag':      { run: commandTag, usage: tagUsage },
+  'untag':    { run: commandUntag, usage: untagUsage },
   'journal':  { run: commandJournal, usage: journalUsage },
+  'memory':   { run: commandMemory, usage: memoryUsage, subcommands: memorySubcommandUsage },
   'start':    { run: commandStart, usage: startUsage },
+  'timings':  { run: commandTimings, usage: timingsUsage },
   'unblock':  { run: commandUnblock, usage: unblockUsage },
   'resume':   { run: commandResume, usage: resumeUsage },
   'reopen':   { run: commandReopen, usage: reopenUsage },
@@ -193,6 +214,8 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'pair':     { run: commandPair, usage: pairUsage },
   'chat':     { run: commandChat, usage: chatUsage },
   'accept':   { run: commandAccept, usage: acceptUsage },
+  'approve':  { run: commandApprove, usage: approveUsage },
+  'protect':  { run: commandProtect, usage: protectUsage },
   'close':    { run: commandClose, usage: closeUsage },
   'reject':   { run: commandReject, usage: rejectUsage },
   'stop':     { run: commandStop, usage: stopUsage },
@@ -201,20 +224,21 @@ const commandMap: Record<string, { run: (args: string[]) => Promise<void>; usage
   'builder':  { run: commandBuilder, usage: builderUsage },
   'doctor':   { run: commandDoctor, usage: doctorUsage },
   'loop':     { run: commandLoop, usage: loopUsage },
-  'propose':  { run: commandPropose, usage: proposeUsage },
   'submit':   { run: commandSubmit, usage: submitUsage },
   'sync':     { run: commandSync, usage: syncUsage },
   'reparent': { run: commandReparent, usage: reparentUsage },
+  'prioritize': { run: commandPrioritize, usage: prioritizeUsage },
   'completion': { run: commandCompletion, usage: completionUsage },
   'review':   { run: commandReview, usage: reviewUsage },
+  'ask':      { run: commandAsk, usage: askUsage },
   'redo':     { run: commandRedo, usage: redoUsage },
   'upgrade':  { run: commandUpgrade, usage: upgradeUsage },
-  'system':   { run: commandSystem, usage: systemUsage },
+  'system':   { run: commandSystem, usage: systemUsage, subcommands: systemSubcommandUsage },
   'document': { run: commandDocument, usage: documentUsage },
   'refactor': { run: commandRefactor, usage: refactorUsage },
   'fix':      { run: commandFix, usage: fixUsage },
   'rework':   { run: commandRework, usage: reworkUsage },
-  'daemon':   { run: commandDaemon, usage: daemonUsage },
+  'daemon':   { run: commandDaemon, usage: daemonUsage, subcommands: daemonSubcommandUsage },
   'watch':    { run: commandWatch, usage: watchUsage },
   'config':   { run: commandConfig, usage: configUsage },
   'report':   { run: commandReport, usage: reportUsage },
@@ -243,9 +267,16 @@ async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
   if (!entry) return;
 
   if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
-    entry.usage();
+    // For multiplexer commands the subcommand always sits at cmdArgs[0] (that's
+    // where the command's own switch reads it), so `lazy daemon logs -h` routes
+    // to logsUsage while a bare `lazy daemon -h` still prints the parent usage.
+    const subUsage = entry.subcommands?.[cmdArgs[0]];
+    (subUsage ?? entry.usage)();
   } else {
-    await entry.run(cmdArgs);
+    // Pass the name the command was invoked as (canonical or alias) so a handler
+    // can vary its default behavior per alias — e.g. `lazy view` defaults to the
+    // chunked turn grouping while the canonical `lazy show` stays flat.
+    await entry.run(cmdArgs, cmd);
   }
 }
 
@@ -334,7 +365,12 @@ function resolveLazyRoot(): string | null {
   return cachedLazyRoot;
 }
 
-if (!isHelpOrVersion && command !== 'completion' && process.env.LAZY_TEST !== '1') {
+// LAZY_FORCE_PREFLIGHT is a test-only escape hatch: preflight is skipped under
+// LAZY_TEST because test temp dirs are always accessible, but the preflight
+// suite deliberately makes them inaccessible and must still exercise the check.
+const preflightSkipped = process.env.LAZY_TEST === '1' && process.env.LAZY_FORCE_PREFLIGHT !== '1';
+
+if (!isHelpOrVersion && command !== 'completion' && !preflightSkipped) {
   const { runPreflight } = await import('./cli/preflight');
   await runPreflight(resolveLazyRoot());
   const { validateConfigPaths } = await import('./cli/config-path-validation');

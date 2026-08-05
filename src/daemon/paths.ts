@@ -23,7 +23,23 @@ import { getHome } from '../utils/home';
 export const PID_FILE = 'lazy.pid';
 export const SOCKET_FILE = 'lazy.sock';
 export const TOKEN_FILE = 'token';
+/**
+ * Records the last TCP web port the daemon successfully bound. Preferred on the
+ * next start so a restart re-binds the SAME port — keeping the `target` in
+ * daemon MCP configs already mounted into running containers/builders valid
+ * (they call back via host.docker.internal:<webPort>). See getWebPortPath.
+ */
+export const WEB_PORT_FILE = 'web-port';
 export const LOG_FILE = 'daemon.log';
+/**
+ * Registry binding each minted MCP bearer token to ONE identity (a task, or the
+ * builder). See src/daemon/mcp-tokens.ts. Lives in the daemon dir, never under
+ * the project root: task containers mount the repo read-only, so a per-task
+ * token stored in-repo would be readable by every other agent.
+ */
+export const MCP_TOKENS_FILE = 'mcp-tokens.json';
+/** Directory holding per-identity daemon MCP config files (see MCP_TOKENS_FILE). */
+export const MCP_CONFIG_DIR = 'mcp';
 export const DAEMON_LOCK_FILE = 'daemon.lock';
 /** Records the canonical project root the daemon serves (see getRootPath). */
 export const ROOT_FILE = 'root';
@@ -71,6 +87,21 @@ export function getSocketPath(projectRoot: string): string {
 /** Bearer token file: ~/.lazy/daemon/<slug>/token */
 export function getTokenPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), TOKEN_FILE);
+}
+
+/** MCP token registry: ~/.lazy/daemon/<slug>/mcp-tokens.json */
+export function getMcpTokensPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), MCP_TOKENS_FILE);
+}
+
+/** Per-identity daemon MCP config dir: ~/.lazy/daemon/<slug>/mcp/ */
+export function getMcpConfigDir(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), MCP_CONFIG_DIR);
+}
+
+/** Last-bound web port marker: ~/.lazy/daemon/<slug>/web-port */
+export function getWebPortPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), WEB_PORT_FILE);
 }
 
 /** Daemon log file: ~/.lazy/daemon/<slug>/daemon.log */

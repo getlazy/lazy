@@ -99,11 +99,13 @@ describeWithPg('PostgresStorage', () => {
   });
 
   test('resolve ambiguous code returns ambiguousMatches', async () => {
-    // Two tasks with same code — shouldn't happen in practice but tests the path
+    // Two non-terminal tasks sharing a code — createTask rejects that outright, so the
+    // collision has to arrive the way it does in practice: updateTaskCode enforces no
+    // uniqueness, so re-coding an existing task can still produce a duplicate.
     const t1 = await storage.createTask('Task 1', undefined, undefined, 'dup-code');
-    const t2 = await storage.createTask('Task 2', undefined, undefined, 'dup-code');
+    const t2 = await storage.createTask('Task 2');
+    await storage.updateTaskCode(t2.id, 'dup-code');
 
-    // updateTaskCode bypasses the uniqueness — directly insert
     const { task, ambiguousMatches } = await storage.resolveTask('dup-code');
     expect(task).toBeNull();
     expect(ambiguousMatches).toHaveLength(2);
@@ -171,8 +173,23 @@ describeWithPg('PostgresStorage', () => {
     expect(typeof fetched!.completed_at).toBe('number');
   });
 
-  test('reopenTask resets status', async () => {
+  // Reopen target depends on whether the task was ever started, matching FileStorage:
+  // a task with a session goes back to 'blocked' (waiting for review), one that never
+  // started goes back to 'backlog'. Both branches are covered so the two backends
+  // cannot drift apart.
+  test('reopenTask resets an unstarted task to backlog', async () => {
     const task = await storage.createTask('Test task');
+    await storage.abandonTask(task.id, 'mistake');
+    await storage.reopenTask(task.id, 'human');
+
+    const fetched = await storage.getTask(task.id);
+    expect(fetched!.status).toBe('backlog');
+    expect(fetched!.completed_at).toBeNull();
+  });
+
+  test('reopenTask resets a started task to blocked', async () => {
+    const task = await storage.createTask('Test task');
+    await storage.createSession(task.id, 'claude-code', 'lazy/test', 'abc');
     await storage.abandonTask(task.id, 'mistake');
     await storage.reopenTask(task.id, 'human');
 
@@ -545,6 +562,43 @@ describeWithPg('PostgresStorage', () => {
     for (const entry of history) {
       expect(typeof entry.timestamp).toBe('number');
     }
+  });
+
+  // ── Tags ──────────────────────────────────────────────────────────
+
+  test('tags round-trip with normalized values and append-only, actor-attributed history', async () => {
+    const task = await storage.createTask('Tag test');
+    // New tasks start with an empty tags array (backward-compatible default).
+    expect(task.tags).toEqual([]);
+
+    // Add normalizes the input and returns the updated task.
+    const tagged = await storage.addTaskTag(task.id, '[Onboarding]', 'human');
+    expect(tagged.tags).toEqual(['onboarding']);
+    const two = await storage.addTaskTag(task.id, 'launch', 'builder');
+    expect(two.tags.sort()).toEqual(['launch', 'onboarding']);
+
+    // Idempotent: re-adding an existing tag is a no-op (no duplicate, no event).
+    const again = await storage.addTaskTag(task.id, 'onboarding', 'human');
+    expect(again.tags.sort()).toEqual(['launch', 'onboarding']);
+
+    // Remove drops the tag but the history keeps the earlier 'tag' event.
+    const removed = await storage.removeTaskTag(task.id, 'onboarding', 'human');
+    expect(removed.tags).toEqual(['launch']);
+
+    const history = await storage.getTagHistory(task.id);
+    expect(history).toHaveLength(3); // tag onboarding, tag launch, untag onboarding
+    expect(history[0]).toMatchObject({ tag: 'onboarding', action: 'tag', actor: 'human' });
+    expect(history[1]).toMatchObject({ tag: 'launch', action: 'tag', actor: 'builder' });
+    expect(history[2]).toMatchObject({ tag: 'onboarding', action: 'untag', actor: 'human' });
+
+    // Timestamps must be numbers (BIGINT parser)
+    for (const entry of history) {
+      expect(typeof entry.timestamp).toBe('number');
+    }
+
+    // The current tags persist on the reloaded task.
+    const reloaded = await storage.getTask(task.id);
+    expect(reloaded!.tags).toEqual(['launch']);
   });
 
   // ── Task tree ─────────────────────────────────────────────────────

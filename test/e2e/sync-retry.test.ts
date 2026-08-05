@@ -6,57 +6,30 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, writeTaskJson, setTaskStatus, findFullTaskId } from '../helpers/storage';
+import { initDaemonStorage, closeAllStorage } from '../../src/daemon/rpc-handlers';
+import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
+import { pinConfig } from '../helpers/pin-config';
 import { calculateBackoffMs, runSyncRetryTick } from '../../src/daemon/sync-retry';
 
-/**
- * Helper: find the full task ID from a short prefix.
- */
-function findFullTaskId(root: string, shortId: string): string {
-  const tasksDir = join(root, '.lazy', 'tasks');
-  const entries = readdirSync(tasksDir);
-  const match = entries.find(e => e.startsWith(shortId));
-  if (!match) throw new Error(`Task not found: ${shortId}`);
-  return match;
-}
-
-/**
- * Helper: read task.json for a task.
- */
-function readTaskJson(root: string, shortId: string): any {
-  const fullId = findFullTaskId(root, shortId);
-  const path = join(root, '.lazy', 'tasks', fullId, 'task.json');
-  return JSON.parse(readFileSync(path, 'utf-8'));
-}
-
-/**
- * Helper: write task.json for a task.
- */
-function writeTaskJson(root: string, shortId: string, data: any): void {
-  const fullId = findFullTaskId(root, shortId);
-  const path = join(root, '.lazy', 'tasks', fullId, 'task.json');
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
-}
+// This suite awaits runSyncRetryTick() IN-PROCESS in a daemonless project, so
+// the `bun test` process itself runs production code and must declare test
+// mode. See CLAUDE.md, "A daemonless suite that calls src/ in-process must
+// declare test mode".
+enableInProcessTestMode();
 
 /**
  * Helper: set pending_sync on a task by directly writing task.json.
+ *
+ * Task state lives in EXTERNAL storage (see test/helpers/storage.ts) — the old
+ * hand-rolled `<root>/.lazy/tasks` paths here died with ENOENT.
  */
 function setTaskPendingSync(root: string, shortId: string, value: number): void {
   const data = readTaskJson(root, shortId);
   data.pending_sync = value;
-  writeTaskJson(root, shortId, data);
-}
-
-/**
- * Helper: set task status by directly writing task.json.
- */
-function setTaskStatus(root: string, shortId: string, status: string): void {
-  const data = readTaskJson(root, shortId);
-  data.status = status;
   writeTaskJson(root, shortId, data);
 }
 
@@ -88,12 +61,24 @@ describe('sync retry', () => {
 
   describe('sync retry tick (e2e)', () => {
     let ctx: TestContext;
+    let restoreConfig: () => void;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
+      // Pin config resolution to THIS project's lazy.toml — otherwise the
+      // in-process loadConfig walks up from bun test's cwd (lazy's own
+      // worktree) and adopts the developer's live store. See pin-config.ts.
+      restoreConfig = pinConfig(ctx.root);
+      // runSyncRetryTick reaches storage through the daemon's module-level
+      // singleton, so an in-process caller must point it at this test's project
+      // (and tear it down afterwards, or the NEXT test inherits this root's
+      // Storage and silently asserts against the wrong project).
+      initDaemonStorage(ctx.root);
     });
 
     afterEach(async () => {
+      await closeAllStorage();
+      restoreConfig();
       await ctx.cleanup();
     });
 

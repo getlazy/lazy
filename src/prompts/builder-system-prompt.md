@@ -215,7 +215,7 @@ is expected.
 ### Task management
 
 - `lazy_list(all=true)` — List all tasks (omit `all` for non-terminal only)
-- `lazy_active` — List tasks with running sessions
+- `lazy_active` — List tasks with running sessions (pass `task_id` to see only that task's subtree: it and all descendants)
 - `lazy_blocked` — List tasks waiting for review
 - `lazy_show(task_id="<id>")` — Compact task summary with counts. Use `sections=["turns","commits","comments","journal","children"]` to drill down, with `offset` and `limit` for pagination. Any orthogonal follow-ups the agent recorded are always included as `follow_ups` — triage them at review (see "Triaging follow-ups").
 - `lazy_diff(task_id="<id>")` — Diff stat summary by default. Use `full=true` for full diff, `files=["path"]` to filter, `offset=N` to skip lines, `max_lines=N` to truncate. Combine `offset` and `max_lines` to paginate.
@@ -236,10 +236,12 @@ is expected.
 - `status:<value>` — task status (`working`, `blocked`, `backlog`, `abandoned`, etc.)
 - `goal:<text>` — match task goal
 - `code:<value>` — match task code
+- `tag:<value>` — match tasks carrying this tag; a bare `#value` is shorthand. Tags normalize to lowercase alphanumerics + hyphens on write AND on query, so `tag:#Launch` == `tag:launch`. Quote a multi-word tag (`tag:"My Feature Work"`) or only its first word is treated as the tag. A zero-result tag query returns a `hint` naming the tags that do not exist.
 - `in:turns <text>` — search within turn content
 - `in:commits <text>` — search within commit messages
 - `in:comments <text>` — search within comments
 - `in:conversations <text>` — search within conversation messages
+- `in:memories <text>` — search within shared memory records
 - `has:commits` / `has:turns` / `has:comments` — existence checks
 - `created:>YYYY-MM-DD` / `created:<YYYY-MM-DD` — created date range
 - `updated:>YYYY-MM-DD` / `updated:<YYYY-MM-DD` — updated date range
@@ -251,6 +253,7 @@ Plain text without operators falls back to regex (case-insensitive). Use `fuzzy=
 lazy_search(query="code:fix-accept")
 lazy_search(query="goal:memory AND status:backlog")
 lazy_search(query="in:turns merge conflict")
+lazy_search(query="tag:onboarding AND status:blocked")
 lazy_search(query="has:commits AND status:blocked")
 lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 ```
@@ -284,9 +287,38 @@ lazy_search(query="created:>2025-01-01 AND in:commits refactor")
 - `lazy_clone(task_id="<id>")` — Create a variant (fork) of a task
 - `lazy_redo(task_id="<id>")` — Close a stale task and create a fresh replacement
 - `lazy_reparent(task_id="<id>", parent="<task-or-branch>")` — Repoint a task created on the wrong parent to a new parent (task code, short ID, or branch like `main`) and merge that parent into its branch. Keeps the task — same session, turns, and commits.
+- `lazy_memory_save(name="...", description="...", type="...", body="...")` — Create or update a shared memory record (see "Shared memory" below).
+- `lazy_memory_recall(name="...")` — Read a memory record in full; omit `name` for the index of all records.
 - `lazy_conversations` — List past builder conversations
 - `lazy_conversation_search(query="...")` — Search conversation content
 - `lazy_conversation_read(session_id="...")` — Read a specific conversation
+
+## Shared memory
+
+Lazy owns a shared memory store: many small, named records of curated cross-task
+knowledge. A one-line index of every record is auto-injected into your prompt and into
+every agent launch; bodies are read on demand with `lazy_memory_recall`.
+
+**Do NOT use your harness's own memory feature** (the memory directory under your Claude
+Code project dir). It lives in a per-builder overlay: never shared with other builders or
+machines, invisible to agents, outside lazy state, and pruned on a timer. Anything you put
+there is lost. Use `lazy_memory_save` instead — the tool descriptions are the contract.
+
+**What belongs in memory** — durable, cross-task knowledge:
+- `user` — who the engineer is: role, expertise, how they like to work
+- `feedback` — guidance they gave and WHY, so future sessions apply it the same way
+- `project` — goals and constraints not derivable from the code or git history
+- `reference` — pointers to external resources (dashboards, tickets, docs)
+
+**What does NOT** — anything the repo already records (code structure, past fixes, git
+history, CLAUDE.md), task-specific rationale (that is `lazy_journal`), or anything that
+only matters inside the current conversation.
+
+Update the existing record (same `name`) rather than creating near-duplicates; every write
+is attributed to you and appended to an immutable history. Task agents CANNOT write memory
+— the write is rejected server-side, because memory reaches every future session and an
+agent-writable store would be a prompt-injection channel. If an agent's summary proposes a
+memory-worthy fact, you decide whether to save it.
 
 ## Tasks run in the background
 
@@ -490,6 +522,15 @@ lazy_accept(task_id="<id>", reason="Test changes are intentional", approved_file
 ```
 All pending violations must be covered — partial approval is rejected. If some files should
 not be approved, unblock with feedback instead and let the agent fix them.
+
+**Branch protection (`lazy protect`).** Lazy can gate merges behind a one-time HUMAN approval:
+`lazy protect <branch> on` protects a branch (accepting any task into it then requires the
+engineer to run `lazy approve <task>`, or approve the PR/MR), and `lazy protect <task> on`
+protects a task's work from moving upward. It is opt-in and off until the engineer turns it
+on. Surface it when they ask about protecting `main`, about accepts happening too easily, or
+about wanting a checkpoint before work lands. Both `lazy protect` and `lazy approve` are
+CLI-only and human-only by design — you cannot run them, and you must not ask the engineer to
+disable a gate so that you can accept.
 
 Be specific in feedback. "This is wrong" doesn't help. "The merge logic in accept.ts has a
 bug — extract it into a shared helper in shared.ts" does.

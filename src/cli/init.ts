@@ -12,6 +12,14 @@ import { detectShell, getCompletionSetupCommand } from '../shell/detect';
 import { theme } from './theme';
 import { runGit } from '../utils/git';
 import { spawnSync } from '../utils/spawn';
+import { loadConfig } from '../config/loader';
+import { discoverCandidateSessions, reimportConversations } from '../import/reimport-conversations';
+import {
+  countImportableMemories,
+  discoverHarnessMemoryFiles,
+  importHarnessMemory,
+  formatLongDescriptionNotice,
+} from '../import/import-harness-memory';
 
 const LAZY_DIR = '.lazy';
 const LEGACY_DIR = '.workshop';
@@ -462,6 +470,9 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     '.lazy/storage.lock',
     '.lazy/.reconcile-lock',
     '.lazy/tmp',
+    // The edge-gate approval passphrase must never be committed: once in the
+    // repo it is inside the builder's context and the friction dissolves.
+    '.lazy/approve-passphrase',
   ];
 
   if (existsSync(gitignorePath)) {
@@ -578,6 +589,115 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
       } finally {
         await dockerfileTaskStorage.close();
       }
+    }
+  }
+
+  // Offer to inherit everything this repo already accumulated under the Claude
+  // Code harness: past conversations (→ builder memory) and harness memory files
+  // (→ lazy shared memory). Adopting lazy on a repo with existing history should
+  // mean inheriting that history — not starting from scratch — and it should read
+  // as ONE "inherit your history?" step, not two disjoint prompt blocks.
+  //
+  // Detection is cheap for both: a readdir of ~/.claude/projects for dirs
+  // matching this repo (the per-builder isolation dirs don't exist yet at init),
+  // plus a readdir of each match's memory/ subdir. Nothing slows init down.
+  if (isTTY() && !options.nonInteractive) {
+    try {
+      const config = await loadConfig(targetDir);
+      const dataDirAbs = join(targetDir, config.data.path);
+      const importOpts = { lazyRoot: targetDir, dataDirAbs };
+
+      const [candidates, memoryFiles] = await Promise.all([
+        discoverCandidateSessions(importOpts),
+        discoverHarnessMemoryFiles(importOpts),
+      ]);
+
+      if (candidates.length > 0 || memoryFiles.length > 0) {
+        // No daemon exists yet at init, so a direct FileStorage is the storage
+        // owner here (init already opens one for first-task creation). Opened
+        // once for the whole block so both offers share one handle.
+        const importStorage = await createStorage(targetDir, {
+          backend: storageChoice.backend,
+          externalPath: externalPathForStorage,
+        });
+        try {
+          // Re-running init on a repo that already imported memory must not
+          // re-offer records lazy already holds. countImportableMemories is the
+          // same discovery pass filtered by the store, so the count in the offer
+          // is exactly what an import would add.
+          const memoryMissing = memoryFiles.length > 0
+            ? await countImportableMemories({ ...importOpts, storage: importStorage })
+            : 0;
+
+          if (candidates.length > 0 || memoryMissing > 0) {
+            console.log('');
+            console.log('This repo already has Claude Code history from before lazy.');
+            if (candidates.length > 0) {
+              console.log(`  Found ${candidates.length} existing Claude Code session(s) for this repo.`);
+            }
+            if (memoryMissing > 0) {
+              console.log(`  Found ${memoryMissing} Claude Code harness memory record(s) with no lazy counterpart.`);
+            }
+            console.log('  Lazy can import both, so you inherit your project\'s history instead of');
+            console.log('  starting from scratch.');
+          }
+
+          if (candidates.length > 0) {
+            const doImport = await promptYesNo(`  Import ${candidates.length} conversation(s) as builder memory?`, true);
+            if (doImport) {
+              const report = await reimportConversations({
+                ...importOpts,
+                storage: importStorage,
+                onImported: (info) => {
+                  const short = info.sessionId.substring(0, 8);
+                  console.log(`  Imported ${short}  ${info.messageCount} msgs, ${info.totalTokens} tokens`);
+                },
+              });
+              console.log(`  Imported ${report.imported.length} conversation(s) as builder memory.`);
+              if (report.skippedEmpty.length > 0) {
+                console.log(`  Skipped ${report.skippedEmpty.length} empty/unparseable session(s).`);
+              }
+            } else {
+              console.log(`  You can import later with: ${theme.command('lazy import-conversation')}`);
+            }
+          }
+
+          if (memoryMissing > 0) {
+            const doImport = await promptYesNo(`  Import ${memoryMissing} memory record(s) into lazy shared memory?`, true);
+            if (doImport) {
+              const report = await importHarnessMemory({
+                ...importOpts,
+                storage: importStorage,
+                onImported: (info) => {
+                  console.log(`  Imported memory ${info.name}  (${info.type})`);
+                },
+              });
+              console.log(`  Imported ${report.imported.length} memory record(s) into lazy shared memory.`);
+              if (report.skippedEmpty.length > 0) {
+                console.log(`  Skipped ${report.skippedEmpty.length} empty memory file(s).`);
+              }
+              // Curation hint, not a failure: these records were imported.
+              const longNotice = formatLongDescriptionNotice(report);
+              if (longNotice) {
+                console.log(`  ${longNotice}`);
+              }
+              // Per-record failures are surfaced, never swallowed — the rest of
+              // the import still landed.
+              for (const { name, error } of report.errors) {
+                console.log(`  Could not import memory ${name}: ${error.message}`);
+              }
+            } else {
+              console.log(`  You can import later with: ${theme.command('lazy doctor --import-memory')}`);
+            }
+          }
+        } finally {
+          await importStorage.close();
+        }
+      }
+    } catch (err) {
+      // Onboarding import is best-effort — a detection/import hiccup must never
+      // fail init. Surface it so it isn't silently swallowed, then continue.
+      console.log(`  (Skipped Claude Code history import: ${err instanceof Error ? err.message : err})`);
     }
   }
 

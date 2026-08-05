@@ -4,6 +4,14 @@ import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
+
+// `lazy link` derives a task code from the PR branch and prints/addresses the
+// task by that code, so extractTaskId's hex-short-id match never fits.
+function extractLinkedTaskRef(output: string): string {
+  const match = output.match(/Linked task (\S+)/);
+  if (!match) throw new Error(`Could not extract linked task ref from output: ${output}`);
+  return match[1];
+}
 import { MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
@@ -145,7 +153,7 @@ describe('lazy link', () => {
     });
 
     expectSuccess(result);
-    const taskId = extractTaskId(result.stdout);
+    const taskId = extractLinkedTaskRef(result.stdout);
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     // Code should be at most 80 chars, derived from branch
@@ -168,7 +176,7 @@ describe('lazy link', () => {
 
     expectSuccess(result);
     // The explicit code should be used, not the derived one
-    const taskId = extractTaskId(result.stdout);
+    const taskId = extractLinkedTaskRef(result.stdout);
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'my-custom-code');
@@ -218,7 +226,7 @@ describe('lazy link', () => {
     });
     expectSuccess(result);
 
-    const taskId = extractTaskId(result.stdout);
+    const taskId = extractLinkedTaskRef(result.stdout);
 
     // Should be able to edit goal on a linked task
     const editResult = await ctx.lazy(['edit', taskId, '--goal', 'Updated goal']);

@@ -3,7 +3,8 @@ import { existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS, disablePreAccept } from '../helpers/fixtures';
+import { runReconcile } from '../helpers/reconcile';
 
 /** Extract child task ID from "Created variant task <id>" output */
 function extractVariantTaskId(output: string): string {
@@ -33,6 +34,9 @@ describe('lazy branch', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: the pre-accept turn has no runner to launch against, and
+    // this file asserts on branch/accept routing rather than on that turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -133,7 +137,10 @@ describe('lazy branch', () => {
     );
 
     expectSuccess(result);
-    expectOutput(result, 'Model:       haiku');
+    // `branch` echoes the model string it was given verbatim — it does not
+    // shorten or alias it. (Commit 5649fcc2 switched the flag value from
+    // "haiku" to the full id without updating this assertion.)
+    expectOutput(result, 'Model:       claude-haiku-4-5-20251001');
   });
 
   test('branch with --code flag sets child code', async () => {
@@ -262,10 +269,12 @@ describe('lazy branch', () => {
 
   // ── Accept child task merges into parent ─────────────────────────────
 
-  test('accept child fails while parent worktree exists (known limitation)', async () => {
-    // The squash merge operation does `git checkout lazy/<parentId>` in the root repo,
-    // which fails because the parent's worktree already has that branch checked out.
-    // Git doesn't allow the same branch to be checked out in two worktrees.
+  test('accept child succeeds while the parent worktree still exists', async () => {
+    // This used to be a known limitation: the squash merge ran
+    // `git checkout lazy/<parentId>` in the root repo, which git refuses while
+    // the parent's worktree has that branch checked out. Accept now merges into
+    // the parent branch WITHOUT checking it out, so a live parent worktree is no
+    // longer in the way — that is what this pins.
     const parentId = await createAndStartParent(ctx, 'Merge parent');
 
     const branchResult = await ctx.lazyMocked(
@@ -284,15 +293,26 @@ describe('lazy branch', () => {
     const gitCommit = ctx.git('-C', childWorktreePath, 'commit', '-m', 'Child work');
     expect(gitCommit.exitCode).toBe(0);
 
-    // Accept the child — fails because parent worktree holds the target branch
-    const acceptResult = await ctx.lazy(['accept', childId]);
-    expectFailure(acceptResult);
-    expectError(acceptResult, 'Merge failed');
-    expectError(acceptResult, 'already used by worktree');
+    // `branch --yes` STARTS the child, so it sits in `working` until something
+    // reconciles it. This suite is daemonless, so drive one reconcile pass by
+    // hand — otherwise accept refuses at the status gate ("still working") and
+    // never reaches the merge this test is about.
+    await runReconcile(ctx.root, ctx.protocolBase);
+
+    const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
+    expectSuccess(acceptResult);
+    expectOutput(acceptResult, 'accepted and merged');
+
+    // The parent's checked-out worktree is untouched and still on its branch.
+    const parentWorktreePath = join(ctx.root, '.lazy', 'worktrees', parentId);
+    expect(existsSync(parentWorktreePath)).toBe(true);
+    const parentBranch = ctx.git('-C', parentWorktreePath, 'rev-parse', '--abbrev-ref', 'HEAD');
+    expect(parentBranch.stdout.trim()).toBe(`lazy/${parentId}`);
   });
 
-  test('accept child identifies correct merge target (parent branch)', async () => {
-    // Verifies accept correctly identifies the parent's branch as the merge target
+  test('accept child merges into the parent branch, not main', async () => {
+    // INVARIANT: a variant merges back into the branch it was cut from. Asserted
+    // on git state rather than on console text, which is presentation.
     const parentId = await createAndStartParent(ctx, 'Target parent');
 
     const branchResult = await ctx.lazyMocked(
@@ -309,10 +329,21 @@ describe('lazy branch', () => {
     ctx.git('-C', childWorktreePath, 'add', 'child-file.txt');
     ctx.git('-C', childWorktreePath, 'commit', '-m', 'Child work');
 
-    // Accept the child — merges into parent's branch (lazy/<parentId>), not main
-    const acceptResult = await ctx.lazy(['accept', childId]);
-    // Will fail because parent worktree holds the branch, but output shows the target
-    expectOutput(acceptResult, `Merging child task ${childId} into parent ${parentId}`);
+    // Daemonless suite: reconcile the started child out of `working` so accept
+    // gets past the status gate (see the sibling test above).
+    await runReconcile(ctx.root, ctx.protocolBase);
+
+    const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
+    expectSuccess(acceptResult);
+
+    // The child's file is on the parent's branch...
+    const onParent = ctx.git('-C', ctx.root, 'show', `lazy/${parentId}:child-file.txt`);
+    expect(onParent.exitCode).toBe(0);
+    expect(onParent.stdout).toContain('child content');
+
+    // ...and NOT on main.
+    const onMain = ctx.git('-C', ctx.root, 'show', 'main:child-file.txt');
+    expect(onMain.exitCode).not.toBe(0);
   });
 
   // ── Reject child task ───────────────────────────────────────────────

@@ -20,12 +20,22 @@
  *   - Loop ONLY on an explicit intent — never on a bare exit (defaults are safe).
  *   - Consume the intent ONLY after committing to a relaunch, so a wrapper crash
  *     during the wait leaves the intent discoverable for manual recovery.
- *   - On timeout / failure, surface an actionable error and print the manual
+ *   - The wait is UNBOUNDED. A rebuild has no honest upper bound (`--no-cache`
+ *     image builds, a slow network, a human answering a prompt in the upgrade's
+ *     terminal), and abandoning a live session on a timer turns a recoverable
+ *     wait into a dead builder for no gain. Instead the loop reassures
+ *     periodically and offers the manual resume as an OPTION, never an exit.
+ *   - It still ends on a real SIGNAL rather than a timer: the intent carries the
+ *     upgrade process's pid/host, so an upgrade that dies without restarting the
+ *     daemon is reported as a FAILED UPGRADE — which is actionable — instead of
+ *     as "timed out", which is not.
+ *   - On failure, surface an actionable error and print the manual
  *     `lazy builder --resume <id>` so nothing is silently lost.
  *   - Docker/podman only: host-process builders are not stopped by upgrade, so
  *     there is nothing to relaunch (callers pass canRelaunch=false there).
  */
 
+import { hostname } from 'os';
 import type { DaemonStatus } from '../daemon/lifecycle';
 import type { BuilderResumeIntent, StoredConversation } from '../storage/types';
 
@@ -67,12 +77,45 @@ export interface RelaunchLoopDeps {
   daemonStatus: () => Promise<DaemonStatus>;
   /** Ensure the (rebuilt) image/binary is present before relaunching. */
   ensureReady: () => Promise<void>;
+  /**
+   * Re-resolve the live proxy target against the RESTARTED daemon, immediately
+   * before relaunching.
+   *
+   * The launch environment is not frozen-safe across an upgrade: the daemon's
+   * proxy port is OS-assigned, so the new daemon serves the proxy somewhere else
+   * and the address resolved when `lazy builder` started is dead. Everything
+   * else the child needs is already re-resolved per launch (the credential and
+   * the MCP config are fetched from the daemon at launch time, storage is
+   * re-resolved per access) — the proxy address was the one value stamped once
+   * and reused, which is why the relaunched builder came back unable to reach
+   * the API.
+   *
+   * MUST throw rather than degrade when the live address cannot be resolved
+   * (`ProxyUnavailableError` semantics): a builder pointed at a dead proxy is
+   * worse than one that says why it did not relaunch. The loop calls this
+   * BEFORE consuming the resume intent, so a failure here leaves the session
+   * recoverable.
+   */
+  refreshProxyTarget: () => Promise<void>;
   log: (msg: string) => void;
   errorOut: (msg: string) => void;
-  /** Bounded wait for the upgrade to finish (default 5 min). */
-  timeoutMs?: number;
   /** Poll cadence while awaiting the upgrade (default 2s). */
   pollIntervalMs?: number;
+  /**
+   * How long to wait quietly before the first reassurance line (default 5 min).
+   * This is NOT a timeout — nothing is abandoned when it elapses.
+   */
+  reassureAfterMs?: number;
+  /** Cadence of subsequent reassurance lines (default 2 min). */
+  reassureIntervalMs?: number;
+  /**
+   * Is the `lazy upgrade` process still alive? Injectable for tests; the default
+   * uses a signal-0 probe. Only consulted when the intent carries a pid stamped
+   * on THIS host.
+   */
+  isProcessAlive?: (pid: number) => boolean;
+  /** Hostname of the machine this wrapper runs on (injectable for tests). */
+  currentHost?: () => string;
   /** Sleep impl (injectable for tests). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -86,10 +129,53 @@ export interface RelaunchLoopResult {
   sessionId: string | null;
 }
 
-const DEFAULT_UPGRADE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_REASSURE_AFTER_MS = 5 * 60 * 1000;
+const DEFAULT_REASSURE_INTERVAL_MS = 2 * 60 * 1000;
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 
+/**
+ * How many consecutive polls a dead upgrade pid must be observed — while the
+ * upgrade still hasn't completed — before we call it failed.
+ *
+ * `lazy upgrade` restarts the daemon and then exits promptly, so "pid gone" and
+ * "daemon healthy again" land almost simultaneously and in an order we do not
+ * control (the daemon is spawned detached). Requiring the dead pid to persist
+ * across a few polls, each of which re-checks completion first, keeps a normal
+ * successful upgrade from ever being misreported as a crash.
+ */
+const UPGRADE_DEATH_CONFIRM_POLLS = 3;
+
 const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** Signal-0 liveness probe: no signal delivered, just an existence/permission check. */
+function defaultIsProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH = no such process (the answer we want). EPERM = alive but owned by
+    // another user — still alive. Anything else is unexpected; treat it as
+    // alive, because the safe default is to keep waiting rather than to declare
+    // a healthy upgrade dead and abandon the human's session.
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/** Outcome of waiting for `lazy upgrade` to finish. There is no timeout case. */
+export type UpgradeWaitOutcome =
+  /** The daemon came back with the new version — the upgrade finished. */
+  | 'complete'
+  /** The upgrade process is gone and the daemon never came back — it failed. */
+  | 'upgrade-died';
+
+/** Render a duration as a human-friendly "5m" / "1h 12m". */
+export function formatWaited(ms: number): string {
+  const totalMinutes = Math.floor(ms / 60000);
+  if (totalMinutes < 1) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${totalMinutes}m`;
+}
 
 /** The `lazy-builder-<id>` container name for a builder short id. */
 export function builderRunName(id: string): string {
@@ -148,22 +234,61 @@ async function newestBuilderSessionId(storage: RelaunchStorage): Promise<string 
   return [...convs].sort((a, b) => ts(b) - ts(a))[0]?.sessionId ?? null;
 }
 
-/** Poll until the upgrade completes or the bounded timeout elapses. */
-async function waitForUpgradeComplete(opts: {
+/**
+ * Poll until the upgrade completes, or until the upgrade process is confirmed
+ * dead without having completed.
+ *
+ * There is deliberately NO timeout. Waiting costs nothing but patience; giving
+ * up costs the human their live session, which is exactly the outcome the wait
+ * exists to prevent. The only way out other than success is a real signal that
+ * the upgrade will never finish.
+ *
+ * Elapsed time is accumulated from the poll interval rather than a wall clock so
+ * the reassurance cadence is deterministic under an injected `sleep` in tests.
+ */
+export async function waitForUpgradeComplete(opts: {
   baseline: DaemonStatus;
   daemonStatus: () => Promise<DaemonStatus>;
-  timeoutMs: number;
   pollIntervalMs: number;
   sleep: (ms: number) => Promise<void>;
-}): Promise<boolean> {
-  const { baseline, daemonStatus, timeoutMs, pollIntervalMs, sleep } = opts;
-  const maxIterations = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
-  for (let i = 0; i < maxIterations; i++) {
-    if (isUpgradeComplete(baseline, await daemonStatus())) return true;
+  /** Liveness of the upgrade process, or null when it cannot be determined. */
+  upgradeAlive: (() => boolean) | null;
+  reassureAfterMs: number;
+  reassureIntervalMs: number;
+  /** Called with the elapsed wait each time a reassurance line is due. */
+  onReassure: (elapsedMs: number) => void;
+}): Promise<UpgradeWaitOutcome> {
+  const {
+    baseline, daemonStatus, pollIntervalMs, sleep, upgradeAlive,
+    reassureAfterMs, reassureIntervalMs, onReassure,
+  } = opts;
+
+  let elapsedMs = 0;
+  let nextReassureAtMs = reassureAfterMs;
+  let deadPolls = 0;
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // Completion is always checked FIRST, so a successful upgrade wins every
+    // race against its own process exiting.
+    if (isUpgradeComplete(baseline, await daemonStatus())) return 'complete';
+
+    if (upgradeAlive) {
+      if (upgradeAlive()) {
+        deadPolls = 0;
+      } else if (++deadPolls >= UPGRADE_DEATH_CONFIRM_POLLS) {
+        return 'upgrade-died';
+      }
+    }
+
     await sleep(pollIntervalMs);
+    elapsedMs += pollIntervalMs;
+
+    if (elapsedMs >= nextReassureAtMs) {
+      onReassure(elapsedMs);
+      nextReassureAtMs = elapsedMs + reassureIntervalMs;
+    }
   }
-  // One final check after the last sleep so the full timeout is honored.
-  return isUpgradeComplete(baseline, await daemonStatus());
 }
 
 /**
@@ -178,10 +303,14 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     getStorage,
     daemonStatus,
     ensureReady,
+    refreshProxyTarget,
     log,
     errorOut,
-    timeoutMs = DEFAULT_UPGRADE_TIMEOUT_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+    reassureAfterMs = DEFAULT_REASSURE_AFTER_MS,
+    reassureIntervalMs = DEFAULT_REASSURE_INTERVAL_MS,
+    isProcessAlive = defaultIsProcessAlive,
+    currentHost = hostname,
     sleep = defaultSleep,
   } = deps;
 
@@ -220,10 +349,45 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     }
 
     // An upgrade stopped this builder. Wait for it to finish rebuilding.
+    // Best-known session id, available before the wait so the reassurance line
+    // can offer a concrete manual-resume command.
+    const hintId = intent.sessionId ?? result.sessionId ?? resumeId ?? null;
+
     log('');
     log("Builder was stopped by 'lazy upgrade'. Waiting for the new version to finish building...");
+    log('This session is not lost — it resumes here automatically when the upgrade completes.');
     const baseline = await daemonStatus();
-    const ready = await waitForUpgradeComplete({ baseline, daemonStatus, timeoutMs, pollIntervalMs, sleep });
+
+    // Only trust a pid stamped on THIS host: with a shared store the intent may
+    // have been written on a different machine, where the pid is meaningless
+    // (and might even name an unrelated live process). No usable pid → the wait
+    // simply never ends on its own, which is the safe default.
+    const upgradeAlive =
+      intent.upgradePid != null && (!intent.upgradeHost || intent.upgradeHost === currentHost())
+        ? () => isProcessAlive(intent.upgradePid as number)
+        : null;
+
+    const outcome = await waitForUpgradeComplete({
+      baseline,
+      daemonStatus,
+      pollIntervalMs,
+      sleep,
+      upgradeAlive,
+      reassureAfterMs,
+      reassureIntervalMs,
+      onReassure: (elapsedMs) => {
+        log('');
+        log(`Still waiting for 'lazy upgrade' to finish (${formatWaited(elapsedMs)} so far). This is not stuck —`);
+        log('a full rebuild can take a while. Your builder session will resume here on its own.');
+        if (hintId) {
+          log(`If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume ${hintId}`);
+        } else {
+          log('If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume <id>');
+          log('  (find session ids with: lazy builder list)');
+        }
+      },
+    });
+    const ready = outcome === 'complete';
 
     // Resolve which session to resume: prefer the id stamped on the intent, then
     // the child's own detection, then the id the child was actually launched with
@@ -231,7 +395,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     // captured builder conversation. Keeping `resumeId` ahead of the global
     // newest-conversation fallback prevents resuming an unrelated session when
     // the stamp is missing.
-    let resolvedId = intent.sessionId ?? result.sessionId ?? resumeId ?? null;
+    let resolvedId = hintId;
     const postStorage = ready ? await getStorage() : null;
     if (!resolvedId && postStorage) {
       try {
@@ -246,8 +410,15 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
       // Fail hard and actionable; LEAVE the intent in place so it's discoverable
       // and the human can resume manually once the upgrade settles.
       if (!ready) {
+        // The ONLY non-success exit from the wait: the upgrade process is gone
+        // and the daemon never came back with the new version. Say that — it
+        // points at a real, fixable failure (a missing credential, a failed
+        // image build) — rather than blaming a timer.
         errorOut('');
-        errorOut(`Timed out waiting for 'lazy upgrade' to finish (after ${Math.round(timeoutMs / 1000)}s).`);
+        errorOut(`The 'lazy upgrade' process exited without completing the upgrade.`);
+        errorOut('The daemon never came back with the new version, so this builder was not relaunched.');
+        errorOut('Check the terminal you ran the upgrade in for the failure (a missing model');
+        errorOut('credential and a failed image build are the usual causes), then re-run `lazy upgrade`.');
       } else if (!postStorage) {
         errorOut('');
         errorOut('Could not reach storage to resume the builder after the upgrade.');
@@ -255,7 +426,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
         errorOut('');
         errorOut('Could not determine which builder session to resume after the upgrade.');
       }
-      const hint = resolvedId ?? intent.sessionId ?? result.sessionId ?? null;
+      const hint = resolvedId ?? hintId;
       if (hint) {
         errorOut(`Resume it manually once the upgrade completes:`);
         errorOut(`  lazy builder --resume ${hint}`);
@@ -264,6 +435,30 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
         errorOut(`  (find session ids with: lazy builder list)`);
       }
       // Suppress the normal footer — we already printed actionable guidance.
+      return { exitCode: 1, sessionId: null };
+    }
+
+    // Re-resolve the live proxy address against the daemon that came back.
+    // The wait above returned only once the NEW daemon was serving, so this is
+    // the first moment the correct address exists — and the last moment before
+    // the child is launched with it. Done BEFORE ensureReady (fail fast, ahead
+    // of a possible image build) and before the intent is consumed, so a
+    // failure leaves the session recoverable by hand.
+    try {
+      await refreshProxyTarget();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errorOut('');
+      errorOut('The upgrade finished, but the builder was NOT relaunched: lazy could not');
+      errorOut("resolve the restarted daemon's proxy address for the new session.");
+      errorOut('');
+      errorOut(msg);
+      errorOut('');
+      errorOut('Relaunching anyway would point the builder at a dead endpoint and every');
+      errorOut('model call would fail, so lazy stopped instead.');
+      // resolvedId is known non-null here (the guard above returned otherwise).
+      errorOut(`Resume it once the daemon is healthy:`);
+      errorOut(`  lazy builder --resume ${resolvedId}`);
       return { exitCode: 1, sessionId: null };
     }
 

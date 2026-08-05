@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('lazy show', () => {
   let ctx: TestContext;
@@ -38,7 +38,7 @@ describe('lazy show', () => {
     const result = await ctx.lazy(['show', 'nonexist0']);
 
     expectFailure(result);
-    expectError(result, 'No task or conversation found matching');
+    expectError(result, 'No task, conversation, or file found matching');
   });
 
   test('shows usage when no arguments', async () => {
@@ -71,6 +71,53 @@ describe('lazy show', () => {
     const json = JSON.parse(result.stdout);
     expect(json.goal).toBe('View JSON task');
     expect(json.prompt).toBe('Test view with JSON');
+  });
+
+  // --- Chunked turn grouping (view vs show parity with `lazy review`) ---
+  // `lazy view` groups turns into review chunks by default (mirroring the
+  // `lazy review` TUI, which groups by default); `lazy show` stays flat by
+  // default so its text output is undisturbed for scripts. `--chunks`/`--flat`
+  // force either mode on both names.
+
+  test('view groups turns into chunks by default', async () => {
+    const taskId = await createTask(ctx, 'Chunk default task', 'Test chunked default');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const result = await ctx.lazy(['view', taskId]);
+    expectSuccess(result);
+    expectOutput(result, 'Turns (chunked):');
+    expectOutput(result, 'Chunk 1');
+  });
+
+  test('show lists turns flat by default (unchanged)', async () => {
+    const taskId = await createTask(ctx, 'Flat default task', 'Test flat default');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const result = await ctx.lazy(['show', taskId]);
+    expectSuccess(result);
+    expectOutput(result, 'Turns:');
+    expectOutputExcludes(result, 'Turns (chunked):');
+    expectOutputExcludes(result, 'Chunk 1');
+  });
+
+  test('view --flat forces the flat turn list', async () => {
+    const taskId = await createTask(ctx, 'View flat task', 'Test view flat override');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const result = await ctx.lazy(['view', taskId, '--flat']);
+    expectSuccess(result);
+    expectOutput(result, 'Turns:');
+    expectOutputExcludes(result, 'Turns (chunked):');
+  });
+
+  test('show --chunks forces the chunked grouping', async () => {
+    const taskId = await createTask(ctx, 'Show chunks task', 'Test show chunks override');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const result = await ctx.lazy(['show', taskId, '--chunks']);
+    expectSuccess(result);
+    expectOutput(result, 'Turns (chunked):');
+    expectOutput(result, 'Chunk 1');
   });
 
   // --- JSON output tests ---
@@ -114,7 +161,6 @@ describe('lazy show', () => {
       expect(Array.isArray(json.commits)).toBe(true);
       expect(Array.isArray(json.comments)).toBe(true);
       expect(Array.isArray(json.children)).toBe(true);
-      expect(Array.isArray(json.proposals)).toBe(true);
 
       // Comment should be present
       expect(json.comments.length).toBe(1);

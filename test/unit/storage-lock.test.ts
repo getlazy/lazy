@@ -36,6 +36,23 @@ describe('StorageLock', () => {
     lock.release();
   });
 
+  test('acquire failure names the holder pid, not just the lock path', async () => {
+    // INVARIANT: the storage-lock failure must identify WHO holds the lock (pid +
+    // command), so a misconfigured external_path that collides with another
+    // project's daemon is self-diagnosing — not just "here is a path". Simulate a
+    // live foreign holder by writing a lock file owned by pid 1 (always alive).
+    mkdirSync(lockDir, { recursive: true });
+    const { writeFileSync } = await import('fs');
+    writeFileSync(
+      join(lockDir, '.storage-lock'),
+      JSON.stringify({ pid: 1, acquired_at: new Date().toISOString() }, null, 2) + '\n',
+    );
+
+    const lock = new StorageLock(tempDir, lockDir);
+    await expect(lock.acquire()).rejects.toThrow('held by process pid 1');
+    await expect(lock.acquire()).rejects.toThrow('external_path');
+  }, 20_000); // ~6s: runs the full 50-attempt retry loop before failing.
+
   test('lock is re-entrant within same process', async () => {
     mkdirSync(lockDir, { recursive: true });
 

@@ -1,13 +1,15 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 describe('lazy redo', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: nothing here can execute the pre-accept agent turn.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
@@ -59,11 +61,9 @@ describe('lazy redo', () => {
   test('redo a started task with --no-start', async () => {
     const taskId = await createTask(ctx, 'Started task to redo', 'Do some work');
 
-    // Start the task (creates session + worktree)
-    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    expectSuccess(startResult);
+    // Start the task (creates session + worktree) and drive the reconcile pass
+    // that moves it out of 'working' -- redo cannot close a working task.
+    await startAndReconcile(ctx, taskId);
 
     // Redo the task
     const result = await ctx.lazy(['redo', taskId, '--no-start']);
@@ -112,11 +112,8 @@ describe('lazy redo', () => {
   test('fails for completed task', async () => {
     const taskId = await createTask(ctx, 'Completed task', 'Implement feature');
 
-    // Start and accept the task
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-    await ctx.lazy(['accept', taskId]);
+    // Start, reconcile, and accept the task.
+    await startAndAccept(ctx, taskId);
 
     const result = await ctx.lazy(['redo', taskId]);
 
@@ -173,7 +170,9 @@ describe('lazy redo', () => {
 
 /** Extract new task ID from redo output that contains "Created task XXXXXXXX" */
 function extractNewTaskId(output: string): string {
-  const match = output.match(/Created task ([a-f0-9]{8})/);
+  // A task created with --code is addressed and printed by that code, not by
+  // its hex short id.
+  const match = output.match(/Created task ([a-z0-9][a-z0-9.-]*)/);
   if (!match) {
     throw new Error(`Could not extract new task ID from output: ${output}`);
   }

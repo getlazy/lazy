@@ -3,7 +3,14 @@ import { join } from 'path';
 import { writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, startAndReconcile } from '../helpers/fixtures';
+
+// Every command's stdout ends with a trailing newline, so a bare split('\n')
+// yields one extra empty element. splitLines() drops it, so the counts below
+// are counts of real output lines.
+function splitLines(stdout: string): string[] {
+  return stdout.replace(/\n$/, '').split('\n');
+}
 
 describe('lazy show --lines', () => {
   let ctx: TestContext;
@@ -22,13 +29,13 @@ describe('lazy show --lines', () => {
     // Get full output first to verify we have multiple lines
     const fullResult = await ctx.lazy(['show', taskId]);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
     expect(fullLines.length).toBeGreaterThan(5);
 
     // Get sliced output (lines 2-4)
     const slicedResult = await ctx.lazy(['show', taskId, '--lines', '2..4']);
     expectSuccess(slicedResult);
-    const slicedLines = slicedResult.stdout.split('\n');
+    const slicedLines = splitLines(slicedResult.stdout);
 
     // Should have exactly 3 lines (2, 3, 4)
     expect(slicedLines.length).toBe(3);
@@ -44,12 +51,12 @@ describe('lazy show --lines', () => {
 
     const fullResult = await ctx.lazy(['show', taskId]);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
 
     // Get lines from 3 to end
     const slicedResult = await ctx.lazy(['show', taskId, '--lines', '3..']);
     expectSuccess(slicedResult);
-    const slicedLines = slicedResult.stdout.split('\n');
+    const slicedLines = splitLines(slicedResult.stdout);
 
     // Should have all lines from 3 onwards (0-indexed: 2 onwards)
     expect(slicedLines.length).toBe(fullLines.length - 2);
@@ -61,12 +68,12 @@ describe('lazy show --lines', () => {
 
     const fullResult = await ctx.lazy(['show', taskId]);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
 
     // Get lines from start to 3
     const slicedResult = await ctx.lazy(['show', taskId, '--lines', '..3']);
     expectSuccess(slicedResult);
-    const slicedLines = slicedResult.stdout.split('\n');
+    const slicedLines = splitLines(slicedResult.stdout);
 
     // Should have exactly 3 lines (1, 2, 3)
     expect(slicedLines.length).toBe(3);
@@ -96,7 +103,7 @@ describe('lazy show --lines', () => {
 
     const fullResult = await ctx.lazy(['show', taskId]);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
 
     // Request lines beyond the actual output
     const result = await ctx.lazy(['show', taskId, '--lines', '1000..2000']);
@@ -122,22 +129,19 @@ describe('lazy diff --lines', () => {
     const taskId = await createTask(ctx, 'Diff lines test', 'Make changes');
 
     // Start task and make some changes
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    await ctx.lazy(['show', taskId]);
+    // Daemonless: drive the reconcile pass that records the agent turn.
+    await startAndReconcile(ctx, taskId);
 
     // Get full diff first
     const fullResult = await ctx.lazy(['diff', taskId, '--full']);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
     expect(fullLines.length).toBeGreaterThan(3);
 
     // Get sliced diff (lines 1-3)
     const slicedResult = await ctx.lazy(['diff', taskId, '--full', '--lines', '1..3']);
     expectSuccess(slicedResult);
-    const slicedLines = slicedResult.stdout.split('\n');
+    const slicedLines = splitLines(slicedResult.stdout);
 
     expect(slicedLines.length).toBe(3);
     expect(slicedLines[0]).toBe(fullLines[0]);
@@ -148,16 +152,13 @@ describe('lazy diff --lines', () => {
   test('slices stat diff output', async () => {
     const taskId = await createTask(ctx, 'Stat diff lines test', 'Make changes');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    await ctx.lazy(['show', taskId]);
+    // Daemonless: drive the reconcile pass that records the agent turn.
+    await startAndReconcile(ctx, taskId);
 
     // Get sliced stat diff
     const result = await ctx.lazy(['diff', taskId, '--lines', '1..2']);
     expectSuccess(result);
-    const lines = result.stdout.split('\n');
+    const lines = splitLines(result.stdout);
 
     // Should have exactly 2 lines
     expect(lines.length).toBe(2);
@@ -166,22 +167,19 @@ describe('lazy diff --lines', () => {
   test('works with --turn flag', async () => {
     const taskId = await createTask(ctx, 'Turn diff lines test', 'Make changes');
 
-    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-    });
-
-    await ctx.lazy(['show', taskId]);
+    // Daemonless: drive the reconcile pass that records the agent turn.
+    await startAndReconcile(ctx, taskId);
 
     // Get full turn diff first
     const fullResult = await ctx.lazy(['diff', taskId, '--turn', 'latest']);
     expectSuccess(fullResult);
-    const fullLines = fullResult.stdout.split('\n');
+    const fullLines = splitLines(fullResult.stdout);
 
     if (fullLines.length > 2) {
       // Get sliced turn diff
       const slicedResult = await ctx.lazy(['diff', taskId, '--turn', 'latest', '--lines', '1..2']);
       expectSuccess(slicedResult);
-      const slicedLines = slicedResult.stdout.split('\n');
+      const slicedLines = splitLines(slicedResult.stdout);
 
       expect(slicedLines.length).toBe(2);
       expect(slicedLines[0]).toBe(fullLines[0]);

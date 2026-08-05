@@ -8,9 +8,10 @@
 import type { SearchResult } from '../../storage';
 import type { Storage } from '../../storage/interface';
 import Fuse from 'fuse.js';
+import { turnText } from '../../utils/turn-content';
 
 export interface SearchableItem {
-  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'conversation';
+  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'conversation' | 'memory';
   taskId: string;
   taskCode: string | null;
   taskGoal: string;
@@ -95,7 +96,7 @@ export async function getAllSearchableContent(storage: Storage): Promise<Searcha
           taskId: task.id,
           taskCode: task.code,
           taskGoal: task.goal,
-          content: turn.content,
+          content: turnText(turn),
           context: `Turn ${turn.sequence} (${turn.role})`,
         });
       }
@@ -139,6 +140,20 @@ export async function getAllSearchableContent(storage: Storage): Promise<Searcha
         });
       }
     }
+  }
+
+  // Memory records are project-level, not per-task: taskId/taskGoal carry the
+  // record's own identity so results still render a useful line.
+  const memories = await storage.listMemories();
+  for (const memory of memories) {
+    items.push({
+      type: 'memory',
+      taskId: memory.name,
+      taskCode: null,
+      taskGoal: `memory: ${memory.name}`,
+      content: `${memory.name}\n${memory.description}\n${memory.body}`,
+      context: `Memory (${memory.type})`,
+    });
   }
 
   return items;

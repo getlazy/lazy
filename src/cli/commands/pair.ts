@@ -16,11 +16,13 @@ import {
 import { runClaude } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, preflightRoleTarget, targetEnvVars, anthropicEnvVarsFromProcess } from '../../utils/role-target';
+import { withLiveProxyTarget } from '../../daemon/auth-env';
 import { createDriver } from '../../remote';
 import { isOfflineMode } from '../../utils/offline';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
+import { markMachineOneshotPrompt } from '../../import/machine-oneshot';
 import { getActor } from '../../constants';
 import { spawn } from '../../utils/spawn';
 
@@ -220,7 +222,15 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
   if (pairTarget.model) {
     claudeArgs.push('--model', pairTarget.model);
   }
-  const pairEnvVars = targetEnvVars(pairTarget, anthropicEnvVarsFromProcess());
+  // 'host': pair runs Claude Code as a HOST process even on a docker-runner
+  // project, so every address it is handed must be host-reachable — the same
+  // conversion preflight probed. See LaunchSurface in utils/role-target.
+  const pairEnvVars = targetEnvVars(
+    await withLiveProxyTarget(pairTarget, config),
+    anthropicEnvVarsFromProcess(),
+    'host',
+    { role: "builder" },
+  );
 
   // Launch Claude Code interactively in the current directory
   const proc = spawn(claudeArgs, {
@@ -536,7 +546,15 @@ export async function commandPair(args: string[]): Promise<void> {
       if (pairTarget.model) {
         claudeArgs.push('--model', pairTarget.model);
       }
-      const pairEnvVars = targetEnvVars(pairTarget, anthropicEnvVarsFromProcess());
+      // 'host': pair runs Claude Code as a HOST process even on a docker-runner
+  // project, so every address it is handed must be host-reachable — the same
+  // conversion preflight probed. See LaunchSurface in utils/role-target.
+  const pairEnvVars = targetEnvVars(
+    await withLiveProxyTarget(pairTarget, config),
+    anthropicEnvVarsFromProcess(),
+    'host',
+    { role: "builder" },
+  );
 
       // Launch Claude Code interactively in the worktree. Use ASYNC spawn +
       // await (not spawnSync): inherited stdio still gives a normal interactive
@@ -646,11 +664,18 @@ export async function commandPair(args: string[]): Promise<void> {
     // and summarization is not explicitly disabled.
     if (contextParts.length > 0 && !noSummary) {
       try {
-        const summaryPrompt = `Summarize this pairing session in 2-3 sentences. Focus on what was discussed, decided, and accomplished.
+        // Marked as a machine one-shot for the same reason as the accept
+        // fidelity summary and `lazy report`: this is lazy talking to itself,
+        // not a conversation anyone will read back. Its output already lands on
+        // the task as a turn, so capturing the session too is pure noise in
+        // `lazy builder list`. It goes through runClaude rather than
+        // runClaudeOneshot, so the marker has to be applied here.
+        const summaryPrompt = markMachineOneshotPrompt(
+          `Summarize this pairing session in 2-3 sentences. Focus on what was discussed, decided, and accomplished.
 
 ${contextParts.join('\n\n')}
 
-Keep the summary concise and factual.`;
+Keep the summary concise and factual.`);
 
         console.log(`\n${theme.label('Summarizing pairing session...')}`);
 

@@ -1,23 +1,40 @@
 /**
  * import-conversation command
  *
- * Imports Claude Code conversation logs into lazy as persisted
- * development context. Conversations are stored via the Storage interface.
+ * Imports Claude Code conversation logs into lazy as persisted development
+ * context. Conversations are stored via the Storage interface.
+ *
+ * This is the single surface for bringing Claude Code history into the store —
+ * per-session and bulk are the same feature. Discovery spans every candidate
+ * Claude projects dir for this repo (the shared `~/.claude/projects` dir AND the
+ * per-builder isolation dirs under `<data>/builder-projects/<id>/`), deduped to
+ * the best copy of each session — the same multi-root discovery the built-in
+ * recovery (`lazy doctor --reimport-conversations`, an alias) uses. Both paths
+ * share `discoverCandidateSessions`/`reimportConversations` in
+ * `src/import/reimport-conversations.ts`; there is no second parser or scanner.
  *
  * Usage:
- *   lazy import-conversation                  # Auto-discover and import all sessions
+ *   lazy import-conversation                  # Bulk import all new sessions (preview + confirm)
  *   lazy import-conversation <session-id>     # Import a specific session
  *   lazy import-conversation --list           # List available sessions to import
+ *   lazy import-conversation --all            # Re-import everything (including imported)
  */
 
+import { join } from 'path';
 import { requireLazyRoot, requireStorage, parseFlags, type LineRange, sliceLines } from '../helpers';
 import { theme } from '../theme';
+import { isTTY, promptYesNo } from '../editor';
+import { loadConfig } from '../../config/loader';
 import {
-  discoverAllProjectSessions,
   parseConversation,
   extractSummary,
   conversationStats,
 } from '../../import/claude-code-logs';
+import {
+  discoverCandidateSessionsPartitioned,
+  reimportConversations,
+  type CandidateSession,
+} from '../../import/reimport-conversations';
 import { toStoredConversation } from '../../import/conversation-storage';
 import type { Storage } from '../../storage/interface';
 
@@ -28,6 +45,7 @@ export async function commandImportConversation(args: string[]): Promise<void> {
     { name: 'show-imported', takesValue: false },
     { name: 'show', takesValue: true },
     { name: 'all', aliases: ['a'], takesValue: false },
+    { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'import-conversation');
 
   const lazyRoot = requireLazyRoot();
@@ -38,25 +56,38 @@ export async function commandImportConversation(args: string[]): Promise<void> {
     const showImported = parsed.flags.get('show-imported') === true;
     const showSession = parsed.flags.get('show') as string | undefined;
     const allMode = parsed.flags.get('all') === true;
+    const yes = parsed.flags.get('yes') === true;
 
     const sessionIdArg = parsed.positional[0];
 
+    // Read-only views don't need discovery.
     if (showSession) {
       await showConversationTranscript(storage, showSession);
       return;
     }
-
     if (showImported) {
       await showImportedConversations(storage);
       return;
     }
 
-    // Discover available sessions
-    const available = await discoverAllProjectSessions(lazyRoot);
+    const config = await loadConfig(lazyRoot);
+    const dataDirAbs = join(lazyRoot, config.data.path);
+
+    // Discover across every candidate root (shared dir + per-builder isolation
+    // dirs), deduped to the best copy of each session. Machine-generated lazy
+    // one-shots are split off — they are housekeeping, never importable.
+    const { capturable: available, machineOneshots } =
+      await discoverCandidateSessionsPartitioned({ lazyRoot, dataDirAbs });
 
     if (available.length === 0) {
       console.log('No Claude Code sessions found for this project.');
-      console.log(`Looked in: ~/.claude/projects/ for paths matching ${lazyRoot}`);
+      console.log(`Looked in: ~/.claude/projects/ and per-builder isolation dirs for paths matching ${lazyRoot}`);
+      if (machineOneshots.length > 0) {
+        console.log(
+          `(Ignored ${machineOneshots.length} machine-generated lazy one-shot(s) — ` +
+          `fidelity summaries, ${theme.command('lazy report')}, memory compaction.)`,
+        );
+      }
       return;
     }
 
@@ -66,49 +97,152 @@ export async function commandImportConversation(args: string[]): Promise<void> {
     }
 
     if (sessionIdArg) {
-      // Import a specific session
+      // Import a specific session. Naming an exact session is explicit intent —
+      // import it directly (no confirmation prompt).
       const match = available.find((s) => s.sessionId === sessionIdArg || s.sessionId.startsWith(sessionIdArg));
       if (!match) {
+        // Distinguish "no such session" from "deliberately not importable": the
+        // JSONL is right there on disk, so a bare "not found" would look like a
+        // bug in discovery.
+        const oneshot = machineOneshots.find(
+          (s) => s.sessionId === sessionIdArg || s.sessionId.startsWith(sessionIdArg),
+        );
+        if (oneshot) {
+          console.error(
+            `Session ${oneshot.sessionId} is a machine-generated lazy one-shot ` +
+            `(a fidelity summary, ${theme.command('lazy report')} unit, or memory compaction), not a conversation.`,
+          );
+          console.error('Those are deliberately never imported into the conversation store.');
+          process.exit(1);
+        }
         console.error(`Session not found: ${sessionIdArg}`);
         console.error(`Run 'lazy import-conversation --list' to see available sessions.`);
         process.exit(1);
       }
 
-      await importSession(storage, match.projectPath, match.sessionId);
+      await importSession(storage, match);
       return;
     }
 
-    // Default: import all new sessions (or all if --all)
-    let imported = 0;
-    let skipped = 0;
-
-    for (const session of available) {
-      const alreadyImported = await storage.isConversationImported(session.sessionId);
-
-      if (alreadyImported && !allMode) {
-        skipped++;
-        continue;
+    if (allMode) {
+      // `--all` is explicit intent to re-import everything, including sessions
+      // already in the store — import directly.
+      let imported = 0;
+      for (const session of available) {
+        await importSession(storage, session);
+        imported++;
       }
-
-      await importSession(storage, session.projectPath, session.sessionId);
-      imported++;
+      console.log(`\nRe-imported ${imported} session(s).`);
+      return;
     }
 
-    if (imported === 0 && skipped > 0) {
-      console.log(`All ${skipped} session(s) already imported. Use --all to re-import.`);
-    } else if (imported === 0) {
-      console.log('No sessions to import.');
-    } else {
-      console.log(`\nImported ${imported} session(s)${skipped > 0 ? `, ${skipped} already imported` : ''}.`);
-    }
+    // Default bulk: preview → confirm → import only what's missing. Shared with
+    // `lazy doctor --reimport-conversations` so both surfaces behave identically.
+    const { ok } = await runReimportBulk({ lazyRoot, dataDirAbs, storage, yes });
+    if (!ok) process.exit(1);
   } finally {
     await storage.close();
   }
 }
 
-async function importSession(storage: Storage, projectPath: string, sessionId: string): Promise<void> {
+/**
+ * Bulk import orchestration shared by `lazy import-conversation` (no session-id)
+ * and `lazy doctor --reimport-conversations`. Previews what would be imported,
+ * confirms before writing (unless `yes`), then imports the sessions missing from
+ * the store through the given Storage. The caller owns the Storage lifecycle.
+ *
+ * Never writes silently: without `--yes`, a TTY is prompted and a non-TTY is
+ * told to re-run with `--yes` — matching CLAUDE.md's least-surprise rule.
+ */
+export async function runReimportBulk(opts: {
+  lazyRoot: string;
+  dataDirAbs: string;
+  storage: Storage;
+  yes: boolean;
+}): Promise<{ ok: boolean }> {
+  const { lazyRoot, dataDirAbs, storage, yes } = opts;
+
+  const { capturable: candidates, machineOneshots } =
+    await discoverCandidateSessionsPartitioned({ lazyRoot, dataDirAbs });
+  // Say what was ignored rather than quietly shrinking the count — a human who
+  // knows there are 200 JSONLs on disk should not have to guess where they went.
+  const ignoredNote =
+    machineOneshots.length > 0
+      ? ` (ignored ${machineOneshots.length} machine-generated lazy one-shot(s))`
+      : '';
+
+  if (candidates.length === 0) {
+    console.log(`No Claude Code sessions found on disk for this project — nothing to import.${ignoredNote}`);
+    return { ok: true };
+  }
+
+  let toImport = 0;
+  for (const c of candidates) {
+    if (!(await storage.isConversationImported(c.sessionId))) toImport++;
+  }
+
+  console.log(
+    `Found ${candidates.length} session(s) on disk; ${toImport} missing from the store, ` +
+    `${candidates.length - toImport} already imported.${ignoredNote}`,
+  );
+
+  if (toImport === 0) {
+    console.log(theme.success('Store is already up to date — nothing to import.'));
+    return { ok: true };
+  }
+
+  if (!yes) {
+    if (!isTTY()) {
+      console.log(`Re-run with ${theme.command('--yes')} to import them (non-interactive).`);
+      return { ok: true };
+    }
+    const proceed = await promptYesNo(`Import ${toImport} conversation(s) into the store?`, true);
+    if (!proceed) {
+      console.log('Aborted — nothing was imported.');
+      return { ok: true };
+    }
+  }
+
+  const report = await reimportConversations({
+    lazyRoot,
+    dataDirAbs,
+    storage,
+    onImported: (info) => {
+      const shortId = info.sessionId.substring(0, 8);
+      const started = info.startedAt ? info.startedAt.replace('T', ' ').substring(0, 16) : 'unknown';
+      console.log(
+        theme.success(`  Imported ${shortId}`) +
+        `  ${started}  ${info.messageCount} msgs, ${info.totalTokens} tokens`,
+      );
+    },
+  });
+
+  console.log('');
+  console.log(
+    `Import complete: ${report.imported.length} imported, ` +
+    `${report.skippedAlready.length} already present, ` +
+    `${report.skippedEmpty.length} empty/unparseable skipped.`,
+  );
+  if (report.skippedEmpty.length > 0) {
+    console.log(theme.warning(`  Skipped (no content): ${report.skippedEmpty.map(s => s.substring(0, 8)).join(', ')}`));
+  }
+  if (report.errors.length > 0) {
+    console.log(theme.error(`  ${report.errors.length} session(s) failed to import:`));
+    for (const { sessionId, error } of report.errors) {
+      console.log(theme.error(`    ${sessionId.substring(0, 8)}: ${error.message}`));
+    }
+    return { ok: false };
+  }
+
+  return { ok: true };
+}
+
+async function importSession(storage: Storage, session: CandidateSession): Promise<void> {
+  const { projectPath, sessionId, projectsDirRoot } = session;
   try {
-    const conversation = await parseConversation(projectPath, sessionId);
+    // Parse from the root the session actually lives in — a session that only
+    // exists in an isolation dir would be invisible to the shared-dir default.
+    const conversation = await parseConversation(projectPath, sessionId, projectsDirRoot);
     const summary = extractSummary(conversation);
     const stats = conversationStats(conversation);
 
@@ -132,7 +266,7 @@ async function importSession(storage: Storage, projectPath: string, sessionId: s
 
 async function listAvailableSessions(
   storage: Storage,
-  available: Array<{ projectPath: string; sessionId: string }>
+  available: CandidateSession[],
 ): Promise<void> {
   console.log(`Found ${available.length} Claude Code session(s):\n`);
 
@@ -142,7 +276,7 @@ async function listAvailableSessions(
     const status = alreadyImported ? '[imported]' : '[new]     ';
 
     try {
-      const conversation = await parseConversation(session.projectPath, session.sessionId);
+      const conversation = await parseConversation(session.projectPath, session.sessionId, session.projectsDirRoot);
       const summary = extractSummary(conversation);
       const stats = conversationStats(conversation);
 
@@ -246,9 +380,16 @@ Import Claude Code conversation logs as development context.
 Conversations are stored in the configured storage location and tracked
 alongside task data. They serve as a persisted record of interactive
 Claude Code sessions - the reasoning, exploration, and decisions that
-happened during development.
+happened during development. Adopting lazy on a repo that already has Claude
+Code history means inheriting that history as builder memory.
 
-Builder sessions are captured automatically when 'lazy builder' exits.
+Discovery spans every Claude projects dir for this repo: the shared
+~/.claude/projects dir AND the per-builder isolation dirs (so a session that
+only lives in an isolation dir is still importable). When the same session
+appears in several dirs, the most complete copy is used.
+
+Builder sessions are captured automatically when 'lazy builder' exits; this
+command imports history that predates lazy or that recovery left behind.
 
 Arguments:
   [session-id]     Import a specific session (can be shortened)
@@ -256,15 +397,19 @@ Arguments:
 Options:
   --list, -l            List available sessions to import
   --all, -a             Re-import all sessions (including already imported)
+  --yes, -y             Skip the confirmation prompt on bulk import
   --show-imported       Show already imported conversations (table)
   --show <session-id>   Show full interleaved conversation transcript
 
-Auto-discovery:
+Bulk import:
   Without arguments, discovers all Claude Code sessions for this project
-  (including worktree sessions) and imports any that haven't been imported yet.
+  (including worktree and isolation-dir sessions), previews what would be
+  imported, and asks for confirmation before importing any that are new.
+  This is the same recovery flow as 'lazy doctor --reimport-conversations'.
 
 Examples:
-  lazy import-conversation              # Import all new sessions
+  lazy import-conversation              # Preview + import all new sessions
+  lazy import-conversation --yes        # Import all new sessions, no prompt
   lazy import-conversation --list       # List available sessions
   lazy import-conversation bc77e1b1     # Import specific session
   lazy import-conversation --all        # Re-import everything

@@ -112,8 +112,9 @@ function statusOrder(status: string): number {
     case 'working': return 5;
     case 'interrupted': return 6;
     case 'zombie': return 7;
-    case 'backlog': return 8;
-    default: return 9;
+    case 'queued': return 8;
+    case 'backlog': return 9;
+    default: return 10;
   }
 }
 

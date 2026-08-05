@@ -23,7 +23,7 @@ function makeConfig(): ResolvedConfig {
   return {
     agent: { watchdog_output_timeout_ms: 0 },
     permissions: { protected: [] },
-  automation: { maintain: [] },
+  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
   mounts: [],
     checks: { post_turn: '', post_turn_timeout: 300 },
   } as unknown as ResolvedConfig;

@@ -25,6 +25,8 @@ import type { DashboardStats, TaskWithSession, ChartDataPoint, ActiveTaskInfo, A
 import { taskRefFromId } from '../cli/helpers';
 import { parentTaskIdOf } from '../task-target';
 import { MAX_PORT_ATTEMPTS } from '../config/constants';
+import { DAEMON_IDLE_TIMEOUT_S, WEB_REQUEST_DEADLINE_MS } from '../daemon/heartbeat';
+import { turnText } from '../utils/turn-content';
 
 function html(content: string, status: number = 200): Response {
   return new Response(content, {
@@ -353,7 +355,7 @@ async function handleDashboard(storage: Storage): Promise<Response> {
         const turns = await storage.getSessionTurns(session.id);
         if (turns.length > 0) {
           const lastTurn = turns[turns.length - 1];
-          lastTurnSummary = lastTurn.content.replace(/\s+/g, ' ').trim();
+          lastTurnSummary = turnText(lastTurn).replace(/\s+/g, ' ').trim();
         }
       }
       return { task, session, lastTurnSummary };
@@ -657,87 +659,160 @@ function matchRoute(path: string, pattern: string): Record<string, string> | nul
 }
 
 /**
+ * Race a dashboard request against {@link WEB_REQUEST_DEADLINE_MS}.
+ *
+ * Every route below reads storage proportionally to project size — the
+ * dashboard and `/api/activity` walk every task and every turn, and a commit
+ * page spawns `git diff`. On a large project under load, none of them is
+ * *structurally* bounded below the listener's `idleTimeout`, and an unbounded
+ * request on Bun.serve does not fail: it is reaped mid-flight, leaving the
+ * browser with a closed socket and the user with no idea why.
+ *
+ * The daemon's RPC and MCP routes solve this with the heartbeat envelope, which
+ * is not available here — a browser cannot opt in via `X-Lazy-Heartbeat` and
+ * cannot read NDJSON. So the dashboard gets a deadline instead, landing inside
+ * the idle timeout so the failure is always an HTTP response the user can read
+ * rather than a silent reap. That makes "bounded under the idle timeout" true
+ * for these routes by construction rather than by hope.
+ *
+ * The in-flight work is deliberately NOT cancelled: these routes are read-only,
+ * the read will finish and be discarded, and there is no cancellation token to
+ * thread through storage anyway.
+ */
+async function withWebRequestDeadline(
+  path: string,
+  work: Promise<Response>,
+  deadlineMs: number,
+): Promise<Response> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<Response>(resolve => {
+    timer = setTimeout(() => {
+      const seconds = Math.round(deadlineMs / 1000);
+      const message =
+        `This page took longer than ${seconds}s to build and was stopped before the ` +
+        `daemon's connection timeout could kill it silently. This usually means the ` +
+        `project has grown large enough that a full dashboard render is expensive, or ` +
+        `the storage backend is slow or unreachable. Try a narrower view (a single task ` +
+        `page rather than the dashboard), and check \`lazy doctor\`.`;
+      logger.error(`Web request exceeded ${seconds}s deadline: ${path}`);
+      resolve(
+        path.startsWith('/api/')
+          ? Response.json({ error: message }, { status: 503 })
+          : html(errorHtml('Request Timed Out', message), 503),
+      );
+    }, deadlineMs);
+  });
+
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    // Always cleared — an uncleared interval/timeout keeps the daemon's event
+    // loop scheduling work for every request it ever served.
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Create the web dashboard request handler for a given storage instance.
  *
  * This handler serves HTML pages and JSON API endpoints for the web dashboard.
  * It's used by the daemon's TCP-bound web server, which is the only thing that
  * serves the dashboard (`lazy server` is a thin alias that prints its URL).
+ *
+ * ROUTE BOUNDING (see the daemon route table in src/daemon/server.ts):
+ * every route here is storage-proportional and therefore NOT structurally
+ * bounded below the listener idle timeout on a large project. None can be
+ * heartbeat-framed (the client is a browser). They are bounded instead by
+ * {@link withWebRequestDeadline}, which applies uniformly to all of them —
+ * including the 404 and the error path — so no route is left unaccounted for
+ * when a new one is added below.
+ *
+ * `options.deadlineMs` exists so tests can compress the deadline the way
+ * `heartbeatEnvelopeResponse`'s `intervalMs` does — production never passes it.
  */
-export function createWebRequestHandler(storage: Storage): (req: Request) => Promise<Response> {
+export function createWebRequestHandler(
+  storage: Storage,
+  options?: { deadlineMs?: number },
+): (req: Request) => Promise<Response> {
+  const deadlineMs = options?.deadlineMs ?? WEB_REQUEST_DEADLINE_MS;
   return async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
-
-    try {
-
-      // HTML routes
-      if (path === '/') {
-        return await handleDashboard(storage);
-      }
-
-      if (path === '/tasks') {
-        return await handleTaskList(storage, url);
-      }
-
-      if (path === '/search') {
-        return await handleSearch(storage, url);
-      }
-
-      // Task PR page: /tasks/:id/pr
-      let params = matchRoute(path, '/tasks/:id/pr');
-      if (params) {
-        return await handleTaskPr(storage, params.id);
-      }
-
-      // Commit detail: /tasks/:id/commits/:commitId
-      params = matchRoute(path, '/tasks/:id/commits/:commitId');
-      if (params) {
-        return await handleCommitDetail(storage, params.id, params.commitId, url);
-      }
-
-      // Turn detail: /tasks/:id/turns/:sequence
-      params = matchRoute(path, '/tasks/:id/turns/:sequence');
-      if (params) {
-        const seq = parseInt(params.sequence, 10);
-        if (isNaN(seq)) {
-          return html(errorHtml('Bad Request', 'Invalid turn sequence'), 400);
-        }
-        return await handleTurnDetail(storage, params.id, seq);
-      }
-
-      // Prompt version: /tasks/:id/prompts/:version
-      params = matchRoute(path, '/tasks/:id/prompts/:version');
-      if (params) {
-        return await handlePromptVersion(storage, params.id, params.version);
-      }
-
-      // Task detail: /tasks/:id (must be after sub-routes)
-      params = matchRoute(path, '/tasks/:id');
-      if (params) {
-        return await handleTaskDetail(storage, params.id);
-      }
-
-      // JSON API routes
-      if (path === '/api/activity') {
-        return await handleApiActivity(storage);
-      }
-
-      if (path === '/api/tasks') {
-        return await handleApiTaskList(storage, url);
-      }
-
-      params = matchRoute(path, '/api/tasks/:id');
-      if (params) {
-        return await handleApiTaskDetail(storage, params.id);
-      }
-
-      return html(errorHtml('Not Found', 'Page not found'), 404);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error(`Server error: ${message}`);
-      return html(errorHtml('Server Error', message), 500);
-    }
+    return withWebRequestDeadline(path, routeWebRequest(storage, url, path), deadlineMs);
   };
+}
+
+/** The route table itself. Bounded by its caller — see {@link createWebRequestHandler}. */
+async function routeWebRequest(storage: Storage, url: URL, path: string): Promise<Response> {
+  try {
+
+    // HTML routes
+    if (path === '/') {
+      return await handleDashboard(storage);
+    }
+
+    if (path === '/tasks') {
+      return await handleTaskList(storage, url);
+    }
+
+    if (path === '/search') {
+      return await handleSearch(storage, url);
+    }
+
+    // Task PR page: /tasks/:id/pr
+    let params = matchRoute(path, '/tasks/:id/pr');
+    if (params) {
+      return await handleTaskPr(storage, params.id);
+    }
+
+    // Commit detail: /tasks/:id/commits/:commitId
+    params = matchRoute(path, '/tasks/:id/commits/:commitId');
+    if (params) {
+      return await handleCommitDetail(storage, params.id, params.commitId, url);
+    }
+
+    // Turn detail: /tasks/:id/turns/:sequence
+    params = matchRoute(path, '/tasks/:id/turns/:sequence');
+    if (params) {
+      const seq = parseInt(params.sequence, 10);
+      if (isNaN(seq)) {
+        return html(errorHtml('Bad Request', 'Invalid turn sequence'), 400);
+      }
+      return await handleTurnDetail(storage, params.id, seq);
+    }
+
+    // Prompt version: /tasks/:id/prompts/:version
+    params = matchRoute(path, '/tasks/:id/prompts/:version');
+    if (params) {
+      return await handlePromptVersion(storage, params.id, params.version);
+    }
+
+    // Task detail: /tasks/:id (must be after sub-routes)
+    params = matchRoute(path, '/tasks/:id');
+    if (params) {
+      return await handleTaskDetail(storage, params.id);
+    }
+
+    // JSON API routes
+    if (path === '/api/activity') {
+      return await handleApiActivity(storage);
+    }
+
+    if (path === '/api/tasks') {
+      return await handleApiTaskList(storage, url);
+    }
+
+    params = matchRoute(path, '/api/tasks/:id');
+    if (params) {
+      return await handleApiTaskDetail(storage, params.id);
+    }
+
+    return html(errorHtml('Not Found', 'Page not found'), 404);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error(`Server error: ${message}`);
+    return html(errorHtml('Server Error', message), 500);
+  }
 }
 
 /**
@@ -764,7 +839,10 @@ export function tryBindTcpPort(
         hostname,
         port: tryPort,
         fetch: handler,
-        idleTimeout: 120,
+        // Same ceiling as the unix-socket listener. Long /rpc and /mcp calls are
+        // kept alive by the heartbeat envelope, not by this value — see
+        // src/daemon/heartbeat.ts for why no idleTimeout can cover them.
+        idleTimeout: DAEMON_IDLE_TIMEOUT_S,
       });
       if (tryPort !== port) {
         logger.info(`Port ${port} was busy, using port ${tryPort} instead`);

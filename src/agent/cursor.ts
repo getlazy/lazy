@@ -13,6 +13,13 @@
 
 import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
+import { safeArgvPrompt } from './argv-safety';
+import {
+  classifyCommonFailureSignals,
+  failureHaystack,
+  type AgentFailure,
+  type AgentFailureInput,
+} from './failure-taxonomy';
 
 export class CursorAgent implements Agent {
   readonly id = 'cursor';
@@ -40,6 +47,8 @@ export class CursorAgent implements Agent {
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
     effort?: string;
+    /** Claude-Code-specific; not applicable to Cursor (gated out upstream). */
+    extraArgs?: string[];
   }): string[] {
     // Cursor CLI uses 'agent' binary with --print for headless mode.
     // No --append-system-prompt — prepend system prompt to user prompt instead.
@@ -66,8 +75,9 @@ export class CursorAgent implements Agent {
       args.push('--model', opts.modelId);
     }
 
-    // Prompt must be the last positional argument
-    args.push(prompt);
+    // Prompt must be the last positional argument. A raw NUL anywhere in argv
+    // is fatal to the spawn, so escape rather than let the turn crash-loop.
+    args.push(safeArgvPrompt(prompt, 'prompt'));
 
     return args;
   }
@@ -105,10 +115,52 @@ export class CursorAgent implements Agent {
     );
   }
 
+  /**
+   * Cursor-specific failure classification.
+   *
+   * Cursor authenticates via CURSOR_API_KEY or an `agent login` session, so a
+   * missing/expired login is its distinctive fatal case. Everything else falls
+   * through to the shared HTTP/network signals.
+   */
+  classifyFailure(input: AgentFailureInput): AgentFailure {
+    const text = failureHaystack(input);
+
+    if (
+      text.includes('not logged in') ||
+      text.includes('please run `agent login`') ||
+      text.includes('please run agent login') ||
+      text.includes('invalid cursor_api_key') ||
+      text.includes('no api key')
+    ) {
+      return { class: 'fatal_auth', reason: 'Cursor CLI is not authenticated' };
+    }
+
+    if (text.includes('unknown option') || text.includes('unknown model')) {
+      return { class: 'fatal_config', reason: 'Cursor rejected the invocation (model or flag)' };
+    }
+
+    return (
+      classifyCommonFailureSignals(input) ?? {
+        class: 'unknown',
+        reason: 'unrecognized Cursor failure',
+      }
+    );
+  }
+
   defaultWatchdogTimeoutMs(): number {
     // Cursor CLI has a known hanging bug in --print mode.
     // Default to 5 minutes of no output before killing the process.
     return 5 * 60 * 1000;
+  }
+
+  activityStream(): null {
+    // No incremental event stream: `agent --print --output-format json` emits a
+    // single blob at exit. The watchdog therefore keeps its byte-level
+    // behavior for Cursor — any output is liveness, and the 5-minute default
+    // above is what catches the --print hang. Do not "upgrade" this without a
+    // format that actually streams; returning a stream the agent doesn't
+    // produce would make every Cursor turn look silent.
+    return null;
   }
 
   discoverSessionFiles(_opts: {

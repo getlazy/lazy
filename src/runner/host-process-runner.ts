@@ -17,6 +17,7 @@ import { spawn } from '../utils/spawn';
 import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RoleTarget } from '../config/types';
+import type { BuilderLaunchProjects } from '../builder/projects-isolation';
 import { getAuthEnvVars as getDefaultAuthEnvVars } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { encodeProjectPath } from '../import/claude-code-logs';
@@ -25,10 +26,13 @@ import {
   checkTargetConnectivity,
   preflightRoleTarget,
   ANTHROPIC_DEFAULT_TARGET,
+  type ProxyAuditHints,
 } from '../utils/role-target';
 import { getLazyCommand } from '../utils/cli-path';
 import type { Agent } from '../agent/interface';
+import { safeArgvPrompt } from '../agent/argv-safety';
 import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
+import { buildAgentSandboxArgs, type HostPermissionConfig } from './host-sandbox';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
 
@@ -99,6 +103,9 @@ function isProcessAlive(pid: number): boolean {
 
 export class HostProcessRunner implements Runner {
   readonly type = 'dangerously-host-process-without-any-isolation' as const;
+  // An idle host supervisor is a cheap Bun process → exempt from base reap
+  // (still demand-reapable: it occupies a capped slot like any other run).
+  readonly reapsIdleRuns = false;
   readonly runLabel = 'Process';
   private lazyRoot: string | undefined;
 
@@ -108,6 +115,16 @@ export class HostProcessRunner implements Runner {
 
   private _agent?: Agent;
   private _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
+  // Host permission posture. Defaults to the safe sandbox posture so a runner
+  // constructed without explicit config (createRunnerFromType) is never an
+  // accidental full bypass. createRunner() overrides this from lazy.toml.
+  private _hostPermission: HostPermissionConfig = {
+    mode: 'sandbox',
+    allowedDomains: ['*.anthropic.com'],
+    allowWeakerNested: false,
+    denyRead: [],
+    denyWrite: [],
+  };
 
   /** Set the agent to use for auth. If not set, falls back to ClaudeCodeAgent singleton. */
   setAgent(agent: Agent): void {
@@ -117,6 +134,11 @@ export class HostProcessRunner implements Runner {
   /** Set the per-role model targets (builder vs agent backends). */
   setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void {
     this._roleTargets = targets;
+  }
+
+  /** Set the host permission posture (sandbox vs bypass) from lazy.toml. */
+  setHostPermission(cfg: HostPermissionConfig): void {
+    this._hostPermission = cfg;
   }
 
   /** The resolved target for task/supervisor (agent) launches. */
@@ -129,14 +151,22 @@ export class HostProcessRunner implements Runner {
     return this._roleTargets?.builder ?? ANTHROPIC_DEFAULT_TARGET;
   }
 
-  private getAuthEnvVars(target?: RoleTarget): Array<{ key: string; value: string }> {
+  private getAuthEnvVars(
+    target?: RoleTarget,
+    hints?: ProxyAuditHints,
+  ): Array<{ key: string; value: string }> {
     const resolved = target ?? this.agentTarget();
     // Local backends are self-contained; the anthropic path may use the
-    // injected agent's credential (falls back to the default reader).
+    // injected agent's credential (falls back to the default reader). Neither
+    // anthropic nor ollama emits the proxy audit headers, so `hints` only takes
+    // effect on the proxy path via `getDefaultAuthEnvVars`.
     if (resolved.backend === 'anthropic' && this._agent) {
       return this._agent.getAuthEnvVars();
     }
-    return getDefaultAuthEnvVars(resolved);
+    // 'host': this runner launches Claude Code as a plain host process (the
+    // sandbox shares the host network namespace), so it must never receive the
+    // Docker-internal `host.docker.internal` alias. See LaunchSurface.
+    return getDefaultAuthEnvVars(resolved, hints, 'host');
   }
 
   runDisplayName(runName: string): string {
@@ -159,6 +189,34 @@ export class HostProcessRunner implements Runner {
         throw new Error(
           `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
           `Host-process runner requires ${binaryName} to be installed on the host.`
+        );
+      }
+    }
+
+    // Sandbox dependency pre-flight (Linux/WSL2 only; macOS uses built-in
+    // Seatbelt). When permission_mode = "sandbox", Claude Code's bubblewrap
+    // backend needs `bwrap` and `socat`. We do NOT auto-install them — per the
+    // host-first-runner spike, the sandbox failing must be a hard, actionable
+    // error, never a silent fallback to an unsandboxed agent.
+    if (this._hostPermission.mode === 'sandbox' && process.platform === 'linux') {
+      const missing: string[] = [];
+      for (const tool of ['bwrap', 'socat']) {
+        try {
+          const probe = spawn([tool, '--version'], { stdout: 'pipe', stderr: 'pipe', timeout: 10_000 });
+          const code = await probe.exited;
+          // socat --version exits non-zero on some builds but still exists; treat
+          // "binary present" (no spawn throw) as sufficient.
+          if (code !== 0 && tool === 'bwrap') missing.push(tool);
+        } catch {
+          // spawn throws ENOENT when the binary isn't on PATH.
+          missing.push(tool);
+        }
+      }
+      if (missing.length > 0) {
+        throw new Error(
+          `Host sandbox requires ${missing.join(' and ')} on Linux, but ${missing.length > 1 ? 'they are' : 'it is'} not on PATH.\n` +
+          `Install with: sudo apt-get install -y bubblewrap socat (Debian/Ubuntu) or sudo dnf install bubblewrap socat (Fedora).\n` +
+          `Alternatively set [runner] permission_mode = "bypass" in lazy.toml to run without the sandbox (no isolation).`
         );
       }
     }
@@ -191,11 +249,14 @@ export class HostProcessRunner implements Runner {
     protocolDir: string,
     debug?: boolean,
     daemonConfigPath?: string,
+    taskId?: string,
   ): Promise<void> {
     // Fail hard before launch if the agent's backend is unreachable.
     await preflightRoleTarget('agent', this.agentTarget());
 
-    const authEnvVars = this.getAuthEnvVars(this.agentTarget());
+    // Supervisor launches are always the `agent` role; the task turn it runs
+    // inherits this env, so proxied traffic is attributed to agent + task.
+    const authEnvVars = this.getAuthEnvVars(this.agentTarget(), { role: 'agent', taskId });
 
     // Set up log file for this run
     const logDir = join(getHome(), '.lazy', 'logs');
@@ -275,10 +336,14 @@ export class HostProcessRunner implements Runner {
     const effectiveModel =
       model ?? (target.backend !== 'anthropic' ? target.model : undefined);
 
+    // Bypass interactive prompts (headless), then layer the OS sandbox on top in
+    // "sandbox" mode so the agent is confined even though it never prompts. In
+    // "bypass" mode this is just --dangerously-skip-permissions (no sandbox).
     const claudeArgs = [
-      'claude', '-p', prompt,
+      'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
       '--output-format', 'json',
       '--dangerously-skip-permissions',
+      ...buildAgentSandboxArgs(this._hostPermission),
     ];
 
     if (effectiveModel) {
@@ -382,15 +447,24 @@ export class HostProcessRunner implements Runner {
     }
   }
 
-  async stopRun(runName: string): Promise<boolean> {
+  /**
+   * `gracefulTimeoutSeconds` only widens the SIGTERM→SIGKILL window: this runner
+   * is ALREADY graceful (SIGTERM first, escalate after the grace period), so the
+   * default path needs no change to honor the interface's contract. Host-process
+   * builders are never stopped by `lazy upgrade` anyway — there is no container
+   * to rebuild — so the option is effectively task-only here.
+   */
+  async stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean> {
     const pidData = readPidFile(runName);
     if (!pidData) return false;
+
+    const graceMs = Math.max(5_000, (opts?.gracefulTimeoutSeconds ?? 0) * 1000);
 
     try {
       process.kill(pidData.pid, 'SIGTERM');
       // Give it a moment, then SIGKILL if still alive
       const start = Date.now();
-      while (Date.now() - start < 5_000) {
+      while (Date.now() - start < graceMs) {
         if (!isProcessAlive(pidData.pid)) return true;
         Bun.sleepSync(100);
       }
@@ -526,7 +600,27 @@ export class HostProcessRunner implements Runner {
     // Delegate agent-specific checks to packaging
     results.push(...agentPackaging.diagnose());
 
-    results.push({ state: 'ok', what: 'Runner mode: host-process (no container isolation)' });
+    if (this._hostPermission.mode === 'bypass') {
+      results.push({ state: 'ok', what: 'Runner mode: host-process, permission_mode = "bypass" (no sandbox, full --dangerously-skip-permissions)' });
+    } else {
+      results.push({ state: 'ok', what: `Runner mode: host-process, permission_mode = "sandbox" (OS sandbox; allowlist: ${this._hostPermission.allowedDomains.join(', ')})` });
+      // On Linux the sandbox needs bwrap + socat. Surface a clear check result.
+      if (process.platform === 'linux') {
+        for (const tool of ['bwrap', 'socat']) {
+          let present = false;
+          try {
+            const probe = spawn([tool, '--version'], { stdout: 'pipe', stderr: 'pipe', timeout: 10_000 });
+            await probe.exited;
+            present = true;
+          } catch {
+            present = false;
+          }
+          results.push(present
+            ? { state: 'ok', what: `Sandbox dependency: ${tool}` }
+            : { state: 'fail', what: `Sandbox dependency: ${tool}`, reason: `${tool} not on PATH — install bubblewrap and socat, or set permission_mode = "bypass"` });
+        }
+      }
+    }
 
     // Check connectivity for any per-role local backend (ollama/proxy).
     for (const role of ['agent', 'builder'] as const) {
@@ -560,10 +654,10 @@ export class HostProcessRunner implements Runner {
     claudeExtraArgs: string[],
     debug?: boolean,
     daemonConfigPath?: string,
-    _projectsDir?: string,
+    _projects?: BuilderLaunchProjects,
   ): Promise<{ exitCode: number; sessionId: string | null }> {
     // Host-process mode: launch Claude Code directly (no supervisor, no MCP proxy).
-    // projectsDir isolation is N/A here — there is no container HOME to remap, so
+    // projects isolation is N/A here — there is no container HOME to remap, so
     // Claude reads/writes the real host ~/.claude/projects. (This mode is the
     // explicitly-unisolated runner anyway.)
     // MCP tools are not available in this mode — the builder relies on Claude Code's
@@ -576,11 +670,11 @@ export class HostProcessRunner implements Runner {
     // Inject the builder target's backend env vars (base URL for ollama/proxy,
     // dummy credentials for ollama) so a local-backend builder actually talks to
     // that backend rather than the inherited shell's default endpoint.
-    const builderEnvVars = this.getAuthEnvVars(this.builderTarget());
+    const builderEnvVars = this.getAuthEnvVars(this.builderTarget(), { role: 'builder' });
 
     const claudeArgs = [
       'claude',
-      '--append-system-prompt', systemPrompt,
+      '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
       ...claudeExtraArgs,
     ];
 

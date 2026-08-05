@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { existsSync } from 'fs';
@@ -27,7 +27,12 @@ async function runLazy(cwd: string, args: string[], input?: string): Promise<Wor
     stdout: 'pipe',
     stderr: 'pipe',
     stdin: input ? 'pipe' : undefined,
-    env: process.env,
+    // LAZY_TEST=1 keeps the CLI from auto-starting a daemon. This suite is
+    // daemonless by design (it only runs `init` and `create`), and without the
+    // flag every invocation left a live daemon holding `.storage-lock` on the
+    // external store — which then failed the NEXT `lazy init` with "Failed to
+    // acquire storage lock after 50 attempts". Mirrors test/helpers/setup.ts.
+    env: { ...process.env, LAZY_TEST: '1' },
   });
 
   if (input && proc.stdin) {
@@ -47,6 +52,7 @@ async function runLazy(cwd: string, args: string[], input?: string): Promise<Wor
 describe('lazy init storage location', () => {
   let testRoot: string;
   let externalPath: string;
+  let projectName: string;
 
   beforeEach(async () => {
     testRoot = await mkdtemp(join(tmpdir(), 'lazy-init-test-'));
@@ -58,8 +64,14 @@ describe('lazy init storage location', () => {
     spawnGit(testRoot, 'config', 'user.name', 'Lazy Test');
     spawnGit(testRoot, 'checkout', '-b', 'main');
 
-    // Add git remote to test project name extraction
-    spawnGit(testRoot, 'remote', 'add', 'origin', 'git@github.com:test/my-project.git');
+    // Add git remote to test project name extraction.
+    //
+    // The repo name must be UNIQUE per test: lazy derives the default external
+    // storage path from it (`~/.lazy/<project-name>`), so a fixed name made
+    // every temp repo in this suite — and any other suite using the same name —
+    // share one store and contend on its `.storage-lock`.
+    projectName = `my-project-${basename(testRoot)}`;
+    spawnGit(testRoot, 'remote', 'add', 'origin', `git@github.com:test/${projectName}.git`);
 
     // Create initial commit
     await writeFile(join(testRoot, 'README.md'), '# Test\n');
@@ -93,7 +105,12 @@ describe('lazy init storage location', () => {
     // Manually edit config to set external storage path
     const configPath = join(testRoot, 'lazy.toml');
     let config = await readFile(configPath, 'utf-8');
-    config = config.replace('external_path = ""', `external_path = "${externalPath}"`);
+    // `init` writes a POPULATED external_path (~/.lazy/<project-name>), so the old
+    // literal replace of `external_path = ""` silently matched nothing and the task
+    // landed in the default store — the assertion below then failed on an empty dir.
+    const before = config;
+    config = config.replace(/^external_path\s*=\s*"[^"]*"/m, `external_path = "${externalPath}"`);
+    expect(config).not.toBe(before);
     await writeFile(configPath, config);
 
     // Create external storage directory

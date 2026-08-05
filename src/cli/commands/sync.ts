@@ -89,12 +89,6 @@ Global remote sync (detecting external changes, fetching comments, pushing
 branches, posting turns) is now handled automatically by the daemon. Start
 the daemon with: lazy daemon start
 
-When called with a task ID, merges upstream into the task's worktree:
-  - Fetches the parent/upstream branch
-  - If upstream has changes, launches a sync-only merge (no agent work)
-  - If fetch fails, marks the task for retry (pending_sync)
-  - Task must be blocked/conflict/interrupted (not working)
-
 Requirements:
   - Task must have a session and worktree
   - A remote driver must be configured for upstream fetch

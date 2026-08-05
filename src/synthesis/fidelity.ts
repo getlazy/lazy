@@ -19,6 +19,7 @@ import type { RepositoryDriver } from '../remote/driver';
 import type { Summarizer, SummarizerInput } from './summarizer';
 import { getSummarizer } from './summarizer';
 import { logger } from '../utils/logger';
+import { turnText, MISSING_TURN_CONTENT } from '../utils/turn-content';
 
 /**
  * Delimiters for the lazy-owned section of a PR/MR description. HTML comments
@@ -49,7 +50,10 @@ function formatTurn(turn: Turn): string {
   const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
   const kind = turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : turn.turn_type === 'sync' ? ' (sync)' : '';
   const auto = turn.auto_triggered ? ' (auto)' : '';
-  const content = turn.content.trim();
+  // Crashed/recovered turns from older writes can lack `content` entirely.
+  // Render a placeholder — the turn's existence is itself signal — and never
+  // crash: this runs inline on the accept path, before the merge.
+  const content = turnText(turn, MISSING_TURN_CONTENT).trim() || MISSING_TURN_CONTENT;
   return `- [${who}]${kind}${auto}: ${content}`;
 }
 
@@ -77,7 +81,7 @@ async function gatherEvents(
   }
 
   if (comments.length > 0) {
-    const lines = comments.map(c => `- [${c.actor ?? 'human'}]: ${c.content.trim()}`);
+    const lines = comments.map(c => `- [${c.actor ?? 'human'}]: ${turnText(c, MISSING_TURN_CONTENT).trim()}`);
     sections.push(`### Comments (${comments.length})\n${lines.join('\n')}`);
   }
 
@@ -96,6 +100,24 @@ async function gatherEvents(
 
   const bundle = sections.length > 0 ? sections.join('\n\n') : '_No recorded events._';
   return { bundle, commitSubjects };
+}
+
+/**
+ * Best-effort commit subjects for the fallback path, used when gathering the
+ * full event bundle threw. Returns [] rather than propagating — this is the
+ * last line of defence before an accept aborts.
+ */
+async function commitSubjectsOnly(storage: Storage, task: Task): Promise<string[]> {
+  try {
+    const session = await storage.getSessionByTaskId(task.id);
+    if (!session) return [];
+    const commits = await storage.getSessionCommits(session.id);
+    return commits.map(c => commitSubject(c.message)).filter(Boolean);
+  } catch {
+    // Storage is unreadable for this task; the deterministic fallback degrades
+    // to "no commits recorded" rather than blocking the caller's accept.
+    return [];
+  }
 }
 
 /** Deterministic fallback summary when synthesis is unavailable. */
@@ -119,7 +141,22 @@ export async function synthesizeFidelityBody(
   task: Task,
   summarizer: Summarizer,
 ): Promise<FidelityResult> {
-  const { bundle, commitSubjects } = await gatherEvents(storage, task);
+  // Gathering reads storage and formats records written by other code paths.
+  // A malformed record (e.g. a crash turn persisted without content) must not
+  // abort the caller — accept regenerates fidelity inline, before the merge, so
+  // a throw here would make the task un-acceptable. Degrade like a Summarizer
+  // failure does.
+  let bundle: string;
+  let commitSubjects: string[];
+  try {
+    ({ bundle, commitSubjects } = await gatherEvents(storage, task));
+  } catch (err) {
+    logger.warn(
+      `Fidelity event gathering failed for task ${task.id.slice(0, 8)} ` +
+      `(${err instanceof Error ? err.message : err}); falling back to deterministic commit list.`,
+    );
+    return { summary: deterministicSummary(await commitSubjectsOnly(storage, task)), synthesized: false };
+  }
 
   const input: SummarizerInput = {
     goal: task.goal,

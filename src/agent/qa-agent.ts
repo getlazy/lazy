@@ -9,6 +9,8 @@
 import { join } from 'path';
 import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
+import { safeArgvPrompt } from './argv-safety';
+import type { AgentFailure, AgentFailureInput } from './failure-taxonomy';
 
 // Resolve the absolute path to the qa-agent script.
 // QA_AGENT_SCRIPT env var takes priority (set by QA test driver when running
@@ -37,11 +39,13 @@ export class QaAgent implements Agent {
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
     effort?: string;
+    /** Claude-Code-specific; not applicable to the QA agent (gated out upstream). */
+    extraArgs?: string[];
   }): string[] {
     // The scenario file path comes from the QA_SCENARIO_FILE env var (read by the binary).
     // The supervisor sets cwd to the worktree path, so we pass '.' as the worktree arg.
     // QA_AGENT_SCRIPT is an absolute path resolved at import time via import.meta.dir.
-    return ['bun', 'run', QA_AGENT_SCRIPT, '-p', opts.prompt, '--worktree', '.'];
+    return ['bun', 'run', QA_AGENT_SCRIPT, '-p', safeArgvPrompt(opts.prompt, 'prompt'), '--worktree', '.'];
   }
 
   parseResponse(stdout: string, _opts?: { workingDir?: string }): AgentResponse {
@@ -67,9 +71,27 @@ export class QaAgent implements Agent {
     return false;
   }
 
+  /**
+   * The qa-agent is LLM-free and local: it never hits an API, so there is no
+   * auth, rate limit, or network condition to classify. A failure here means
+   * the scenario or the script itself is broken — which no retry fixes, but
+   * classifying it `fatal_config` would let a flaky test spawn block a task
+   * permanently. `unknown` keeps the existing conservative retry behavior
+   * (bounded in practice by the crash-loop detector, since qa-agent fails fast).
+   */
+  classifyFailure(_input: AgentFailureInput): AgentFailure {
+    return { class: 'unknown', reason: 'qa-agent failure (no remote provider involved)' };
+  }
+
   defaultWatchdogTimeoutMs(): number {
     // qa-agent should complete fast — 30 second timeout.
     return 30_000;
+  }
+
+  activityStream(): null {
+    // Scripted and fast — it prints one JSON blob and exits. Byte-level
+    // watchdogging is sufficient.
+    return null;
   }
 
   discoverSessionFiles(_opts: {

@@ -1,8 +1,9 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
-import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+import { extractEmbeddedAgentBinary } from '../../src/capture/claude';
 
 /**
  * Tests for atomic agent binary replacement logic.
@@ -115,5 +116,99 @@ describe('Agent binary atomic replacement pattern', () => {
 
     expect(tempFiles.length).toBe(0);
     expect(files).toContain('lazy-agent');
+  });
+});
+
+/**
+ * The extraction path itself, driven for real (the embedded-binary source is
+ * parameterised so a compiled build isn't needed).
+ *
+ * Regression: this used to decide the extracted binary was current by comparing
+ * SIZES. Two builds of a ~100MB Bun executable that differ by a few source
+ * lines routinely land on the same size, and when they did, every container got
+ * the STALE agent binary bind-mounted while the daemon ran the new code. That
+ * is invisible from both ends — the daemon reports the new version, the agent
+ * behaves like the old one — and it is the shape of the `lazy_wait` failure
+ * this suite was extended for: an agent-side MCP client older than the daemon
+ * it talks to.
+ */
+describe('extractEmbeddedAgentBinary staleness detection', () => {
+  let testDir: string;
+  let embeddedPath: string;
+  let destDir: string;
+
+  /** Above MIN_AGENT_BINARY_SIZE (1024) so the placeholder guard doesn't fire. */
+  const pad = (marker: string) => marker + 'x'.repeat(4096 - marker.length);
+
+  beforeEach(() => {
+    testDir = join(tmpdir(), `lazy-extract-${randomUUID()}`);
+    mkdirSync(testDir, { recursive: true });
+    embeddedPath = join(testDir, 'embedded-lazy-agent');
+    destDir = join(testDir, 'bin');
+  });
+
+  afterEach(() => {
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
+  });
+
+  test('extracts when nothing is there yet', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const out = await extractEmbeddedAgentBinary(destDir, embeddedPath);
+    expect(out).toBe(join(destDir, 'lazy-agent'));
+    expect(await Bun.file(out!).text()).toBe(pad('BUILD-A'));
+    expect(statSync(out!).mode & 0o111).toBeGreaterThan(0);
+  });
+
+  // THE regression: same size, different bytes. A size-only check keeps the
+  // stale binary here and ships old agent code into every container.
+  test('re-extracts a stale binary of identical size', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+    expect(await Bun.file(out).text()).toBe(pad('BUILD-A'));
+
+    // A new lazy build: same length to the byte, different content.
+    writeFileSync(embeddedPath, pad('BUILD-B'));
+    expect(Bun.file(embeddedPath).size).toBe(4096);
+
+    await extractEmbeddedAgentBinary(destDir, embeddedPath);
+    expect(await Bun.file(out).text()).toBe(pad('BUILD-B'));
+  });
+
+  test('leaves a byte-identical binary untouched', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+    const before = statSync(out);
+
+    const again = await extractEmbeddedAgentBinary(destDir, embeddedPath);
+    expect(again).toBe(out);
+    // Same inode AND same mtime — nothing was rewritten.
+    expect(statSync(out).ino).toBe(before.ino);
+    expect(statSync(out).mtimeMs).toBe(before.mtimeMs);
+  });
+
+  // INVARIANT: re-extraction must not rewrite the destination inode in place.
+  // Running containers bind-mount that exact file at /usr/local/bin/lazy-agent;
+  // truncating and rewriting it mutates a live builder's agent binary
+  // mid-session. rename() gives them the old inode and new launches the new one.
+  test('re-extraction replaces the file atomically, not in place', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+    const oldIno = statSync(out).ino;
+
+    writeFileSync(embeddedPath, pad('BUILD-B'));
+    await extractEmbeddedAgentBinary(destDir, embeddedPath);
+
+    expect(statSync(out).ino).not.toBe(oldIno);
+    // And no temp file is left behind.
+    expect(readdirSync(destDir).filter(f => f.startsWith('.tmp-'))).toEqual([]);
+  });
+
+  test('ignores a dev-mode placeholder that is too small to be a binary', async () => {
+    writeFileSync(embeddedPath, 'placeholder\n');
+    expect(await extractEmbeddedAgentBinary(destDir, embeddedPath)).toBeNull();
+  });
+
+  test('returns null when there is no embedded binary at all', async () => {
+    expect(await extractEmbeddedAgentBinary(destDir, join(testDir, 'nope'))).toBeNull();
   });
 });

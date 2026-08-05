@@ -18,6 +18,7 @@ import {
   targetToLegacy,
   parentTaskIdOf,
   targetBranchOf,
+  collectSubtreeIds,
 } from '../../src/task-target';
 import type { Task } from '../../src/types';
 
@@ -112,5 +113,29 @@ describe('TaskTarget projections', () => {
     expect(targetBranchOf(asTask({ kind: 'branch' as const, branch: 'main' }))).toBe('main');
     expect(targetBranchOf(asTask({ kind: 'branch' as const, branch: '' }))).toBeUndefined();
     expect(targetBranchOf(asTask({ kind: 'task' as const, parentTaskId: 'p1' }))).toBeUndefined();
+  });
+});
+
+describe('collectSubtreeIds', () => {
+  const child = (id: string, parentId: string): Task => ({ id, target: taskTarget(parentId) } as Task);
+  const root = (id: string): Task => ({ id, target: branchTarget('main') } as Task);
+
+  test('collects the task itself plus descendants at every depth', () => {
+    const tasks = [root('r'), child('c1', 'r'), child('c2', 'r'), child('g1', 'c1'), child('gg1', 'g1'), root('other')];
+    expect([...collectSubtreeIds('r', tasks)].sort()).toEqual(['c1', 'c2', 'g1', 'gg1', 'r']);
+  });
+
+  test('a leaf subtree is just the task itself', () => {
+    expect([...collectSubtreeIds('g1', [root('r'), child('c1', 'r'), child('g1', 'c1')])]).toEqual(['g1']);
+  });
+
+  test('an id with no matching task still yields that id (callers filter, not the walk)', () => {
+    expect([...collectSubtreeIds('missing', [root('r')])]).toEqual(['missing']);
+  });
+
+  // INVARIANT: a corrupt store with a cyclic parent link must not hang the walk.
+  test('terminates on a parent cycle', () => {
+    const tasks = [child('a', 'b'), child('b', 'a')];
+    expect([...collectSubtreeIds('a', tasks)].sort()).toEqual(['a', 'b']);
   });
 });

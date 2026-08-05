@@ -43,6 +43,9 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
     data: { path: '/tmp/fake-data' },
     ollama: { enabled: false, model: null },
     models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    // Guard timeouts ride along on the sync command: a sync that hits conflicts
+    // runs a real agent turn and must be guarded like any other.
+    agent: REAL_DEFAULT_CONFIG.agent,
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
@@ -195,6 +198,9 @@ function createMockStorage() {
     },
     updateSessionInteraction: async (sessionId: string, dur: number) => {
       updateCalls.push({ method: 'updateSessionInteraction', args: [sessionId, dur] });
+    },
+    updateSessionRunnerType: async (sessionId: string, runnerType: string | null) => {
+      updateCalls.push({ method: 'updateSessionRunnerType', args: [sessionId, runnerType] });
     },
     resetTaskPendingSync: async () => {},
     incrementTaskPendingSync: async () => {},

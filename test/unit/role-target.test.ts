@@ -4,9 +4,12 @@ import {
   resolveRoleTarget,
   resolveAgentModel,
   targetEnvVars,
+  proxyAuditHeaderEnv,
+  proxyBaseUrlForRunner,
   checkTargetConnectivity,
   preflightRoleTarget,
   isKnownAnthropicModel,
+  targetForSurface,
 } from '../../src/utils/role-target';
 
 /**
@@ -147,7 +150,7 @@ describe('resolveAgentModel', () => {
 
 describe('targetEnvVars', () => {
   test('ollama uses self-contained dummy credentials + base URL + stability flags', () => {
-    const env = targetEnvVars(ollama('qwen3-coder', 'http://localhost:11434'), []);
+    const env = targetEnvVars(ollama('qwen3-coder', 'http://localhost:11434'), [], 'container');
     const map = Object.fromEntries(env.map(v => [v.key, v.value]));
     expect(map.ANTHROPIC_BASE_URL).toBe('http://localhost:11434');
     expect(map.ANTHROPIC_AUTH_TOKEN).toBe('ollama');
@@ -158,15 +161,147 @@ describe('targetEnvVars', () => {
     const env = targetEnvVars(
       { backend: 'proxy', model: 'claude-opus-4-8', endpoint: 'http://localhost:8080' },
       [{ key: 'ANTHROPIC_API_KEY', value: 'sk-real' }],
+      'container',
     );
     const map = Object.fromEntries(env.map(v => [v.key, v.value]));
     expect(map.ANTHROPIC_BASE_URL).toBe('http://localhost:8080');
     expect(map.ANTHROPIC_API_KEY).toBe('sk-real');
   });
 
-  test('anthropic passes the credential through unchanged', () => {
-    const env = targetEnvVars(anthropic('claude-opus-4-8'), [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }]);
+  test('anthropic with no proxyUrl passes the credential through unchanged (proxy disabled)', () => {
+    const env = targetEnvVars(anthropic('claude-opus-4-8'), [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }], 'container');
     expect(env).toEqual([{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }]);
+  });
+
+  // INVARIANT (default-on proxy): anthropic traffic routes through lazy's local
+  // audit/policy proxy whenever one is live. Without this, the default-on posture
+  // is a lie — the proxy would run but nothing would flow through it.
+  test('anthropic WITH proxyUrl routes through the proxy, credential passed through', () => {
+    const env = targetEnvVars(
+      { ...anthropic('claude-opus-4-8'), proxyUrl: 'http://127.0.0.1:8766' },
+      [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }],
+      'container',
+      { role: 'agent', taskId: 'abc12345' },
+    );
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8766');
+    // Credential passthrough is what makes this transparent — no auth regression.
+    expect(map.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok');
+    // Proxied traffic is attributable like any other proxied traffic.
+    expect(map.ANTHROPIC_CUSTOM_HEADERS).toBe('x-lazy-role: agent\nx-lazy-task-id: abc12345');
+  });
+
+  test('an API-key credential is passed through the proxy path too', () => {
+    const env = targetEnvVars(
+      { ...anthropic(''), proxyUrl: 'http://127.0.0.1:8766' },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk-real' }],
+      'container',
+    );
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8766');
+    expect(map.ANTHROPIC_API_KEY).toBe('sk-real');
+  });
+
+  // INVARIANT: ollama is NEVER routed through the proxy — the proxy has a single
+  // Anthropic-native upstream, and a local model is not it.
+  test('ollama ignores proxyUrl entirely', () => {
+    const env = targetEnvVars(
+      { ...ollama('qwen3-coder', 'http://localhost:11434'), proxyUrl: 'http://127.0.0.1:8766' },
+      [],
+      'container',
+    );
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_BASE_URL).toBe('http://localhost:11434');
+  });
+
+  // INVARIANT: proxied traffic carries x-lazy-role / x-lazy-task-id (via
+  // ANTHROPIC_CUSTOM_HEADERS) so the audit plane can attribute each request to
+  // the agent + task that made it. Without this the audit record's role/taskId
+  // are always null (the proxy reads headers nobody sets).
+  test('proxy emits ANTHROPIC_CUSTOM_HEADERS from audit hints', () => {
+    const env = targetEnvVars(
+      { backend: 'proxy', model: 'claude-opus-4-8', endpoint: 'http://localhost:8080' },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk-real' }],
+      'container',
+      { role: 'agent', taskId: 'abc12345' },
+    );
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_CUSTOM_HEADERS).toBe('x-lazy-role: agent\nx-lazy-task-id: abc12345');
+  });
+
+  // INVARIANT: the audit headers are proxy-only — real Anthropic and ollama must
+  // never receive lazy-internal headers.
+  test('anthropic and ollama never emit audit headers even with hints', () => {
+    const a = targetEnvVars(anthropic('claude-opus-4-8'), [{ key: 'X', value: 'y' }], 'container', { role: 'agent', taskId: 't' });
+    expect(a.find(v => v.key === 'ANTHROPIC_CUSTOM_HEADERS')).toBeUndefined();
+    const o = targetEnvVars(ollama('qwen3-coder'), [], 'container', { role: 'agent', taskId: 't' });
+    expect(o.find(v => v.key === 'ANTHROPIC_CUSTOM_HEADERS')).toBeUndefined();
+  });
+
+  test('proxy without hints emits no audit header (backwards compatible)', () => {
+    const env = targetEnvVars(
+      { backend: 'proxy', model: 'm', endpoint: 'http://localhost:8080' },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
+      'container',
+    );
+    expect(env.find(v => v.key === 'ANTHROPIC_CUSTOM_HEADERS')).toBeUndefined();
+  });
+
+  // INVARIANT: never point Claude Code at an empty base URL — that would silently
+  // send traffic straight to real Anthropic, bypassing the proxy's audit/policy
+  // plane. An unset endpoint means the daemon's live proxy URL was never injected.
+  test('proxy with an empty endpoint fails hard (no silent bypass)', () => {
+    expect(() =>
+      targetEnvVars({ backend: 'proxy', model: 'm', endpoint: '' }, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'container'),
+    ).toThrow(/no endpoint/i);
+  });
+});
+
+describe('proxyBaseUrlForRunner', () => {
+  // INVARIANT: container runners reach host services via host.docker.internal;
+  // the host-process runner reaches the proxy on its own bind address.
+  test('container runners use host.docker.internal', () => {
+    expect(proxyBaseUrlForRunner('docker', 8766, '127.0.0.1')).toBe('http://host.docker.internal:8766');
+    expect(proxyBaseUrlForRunner('podman', 40000, '127.0.0.1')).toBe('http://host.docker.internal:40000');
+  });
+
+  test('host-process runner uses the proxy bind (loopback default)', () => {
+    expect(proxyBaseUrlForRunner('dangerously-host-process-without-any-isolation', 8766, '127.0.0.1'))
+      .toBe('http://127.0.0.1:8766');
+  });
+
+  test('a wildcard bind falls back to loopback for the host-process URL', () => {
+    expect(proxyBaseUrlForRunner('dangerously-host-process-without-any-isolation', 8766, '0.0.0.0'))
+      .toBe('http://127.0.0.1:8766');
+  });
+});
+
+describe('proxyAuditHeaderEnv', () => {
+  test('emits only the present hints', () => {
+    expect(proxyAuditHeaderEnv({ role: 'builder' })).toEqual({
+      key: 'ANTHROPIC_CUSTOM_HEADERS',
+      value: 'x-lazy-role: builder',
+    });
+    expect(proxyAuditHeaderEnv({ taskId: 'abc12345' })).toEqual({
+      key: 'ANTHROPIC_CUSTOM_HEADERS',
+      value: 'x-lazy-task-id: abc12345',
+    });
+  });
+
+  test('returns null when nothing usable is present', () => {
+    expect(proxyAuditHeaderEnv(undefined)).toBeNull();
+    expect(proxyAuditHeaderEnv({})).toBeNull();
+  });
+
+  // INVARIANT: a value is interpolated into a header line, so a crafted id that
+  // contains a newline (or other non-token chars) MUST be dropped — otherwise it
+  // could inject a second, attacker-controlled header.
+  test('drops a hint value that could inject a header', () => {
+    expect(proxyAuditHeaderEnv({ taskId: 'evil\nx-inject: 1' })).toBeNull();
+    expect(proxyAuditHeaderEnv({ role: 'agent', taskId: 'has space' })).toEqual({
+      key: 'ANTHROPIC_CUSTOM_HEADERS',
+      value: 'x-lazy-role: agent',
+    });
   });
 });
 
@@ -187,5 +322,93 @@ describe('connectivity preflight', () => {
     // Port 1 is reserved/unused, so the probe fails fast with a connection error.
     const target: RoleTarget = { backend: 'ollama', model: 'qwen3-coder', endpoint: 'http://127.0.0.1:1' };
     await expect(preflightRoleTarget('agent', target)).rejects.toThrow(/Preflight failed for the "agent" role/);
+  });
+});
+
+describe('launch surface (host vs container endpoints)', () => {
+  const DOCKER_OLLAMA = 'http://host.docker.internal:11434';
+
+  // INVARIANT: `host.docker.internal` is Docker's internal DNS alias for the
+  // host. It resolves only INSIDE a container — a host process handed that name
+  // dies with ENOTFOUND. `lazy pair`, `lazy chat`, and the host-process runner
+  // all launch Claude Code as HOST processes even on a docker-runner project,
+  // so their env MUST carry the host-reachable address.
+  test('host surface rewrites a docker-internal endpoint', () => {
+    const env = targetEnvVars(ollama('qwen3-coder', DOCKER_OLLAMA), [], 'host');
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_BASE_URL).toBe('http://localhost:11434');
+  });
+
+  // INVARIANT: the conversion is one-directional. A CONTAINER launch genuinely
+  // needs `host.docker.internal` to reach a service on the host — blanket-
+  // converting would break containers in the other direction.
+  test('container surface keeps the docker-internal endpoint untouched', () => {
+    const env = targetEnvVars(ollama('qwen3-coder', DOCKER_OLLAMA), [], 'container');
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.ANTHROPIC_BASE_URL).toBe(DOCKER_OLLAMA);
+  });
+
+  // INVARIANT: the injected proxy address is converted too, not just `endpoint`.
+  // `resolveLiveProxyUrl` builds the proxy URL for the CONFIGURED RUNNER — so on
+  // a docker-runner project it hands back `host.docker.internal`, which a host
+  // launch (pair/chat) must not pass through verbatim. This is the default-on
+  // proxy half of the same bug and is NOT covered by `endpoint`.
+  test('host surface rewrites an injected proxyUrl on an anthropic role', () => {
+    const target: RoleTarget = { ...anthropic('claude-opus-4-8'), proxyUrl: 'http://host.docker.internal:8766' };
+    const hostMap = Object.fromEntries(
+      targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'host').map(v => [v.key, v.value]),
+    );
+    expect(hostMap.ANTHROPIC_BASE_URL).toBe('http://localhost:8766');
+    // ...and the container launch still gets the docker-internal name.
+    const containerMap = Object.fromEntries(
+      targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'container').map(v => [v.key, v.value]),
+    );
+    expect(containerMap.ANTHROPIC_BASE_URL).toBe('http://host.docker.internal:8766');
+  });
+
+  test('a proxy-backend endpoint is converted for the host surface as well', () => {
+    const target: RoleTarget = { backend: 'proxy', model: 'claude-opus-4-8', endpoint: 'http://host.docker.internal:8766' };
+    const map = Object.fromEntries(
+      targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'host').map(v => [v.key, v.value]),
+    );
+    expect(map.ANTHROPIC_BASE_URL).toBe('http://localhost:8766');
+  });
+
+  // Only the exact hostname is rewritten — never a substring match.
+  test('targetForSurface leaves unrelated hostnames alone', () => {
+    const t: RoleTarget = { backend: 'ollama', model: 'm', endpoint: 'http://host.docker.internal.example.com:11434' };
+    expect(targetForSurface(t, 'host').endpoint).toBe('http://host.docker.internal.example.com:11434');
+    expect(targetForSurface({ backend: 'ollama', model: 'm', endpoint: 'http://192.168.1.5:11434' }, 'host').endpoint)
+      .toBe('http://192.168.1.5:11434');
+  });
+
+  // INVARIANT — THE load-bearing one for this module: the address the
+  // reachability preflight VERIFIED is the address a host launch is handed.
+  // These two used to be computed independently: preflight probed the
+  // host-converted address (so it passed) while the env carried the raw
+  // docker-internal one (so Claude Code died with ENOTFOUND despite a green
+  // preflight). They now share `targetForSurface`, and this test pins that.
+  test('probed endpoint == the ANTHROPIC_BASE_URL a host launch receives', async () => {
+    const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response('ok') });
+    try {
+      // Configured the way a docker-runner project configures it.
+      const target: RoleTarget = {
+        backend: 'proxy',
+        model: 'claude-opus-4-8',
+        endpoint: `http://host.docker.internal:${server.port}`,
+      };
+      const probed = await preflightRoleTarget('builder', target);
+      const map = Object.fromEntries(
+        targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'host').map(v => [v.key, v.value]),
+      );
+      expect(map.ANTHROPIC_BASE_URL).toBe(probed);
+      expect(probed).toBe(`http://localhost:${server.port}`);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('preflight reports "anthropic" for an anthropic target', async () => {
+    expect(await preflightRoleTarget('builder', anthropic('claude-opus-4-8'))).toBe('anthropic');
   });
 });

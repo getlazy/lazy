@@ -18,19 +18,10 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { resolve } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-
-const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
-
-interface JsonRpcResponse {
-  jsonrpc: '2.0';
-  id: number | string | null;
-  result?: { content: Array<{ text: string }>; isError?: boolean };
-  error?: { code: number; message: string; data?: unknown };
-}
+import { runMcpSession, type JsonRpcResponse } from '../helpers/mcp-session';
 
 interface ShownTurn {
   role: string;
@@ -46,46 +37,6 @@ function turnsFromShow(response: JsonRpcResponse | undefined): ShownTurn[] {
   } catch {
     return [];
   }
-}
-
-/**
- * Drive a short MCP session against the running daemon in builder/pairing mode
- * (--task-id '' and NO LAZY_TEST=1, so lifecycle ops reach the daemon over RPC,
- * exactly like a real builder session). Mirrors mcp-start.test.ts.
- */
-async function runMcpSession(
-  root: string,
-  worktreePath: string,
-  messages: Array<{ method: string; id: number; params?: Record<string, unknown> }>,
-): Promise<JsonRpcResponse[]> {
-  const proc = Bun.spawn(['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', '', '--worktree', worktreePath], {
-    cwd: root,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-    env: { ...process.env },
-  });
-
-  const stdin = proc.stdin as import('bun').FileSink;
-  for (const msg of messages) {
-    stdin.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
-    await Bun.sleep(50);
-  }
-  stdin.end();
-
-  const stdout = await new Response(proc.stdout).text();
-  await proc.exited;
-
-  const responses: JsonRpcResponse[] = [];
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      responses.push(JSON.parse(line));
-    } catch {
-      // skip non-JSON banner lines
-    }
-  }
-  return responses;
 }
 
 describe('builder actor (MCP channel)', () => {
@@ -108,7 +59,7 @@ describe('builder actor (MCP channel)', () => {
   test('lazy_start via MCP records the first turn as actor=builder', async () => {
     const taskShortId = await createTask(ctx, 'MCP channel start', 'Do the work');
 
-    const responses = await runMcpSession(ctx.root, ctx.root, [
+    const responses = await runMcpSession(ctx.root, '', ctx.root, [
       { method: 'initialize', id: 1, params: {} },
       { method: 'tools/call', id: 2, params: { name: 'lazy_start', arguments: { task_id: taskShortId } } },
       { method: 'tools/call', id: 3, params: { name: 'lazy_show', arguments: { task_id: taskShortId, sections: ['turns'] } } },
@@ -117,7 +68,7 @@ describe('builder actor (MCP channel)', () => {
     const startResponse = responses.find(r => r.id === 2);
     expect(startResponse).toBeDefined();
     expect(startResponse!.result?.isError).toBeFalsy();
-    expect(startResponse!.result?.content[0].text).toContain('Started task');
+    expect(startResponse!.result?.content?.[0].text).toContain('Started task');
 
     const turns = turnsFromShow(responses.find(r => r.id === 3));
     const humanTurn = turns.find(t => t.role === 'human');
@@ -138,7 +89,7 @@ describe('builder actor (MCP channel)', () => {
     expectSuccess(startResult);
 
     // Read back through the same daemon via an MCP lazy_show session.
-    const responses = await runMcpSession(ctx.root, ctx.root, [
+    const responses = await runMcpSession(ctx.root, '', ctx.root, [
       { method: 'initialize', id: 1, params: {} },
       { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: taskShortId, sections: ['turns'] } } },
     ]);

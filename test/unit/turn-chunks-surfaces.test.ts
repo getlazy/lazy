@@ -60,6 +60,7 @@ function mockTask(): Task {
     prompt: 'demo prompt',
     type: 'task',
     status: 'blocked',
+    priority: 'normal',
     created_at: 1_700_000_000_000,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },
@@ -67,7 +68,9 @@ function mockTask(): Task {
     close_reason: null,
     model: 'claude-opus-4-8',
     agent_id: 'claude',
+    runner_type: null,
     metadata: null,
+    tags: [],
     pending_sync: 0,
   };
 }
@@ -77,6 +80,7 @@ function mockSession(): Session {
     id: 'sess1',
     task_id: 'abc12345',
     agent_id: 'claude',
+    runner_type: null,
     started_at: 1_700_000_000_000,
     ended_at: null,
     outcome: null,
@@ -110,6 +114,7 @@ describe('CLI buildTaskShowLines --chunks', () => {
       journal: [],
       followUps: [],
       statusHistory: [],
+      tagHistory: [],
       children: [],
       childSessions: new Map(),
       proposals: [],

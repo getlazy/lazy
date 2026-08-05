@@ -55,17 +55,46 @@ backend = "ollama"
     expectError(result, 'no model is set');
   });
 
-  // INVARIANT: A proxy backend requires an explicit endpoint — there is no
-  // sensible default proxy address to guess.
-  test('fails when a role uses proxy backend without an endpoint', async () => {
+  // INVARIANT (default-on proxy): a proxy role may omit `endpoint` — the daemon
+  // injects the live (OS-assigned) address at launch. With the proxy on by
+  // default this holds even with NO [proxy] section at all.
+  test('a proxy role with no endpoint is accepted with no [proxy] section (default-on)', async () => {
     await appendConfig(`
 [models.roles.builder]
 backend = "proxy"
 model = "claude-opus-4-8"
 `);
     const result = await ctx.lazy(['create', '--goal', 'test task']);
+    expectSuccess(result);
+  });
+
+  test('a proxy role with no endpoint is accepted with an explicit [proxy] section', async () => {
+    await appendConfig(`
+[proxy]
+
+[models.roles.builder]
+backend = "proxy"
+model = "claude-opus-4-8"
+`);
+    const result = await ctx.lazy(['create', '--goal', 'test task']);
+    expectSuccess(result);
+  });
+
+  // INVARIANT: the one hard failure left — routing a role at a proxy that is
+  // switched off. Fail at load rather than launching with an empty base URL,
+  // which would silently bypass the audit/policy plane.
+  test('fails when a proxy role has no endpoint AND the proxy is disabled', async () => {
+    await appendConfig(`
+[proxy]
+enabled = false
+
+[models.roles.builder]
+backend = "proxy"
+model = "claude-opus-4-8"
+`);
+    const result = await ctx.lazy(['create', '--goal', 'test task']);
     expectFailure(result);
-    expectError(result, 'no endpoint is set');
+    expectError(result, 'proxy is disabled');
   });
 
   // INVARIANT: An unknown backend is a config error — lazy supports exactly

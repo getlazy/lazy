@@ -5,11 +5,21 @@
  * initialized. Tests run the real CLI via subprocess for maximum fidelity.
  */
 
-import { join, resolve } from 'path';
-import { mkdtemp, rm, writeFile, realpath } from 'fs/promises';
+import { basename, join, resolve } from 'path';
+import { mkdtemp, rm, writeFile, readFile, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { waitForDaemon, readPid, getDaemonDir } from '../../src/daemon';
 import { registerTestDaemonRoot, unregisterTestDaemonRoot } from './daemon-registry';
+import { storageDirFor } from './storage';
+import {
+  installFakeClaude,
+  setClaudeScenario,
+  readClaudeInvocations,
+  clearClaudeInvocations,
+  type ClaudeInvocation,
+  type ClaudeScenarioFile,
+  type FakeClaude,
+} from './fake-claude';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 const PRELOAD_PATH = resolve(__dirname, '../mocks/preload-mocks.ts');
@@ -45,6 +55,31 @@ export interface TestContext {
   git: (...args: string[]) => { stdout: string; stderr: string; exitCode: number };
   /** Clean up the temporary directory */
   cleanup: () => Promise<void>;
+
+  // --- fake-claude seam (only present with `setupTestLazy({ fakeClaude: true })`) ---
+
+  /**
+   * Script what the fake `claude` binary does on its next invocation(s).
+   *
+   * Throws when the context was not created with `fakeClaude: true` — silently
+   * doing nothing would let a test "pass" while the real agent seam was never
+   * installed.
+   */
+  setClaudeScenario: (scenario: ClaudeScenarioFile) => Promise<void>;
+  /** Every fake-agent invocation so far, with the argv lazy actually passed. */
+  claudeInvocations: () => Promise<ClaudeInvocation[]>;
+  /** Forget recorded invocations (e.g. between two turns of one test). */
+  clearClaudeInvocations: () => Promise<void>;
+  /**
+   * Directory holding the fake `claude` executable. A test that spawns its own
+   * subprocess (rather than going through `ctx.lazy`) must prepend this to that
+   * process's PATH — the harness's own PATH override lives in a private
+   * `baseEnv`, so `process.env.PATH` does NOT contain it and a naive
+   * `PATH: ${myBin}:${process.env.PATH}` silently runs the REAL claude.
+   *
+   * Undefined unless the context was created with `fakeClaude: true`.
+   */
+  fakeClaudeBinDir?: string;
 }
 
 export interface SetupOptions {
@@ -66,6 +101,21 @@ export interface SetupOptions {
    * the mocks read on each call (see test/mocks/remote.ts readGatesFromFile).
    */
   daemonEnv?: Record<string, string>;
+  /**
+   * Install a scriptable fake `claude` binary on PATH instead of mocking
+   * lazy's own `capture/claude` module, and switch the project to the
+   * host-process runner so the REAL supervisor runs.
+   *
+   * This is the low-level agent seam (see test/helpers/fake-claude.ts). With it
+   * on, `lazy start` goes daemon → HostProcessRunner → a real `lazy supervise`
+   * subprocess → `execWithWatchdog` → the fake binary. Nothing in `src/` is
+   * mocked, which is what makes the watchdog, kill protocol, stream-json
+   * parsing, and response capture reachable from an e2e test at all.
+   *
+   * Implies `withDaemon: true` (the supervisor is launched by the daemon), and
+   * suppresses the module-mock preload for every process this context spawns.
+   */
+  fakeClaude?: boolean;
 }
 
 function spawnGit(cwd: string, ...args: string[]) {
@@ -77,7 +127,7 @@ function spawnGit(cwd: string, ...args: string[]) {
   };
 }
 
-async function runLazy(cwd: string, args: string[], protocolBase: string, withDaemon: boolean, extraEnv?: Record<string, string>, input?: string): Promise<WorkResult> {
+async function runLazy(cwd: string, args: string[], protocolBase: string, withDaemon: boolean, extraEnv?: Record<string, string>, input?: string, baseEnv?: Record<string, string>): Promise<WorkResult> {
   // Symmetric with runLazyMocked: in a daemonless suite, LAZY_TEST=1 keeps
   // `ctx.lazy` from auto-starting a daemon (ensureDaemon bypasses under
   // LAZY_TEST). Without it, a plain `ctx.lazy(['create'])` (e.g. createTask)
@@ -96,7 +146,7 @@ async function runLazy(cwd: string, args: string[], protocolBase: string, withDa
     // point) lets the implicitly auto-started daemon come up. Mirrors
     // runLazyMocked/startTestDaemon. Placed BEFORE extraEnv so individual tests
     // can clear it (e.g. ANTHROPIC_API_KEY: '') to exercise the gate.
-    env: { ...process.env, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...lazyTestEnv, ...extraEnv },
+    env: { ...process.env, ...baseEnv, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...lazyTestEnv, ...extraEnv },
   });
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -116,6 +166,7 @@ async function runLazyMocked(
   withDaemon: boolean,
   extraEnv?: Record<string, string>,
   input?: string,
+  baseEnv?: Record<string, string>,
 ): Promise<WorkResult> {
   // When a real daemon is running for this test, LAZY_TEST=1 must NOT be set —
   // it would short-circuit tryRemoteStorage/tryRpc and bypass the daemon,
@@ -130,12 +181,16 @@ async function runLazyMocked(
     stderr: 'pipe',
     env: {
       ...process.env,
+      ...baseEnv,
+      // Provide fake auth so getAuthEnvVars() doesn't fail. This is a DEFAULT —
+      // it precedes extraEnv so a test that deliberately exercises the
+      // no-credential path (e.g. the upgrade credential preflight) can clear it.
+      // Same precedence as runLazy.
+      ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
       ...extraEnv,
       ...lazyTestEnv,
       LAZY_PROTOCOL_BASE: protocolBase,
       LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify(mockResponse),
-      // Provide fake auth so getAuthEnvVars() doesn't fail
-      ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
     },
   });
 
@@ -153,7 +208,19 @@ async function runLazyMocked(
  * so agent/claude calls stay mocked even when the daemon is the one launching
  * the task. Waits for the daemon socket to become responsive before returning.
  */
-async function startTestDaemon(projectRoot: string, protocolBase: string, extraEnv: Record<string, string> = {}): Promise<void> {
+async function startTestDaemon(
+  projectRoot: string,
+  protocolBase: string,
+  extraEnv: Record<string, string> = {},
+  /**
+   * When true the daemon runs WITHOUT the module-mock preload: the fake-claude
+   * seam replaces the agent binary instead of lazy's own modules, so preloading
+   * the mock would defeat the point (it would stub out the very supervisor
+   * launch path under test). `baseEnv` carries the PATH that puts the fake
+   * binary ahead of any real `claude`.
+   */
+  options: { noPreload?: boolean; baseEnv?: Record<string, string> } = {},
+): Promise<void> {
   const { mkdir, open } = await import('fs/promises');
   const { join: pathJoin } = await import('path');
   const daemonDir = getDaemonDir(projectRoot);
@@ -166,8 +233,12 @@ async function startTestDaemon(projectRoot: string, protocolBase: string, extraE
   const logHandle = await open(startupLogPath, 'a');
 
   try {
+    const daemonArgv = options.noPreload
+      ? ['bun', 'run', ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot]
+      : ['bun', 'run', '--preload', PRELOAD_PATH, ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot];
+
     const proc = Bun.spawn(
-      ['bun', 'run', '--preload', PRELOAD_PATH, ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot],
+      daemonArgv,
       {
         // cwd=projectRoot so preflight/findLazyRoot don't climb up to the
         // parent worktree and probe .lazy there (causing EROFS in sandboxed
@@ -178,6 +249,7 @@ async function startTestDaemon(projectRoot: string, protocolBase: string, extraE
         stderr: logHandle.fd,
         env: {
           ...process.env,
+          ...options.baseEnv,
           LAZY_PROTOCOL_BASE: protocolBase,
           // Fake auth so agent launches in the daemon don't fail on getAuthEnvVars()
           ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
@@ -189,10 +261,15 @@ async function startTestDaemon(projectRoot: string, protocolBase: string, extraE
           // runLazyMocked don't propagate into the already-running daemon,
           // but that's fine: start/accept tests only need the launch to
           // succeed, not a specific transcript.
-          LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify({
-            result: 'Mock daemon task completion',
-            session_id: 'mock-sess-daemon',
-            usage: { input_tokens: 100, output_tokens: 200 },
+          // Under the fake-binary seam this var must NOT be set: it is the
+          // activation switch for preload-mocks.ts, and the supervisor the
+          // daemon spawns would inherit it. Nothing in lazy is mocked there.
+          ...(options.noPreload ? {} : {
+            LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify({
+              result: 'Mock daemon task completion',
+              session_id: 'mock-sess-daemon',
+              usage: { input_tokens: 100, output_tokens: 200 },
+            }),
           }),
           // extraEnv last so callers can override anything above (e.g.
           // LAZY_MOCK_ACCEPT_GATES='[]' to activate the remote mock inside
@@ -270,6 +347,23 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   const root = await realpath(await mkdtemp(join(tmpdir(), 'lazy-e2e-')));
   const protocolBase = await mkdtemp(join(tmpdir(), 'lazy-e2e-protocol-'));
 
+  // The fake agent seam. Its state lives OUTSIDE `root` on purpose: a bin dir
+  // and a scenario file inside the repo would show up as untracked changes and
+  // trip lazy's own dirty-worktree checks.
+  const useFakeClaude = options.fakeClaude === true;
+  const withDaemon = options.withDaemon === true || useFakeClaude;
+  let fakeClaudeDir: string | undefined;
+  let fake: FakeClaude | undefined;
+  let baseEnv: Record<string, string> | undefined;
+  if (useFakeClaude) {
+    fakeClaudeDir = await mkdtemp(join(tmpdir(), 'lazy-e2e-claude-'));
+    fake = await installFakeClaude(fakeClaudeDir);
+    // Prepend, so the fake shadows any real `claude` the developer has
+    // installed. Everything this context spawns (CLI, daemon, and through the
+    // daemon the supervisor and the agent) inherits this PATH.
+    baseEnv = { PATH: `${fake.binDir}:${process.env.PATH ?? ''}` };
+  }
+
   // Arm the process-death safety net for this root BEFORE any CLI call can
   // auto-start a daemon (e.g. `lazy init` below). If `afterEach`/cleanup() never
   // runs, the registry's exit/SIGINT/SIGTERM handlers reap this root's daemon.
@@ -290,26 +384,74 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   spawnGit(root, 'commit', '-m', 'Initial commit');
 
   // Run `lazy init` (skip auth/github checks, non-interactive for piped test env)
-  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, options.withDaemon === true);
+  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, withDaemon, undefined, undefined, baseEnv);
   if (initResult.exitCode !== 0) {
     throw new Error(`lazy init failed: ${initResult.stderr}\n${initResult.stdout}`);
   }
+
+  if (useFakeClaude) {
+    // The fake-binary seam requires the host-process runner: it is the only
+    // runner that launches the supervisor as a plain subprocess on this host,
+    // where a PATH-shadowed `claude` is reachable at all. Docker mode would run
+    // the agent inside a container that never sees our temp bin dir.
+    //
+    // permission_mode = "bypass" because the default "sandbox" posture needs
+    // bwrap + socat on Linux — a suite asserting on watchdog behavior must not
+    // fail on a sandbox dependency. The sandbox posture has its own suites.
+    const configPath = join(root, 'lazy.toml');
+    const config = await readFile(configPath, 'utf-8');
+    const patched = config.replace(
+      /^type\s*=\s*"docker"/m,
+      'type = "dangerously-host-process-without-any-isolation"\npermission_mode = "bypass"',
+    );
+    if (patched === config) {
+      throw new Error('fakeClaude setup: could not find [runner] type = "docker" in the generated lazy.toml');
+    }
+    await writeFile(configPath, patched);
+  }
+
+  // Branch protection is opt-in (off by default), so the harness needs no
+  // config injection: the accept suites exercise the unprotected default path
+  // as-is. Protection tests opt in explicitly (see test/e2e/approve.test.ts
+  // enableProtection helper).
 
   // Commit lazy initialization so worktrees can branch from here
   spawnGit(root, 'add', '.');
   spawnGit(root, 'commit', '-m', 'Initialize lazy');
 
-  if (options.withDaemon) {
-    await startTestDaemon(root, protocolBase, options.daemonEnv);
+  // `lazy init` writes an `external_path` into lazy.toml, so this project's
+  // task state lives OUTSIDE the temp repo (default ~/.lazy/<project-name>).
+  // Resolve it now so cleanup() can remove it — otherwise every e2e run leaves
+  // a ~/.lazy/lazy-e2e-* directory behind on the developer's machine forever.
+  const externalStorageDir = storageDirFor(root);
+
+  if (withDaemon) {
+    await startTestDaemon(root, protocolBase, options.daemonEnv, {
+      noPreload: useFakeClaude,
+      baseEnv,
+    });
   }
 
   const ctx: TestContext = {
     root,
     protocolBase,
-    lazy: (args, optsArg) => runLazy(root, args, protocolBase, options.withDaemon === true, optsArg?.env, optsArg?.input),
+    lazy: (args, optsArg) => runLazy(root, args, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
     lazyMocked: (args, mockResponse, optsArg) =>
-      runLazyMocked(root, args, mockResponse, protocolBase, options.withDaemon === true, optsArg?.env, optsArg?.input),
+      runLazyMocked(root, args, mockResponse, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
     git: (...args) => spawnGit(root, ...args),
+    setClaudeScenario: async (scenario) => {
+      if (!fake) throw new Error('setClaudeScenario requires setupTestLazy({ fakeClaude: true })');
+      await setClaudeScenario(fake, scenario);
+    },
+    claudeInvocations: async () => {
+      if (!fake) throw new Error('claudeInvocations requires setupTestLazy({ fakeClaude: true })');
+      return readClaudeInvocations(fake);
+    },
+    fakeClaudeBinDir: fake?.binDir,
+    clearClaudeInvocations: async () => {
+      if (!fake) throw new Error('clearClaudeInvocations requires setupTestLazy({ fakeClaude: true })');
+      await clearClaudeInvocations(fake);
+    },
     cleanup: async () => {
       // Always stop any daemon that was spawned for this project — either
       // explicitly via withDaemon or implicitly auto-started by a CLI call
@@ -321,10 +463,20 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
       // Daemon is stopped — the safety net no longer needs to track this root.
       unregisterTestDaemonRoot(root);
 
+      // Guard: only ever remove a storage dir this harness could have created.
+      // Test roots come from mkdtemp('lazy-e2e-'), so the derived project name
+      // always carries that prefix — a real project's ~/.lazy/<name> can never
+      // match, no matter how cleanup is called.
+      const removableStorage = basename(externalStorageDir).startsWith('lazy-e2e-')
+        ? [rm(externalStorageDir, { recursive: true, force: true })]
+        : [];
+
       await Promise.all([
         rm(root, { recursive: true, force: true }),
         rm(protocolBase, { recursive: true, force: true }),
         rm(getDaemonDir(root), { recursive: true, force: true }),
+        ...(fakeClaudeDir ? [rm(fakeClaudeDir, { recursive: true, force: true })] : []),
+        ...removableStorage,
       ]);
     },
   };

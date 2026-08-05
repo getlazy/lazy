@@ -1,4 +1,4 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, formatDate, getBranchNameFromId } from '../helpers';
+import { requireLazyRoot, requireStorage, shortId, displayId, taskRef, parseFlags, resolveTaskOrExit, formatDate, getBranchNameFromId } from '../helpers';
 import { openEditor, removeRecoveryFile, isTTY } from '../editor';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
@@ -7,11 +7,16 @@ import { parentTaskIdOf } from '../../task-target';
 
 /**
  * Find the merge commit SHA for an accepted task on the target branch.
- * Searches for commits matching "Accept task <shortId>" pattern.
+ *
+ * Searches for commits matching "Accept task <ref>". The ref is whatever
+ * `taskRef()` returns — the task's code when it has one, the short id
+ * otherwise — because that is exactly what the accept merge wrote
+ * (mergeOptions.taskShortId = taskRef(task) in acceptTask). Grepping for the
+ * short id unconditionally never matched a task that had a code.
  */
-async function findMergeCommit(taskShortId: string, targetBranch: string, root: string): Promise<string | null> {
+async function findMergeCommit(ref: string, targetBranch: string, root: string): Promise<string | null> {
   const result = await runGit(
-    ['log', targetBranch, '--grep', `Accept task ${taskShortId}`, '--format=%H', '-1'],
+    ['log', targetBranch, '--grep', `Accept task ${ref}`, '--format=%H', '-1'],
     { cwd: root },
   );
   if (result.exitCode !== 0) return null;
@@ -65,10 +70,11 @@ export async function commandRevert(args: string[]): Promise<void> {
       : 'main';
 
     // Find the merge commit
-    const mergeSha = await findMergeCommit(shortId(task.id), mergeTargetBranch, root);
+    const acceptRef = taskRef(task);
+    const mergeSha = await findMergeCommit(acceptRef, mergeTargetBranch, root);
     if (!mergeSha) {
       console.error(`Could not find merge commit for task ${displayId(task)} on ${mergeTargetBranch}.`);
-      console.error(`Expected a commit matching "Accept task ${shortId(task.id)}" on branch ${mergeTargetBranch}.`);
+      console.error(`Expected a commit matching "Accept task ${acceptRef}" on branch ${mergeTargetBranch}.`);
       console.error('The commit may have been rebased, squashed, or the branch may have diverged.');
       process.exit(1);
     }

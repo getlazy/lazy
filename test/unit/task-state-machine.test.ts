@@ -14,7 +14,7 @@ import type { TaskStatus } from '../../src/types';
 
 // All statuses that exist in the TaskStatus type
 const ALL_STATUSES: TaskStatus[] = [
-  'backlog', 'working', 'blocked', 'conflict', 'pairing',
+  'backlog', 'queued', 'working', 'blocked', 'conflict', 'pairing',
   'interrupted', 'submitted', 'merging', 'zombie', 'complete', 'abandoned',
 ];
 
@@ -94,6 +94,19 @@ describe('task-state-machine', () => {
     // But merging CAN go to complete or blocked
     expect(canTransition('merging', 'complete')).toBe(true);
     expect(canTransition('merging', 'blocked')).toBe(true);
+  });
+
+  // INVARIANT (accept restores the TRUE prior status): an accept walks the task
+  // through `working` (pre-accept turn) and `merging` (merge phase). When it
+  // aborts, the task returns to the status it ACTUALLY had — a task that was in
+  // `conflict` (unresolved violations) or `submitted` (open PR awaiting review)
+  // is not `blocked`, and rewriting it to `blocked` silently destroys that
+  // signal. Both statuses must therefore reach the whole blocked family.
+  test('an aborted accept can restore conflict and submitted, not just blocked', () => {
+    for (const restored of ['blocked', 'conflict', 'submitted'] as const) {
+      expect(canTransition('working', restored)).toBe(true);
+      expect(canTransition('merging', restored)).toBe(true);
+    }
   });
 
   // INVARIANT: canTransition and transitionsTo are consistent (reverse lookup)

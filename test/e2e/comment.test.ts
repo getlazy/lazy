@@ -26,6 +26,18 @@ describe('lazy comment', () => {
     expectOutput(result, 'Added comment to task');
   });
 
+  test('accepts -m as a short alias for --message', async () => {
+    const taskId = await createTask(ctx, 'Task with -m comment');
+
+    const result = await ctx.lazy(['comment', taskId, '-m', 'Short-flag comment']);
+
+    expectSuccess(result);
+    expectOutput(result, 'Added comment to task');
+
+    const showResult = await ctx.lazy(['show', taskId]);
+    expectOutput(showResult, 'Short-flag comment');
+  });
+
   test('comment appears in show output', async () => {
     const taskId = await createTask(ctx, 'Task with visible comment');
     await ctx.lazy(['comment', taskId, '--message', 'Important observation']);

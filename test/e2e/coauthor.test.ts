@@ -3,7 +3,8 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { worktreePathFor } from '../helpers/storage';
 
 /**
  * Helper: create a task, start it, make a commit in the worktree.
@@ -11,16 +12,19 @@ import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Promise<string> {
   const taskId = await createTask(ctx, goal, 'Some work');
 
-  const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
-    env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
-  });
-  expectSuccess(startResult);
+  // Drive the reconcile pass too — accept refuses a task that is still
+  // 'working', and only a reconcile (daemon or explicit) moves it to 'blocked'.
+  await startAndReconcile(ctx, taskId);
 
-  // Add a file and commit it
-  const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
-  writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
+  // Add a file and commit it. The filename must be unique per task: the second
+  // test accepts three tasks in a row, so a shared 'feature.txt' would already
+  // be on main (with identical content) by the time task 2 branches off it, and
+  // `git commit` would fail with "nothing to commit".
+  const worktreePath = worktreePathFor(ctx.root, taskId);
+  const featureFile = `feature-${taskId}.txt`;
+  writeFileSync(join(worktreePath, featureFile), `feature content for ${taskId}\n`);
 
-  const gitAdd = ctx.git('-C', worktreePath, 'add', 'feature.txt');
+  const gitAdd = ctx.git('-C', worktreePath, 'add', featureFile);
   expect(gitAdd.exitCode).toBe(0);
 
   const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
@@ -34,6 +38,9 @@ describe('Lazy co-author trailer', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    // Daemonless suite: no runner exists to execute the pre-accept agent turn,
+    // and these tests assert on the merge commit, not on pre-accept.
+    disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {

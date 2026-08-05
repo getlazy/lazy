@@ -13,12 +13,19 @@ function truncate(str: string, maxLen: number): string {
 }
 
 function resultDisplayId(result: SearchResult): string {
+  // Memory records are keyed by their name, not by an id — truncating it to 8
+  // chars ("tasks-no") would hide which record matched.
+  if (result.entity_type === 'memory') return result.entity_id;
   return result.task_code ?? shortId(result.task_id);
 }
 
-function printResults(results: SearchResult[], groupByTask: boolean): void {
+function printResults(results: SearchResult[], groupByTask: boolean, hint?: string): void {
   if (results.length === 0) {
     console.log('No matches found.');
+    if (hint) {
+      console.log('');
+      console.log(hint);
+    }
     return;
   }
 
@@ -120,14 +127,14 @@ function buildMatchContext(result: SearchResult, showLines: string[], lineNum: n
  * For each matched task, builds the show output text and finds
  * where matched content appears to compute accurate line numbers.
  */
-async function printJsonResults(storage: Storage, results: SearchResult[], query: string): Promise<void> {
+async function printJsonResults(storage: Storage, results: SearchResult[], query: string, hint?: string): Promise<void> {
   // Build show output for each unique task (for line number computation)
   const showOutputCache = new Map<string, string[]>();
 
   // Collect unique task IDs (excluding conversations which use session IDs)
   const taskIds = new Set<string>();
   for (const r of results) {
-    if (r.entity_type !== 'conversation') {
+    if (r.entity_type !== 'conversation' && r.entity_type !== 'memory') {
       taskIds.add(r.task_id);
     }
   }
@@ -164,7 +171,7 @@ async function printJsonResults(storage: Storage, results: SearchResult[], query
     };
   });
 
-  console.log(JSON.stringify({ query, matches }));
+  console.log(JSON.stringify({ query, matches, ...(hint ? { hint } : {}) }));
 }
 
 export async function commandSearch(args: string[]): Promise<void> {
@@ -180,6 +187,7 @@ export async function commandSearch(args: string[]): Promise<void> {
     { name: 'notes', takesValue: false },
     { name: 'followups', takesValue: false },
     { name: 'conversations', takesValue: false },
+    { name: 'memories', takesValue: false },
   ], 'search');
 
   // Parse options
@@ -195,9 +203,10 @@ export async function commandSearch(args: string[]): Promise<void> {
   const searchNotes = parsed.flags.get('notes') === true;
   const searchFollowUps = parsed.flags.get('followups') === true;
   const searchConversations = parsed.flags.get('conversations') === true;
+  const searchMemories = parsed.flags.get('memories') === true;
 
   // If no specific types, search all
-  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchFollowUps && !searchConversations;
+  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchFollowUps && !searchConversations && !searchMemories;
 
   // Get query (remaining positional args)
   const query = parsed.positional.join(' ');
@@ -218,6 +227,7 @@ export async function commandSearch(args: string[]): Promise<void> {
     if (searchNotes) types.push('comment');
     if (searchFollowUps) types.push('followup');
     if (searchConversations) types.push('conversation');
+    if (searchMemories) types.push('memory');
   }
 
   // For --json output, we need local show output computation for line numbers,
@@ -226,8 +236,8 @@ export async function commandSearch(args: string[]): Promise<void> {
   if (jsonOutput) {
     const storage = await requireStorage();
     try {
-      const { results } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
-      await printJsonResults(storage, results, query);
+      const { results, hint } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
+      await printJsonResults(storage, results, query, hint);
     } catch (err) {
       if (err instanceof QueryParseError) {
         console.error(`Query parse error: ${err.message}`);
@@ -241,8 +251,8 @@ export async function commandSearch(args: string[]): Promise<void> {
   }
 
   try {
-    const { results } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
-    printResults(results, groupByTask);
+    const { results, hint } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
+    printResults(results, groupByTask, hint);
   } catch (err) {
     if (err instanceof QueryParseError) {
       console.error(`Query parse error: ${err.message}`);
@@ -255,7 +265,8 @@ export async function commandSearch(args: string[]): Promise<void> {
 export function searchUsage(): void {
   console.log(`Usage: lazy search <query> [options]
 
-Search across tasks, prompts, turns, commits, notes, follow-ups, and conversations.
+Search across tasks, prompts, turns, commits, notes, follow-ups, conversations,
+and shared memory records.
 
 Options:
   -f, --fuzzy        Use fuzzy matching (typo-tolerant)
@@ -270,11 +281,16 @@ Filter by type:
   --notes            Search task notes only
   --followups        Search task follow-ups only
   --conversations    Search captured builder conversations only
+  --memories         Search shared memory records only
 
 Query language:
   Supports Lucene-style syntax with boolean operators and field filters.
-  When operators or field syntax are detected, structured search is used
-  automatically. Plain text queries use regex (case-insensitive) matching.
+  When operators, field syntax, or a #tag are detected, structured search is
+  used automatically. Plain text queries use regex (case-insensitive) matching.
+
+  Quote the whole query in single quotes so the shell does not eat the syntax:
+  '#' starts a comment in most shells, and an unquoted multi-word value is
+  split into separate terms.
 
   Boolean operators:
     AND                Both conditions must match
@@ -286,11 +302,14 @@ Query language:
     status:<value>     Task status (working, blocked, interrupted, etc.)
     goal:<text>        Match against task goal
     code:<value>       Match task code
+    tag:<value>        Match tasks carrying this tag
+    #<value>           Shorthand for tag:<value>, also matching '#value' as text
     in:turns <text>    Search within turn content
     in:commits <text>  Search within commit messages
     in:comments <text> Search within comments
     in:followups <text>  Search within follow-ups
     in:conversations <text>  Search within conversation messages
+    in:memories <text>       Search within shared memory records
     has:commits        Task has commits
     has:turns          Task has turns
     has:comments       Task has comments
@@ -298,14 +317,31 @@ Query language:
     created:>YYYY-MM-DD / created:<YYYY-MM-DD   Date filter on creation
     updated:>YYYY-MM-DD / updated:<YYYY-MM-DD   Date filter on last update
 
+Tags:
+  Tags are normalized on write AND on query — lowercased, with every run of
+  non-alphanumerics collapsed to a hyphen. So 'tag:My Feature!' and
+  'tag:my-feature' both look for the stored tag 'my-feature', and a leading
+  '#' is stripped ('tag:#launch' == 'tag:launch').
+
+  A multi-word tag MUST be quoted, or only the first word is treated as the
+  tag and the rest become separate text terms:
+
+    lazy search 'tag:"My Feature Work"'    # matches tag 'my-feature-work'
+    lazy search 'tag:My Feature Work'      # tag:my AND "Feature" AND "Work"
+
 Examples:
   lazy search "auth"                                       # Regex search everywhere
   lazy search catchup --fuzzy                              # Fuzzy search
   lazy search 'status:blocked AND in:turns "reconciler"'   # Structured query
   lazy search 'in:conversations "design decision"'         # Search conversations
+  lazy search 'in:memories "credentials"'                  # Search shared memory
   lazy search 'status:abandoned OR status:complete'         # Boolean OR
   lazy search 'has:commits AND NOT in:commits "wip"'       # Negation
   lazy search 'created:>2026-02-15 AND status:working'     # Date filter
+  lazy search 'tag:onboarding'                             # Tasks tagged 'onboarding'
+  lazy search '#onboarding'                                # Same, using the printed spelling
+  lazy search 'tag:"My Feature Work"'                      # Multi-word tag (quote it)
+  lazy search 'tag:launch AND status:blocked'              # Combine tag with status
   lazy search "design decision" --conversations            # Filter to conversations only
   lazy search "auth" --json                                  # JSON output with line numbers`);
 }

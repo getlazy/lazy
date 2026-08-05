@@ -13,6 +13,15 @@ import {
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
 import { reconcileTasks } from '../../src/utils/reconcile';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
+import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
+
+// This suite awaits reconcileTasks() IN-PROCESS, so the `bun test` process itself
+// runs production code — and it is daemonless by design. Without LAZY_TEST=1 the
+// on-by-default audit proxy makes createRunner fail loud (ProxyUnavailableError)
+// because there is no daemon to report a proxy address, aborting every pass
+// before it does any work. See CLAUDE.md, "A daemonless suite that calls src/
+// in-process must declare test mode".
+enableInProcessTestMode();
 
 // ============================================================
 // Helpers
