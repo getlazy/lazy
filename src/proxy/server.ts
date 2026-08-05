@@ -29,10 +29,9 @@
  */
 
 import { randomUUID } from 'crypto';
-import type { Storage } from '../storage/interface';
 import type { ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
 import { extractRequest } from './extractor';
-import { AuditQueue } from './audit';
+import { AuditQueue, type AuditSink } from './audit';
 import { enforceResponseBody } from './enforce';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from './policy';
 import { logger } from '../utils/logger';
@@ -116,7 +115,10 @@ function bodyForTarget(
 
 export function createProxyServer(
   config: ProxyServerConfig,
-  storage: Storage,
+  // The audit sink is the project-local bounded log (src/proxy/audit-log.ts) —
+  // NOT the Storage layer. Audit records are disposable telemetry, so they must
+  // never take a storage round-trip on the proxy hot path.
+  auditSink: AuditSink,
 ): ReturnType<typeof Bun.serve> {
   const upstream = config.upstream.replace(/\/$/, '');
   const fallbacks: ProxyFallbackTarget[] = (config.fallbacks ?? []).map((f) => ({
@@ -125,7 +127,7 @@ export function createProxyServer(
   }));
   const retryAfterThreshold = config.retryAfterThreshold ?? DEFAULT_RETRY_AFTER_THRESHOLD;
   const policy = config.policy ?? defaultPolicyConfig();
-  const auditQueue = new AuditQueue(storage);
+  const auditQueue = new AuditQueue(auditSink);
   let seq = 0;
 
   const fallbackNote = fallbacks.length

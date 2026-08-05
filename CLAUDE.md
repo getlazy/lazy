@@ -48,6 +48,8 @@ Upstream merge is a separate operation — triggered by `lazy sync <task>`, daem
 
 All persistent state (tasks, sessions, turns, commits, comments, conversations) MUST go through the Storage interface (`src/storage/interface.ts`). Never read/write files in `.lazy/` or other stores directly from CLI commands or other modules. The FileStorage implementation is just one backend — we don't know where users will store state. If you need a new entity type, add methods to the Storage interface first, then implement in FileStorage.
 
+**Carve-out: disposable telemetry is not storage state.** Bounded, project-local, throwaway streams are deliberately OUTSIDE Storage and are read and written directly. The proxy audit log (`src/proxy/audit-log.ts`, `.lazy/logs/proxy-audit.jsonl`) is the one instance today: it is one line per model API request, and when it lived in the store it grew to 677 MiB and broke a store push. Storage is for permanent state that must survive and travel with the project; high-churn telemetry is neither. Do not "fix" this back into the Storage interface. Anything new claiming this carve-out must be bounded by construction (rotation or a hard cap) and disposable — if losing it costs the user anything, it belongs in Storage.
+
 ### Tests encode invariants, not just current behavior
 
 When you write a test, you're asserting "this behavior is correct and should not change." Every test that encodes a design decision MUST have a comment explaining WHY:

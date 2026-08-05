@@ -1825,20 +1825,6 @@ export class PostgresStorage implements Storage {
     return row ?? null;
   }
 
-  // --- Proxy Audit (Tier-1 passive audit plane) ---
-  // PostgresStorage does not yet implement the audit plane — audit records are
-  // local to the daemon's FileStorage and are not replicated to Postgres. These
-  // stubs satisfy the Storage interface contract until a Postgres schema and
-  // migration are added.
-
-  async appendAuditRecord(_record: import('./types').ProxyAuditRecord): Promise<void> {
-    // No-op: Postgres audit plane not yet implemented.
-  }
-
-  async listAuditRecords(_options?: import('./types').ListAuditRecordsOptions): Promise<import('./types').ProxyAuditRecord[]> {
-    return [];
-  }
-
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 
   async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {

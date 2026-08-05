@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { cp, mkdir, readdir, readFile, writeFile, appendFile, rename, rm, stat, unlink } from 'fs/promises';
+import { cp, mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
 import { join } from 'path';
 import type { Storage, CreateTurnOptions } from './interface';
 import { normalizeTurnContent } from '../utils/turn-content';
@@ -74,8 +74,6 @@ import type {
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
-  ProxyAuditRecord,
-  ListAuditRecordsOptions,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { normalizeTagOrThrow } from '../utils/tags';
@@ -2298,47 +2296,11 @@ export class FileStorage implements Storage {
     return { taskId: fullId, sessionId: meta.sessionId, capturedAt: meta.capturedAt, content };
   }
 
-  // --- Proxy Audit (Tier-1 passive audit plane) ---
-
-  /** Append-only JSONL of proxy audit records, one record per line. */
-  private get auditPath(): string {
-    return join(this.basePath, 'proxy-audit.jsonl');
-  }
-
-  async appendAuditRecord(record: ProxyAuditRecord): Promise<void> {
-    // Append-only line-delimited JSON. The proxy's audit queue serializes calls
-    // to this method, so a plain append is safe (no interleaving). mkdir is
-    // cheap and idempotent; it guards against a brand-new project whose base
-    // dir does not exist yet.
-    await mkdir(this.basePath, { recursive: true });
-    await appendFile(this.auditPath, JSON.stringify(record) + '\n', 'utf-8');
-  }
-
-  async listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]> {
-    let raw: string;
-    try {
-      raw = await readFile(this.auditPath, 'utf-8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw new Error(`Failed to read proxy audit log at ${this.auditPath}: ${(err as Error).message}`);
-    }
-    const records: ProxyAuditRecord[] = [];
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        records.push(JSON.parse(trimmed) as ProxyAuditRecord);
-      } catch {
-        // A single corrupt line (e.g. a partial write interrupted by a crash)
-        // must not make the whole audit log unreadable — skip it. The append
-        // path writes whole lines, so this is rare and self-limiting.
-      }
-    }
-    if (options?.limit !== undefined && options.limit >= 0 && records.length > options.limit) {
-      return records.slice(records.length - options.limit);
-    }
-    return records;
-  }
+  // NOTE: the proxy audit log used to live at `<store>/proxy-audit.jsonl`,
+  // uncapped. It reached 677 MiB in a real store and broke a store push. It is
+  // now a bounded, project-local file under `.lazy/` (src/proxy/audit-log.ts) —
+  // storage is for permanent state, not telemetry. The daemon deletes any
+  // leftover file at the old path on startup.
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 

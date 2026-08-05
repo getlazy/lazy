@@ -44,6 +44,13 @@ import { findHousekeepingConversations } from '../../import/housekeeping-convers
 import { runReimportBulk } from './import-conversation';
 import { requireStorage, tryRemoteStorage } from '../helpers';
 import { unresolvedAuthRejection } from '../../proxy/auth-verdict';
+import {
+  readAuditRecords,
+  legacyAuditLogInfo,
+  formatSize,
+  AUDIT_LOG_FILENAME,
+  AUDIT_LOG_SUBDIR,
+} from '../../proxy/audit-log';
 import { fetchDaemonCredentialState, ProxyUnavailableError } from '../../daemon/auth-env';
 import { credentialFromEnv } from '../../daemon/credential-gate';
 import {
@@ -205,20 +212,16 @@ const AUTH_VERDICT_RECORDS = 200;
  * succeeded (see unresolvedAuthRejection), so re-exporting a good token and
  * restarting the daemon silences it with no state to reset.
  *
- * Mirrors checkReimportableConversations: prefer the daemon's storage, fall back
- * to a direct read-only handle, and degrade to a skipped check on any error —
- * a diagnostics hiccup must not become a health failure.
+ * Reads the project-local audit log directly — it is a plain, size-capped file
+ * under `.lazy/logs/` (bind-mounted read-write into builder containers at the
+ * same path, so this works inside one too), not storage state. This is the
+ * deliberate carve-out from the "never read `.lazy/` directly" rule in
+ * CLAUDE.md: disposable telemetry is explicitly not storage state. Degrades to a skipped
+ * check on any error: a diagnostics hiccup must not become a health failure.
  */
-async function checkCredentialAccepted(root: string): Promise<CheckResult> {
-  let storage: Storage | null = null;
-  let ownsStorage = false;
+async function checkCredentialAccepted(dataDir: string): Promise<CheckResult> {
   try {
-    storage = await tryRemoteStorage(root);
-    if (!storage) {
-      storage = await createStorage(root);
-      ownsStorage = true;
-    }
-    const records = await storage.listAuditRecords({ limit: AUTH_VERDICT_RECORDS });
+    const records = await readAuditRecords(dataDir, { limit: AUTH_VERDICT_RECORDS });
     const rejection = unresolvedAuthRejection(records);
     if (!rejection) {
       return { ok: true, label: 'Model API accepts lazy credential' };
@@ -241,6 +244,44 @@ async function checkCredentialAccepted(root: string): Promise<CheckResult> {
     };
   } catch {
     return { ok: true, label: 'Model API accepts lazy credential (check skipped)' };
+  }
+}
+
+/**
+ * Is a pre-move proxy audit log still sitting at the store root?
+ *
+ * Older versions appended the audit stream there with no cap; one real store
+ * grew a 677 MiB blob that broke a push. The daemon deletes it on startup, so
+ * this only fires when the daemon has not been restarted since the upgrade —
+ * and it is the one place that spells out the part lazy cannot fix: the blob is
+ * already in that store repo's git history.
+ */
+async function checkLegacyProxyAuditLog(root: string): Promise<CheckResult> {
+  const label = 'No legacy proxy audit log in the store';
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    storage = await tryRemoteStorage(root);
+    if (!storage) {
+      storage = await createStorage(root);
+      ownsStorage = true;
+    }
+    const legacy = await legacyAuditLogInfo(storage.getStoragePath());
+    if (!legacy) return { ok: true, label };
+    return {
+      ok: false,
+      label,
+      detail:
+        `${legacy.path} (${formatSize(legacy.bytes)}) is left over from when the proxy audit trail ` +
+        `was written into the store uncapped. It is disposable telemetry — audit records now live in ` +
+        `the project-local, size-capped ${join(AUDIT_LOG_SUBDIR, AUDIT_LOG_FILENAME)} under your data dir.\n` +
+        `  Restart the daemon to remove it:\n` +
+        `    ${theme.command('lazy daemon restart')}\n` +
+        `  Or delete it by hand. If your store is a git repo, the blob is also in its HISTORY — ` +
+        `lazy cannot rewrite that for you; use ${theme.command('git filter-repo')} in the store repo.`,
+    };
+  } catch {
+    return { ok: true, label: `${label} (check skipped)` };
   } finally {
     if (storage && ownsStorage) await storage.close();
   }
@@ -1732,7 +1773,8 @@ export async function commandDoctor(args: string[]): Promise<void> {
     results.push(await checkReimportableConversations(root, join(root, config!.data.path)));
     results.push(await checkImportableMemories(root, join(root, config!.data.path)));
     results.push(await checkMemoryContext(root, config!));
-    results.push(await checkCredentialAccepted(root));
+    results.push(await checkCredentialAccepted(join(root, config!.data.path)));
+    results.push(await checkLegacyProxyAuditLog(root));
     results.push(await checkProtectedTasksResolvable(root, config!));
     results.push(await checkDefaultBranchProtectionResolvable(root, config!));
     results.push(await checkTaskBranchUpstreamTracking());

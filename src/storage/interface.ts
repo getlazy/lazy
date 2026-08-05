@@ -43,8 +43,6 @@ import type {
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
-  ProxyAuditRecord,
-  ListAuditRecordsOptions,
 } from './types';
 import type { SpanRecord } from '../tracing/types';
 import type { RunnerType } from '../config/types';
@@ -580,22 +578,10 @@ export interface Storage {
    */
   getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null>;
 
-  // --- Proxy Audit (Tier-1 passive audit plane) ---
-
-  /**
-   * Append one proxy audit record. Append-only: records are never updated or
-   * deleted. Written asynchronously by the passthrough proxy's audit queue
-   * (src/proxy/audit.ts) — must not block the proxy hot path, so keep this
-   * cheap and serial.
-   */
-  appendAuditRecord(record: ProxyAuditRecord): Promise<void>;
-
-  /**
-   * List proxy audit records in insertion order (oldest first). `limit` returns
-   * the most recent N. Used by tooling and a later model-economics / routing
-   * layer to query captured traffic.
-   */
-  listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]>;
+  // NOTE: the proxy audit plane deliberately does NOT live here. Storage holds
+  // permanent state; the audit stream is high-churn, disposable telemetry and
+  // lives in the impermanent project-local `.lazy/` dir, size-capped — see
+  // src/proxy/audit-log.ts.
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 

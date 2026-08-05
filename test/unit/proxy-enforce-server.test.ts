@@ -14,16 +14,17 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createProxyServer } from '../../src/proxy/server';
 import { defaultPolicyConfig } from '../../src/proxy/policy';
 import { parseSSEMessage } from '../../src/proxy/enforce';
-import type { Storage } from '../../src/storage/interface';
+import type { AuditSink } from '../../src/proxy/audit';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
-function createMockStorage() {
+// The proxy writes audit records to an AuditSink (the project-local bounded
+// log in production) — never to Storage.
+function createMockSink() {
   const records: ProxyAuditRecord[] = [];
-  const storage = {
-    appendAuditRecord: async (r: ProxyAuditRecord) => { records.push(r); },
-    listAuditRecords: async () => records,
-  } as unknown as Storage;
-  return { storage, records };
+  const sink: AuditSink = {
+    append: async (r: ProxyAuditRecord) => { records.push(r); },
+  };
+  return { sink, records };
 }
 
 function findFreePort(): number {
@@ -68,7 +69,7 @@ describe('proxy enforcement (server integration)', () => {
   });
 
   function startProxy(policyOverrides = {}) {
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: findFreePort(),
@@ -76,7 +77,7 @@ describe('proxy enforcement (server integration)', () => {
         upstream: `http://127.0.0.1:${upstreamPort}`,
         policy: { ...defaultPolicyConfig(), ...policyOverrides },
       },
-      ms.storage,
+      ms.sink,
     );
     return { proxy, ms, port: (proxy as unknown as { port: number }).port };
   }

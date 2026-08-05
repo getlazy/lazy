@@ -478,7 +478,11 @@ model = "claude-sonnet-4-6"
 endpoint = "http://127.0.0.1:8766"
 ```
 
-Audit records are written to `.lazy/proxy-audit.jsonl` (append-only JSONL, one record per line). Writes are serialised — no interleaving even under concurrent requests — and happen asynchronously so the proxy hot path is never blocked by disk I/O.
+Audit records are written to `.lazy/logs/proxy-audit.jsonl` (append-only JSONL, one record per line) in the project-local data dir — **not** into your task store. The audit trail is disposable telemetry, not durable state: it is gitignored, safe to delete at any time, and never travels with the store. Writes are serialised — no interleaving even under concurrent requests — and happen asynchronously so the proxy hot path is never blocked by disk I/O.
+
+The file is **bounded**: it rotates to `proxy-audit.jsonl.1` at 4 MiB and only that one older segment is kept, so the audit trail can never exceed 8 MiB total. Retention is deliberately shallow — the only reader is the recent-history "is lazy's credential actually accepted?" verdict in `lazy doctor`. Anything wanting statistics should tap the stream as it flows rather than mine the file.
+
+> **Upgrading from an earlier version:** the audit stream used to be appended, uncapped, into the task store itself (`<store>/proxy-audit.jsonl`) — where one real store grew it to 677 MiB and broke a push. The daemon deletes that leftover file on startup and says so in its log — including when `[proxy] enabled = false`, since it is cleanup of a file an older version wrote and has nothing to do with whether the proxy runs now. `lazy doctor` reports it if it is still there. If your store is a git repo, the oversized blob is also in its **history**, which lazy will not rewrite for you — use `git filter-repo` in the store repo to purge it.
 
 Each record is **attributed to the role and task that made the request.** lazy sets `ANTHROPIC_CUSTOM_HEADERS` on every agent it launches through the proxy, so Claude Code sends `x-lazy-role` (`agent` or `builder`) and — for task agents — `x-lazy-task-id` on each request; the proxy reads them into the audit record's `role`/`taskId`, then strips them before forwarding upstream (real Anthropic never sees lazy-internal headers). This is what lets the audit trail (and every `DENY` log line) say *which* agent and task tried a given `tool_use`, not just that one did.
 

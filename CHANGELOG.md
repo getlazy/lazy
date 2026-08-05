@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.20.1083] - 2026-08-05 - Hot fix
+
+### Fixed
+
+- **Proxy audit log no longer bloats your task store** — it now lives in the disposable, gitignored `.lazy/logs/`, capped at 8 MiB, and any oversized leftover in the store is removed on daemon start (`fix-proxy-audit-growth`)
+
 ## [0.20.1081] - 2026-08-04 - Agent containment, agent-run subtasks, and builder session reliability
 
 This release draws a hard boundary around what an agent can do, and makes builder sessions dependable across restarts and upgrades. Containment is now enforced by mounts and tokens rather than by prompt: agent containers get a split `.git` mount that cannot move refs, every daemon MCP token is scoped to a single task or a single builder session, and all agent model traffic routes through lazy's local audit proxy by default. On top of that boundary agents can decompose and run their own subtasks end-to-end (create → start → review → accept), while the builder gets one unified `/resume` list per project, live conversation capture into lazy's store, and a relaunch that survives `lazy upgrade`.

@@ -4,8 +4,7 @@
  */
 
 import { describe, test, expect, mock } from 'bun:test';
-import { AuditQueue } from '../../src/proxy/audit';
-import type { Storage } from '../../src/storage/interface';
+import { AuditQueue, type AuditSink } from '../../src/proxy/audit';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
 function makeRecord(seq: number): ProxyAuditRecord {
@@ -36,13 +35,13 @@ function makeRecord(seq: number): ProxyAuditRecord {
 }
 
 describe('AuditQueue', () => {
-  test('appends records to storage in order', async () => {
+  test('appends records to the sink in order', async () => {
     const written: ProxyAuditRecord[] = [];
-    const storage = {
-      appendAuditRecord: async (r: ProxyAuditRecord) => { written.push(r); },
-    } as unknown as Storage;
+    const sink: AuditSink = {
+      append: async (r: ProxyAuditRecord) => { written.push(r); },
+    };
 
-    const queue = new AuditQueue(storage);
+    const queue = new AuditQueue(sink);
     queue.enqueue(makeRecord(1));
     queue.enqueue(makeRecord(2));
     queue.enqueue(makeRecord(3));
@@ -54,15 +53,15 @@ describe('AuditQueue', () => {
   test('continues after a failed append', async () => {
     const written: number[] = [];
     let callCount = 0;
-    const storage = {
-      appendAuditRecord: async (r: ProxyAuditRecord) => {
+    const sink: AuditSink = {
+      append: async (r: ProxyAuditRecord) => {
         callCount++;
         if (callCount === 2) throw new Error('disk full');
         written.push(r.seq);
       },
-    } as unknown as Storage;
+    };
 
-    const queue = new AuditQueue(storage);
+    const queue = new AuditQueue(sink);
     queue.enqueue(makeRecord(1));
     queue.enqueue(makeRecord(2)); // will throw
     queue.enqueue(makeRecord(3));
@@ -76,11 +75,11 @@ describe('AuditQueue', () => {
   test('flush returns after all enqueued writes complete', async () => {
     let resolveWrite!: () => void;
     const writePromise = new Promise<void>((res) => { resolveWrite = res; });
-    const storage = {
-      appendAuditRecord: async () => { await writePromise; },
-    } as unknown as Storage;
+    const sink: AuditSink = {
+      append: async () => { await writePromise; },
+    };
 
-    const queue = new AuditQueue(storage);
+    const queue = new AuditQueue(sink);
     queue.enqueue(makeRecord(1));
     let flushed = false;
     const flushPromise = queue.flush().then(() => { flushed = true; });

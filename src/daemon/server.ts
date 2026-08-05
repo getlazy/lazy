@@ -53,7 +53,15 @@ import { getLogPath } from './paths';
 import { loadConfig } from '../config/loader';
 import type { RunnerType } from '../config/types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
-import { createProxyServer } from '../proxy';
+import {
+  createProxyServer,
+  ProxyAuditLog,
+  auditLogPath,
+  pruneLegacyAuditLog,
+  formatSize,
+  AUDIT_SEGMENT_MAX_BYTES,
+  AUDIT_RETAINED_SEGMENTS,
+} from '../proxy';
 import { resolveDaemonBindHosts } from './bind-hosts';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
 import { setDaemonContext, setDaemonProxyPort } from './context';
@@ -1037,20 +1045,51 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Start the Anthropic passthrough proxy. This is ON BY DEFAULT — `cfg.proxy`
   // is non-null unless the operator set `[proxy] enabled = false` — so the proxy
   // is part of a normal daemon start, like the web server.
-  // The daemon owns the proxy: it SHARES the daemon's single Storage instance
-  // (never constructs its own — that was the storage-lock contention that took
-  // the daemon down) and announces its address at INFO next to the dashboard.
+  // The daemon owns the proxy: it announces its address at INFO next to the
+  // dashboard. Audit records do NOT go through Storage — they are disposable
+  // telemetry written to the project-local, size-capped
+  // `.lazy/logs/proxy-audit.jsonl`.
   try {
     // Search from projectRoot explicitly — loadConfig otherwise defaults its
     // search to process.cwd(), which is the project root for a real daemon but
     // NOT for an in-process test daemon.
     const cfg = await loadConfig(projectRoot, { cwd: projectRoot });
+    const dataDir = join(projectRoot, cfg.data.path);
+
+    // Upgrade path: earlier versions appended the audit stream to the STORE
+    // root with no cap, where it reached 677 MiB and broke a store push. Drop
+    // it — telemetry, not durable state — and say so rather than letting data
+    // disappear silently.
+    //
+    // Deliberately OUTSIDE the `cfg.proxy` check: this is cleanup of a file a
+    // PREVIOUS version wrote, so whether the proxy runs now is irrelevant.
+    // Gating it on the proxy would strand the oversized file forever on exactly
+    // the machines that set `[proxy] enabled = false`, while `lazy doctor` told
+    // them to restart the daemon to remove it.
+    try {
+      const storePath = (await getOrCreateStorage()).getStoragePath();
+      const pruned = await pruneLegacyAuditLog(storePath);
+      if (pruned) {
+        logger.info(
+          `Removed the legacy proxy audit log at ${pruned.path} (${formatSize(pruned.bytes)}). ` +
+          `Audit records now live in ${auditLogPath(dataDir)}, capped at ` +
+          `${formatSize(AUDIT_SEGMENT_MAX_BYTES * (AUDIT_RETAINED_SEGMENTS + 1))}. ` +
+          `If that store is a git repo, the old blob is still in its history — ` +
+          `use git filter-repo to purge it.`,
+        );
+      }
+    } catch (err) {
+      // Cleanup is best-effort housekeeping: a failure here must not stop the
+      // daemon from starting. Say what happened so it is not silent.
+      logger.warn(
+        `Could not remove the legacy proxy audit log from the store root: ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `It is safe to delete by hand.`,
+      );
+    }
+
     if (cfg.proxy) {
-      // Reuse the daemon's already-initialized singleton storage. getOrCreateStorage
-      // memoizes its in-flight init, so this shares the SAME instance the web
-      // handler resolves — no second lock acquisition.
-      const proxyStorage = await getOrCreateStorage();
-      proxyServer = createProxyServer(cfg.proxy, proxyStorage);
+      proxyServer = createProxyServer(cfg.proxy, new ProxyAuditLog(dataDir));
       // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
       // omitted) so per-launch env injection and `lazy daemon status` resolve
       // the real proxy address.

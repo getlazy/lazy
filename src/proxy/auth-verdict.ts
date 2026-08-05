@@ -42,7 +42,7 @@ export interface AuthRejection {
  * to leave a stale warning behind.
  *
  * @param records - Audit records in insertion order, oldest first (as
- *   `Storage.listAuditRecords` returns them)
+ *   `ProxyAuditLog.list` returns them)
  */
 export function unresolvedAuthRejection(records: ProxyAuditRecord[]): AuthRejection | null {
   let rejection: AuthRejection | null = null;

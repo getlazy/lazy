@@ -36,8 +36,6 @@ import type {
   AgentSessionLog,
   BuilderResumeIntent,
   StatusChange,
-  ProxyAuditRecord,
-  ListAuditRecordsOptions,
   TagEvent,
   MemoryRecord,
   MemoryEvent,
@@ -406,16 +404,6 @@ export class RemoteStorage implements Storage {
 
   async getAgentSessionLog(taskId: string): Promise<AgentSessionLog | null> {
     return this.call<AgentSessionLog | null>('getAgentSessionLog', { taskId });
-  }
-
-  // --- Proxy Audit (Tier-1 passive audit plane) ---
-
-  async appendAuditRecord(record: ProxyAuditRecord): Promise<void> {
-    await this.call('appendAuditRecord', { record });
-  }
-
-  async listAuditRecords(options?: ListAuditRecordsOptions): Promise<ProxyAuditRecord[]> {
-    return this.call<ProxyAuditRecord[]>('listAuditRecords', { options });
   }
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---

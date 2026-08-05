@@ -1,5 +1,18 @@
 export { createProxyServer, type ProxyServerConfig, type ProxyFallbackTarget } from './server';
-export { AuditQueue } from './audit';
+export { AuditQueue, type AuditSink } from './audit';
+export {
+  ProxyAuditLog,
+  auditLogDir,
+  auditLogPath,
+  readAuditRecords,
+  legacyAuditLogInfo,
+  pruneLegacyAuditLog,
+  formatSize,
+  AUDIT_LOG_FILENAME,
+  AUDIT_LOG_SUBDIR,
+  AUDIT_SEGMENT_MAX_BYTES,
+  AUDIT_RETAINED_SEGMENTS,
+} from './audit-log';
 export { extractRequest, classifyEndpoint, tierGuess, type ExtractedRequest, type ClassifiedEndpoint } from './extractor';
 export {
   evaluateToolUse,

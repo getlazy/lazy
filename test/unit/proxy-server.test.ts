@@ -12,18 +12,17 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { createProxyServer } from '../../src/proxy/server';
-import type { Storage } from '../../src/storage/interface';
+import type { AuditSink } from '../../src/proxy/audit';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
-// ---- Mock storage ----
-
-function createMockStorage() {
+// The proxy writes audit records to an AuditSink (the project-local bounded
+// log in production) — never to Storage.
+function createMockSink() {
   const records: ProxyAuditRecord[] = [];
-  const storage = {
-    appendAuditRecord: async (r: ProxyAuditRecord) => { records.push(r); },
-    listAuditRecords: async () => records,
-  } as unknown as Storage;
-  return { storage, records };
+  const sink: AuditSink = {
+    append: async (r: ProxyAuditRecord) => { records.push(r); },
+  };
+  return { sink, records };
 }
 
 // ---- Helpers ----
@@ -42,7 +41,7 @@ describe('proxy server', () => {
   let proxyServer: ReturnType<typeof Bun.serve>;
   let proxyPort: number;
   let upstreamPort: number;
-  let mockStorage: ReturnType<typeof createMockStorage>;
+  let mockSink: ReturnType<typeof createMockSink>;
   let lastForwardedRequest: ForwardedRequest | null = null;
 
   beforeAll(async () => {
@@ -61,10 +60,10 @@ describe('proxy server', () => {
     });
 
     proxyPort = findFreePort();
-    mockStorage = createMockStorage();
+    mockSink = createMockSink();
     proxyServer = createProxyServer(
       { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
-      mockStorage.storage,
+      mockSink.sink,
     );
 
     // Give servers a moment to bind
@@ -134,10 +133,10 @@ describe('proxy server', () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
     const up = (upstreamWithWrongLength as unknown as { port: number }).port;
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const p = createProxyServer(
       { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${up}` },
-      ms.storage,
+      ms.sink,
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
     const pp = (p as unknown as { port: number }).port;
@@ -155,7 +154,7 @@ describe('proxy server', () => {
   });
 
   test('writes an audit record for each request', async () => {
-    const before = mockStorage.records.length;
+    const before = mockSink.records.length;
     await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
       headers: {
@@ -167,8 +166,8 @@ describe('proxy server', () => {
     });
     // Give the async audit queue a moment to flush
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(mockStorage.records.length).toBeGreaterThan(before);
-    const record = mockStorage.records[mockStorage.records.length - 1];
+    expect(mockSink.records.length).toBeGreaterThan(before);
+    const record = mockSink.records[mockSink.records.length - 1];
     expect(record.method).toBe('POST');
     expect(record.path).toBe('/v1/messages');
     expect(record.endpoint).toBe('messages');
@@ -180,7 +179,7 @@ describe('proxy server', () => {
   });
 
   test('extracts tool_use blocks into the audit record', async () => {
-    const before = mockStorage.records.length;
+    const before = mockSink.records.length;
     const body = {
       model: 'claude-sonnet-4-6',
       messages: [
@@ -205,7 +204,7 @@ describe('proxy server', () => {
       body: JSON.stringify(body),
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const record = mockStorage.records[mockStorage.records.length - 1];
+    const record = mockSink.records[mockSink.records.length - 1];
     expect(record.toolUses).toHaveLength(2);
     expect(record.toolUses[0]).toMatchObject({ name: 'Read', path: '/etc/hosts' });
     expect(record.toolUses[1]).toMatchObject({ name: 'Bash', command: 'ls -la' });
@@ -215,10 +214,10 @@ describe('proxy server', () => {
 
   test('returns 502 when upstream is unreachable', async () => {
     const badPort = findFreePort(); // nothing listening here
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const badProxy = createProxyServer(
       { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${badPort}` },
-      ms.storage,
+      ms.sink,
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
     const pp = (badProxy as unknown as { port: number }).port;
@@ -278,7 +277,7 @@ describe('proxy smart routing (failover)', () => {
     const fallback = createControllableUpstream(({ body }) =>
       Response.json({ type: 'message', ok: true, model: body?.model }),
     );
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: 0,
@@ -286,7 +285,7 @@ describe('proxy smart routing (failover)', () => {
         upstream: primary.url,
         fallbacks: [{ upstream: fallback.url, model: 'qwen-local' }],
       },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -327,10 +326,10 @@ describe('proxy smart routing (failover)', () => {
       Response.json({ type: 'error', error: { type: 'overloaded_error' } }, { status: 529 }),
     );
     const fallback = createControllableUpstream(() => Response.json({ ok: true }));
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primary.url, fallbacks: [{ upstream: fallback.url }] },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -360,10 +359,10 @@ describe('proxy smart routing (failover)', () => {
     const primary = createControllableUpstream(() =>
       Response.json({ type: 'error', error: { type: 'rate_limit_error' } }, { status: 429 }),
     );
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primary.url },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -389,7 +388,7 @@ describe('proxy smart routing (failover)', () => {
   test('unreachable primary with a fallback reroutes; audit trigger is "unreachable"', async () => {
     const deadPort = findFreePort(); // nothing listening
     const fallback = createControllableUpstream(() => Response.json({ ok: true }));
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: 0,
@@ -397,7 +396,7 @@ describe('proxy smart routing (failover)', () => {
         upstream: `http://127.0.0.1:${deadPort}`,
         fallbacks: [{ upstream: fallback.url }],
       },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -420,7 +419,7 @@ describe('proxy smart routing (failover)', () => {
   test('all targets unreachable still yields a 502 with an error audit record', async () => {
     const deadA = findFreePort();
     const deadB = findFreePort();
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: 0,
@@ -428,7 +427,7 @@ describe('proxy smart routing (failover)', () => {
         upstream: `http://127.0.0.1:${deadA}`,
         fallbacks: [{ upstream: `http://127.0.0.1:${deadB}` }],
       },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -463,7 +462,7 @@ describe('proxy smart routing (failover)', () => {
       return Response.json({ ok: true, recovered: true });
     });
     const fallback = createControllableUpstream(() => Response.json({ ok: true, fromFallback: true }));
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: 0,
@@ -472,7 +471,7 @@ describe('proxy smart routing (failover)', () => {
         fallbacks: [{ upstream: fallback.url }],
         retryAfterThreshold: 5,
       },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -509,7 +508,7 @@ describe('proxy smart routing (failover)', () => {
       ),
     );
     const fallback = createControllableUpstream(() => Response.json({ ok: true, fromFallback: true }));
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       {
         port: 0,
@@ -518,7 +517,7 @@ describe('proxy smart routing (failover)', () => {
         fallbacks: [{ upstream: fallback.url }],
         retryAfterThreshold: 5,
       },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -564,10 +563,10 @@ describe('proxy smart routing (failover)', () => {
     });
     const primaryUrl = `http://127.0.0.1:${portOf(primary)}`;
     const fallback = createControllableUpstream(() => Response.json({ ok: true, fromFallback: true }));
-    const ms = createMockStorage();
+    const ms = createMockSink();
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primaryUrl, fallbacks: [{ upstream: fallback.url }] },
-      ms.storage,
+      ms.sink,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
