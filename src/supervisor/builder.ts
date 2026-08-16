@@ -9,7 +9,10 @@
  *
  * MCP config (lazy MCP server entry in ~/.claude.json) is prepared by the
  * runner on the host side before launching the supervisor. In Docker mode,
- * a merged config file is mounted into the container.
+ * a merged config file is mounted into the container — PER LAUNCH, so two
+ * builders of the same project can never overwrite each other's (see
+ * src/builder/claude-home.ts). This supervisor preflights that the config and
+ * the mounted MCP credential agree before Claude Code starts.
  *
  * Tool execution: The MCP server runs in proxy mode — tool calls are
  * forwarded over HTTP to the host-side builder server via TCP.
@@ -21,12 +24,15 @@
 
 import { readFile } from 'fs/promises';
 import { spawn } from '../utils/spawn';
-import { basename } from 'path';
+import { basename, join } from 'path';
+import { getHome } from '../utils/home';
 import { log, logError, setLogFile } from './log';
 
 // JSONL discovery / capture for conversation capture
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
+import { excludeMachineOneshots } from '../import/machine-oneshot';
 import { safeArgvPrompt } from '../agent/argv-safety';
+import { AGENT_SELFCHECK_SENTINEL } from '../agent/binary-identity';
 import {
   snapshotSessionFiles,
   captureNewOrModifiedConversations,
@@ -106,6 +112,41 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // actionable error. See the `selfcheck` sentinel in agent-entry.ts.
   await preflightAgentBinary('lazy-agent');
 
+  // Preflight: prove the lazy MCP credential Claude Code's MCP child will read
+  // is actually present in THIS container, and that ~/.claude.json names that
+  // same file. A host-side check cannot see either — only the container knows
+  // what it really got mounted. Without this, a mismatch costs the human every
+  // lazy_* tool for the whole session, announced only as an opaque reconnect
+  // failure in Claude's logs. See src/builder/mcp-config-check.ts.
+  //
+  // Then actually START that MCP server and require it to answer an `initialize`
+  // handshake. The two checks above each catch one KNOWN cause; this catches the
+  // rest without enumerating them, and it is the only place the server's own
+  // stderr can be read. Claude Code's MCP child is a GRANDCHILD of this
+  // supervisor whose stderr Claude owns and never re-emits, so the failure text
+  // exists but goes nowhere — see probeLazyMcpServerStartup.
+  const sessionStartedAt = Date.now();
+  if (config.daemonConfigPath) {
+    const { preflightBuilderMcpConfig, probeLazyMcpServerStartup } =
+      await import('../builder/mcp-config-check');
+    const claudeConfigPath = join(getHome(), '.claude.json');
+    await preflightBuilderMcpConfig({
+      daemonConfigPath: config.daemonConfigPath,
+      claudeConfigPath,
+    });
+    await probeLazyMcpServerStartup({
+      claudeConfigPath,
+      cwd: config.worktreePath,
+    });
+
+    // Preflight: prove conversation capture can WRITE. The checks above cover
+    // the agent's tool channel; capture is a different credential on a different
+    // daemon surface, and its failure mode is the quietest in the system — a
+    // 30-second timer logging into /tmp while the session's history and its
+    // resume stamp are lost. See preflightBuilderCapture.
+    await preflightBuilderCapture(config.daemonConfigPath);
+  }
+
   // Read builder config for MCP proxy setup
   const builderConfig = JSON.parse(await readFile(config.builderConfigPath, 'utf-8'));
   log(`[builder] Builder config loaded (host: ${builderConfig.host}, port: ${builderConfig.port})`);
@@ -173,9 +214,56 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const exitCode = await proc.exited;
   log(`[builder] Claude Code exited with code ${exitCode}`);
 
+  // The launch probe proves the MCP server can start; it cannot see a loss that
+  // happens LATER (daemon restart, token evicted, server crash on some tool
+  // call), which is exactly how a session ends up toolless halfway through with
+  // no signal. Claude Code does record the server's stderr — into its own MCP
+  // log — so read that back and say so out loud once the terminal is ours again.
+  // Not printed mid-session: that would corrupt Claude Code's TUI.
+  if (config.daemonConfigPath) {
+    const { collectMcpServerErrors } = await import('../builder/mcp-config-check');
+    const mcpErrors = await collectMcpServerErrors({
+      home: getHome(),
+      cwd: config.worktreePath,
+      since: sessionStartedAt,
+    });
+    if (mcpErrors.length > 0) {
+      console.error(
+        `\nlazy MCP server reported errors during this session — some or all lazy_* ` +
+        `tools may have been unavailable:`,
+      );
+      for (const err of mcpErrors) console.error(`  ${err}`);
+      console.error(
+        `If the builder said it could not call lazy, this is why. Relaunch with ` +
+        `\`lazy builder --resume ${builderId ?? '<id>'}\` after \`lazy daemon status\`.`,
+      );
+      log(`[builder] MCP server errors this session: ${mcpErrors.length}`);
+    }
+  }
+
   // Final capture. The resume-intent stamp happens inside monitor.stop() (see
   // startCaptureMonitor's onFinalSession) so the signal path stamps too.
   const detectedSessionId = await monitor.stop();
+
+  // Same rule as the MCP report above: capture runs on a 30-second timer whose
+  // only voice is a log file in the container, so a session whose history never
+  // reached the store used to end looking exactly like one that did. Say it on
+  // the terminal, once, now that the TUI is gone.
+  const captureFailures = monitor.failures();
+  if (captureFailures.length > 0) {
+    console.error(
+      `\nConversation capture failed during this session — some or all of this ` +
+      `session's history may not be in the lazy store, and \`lazy upgrade\` may ` +
+      `not be able to resume it:`,
+    );
+    for (const failure of captureFailures) console.error(`  ${failure}`);
+    console.error(
+      `Check \`lazy daemon status\`, then \`lazy doctor\` for details. ` +
+      `\`lazy doctor --reimport-conversations\` can re-import from the session files on disk.`,
+    );
+    log(`[builder] Conversation capture failures this session: ${captureFailures.length}`);
+  }
+
   if (detectedSessionId) {
     log(`[builder] Captured conversation: ${detectedSessionId}`);
     // Print session ID to stderr (stdout is Claude's territory)
@@ -214,11 +302,21 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
  */
 export async function preflightAgentBinary(command: string): Promise<void> {
   let stdout = '';
+  let stderr = '';
   let exitCode: number | null = null;
   try {
     const proc = spawn([command, 'selfcheck'], { stdout: 'pipe', stderr: 'pipe' });
-    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    // Read BOTH streams. The one line that names the actual problem goes to
+    // stderr — a bare Bun runtime prints `error: Script not found "selfcheck"`
+    // there and nothing at all on stdout, which is how this check once reported
+    // `output: <no output>` while the binary had said exactly what it was.
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
     stdout = out;
+    stderr = err;
     exitCode = proc.exitCode;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -230,15 +328,23 @@ export async function preflightAgentBinary(command: string): Promise<void> {
     );
   }
 
-  if (exitCode !== 0 || !stdout.includes('lazy-agent ok')) {
+  if (exitCode !== 0 || !stdout.includes(AGENT_SELFCHECK_SENTINEL)) {
     const preview = stdout.trim().slice(0, 120) || '<no output>';
+    const errPreview = stderr.trim().slice(0, 200) || '<no output>';
+    // `Script not found` is Bun's message for `bun <word>` with no such package
+    // script: the mounted file is the Bun runtime itself, so the container's own
+    // entry argv (`lazy-agent builder …`) would die as `Script not found "builder"`.
+    const diagnosis = /Script not found/i.test(stderr)
+      ? `The binary at /usr/local/bin/lazy-agent is a BARE BUN RUNTIME, not the compiled ` +
+        `lazy agent — Bun is reporting the subcommand as a missing package script.`
+      : `The binary at /usr/local/bin/lazy-agent is not the compiled lazy agent (likely ` +
+        `bare Bun or a stale/placeholder file).`;
     throw new Error(
       `Builder preflight failed: '${command} selfcheck' did not identify the lazy ` +
-      `agent (exit ${exitCode}, output: ${preview}). The binary at ` +
-      `/usr/local/bin/lazy-agent is not the compiled lazy agent (likely bare Bun or a ` +
-      `stale/placeholder file). Claude Code's MCP server would fail to start (-32000) ` +
-      `and the builder would have no lazy_* tools. Rebuild/reinstall the agent binary ` +
-      `(e.g. 'lazy upgrade') and restart the builder.`,
+      `agent (exit ${exitCode}, stdout: ${preview}, stderr: ${errPreview}). ${diagnosis} ` +
+      `Claude Code's MCP server would fail to start (-32000) and the builder would have ` +
+      `no lazy_* tools. Rebuild/reinstall the agent binary on the HOST ` +
+      `(bun run build, then 'lazy upgrade') and restart the builder.`,
     );
   }
 
@@ -319,7 +425,12 @@ export async function stampSessionIdOnStorage(
  * exists only for resume-target detection.
  */
 async function getSessionFileTimes(lazyRoot: string): Promise<Map<string, number>> {
-  const files = await discoverProjectSessionFiles(lazyRoot);
+  // Machine one-shots excluded: a `claude -p` housekeeping run in this project
+  // (a fidelity summary from an accept the builder itself just made) is a
+  // genuinely-NEW file since launch, which is rule 1 of pickActiveSessionFile —
+  // it would win over the builder's own session and be stamped as the resume
+  // target. See excludeMachineOneshots.
+  const files = await excludeMachineOneshots(await discoverProjectSessionFiles(lazyRoot));
   const times = new Map<string, number>();
   for (const f of files) {
     // Keyed by filename to preserve pickActiveSessionFile's contract.
@@ -432,11 +543,20 @@ type StorageFactory = (lazyRoot: string) => Promise<import('../storage/interface
  * Build a Storage that persists through the daemon over its TCP web server.
  *
  * The daemon MCP config (mounted into the container) carries the daemon's TCP
- * `target` (`http://host.docker.internal:<webPort>`) and bearer token. The
- * daemon exposes `/rpc/storage` on TCP, so a RemoteStorage over that target
- * writes to the real host store — the same one `lazy builder list` reads —
- * rather than to an unmounted, ephemeral in-container path. The daemon is the
- * single storage owner, so this also honors the storage-ownership invariant.
+ * `target` (`http://host.docker.internal:<webPort>`) and a bearer token, so a
+ * RemoteStorage over that target writes to the real host store — the same one
+ * `lazy builder list` reads — rather than to an unmounted, ephemeral
+ * in-container path. The daemon is the single storage owner, so this also
+ * honors the storage-ownership invariant.
+ *
+ * WHICH DAEMON SURFACE, AND WHY IT IS NOT `/rpc/storage`. The token in that
+ * config is a per-identity MCP token, NOT the shared daemon token, and
+ * `/rpc/storage` requires the shared one. Pointing capture at `/rpc/*` is what
+ * made every 30-second tick 401 for whole sessions. Capture therefore posts to
+ * `/builder/storage`, which authenticates the builder MCP token it actually
+ * holds and allowlists the handful of Storage methods this supervisor needs.
+ * Do not "simplify" this back to routePrefix 'rpc' — the container does not and
+ * should not hold a credential that route accepts.
  */
 export async function daemonRemoteStorage(
   daemonConfigPath: string,
@@ -454,7 +574,7 @@ export async function daemonRemoteStorage(
     const raw = await readFile(daemonConfigPath, 'utf-8');
     const fresh = JSON.parse(raw) as { token?: string; target?: string };
     return fresh.token && fresh.target ? { target: fresh.target, token: fresh.token } : null;
-  });
+  }, 'builder');
   // getStoragePath doubles as a connectivity probe: if the daemon is
   // unreachable this throws here, surfacing the failure instead of silently
   // dropping the conversation. RemoteStorage needs the path for
@@ -464,6 +584,47 @@ export async function daemonRemoteStorage(
     args: {},
   }) as string;
   return new RemoteStorage(client, cfg.projectRoot, storagePath);
+}
+
+/**
+ * Prove — before Claude Code starts — that conversation capture can actually
+ * write to the store.
+ *
+ * WHY THIS EXISTS. Capture runs on a 30-second timer whose only output is
+ * `logError` into `/tmp/lazy-builder-*.log`, a file no human opens. When the
+ * supervisor presented the wrong KIND of credential, every tick failed from the
+ * first one, for multi-hour sessions, and the operator was never told: the
+ * resume-intent stamp went with it, so `lazy upgrade` had nothing to resume.
+ * One round-trip at launch turns that entire class of failure — wrong
+ * credential, wrong surface, revoked token, unreachable daemon — into an error
+ * the human reads before they start working, instead of a silence they discover
+ * later.
+ *
+ * Throws — never warns, matching the sibling MCP preflights in
+ * src/builder/mcp-config-check.ts. In daemon-proxy mode the daemon is
+ * definitionally reachable (the MCP probe just talked to it), so a failure here
+ * is a real misconfiguration, not a transient.
+ */
+export async function preflightBuilderCapture(
+  daemonConfigPath: string,
+): Promise<void> {
+  let storage: import('../storage/interface').Storage;
+  try {
+    storage = await daemonRemoteStorage(daemonConfigPath);
+  } catch (err) {
+    throw new Error(
+      `Builder preflight failed: conversation capture cannot reach the lazy store, so this ` +
+      `session's history would be lost and \`lazy upgrade\` would have no session to resume.\n` +
+      `  daemon config: ${daemonConfigPath}\n` +
+      `  error:         ${err instanceof Error ? err.message : String(err)}\n` +
+      `A 401 here means the supervisor is presenting the wrong kind of credential to the ` +
+      `daemon (capture uses POST /builder/storage with the builder MCP token). Anything else ` +
+      `usually means the daemon is unreachable from inside the container — check ` +
+      `\`lazy daemon status\` and relaunch the builder.`,
+    );
+  }
+  await storage.close();
+  log('[builder] Preflight OK: conversation capture can reach the store');
 }
 
 /**
@@ -500,7 +661,10 @@ export function buildBuilderStorageFactory(
  *   - The graceful path calls stop() after Claude exits for a final flush.
  *
  * Capture errors are surfaced (logged at error level) — never swallowed — since
- * losing builder history silently is the bug this exists to prevent.
+ * losing builder history silently is the bug this exists to prevent. Every
+ * occurrence still logs; `failures()` additionally returns the DISTINCT error
+ * messages (capped) so the caller can report them on the terminal once the
+ * session ends. A log line inside a container is not "telling the human".
  */
 export function startCaptureMonitor(
   lazyRoot: string,
@@ -517,7 +681,7 @@ export function startCaptureMonitor(
     storage: import('../storage/interface').Storage,
     sessionId: string,
   ) => Promise<void>,
-): { stop: () => Promise<string | null> } {
+): { stop: () => Promise<string | null>; failures: () => string[] } {
   const beforeTimes = snapshotToFileTimes(beforeSnapshot);
   // Tracks what we've already persisted so each pass only re-saves files that
   // actually changed since last capture.
@@ -526,6 +690,8 @@ export function startCaptureMonitor(
   let inFlight = false;
   let storage: import('../storage/interface').Storage | null = null;
   let lastDetectedSessionId: string | null = resumeSessionId;
+
+  const { record: recordFailure, list: listFailures } = createCaptureFailureRecorder(logError);
 
   async function getStorage(): Promise<import('../storage/interface').Storage> {
     if (!storage) storage = await storageFactory(lazyRoot);
@@ -537,7 +703,7 @@ export function startCaptureMonitor(
     const s = await getStorage();
     const result = await captureNewOrModifiedConversations(lazyRoot, beforeSnapshot, s, captured);
     for (const { sessionId, error } of result.errors) {
-      logError(`[builder] Incremental capture failed for ${sessionId}: ${error.message}`);
+      recordFailure(`[builder] Incremental capture failed for ${sessionId}: ${error.message}`);
     }
     if (result.captured.length > 0) {
       log(`[builder] Incremental capture: saved ${result.captured.length} session file(s)`);
@@ -557,7 +723,7 @@ export function startCaptureMonitor(
       await captureOnce();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logError(`[builder] Incremental capture failed: ${msg}`);
+      recordFailure(`[builder] Incremental capture failed: ${msg}`);
     } finally {
       inFlight = false;
     }
@@ -578,7 +744,7 @@ export function startCaptureMonitor(
         await stopInternal();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logError(`[builder] Signal-triggered capture failed: ${msg}`);
+        recordFailure(`[builder] Signal-triggered capture failed: ${msg}`);
       } finally {
         process.removeListener('SIGINT', onSignal);
         process.removeListener('SIGTERM', onSignal);
@@ -604,7 +770,7 @@ export function startCaptureMonitor(
       log('[builder] Final conversation capture completed');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logError(`[builder] Final capture failed: ${msg}`);
+      recordFailure(`[builder] Final capture failed: ${msg}`);
     }
 
     // Resume-intent stamp. Deliberately OUTSIDE the capture try/catch and its own
@@ -616,7 +782,7 @@ export function startCaptureMonitor(
         await onFinalSession(await getStorage(), lastDetectedSessionId);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logError(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
+        recordFailure(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
       }
     }
 
@@ -636,5 +802,36 @@ export function startCaptureMonitor(
     return stopPromise;
   }
 
-  return { stop: stopInternal };
+  // `failures` is the whole point of recordFailure: the caller prints it to the
+  // terminal once the session ends, so a capture that has been failing silently
+  // into /tmp for hours is something the human is TOLD about.
+  return { stop: stopInternal, failures: listFailures };
+}
+
+/**
+ * Accumulate the DISTINCT capture failures of one builder session, for the
+ * end-of-session report.
+ *
+ * This is not rate limiting: `record` logs EVERY occurrence, exactly as before.
+ * What it adds is a summary the supervisor can put on the human's terminal when
+ * the session ends — the missing half of the original bug, where a capture that
+ * failed every 30 seconds for hours only ever said so in a log file inside a
+ * container that nobody opens.
+ *
+ * A capture failure is normally the same failure repeating (a wrong credential,
+ * an unreachable daemon), so the report dedupes by message; the cap bounds a
+ * pathological session where each tick fails differently.
+ */
+export function createCaptureFailureRecorder(
+  logFailure: (message: string) => void,
+  max = 5,
+): { record: (message: string) => void; list: () => string[] } {
+  const failures: string[] = [];
+  return {
+    record(message: string): void {
+      logFailure(message);
+      if (!failures.includes(message) && failures.length < max) failures.push(message);
+    },
+    list: () => [...failures],
+  };
 }

@@ -353,41 +353,68 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     // can offer a concrete manual-resume command.
     const hintId = intent.sessionId ?? result.sessionId ?? resumeId ?? null;
 
-    log('');
-    log("Builder was stopped by 'lazy upgrade'. Waiting for the new version to finish building...");
-    log('This session is not lost — it resumes here automatically when the upgrade completes.');
-    const baseline = await daemonStatus();
+    // What to call the thing that stopped this builder, in copy shared by both
+    // paths. Telling a human to "wait for the upgrade to complete" when no
+    // upgrade ever ran sends them looking for a terminal that does not exist.
+    const stopCause = intent.reason === 'daemon-restart' ? 'daemon restart' : 'upgrade';
 
-    // Only trust a pid stamped on THIS host: with a shared store the intent may
-    // have been written on a different machine, where the pid is meaningless
-    // (and might even name an unrelated live process). No usable pid → the wait
-    // simply never ends on its own, which is the safe default.
-    const upgradeAlive =
-      intent.upgradePid != null && (!intent.upgradeHost || intent.upgradeHost === currentHost())
-        ? () => isProcessAlive(intent.upgradePid as number)
-        : null;
+    // WHY the builder was stopped decides whether there is anything to wait for.
+    //
+    // An UPGRADE writes its intent BEFORE rebuilding, so the daemon restart the
+    // wait watches for is still ahead of us. A DAEMON RESTART writes its intent
+    // from the daemon that has ALREADY come up, so the restart is behind us —
+    // running the same wait would compare a baseline taken after the restart
+    // against the very daemon that caused it and never return. Nothing to wait
+    // for; go straight to relaunching against the daemon that is already there.
+    let ready: boolean;
+    if (intent.reason === 'daemon-restart') {
+      log('');
+      log("The lazy daemon restarted, which invalidated this builder's connection to its");
+      log('audit proxy, so lazy stopped it rather than let every model call fail.');
+      log('This session is not lost — resuming it against the new daemon.');
+      ready = (await daemonStatus()).running;
+      if (!ready) {
+        errorOut('');
+        errorOut('The daemon that stopped this builder is no longer reachable, so it was not');
+        errorOut('relaunched — a new session would have no audit plane to talk to.');
+      }
+    } else {
+      log('');
+      log("Builder was stopped by 'lazy upgrade'. Waiting for the new version to finish building...");
+      log('This session is not lost — it resumes here automatically when the upgrade completes.');
+      const baseline = await daemonStatus();
 
-    const outcome = await waitForUpgradeComplete({
-      baseline,
-      daemonStatus,
-      pollIntervalMs,
-      sleep,
-      upgradeAlive,
-      reassureAfterMs,
-      reassureIntervalMs,
-      onReassure: (elapsedMs) => {
-        log('');
-        log(`Still waiting for 'lazy upgrade' to finish (${formatWaited(elapsedMs)} so far). This is not stuck —`);
-        log('a full rebuild can take a while. Your builder session will resume here on its own.');
-        if (hintId) {
-          log(`If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume ${hintId}`);
-        } else {
-          log('If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume <id>');
-          log('  (find session ids with: lazy builder list)');
-        }
-      },
-    });
-    const ready = outcome === 'complete';
+      // Only trust a pid stamped on THIS host: with a shared store the intent may
+      // have been written on a different machine, where the pid is meaningless
+      // (and might even name an unrelated live process). No usable pid → the wait
+      // simply never ends on its own, which is the safe default.
+      const upgradeAlive =
+        intent.upgradePid != null && (!intent.upgradeHost || intent.upgradeHost === currentHost())
+          ? () => isProcessAlive(intent.upgradePid as number)
+          : null;
+
+      const outcome = await waitForUpgradeComplete({
+        baseline,
+        daemonStatus,
+        pollIntervalMs,
+        sleep,
+        upgradeAlive,
+        reassureAfterMs,
+        reassureIntervalMs,
+        onReassure: (elapsedMs) => {
+          log('');
+          log(`Still waiting for 'lazy upgrade' to finish (${formatWaited(elapsedMs)} so far). This is not stuck —`);
+          log('a full rebuild can take a while. Your builder session will resume here on its own.');
+          if (hintId) {
+            log(`If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume ${hintId}`);
+          } else {
+            log('If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume <id>');
+            log('  (find session ids with: lazy builder list)');
+          }
+        },
+      });
+      ready = outcome === 'complete';
+    }
 
     // Resolve which session to resume: prefer the id stamped on the intent, then
     // the child's own detection, then the id the child was actually launched with
@@ -409,7 +436,10 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     if (!ready || !resolvedId || !postStorage) {
       // Fail hard and actionable; LEAVE the intent in place so it's discoverable
       // and the human can resume manually once the upgrade settles.
-      if (!ready) {
+      if (!ready && intent.reason === 'daemon-restart') {
+        // Already explained above (the daemon went away again) — adding the
+        // upgrade copy here would blame an upgrade that never ran.
+      } else if (!ready) {
         // The ONLY non-success exit from the wait: the upgrade process is gone
         // and the daemon never came back with the new version. Say that — it
         // points at a real, fixable failure (a missing credential, a failed
@@ -421,17 +451,17 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
         errorOut('credential and a failed image build are the usual causes), then re-run `lazy upgrade`.');
       } else if (!postStorage) {
         errorOut('');
-        errorOut('Could not reach storage to resume the builder after the upgrade.');
+        errorOut(`Could not reach storage to resume the builder after the ${stopCause}.`);
       } else {
         errorOut('');
-        errorOut('Could not determine which builder session to resume after the upgrade.');
+        errorOut(`Could not determine which builder session to resume after the ${stopCause}.`);
       }
       const hint = resolvedId ?? hintId;
       if (hint) {
-        errorOut(`Resume it manually once the upgrade completes:`);
+        errorOut(`Resume it manually once the daemon is healthy again:`);
         errorOut(`  lazy builder --resume ${hint}`);
       } else {
-        errorOut(`Resume manually once the upgrade completes:  lazy builder --resume <id>`);
+        errorOut(`Resume manually once the daemon is healthy again:  lazy builder --resume <id>`);
         errorOut(`  (find session ids with: lazy builder list)`);
       }
       // Suppress the normal footer — we already printed actionable guidance.
@@ -449,7 +479,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       errorOut('');
-      errorOut('The upgrade finished, but the builder was NOT relaunched: lazy could not');
+      errorOut(`The ${stopCause} finished, but the builder was NOT relaunched: lazy could not`);
       errorOut("resolve the restarted daemon's proxy address for the new session.");
       errorOut('');
       errorOut(msg);
@@ -467,7 +497,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     await ensureReady();
     await postStorage.takeBuilderResumeIntent(intent.builderId);
 
-    log(`Resuming builder session ${resolvedId.substring(0, 8)} after upgrade...`);
+    log(`Resuming builder session ${resolvedId.substring(0, 8)} after the ${stopCause}...`);
     resumeId = resolvedId;
     // Loop → relaunch the child with --resume into the same terminal.
   }

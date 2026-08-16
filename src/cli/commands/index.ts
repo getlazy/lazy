@@ -11,6 +11,8 @@ export { commandList, listUsage, commandActive, activeUsage, commandBlocked, blo
 export { commandShow, showUsage } from './show';
 export { commandStatus, statusUsage } from './status';
 export { commandTimings, timingsUsage } from './timings';
+export { commandStats, statsUsage, statsSubcommandUsage } from './stats';
+export { commandTokens, tokensUsage } from './tokens';
 export { commandDiff, diffUsage } from './diff';
 export { commandShell, shellUsage } from './shell';
 export { commandPair, pairUsage } from './pair';
@@ -29,7 +31,6 @@ export { commandJournal, journalUsage } from './journal';
 export { commandMemory, memoryUsage, memorySubcommandUsage } from './memory';
 export { commandLink, linkUsage } from './link';
 export { commandImportConversation, importConversationUsage } from './import-conversation';
-export { commandServer, serverUsage } from './server';
 export { commandReopen, reopenUsage } from './reopen';
 export { commandResume, resumeUsage } from './resume';
 export { commandWait, waitUsage } from './wait';

@@ -15,20 +15,30 @@ import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 import { RemoteStorage } from '../../src/storage/remote-storage';
 import { DaemonClient } from '../../src/daemon/client';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { createTask } from '../helpers/fixtures';
+import { createTaskBeforeDaemon } from '../helpers/fixtures';
 import { slowSuiteSkipped } from '../helpers/slow-suite';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 // Slow suite (>300s per file): opt in with LAZY_SLOW_TESTS=1. Gating only —
 // no test content is weakened or removed.
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
+
 describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
   let daemon: RunningDaemon;
   let ctx: TestContext;
   let tmpDir: string;
   let socketPath: string;
   let token: string;
+  let cliTaskId: string;
 
   beforeAll(async () => {
     ctx = await setupTestLazy();
+    // Created here, before the daemon exists: `lazy create` is a subprocess and
+    // cannot take the storage lock the in-process daemon holds for its lifetime.
+    cliTaskId = await createTaskBeforeDaemon(ctx, 'CLI created task for remote test');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-remote-storage-'));
     socketPath = join(tmpDir, 'remote-storage-test.sock');
     token = 'remote-storage-test-token';
@@ -89,15 +99,41 @@ describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
     expect(fetched!.goal).toBe('Remote storage test task');
   });
 
+  // INVARIANT: per-turn launch labels survive the RPC hop. RemoteStorage forwards
+  // CreateTurnOptions wholesale, so a field added to the interface reaches the
+  // backing store without a RemoteStorage change — this test is what makes that
+  // "no change needed" claim checkable instead of assumed. `model_id` must stay
+  // ABSENT when the caller omitted it (never back-filled from `model`).
+  test('createTurn round-trips model, model_id and effort through the daemon', async () => {
+    const remote = await makeRemoteStorage();
+
+    const task = await remote.createTask('Remote turn label round-trip');
+    const session = await remote.createSession(task.id, 'claude-code', 'lazy/remote-labels', 'abc123');
+
+    await remote.createTurn({
+      sessionId: session.id, sequence: 0, role: 'agent', content: 'Labelled turn',
+      model: 'opus', modelId: 'claude-opus-4-6-20260101', effort: 'high',
+    });
+    await remote.createTurn({
+      sessionId: session.id, sequence: 1, role: 'agent', content: 'Alias-only turn', model: 'opus',
+    });
+
+    const turns = await remote.getSessionTurns(session.id);
+    expect(turns[0].model).toBe('opus');
+    expect(turns[0].model_id).toBe('claude-opus-4-6-20260101');
+    expect(turns[0].effort).toBe('high');
+    expect(turns[1].model).toBe('opus');
+    expect(turns[1].model_id).toBeUndefined();
+    expect(turns[1].effort).toBeUndefined();
+  });
+
   // INVARIANT: RemoteStorage.listTasks returns all tasks visible via direct storage.
   // The daemon proxy must not filter or lose data.
   test('listTasks returns tasks created via CLI', async () => {
-    const taskId = await createTask(ctx, 'CLI created task for remote test');
-
     const remote = await makeRemoteStorage();
     const tasks = await remote.listTasks();
     expect(tasks.length).toBeGreaterThan(0);
-    const found = tasks.find(t => t.id.startsWith(taskId));
+    const found = tasks.find(t => t.id.startsWith(cliTaskId));
     expect(found).toBeDefined();
     expect(found!.goal).toBe('CLI created task for remote test');
   });

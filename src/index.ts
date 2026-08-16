@@ -8,7 +8,7 @@ import {
   commandBranch, branchUsage,
   commandClone, cloneUsage,
   commandStart, startUsage,
-  commandTimings, timingsUsage,
+  commandStats, statsUsage, statsSubcommandUsage,
   commandUnblock, unblockUsage,
   commandList, listUsage,
   commandActive, activeUsage,
@@ -33,7 +33,6 @@ import {
   commandMemory, memoryUsage, memorySubcommandUsage,
   commandLink, linkUsage,
   commandImportConversation, importConversationUsage,
-  commandServer, serverUsage,
   commandReopen, reopenUsage,
   commandResume, resumeUsage,
   commandWait, waitUsage,
@@ -62,6 +61,7 @@ import {
 import { handleFuzzyCommand } from './cli/fuzzy-command';
 import { COMMAND_ALIASES, ALIAS_NAMES } from './cli/command-aliases';
 import { isLoggedToFile } from './utils/logged-error';
+import { docsFooter } from './docs/links';
 
 
 import { VERSION } from './version';
@@ -75,12 +75,14 @@ function usage(): void {
 Usage: lazy <command> [options]
 
 Task Management:
+  create                 Create a task without starting it
   start                  Create and start a new task (or start existing)
   fix                    Create a debugging/fix task (experimental methodology)
   document               Create a documentation task (design docs, not code)
   refactor               Create a refactoring task (restructure, no behavior change)
   edit <task_id>         Edit a task's goal or prompt
   comment <task_id>      Add a comment/annotation to a task
+  journal <task_id>      Append a journal entry (rationale; never sent to agents)
   tag <task_id> <tag>    Add a tag to a task (grouping label)
   untag <task_id> <tag>  Remove a tag from a task
   clone <task_id>        Duplicate task with optional reparenting
@@ -91,18 +93,22 @@ Task Management:
   show <task_id>         Show task details
   search <query>         Search tasks, prompts, turns, commits, comments, memory
   report                 LLM-summarized markdown digest of recent activity
-  memory                 Shared, curated cross-task knowledge (list/show/save/rm)
+  memory                 Shared, curated cross-task knowledge (list/show/save/rm/
+                         history/compact)
 
 Working on Tasks:
   review <task_id>       TUI review: full-screen artifact browser
   ask <task_id>          Ask a paused task's agent a question (read-only)
-  loop                   Review all blocked tasks sequentially
+  loop [<task_id>...]    Review all blocked tasks sequentially, or drive a
+                         curated queue: start, wait, review gate, decide, next
   unblock <task_id>      Unblock task: interactive review or feedback
   resume <task_id>       Resume an interrupted task
   reopen <task_id>       Reopen a rejected task
   branch <task_id>       Create a variant task (fork)
+  stop <task_id>         Halt a working task without auto-resume
   wait [<task_id>...]    Wait for task(s) to complete (--follow, --next)
-  watch [<task-code>]    Watch an agent working (read-only tmux view)
+  watch [<task-code>]    Watch a task working (live supervisor + agent timeline)
+  reparent <task> <new>  Repoint a task at a new parent and sync it
 
 System:
   system prompts         List built-in system prompt templates
@@ -110,6 +116,12 @@ System:
   system status          Show current system state (offline/online, driver, daemon)
   system offline         Enable offline mode (skip all remote operations)
   system online          Disable offline mode (restore remote operations)
+  system export-dockerfile  Write the embedded default Dockerfile to disk
+
+Stats:
+  stats tokens           Token accounting from the proxy audit trail (by role/task/model)
+  stats audit            Browse the proxy audit trail record by record (denials, reroutes)
+  stats timings          Recorded request traces, ranked by self time
 
 Inspect:
   diff <task_id>         Show changes made by task
@@ -125,6 +137,7 @@ Inspect:
   revert <task_id>       Undo an accepted task (create revert task)
   rework <task_id>       Create follow-up task for accepted work that needs changes
   redo <task_id>         Abandon stale task and restart fresh on current main
+  submit <task_id>       Submit a task for human review (opens a PR)
 
 Link:
   link <url>             Link an external resource (e.g., GitHub PR) as a task
@@ -140,8 +153,11 @@ Daemon:
   daemon stop            Stop the daemon gracefully
   daemon restart         Restart the daemon
   daemon status          Show daemon status and web URL
+  daemon list            List ALL running lazy daemons on this host (marks strays)
+  daemon kill-stray      Reap daemons whose project root no longer exists
   daemon logs            Tail daemon log file (primary debugging tool)
   daemon auto-budget     Control/inspect the auto-react daily budget (list/update/pause/resume)
+  daemon config          Inspect/override concurrency caps at runtime (get/set/reset)
   server                 Start daemon and show web dashboard URL
   config set/get         Runtime config toggles (e.g., auto_react on/off)
 
@@ -154,7 +170,7 @@ Setup:
   upgrade                Rebuild image/binary and restart containers
   completion             Output shell completion script (--bash or --zsh)
 
-Run 'lazy <command> --help' for more information on a command.`);
+Run 'lazy <command> --help' for more information on a command.${docsFooter()}`);
 }
 
 // Command dispatch table: maps command names to their handler and usage functions.
@@ -202,12 +218,10 @@ const commandMap: Record<string, {
   'journal':  { run: commandJournal, usage: journalUsage },
   'memory':   { run: commandMemory, usage: memoryUsage, subcommands: memorySubcommandUsage },
   'start':    { run: commandStart, usage: startUsage },
-  'timings':  { run: commandTimings, usage: timingsUsage },
   'unblock':  { run: commandUnblock, usage: unblockUsage },
   'resume':   { run: commandResume, usage: resumeUsage },
   'reopen':   { run: commandReopen, usage: reopenUsage },
   'branch':   { run: commandBranch, usage: branchUsage },
-  'server':   { run: commandServer, usage: serverUsage },
   'diff':     { run: commandDiff, usage: diffUsage },
   'status':   { run: commandStatus, usage: statusUsage },
   'shell':    { run: commandShell, usage: shellUsage },
@@ -233,6 +247,7 @@ const commandMap: Record<string, {
   'ask':      { run: commandAsk, usage: askUsage },
   'redo':     { run: commandRedo, usage: redoUsage },
   'upgrade':  { run: commandUpgrade, usage: upgradeUsage },
+  'stats':    { run: commandStats, usage: statsUsage, subcommands: statsSubcommandUsage },
   'system':   { run: commandSystem, usage: systemUsage, subcommands: systemSubcommandUsage },
   'document': { run: commandDocument, usage: documentUsage },
   'refactor': { run: commandRefactor, usage: refactorUsage },
@@ -323,9 +338,13 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
 
     const taskId = cmdArgs[taskIdIdx + 1];
     const worktreePath = cmdArgs[worktreeIdx + 1];
+    // Read-only turns (ask) get a toolset with the write tools withheld. The
+    // supervisor writes this flag into ~/.claude.json per turn — see
+    // src/supervisor/mcp-setup.ts.
+    const readOnly = cmdArgs.includes('--read-only');
 
     const { startMcpServer } = await import('./mcp/index');
-    await startMcpServer({ taskId, worktreePath });
+    await startMcpServer({ taskId, worktreePath }, { readOnly });
   },
 
 };
@@ -377,6 +396,30 @@ if (!isHelpOrVersion && command !== 'completion' && !preflightSkipped) {
   await validateConfigPaths(resolveLazyRoot());
 }
 
+// Documentation pointers ("Check documentation at <url>") honour the project's
+// [docs] url. Commands that load a full config get the validated value from
+// loadConfig(); help, --version and the early daemon auto-start failure below
+// never load one, so install a best-effort value here — before anything that can
+// print a pointer, and after preflight, which owns the "can't even read this
+// directory" diagnosis. Best-effort on purpose: `lazy --help` must not die of a
+// broken lazy.toml, and neither must the message explaining that it is broken.
+{
+  const docsRoot = resolveLazyRoot();
+  if (docsRoot) {
+    try {
+      const { loadRawConfig } = await import('./config/loader');
+      const { normalizeDocsUrl, setDocsBaseUrl } = await import('./docs/links');
+      const raw = await loadRawConfig(docsRoot);
+      setDocsBaseUrl(normalizeDocsUrl((raw?.docs as { url?: unknown } | undefined)?.url));
+    } catch {
+      // Unreadable lazy.toml, or a [docs] url that fails validation: keep the
+      // default docs domain rather than turn a help request into an error.
+      // loadConfig() surfaces the same problem loudly on any command that
+      // actually needs the config, and `lazy doctor` reports it as a check.
+    }
+  }
+}
+
 if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
   const lazyRoot = resolveLazyRoot();
   if (!lazyRoot) {
@@ -407,13 +450,40 @@ if (!isHelpOrVersion) {
     try {
       await ensureDaemon(command, root);
     } catch (err) {
-      // Surface daemon startup failures (missing auth credential, web-port
-      // conflict, etc.) as a clean, actionable message rather than an uncaught
-      // top-level rejection with a stack trace. The daemon is the single
-      // enforcement point for auth — clients pass through and let the daemon's
-      // gate surface the problem instead of enforcing it themselves.
-      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      const message = err instanceof Error ? err.message : String(err);
+      // INVARIANT: `lazy doctor` never dies of the problem it exists to
+      // diagnose. Every reason auto-start can fail is already a doctor check —
+      // an unloadable lazy.toml ('lazy.toml parses'), a missing model
+      // credential (checkAuth), a runner that isn't there (runner.diagnose) —
+      // and exiting here makes all of them unreachable, so the user's one
+      // diagnostic surface goes dark exactly when they need it. Report the
+      // failure and run degraded instead: doctor's checks work daemon-less
+      // (they fall back to a direct FileStorage when there is no daemon).
+      //
+      // This removes the FIRST abort, not every one. On a broken config doctor
+      // now completes, because it skips createRunner when the config did not
+      // load. When the daemon is absent for some OTHER reason and `[proxy]` is
+      // enabled, doctor still dies further in, at createRunner's proxy
+      // fail-loud gate — a separate blocker on the same goal, recorded as a
+      // follow-up rather than fixed here.
+      if (command === 'doctor') {
+        console.error('Warning: the daemon is not running and could not be auto-started.');
+        console.error(`  ${message.split('\n').join('\n  ')}`);
+        console.error('');
+        console.error('Continuing without it — checks that need the daemon are skipped.');
+        console.error('');
+      } else {
+        // Surface daemon startup failures (missing auth credential, web-port
+        // conflict, etc.) as a clean, actionable message rather than an uncaught
+        // top-level rejection with a stack trace. The daemon is the single
+        // enforcement point for auth — clients pass through and let the daemon's
+        // gate surface the problem instead of enforcing it themselves.
+        const { docsSuffix } = await import('./docs/links');
+        console.error(`Error: ${message}`);
+        const pointer = docsSuffix('troubleshooting-daemon', '');
+        if (pointer) console.error(pointer);
+        process.exit(1);
+      }
     }
   }
 }

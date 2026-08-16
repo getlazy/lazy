@@ -96,6 +96,13 @@ export interface CreateStorageOptions {
   backend?: StorageBackend;
   /** External storage path (only used with 'external' backend) */
   externalPath?: string;
+  /**
+   * Fail after this long waiting for the storage lock instead of running the
+   * default retry loop (only used with the 'external' backend, which is the
+   * only one with a file lock). Reserved for read-only diagnostics that must
+   * not block — `lazy doctor`. Every other caller should queue.
+   */
+  lockTimeoutMs?: number;
 }
 
 /**
@@ -162,7 +169,10 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
           `and can be safely removed: rm -rf "${strayTilde}"`,
         );
       }
-      storage = new FileStorage(lazyRoot, { basePath: externalPath });
+      storage = new FileStorage(lazyRoot, {
+        basePath: externalPath,
+        lockTimeoutMs: options?.lockTimeoutMs,
+      });
       break;
     }
 

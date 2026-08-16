@@ -16,6 +16,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, fullTaskId, startAndWait } from '../helpers/fixtures';
 import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -75,7 +76,7 @@ class McpSession {
         stdin: 'pipe',
         stdout: 'pipe',
         stderr: 'pipe',
-        env: { ...process.env },
+        env: { ...process.env, ...MCP_SERVER_ENV_PINS },
       },
     );
     this.stdin = this.proc.stdin as import('bun').FileSink;
@@ -177,7 +178,7 @@ async function runMcpSession(
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env },
+    env: { ...process.env, ...MCP_SERVER_ENV_PINS },
   });
 
   const stdin = proc.stdin as import('bun').FileSink;
@@ -211,7 +212,7 @@ describe('MCP confirmation protocol', () => {
 
   beforeEach(async () => {
     // The MCP server is spawned WITHOUT LAZY_TEST=1 (see runMcpSession /
-    // McpSession: `env: { ...process.env }`), so every storage-backed tool it
+    // McpSession — both pin it off, see MCP_SERVER_ENV_PINS), so every storage-backed tool it
     // exposes must reach a real daemon over RPC — exactly like the pairing and
     // builder MCP servers do in production. Daemonless, requireStorage() exits
     // with "Daemon is not running" and the server dies before answering the

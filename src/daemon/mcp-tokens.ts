@@ -34,6 +34,7 @@
 import { randomBytes } from 'crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname } from 'path';
+import { pidExists } from '../utils/process-identity';
 import { getMcpTokensPath } from './paths';
 
 /** Who a presented MCP token proves the caller to be. */
@@ -50,6 +51,13 @@ interface McpTokenRecord {
   /** Container / builder name the token was minted for — diagnostics only. */
   label: string;
   createdAt: string;
+  /**
+   * pid of the process that OWNS this session, when it told us. Builder tokens
+   * only: `lazy builder` runs on the host, in the same pid namespace as the
+   * daemon, and reports its own pid when it asks for a config. Used for exactly
+   * one thing — eviction order (see MAX_BUILDER_TOKENS). Never for auth.
+   */
+  ownerPid?: number;
 }
 
 interface McpTokenFile {
@@ -62,11 +70,39 @@ interface McpTokenFile {
  * token when its supervisor exits (see revokeBuilderMcpToken), but that hook is
  * best-effort: a SIGKILLed `lazy builder`, or one whose daemon was down at exit,
  * leaves its record behind. The cap bounds that residue so the registry cannot
- * grow forever. Oldest entries are dropped first; the practical effect of
- * dropping one is that a builder left open across 50 later builder launches must
- * be relaunched.
+ * grow forever.
+ *
+ * EVICTION ORDER: residue first, live sessions last. Dropping a builder's token
+ * costs it every `lazy_*` tool for the rest of its session, silently — the same
+ * failure fix-builder-mcp-token-race removed, reached by a different route. The
+ * original policy (oldest-created first) picked the *worst* victim available:
+ * the oldest record is the most likely long-running live builder. So a record
+ * whose owning process is still alive is evicted only after every record that is
+ * not, and within each group the oldest goes first.
+ *
+ * The liveness signal is the owner's pid (see `ownerPid`), tested with a
+ * `kill(pid, 0)` — no file I/O, no daemon→runner dependency, and nothing on the
+ * hot verify path, which stays I/O-free. What it costs:
+ *   - a record with no pid (minted before this change, or by a caller that sent
+ *     none) is "not provably live" and is evicted first, exactly as today;
+ *   - a recycled pid makes a dead record look live. That only *demotes* it in
+ *     the eviction order — the cap is still a hard cap, so the registry stays
+ *     bounded and the failure mode is one extra retained token, not growth.
+ * The cap is never exceeded: if every retained builder is live, the oldest live
+ * one is still dropped.
  */
-const MAX_BUILDER_TOKENS = 50;
+export const MAX_BUILDER_TOKENS = 50;
+
+/**
+ * Is this record's owning session provably still running?
+ *
+ * Deliberately conservative: unknown pid means "not provably live". A false
+ * negative only means an already-dead-looking record is evicted sooner, which
+ * is the pre-existing behavior for every record.
+ */
+function isProvablyLive(record: McpTokenRecord): boolean {
+  return typeof record.ownerPid === 'number' && pidExists(record.ownerPid);
+}
 
 /** Cached registry per project root, so the hot verify path does no file I/O. */
 const cache = new Map<string, McpTokenFile>();
@@ -141,6 +177,17 @@ async function mutate<T>(
   return run;
 }
 
+/** Extra facts about the session a token is being minted for. */
+export interface MintMcpTokenOptions {
+  /**
+   * pid of the process owning the session, when the caller can name it. Only
+   * `lazy builder` does today; it runs on the host beside the daemon. Recorded
+   * for eviction ordering alone — it is a CLAIM by an already-authenticated
+   * caller, never evidence of identity, and no auth decision reads it.
+   */
+  ownerPid?: number;
+}
+
 /**
  * Mint (or reuse) the token for one identity.
  *
@@ -154,11 +201,22 @@ export async function mintMcpToken(
   projectRoot: string,
   identity: McpIdentity,
   label: string,
+  options: MintMcpTokenOptions = {},
 ): Promise<string> {
   return mutate(projectRoot, async registry => {
     const key = identityKey(identity, label);
     const existing = registry.tokens.find(t => recordKey(t) === key);
-    if (existing) return existing.token;
+    if (existing) {
+      // Refresh the liveness pid on reuse. The re-issue watcher and the relaunch
+      // loop both come back through here for the SAME identity, and a record
+      // that predates this field would otherwise never learn its owner — the
+      // live session it belongs to would stay first in line for eviction.
+      if (options.ownerPid !== undefined && existing.ownerPid !== options.ownerPid) {
+        existing.ownerPid = options.ownerPid;
+        await persist(projectRoot, registry);
+      }
+      return existing.token;
+    }
 
     const record: McpTokenRecord = {
       token: randomBytes(32).toString('hex'),
@@ -166,14 +224,21 @@ export async function mintMcpToken(
       ...(identity.kind === 'task' ? { taskId: identity.taskId } : {}),
       label,
       createdAt: new Date().toISOString(),
+      ...(options.ownerPid !== undefined ? { ownerPid: options.ownerPid } : {}),
     };
     registry.tokens.push(record);
 
     const builders = registry.tokens.filter(t => t.kind === 'builder');
     if (builders.length > MAX_BUILDER_TOKENS) {
+      const byAge = [...builders]
+        // Never evict the record we just minted: it is the one session we know
+        // for certain is starting right now.
+        .filter(t => t.token !== record.token)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const notLive = byAge.filter(t => !isProvablyLive(t));
+      const live = byAge.filter(t => isProvablyLive(t));
       const drop = new Set(
-        builders
-          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        [...notLive, ...live]
           .slice(0, builders.length - MAX_BUILDER_TOKENS)
           .map(t => t.token),
       );

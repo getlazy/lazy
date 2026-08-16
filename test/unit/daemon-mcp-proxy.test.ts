@@ -77,7 +77,10 @@ describe('daemon MCP proxy error handling', () => {
     const deadPort = probe.port!;
     probe.stop(true);
 
-    const handler = createDaemonProxyHandler(configFor(deadPort), 'lazy_show');
+    // reconnectWindowMs: 0 — this test is about the MESSAGE. An unreachable
+    // daemon is now waited out first (a rebuild takes it away for a while), and
+    // that wait is covered by daemon-mcp-reconnect.test.ts.
+    const handler = createDaemonProxyHandler(configFor(deadPort), 'lazy_show', { reconnectWindowMs: 0 });
 
     let thrown: unknown;
     try {

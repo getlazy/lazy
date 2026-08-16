@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { renderDiff, diffScripts, diffStyles } from '../../src/server/diff';
+import { bundledStylesheet } from '../../src/server/styles';
 import { commitDetailHtml } from '../../src/server/templates';
 import type { Task, Commit } from '../../src/types';
 
@@ -48,70 +48,85 @@ function makeCommit(): Commit {
   };
 }
 
-// INVARIANT: The diff viewer is rendered through @pierre/diffs SSR
-// (renderDiff in src/server/diff.ts), ported from the add-server-diffs task.
-// The output must wrap each file's pre-rendered diff in a <diffs-container>
-// web component and expose a per-file header with add/del stats. These
-// assertions guard that the SSR integration stays wired up.
-describe('renderDiff (@pierre/diffs SSR)', () => {
-  test('split view wraps each file in a <diffs-container> with header + stats', async () => {
-    const html = await renderDiff(SAMPLE_PATCH, 'split');
-    expect(html).toContain('<diffs-container>');
-    expect(html).toContain('class="diff-file"');
-    expect(html).toContain('foo.ts');
-    // Two additions, one deletion in the sample patch.
-    expect(html).toContain('diff-stat-add');
-    expect(html).toContain('diff-stat-del');
+/**
+ * INVARIANT (one-diff-renderer): the commit detail page renders through the
+ * SAME renderer as the review surface.
+ *
+ * It used to use @pierre/diffs, which put every line inside a <diffs-container>
+ * web component's Shadow DOM. Nothing outside a shadow root can address a line,
+ * so that renderer could never carry the per-line anchors inline comments are
+ * built on — the review surface needed its own renderer, and the project ended
+ * up with two diff components, two looks and two sets of behaviour. These
+ * assertions guard against a second one reappearing.
+ */
+describe('commitDetailHtml', () => {
+  test('renders light-DOM diff rows, not a shadow-DOM web component', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
+    expect(html).toContain('class="rv-file"');
+    expect(html).toContain('table class="rv-diff"');
+    expect(html).not.toContain('diffs-container');
+    expect(html).not.toContain('customElements.define');
   });
 
-  test('unified view also renders through the web component', async () => {
-    const html = await renderDiff(SAMPLE_PATCH, 'unified');
-    expect(html).toContain('<diffs-container>');
+  test('shows the file and its add/delete counts', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
     expect(html).toContain('foo.ts');
+    expect(html).toContain('+2');
+    expect(html).toContain('-1');
   });
 
-  test('empty diff yields an empty-state message, not a broken container', async () => {
-    const html = await renderDiff('', 'split');
+  // A historical commit has nothing to reply to and nothing to work through,
+  // so the review-only affordances must not appear here.
+  test('carries no comment affordance and no Viewed tick', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
+    // The shared stylesheet names both classes on every page, so assert on the
+    // MARKUP each would produce, not on the bare class name.
+    expect(html).not.toContain('class="rv-add-comment"');
+    expect(html).not.toContain('class="rv-viewed-box"');
+    expect(html).toContain('<td class="rv-gutter"></td>');
+  });
+
+  test('offers the wrap/scroll and unified/split toggles and the script that drives them', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
+    expect(html).toContain('data-rv-viewopts');
+    expect(html).toContain('data-rv-mode="wrap" data-rv-value="1"');
+    expect(html).toContain('data-rv-mode="layout" data-rv-value="split"');
+    expect(html).toContain('#commit-diff');
+  });
+
+  // Split view was the one thing commit detail lost when the second (shadow-DOM)
+  // renderer was deleted. It comes back through the shared renderer, so this
+  // page gets it without gaining any of the review-only comment machinery.
+  test('side-by-side works here without dragging comment UI onto the page', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
+    // The pairing the split layout is built from.
+    expect(html).toContain('data-rv-pair="1" data-rv-pane="l"');
+    expect(html).toContain('data-rv-pair="1" data-rv-pane="r"');
+    // Still no comment affordance anywhere, in either layout.
+    expect(html).not.toContain('class="rv-add-comment"');
+  });
+
+  test('an empty diff yields an empty state rather than a broken table', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), '');
     expect(html).toContain('empty-state');
-    expect(html).not.toContain('<diffs-container>');
+    expect(html).not.toContain('table class="rv-diff"');
   });
 
-  // INVARIANT: Rendering must never throw on malformed input — it falls back
-  // to a raw <pre> dump so the page still loads. Errors are surfaced to the
-  // user, not swallowed (see CLAUDE.md error-handling rules).
-  test('unparseable input falls back to a raw pre block instead of throwing', async () => {
-    const garbage = 'this is not a unified diff at all\njust some text\n';
-    const html = await renderDiff(garbage, 'split');
-    // Falls back to a raw <pre> dump (no web component) rather than throwing.
-    expect(html).toContain('class="diff-raw"');
-    expect(html).not.toContain('<diffs-container>');
+  // The parser is deliberately tolerant: unrecognized input yields no files,
+  // which renders as the empty state rather than throwing the page away.
+  test('unparseable input renders an empty state instead of throwing', () => {
+    const html = commitDetailHtml(makeTask(), makeCommit(), 'not a diff at all\njust text\n');
+    expect(html).toContain('empty-state');
   });
 
-  test('diffScripts registers the diffs-container custom element', () => {
-    expect(diffScripts).toContain("customElements.define('diffs-container'");
-  });
-
-  test('diffStyles ship the file-wrapper styling', () => {
-    expect(diffStyles).toContain('.diff-file');
-    expect(diffStyles).toContain('.diff-view-toggle');
-  });
-});
-
-// INVARIANT: The commit detail page honors the side-by-side/unified view
-// toggle, marks the active view, renders the diff via renderDiff, and includes
-// the companion registration script (diffScripts) so the web component works.
-describe('commitDetailHtml view toggle + diff integration', () => {
-  test('side-by-side view marks side-by-side active and embeds the diff + scripts', async () => {
-    const html = await commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH, 'side-by-side');
-    expect(html).toContain('class="diff-view-toggle"');
-    expect(html).toMatch(/view=side-by-side"[^>]*class="active"/);
-    expect(html).toContain('<diffs-container>');
-    expect(html).toContain("customElements.define('diffs-container'");
-  });
-
-  test('unified view marks unified active', async () => {
-    const html = await commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH, 'unified');
-    expect(html).toMatch(/view=unified"[^>]*class="active"/);
-    expect(html).toContain('<diffs-container>');
+  // INVARIANT: the diff styling SHIPS. It lives in src/server/styles/diff.css,
+  // which a compiled binary can only serve if it is compiled in — so assert
+  // against the bundled stylesheet, not against the file on disk. The classes
+  // are the shared renderer's (.rv-*): the .diff-* set belonged to the second,
+  // shadow-DOM renderer and went with it.
+  test('the bundled stylesheet ships the diff styling', () => {
+    expect(bundledStylesheet()).toContain('.rv-file');
+    expect(bundledStylesheet()).toContain('.rv-wrap');
+    expect(bundledStylesheet()).toContain('.rv-diff-scroll');
   });
 });

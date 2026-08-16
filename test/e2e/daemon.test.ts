@@ -26,11 +26,13 @@ import { getStartLockPath, getDaemonDir } from '../../src/daemon/paths';
 import { DEFAULT_SERVER_BIND } from '../../src/config/constants';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTaskBeforeDaemon } from '../helpers/fixtures';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 import { slowSuiteSkipped } from '../helpers/slow-suite';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { pinConfig } from '../helpers/pin-config';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
+import { DEAD_PID } from '../helpers/dead-pid';
 
 /**
  * The address a port squatter must bind to actually block the daemon.
@@ -87,6 +89,11 @@ async function pinFreeServerPort(projectRoot: string): Promise<number> {
 
 // Slow suite (>300s per file): opt in with LAZY_SLOW_TESTS=1. Gating only —
 // no test content is weakened or removed.
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
+
 describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
   describe('server module (unit-level)', () => {
     let daemon: RunningDaemon;
@@ -233,16 +240,22 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       expect(pid).toBeNull();
     });
 
-    // INVARIANT: cleanupStaleFiles removes PID and socket files.
-    // When the daemon crashes, stale files must be cleaned up before restart.
+    // INVARIANT: cleanupStaleFiles removes PID and socket files that are
+    // genuinely stale — no lock holder and the recorded PID dead. Those two
+    // conditions are the whole contract: the same call must REFUSE while a live
+    // daemon owns the directory (see test/e2e/daemon-cleanup-ownership.test.ts),
+    // because deleting a running daemon's files wedges every CLI command
+    // against a daemon that is running fine. The PID below must therefore be a
+    // definitely-dead one — an arbitrary low PID like 12345 can be a live
+    // process on the host, which would make the guard refuse and this test flap.
     test('cleanupStaleFiles removes daemon files', async () => {
       const daemonDir = getDaemonDir(fakeProjectRoot);
       const { mkdirSync, writeFileSync } = await import('fs');
       mkdirSync(daemonDir, { recursive: true });
-      writeFileSync(join(daemonDir, 'lazy.pid'), '12345');
+      writeFileSync(join(daemonDir, 'lazy.pid'), String(DEAD_PID));
       writeFileSync(join(daemonDir, 'lazy.sock'), 'dummy');
 
-      cleanupStaleFiles(fakeProjectRoot);
+      expect(cleanupStaleFiles(fakeProjectRoot)).toBe('removed');
 
       expect(existsSync(join(daemonDir, 'lazy.pid'))).toBe(false);
       expect(existsSync(join(daemonDir, 'lazy.sock'))).toBe(false);
@@ -486,7 +499,9 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       await daemon.stop();
 
       // Verify socket is cleaned up
-      // Note: stop() calls cleanupStaleFiles which removes PID and socket
+      // Note: stop() calls cleanupOwnDaemonFiles, which removes PID and socket.
+      // The owner deletes its own files unconditionally — the ownership guard in
+      // cleanupStaleFiles is for OTHER processes, and would refuse here.
     });
 
     // INVARIANT: Daemon reports increasing uptime over time.
@@ -537,8 +552,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
-      fixtureTaskId = await createTask(ctx, FIXTURE_GOAL);
-      settledTaskId = await createTask(ctx, 'Settled daemon fixture task');
+      fixtureTaskId = await createTaskBeforeDaemon(ctx, FIXTURE_GOAL);
+      settledTaskId = await createTaskBeforeDaemon(ctx, 'Settled daemon fixture task');
       const setupStorage = await openProjectStorage(ctx.root);
       try {
         const settled = (await setupStorage.listTasks()).find(t => t.id.startsWith(settledTaskId));
@@ -746,9 +761,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
-      // Before the daemon starts — it holds .storage-lock for its lifetime, so a
-      // `lazy create` subprocess can never acquire the lock while it is running.
-      await createTask(ctx, 'Matching project task');
+      await createTaskBeforeDaemon(ctx, 'Matching project task');
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-mismatch-'));
       socketPath = join(tmpDir, 'mismatch-test.sock');
       token = 'mismatch-token';
@@ -890,12 +903,10 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       socketPath = join(tmpDir, 'reconcile-test.sock');
       token = 'reconcile-test-token';
 
-      // Create the task and put it in 'working' with a session BEFORE the daemon
-      // starts. Two reasons, both load-bearing: the reconcile loop must see the
-      // state on its first tick, and the daemon holds .storage-lock for its whole
-      // lifetime — neither `lazy create` (a subprocess) nor openProjectStorage()
-      // here can acquire the lock once it is running.
-      workingTaskId = await createTask(ctx, 'Reconcile test task');
+      // Put the task in 'working' with a session BEFORE the daemon starts: the
+      // reconcile loop must see that state on its first tick. openProjectStorage()
+      // below carries the same ordering constraint createTaskBeforeDaemon enforces.
+      workingTaskId = await createTaskBeforeDaemon(ctx, 'Reconcile test task');
       const storage = await openProjectStorage(ctx.root);
       try {
         const allTasks = await storage.listTasks();

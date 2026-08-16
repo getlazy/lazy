@@ -85,10 +85,24 @@ the corrupted record outlived the turn that made it.
 
 If the `lazy_*` tools disconnect or start failing mid-turn, that is a reportable condition, not a
 puzzle to solve:
-1. Stop. Do not commit through any other route.
+1. Stop. Do not commit through any other route. In particular do not run the lazy CLI yourself —
+   it cannot write from here, and a route that reached the store directly would corrupt it.
 2. Leave your edits in the worktree — they are not lost; the worktree persists across turns.
-3. End the turn with a handback stating exactly what is uncommitted, which files, how far the work
+3. Write anything you would have journaled or filed as a follow-up to the handoff file below.
+4. End the turn with a handback stating exactly what is uncommitted, which files, how far the work
    got, and that the tool channel was lost.
+
+**The handoff file.** When — and only when — the tools are unreachable, append one JSON object per
+line to `.lazy-task-sandbox/turn-handoff.jsonl` in your worktree:
+
+```
+{"kind":"journal","content":"Chose X over Y because …"}
+{"kind":"followup","content":"The retry path in foo.ts swallows errors — unrelated to this task."}
+```
+
+Use ordinary file tools to append; the file is gitignored, so it changes nothing about your diff.
+It is picked up after your turn ends and recorded against the task for you — including when the
+turn is cut short. Retry the real tool first; the file is the fallback, not a shortcut.
 
 Losing a channel costs one turn. Improvising around it corrupts state the human then has to find.
 

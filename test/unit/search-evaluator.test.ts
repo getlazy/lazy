@@ -347,4 +347,75 @@ describe('buildSearchResults', () => {
     expect(followUpResults.length).toBe(1);
     expect(followUpResults[0].content).toContain('retry helper');
   });
+
+  // INVARIANT: a turn hit must say WHICH turn matched. Search excerpts are
+  // truncated by design (search locates, show reads), so a hit that names only
+  // the task forces the reader to page through show by hand. entity_index is
+  // the turn's position in the list show pages over — usable directly as its
+  // `offset` — and turn_sequence is the number show prints.
+  test('turn hits carry entity_index and turn_sequence', () => {
+    const data = makeData({
+      turns: [
+        makeTurn({ id: 'turn-a', sequence: 0, content: 'unrelated preamble' }),
+        makeTurn({ id: 'turn-b', sequence: 1, content: 'first pass at the reconciler' }),
+        makeTurn({ id: 'turn-c', sequence: 2, content: 'more unrelated text' }),
+        makeTurn({ id: 'turn-d', sequence: 3, content: 'reconciler follow-up work' }),
+      ],
+    });
+    const ast = parseQuery('in:turns "reconciler"');
+    const turnResults = buildSearchResults(ast, data).filter(r => r.entity_type === 'turn');
+
+    expect(turnResults.length).toBe(2);
+    expect(turnResults[0].entity_index).toBe(1);
+    expect(turnResults[0].turn_sequence).toBe(1);
+    expect(turnResults[1].entity_index).toBe(3);
+    expect(turnResults[1].turn_sequence).toBe(3);
+  });
+
+  // The index is a POSITION in the list, not the turn's sequence number. They
+  // diverge whenever a session's sequences do not start at 0 — passing a
+  // sequence as show's `offset` would then land on the wrong turn, so the two
+  // must stay separate fields.
+  test('entity_index is a position, independent of the sequence number', () => {
+    const data = makeData({
+      turns: [
+        makeTurn({ id: 'turn-a', sequence: 7, content: 'unrelated' }),
+        makeTurn({ id: 'turn-b', sequence: 8, content: 'the reconciler again' }),
+      ],
+    });
+    const ast = parseQuery('in:turns "reconciler"');
+    const [hit] = buildSearchResults(ast, data).filter(r => r.entity_type === 'turn');
+
+    expect(hit.entity_index).toBe(1);
+    expect(hit.turn_sequence).toBe(8);
+  });
+
+  test('commit, comment and follow-up hits carry entity_index; task hits do not', () => {
+    const data = makeData({
+      commits: [
+        makeCommit({ id: 'commit-a', message: 'unrelated' }),
+        makeCommit({ id: 'commit-b', message: 'Fix bug in reconciler' }),
+      ],
+      comments: [
+        makeComment({ id: 'comment-a', content: 'unrelated' }),
+        makeComment({ id: 'comment-b', content: 'the reconciler needs a look' }),
+      ],
+      followUps: [
+        makeFollowUp({ id: 'followup-a', content: 'unrelated' }),
+        makeFollowUp({ id: 'followup-b', content: 'reconciler retry helper' }),
+      ],
+    });
+    const results = buildSearchResults(parseQuery('"reconciler"'), data);
+
+    expect(results.find(r => r.entity_type === 'commit')?.entity_index).toBe(1);
+    expect(results.find(r => r.entity_type === 'comment')?.entity_index).toBe(1);
+    expect(results.find(r => r.entity_type === 'followup')?.entity_index).toBe(1);
+
+    // A task/prompt hit has no position in any per-task list, so it must not
+    // claim one — an index of 0 there would read as "the first turn".
+    const taskHits = buildSearchResults(parseQuery('status:working'), makeData());
+    expect(taskHits[0].entity_type).toBe('task');
+    expect(taskHits[0].entity_index).toBeUndefined();
+    expect(taskHits[0].turn_sequence).toBeUndefined();
+  });
 });

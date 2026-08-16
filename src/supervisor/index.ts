@@ -20,6 +20,8 @@
  */
 
 import { existsSync } from 'fs';
+import { mkdir, writeFile } from 'fs/promises';
+import { join } from 'path';
 import {
   readCommand,
   consumeCommand,
@@ -43,25 +45,28 @@ import type {
   SupervisorPhase,
   CompletedResponse,
   ErrorResponse,
+  WorktreeRecovery,
 } from '../protocol/types';
 import type { MergeConflict } from '../types';
-import { runSyncWithUpstream, runSyncWithRemote, type MergeGuardOptions, hasMergeInProgress, hasUnmergedFiles, abortMergeIfInProgress } from './merge';
+import { runSyncWithUpstream, runSyncWithRemote, type MergeGuardOptions, hasUnmergedFiles, abortMergeIfInProgress, settleConflictedWorktree } from './merge';
+import { readWorktreeMergeState, describeMergeState, isMidMerge } from '../git/operations';
 import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError } from './work';
 import { makeRetryStatusHandler } from './retry-status';
 import askSystemPrompt from '../prompts/ask-system-prompt.md' with { type: 'text' };
 import { runPostTurnCheck } from './post-turn-check';
 import { resolveWatchdogTimeout } from './watchdog';
+import { readUsage } from './usage';
 import { getAgent } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
-import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
-import { allTools } from '../mcp/tools';
+import { prepareTurnMcp } from './mcp-setup';
+import { clearTurnHandoff, handoffField } from './turn-handoff';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
 import { PROTOCOL_VERSION } from '../protocol/types';
 import { VERSION } from '../version';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
-import { elevatedMergeAbort, elevatedResetHardHead, elevatedTag } from './elevated-git';
+import { elevatedResetHardHead, elevatedTag } from './elevated-git';
 import { detectViolations } from './permissions';
 import { runPermissionPushback } from './pushback';
 import { detectSkippedMaintainEntries, runMaintainFollowup, renderMaintainContext } from './maintain';
@@ -110,6 +115,30 @@ async function checkRequiredTools(runner: Runner): Promise<void> {
 export const ONE_SHOT_STOP_EXIT_CODE = 42;
 
 /**
+ * Launch settings to stamp on a response so the reconciler can record them on
+ * the turn it writes.
+ *
+ * `cmd.model_id` is the REQUESTED model (the resolved `--model` value the daemon
+ * sent — usually a tier alias); it lands on the response as `model`.
+ * `reportedModelId` is what the agent said it actually ran, and lands as
+ * `model_id`. Omitting a field is meaningful: it records that the setting was
+ * not in force / not reported, rather than guessing a default.
+ *
+ * Called per invocation, not per bundle: push-back and maintain are separate
+ * agent runs and can report a different concrete model than the work phase.
+ */
+function launchSettings(
+  cmd: { model_id?: string; effort?: string },
+  reportedModelId?: string,
+): { model?: string; model_id?: string; effort?: string } {
+  return {
+    ...(cmd.model_id ? { model: cmd.model_id } : {}),
+    ...(reportedModelId ? { model_id: reportedModelId } : {}),
+    ...(cmd.effort ? { effort: cmd.effort } : {}),
+  };
+}
+
+/**
  * Check whether the command's protocol_version matches the supervisor's own.
  * Returns null on match, or an error message describing the mismatch.
  *
@@ -153,8 +182,21 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
   // Check required tools before doing any work
   await checkRequiredTools(runner);
 
-  // Recovery: clean up any in-progress merge left by a previous crash
-  await recoverWorktreeState(worktreePath);
+  // A half-merged worktree left by a previous crash is REPORTED here, not
+  // rolled back. Startup is the one moment with no command to attribute a
+  // rollback to, and a supervisor is (re)started for every turn — so rolling
+  // back here quietly consumed the evidence before the per-command recovery
+  // below could record it. That is how a stranded merge once vanished between
+  // two commands leaving only "reset: moving to HEAD" in the reflog
+  // (fix-sync-silent-conflict). The next command's recovery cleans it up and
+  // says so on its response.
+  const startupMergeState = await readWorktreeMergeState(worktreePath);
+  if (isMidMerge(startupMergeState)) {
+    logWarn(
+      `[supervisor] Worktree is mid-merge on startup (${describeMergeState(startupMergeState)}). ` +
+      `Leaving it in place; the next command will recover it and record what it discarded.`,
+    );
+  }
 
   // Recovery: check if there's an in-progress status from a previous supervisor
   const prevStatus = readStatus(protocolDir);
@@ -249,21 +291,93 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
 }
 
 /**
+ * Save the worktree's current diff against HEAD so a rollback is recoverable.
+ *
+ * Rolling back a mid-merge worktree destroys whatever resolution was in it.
+ * CLAUDE.md's recovery-file rule exists for exactly this: work that cannot be
+ * kept must at least be retrievable. `.lazy/recovery/` is gitignored, so writing
+ * here never dirties the worktree the caller is about to clean.
+ *
+ * Returns the patch path, or null when nothing could be saved — saving is
+ * best-effort and must never stop the recovery it precedes.
+ */
+async function saveWorktreeRollbackPatch(worktreePath: string): Promise<string | null> {
+  try {
+    const diff = await runGit(['diff', 'HEAD'], { cwd: worktreePath });
+    if (diff.exitCode !== 0 || !diff.stdout.trim()) return null;
+    const dir = join(worktreePath, '.lazy', 'recovery');
+    await mkdir(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const patchPath = join(dir, `merge-rollback-${stamp}.patch`);
+    await writeFile(patchPath, diff.stdout.endsWith('\n') ? diff.stdout : `${diff.stdout}\n`, 'utf-8');
+    return patchPath;
+  } catch (err) {
+    logWarn(
+      `[supervisor] Could not save a rollback patch before recovering the worktree: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Recover worktree state from a previous crash. Aborts any in-progress
  * merge and ensures the worktree is clean before work begins.
+ *
+ * INVARIANT (fix-sync-silent-conflict): this rollback is never silent. A
+ * mid-merge worktree may hold a real, in-progress resolution — a human's or an
+ * agent's — and discarding it used to leave nothing behind but a `logWarn` in a
+ * container log and a bare "reset: moving to HEAD" in the reflog. Now the
+ * discarded state is saved to `.lazy/recovery/` first and the caller puts the
+ * returned report on the response, where the reconciler journals it against the
+ * task. Returns null when there was nothing to recover (the normal case).
  */
-async function recoverWorktreeState(worktreePath: string): Promise<void> {
-  // Check for in-progress merge (MERGE_HEAD exists)
-  if (await hasMergeInProgress(worktreePath)) {
-    logWarn('[supervisor] Detected in-progress merge from previous crash. Aborting merge to recover clean state.');
-    await abortMergeIfInProgress(worktreePath);
+async function recoverWorktreeState(
+  worktreePath: string,
+  context: string,
+): Promise<WorktreeRecovery | null> {
+  const state = await readWorktreeMergeState(worktreePath);
+  if (!isMidMerge(state)) return null;
+
+  const found: WorktreeRecovery['found'] = state.mergeInProgress
+    ? 'merge_in_progress'
+    : 'unmerged_files';
+  logWarn(
+    `[supervisor] Found a half-merged worktree before the ${context} command ` +
+    `(${describeMergeState(state)}). Rolling it back — any resolution in it is being discarded.`,
+  );
+
+  const patchPath = await saveWorktreeRollbackPatch(worktreePath);
+  if (patchPath) {
+    logWarn(`[supervisor] Saved the discarded worktree state to ${patchPath}`);
   }
 
-  // Check for unmerged files (conflict markers without MERGE_HEAD — shouldn't happen but be safe)
+  if (state.mergeInProgress) {
+    await abortMergeIfInProgress(worktreePath);
+  }
   if (await hasUnmergedFiles(worktreePath)) {
-    logWarn('[supervisor] Detected unmerged files in worktree. Resetting to clean state.');
+    // Unmerged paths with no MERGE_HEAD (or an abort that did not clear them):
+    // nothing but a hard reset settles this.
+    logWarn('[supervisor] Unmerged files remain after abort. Resetting the worktree to HEAD.');
     await elevatedResetHardHead(worktreePath);
   }
+
+  const after = await readWorktreeMergeState(worktreePath);
+  const settled = !isMidMerge(after);
+  const summary =
+    `Rolled back a half-merged worktree found before the ${context} command ` +
+    `(${describeMergeState(state)})` +
+    (patchPath ? `. The discarded changes were saved to ${patchPath}` : '') +
+    (settled ? '.' : `. WARNING: the worktree is STILL mid-merge (${describeMergeState(after)}).`);
+  if (!settled) logError(`[supervisor] ${summary}`);
+
+  return {
+    found,
+    summary,
+    files: state.unmergedFiles,
+    ...(patchPath ? { patch_path: patchPath } : {}),
+    context,
+  };
 }
 
 /**
@@ -324,7 +438,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
   log(`[supervisor] Command fields: protected_patterns=${JSON.stringify(cmd.protected_patterns)}, post_turn_check=${JSON.stringify(cmd.post_turn_check)}, parent_branch=${cmd.parent_branch}, agent_id=${cmd.agent_id}`);
 
   // Pre-turn worktree health check: ensure no leftover merge state
-  await recoverWorktreeState(worktreePath);
+  const turnRecovery = await recoverWorktreeState(worktreePath, cmd.type);
 
   // Record pre-turn SHA for deterministic turn diff
   const preTurnSha = await getHeadSha(worktreePath);
@@ -369,10 +483,16 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const errorMessage = err instanceof Error ? err.message : String(err);
       logError(`[supervisor] Sync-with-remote failed: ${errorMessage}`);
 
+      // INVARIANT (fix-sync-silent-conflict): a failed merge phase never returns
+      // with a half-merged worktree. Settle it first, and report what settling
+      // did (or could not do) on the response itself.
+      const mergeState = await settleConflictedWorktree(worktreePath);
       const errorResponse: ErrorResponse = {
         status: 'error',
-        error: `Sync-with-remote failed: ${errorMessage}`,
+        error: `Sync-with-remote failed: ${errorMessage}${mergeState.settled ? '' : ` — ${mergeState.detail}`}`,
         phase: 'sync_with_remote',
+        merge_state: mergeState,
+        ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       };
       writeResponse(protocolDir, errorResponse);
       return;
@@ -417,10 +537,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const errorMessage = err instanceof Error ? err.message : String(err);
       logError(`[supervisor] Pre-turn sync-with-upstream failed: ${errorMessage}`);
 
+      // INVARIANT (fix-sync-silent-conflict): see the sync-with-remote catch above.
+      const mergeState = await settleConflictedWorktree(worktreePath);
       const errorResponse: ErrorResponse = {
         status: 'error',
-        error: `Merge-and-fix failed: ${errorMessage}`,
+        error: `Merge-and-fix failed: ${errorMessage}${mergeState.settled ? '' : ` — ${mergeState.detail}`}`,
         phase: 'merge_and_fix',
+        merge_state: mergeState,
+        ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       };
       writeResponse(protocolDir, errorResponse);
       return;
@@ -436,24 +560,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     await tagHead(worktreePath, tagName);
   }
 
-  // Write MCP server config so Claude Code discovers lazy tools
-  try {
-    const mcpConfig = runner.mcpServerConfig(cmd.task_id, worktreePath);
-    await writeMcpConfig(mcpConfig);
-    log(`[supervisor] Wrote MCP config for task ${cmd.task_id.substring(0, 8)}`);
-  } catch (err) {
-    // Non-fatal: Claude Code will work without MCP tools (they just won't be available)
-    logWarn(`[supervisor] Failed to write MCP config: ${err instanceof Error ? err.message : err}`);
-  }
+  // Write this turn's MCP server config + permissions so Claude Code discovers
+  // the lazy tools. Write mode — this turn may commit, journal, and run subtasks.
+  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
 
-  // Pre-approve lazy MCP tools so Claude Code doesn't prompt for permission
-  try {
-    const toolNames = allTools.map(t => t.name);
-    await writeToolPermissions(toolNames);
-    log(`[supervisor] Pre-approved ${toolNames.length} MCP tools`);
-  } catch (err) {
-    logWarn(`[supervisor] Failed to write tool permissions: ${err instanceof Error ? err.message : err}`);
-  }
+  // Start the turn with an empty handoff file, so anything collected afterwards
+  // is unambiguously from THIS turn's agent.
+  await clearTurnHandoff(worktreePath, log);
 
   // Phase 3: Work (actual task work via Claude Code)
   updatePhase(status, 'work', protocolDir);
@@ -603,6 +716,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         result: pushbackResult.response,
         session_id: pushbackResult.session_id,
         usage: pushbackResult.usage,
+        ...launchSettings(cmd, pushbackResult.model_id),
         start_sha_work: lastInvocationSha,
         end_sha_work: postPushbackSha,
         violations,
@@ -670,6 +784,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
           result: followup.response,
           session_id: followup.session_id,
           usage: followup.usage,
+          ...launchSettings(cmd, followup.model_id),
           start_sha_work: lastInvocationSha,
           end_sha_work: postFollowupSha,
           supervised: { kind: 'maintain', prompt: followup.prompt },
@@ -749,8 +864,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         const errorMessage = err instanceof Error ? err.message : String(err);
         logWarn(`[supervisor] Post-turn sync failed: ${errorMessage}. Skipping.`);
 
-        // Abort any in-progress merge to leave the branch clean
-        await elevatedMergeAbort(worktreePath);
+        // Leave the branch settled. A failed abort used to be swallowed here,
+        // which is one of the ways a half-merged worktree survived a turn that
+        // reported success (fix-sync-silent-conflict).
+        const settled = await settleConflictedWorktree(worktreePath);
+        if (!settled.settled) {
+          logError(`[supervisor] Post-turn sync left the worktree unsettled: ${settled.detail}`);
+        }
       }
     }
 
@@ -765,11 +885,19 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // response (the FINAL set). `pushed_back` records that the supervisor gave the
     // agent a chance to self-correct — true whenever push-back RAN, independent of
     // whether violations remained (so a resolved push-back still reports it).
+    // Whatever the agent left in its handoff file because the lazy tools were
+    // unreachable. Absent in the normal case.
+    const handoff = await handoffField(worktreePath, log);
+
     const workResponse: CompletedResponse = {
       status: 'completed',
       result: result.result,
       session_id: result.session_id,
       usage: result.usage,
+      ...launchSettings(cmd, result.model_id),
+      ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
+      ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
+      ...handoff,
       ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
       ...(pushedBack ? { pushed_back: true } : {}),
       ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
@@ -787,45 +915,18 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const errorMessage = err instanceof Error ? err.message : String(err);
     logError(`[supervisor] Work phase failed: ${errorMessage}`);
 
+    // Collect the handoff on the failure path too: a watchdog kill or a crash is
+    // exactly when the agent's own account of the turn is most worth keeping.
     const errorResponse: ErrorResponse = {
       status: 'error',
       error: `Work phase failed: ${errorMessage}`,
       phase: 'work',
+      ...launchSettings(cmd),
+      ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
+      ...(await handoffField(worktreePath, log)),
     };
 
-    // Enrich with crash details if available
-    if (err instanceof FatalAgentError) {
-      // The retry policy gave up on purpose. Put the classification on the wire
-      // so the reconciler blocks the task (reason visible to the human) instead
-      // of auto-resuming into the same unrecoverable condition.
-      errorResponse.failure_class = err.failureClass;
-      errorResponse.failure_reason = err.failureReason;
-      errorResponse.failure_attempts = err.attempts;
-    } else if (err instanceof CrashError) {
-      errorResponse.exit_code = err.exitCode;
-      errorResponse.stderr = err.stderr;
-      errorResponse.stdout_error = err.stdoutError;
-      errorResponse.duration_ms = err.durationMs;
-    } else if (err instanceof WatchdogTimeoutError) {
-      // Presence of watchdog_timeout_ms is what makes the recorded turn say
-      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
-      errorResponse.duration_ms = err.durationMs;
-      errorResponse.watchdog_timeout_ms = err.timeoutMs;
-      errorResponse.watchdog_attempts = err.attempts;
-      errorResponse.watchdog_captured_work = err.capturedWork;
-    } else if (err instanceof GracefulExitTimeoutError) {
-      // The agent already committed its work — the marker that triggered this
-      // kill is written by lazy_commit. The commit is preserved in git either
-      // way. The agent's JSON response (summary) is lost, but the session_id
-      // is recovered when possible (resume case or jsonl tail) so the human
-      // can `lazy unblock` to resume the conversation cleanly.
-      errorResponse.duration_ms = err.durationMs;
-      if (err.sessionId) {
-        errorResponse.session_id = err.sessionId;
-      } else {
-        logWarn('[supervisor] GracefulExitTimeoutError: no session_id recovered — agent likely died before writing any JSONL.');
-      }
-    }
+    describeTurnFailure(errorResponse, err);
 
     writeResponse(protocolDir, errorResponse);
   }
@@ -839,7 +940,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   const { protocolDir, worktreePath } = config;
 
   // Pre-turn worktree health check
-  await recoverWorktreeState(worktreePath);
+  const syncRecovery = await recoverWorktreeState(worktreePath, 'sync');
 
   const preTurnSha = await getHeadSha(worktreePath);
   log(`[supervisor] Sync command: pre-turn SHA ${preTurnSha.substring(0, 8)}, parent_branch=${cmd.parent_branch}`);
@@ -857,24 +958,10 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   };
   writeStatus(protocolDir, status);
 
-  // Write MCP server config so Claude Code discovers lazy tools during conflict resolution
-  try {
-    const mcpConfig = runner.mcpServerConfig(cmd.task_id, worktreePath);
-    await writeMcpConfig(mcpConfig);
-    log(`[supervisor] Wrote MCP config for task ${cmd.task_id.substring(0, 8)}`);
-  } catch (err) {
-    // Non-fatal: Claude Code will work without MCP tools (they just won't be available)
-    logWarn(`[supervisor] Failed to write MCP config: ${err instanceof Error ? err.message : err}`);
-  }
-
-  // Pre-approve lazy MCP tools so Claude Code doesn't prompt for permission
-  try {
-    const toolNames = allTools.map(t => t.name);
-    await writeToolPermissions(toolNames);
-    log(`[supervisor] Pre-approved ${toolNames.length} MCP tools`);
-  } catch (err) {
-    logWarn(`[supervisor] Failed to write tool permissions: ${err instanceof Error ? err.message : err}`);
-  }
+  // MCP config for the conflict-resolution agent. Write mode: resolving a merge
+  // means editing and committing.
+  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
+  await clearTurnHandoff(worktreePath, log);
 
   const allMergeConflicts: MergeConflict[] = [];
 
@@ -924,10 +1011,48 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
     const errorMessage = err instanceof Error ? err.message : String(err);
     logError(`[supervisor] Sync merge failed: ${errorMessage}`);
 
+    // INVARIANT (fix-sync-silent-conflict): a sync ends in exactly one of three
+    // states, all loud — merged and committed, conflicted with a resolution turn
+    // recorded, or aborted with an actionable error. This is the third: settle the
+    // worktree before reporting, so a failed sync can never return leaving UU
+    // files behind with no resolution in flight.
+    const mergeState = await settleConflictedWorktree(worktreePath);
     const errorResponse: ErrorResponse = {
       status: 'error',
-      error: `Sync merge failed: ${errorMessage}`,
+      error: `Sync merge failed: ${errorMessage}${mergeState.settled ? '' : ` — ${mergeState.detail}`}`,
       phase: 'merge_and_fix',
+      merge_state: mergeState,
+      ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
+      ...(await handoffField(worktreePath, log)),
+    };
+    writeResponse(protocolDir, errorResponse);
+    return;
+  }
+
+  // INVARIANT (fix-sync-silent-conflict): a sync NEVER reports success over a
+  // half-merged worktree. This is the backstop for the incident that motivated
+  // this fix — the merge path returned a result while `UU` files were still on
+  // disk, the task went back to `blocked`, and nothing anywhere said so. If the
+  // tree is not settled here, that is a bug in the merge path, so we settle it
+  // and fail loudly rather than papering over it with a success response.
+  const postSyncState = await readWorktreeMergeState(worktreePath);
+  if (isMidMerge(postSyncState)) {
+    logError(
+      `[supervisor] Sync reported success but the worktree is still mid-merge ` +
+      `(${describeMergeState(postSyncState)}). Settling it and failing the sync.`,
+    );
+    const mergeState = await settleConflictedWorktree(worktreePath);
+    const errorResponse: ErrorResponse = {
+      status: 'error',
+      error:
+        `Sync merge left an unresolved merge in the worktree ` +
+        `(${describeMergeState(postSyncState)}). ${mergeState.settled
+          ? 'The merge was aborted; re-run `lazy sync` to retry it.'
+          : mergeState.detail}`,
+      phase: 'merge_and_fix',
+      merge_state: mergeState,
+      ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
+      ...(await handoffField(worktreePath, log)),
     };
     writeResponse(protocolDir, errorResponse);
     return;
@@ -965,6 +1090,10 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
     session_id: '',
     usage: { input_tokens: 0, output_tokens: 0 },
     sync: { merged: syncResult.merged, conflicts: syncResult.conflicts.length },
+    // A rollback performed before this sync is reported on the response even
+    // when the sync itself succeeded — the reconciler journals it against the
+    // task so a discarded resolution is never invisible (fix-sync-silent-conflict).
+    ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
     ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
     ...(syncResult.merged && syncResult.conflicts.length === 0
       ? { start_sha_work: syncResult.preMergeSha, end_sha_work: postMergeSha }
@@ -978,8 +1107,15 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       result: syncResult.resolution.result,
       session_id: syncResult.resolution.session_id,
       usage: syncResult.resolution.usage,
+      // A SyncCommand carries no `effort` (the daemon never resolves one for a
+      // merge), so the conflict-resolution turn honestly records model only —
+      // `effort` stays absent rather than being invented from the task default.
+      ...launchSettings(cmd, syncResult.resolution.model_id),
       start_sha_work: syncResult.preMergeSha,
       end_sha_work: postMergeSha,
+      // The conflict-resolution agent is the only agent this command runs, so
+      // any handoff it left belongs to this turn.
+      ...(await handoffField(worktreePath, log)),
     });
   }
 
@@ -1021,13 +1157,27 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
 
     const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
 
-    // Ask mode locks down write tools at three layers (defense in depth):
+    // Ask mode locks down write tools at four layers (defense in depth):
     //   1. --disallowedTools Bash/Write/Edit (see ClaudeCodeAgent.buildExecArgs)
-    //   2. LAZY_MCP_READ_ONLY=1 env var — write MCP tools (lazy_commit,
+    //   2. A read-only MCP server: the config written below spawns the in-agent
+    //      MCP server with --read-only, so the write tools are never advertised
+    //      and are refused before they can be proxied. This is the layer that
+    //      holds for containerized agents — see prepareTurnMcp.
+    //   3. LAZY_MCP_READ_ONLY=1 env var — write MCP tools (lazy_commit,
     //      lazy_comment) reject any call. The PID-1 wrapper
     //      restarts the supervisor per turn, so this env override is per-turn.
-    //   3. Stern ask-system-prompt steering the agent to answer in text only.
+    //      Only effective when tools execute locally (host-process runner);
+    //      under the daemon proxy the handlers run in the daemon, which never
+    //      sees this variable. Layer 2 is what covers that case.
+    //   4. Stern ask-system-prompt steering the agent to answer in text only.
     process.env.LAZY_MCP_READ_ONLY = '1';
+
+    // An ask is still an agent turn, and it needs the READ-ONLY lazy tools to
+    // answer questions about live task state. Without this the turn ran with
+    // whatever ~/.claude.json the container happened to have — nothing at all
+    // after a container relaunch, which is how asks lost their lazy tools.
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true });
+
     const askPrompt = cmd.system_prompt
       ? `${askSystemPrompt}\n\n---\n\n${cmd.system_prompt}`
       : askSystemPrompt;
@@ -1058,6 +1208,8 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       result: result.result,
       session_id: result.session_id,
       usage: result.usage,
+      ...launchSettings(cmd, result.model_id),
+      ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       agent_duration_ms: agentDurationMs,
     };
     writeResponse(protocolDir, response);
@@ -1069,27 +1221,9 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       status: 'error',
       error: `Work phase failed: ${errorMessage}`,
       phase: 'work',
+      ...launchSettings(cmd),
     };
-    if (err instanceof FatalAgentError) {
-      // The retry policy gave up on purpose. Put the classification on the wire
-      // so the reconciler blocks the task (reason visible to the human) instead
-      // of auto-resuming into the same unrecoverable condition.
-      errorResponse.failure_class = err.failureClass;
-      errorResponse.failure_reason = err.failureReason;
-      errorResponse.failure_attempts = err.attempts;
-    } else if (err instanceof CrashError) {
-      errorResponse.exit_code = err.exitCode;
-      errorResponse.stderr = err.stderr;
-      errorResponse.stdout_error = err.stdoutError;
-      errorResponse.duration_ms = err.durationMs;
-    } else if (err instanceof WatchdogTimeoutError) {
-      // Presence of watchdog_timeout_ms is what makes the recorded turn say
-      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
-      errorResponse.duration_ms = err.durationMs;
-      errorResponse.watchdog_timeout_ms = err.timeoutMs;
-      errorResponse.watchdog_attempts = err.attempts;
-      errorResponse.watchdog_captured_work = err.capturedWork;
-    }
+    describeTurnFailure(errorResponse, err);
     writeResponse(protocolDir, errorResponse);
   }
 }
@@ -1111,7 +1245,7 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
   log(`[supervisor] Pre-accept command for task ${cmd.task_id.substring(0, 8)} (${cmd.pre_accept_commands.length} gate command(s), effort=${cmd.effort ?? 'default'})`);
 
   // Pre-turn worktree health + SHA so the daemon can attribute this turn's commits.
-  await recoverWorktreeState(worktreePath);
+  const preAcceptRecovery = await recoverWorktreeState(worktreePath, 'pre-accept');
   const preTurnSha = await getHeadSha(worktreePath);
 
   const now = new Date().toISOString();
@@ -1138,6 +1272,11 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
 
     // WRITE mode: no plan-mode lockdown, no LAZY_MCP_READ_ONLY — the agent must
     // be able to run commands, edit files, commit, and journal the post-mortem.
+    // Which is exactly why this turn needs its own MCP config written: like ask,
+    // it can be the first turn in a freshly launched container.
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
+    await clearTurnHandoff(worktreePath, log);
+
     const agentStart = Date.now();
     const result = await runWork(
       agent,
@@ -1178,9 +1317,13 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
       result: result.result,
       session_id: result.session_id,
       usage: result.usage,
+      ...launchSettings(cmd, result.model_id),
+      ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       agent_duration_ms: agentDurationMs,
       start_sha_work: preTurnSha,
       end_sha_work: postWorkSha,
+      ...(preAcceptRecovery ? { worktree_recovery: preAcceptRecovery } : {}),
+      ...(await handoffField(worktreePath, log)),
       pre_accept: {
         passed: gate.passed,
         ...(gate.failedCommand !== undefined ? { failed_command: gate.failedCommand } : {}),
@@ -1197,32 +1340,74 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
       status: 'error',
       error: `Pre-accept turn failed: ${errorMessage}`,
       phase: 'work',
+      ...launchSettings(cmd),
+      ...(preAcceptRecovery ? { worktree_recovery: preAcceptRecovery } : {}),
+      ...(await handoffField(worktreePath, log)),
     };
-    if (err instanceof FatalAgentError) {
-      // The retry policy gave up on purpose. Put the classification on the wire
-      // so the reconciler blocks the task (reason visible to the human) instead
-      // of auto-resuming into the same unrecoverable condition.
-      errorResponse.failure_class = err.failureClass;
-      errorResponse.failure_reason = err.failureReason;
-      errorResponse.failure_attempts = err.attempts;
-    } else if (err instanceof CrashError) {
-      errorResponse.exit_code = err.exitCode;
-      errorResponse.stderr = err.stderr;
-      errorResponse.stdout_error = err.stdoutError;
-      errorResponse.duration_ms = err.durationMs;
-    } else if (err instanceof WatchdogTimeoutError) {
-      // Presence of watchdog_timeout_ms is what makes the recorded turn say
-      // "killed by the watchdog after 30m" instead of a bare "agent crashed".
-      errorResponse.duration_ms = err.durationMs;
-      errorResponse.watchdog_timeout_ms = err.timeoutMs;
-      errorResponse.watchdog_attempts = err.attempts;
-      errorResponse.watchdog_captured_work = err.capturedWork;
-    }
+    describeTurnFailure(errorResponse, err);
     writeResponse(protocolDir, errorResponse);
   }
 }
 
 // --- Helpers ---
+
+/**
+ * Put everything we know about a failed turn onto its ErrorResponse.
+ *
+ * One function for every failure path (work, ask, pre-accept) on purpose: this
+ * used to be three near-identical copies, and they had already drifted — only
+ * the work copy handled a wind-down kill, so an ask or pre-accept killed that
+ * way lost its recovered session id. A detail added to one copy and not the
+ * others is exactly the class of hole this consolidation closes.
+ *
+ * INVARIANT: salvaged token usage is applied for EVERY error class, outside the
+ * branch chain. A turn that spent tokens and then died must be able to put those
+ * tokens on a turn record regardless of how it died — attributing them to the
+ * session alone is what produced `session.total_usage > sum(turns)` gaps.
+ */
+function describeTurnFailure(errorResponse: ErrorResponse, err: unknown): void {
+  if (err instanceof FatalAgentError) {
+    // The retry policy gave up on purpose. Put the classification on the wire
+    // so the reconciler blocks the task (reason visible to the human) instead
+    // of auto-resuming into the same unrecoverable condition.
+    errorResponse.failure_class = err.failureClass;
+    errorResponse.failure_reason = err.failureReason;
+    errorResponse.failure_attempts = err.attempts;
+  } else if (err instanceof CrashError) {
+    errorResponse.exit_code = err.exitCode;
+    errorResponse.stderr = err.stderr;
+    errorResponse.stdout_error = err.stdoutError;
+    errorResponse.duration_ms = err.durationMs;
+  } else if (err instanceof WatchdogTimeoutError) {
+    // Presence of watchdog_timeout_ms is what makes the recorded turn say
+    // "killed by the watchdog after 30m" instead of a bare "agent crashed".
+    errorResponse.duration_ms = err.durationMs;
+    errorResponse.watchdog_timeout_ms = err.timeoutMs;
+    errorResponse.watchdog_attempts = err.attempts;
+    errorResponse.watchdog_captured_work = err.capturedWork;
+  } else if (err instanceof GracefulExitTimeoutError) {
+    // The agent already committed its work — the marker that triggered this
+    // kill is written by lazy_commit. The commit is preserved in git either
+    // way. The agent's JSON response (summary) is lost, but the session_id
+    // is recovered when possible (resume case or jsonl tail) so the human
+    // can `lazy unblock` to resume the conversation cleanly.
+    errorResponse.duration_ms = err.durationMs;
+    if (err.sessionId) {
+      errorResponse.session_id = err.sessionId;
+    } else {
+      logWarn('[supervisor] GracefulExitTimeoutError: no session_id recovered — agent likely died before writing any JSONL.');
+    }
+  }
+
+  const salvaged = readUsage(err);
+  if (salvaged) {
+    errorResponse.usage = salvaged;
+    log(
+      `[supervisor] Recovered ${salvaged.input_tokens + salvaged.output_tokens} reported tokens ` +
+      `from the failed turn — recording them on its turn.`,
+    );
+  }
+}
 
 function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: string): void {
   const now = new Date().toISOString();

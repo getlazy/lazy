@@ -42,7 +42,8 @@ import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { resolveAndPersistEffort } from './effort';
 import { getAgent } from '../agent/registry';
-import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getNewCommits } from '../git/operations';
+import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
+import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getNewCommits, getMergeBase } from '../git/operations';
 import { renderPreAcceptPrompt } from '../supervisor/pre-accept';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
@@ -52,7 +53,16 @@ import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktree
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { resetAutoReactCounters } from './auto-react-budget';
-import { enforceEdgeGate, EdgeGateRefusedError, recordHumanApproval, peekHumanApproval } from '../protection/edge-gate';
+import {
+  enforceEdgeGate,
+  EdgeGateRefusedError,
+  recordHumanApproval,
+  peekHumanApproval,
+  takeHumanApproval,
+  type EdgeGateClearance,
+} from '../protection/edge-gate';
+import { enforceResurrectionGuard, ResurrectionRefusedError, stackedChildAdvisory } from '../protection/resurrection-guard';
+import { enforceLfsGuard, LfsPointerRefusedError } from '../protection/lfs-guard';
 import { createHumanTokenVerifier } from '../protection/verify-token';
 import { isFeatureEnabled } from '../utils/features';
 import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
@@ -65,7 +75,7 @@ import { setupSandbox } from '../utils/sandbox';
 import { hasDaemonContext } from './context';
 import { runGit } from '../utils/git';
 import { validateBranchInSyncWithRemote } from '../utils/git';
-import { latestViolationTurn } from '../utils/turns';
+import { latestViolationTurn, findStickyModel, launchSettingsFromResponse } from '../utils/turns';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../utils/feedback-redelivery';
 import { isOfflineMode } from '../utils/offline';
 import { readdir, readFile } from 'fs/promises';
@@ -73,6 +83,7 @@ import { readdir, readFile } from 'fs/promises';
 import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, PreAcceptCommand, CompletedResponse, ErrorResponse } from '../protocol';
 import { PROTOCOL_VERSION } from '../protocol/types';
 import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor } from '../types';
+import { toTurnUsage, rollUpSessionUsage } from '../utils/usage-recording';
 import type { Storage } from '../storage';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { isWatchdogKill, watchdogTurnLines, WATCHDOG_TURN_HEADING } from '../utils/watchdog-turn';
@@ -82,6 +93,7 @@ import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
 import resumeContextText from '../prompts/resume-context.md' with { type: 'text' };
 import goalContextResumeText from '../prompts/goal-context-resume.md' with { type: 'text' };
+import violationRevertNoticeText from '../prompts/violation-revert-notice.md' with { type: 'text' };
 
 // =====================================================================
 // Shared pre-flight helpers
@@ -126,7 +138,23 @@ function checkPairingLockOrThrow(root: string, tRef: string, displayTaskId: stri
  * Check for uncommitted changes in a task's worktree and throw if found.
  */
 async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskId: string, commandName: string): Promise<void> {
-  if (await pathExists(worktreePath) && await hasUncommittedChanges(worktreePath)) {
+  if (!await pathExists(worktreePath)) return;
+
+  // A half-merged worktree is NOT "uncommitted changes" and telling the human to
+  // "commit or stash" is bad advice — stashing a conflicted merge fails, and
+  // committing one records conflict markers. Name what actually happened and give
+  // the one command that fixes it (fix-sync-silent-conflict).
+  const mergeState = await readWorktreeMergeState(worktreePath);
+  if (isMidMerge(mergeState)) {
+    throw new RpcError(
+      409,
+      `Task ${displayTaskId} has an unresolved merge in its worktree (${describeMergeState(mergeState)}). ` +
+      `A sync did not finish. Run \`lazy sync ${displayTaskId}\` to complete it, ` +
+      `then re-run ${commandName}.`,
+    );
+  }
+
+  if (await hasUncommittedChanges(worktreePath)) {
     throw new RpcError(409, `Task ${displayTaskId} has uncommitted changes. Commit or stash changes before running ${commandName}.`);
   }
 }
@@ -148,6 +176,13 @@ export async function resolveParentBranchWithFallback(
   task: Task,
   storage: Storage,
   projectRoot: string,
+  /**
+   * Channel actor of the operation that triggered this resolution (unblock or
+   * sync). The re-parent comments below are a side effect of THAT command, so
+   * they carry its channel — not the daemon's env-var default, which reports
+   * 'human' for every caller. See {@link MCP_ACTOR}.
+   */
+  actor: Actor = getActor(),
 ): Promise<{ branch: string; warnings: string[] }> {
   const warnings: string[] = [];
 
@@ -210,7 +245,7 @@ export async function resolveParentBranchWithFallback(
       await storage.createComment(
         task.id,
         `[Re-parented] Stale parent chain detected during sync. Re-parented from ${staleList} to ${ancestorDisplay}.`,
-        getActor(),
+        actor,
       );
 
       return {
@@ -237,7 +272,7 @@ export async function resolveParentBranchWithFallback(
   await storage.createComment(
     task.id,
     `[Re-parented] Stale parent chain detected during sync. All ancestors terminal (${staleList}). Re-parented to top-level, targeting ${fallbackBranch}.`,
-    getActor(),
+    actor,
   );
 
   return {
@@ -299,6 +334,10 @@ export async function launchUnblockTask(
 ): Promise<UnblockTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask. Every actor-attributed write in this path
+  // (the feedback turn, the status transitions, the escape-hatch comment) uses
+  // the SAME value, so a reader never sees one command attributed two ways.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const result = await storage.resolveTask(params.taskId);
@@ -342,8 +381,8 @@ export async function launchUnblockTask(
 
   // Merging → blocked escape hatch
   if (task.status === 'merging') {
-    await storage.updateTaskStatus(task.id, 'blocked', getActor());
-    await storage.createComment(task.id, 'Task unblocked from merging state (manual escape hatch).', getActor());
+    await storage.updateTaskStatus(task.id, 'blocked', actor);
+    await storage.createComment(task.id, 'Task unblocked from merging state (manual escape hatch).', actor);
     task = (await storage.getTask(task.id))!;
     warnings.push('Task was in merging state. Moved back to blocked.');
   }
@@ -503,7 +542,20 @@ export async function launchUnblockTask(
         const approvedList = approvedViolations.map(v => v.file);
         const parts: string[] = [];
         if (revertedList.length > 0) {
-          parts.push(`The following protected files were REVERTED (do NOT modify them again):\n${revertedList.map(f => `  - ${f}`).join('\n')}`);
+          // WORDING IS LOAD-BEARING (fix-violation-turn-detection) — see
+          // src/prompts/violation-revert-notice.md. The old text was an absolute
+          // "do NOT modify them again", which covers only the common case: a
+          // revert can leave the tree incoherent (e.g. restoring tests for code
+          // the task deleted), and then a literal agent ships the breakage rather
+          // than say so. The escape hatch is REPORT AND STOP, not re-apply — an
+          // agent that re-applies unilaterally starts a revert ping-pong with the
+          // reviewer. Re-approval is the reviewer's move: they re-unblock with
+          // the files in --approve-file / approved_files.
+          parts.push(
+            violationRevertNoticeText
+              .trim()
+              .replace('{{files}}', revertedList.map(f => `  - ${f}`).join('\n'))
+          );
         }
         if (approvedList.length > 0) {
           parts.push(`The following protected file changes were APPROVED by the reviewer:\n${approvedList.map(f => `  - ${f}`).join('\n')}`);
@@ -520,13 +572,7 @@ export async function launchUnblockTask(
     // Determine model: CLI flag > previous turn's model (sticky) > task.model > config default
     let stickyModel: string | undefined;
     if (!params.modelOverride) {
-      const existingTurns = await storage.getSessionTurns(sess.id);
-      for (let i = existingTurns.length - 1; i >= 0; i--) {
-        if (existingTurns[i].model) {
-          stickyModel = existingTurns[i].model;
-          break;
-        }
-      }
+      stickyModel = findStickyModel(await storage.getSessionTurns(sess.id));
     }
     // Per-role model resolution: a local backend (ollama/proxy) forces its
     // authoritative model; otherwise CLI flag > sticky > task.model > default.
@@ -548,7 +594,7 @@ export async function launchUnblockTask(
     const effortValue = await resolveAndPersistEffort(task, params.effortOverride, config.agent.effort, storage);
 
     // Determine parent branch (with stale-parent fallback)
-    const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot);
+    const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot, actor);
     const parentBranch = parentResolution.branch;
     if (parentResolution.warnings.length > 0) {
       warnings.push(...parentResolution.warnings);
@@ -604,11 +650,12 @@ export async function launchUnblockTask(
       role: 'human',
       content: message.trim(),
       model: modelName,
+      effort: effortValue,
       prompt: fullMessage,
       // Channel actor: MCP-relayed feedback is 'builder' even when it carries a
       // human's words — the actor records who submitted (the channel), not who
       // authored the content. Falls back to getActor() for CLI. See MCP_ACTOR.
-      actor: params.actor ?? getActor(),
+      actor,
       // INVARIANT: this turn IS the human's feedback. If the work phase crashes
       // before the agent consumes it, resume must re-deliver it verbatim.
       carriesFeedback: true,
@@ -621,7 +668,7 @@ export async function launchUnblockTask(
     // The transition itself is validated against the canonical table in
     // src/task-state-machine.ts inside storage.updateTaskStatus.
     if (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted' || task.status === 'interrupted') {
-      await storage.updateTaskStatus(task.id, 'working', getActor());
+      await storage.updateTaskStatus(task.id, 'working', actor);
     }
 
     // --- Write command and launch/reuse supervisor ---
@@ -661,14 +708,18 @@ export async function launchUnblockTask(
 
     // Launch or reuse supervisor
     if (await runner.isRunning(containerName)) {
-      // Supervisor already running — it will pick up the new command
+      // Supervisor already running — it will pick up the new command. The
+      // config written just above still reaches it (in-place write, pinned
+      // inode); a container whose FIRST launch had none stays without one, but
+      // now reports itself instead of running toolless. See the "CONTAINER
+      // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
     } else {
       await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
       } catch (err) {
-        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -761,6 +812,9 @@ export async function launchAskTask(
   const daemonStart = Date.now();
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const resolved = await storage.resolveTask(params.taskId);
@@ -821,14 +875,7 @@ export async function launchAskTask(
     // --- Model + effort resolution ---
     const config = await loadConfig(projectRoot, { cwd: worktreePath });
 
-    let stickyModel: string | undefined;
-    const existingTurns = await storage.getSessionTurns(sess.id);
-    for (let i = existingTurns.length - 1; i >= 0; i--) {
-      if (existingTurns[i].model) {
-        stickyModel = existingTurns[i].model;
-        break;
-      }
-    }
+    const stickyModel = findStickyModel(await storage.getSessionTurns(sess.id));
     const modelName = resolveAgentModel(config, {
       preferredModel: stickyModel ?? task.model,
       agentId: task.agent_id,
@@ -862,9 +909,10 @@ export async function launchAskTask(
       role: 'human',
       content: askMessage.trim(),
       model: modelName,
+      effort: effortValue,
       prompt: fullMessage,
       // Channel actor: MCP-originated questions are 'builder', CLI 'human'.
-      actor: params.actor ?? getActor(),
+      actor,
       turnType: 'ask',
       // INVARIANT: an unanswered question is unconsumed feedback — re-deliver
       // it if the ask crashes before the agent replies.
@@ -872,7 +920,7 @@ export async function launchAskTask(
     });
 
     // --- Transition blocked → working ---
-    await storage.updateTaskStatus(task.id, 'working', getActor());
+    await storage.updateTaskStatus(task.id, 'working', actor);
 
     // --- Dispatch ask command to supervisor ---
     const protoDir = getProtocolDir(task.id);
@@ -911,7 +959,7 @@ export async function launchAskTask(
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
       } catch (err) {
-        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -984,12 +1032,7 @@ async function recordAskCompletedTurn(
     await storage.updateSessionClaudeId(session.id, response.session_id);
   }
 
-  const turnUsage: TokenUsage | undefined = response.usage ? {
-    inputTokens: response.usage.input_tokens ?? 0,
-    outputTokens: response.usage.output_tokens ?? 0,
-    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-  } : undefined;
+  const turnUsage = toTurnUsage(response.usage);
 
   // Idempotency: if a previous flush already recorded the agent turn, reuse it.
   const existingTurns = await storage.getSessionTurns(session.id);
@@ -1005,8 +1048,14 @@ async function recordAskCompletedTurn(
       role: 'agent',
       content: response.result,
       usage: turnUsage,
+      ...launchSettingsFromResponse(response),
       turnType: 'ask',
     });
+    // INVARIANT: the session rollup shares the turn write's idempotency guard.
+    // Outside it, a re-flush of the same unconsumed response.json re-added the
+    // usage without adding a turn, leaving the session total permanently above
+    // the sum of its turns. See src/utils/usage-recording.ts.
+    await rollUpSessionUsage(storage, session.id, turnUsage);
   }
 
   // INVARIANT (CLAUDE.md — never lose human feedback): the agent answered, so
@@ -1018,14 +1067,6 @@ async function recordAskCompletedTurn(
   } catch {
     // Best-effort: leaving feedback pending re-delivers it, which is the safe
     // direction to fail in — we never lose it, we might repeat it.
-  }
-
-  if (turnUsage) {
-    try {
-      await storage.updateSessionUsage(session.id, turnUsage);
-    } catch {
-      // Token-usage rollup is best-effort — do not fail the ask over it.
-    }
   }
 
   try {
@@ -1070,13 +1111,20 @@ async function recordAskErrorTurn(
   const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
   if (lastTurn?.role !== 'agent') {
     const seq = await storage.getNextTurnSequence(sessionId);
+    // Tokens the ask had already spent before it died, salvaged by the
+    // supervisor (src/supervisor/usage.ts). A crashed ask used to record none.
+    const errorUsage = toTurnUsage(response.usage);
     await storage.createTurn({
       sessionId,
       sequence: seq,
       role: 'agent',
       content: turnContent,
+      // A crashed ask is still an agent turn — record what it ran under.
+      ...launchSettingsFromResponse(response),
       turnType: 'ask',
+      ...(errorUsage ? { usage: errorUsage } : {}),
     });
+    await rollUpSessionUsage(storage, sessionId, errorUsage);
   }
 
   consumeResponse(protoDir);
@@ -1202,6 +1250,8 @@ async function launchPreAcceptTurn(
       sequence: humanSeq,
       role: 'human',
       content: '[system] Pre-accept validation before merge',
+      model: modelName,
+      effort: effortValue,
       actor: 'system',
       autoTriggered: true,
     });
@@ -1332,12 +1382,7 @@ async function recordPreAcceptTurn(
     await storage.updateSessionClaudeId(session.id, response.session_id);
   }
 
-  const turnUsage: TokenUsage | undefined = response.usage ? {
-    inputTokens: response.usage.input_tokens ?? 0,
-    outputTokens: response.usage.output_tokens ?? 0,
-    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-  } : undefined;
+  const turnUsage = toTurnUsage(response.usage);
 
   const existingTurns = await storage.getSessionTurns(session.id);
   const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
@@ -1349,19 +1394,15 @@ async function recordPreAcceptTurn(
       role: 'agent',
       content: `${PRE_ACCEPT_HEADING}\n\n${response.result}`,
       usage: turnUsage,
+      ...launchSettingsFromResponse(response),
       startSha: response.start_sha_work,
       endSha: response.end_sha_work,
       startShaWork: response.start_sha_work,
       endShaWork: response.end_sha_work,
     });
-  }
-
-  if (turnUsage) {
-    try {
-      await storage.updateSessionUsage(session.id, turnUsage);
-    } catch {
-      // Token-usage rollup is best-effort — do not fail the accept over it.
-    }
+    // INVARIANT: the session rollup shares the turn write's idempotency guard —
+    // see recordAskCompletedTurn for what rolling up outside it produced.
+    await rollUpSessionUsage(storage, session.id, turnUsage);
   }
 
   // Record commits the pre-accept turn made (fixes, CHANGELOG). They land in the
@@ -1397,6 +1438,8 @@ export interface RejectTaskParams {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface RejectTaskResult {
@@ -1413,6 +1456,10 @@ export async function rejectTask(
 ): Promise<RejectTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor: this runs INSIDE the daemon, where LAZY_ACTOR is never set,
+  // so getActor() reports 'human' for every channel. The MCP boundary threads
+  // the real channel through params; getActor() stays the CLI fallback.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const resolveResult = await storage.resolveTask(params.taskId);
@@ -1459,11 +1506,11 @@ export async function rejectTask(
     const runner = await createRunner(projectRoot, sess.runner_type ?? undefined);
     const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
     await runner.stopRun(runName);
-    await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+    await storage.updateTaskStatus(task.id, 'interrupted', actor);
   }
 
   // Mark as abandoned
-  await storage.updateTaskStatus(task.id, 'abandoned', getActor());
+  await storage.updateTaskStatus(task.id, 'abandoned', actor);
 
   // End session
   await storage.endSession(sess.id, 'rejected');
@@ -1473,7 +1520,7 @@ export async function rejectTask(
   await revokeTaskTokens(projectRoot, task.id);
 
   // Store rejection reason as comment
-  await storage.createComment(task.id, `[Rejected] ${params.reason.trim()}`, getActor());
+  await storage.createComment(task.id, `[Rejected] ${params.reason.trim()}`, actor);
 
   // Post reject review and close PR
   try {
@@ -1513,6 +1560,8 @@ export interface CloseTaskParams {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface CloseTaskResult {
@@ -1529,6 +1578,9 @@ export async function closeTask(
 ): Promise<CloseTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: getActor() cannot see the caller's channel
+  // from inside the daemon, so MCP threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const resolveResult = await storage.resolveTask(params.taskId);
@@ -1567,11 +1619,11 @@ export async function closeTask(
       const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
       await runner.stopRun(runName);
     }
-    await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+    await storage.updateTaskStatus(task.id, 'interrupted', actor);
   }
 
   // Close task (persists reason)
-  await storage.abandonTask(task.id, params.reason, getActor());
+  await storage.abandonTask(task.id, params.reason, actor);
 
   // Re-parent unfinished children to the grandparent (or top-level).
   // Same logic as accept: closing a parent orphans its children.
@@ -2015,25 +2067,102 @@ async function clearMergeInFlight(storage: Storage, task: Task): Promise<void> {
   await storage.updateTaskMetadata(task.id, ACCEPT_IN_FLIGHT_KEY, '');
 }
 
+/**
+ * Carries the edge-gate clearance out of the long accept body so the failure
+ * path can say what happened to the human's one-shot approval.
+ *
+ * INVARIANT: approval consumption is atomic with accept completion. `spend()`
+ * is called ONLY where the merge is durable; anywhere else the accept can die,
+ * the approval is still pending and the human must be told so — otherwise they
+ * re-approve out of doubt, which is exactly the friction the gate is meant to
+ * spend deliberately.
+ */
+interface ApprovalReservation {
+  clearance: EdgeGateClearance | null;
+  spent: boolean;
+}
+
+/**
+ * Consume the human approval now that the accept is durably finished. Call
+ * ONLY where the merge has landed (or has been handed to the forge, which is
+ * the state later accepts re-enter without re-checking the gate).
+ *
+ * Spends the reservation, and then clears any approval record still pending on
+ * the task. The second half is what keeps the approval single-use across the
+ * paths that never reserved anything — a `merging` re-entry skips the gate
+ * entirely, so without this a leftover record from a crashed earlier attempt
+ * would outlive the accept it belonged to.
+ */
+async function spendApproval(
+  storage: Storage,
+  taskId: string,
+  reservation: ApprovalReservation,
+): Promise<void> {
+  try {
+    if (reservation.clearance && !reservation.spent) {
+      await reservation.clearance.commit();
+      reservation.spent = true;
+    }
+    await takeHumanApproval(storage, taskId);
+  } catch (err) {
+    // The merge is durable at this point; failing the whole accept over the
+    // approval bookkeeping would be worse than a loud warning. A surviving
+    // record is caught by the same clear on the next accept of this task.
+    logger.warn(
+      `accept: failed to consume the human approval for task ${taskId} after a completed ` +
+      `merge: ${err instanceof Error ? err.message : err}. Check \`lazy show ${taskId}\` — ` +
+      `an approval left pending there should be treated as already used.`,
+    );
+  }
+}
+
 async function acceptTaskInner(
   projectRoot: string,
   params: AcceptTaskParams,
 ): Promise<AcceptTaskResult> {
   const phases = new PhaseReporter(params.onProgress, 'accept');
+  const reservation: ApprovalReservation = { clearance: null, spent: false };
   try {
-    return await acceptTaskRun(projectRoot, params, phases);
+    return await acceptTaskRun(projectRoot, params, phases, reservation);
   } catch (err) {
     // Close whatever phase was open as failed, so the caller's last line says
     // WHERE the accept died rather than leaving a phase hanging mid-sentence.
     phases.fail(err instanceof Error ? err.message : String(err));
+    // The accept died with a protected-merge approval reserved but not spent.
+    // Say so explicitly: silence here is what made humans re-run `lazy approve`
+    // after a failed accept that never touched their approval.
+    if (reservation.clearance?.usesLocalApproval && !reservation.spent) {
+      throw appendApprovalIntactNote(err);
+    }
     throw err;
   }
+}
+
+/** Suffix appended to an accept failure when the approval was NOT consumed. */
+const APPROVAL_INTACT_NOTE =
+  'Your `lazy approve` approval was NOT consumed — it is still pending, ' +
+  'so you can re-run the accept once the cause above is fixed without approving again.';
+
+function appendApprovalIntactNote(err: unknown): unknown {
+  const message = err instanceof Error ? err.message : String(err);
+  const combined = `${message}\n\n${APPROVAL_INTACT_NOTE}`;
+  if (err instanceof RpcError) {
+    return new RpcError(err.status, combined);
+  }
+  if (err instanceof Error) {
+    const next = new Error(combined);
+    next.name = err.name;
+    next.stack = err.stack;
+    return next;
+  }
+  return new Error(combined);
 }
 
 async function acceptTaskRun(
   projectRoot: string,
   params: AcceptTaskParams,
   phases: PhaseReporter,
+  reservation: ApprovalReservation,
 ): Promise<AcceptTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
@@ -2141,7 +2270,9 @@ async function acceptTaskRun(
       ? () => driver.hasExternalApproval(task)
       : undefined;
     try {
-      await enforceEdgeGate({
+      // RESERVES the approval; it is spent by spendApproval() below, at the
+      // point the merge becomes durable. See the ApprovalReservation invariant.
+      reservation.clearance = await enforceEdgeGate({
         storage,
         config,
         projectRoot,
@@ -2161,6 +2292,89 @@ async function acceptTaskRun(
     // Only worth saying when the gate was in the announced plan; the re-entry
     // plan never lists it.
     phases.skip(ACCEPT_PHASES.edgeGate, 'already passed when the merge started');
+  }
+
+  // --- Step 1a': Deleted-file resurrection guard ---
+  // INVARIANT: like the edge gate, this is a single decision point that runs for
+  // ALL drivers and every caller (CLI --yes, MCP, automation, builder). It
+  // refuses an accept that would silently re-add files the target branch
+  // deliberately deleted — the defect class that let the v0.12 release put the
+  // dead SSE module back for eight releases. See
+  // src/protection/resurrection-guard.ts for the mechanism, and
+  // docs/spikes/v012-release-resurrection-audit.md for the incident.
+  //
+  // Placed AFTER the edge gate on purpose: "a human must approve this merge at
+  // all" is the more fundamental refusal, and asking a builder to reason about
+  // resurrected files on a merge it may not be allowed to make at all would bury
+  // the actionable message.
+  //
+  // 'merging' is exempt for the same reason the edge gate is: the merge was
+  // already authorized when that state was entered.
+  if (preflight.taskStatus !== 'merging') {
+    phases.begin(ACCEPT_PHASES.resurrection);
+    try {
+      const guard = await enforceResurrectionGuard({
+        projectRoot,
+        sourceBranch: sess.git_branch,
+        targetBranch: mergeTargetBranch,
+        displayId: preflight.displayId,
+        approvedFiles: params.approvedFiles,
+      });
+      warnings.push(...guard.warnings);
+      phases.end(guard.approved.length > 0
+        ? `${guard.approved.length} approved re-addition(s)`
+        : undefined);
+    } catch (err) {
+      if (err instanceof ResurrectionRefusedError) {
+        throw new RpcError(409, err.message);
+      }
+      throw err;
+    }
+  } else if (!isRemoteMergeReentry) {
+    phases.skip(ACCEPT_PHASES.resurrection, 'already passed when the merge started');
+  }
+
+  // --- Step 1a'': Git LFS pointer guard ---
+  // INVARIANT: an accept never merges raw file content onto an LFS-tracked
+  // path. With `filter.lfs.required=false` git commits raw bytes SILENTLY when
+  // the LFS filter is broken, so a 335 MB blob can reach a task branch with
+  // nothing having errored (see src/git/lfs.ts for the incident). Once it is an
+  // ancestor of the target branch the branch is unpushable and only history
+  // surgery removes it — so the refusal has to happen here, while the damage is
+  // still confined to one disposable task branch.
+  //
+  // This is the backstop for the start-time environment check in
+  // task-launcher.ts, and it is deliberately independent of it: it inspects
+  // what was COMMITTED, so it also catches a config that broke mid-task, a
+  // `lazy pair` commit from a differently-configured host, and commits that
+  // predate lazy's involvement with the branch.
+  //
+  // Same placement rationale and same 'merging' exemption as the resurrection
+  // guard directly above.
+  if (preflight.taskStatus !== 'merging') {
+    phases.begin(ACCEPT_PHASES.lfs);
+    try {
+      const mergeBase = await getMergeBase(mergeTargetBranch, sess.git_branch, projectRoot);
+      const guard = await enforceLfsGuard({
+        projectRoot,
+        sourceBranch: sess.git_branch,
+        targetBranch: mergeTargetBranch,
+        mergeBase,
+        displayId: preflight.displayId,
+        approvedFiles: params.approvedFiles,
+      });
+      warnings.push(...guard.warnings);
+      phases.end(guard.approved.length > 0
+        ? `${guard.approved.length} approved raw blob(s) on LFS paths`
+        : undefined);
+    } catch (err) {
+      if (err instanceof LfsPointerRefusedError) {
+        throw new RpcError(409, err.message);
+      }
+      throw err;
+    }
+  } else if (!isRemoteMergeReentry) {
+    phases.skip(ACCEPT_PHASES.lfs, 'already passed when the merge started');
   }
 
   // --- Step 1b: Handle re-entry for tasks already in 'merging' state ---
@@ -2202,6 +2416,8 @@ async function acceptTaskRun(
       const reparented = await reparentChildren(task, storage);
       const reparentMsg = formatReparentWarning(reparented, task);
       if (reparentMsg) warnings.push(`${reparentMsg}.`);
+      const stackAdvice = stackedChildAdvisory(reparented.length, mergeTargetBranch);
+      if (stackAdvice) warnings.push(`${stackAdvice}.`);
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
@@ -2303,6 +2519,8 @@ async function acceptTaskRun(
       const reparented = await reparentChildren(task, storage);
       const reparentMsg = formatReparentWarning(reparented, task);
       if (reparentMsg) warnings.push(`${reparentMsg}.`);
+      const stackAdvice = stackedChildAdvisory(reparented.length, mergeTargetBranch);
+      if (stackAdvice) warnings.push(`${stackAdvice}.`);
       for (const child of reparented) {
         await storage.incrementTaskPendingSync(child.id);
       }
@@ -2576,6 +2794,11 @@ async function acceptTaskRun(
     // in-flight marker so a later accept takes the remote re-entry path.
     phases.end(result.reason ?? 'merge handed to the remote');
     await clearMergeInFlight(storage, task);
+    // INVARIANT: approval consumption is atomic with accept completion. This is
+    // the other durable end-state — the forge now owns the merge and every
+    // later accept of this task re-enters `merging` without re-checking the
+    // gate, so the approval has done its job and must be spent here.
+    await spendApproval(storage, task.id, reservation);
     await storage.createComment(task.id, `[Accepted] ${reason}`, acceptActor);
 
     const reviewWarning = await driver.postAcceptReview(task, reason);
@@ -2660,6 +2883,14 @@ async function acceptTaskRun(
   // path (target HEAD is the squash commit) and the remote FF path.
   await createAcceptTag(task.id, resolvedMergeTarget, projectRoot);
 
+  // INVARIANT: approval consumption is atomic with accept completion. The
+  // merge is durable and the authoritative accept marker exists, so this is the
+  // first moment the one-shot approval has actually bought something. Every
+  // failure before this point — pre-flight, the gate's own siblings, the merge
+  // itself — leaves the approval pending for a retry; every path past it has
+  // spent it, so it can never unlock a second accept.
+  await spendApproval(storage, task.id, reservation);
+
   // End session, create comment, post review
   await storage.endSession(sess.id, 'accepted');
   await storage.createComment(task.id, `[Accepted] ${reason}`, acceptActor);
@@ -2695,6 +2926,8 @@ async function acceptTaskRun(
   // triggering a sync automatically.
   const reparentMsg = formatReparentWarning(reparented, task);
   if (reparentMsg) warnings.push(`${reparentMsg}.`);
+  const stackAdvice = stackedChildAdvisory(reparented.length, resolvedMergeTarget);
+  if (stackAdvice) warnings.push(`${stackAdvice}.`);
   for (const child of reparented) {
     await storage.incrementTaskPendingSync(child.id);
   }
@@ -2919,6 +3152,9 @@ export async function syncTask(
 ): Promise<SyncTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const result = await storage.resolveTask(params.taskId);
@@ -2988,7 +3224,7 @@ export async function syncTask(
   }
 
   // --- Determine parent branch (with stale-parent fallback) ---
-  const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot);
+  const parentResolution = await resolveParentBranchWithFallback(task, storage, projectRoot, actor);
   const parentBranch = parentResolution.branch;
   warnings.push(...parentResolution.warnings);
 
@@ -3112,7 +3348,7 @@ export async function syncTask(
     // response.json and records the agent turn / status transition when the
     // merge completes. Without this, the supervisor runs but the response
     // sits in protocol/ forever and the task stays in its prior status.
-    await storage.updateTaskStatus(task.id, 'working', getActor());
+    await storage.updateTaskStatus(task.id, 'working', actor);
 
     // Write a sync command — semantically distinct from start/unblock
     const syncCommand: SyncCommand = {
@@ -3143,7 +3379,11 @@ export async function syncTask(
 
     // Launch or reuse supervisor
     if (await runner.isRunning(containerName)) {
-      // Supervisor already running — it will pick up the new command
+      // Supervisor already running — it will pick up the new command. The
+      // config written just above still reaches it (in-place write, pinned
+      // inode); a container whose FIRST launch had none stays without one, but
+      // now reports itself instead of running toolless. See the "CONTAINER
+      // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
     } else {
       await runner.removeRun(containerName);
 
@@ -3155,7 +3395,7 @@ export async function syncTask(
         // Going back to the prior status is safer than 'interrupted' because
         // no work has happened yet; the user can simply retry sync.
         try {
-          await storage.updateTaskStatus(task.id, priorStatus, getActor());
+          await storage.updateTaskStatus(task.id, priorStatus, actor);
         } catch (revertErr) {
           logger.warn(`Failed to revert status for ${displayId(task)} after supervisor launch failure: ${revertErr instanceof Error ? revertErr.message : revertErr}`);
         }
@@ -3201,6 +3441,8 @@ export interface ReparentTaskParams {
   taskId: string;
   /** New parent: a task code, short ID, or a raw branch name (e.g. "main"). */
   parent: string;
+  /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface ReparentTaskResult {
@@ -3242,6 +3484,9 @@ export async function reparentTask(
 ): Promise<ReparentTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const result = await storage.resolveTask(params.taskId);
@@ -3341,7 +3586,7 @@ export async function reparentTask(
   await storage.createComment(
     task.id,
     `[Reparented] Parent changed from ${oldParentLabel} to ${newParentLabel}.`,
-    getActor(),
+    actor,
   );
 
   // Children stack on THIS task's branch, not on its parent. Repointing this
@@ -3394,6 +3639,8 @@ export async function reparentTask(
 
 export interface SubmitTaskParams {
   taskId: string;
+  /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface SubmitTaskResult {
@@ -3422,6 +3669,9 @@ export async function submitTask(
 ): Promise<SubmitTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const resolveResult = await storage.resolveTask(params.taskId);
@@ -3532,8 +3782,8 @@ export async function submitTask(
   }
 
   // --- Transition to submitted ---
-  await storage.updateTaskStatus(task.id, 'submitted', getActor());
-  await storage.createComment(task.id, `[Submitted] Task submitted for review${prUrl ? `: ${prUrl}` : ''}`, getActor());
+  await storage.updateTaskStatus(task.id, 'submitted', actor);
+  await storage.createComment(task.id, `[Submitted] Task submitted for review${prUrl ? `: ${prUrl}` : ''}`, actor);
 
   return {
     taskId: task.id,
@@ -3552,6 +3802,8 @@ export interface ResumeTaskParams {
   modelOverride?: string;
   /** CLI `--effort` override. Persists on the task so future turns use same value. */
   effortOverride?: string;
+  /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
+  actor?: Actor;
 }
 
 export interface ResumeTaskResult {
@@ -3665,6 +3917,9 @@ export async function resumeTask(
 ): Promise<ResumeTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   // --- Resolve task ---
   const result = await storage.resolveTask(params.taskId);
@@ -3761,13 +4016,7 @@ export async function resumeTask(
     // --- Model resolution ---
     let stickyModel: string | undefined;
     if (!params.modelOverride) {
-      const existingTurns = await storage.getSessionTurns(sess.id);
-      for (let i = existingTurns.length - 1; i >= 0; i--) {
-        if (existingTurns[i].model) {
-          stickyModel = existingTurns[i].model;
-          break;
-        }
-      }
+      stickyModel = findStickyModel(await storage.getSessionTurns(sess.id));
     }
     // When Ollama is enabled for Claude Code, always use the Ollama model — task/sticky
     // model names (e.g. "claude-opus-4-8") don't exist in Ollama's model registry.
@@ -3821,10 +4070,11 @@ export async function resumeTask(
         ? '[system] Session interrupted and resumed (unconsumed feedback re-delivered)'
         : '[system] Session interrupted and resumed',
       model: modelName,
-      actor: getActor(),
+      effort: effortValue,
+      actor,
     });
 
-    await storage.updateTaskStatus(task.id, 'working', getActor());
+    await storage.updateTaskStatus(task.id, 'working', actor);
 
     // --- Write command and launch supervisor ---
     const protoDir = getProtocolDir(task.id);
@@ -3852,14 +4102,18 @@ export async function resumeTask(
 
     // Launch or reuse supervisor
     if (await runner.isRunning(containerName)) {
-      // Supervisor already running — it will pick up the new command
+      // Supervisor already running — it will pick up the new command. The
+      // config written just above still reaches it (in-place write, pinned
+      // inode); a container whose FIRST launch had none stays without one, but
+      // now reports itself instead of running toolless. See the "CONTAINER
+      // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
     } else {
       await runner.removeRun(containerName);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
       } catch (err) {
-        await storage.updateTaskStatus(task.id, 'interrupted', getActor());
+        await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -3929,6 +4183,9 @@ export async function stopTask(
   const reason = params.reason.trim();
 
   const storage = await getOrCreateStorage();
+  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+  // caller's channel, so the MCP boundary threads it through params.
+  const actor = params.actor ?? getActor();
 
   const resolved = await storage.resolveTask(params.taskId);
   if (!resolved.task) {
@@ -3964,7 +4221,7 @@ export async function stopTask(
     role: 'human',
     content: `[built-in] Stopped by user: ${reason}`,
     // Channel actor: MCP-originated stop is 'builder', CLI 'human'.
-    actor: params.actor ?? getActor(),
+    actor,
   });
   await storage.setUserStopped(sess.id, true);
 
@@ -4008,7 +4265,7 @@ export async function stopTask(
   // see shouldSkipAutoResumeForUserStop in src/utils/reconcile.ts.
   // 'interrupted' is reserved for ungraceful interruptions (crash, watchdog
   // kill, supervisor died) which should auto-resume.
-  await storage.updateTaskStatus(task.id, 'blocked', getActor());
+  await storage.updateTaskStatus(task.id, 'blocked', actor);
   await storage.recordInterrupt(sess.id, {
     reason: `Stopped by user: ${reason}`,
     exit_code: null,

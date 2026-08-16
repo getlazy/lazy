@@ -30,7 +30,14 @@ function findFullTaskId(root: string, shortId: string): string {
 /**
  * Read turns.json for a task and return the parsed turns array.
  */
-function readTurns(root: string, shortId: string): Array<{ sequence: number; role: string; model?: string; content: string }> {
+function readTurns(root: string, shortId: string): Array<{
+  sequence: number;
+  role: string;
+  model?: string;
+  model_id?: string;
+  effort?: string;
+  content: string;
+}> {
   const fullId = findFullTaskId(root, shortId);
   const turnsPath = join(tasksDirFor(root), fullId, 'turns.json');
   const data = JSON.parse(readFileSync(turnsPath, 'utf-8'));
@@ -182,4 +189,68 @@ describe('per-turn model override', () => {
     expectSuccess(showResult);
     expectOutput(showResult, 'claude-haiku-4-5-20251001');
   }, 30_000);
+
+  // INVARIANT: a mid-task model override lands on THAT turn only. The turns
+  // recorded before it keep the model they actually ran under — this is the
+  // whole point of per-turn labels: an experiment must be able to label its own
+  // arms, which is impossible while `task.model` is the only record and it is
+  // last-value-wins.
+  test('a mid-task model override labels only the turns from that point on', async () => {
+    const taskId = await createTask(ctx, 'Mid-task override', 'Do work');
+
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--model', 'claude-opus-4-6', '--effort', 'low'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
+    const afterStart = readTurns(ctx.root, taskId);
+    const firstAgentTurn = afterStart.find(t => t.role === 'agent')!;
+    // The AGENT turn carries the labels too — usage without them cannot be
+    // attributed to anything.
+    expect(firstAgentTurn.model).toBe('claude-opus-4-6');
+    expect(firstAgentTurn.effort).toBe('low');
+
+    const unblockResult = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'Try the other arm', '--model', 'claude-haiku-4-5-20251001', '--effort', 'high'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(unblockResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
+    const turns = readTurns(ctx.root, taskId);
+    const agentTurns = turns.filter(t => t.role === 'agent');
+    expect(agentTurns.length).toBeGreaterThanOrEqual(2);
+
+    // The pre-override turn is untouched by the override…
+    expect(agentTurns[0].model).toBe('claude-opus-4-6');
+    expect(agentTurns[0].effort).toBe('low');
+    // …and the post-override turn carries the new arm, on both the feedback turn
+    // the human authored and the agent turn it produced.
+    const lastAgentTurn = agentTurns[agentTurns.length - 1];
+    expect(lastAgentTurn.model).toBe('claude-haiku-4-5-20251001');
+    expect(lastAgentTurn.effort).toBe('high');
+    const lastHumanTurn = turns.filter(t => t.role === 'human').at(-1)!;
+    expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
+    expect(lastHumanTurn.effort).toBe('high');
+
+    // `lazy show --json` exposes the labels so an experiment can read them
+    // without parsing storage internals.
+    const showJson = await ctx.lazy(['show', taskId, '--json']);
+    expectSuccess(showJson);
+    const shown = JSON.parse(showJson.stdout) as {
+      turns: Array<{ role: string; model: string | null; model_id: string | null; effort: string | null }>;
+    };
+    const shownAgentTurns = shown.turns.filter(t => t.role === 'agent');
+    expect(shownAgentTurns[0].model).toBe('claude-opus-4-6');
+    expect(shownAgentTurns[0].effort).toBe('low');
+    expect(shownAgentTurns.at(-1)!.model).toBe('claude-haiku-4-5-20251001');
+    expect(shownAgentTurns.at(-1)!.effort).toBe('high');
+    // INVARIANT: this seam runs no agent, so no concrete model id is ever
+    // reported — and the alias is NOT copied in to fill the gap.
+    expect(shownAgentTurns.at(-1)!.model_id).toBeNull();
+  }, 45_000);
 });

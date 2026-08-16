@@ -59,6 +59,7 @@ import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
+import { remoteUrlHasHost, remoteUrlHostContains } from './remote-url';
 
 export interface GlResult {
   stdout: string;
@@ -118,7 +119,9 @@ export function detectGitLab(repoDir: string, remoteName: string = 'origin'): Dr
     const exitCode = proc.exitCode ?? 1;
     const url = proc.stdout ? proc.stdout.toString().trim() : '';
 
-    if (exitCode === 0 && url.includes('gitlab.com')) {
+    // Host comparison, not a substring test: `https://evil.com/gitlab.com/x.git`
+    // is not a GitLab remote. Handles scp syntax (git@gitlab.com:o/r.git) too.
+    if (exitCode === 0 && remoteUrlHasHost(url, 'gitlab.com')) {
       return {
         name: 'GitLab',
         tomlOverrides: { 'remote.driver': 'gitlab' },
@@ -960,7 +963,11 @@ export class GitLabDriver implements RepositoryDriver {
       return checks;
     }
     const url = remoteUrl.stdout;
-    if (!url.includes('gitlab.com') && !url.includes('gitlab')) {
+    // gitlab.com (or a subdomain), or a host that merely mentions "gitlab" —
+    // the latter is the deliberate self-hosted escape hatch, so gitlab.mycorp.com
+    // does not get a spurious "does not appear to be GitLab". Unlike the old
+    // substring test, both look at the HOST, not the whole URL.
+    if (!remoteUrlHasHost(url, 'gitlab.com') && !remoteUrlHostContains(url, 'gitlab')) {
       checks.push({
         state: 'warn',
         what: `Git remote ${this.remoteName}`,

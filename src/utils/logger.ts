@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync, statSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { getDataDir } from '../cli/init';
+import { redactSecretValues } from './redact';
 
 /**
  * Logger module for lazy CLI
@@ -124,6 +125,18 @@ class Logger {
     }
   }
 
+  /**
+   * Last line of defence against a credential reaching the console or a log
+   * file. Every level goes through this, so no call site has to remember: a
+   * live CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY value embedded in a
+   * message becomes `<redacted>` on the way out, whatever assembled the string.
+   * Redaction is by known env KEY names, not by guessing which values look
+   * secret — see src/utils/redact.ts.
+   */
+  private scrub(message: string): string {
+    return redactSecretValues(message);
+  }
+
   private writeToFile(level: string, message: string): void {
     if (this.config.logFile) {
       try {
@@ -135,7 +148,8 @@ class Logger {
     }
   }
 
-  debug(message: string): void {
+  debug(rawMessage: string): void {
+    const message = this.scrub(rawMessage);
     if (this.config.fileLevel <= LogLevel.DEBUG) {
       this.writeToFile('DEBUG', message);
     }
@@ -144,7 +158,8 @@ class Logger {
     }
   }
 
-  info(message: string): void {
+  info(rawMessage: string): void {
+    const message = this.scrub(rawMessage);
     if (this.config.fileLevel <= LogLevel.INFO) {
       this.writeToFile('INFO', message);
     }
@@ -153,7 +168,8 @@ class Logger {
     }
   }
 
-  warn(message: string): void {
+  warn(rawMessage: string): void {
+    const message = this.scrub(rawMessage);
     if (this.config.fileLevel <= LogLevel.WARN) {
       this.writeToFile('WARN', message);
     }
@@ -162,7 +178,8 @@ class Logger {
     }
   }
 
-  error(message: string): void {
+  error(rawMessage: string): void {
+    const message = this.scrub(rawMessage);
     if (this.config.fileLevel <= LogLevel.ERROR) {
       this.writeToFile('ERROR', message);
     }
@@ -173,7 +190,7 @@ class Logger {
 
   // Special method for streaming output (always goes to console in verbose mode)
   stream(message: string): void {
-    this.writeToFile('STREAM', message);
+    this.writeToFile('STREAM', this.scrub(message));
     // Don't echo to console - this is for captured streams
   }
 }

@@ -86,8 +86,13 @@ export async function commandStart(args: string[]): Promise<void> {
   const taskId = parsed.positional[0];
   if (!taskId) {
     console.error('Error: Task ID is required.');
-    console.error('To create a new task, use: lazy create --goal "..." --prompt "..."');
-    console.error('Then start it with: lazy start <task_id>');
+    console.error('');
+    console.error('`lazy start` does not create tasks — it only starts one that already');
+    console.error('exists. Creation flags (--goal, --prompt, --code, --type, --parent) live');
+    console.error('on `lazy create`, where they are still correctable before an agent runs.');
+    console.error('');
+    console.error('  lazy create --goal "..." --prompt "..." --code my-task-code');
+    console.error('  lazy start my-task-code');
     process.exit(1);
   }
 
@@ -295,7 +300,11 @@ export function startUsage(): void {
 Start an existing task. The daemon handles worktree creation, agent launch,
 and lifecycle management.
 
-To create a new task, use 'lazy create' first, then start it with this command.
+This command does NOT create tasks. Creation parameters — goal, prompt, code,
+type, parent — belong to 'lazy create', which leaves the task in the backlog
+where 'lazy edit' can still correct them. Once an agent is running, none of them
+can be changed. Use 'lazy create --code <code> ...' then 'lazy start <code>'.
+See docs/surface-asymmetries.md (section 9) for why.
 
 Use 'lazy blocked' to check when the agent finishes and needs your input.
 Use 'lazy status <task_id>' to check the current state.
@@ -334,8 +343,9 @@ Notes:
     crash-safe — if the process dies, the turn is preserved
 
 Examples:
-  lazy create --goal "Add auth" --prompt "Implement OAuth2 login"
-  lazy start abc12345                       # Start the created task
+  lazy create --goal "Add auth" --prompt "..." --code add-auth
+  lazy start add-auth                       # Start it by its code
+  lazy start abc12345                       # ...or by short ID
   lazy start abc12345 --yes                 # Start without confirmation
   lazy start abc1 --model claude-haiku-4-5-20251001  # Start with model override
   lazy start abc1 --follow                  # Wait for completion`);

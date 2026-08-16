@@ -71,9 +71,10 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
   'system': ['prompts', 'build', 'status', 'offline', 'online', 'export-dockerfile'],
-  'daemon': ['start', 'stop', 'restart', 'status', 'logs', 'auto-budget'],
+  'daemon': ['start', 'stop', 'restart', 'status', 'dashboard-url', 'list', 'kill-stray', 'logs', 'auto-budget', 'config'],
   'config': ['set', 'get'],
-  'memory': ['list', 'show', 'save', 'rm', 'history'],
+  'memory': ['list', 'show', 'save', 'rm', 'history', 'compact'],
+  'stats': ['tokens', 'audit', 'timings'],
 });
 
 // All top-level commands. The literal is the canonical set (mirrors the
@@ -84,62 +85,68 @@ const ALL_COMMANDS = withAliases([
   'list', 'active', 'blocked', 'show', 'search', 'report',
   'review', 'ask', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
   'diff', 'status', 'shell', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
-  'close', 'redo', 'stop', 'reparent', 'approve', 'protect',
-  'link', 'import-conversation', 'submit', 'sync',
-  'daemon', 'server', 'config',
+  'close', 'redo', 'stop', 'reparent', 'prioritize', 'approve', 'protect',
+  'link', 'import-conversation', 'submit', 'sync', 'stats',
+  'daemon', 'config',
   'builder', 'init', 'doctor', 'upgrade', 'completion', 'system',
 ]);
 
 // Flags per command (only commands with flags are listed). Aliases inherit
 // their canonical command's flags via expandAliasKeys.
 const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
-  'create':              ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--agent', '--tag'],
-  'start':               ['--model', '--agent', '--follow', '--yes', '--force-local'],
+  'create':              ['--goal', '--prompt', '--model', '--type', '--priority', '--code', '--parent', '--agent', '--effort', '--runner', '--tag'],
+  'start':               ['--model', '--agent', '--effort', '--runner', '--follow', '--yes', '--force-local'],
   'fix':                 ['--goal', '--prompt', '--model', '--code', '--parent'],
   'document':            ['--goal', '--prompt', '--model', '--code', '--parent'],
   'refactor':            ['--goal', '--prompt', '--model', '--code', '--parent'],
-  'edit':                ['--goal', '--prompt', '--model', '--type', '--code', '--parent'],
+  'edit':                ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--runner'],
   'clone':               ['--parent', '--default-parent', '--code', '--model'],
   'list':                ['--all', '--flat', '--tree', '--ids-only', '--tag'],
   'active':              ['--flat', '--tree', '--follow', '--ids-only'],
   'blocked':             ['--flat', '--tree', '--tag'],
   'show':                ['--full', '--chunks', '--flat', '--lines', '--json'],
-  'search':              ['--fuzzy', '--group', '--json', '--tasks', '--prompts', '--turns', '--commits', '--notes', '--conversations', '--memories'],
+  'search':              ['--fuzzy', '--group', '--json', '--tasks', '--prompts', '--turns', '--commits', '--notes', '--followups', '--conversations', '--memories'],
   'comment':             ['--message'],
   'journal':             ['--message', '--add'],
-  'memory':              ['--all', '--description', '--type', '--body', '--yes'],
+  'memory':              ['--all', '--description', '--type', '--body', '--yes', '--mechanical', '--llm', '--model', '--show', '--clear'],
   'close':               ['--yes', '--reason', '--accept-dirty-worktree'],
   'reject':              ['--yes', '--reason', '--accept-dirty-worktree'],
   'diff':                ['--turn', '--full', '--lines'],
   'branch':              ['--goal', '--prompt', '--model', '--code', '--yes'],
   'accept':              ['--yes', '--reason', '--wait', '--approve-file'],
-  'resume':              ['--follow', '--model'],
+  'resume':              ['--follow', '--model', '--effort'],
   'reopen':              ['--reason'],
   'revert':              ['--reason', '--yes'],
-  'review':              ['--model', '--follow'],
+  'review':              ['--interactive'],
   'ask':                 ['--message', '--json'],
   'rework':              ['--goal', '--prompt', '--model', '--code', '--parent'],
   'redo':                ['--prompt', '--model', '--no-start', '--yes'],
   'pair':                ['--unlock', '--no-summary', '--resume', '--autonomous', '--yes'],
-  'unblock':             ['--message', '--model', '--follow', '--approve-file', '--no-approve-files', '--yes'],
-  'loop':                ['--model', '--follow'],
-  'wait':                ['--follow', '--next'],
+  'unblock':             ['--message', '--model', '--effort', '--follow', '--approve-file', '--no-approve-files', '--yes'],
+  'loop':                ['--model', '--follow', '--pipeline', '--backlog', '--parent', '--tag'],
+  'wait':                ['--follow', '--next', '--json'],
   'submit':              ['--yes'],
   'link':                ['--parent', '--code'],
   'import-conversation': ['--list', '--show-imported', '--show', '--all', '--yes'],
-  'builder':             ['--autonomous', '--yes', '--resume'],
-  'daemon':              ['--foreground', '--background', '--project'],
-  'server':              [],
+  'builder':             ['--autonomous', '--yes', '--resume', '--import', '--effort', '--model'],
+  'daemon':              ['--foreground', '--background', '--project', '--yes', '--prune-dirs', '--reason', '--lines', '--follow', '--no-follow'],
   'config':              ['--task', '--reason'],
-  'doctor':              ['--no-resume', '--dry-run', '--yes'],
+  'doctor':              ['--no-resume', '--dry-run', '--yes', '--reimport-conversations', '--purge-housekeeping-conversations', '--import-memory', '--probe-agent'],
   'init':                ['--toolchain', '--skip-auth-check', '--skip-remote-check', '--skip-github-check', '--skip-completion-check', '--non-interactive'],
-  'upgrade':             ['--force', '--dry-run'],
+  'upgrade':             ['--force', '--dry-run', '--wait', '--images'],
   'completion':          ['--bash', '--zsh'],
   'chat':                ['--effort'],
   'stop':                ['--reason', '--yes'],
   'reparent':            ['--parent', '--yes'],
   'report':              ['--start', '--end', '--pdf', '--out'],
   'protect':             ['--branch', '--task'],
+  // Flags for `lazy stats <sub>`. The completion script matches flags on the
+  // TOP-LEVEL word, so subcommand flags hang off the parent ('stats'), the
+  // same way 'daemon' carries its subcommands' flags.
+  'stats':               ['--since', '--last', '--limit', '--top', '--role', '--task', '--model',
+                          '--denied', '--reroutes', '--errors', '--scan', '--json', '--tree'],
+  // Same for `lazy system <sub>`: build's --no-cache plus export-dockerfile's flags.
+  'system':              ['--no-cache', '--force', '--output', '--stdout'],
 });
 
 function generateBashScript(): string {
@@ -339,7 +346,7 @@ Setup:
 
 Completions include:
   - Command names (lazy <TAB>)
-  - Subcommands (lazy system <TAB>, lazy daemon <TAB>, lazy config <TAB>)
+  - Subcommands (lazy system/daemon/config/memory/stats <TAB>)
   - Task IDs for commands that accept them (lazy show <TAB>)
   - Flags for each command (lazy list --<TAB>)`);
 }

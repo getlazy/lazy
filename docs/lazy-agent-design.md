@@ -52,10 +52,44 @@ The supervisor is the container entrypoint. It:
 Before spawning Claude Code, the supervisor writes `~/.claude.json` inside the
 container so Claude Code discovers the MCP server on startup.
 
+### The MCP config is written per TURN, not once per task
+
+`~/.claude.json` is **not** persisted for a task. The container mounts
+`<worktree>/.lazy-task-sandbox/.claude` at `/home/user/.claude`, but
+`/home/user/.claude.json` sits beside that mount on the container's own ephemeral
+filesystem. A task whose container has been reaped — the normal state for anything
+blocked for a while — gets a brand-new container on its next turn, with no MCP
+entry at all.
+
+So every supervisor path that runs an agent calls `prepareTurnMcp`
+(`src/supervisor/mcp-setup.ts`) first. Ask and pre-accept turns did not, which is
+how an agent asked about its own task came to answer *"the lazy MCP tools are
+currently disconnected"* — it genuinely had none. A source-scanning coverage test
+(`test/unit/supervisor-mcp-setup.test.ts`) fails if a new agent-running handler
+forgets the call, since the symptom is otherwise silent and only appears for tasks
+whose container had already gone away.
+
+### Ask turns get a read-only toolset
+
+An ask is read-only Q&A, so its MCP config asks the runner for a server started
+with `--read-only`: it advertises only the tools that cannot mutate state
+(`lazy_show`, `lazy_list`, `lazy_search`, `lazy_status`, `lazy_diff`, `lazy_wait`,
+the conversation and memory readers), and a write tool answers with an actionable
+refusal rather than "Unknown tool". Only the read-only tools are pre-approved in
+`settings.json` for that turn.
+
+The scope has to be applied *in the container*. The older guard — the
+`LAZY_MCP_READ_ONLY=1` env var checked inside the tool handlers — is a no-op for a
+containerized agent, because under the daemon proxy the handlers execute in the
+**daemon**, which never sees the supervisor's environment. The env var still
+covers the host-process runner, where tools execute locally; the flag covers the
+rest. Which tools are reads is decided in one place, `src/mcp/tool-access.ts`, and
+an unclassified tool is treated as a write (fail closed).
+
 ## MCP Server (`mcp` subcommand)
 
 ```
-lazy-agent mcp --task-id <uuid> --worktree <path>
+lazy-agent mcp --task-id <uuid> --worktree <path> [--read-only]
 ```
 
 The MCP server is spawned by Claude Code (not by the supervisor directly). It:
@@ -144,7 +178,7 @@ STALE` warning pointing at `lazy daemon restart` when they diverge. `codeSha` is
 absent for compiled/installed binaries (no source tree), where the `version` and
 `Built` timestamp already convey staleness.
 
-### Surviving a daemon restart (401 credential refresh)
+### Surviving a daemon restart (credential refresh)
 
 In daemon-proxy mode the container reaches the daemon using a small config file
 minted at launch and bind-mounted in: the caller's own MCP token (see
@@ -168,19 +202,128 @@ mechanisms recover a live session:
    pins the inode, so a write-temp-then-rename would be invisible inside the
    container. `test/unit/daemon-mcp-config-refresh.test.ts` asserts the inode
    precisely so this is never "hardened" into an atomic replace.
-2. **Clients re-read that file on a 401 and retry exactly once.** This holds for
-   the stdio MCP proxy, the supervisor's `DaemonClient` (which re-reads
-   `~/.lazy/daemon/<slug>/token`), and the builder's conversation-capture storage,
-   whose client lives for the whole session and so *will* outlive a restart.
+2. **Clients re-read that file when a call fails to reach the daemon, and retry
+   exactly once.** This holds for the stdio MCP proxy, the supervisor's
+   `DaemonClient` (which re-reads `~/.lazy/daemon/<slug>/token`), and the builder's
+   conversation-capture storage, whose client lives for the whole session and so
+   *will* outlive a restart.
+
+**A moved port usually produces no 401 at all.** This healing was originally wired
+to the 401 branch alone, which only covers the case where a *foreign* daemon took
+the old port. The commoner outcome is that nothing took it: `fetch` then fails at
+the transport layer with ECONNREFUSED, the corrected address sits unread in the
+mounted file, and every `lazy_*` tool reports "the daemon appears to be down" for
+the rest of the turn. So the proxy now refreshes on a transport failure too, on
+exactly the same terms as a 401 — same trusted file, one retry, no loop.
+
+That retry is restricted to a connection that was **never established**. A call
+lost mid-flight may already have run on the daemon, and lazy tools are not
+idempotent — a replayed `lazy_commit` would commit twice — so those are reported,
+never retried (`isMidFlightTransportFailure`).
+
+Because the rewrite is an in-place truncate, a reader can legitimately land
+mid-write. Both the refresher and the MCP server's startup read
+(`readDaemonMcpConfigWithRetry`) retry a torn file rather than treat one bad parse
+as "nothing changed"; a torn read at startup used to kill the server process, and
+Claude Code does not respawn one, costing the agent every lazy tool for the whole
+turn. For the same reason the `mcp` subcommand installs `uncaughtException` /
+`unhandledRejection` guards that keep the server up — scoped to that subcommand, so
+the supervisor and builder paths keep failing loudly.
 
 The refresh never weakens the check: the only credential source is the same trusted
-local file, an unreadable or malformed source reports no change so the 401 stands,
-unchanged credentials skip the pointless second round trip, and there is no retry
-loop. All tools share one config object and one refresher, so healing any tool heals
-them all — matching the failure, which was always total. A 401 that survives the
-refresh reports the actual cause, using `GET /daemon/status` → `projectRoot`
+local file, an unreadable or malformed source reports no change so the failure
+stands, unchanged credentials skip the pointless second round trip, and there is no
+retry loop. All tools share one config object and one refresher, so healing any tool
+heals them all — matching the failure, which was always total. A 401 that survives
+the refresh reports the actual cause, using `GET /daemon/status` → `projectRoot`
 (unauthenticated on TCP for exactly this diagnosis) to say when the daemon on that
 port belongs to a *different* project.
+
+Covered by `test/unit/daemon-mcp-transport-refresh.test.ts`. A real mid-turn daemon
+restart can only be verified live — see "How to verify" in the task.
+
+### A rebuild is a gap, not a move
+
+Re-reading once heals a daemon that has *already* come back somewhere else. A
+rebuild-and-restart is different: for seconds to minutes there is no daemon at all.
+A call landing in that gap re-read an unchanged file, found nothing listening, and
+died with "the daemon appears to be down … exit and relaunch this builder" — losing
+a whole builder conversation for a routine restart, and ending task-agent turns as
+`MCP error -32000: Connection closed`.
+
+So a connection that was **never established** now waits for the daemon to come
+back, instead of giving up on the first attempt:
+
+- The wait is bounded (`RECONNECT_WINDOW_MS`, 90s) with exponential backoff, and
+  when it runs out the call fails with the same actionable message as before.
+- The mounted config is re-read on **every** round, so a daemon that came back on a
+  different address is picked up mid-wait.
+- A call lost **mid-flight** is still never replayed — the window does not change
+  that, for the same non-idempotency reason as above.
+- The proxy reports progress while it waits (`notifications/progress`), so the human
+  sees "the daemon is not answering — waiting for it to come back" rather than a
+  silent hang. These frames state something the proxy is observably doing; they are
+  not an invented keepalive, and both waits are capped well below the client's idle
+  budget.
+
+The second gap is a daemon that comes back **without this session's token record** —
+registry moved by an upgrade, cleared by a repair, label evicted by the 50-entry
+builder cap. Re-reading the file then finds the same dead token forever, and nothing
+container-side can mint a new one. The fix is owner-driven, not daemon-driven:
+
+- `lazy builder` runs a watcher (`src/builder/mcp-reissue.ts`) that polls
+  `GET /daemon/status` and, when it sees a *different* daemon instance (pid /
+  buildTime / codeSha) or one that had been away, asks the daemon for a config under
+  **its own label** — the same `queryDaemonMcpConfig` call it makes at launch, which
+  reuses the existing token when the registry still has it and mints a fresh one when
+  it does not, and rewrites the same mounted path in place.
+- Container-side, a 401 that a re-read cannot immediately fix waits briefly
+  (`REAUTH_WINDOW_MS`, 20s) for exactly that file to change, then gives up.
+
+Deliberately *not* done: having the daemon re-mint tokens for every MCP config file
+it finds lying around at startup. That would resurrect credentials whose sessions are
+gone — including ones deliberately revoked — and break "a builder token dies with its
+builder session". Every security property holds unchanged: one identity per session,
+credentials only ever read from the trusted local 0600 file, nothing adopted from the
+wire, revoke still final, and the watcher stops (awaiting any in-flight re-issue)
+before the session's revoke runs.
+
+The same machinery covers task agents: they share this proxy, so a mid-turn restart
+is waited out there too. Covered by `test/unit/daemon-mcp-reconnect.test.ts`,
+`test/unit/builder-mcp-reissue.test.ts`, and `test/e2e/daemon-restart-mcp.test.ts`
+(a real daemon stopped and started under a live session).
+
+### When the tools are gone anyway: the end-of-turn handoff file
+
+Healing is best-effort; the channel can still be down when a turn ends. What an
+agent holds at that moment — its journal entry and its follow-ups — is the most
+expensive thing in the turn to lose, and agents improvised: they ran the lazy CLI
+in the container (which fails with EROFS, and would bypass the daemon's storage
+ownership even if it could write), then pasted the journal text into the summary
+for the human to re-enter by hand.
+
+The fallback is deliberately dumber than MCP and shares no failure mode with it.
+The agent appends NDJSON to `<worktree>/.lazy-task-sandbox/turn-handoff.jsonl` —
+a directory that is already mounted read-write in every runner and gitignored:
+
+```
+{"kind":"journal","content":"Chose X over Y because …"}
+{"kind":"followup","content":"The retry path in foo.ts swallows errors."}
+```
+
+The supervisor clears any stale file before the agent runs, then collects it after
+(`src/supervisor/turn-handoff.ts`) and puts the entries on the protocol response —
+on the success path *and* the error path, because a watchdog kill is exactly when
+an agent's own account of the turn is most worth keeping. The reconciler persists
+them through Storage like every other write, so ownership is preserved and the
+container never needs a credential.
+
+Collection is non-fatal by construction (no file is the normal case; a truncated
+or junk line is skipped individually) and capped at 50 entries / 20 000 characters
+each. Persistence is idempotent **by content**: the reconciler re-runs, and an
+agent whose tools came back may have both written the file and made the call.
+Ask turns are excluded — they are read-only. Covered by
+`test/unit/agent-turn-handoff.test.ts`.
 
 ### Surviving a daemon restart (proxy address re-resolve)
 
@@ -319,10 +462,71 @@ longer reach through to the human's real record. Agents are untouched.
 The builder's `~/.claude.json` is a separate, *persisted* file
 (`.lazy/builder-claude-config.json`), seeded once from the human's and thereafter
 authoritative. It holds no credentials — onboarding state, theme, folder trust,
-model choice, MCP approvals — and lazy merges its own `mcpServers.lazy` entry
-into it on every launch. It used to be a per-launch temp file, which discarded
-every answer Claude Code wrote during the session and re-prompted on the next
-launch.
+model choice, MCP approvals. It used to be a per-launch temp file, which
+discarded every answer Claude Code wrote during the session and re-prompted on
+the next launch.
+
+That persisted file is **not** the file mounted into the container. Lazy merges
+its own `mcpServers.lazy` entry — carrying this launch's `--daemon-config <path>`
+— into a *per-launch* copy, `.lazy/tmp/builder-claude-<builderId>.json`, and
+mounts that at `/home/user/.claude.json`; on exit the copy is folded back into
+the persisted file with the `lazy` entry stripped, since that path is minted
+fresh and revoked each launch. Mounting the persisted file directly was a real
+bug: a single-file bind mount pins the inode, so a second launch of the same
+project rewrote the running container's config in place, pointing its MCP server
+at a credential file that container never had mounted. The builder then ran the
+whole session with no `lazy_*` tools and nothing said why. `lazy upgrade` made it
+routine rather than rare — it stops every builder of a project at once and each
+host wrapper relaunches off the same daemon-healthy poll, milliseconds apart.
+
+The MCP identity label — the key the daemon binds the token to, and the key the
+builder revokes on exit — is `builder-<builderId>`, drawn per launch, never
+`builder-<timestamp>`. The clock-derived spelling was the same bug through a
+third door: two builders starting in the same millisecond shared a label, so the
+registry (which reuses a token per identity key) handed them one token, and the
+first to exit revoked it out from under the one still running. Same silent,
+tool-less symptom, a ~1 ms window instead of a ~150 ms one. The label is computed
+once, from the id that already names the container, and handed to mint, to the
+reissue watcher and to revoke.
+
+Three checks make any recurrence loud instead of silent
+(`src/builder/mcp-config-check.ts`). The host refuses to `docker run` unless the
+credential exists and the config names that exact file. The in-container builder
+supervisor re-checks both against the mount it actually got. Then it **starts the
+MCP server the config names** and requires a real `initialize` response — the
+general net, catching causes nobody enumerated rather than the two we know. Each
+failure names expected vs actual, and the probe quotes the server's own stderr.
+
+That last point is why the probe spawns its own child. Claude Code's MCP child is
+a *grandchild* of the supervisor whose stderr Claude owns: it drains it into
+`~/.cache/claude-cli-nodejs/<cwd-slug>/mcp-logs-lazy/<ts>.jsonl` as
+`{"error":"Server stderr: …"}` and re-emits only an opaque `-32000: Connection
+closed`. Nothing in the supervisor's process tree can read that stream, so the
+only way to hold the server's own words is to start the server ourselves. For the
+mid-session case a launch probe structurally cannot see — a daemon restart, an
+evicted token, a crash on the tenth tool call — the supervisor scans that same
+log after Claude exits and prints anything it finds. That scan is deliberately
+tolerant: the format is Claude Code's, so a change to it degrades to today's
+silence rather than to a false alarm.
+
+It is also deliberately narrow. Claude Code writes tool-call error *results* into
+that same file as `{"error": …}` lines, so a raw scan reports a healthy server —
+one answering `lazy_accept` with its confirmation-code gate, or rejecting an
+over-long memory description — as a connectivity failure, which is how the banner
+came to fire on nearly every v0.21 beta session. Those entries are recognised
+structurally, by Claude's own framing rather than by matching lazy's error text:
+a tool result is echoed a second time as
+`{"debug":"Tool '<name>' failed after <d>: <same text>"}`, while the availability
+paths (`Server stderr: …`, `Connection failed …`, `Error during reconnection: …`)
+have no tool in scope and no such echo. Entries that pair with a tool-failure
+debug line are dropped; everything else, recognised or not, is still reported.
+
+Task agents cannot hit this by construction and deliberately share none of the
+machinery: no host `~/.claude.json` is mounted into an agent container at all.
+Each agent writes its own at the start of every turn, on the container's own
+ephemeral filesystem, from the `LAZY_DAEMON_CONFIG` path that container was
+launched with (`src/supervisor/mcp-setup.ts`). There is no shared host file for a
+concurrent launch to clobber.
 
 The reason this was hard to find is that nothing could tell the human their
 credential was dead. The daemon gate checks presence, not validity, and says so
@@ -344,7 +548,7 @@ from the union of the shared `~/.claude/projects` dir and every other isolation
 dir before the container starts — mtimes preserved, so a copy never looks newer
 than the line it came from.
 
-Two rules keep the seeded union honest, and both were bugs before they were rules:
+Four rules keep the seeded union honest, and each was a bug before it was a rule:
 
 - **Resume never falls back to the shared dir.** The shared dir is a seeding
   *source* but never a *sink*: nothing born under isolation is copied back into
@@ -353,6 +557,17 @@ Two rules keep the seeded union honest, and both were bugs before they were rule
   resumed. Resolution now mounts an isolation dir or nothing.
 - **A stale seeded copy is refreshed from the newest copy elsewhere.** Skipping
   any file that already existed let per-dir snapshots drift apart permanently.
+  Refresh never runs backwards, though: a copy that is *longer* than the source,
+  or that has grown past its seed-time size, is left alone.
+- **Length measures history, not recency.** Session JSONLs are append-only, so a
+  copy's size is evidence and its mtime is not — merely mounting a dir bumps the
+  file's mtime without adding a byte. Resume picks the largest copy and uses
+  mtime only to break a size tie. Ranking by mtime once resumed a two-hour-old
+  copy over the complete transcript sitting in another dir.
+- **A seeded copy Claude appended to is no longer a seeded copy.** Growth past
+  the recorded seed-time size can only have come from Claude writing inside the
+  container, so such a copy is reclassified as container-written: resumable, and
+  write-trusted like any other container-written copy.
 
 What `/resume` shows is bounded by Claude Code's own retention window
 (`cleanupPeriodDays` in your `~/.claude/settings.json`, which the `~/.claude` mount
@@ -360,10 +575,23 @@ carries into containers) — lazy does not extend it; the full conversation hist
 lives permanently in lazy's store and is reachable via `lazy builder list`.
 
 Each dir carries a `.lazy-seeded.json` manifest listing the sessions that were
-copied in host-side. A session present on disk but *absent* from the manifest is
-one Claude wrote from inside the container — the only positive evidence that the
-container user can write there, which is what lets a resume mount survive a
-transiently failing write-probe.
+copied in host-side (`seededSessionIds`), the ones adopted with `--import`
+(`adoptedSessionIds`), and each seeded file's size and mtime *at seed time*
+(`seededFileStats`). A session present on disk but *absent* from
+`seededSessionIds` is one Claude wrote from inside the container — the only
+positive evidence that the container user can write there, which is what lets a
+resume mount survive a transiently failing write-probe. A seeded session whose
+file is now *larger* than its `seededFileStats` baseline counts as the same
+evidence, for the same reason: nothing on the host appends to a seeded copy.
+
+Manifests written before `seededFileStats` existed have no baseline, so growth
+is undecidable there. For those, a longer seeded copy is still promoted over a
+shorter usable one when it is a byte-exact *extension* of it — the same
+conversation carried further. That promotion makes the dir resumable but grants
+no write trust: a host re-seed extends a copy too, so it is not proof the
+container can write there. If the longer copy is not an extension, the two
+copies genuinely diverged; resume keeps the container-written one and logs a
+warning naming both dirs and sizes rather than guessing.
 
 #### Adopting a session that never ran under isolation: `--import`
 
@@ -524,6 +752,7 @@ in `src/daemon/server.ts` that is meant to be extended whenever a route is added
 | --- | --- | --- |
 | `POST /rpc/{command}` | framed | `wait` long-polls up to 600s |
 | `POST /mcp/:taskId/:toolName` | framed | tool calls run for minutes (accept, sync) |
+| `POST /builder/storage` | framed | a `saveConversation` of a long session is a large write |
 | `GET /daemon/status` | bounded | see below |
 | `POST /daemon/shutdown` | bounded | schedules a 50ms timer, returns at once |
 | no match → 404 | bounded | constant body, no I/O |
@@ -561,6 +790,57 @@ The `:taskId` path segment is validated before task resolution
 code. Anything else — most usefully a daemon bearer token pasted into the path
 instead of the `Authorization` header — is a 400 naming the mistake, not a
 `Task not found: <garbage>` from the store.
+
+### Every request is parsed before it is dispatched
+
+A route may not assume a well-behaved client. **Every external surface parses its
+inputs and confirms them; no surface may rely on *not* being the surface someone
+hand-rolls a request against.**
+
+`POST /mcp/:taskId/:toolName` used to take `body.arguments ?? {}` and dispatch.
+Each tool already ships an `inputSchema` — the same one advertised to the agent —
+and the route ignored it, so a declared `required` field was documentation
+rather than a check. A body that omitted the `{"arguments": {...}}` envelope,
+which is exactly what an agent writing its own HTTP fallback sends, therefore
+dispatched with *no* arguments: `lazy_commit` ran `git commit -m undefined` and
+produced a real commit whose message was the literal string `undefined`, and
+`lazy_journal` wrote an empty entry the same way. A corrupt write, from a
+request that never should have reached a handler.
+
+Validation now happens at the boundary, before any handler runs:
+
+- **Body shape.** A body that is present but unparsable, or that parses to
+  something other than an object, is a 400 quoting what arrived
+  (`src/daemon/http-body.ts`). It used to be `req.json().catch(() => ({}))` — a
+  truncated payload silently became a different, emptier request.
+- **Envelope.** A body with no `arguments` key but with top-level keys that *are*
+  parameters of the tool gets a 400 that names the mistake — "did you forget the
+  arguments envelope?" — rather than "missing required parameter 'message'",
+  which would send the caller looking for a value sitting right there in their
+  body.
+- **Schema.** Arguments are checked against the tool's declared `inputSchema` —
+  required fields, `type` (including unions), `enum`, `minLength`/`maxLength`,
+  `pattern`, and array element types — by a small dependency-free validator
+  (`src/mcp/validate-args.ts`). A violation names the field and shows the
+  expected envelope.
+
+The validator covers a deliberately closed subset of JSON Schema: the keywords
+lazy's own tool definitions use. A unit test walks every dispatchable tool schema
+and fails if one uses a keyword the validator does not implement, because an
+unenforced keyword is the original bug wearing a different hat. Extend the
+validator when you extend a schema.
+
+The same check guards the other two surfaces onto the same handlers: the stdio
+MCP server (`src/mcp/server.ts`, as JSON-RPC `-32602`) and the builder's
+`POST /tool/:name` (`src/builder/server.ts`, which had the identical
+`body.arguments ?? {}`). On `/rpc/{command}`, handlers read their parameters
+through typed accessors (`src/daemon/rpc-params.ts`) instead of
+`params.taskId as string` — a cast satisfies the compiler and checks nothing at
+runtime, so a wrong-typed value used to pass the presence check and reach the
+lifecycle code, where it surfaced as a 500.
+
+Rejection is total: a request that fails validation performs no work at all. A
+400 that still wrote something would be the same corruption with better manners.
 
 ### Identity comes from the token, not the URL
 
@@ -614,6 +894,78 @@ its back would leave the revoked token still accepted. It is best effort — a d
 that is down must not break builder exit, so a failure warns and exits. The
 registry's 50-entry builder cap now bounds only that residue (a SIGKILLed builder,
 a daemon that was down at exit).
+
+That cap evicts **residue before live sessions**. Dropping a builder's token costs
+that session every `lazy_*` tool for the rest of its life, silently — so eviction
+order matters as much as the cap does, and oldest-created-first (the original rule)
+picked the worst victim available: the oldest record is the likeliest long-running
+live builder. `lazy builder` now reports its own pid when it asks for a config
+(`ownerPid`, refreshed on every re-issue), the daemon records it, and eviction takes
+records whose owner is not provably alive first — oldest first within each group.
+The signal is a `kill(pid, 0)`: no file I/O, so the hot verify path stays I/O-free,
+and no daemon→runner dependency (the alternative was enumerating builder
+containers). It works because `lazy builder` runs on the host, in the daemon's own
+pid namespace. Costs: a record with no pid (minted before this, or by a caller that
+sends none) is treated as residue exactly as before, and a recycled pid makes a dead
+record merely *look* live — which only demotes it in the order. The cap stays hard:
+when every retained builder is live, the oldest live one is still dropped.
+
+### Builder conversation capture has its own surface: `POST /builder/storage`
+
+The builder supervisor runs **inside** the builder container, and the project's
+store is not mounted there, so its incremental conversation capture must write
+through the daemon. It built that Storage from the same mounted daemon MCP config
+the agent uses — and posted to `/rpc/storage`, which takes the **shared** token.
+The result was a 401 on the very first capture tick of every containerized builder
+session and every 30 seconds thereafter, for the whole session, visible only in a
+log file inside the container.
+
+The daemon-side capture sweep (`src/import/capture-sweep.ts`) covers the builder
+isolation dirs, so the conversations themselves were still landing — but the
+**resume-intent stamp** rides the same storage handle (`onFinalSession` →
+`stampSessionIdOnStorage`), and the sweep does not replicate it. So the 401 was
+also silently costing `lazy upgrade` its deterministic builder resume. Deleting the
+supervisor's capture instead of repairing it was therefore not an option.
+
+Neither existing surface could take the write:
+
+- **Shared token in the container.** That credential also unlocks every
+  `/rpc/<command>` CLI pass-through and the unrestricted Storage interface, to a
+  container whose agent can read its own mounted config. Trading full CLI and
+  store authority for a capture path is not a trade.
+- **`/rpc/*` accepting MCP tokens.** That is the split the section above exists to
+  establish; collapsing it re-creates the single shared identity.
+- **A new MCP tool.** Tools are listed to the agent; capture is the supervisor's
+  business, not something to hand the builder as a callable write.
+
+So capture got a fourth surface, strictly narrower than any of them:
+
+| | `/rpc/*` | `/mcp/:taskId/:tool` | `/builder/storage` |
+| --- | --- | --- | --- |
+| credential | shared daemon token | any MCP token, identity-matched | **builder**-kind MCP token only |
+| exposes | every CLI command + all of Storage | the MCP toolset | 4 Storage methods |
+| caller | host-side CLI | agent in a container | builder **supervisor** in a container |
+
+The allowlist is `BUILDER_STORAGE_METHODS` in `src/daemon/rpc-handlers.ts`:
+`getStoragePath` (probe + `getTaskDir`), `saveConversation`,
+`listBuilderResumeIntents`, `saveBuilderResumeIntent`. Anything else is a **403**,
+refused before storage is even opened. A task-kind token, the shared token, and an
+unknown token are all **401** — the surface is defined by credential *kind*, not by
+"at least as privileged as". Client-side, the route family is a property of the
+credential: `DaemonClient.fromTarget(..., 'builder')` sends `client.rpc('storage')`
+to `/builder/storage`, so `RemoteStorage` is unchanged.
+
+Adding an entry to that allowlist widens what a compromised builder container can
+do to the store. Give a new caller its own surface instead.
+
+Both halves of the original failure are now loud. `preflightBuilderCapture`
+(`src/supervisor/builder.ts`) proves capture can reach the store **before** Claude
+Code launches and throws with an actionable message if it cannot — a session whose
+history cannot be saved is not one to start. And the capture monitor accumulates
+the distinct failure reasons it hits (`createCaptureFailureRecorder`) and the
+supervisor prints them to stderr once Claude exits, next to the MCP-error report.
+Every occurrence still logs; the summary is additional. Printing mid-session would
+corrupt Claude Code's TUI, which is why the report waits for the exit.
 
 ### The daemon state dir is never mounted into a container
 
@@ -761,6 +1113,61 @@ including ones operating on a different, writable repository.
 Conflicted merges are now started host-side and **left in place** for the agent,
 which resolves and stages, then calls `lazy_commit` to conclude them — the
 merge-conflict prompts say so explicitly.
+
+### A sync ends in one of three states, all loud
+
+Leaving a conflicted merge in place is only safe if every exit from the merge
+phase is accounted for. A sync therefore ends in exactly one of:
+
+1. **merged and committed** — clean merge, or conflicts resolved and concluded;
+2. **conflicted with resolution in flight** — the conflicted merge is on disk
+   *and* a resolution agent turn was launched and recorded;
+3. **aborted** — the merge is rolled back and the caller gets an error naming
+   what happened to the files on disk.
+
+A worktree with unmerged files and no resolution in flight is not a valid
+outcome. `settleConflictedWorktree` (`src/supervisor/merge.ts`) enforces it:
+every failure path in the merge phase goes through it, and its verdict is
+attached to the error the supervisor reports (`merge_state` on the error
+response) so the human sees whether their files are still conflicted. A failed
+abort is reported as `settled: false` with the one command to run by hand — it
+is never swallowed. The sync success path re-reads the worktree before reporting
+success, and turns a still-mid-merge tree into a loud failure rather than a
+`blocked` task that looks settled.
+
+A **fully resolved but uncommitted** merge is concluded, not discarded. The
+agent cannot create a merge commit from inside the container, so the supervisor
+asks the daemon to do it (`merge_commit` on `lazy_internal_git`), which refuses
+unless MERGE_HEAD exists and no path is unmerged. Aborting instead threw away a
+complete resolution and asked for it again from scratch.
+
+### Rolling back a half-merged worktree is loud and attributed
+
+A rollback destroys work — possibly a human's or an agent's in-progress
+resolution. Before aborting, the supervisor saves what it found to
+`.lazy/recovery/merge-rollback-<timestamp>.patch`, reports it on the protocol
+response (`worktree_recovery`), and the reconciler writes it to the task journal
+attributed to the supervisor. The journal is the right home: durable, visible in
+`lazy show`, and never fed back into a prompt.
+
+Supervisor **startup** deliberately does not roll back. It is the one moment
+with no command to attribute a rollback to, and a supervisor starts for every
+turn — so rolling back there consumed the evidence before any recovery record
+could be written. Startup reports the mid-merge worktree; the next command
+recovers it and says what it discarded.
+
+### Every status surface reports a mid-merge worktree
+
+`lazy show` (text and `--json`), `lazy wait`, `lazy status`, and the MCP
+`lazy_show` / `lazy_status` / `lazy_wait` tools all read the same probe
+(`readWorktreeMergeState` / `describeMergeState` in `src/git/operations.ts`) and
+say "unresolved merge — …" next to the status. `blocked` on its own reads as
+"settled, waiting for you", which is a lie over conflicted files.
+
+`accept` and `reject` distinguish the two cases before refusing: a mid-merge
+worktree gets "unresolved merge … run `lazy sync <task>`", not "uncommitted
+changes. Commit or stash" — advice that cannot work, since stashing a conflicted
+merge fails and committing one records conflict markers.
 
 Residuals, accepted: an agent can still write arbitrary *content* into its own
 worktree and have it committed (content smuggling is out of scope — review is

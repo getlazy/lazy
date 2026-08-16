@@ -12,7 +12,9 @@ A missing `lazy.toml` is a normal condition — lazy uses its defaults. A `lazy.
 
 The most common cause is a **duplicate table**. `lazy init` already writes `[runner]`, `[server]`, `[storage]`, `[remote]`, `[docker]` and others, so appending a second copy of one is a TOML redefinition error. Edit the table that is already there instead of adding another one.
 
-`lazy doctor` is the exception that keeps working: it reports the parse failure as a failed `lazy.toml parses` check and skips every config-dependent check rather than reporting defaults as if you had chosen them.
+**The daemon refuses to start on such a config**, whether it failed to parse or was rejected for an invalid value — it fails before the dashboard port is bound, with an error naming the file and the cause, and tears down what it had already opened — the control socket, the lock — so a refused start leaves nothing listening and nothing to clean up by hand. It reads the dashboard port, the bind interface, and the runner from this file and hands the last of those to every task it launches, so starting on guessed values would serve a dashboard on a port you did not configure with a runner you may not have. This joins the daemon's other hard startup preconditions — the credential gate and the [proxy bind](#proxy).
+
+`lazy doctor` is the exception that keeps working: it reports the parse failure as a failed `lazy.toml parses` check and skips every config-dependent check rather than reporting defaults as if you had chosen them. It keeps working *without a daemon*, too — every other command auto-starts one and fails when that start fails, but doctor prints why the daemon isn't there and runs its remaining checks anyway. It is the command you reach for when nothing else runs, so it must not die of the thing it is meant to diagnose.
 
 ---
 
@@ -138,6 +140,7 @@ Git-related configuration.
 | Key                     | Type     | Default  | Description |
 |-------------------------|----------|----------|-------------|
 | `default_branch_prefix` | `string` | `"lazy"` | Prefix for task branches (e.g., `lazy/fix-bug`). |
+| `lfs_check`             | `string` | `"refuse"` | Start-time git LFS check on repos that use LFS: `"refuse"` blocks the start when the LFS filter would not run, `"warn"` starts anyway and records a warning, `"off"` disables it. Does not affect the accept-time guard, which always runs — see [LFS guard](lfs-guard.md). |
 
 ---
 
@@ -247,8 +250,8 @@ Web dashboard server settings.
 | Key             | Type     | Default       | Description |
 |-----------------|----------|---------------|-------------|
 | `port`          | `number` | `26024`       | Starting port for the web dashboard server. If busy, the daemon tries the next few ports (a bounded window of 20) so several projects can run on one host. If the whole window is occupied — almost always stray daemons squatting the range — startup fails with an actionable error pointing at `lazy daemon kill-stray` rather than silently binding a far-off port. |
-| `bind`          | `string` | `"127.0.0.1"` | Network interface the daemon's TCP server binds to. Loopback by default so the unauthenticated dashboard and the `/mcp` + `/rpc` endpoints are not reachable from other machines. Set to `"0.0.0.0"` to expose on all interfaces (opt-in to LAN access — the dashboard is unauthenticated, so the daemon logs a warning). The dashboard URL printed by `lazy daemon status`/`lazy server` reflects this value; a `0.0.0.0` bind is shown as `127.0.0.1` for local convenience. |
-| `sync_interval` | `number` | `60`          | Interval in seconds for background sync when running `lazy server`. Set to `0` to disable. |
+| `bind`          | `string` | `"127.0.0.1"` | Network interface the daemon's TCP server binds to. Loopback by default so the unauthenticated dashboard and the `/mcp` + `/rpc` endpoints are not reachable from other machines. Set to `"0.0.0.0"` to expose on all interfaces (opt-in to LAN access — the dashboard is unauthenticated, so the daemon logs a warning). The dashboard URL printed by `lazy daemon status`/`lazy daemon dashboard-url` reflects this value; a `0.0.0.0` bind is shown as `127.0.0.1` for local convenience. |
+| `sync_interval` | `number` | `60`          | Interval in seconds for the daemon's background sync. Set to `0` to disable. |
 
 **Native Linux Docker note:** When `bind` is left at the loopback default and a container runner (`docker`/`podman`) is configured, on Linux the daemon *additionally* binds the detected docker/podman bridge gateway (`docker0`, typically `172.17.0.1`) on the same port. This is required because containers reach the host via `host.docker.internal` → the bridge gateway (a non-loopback interface), which a loopback-only daemon would refuse. The bridge interface is host-local and reachable only from the container network — **not** routable from the LAN — so it does not widen LAN exposure. macOS/Windows Docker Desktop need nothing extra (`host.docker.internal` is proxied to the host's loopback). If you set `bind` explicitly, that value is used as-is with no extra interfaces; if the bridge can't be detected on Linux the daemon logs an actionable warning rather than letting agents fail to reach it.
 
@@ -328,6 +331,8 @@ There are two ways to be offline, with deliberately different lifetimes:
 
 Under either mode, `lazy start` branches a task from the **local** parent/integration branch — it skips the remote fetch entirely (mirroring `lazy sync`), so starting a task whose parent branch only exists locally (e.g. created earlier while offline and never pushed) works without error. When you are **online** and a parent ref genuinely isn't on the remote, `lazy start --force-local` (CLI) or the `force_local` param on the `lazy_start` MCP tool starts from the parent's local HEAD instead of failing.
 
+For a **top-level task created with `--parent <branch>`**, `--force-local` means *that branch's* local ref — never whatever the repository currently has checked out. If the stored target branch cannot be resolved at all (deleted, renamed, or never created locally), `lazy start` fails and names the branch rather than silently basing the task on the repository default; fetch or restore the branch, or retarget the task with `lazy reparent <task> <parent>`.
+
 ### `auto_approve` on protected branches
 
 When the target branch (usually `main`) has protection rules requiring approval, the accept path has two modes:
@@ -345,6 +350,32 @@ Available when `driver = "github"`. Authentication is handled by `gh` CLI (`gh a
 |--------------------|--------|---------|-------------|
 | `github_auto_push` | `bool` | `true`  | Automatically push after each agent turn. |
 | `github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection` | `bool` | `false` | Sync PR comments in public repos. **Security risk** — enables prompt injection via public comments. |
+
+#### GitHub Enterprise Server
+
+`driver = "github"` also works against a GitHub Enterprise Server install — the
+remote's hostname is read from the git remote, so `git@github.mycorp.com:team/app.git`
+and `https://github.internal.example/team/app.git` resolve to `team/app` on that
+host. Authenticate `gh` against the install first:
+
+```bash
+gh auth login --hostname github.mycorp.com
+```
+
+Nothing in `lazy.toml` needs to name the host. `lazy doctor` verifies that `gh`
+is logged into *that* host specifically — `gh auth status` on its own exits 0
+whenever gh is logged into any host, which on an Enterprise remote is usually
+github.com — and fails the check by name if it is not:
+
+```
+✗ GitHub authentication (github.mycorp.com)
+  gh is not authenticated to github.mycorp.com, the host of remote 'origin'. Run: gh auth login --hostname github.mycorp.com
+```
+
+Note that `gh` resolves a bare `owner/repo` and all `gh api` requests against
+*its* default host, so if you are logged into both github.com and an Enterprise
+install, lazy pins the Enterprise host explicitly on every call it makes, but
+ad-hoc `gh` commands you run yourself will not be.
 
 ### GitLab-specific options
 
@@ -486,6 +517,58 @@ The file is **bounded**: it rotates to `proxy-audit.jsonl.1` at 4 MiB and only t
 
 Each record is **attributed to the role and task that made the request.** lazy sets `ANTHROPIC_CUSTOM_HEADERS` on every agent it launches through the proxy, so Claude Code sends `x-lazy-role` (`agent` or `builder`) and — for task agents — `x-lazy-task-id` on each request; the proxy reads them into the audit record's `role`/`taskId`, then strips them before forwarding upstream (real Anthropic never sees lazy-internal headers). This is what lets the audit trail (and every `DENY` log line) say *which* agent and task tried a given `tool_use`, not just that one did.
 
+### Token accounting — `lazy stats tokens`
+
+Every audit record also carries the **token usage** the upstream reported for that request, in the `usage` field: `inputTokens`, `outputTokens`, `cacheCreationInputTokens`, `cacheReadInputTokens`. Combined with the role/task attribution above, that gives per-role, per-task and per-model token accounting with no extra instrumentation.
+
+Usage is captured on both response paths:
+
+- **Non-streaming / enforcement path** — the body is already buffered, so `usage` is read straight out of the JSON. On an enforced (denied) request the counts come from the *original* upstream body, not the rewritten one: a denial changes content, never the tokens the upstream billed.
+- **Streaming path** — the response body is passed through a tee that forwards each chunk to the client *before* inspecting it, watching the SSE stream for `message_start` (input/cache counts) and the final `message_delta` (cumulative `output_tokens`). Nothing is buffered and the client never waits on the scanner, so the streaming hot path keeps its zero-added-latency guarantee. The audit record is enqueued when the stream ends — including when the client cancels mid-stream, so a walked-away client never vanishes from the trail.
+
+Requests that failed before any response (an unreachable upstream, a terminal error) legitimately have no usage and keep `usage: null`. They still appear in the trail, and `lazy stats tokens` counts them under "requests" but not under "with usage" — so a failure is visible rather than silently inflating or deflating the totals.
+
+Read the trail with `lazy stats tokens`. It lives under `lazy stats`, the multiplexer for read-only analytics over what lazy recorded (alongside `lazy stats timings`, the request-trace readout) — top-level verbs are reserved for task-lifecycle operations:
+
+```bash
+lazy stats tokens                        # totals + by-role / by-task / by-model breakdowns
+lazy stats tokens --since 24h            # only the last day
+lazy stats tokens --role agent --top 20  # agent traffic only, 20 rows per breakdown
+lazy stats tokens --task add-proxy       # one task's spend (short-id prefix match)
+lazy stats tokens --json                 # machine-readable rollup
+```
+
+Two scope caveats, both printed in the readout:
+
+- **Only traffic through the proxy is audited.** An agent whose role is on the `anthropic` or `ollama` backend talks to its upstream directly and never appears here.
+- **Traffic with no `x-lazy-role`/`x-lazy-task-id` header is grouped under `(unattributed)`, not dropped.** It cost real tokens; hiding it would make the rollup under-report.
+
+### Reading the trail record by record — `lazy stats audit`
+
+`lazy stats tokens` rolls the trail up. `lazy stats audit` is the other half: **one row per proxied request**, so you can answer "what did the policy engine deny on that turn?" or "which requests failed over to the fallback?" without hand-reading `proxy-audit.jsonl`.
+
+```bash
+lazy stats audit                          # the newest 20 proxied requests, one row each
+lazy stats audit --denied                 # every policy denial recorded
+lazy stats audit --task add-audit --last 2h
+lazy stats audit --errors --limit 50      # recent failures — e.g. the 401s that mean an expired credential
+lazy stats audit --reroutes --json        # failovers, machine-readable
+lazy stats audit 3f9a1c2b                 # full detail for one record
+```
+
+The listing shows time, record id, role, task, model, tool_use/tool_result counts, total tokens and duration, plus a `NOTES` column that flags the rows worth opening: `DENY(n)`, `REROUTE`, and `FAIL(<status>)` (or `FAIL(no-response)` when the request never got one). Filters — `--task` (short-id prefix), `--role`, `--model` (substring), `--since`/`--last`, `--denied`, `--reroutes`, `--errors` — all combine.
+
+Passing a record id (the short form from the `ID` column is enough) opens the **detail view** for that request: routing and upstream, request shape and declared tools, token usage, the `tool_use` blocks the agent intended with their paths/commands, `tool_result` previews, the reroute's source and target, and each denial with the rule that fired and the reason given back to the agent. `--json` emits the row list, or — with a record id — the raw record.
+
+Two deliberate behaviors worth knowing:
+
+- **`--limit` keeps the newest records, not the oldest.** The trail reads like a log; when the listing is capped the tail is what you want, and the footer says how many older records were hidden.
+- **An ambiguous record-id prefix is an error, not a best guess.** Showing the wrong request's denials would be worse than failing.
+
+Like `lazy stats tokens`, this is read-only and covers proxied traffic only — an agent on the `anthropic` or `ollama` backend never appears in it, and the readout says so.
+
+The audit plane is implemented by `FileStorage` only. `PostgresStorage` **fails loudly** on both `appendAuditRecord` and `listAuditRecords` rather than accepting writes into a void or returning an empty list — an empty list would render as "no traffic yet", an answer indistinguishable from the truth and wrong in the worst direction.
+
 ### Smart routing — `[[proxy.fallback]]` failover chain
 
 By default, when the upstream returns **429** (rate limited) / **529** (overloaded) or is unreachable, the proxy fails the request and the agent's turn fails with it. A `[[proxy.fallback]]` chain lets the proxy instead **reroute** the request to an alternate Anthropic-native target — a different model tier, a different endpoint (e.g. a locally-served Ollama model), or a different account. Each entry is tried in order until one responds.
@@ -563,6 +646,37 @@ Mount additional documents into agent containers.
 
 ---
 
+## `[docs]`
+
+Where the `Check documentation at <url>` pointers in error messages, warnings and command help point.
+
+Not to be confused with `[documents]` above — that mounts a directory of reference material into agent containers. `[docs]` is only the documentation link domain.
+
+| Key   | Type              | Default                                | Description |
+|-------|-------------------|----------------------------------------|-------------|
+| `url` | `string \| false` | `"https://docs.getlazy.dev/v<major.minor>"` | Base URL for documentation links. `""` or `false` turns pointers off. |
+
+```toml
+[docs]
+# Point at your own mirror (a fork, or an internal copy of the docs)
+url = "https://docs.internal.example.com/lazy"
+
+# ...or turn documentation pointers off entirely
+# url = ""
+```
+
+Links are composed as `<url>/<page>` — `docs/protected-branches.md` in the repo renders as `<url>/protected-branches`. Set `url` to the root of whatever serves the `docs/` tree; a trailing slash is ignored.
+
+**The default is version-pinned; a configured value is not.** With no `url` set, lazy points at `https://docs.getlazy.dev/v<major.minor>` — the snapshot of the docs published alongside the build you are running. [The docs site](docs-site.md) keeps one directory per minor release and never rewrites an old one, so a pointer printed by any build that ever shipped keeps resolving.
+
+A `url` you configure is used **exactly as written**: lazy appends the page path and nothing else, and never adds a version segment. Appending our layout to someone else's site would produce 404s they could not fix from their side, so a mirror owns its own paths. If you want your mirror version-pinned too, put the version in the URL yourself.
+
+Pointers are always a **supplement**. Every message that carries one is fully actionable with the pointer removed, so disabling them costs you a link and nothing else.
+
+A value that is neither an `http(s)` URL nor the empty string fails the config load with a message naming the section — an unusable URL is reported at load time rather than silently degrading into "links never appear".
+
+---
+
 ## `[[mounts]]`
 
 Custom mounts injected into **task agent containers** (the worktree containers where agents run; the builder container is not affected). Array of tables — each entry is either a host **bind** mount or a container-local **volume**. Opt-in: none by default, and with no `[[mounts]]` configured container launch is exactly as before.
@@ -589,6 +703,8 @@ Each entry's keys:
 Invalid entries fail loudly at config-load time with a message naming the offending entry (missing `target`, unknown `type`, a bind with no `source`, a volume that sets `source`, etc.) — they are never silently skipped.
 
 **One host path is refused outright: lazy's daemon state directory** (`~/.lazy/daemon/`, or wherever `LAZY_DAEMON_BASE_DIR` points). A bind `source` inside it — or one that *contains* it, such as `~/.lazy` or `$HOME` — fails with an error naming the entry and the reason. That directory holds the shared daemon token (which authenticates every `/rpc` call) and the per-task MCP token registry; a container that could read it could act as any other task, or as the builder, defeating per-task agent identity entirely. Absolute sources are refused at config-load time; a project-relative or placeholder source that *resolves* into that directory is refused at launch. Lazy's own read-only mount of a container's single MCP config file is added by the launch path itself and is unaffected.
+
+**A second host path is refused the same way: the builder scratch directory** (`~/.lazy/scratch/`, or wherever `LAZY_SCRATCH_BASE_DIR` points). That directory is the builder's scratchpad for handing documents to *you*, and is deliberately unreadable by agents — a builder that can pass code to an agent through a shared directory stops delegating and starts implementing. A bind `source` inside it, or one that contains it, fails with an error naming the entry. See [builder-scratch-dir.md](./builder-scratch-dir.md).
 
 ```toml
 # Bind a host path into the container
@@ -648,6 +764,40 @@ File protection — prevents agents from modifying or deleting certain files.
 protected = ["README.md", "test/**/*.ts", "*.spec.*"]
 ```
 
+### Resolving a conflict task
+
+A turn that violates these patterns leaves the task in `conflict`. Protected
+files are protected **by default**: on unblock, every violated file the reviewer
+does not approve is reverted to its base commit and committed. Because that is
+destructive, no decision is inferred — omitting the flag/parameter on a conflict
+task is an error on both surfaces, not "revert all".
+
+| | `lazy unblock` | `lazy accept` |
+|---|---|---|
+| CLI | `--approve-file <file>` (repeatable) or `--no-approve-files` | `--approve-file <file>` (repeatable) |
+| MCP | `approved_files: [...]`, `[]` = revert all | `approved_files: [...]` |
+| Required? | Yes, on a conflict task — no default | Yes, on a conflict task |
+| A file left out | is **reverted** to its base commit | makes accept **refuse**; nothing is reverted |
+
+The two are easy to confuse and behave oppositely on the omitted file, so they
+are spelled out separately in `lazy unblock --help` and `lazy accept --help`.
+Approving files in the feedback *text* has no effect on either — the flag and
+the parameter are the only channels that are read.
+
+Which violations count is a per-turn question with a subtlety: a turn that
+violates protections is followed by supervised push-back and maintained-files
+nudges, each producing a further agent turn. Only the last agent turn that
+*re-detected* violations carries the set the reviewer must resolve — reading
+"the last agent turn" instead lands on a nudge reply that carries none. Every
+surface reads it through one helper (`pendingViolations` in
+`src/utils/turns.ts`) so the guard and the enforcement cannot drift apart.
+
+When a file is reverted, the agent's next prompt names it and says the revert
+stands. If the reverted state does not compile or breaks tests, the agent is
+told to report that and hand the task back rather than re-apply — re-applying
+unilaterally would just start a revert ping-pong. Re-approval is the reviewer's
+move: unblock again with those files approved.
+
 ---
 
 ## `[protection]`
@@ -669,6 +819,8 @@ Both lists are managed by **`lazy protect <branch|task> on|off`**, which edits t
 When enabled, protection applies on **all** remote drivers, including `local`, and regardless of who calls accept (CLI `--yes`, the builder over MCP, automation). Subtask merges into intermediate `lazy/*` parent branches are never protected — no friction in the inner loop — with one deliberate exception: a task listed in `protected_tasks` gates its own outgoing merge even into a `lazy/*` parent. One approval unlocks exactly one accept of the approved task.
 
 `gate_default_branch` protects a branch that appears in no list: the default branch is resolved from `refs/remotes/<remote>/HEAD` at decision time, so it stays correct if the repo's default branch changes. `lazy protect` shows it under Protected branches marked as implicit, and `lazy doctor` warns when that remote ref is missing (resolution then falls back to the literal `main`, which would gate nothing on a `master` repo).
+
+Once anything here is protected, the gates are **visible before they bite**: `lazy show` and `lazy status` print a `Protected:` line, `lazy list` and the dashboard mark the task `[P]` (`[P][A]` when an approval is recorded and pending), `lazy review` shows it in the header, and MCP `lazy_show` returns a read-only `protection` object. A project that protects nothing sees no change at all. See [protected-branches.md](./protected-branches.md#seeing-a-gate-before-it-bites).
 
 On GitHub and GitLab projects, **approving the task's PR/MR satisfies this same gate** — it is a satisfier resolved inside the gate, not a parallel mechanism, so a `local` project and a forge project reach the identical decision. The forge is checked before any pending `lazy approve` record (so an approved PR does not burn it) and fails closed if the forge is unreachable. See [protected-branches.md](./protected-branches.md).
 
@@ -861,12 +1013,22 @@ countdown anchored to `00:00 local`.
 daemons across **all** projects on the host:
 
 - `lazy daemon list` — every running daemon (pid, web port, version, age, project
-  root). A daemon whose project root has been deleted is marked `(stray)`, and dead-pid
-  state dirs left behind by crashes are reported as orphans.
+  root). A daemon whose project root has been deleted is marked `(stray)`, and state
+  dirs with no daemon behind them are reported as orphans.
 - `lazy daemon kill-stray` — reap only stray daemons (those whose project root no longer
   exists). A daemon whose root still exists is **never** touched. Requires confirmation;
   pass `--yes` for non-interactive callers and `--prune-dirs` to also remove orphaned
-  state dirs whose process is dead.
+  state dirs.
+
+A state dir counts as *running* only if the process behind its recorded PID is verified
+to be that daemon — by answering on its socket, by holding the dir's daemon lock, or by
+its command line. A PID alone proves nothing: the OS reuses PIDs, so a dir left behind
+months ago will eventually record a PID that belongs to some unrelated process. Such a
+dir is reported as an orphan (and is removable with `--prune-dirs`), and its recycled
+PID is never signalled. When two dirs record the same PID, only the one that verifies is
+listed. If none of those signals can be evaluated at all, the daemon is assumed alive —
+the safe direction, since a wrong "dead" verdict would let `--prune-dirs` delete a live
+daemon's socket and token.
 
 Daemon state lives under `~/.lazy/daemon/<slug>/` by default. Set the
 `LAZY_DAEMON_BASE_DIR` environment variable to relocate it — useful for isolated test

@@ -26,6 +26,27 @@ import { recoverMissingWorktreeWithFetch, branchExists } from '../../git/operati
 import { loadConfig } from '../../config/loader';
 import { hunkHash } from '../../utils/hunk-hash';
 import reviewQaPromptTemplate from '../../prompts/review-qa.md' with { type: 'text' };
+import { loadTaskProtectionStatus, protectionHeadline } from '../../protection/status';
+import { logger } from '../../utils/logger';
+
+/**
+ * The one-line protection headline for the per-hunk review header, or null when
+ * there is no gate (or it cannot be resolved — a review must never fail over an
+ * advisory line).
+ */
+async function protectionHeadlineForTask(
+  storage: Storage,
+  root: string,
+  task: Task,
+): Promise<string | null> {
+  try {
+    const config = await loadConfig(root);
+    return protectionHeadline(await loadTaskProtectionStatus(storage, config, root, task));
+  } catch (err) {
+    logger.debug(`Interactive review: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
 
 // ── Hunk parsing ────────────────────────────────────────────────────────
 
@@ -1005,7 +1026,7 @@ async function askAgent(
 
   // Waiting-line renderer: elapsed seconds, redrawn every 1s using \r so the
   // line is a live progress indicator rather than a frozen "Asking agent…".
-  const baseLine = `${ansi.dim}Asking agent (plan mode, read-only, ${ASK_EFFORT} effort)…${ansi.reset}`;
+  const baseLine = `${ansi.dim}Asking agent (reflective, read-only, ${ASK_EFFORT} effort)…${ansi.reset}`;
   const CLEAR_LINE = '\r\x1b[2K';
   process.stdout.write(`${baseLine}  ${ansi.dim}0s (Ctrl+C to abort)${ansi.reset}`);
   const progressTimer = setInterval(() => {
@@ -1352,6 +1373,12 @@ export async function runInteractiveReview(
 
   try {
     console.log(`\n${ansi.bold}Interactive review: ${task.goal}${ansi.reset}`);
+    // Same header fact as the full-screen review: if accepting this task will
+    // need `lazy approve`, say so before the reviewer starts approving hunks.
+    const protectionLine = await protectionHeadlineForTask(storage, root, task);
+    if (protectionLine) {
+      console.log(`${ansi.fg.yellow}${protectionLine}${ansi.reset}`);
+    }
     const approvedNow = approvedCount();
     if (approvedNow > 0) {
       console.log(

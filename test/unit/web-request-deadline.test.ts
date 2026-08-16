@@ -52,7 +52,9 @@ function emptyStorage(): Storage {
 function startDashboard(storage: Storage) {
   const server = Bun.serve({
     port: 0,
-    fetch: createWebRequestHandler(storage, { deadlineMs: TEST_DEADLINE_MS }),
+    // No ReviewActions port: this suite exercises the deadline, and the review
+    // routes 503 without one (see handleReviewRoute).
+    fetch: createWebRequestHandler(storage, undefined, { deadlineMs: TEST_DEADLINE_MS }),
   });
   servers.push(server);
   return server;

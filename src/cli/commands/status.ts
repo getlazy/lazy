@@ -1,7 +1,7 @@
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, formatDate, taskRef, getWorktreePath } from '../helpers';
-import { getCurrentSha, hasUncommittedChanges } from '../../git/operations';
+import { getCurrentSha, hasUncommittedChanges, readWorktreeMergeState, isMidMerge, describeMergeState } from '../../git/operations';
 import { checkOrphanedChild } from '../orphan';
 import { isTerminalStatus } from '../../types';
 import type { Storage } from '../../storage';
@@ -15,6 +15,7 @@ import { checkLock } from '../../utils/lock';
 import { createRunner } from '../../runner';
 import { protocolDir as getProtocolDir } from '../../protocol';
 import { computeWorkingSubstate, renderWorkingStatus } from '../../utils/working-substate';
+import { loadTaskProtectionStatus, protectionSummary, protectionAdvice } from '../../protection/status';
 import { logger } from '../../utils/logger';
 import {
   isAutoReactPaused,
@@ -79,6 +80,25 @@ export async function commandStatus(args: string[]): Promise<void> {
       }
     }
 
+    // Protection, if any. Same wording as `lazy show` — the point of the shared
+    // vocabulary is that a gate reads identically wherever you meet it.
+    try {
+      const config = await loadConfig(root);
+      const protection = await loadTaskProtectionStatus(storage, config, root, task, {
+        hasBranch: Boolean(sess?.git_branch),
+      });
+      const summary = protectionSummary(protection);
+      if (summary) {
+        const paint = protection.gated ? theme.warning : (s: string) => s;
+        console.log(`  ${theme.label('Protected:')} ${paint(summary)}`);
+        for (const line of protectionAdvice(protection, displayId(task))) {
+          console.log(`             ${line}`);
+        }
+      }
+    } catch (err) {
+      logger.debug(`Task ${shortId(task.id)}: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
+    }
+
     if (!sess) {
       console.log(`\n${theme.label('Session:')} not started`);
       console.log(`  Start with: ${theme.command('lazy start ' + displayId(task))}`);
@@ -126,6 +146,15 @@ export async function commandStatus(args: string[]): Promise<void> {
 
     // Check for uncommitted changes (only if worktree exists)
     if (worktreeExists) {
+      // An unresolved merge is reported BEFORE the uncommitted-changes line: the
+      // conflict markers would otherwise show up as ordinary modified files with
+      // nothing saying the tree is mid-merge (fix-sync-silent-conflict).
+      const mergeState = await readWorktreeMergeState(worktreePath);
+      if (isMidMerge(mergeState)) {
+        console.log(`\n  ${theme.warning(`Unresolved merge: ${describeMergeState(mergeState)}`)}`);
+        console.log(`  A sync did not finish. Resolve the conflicts and commit the merge, or run \`git merge --abort\`.`);
+      }
+
       const hasUncommitted = await hasUncommittedChanges(worktreePath);
       console.log(`\n  Uncommitted changes: ${hasUncommitted ? 'YES' : 'NO'}`);
 

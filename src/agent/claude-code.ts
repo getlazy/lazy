@@ -47,12 +47,53 @@ function tryParseObject(text: string): Record<string, unknown> | null {
   }
 }
 
+/**
+ * Pull the CONCRETE model id out of a Claude Code result object.
+ *
+ * Two shapes are accepted because Claude Code has emitted both:
+ *  - a flat `model` string on the result line, and
+ *  - a `modelUsage` map keyed by model id (a turn can bill more than one model —
+ *    the main model plus small side-task models), in which case the model that
+ *    produced the turn is the one with the most output tokens.
+ *
+ * Returns undefined when neither is present. That is deliberate: the caller
+ * records the requested alias in `Turn.model` and leaves `Turn.model_id` unset,
+ * so "we don't know which snapshot ran" stays distinguishable from "we do".
+ */
+export function extractModelId(obj: Record<string, unknown>): string | undefined {
+  if (typeof obj.model === 'string' && obj.model.trim()) return obj.model.trim();
+
+  const usage = obj.modelUsage;
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return undefined;
+
+  let best: string | undefined;
+  let bestTokens = -1;
+  for (const [id, entry] of Object.entries(usage as Record<string, unknown>)) {
+    if (!id.trim()) continue;
+    const tokens =
+      entry && typeof entry === 'object'
+        ? Number((entry as Record<string, unknown>).outputTokens ?? (entry as Record<string, unknown>).output_tokens ?? 0)
+        : 0;
+    const score = Number.isFinite(tokens) ? tokens : 0;
+    if (score > bestTokens) {
+      bestTokens = score;
+      best = id.trim();
+    }
+  }
+  return best;
+}
+
 /** Assert the fields every caller of parseResponse relies on. */
 function requireResponseFields(obj: Record<string, unknown>): AgentResponse {
   if (!obj.result || !obj.session_id) {
     throw new Error('Claude Code response missing required fields (result, session_id)');
   }
-  return obj as unknown as AgentResponse;
+  // Cast keeps any extra result fields intact for callers that read them; the
+  // model id is normalized on top so every call site sees one field name
+  // regardless of which shape Claude Code emitted.
+  const response = obj as unknown as AgentResponse;
+  const modelId = extractModelId(obj);
+  return modelId ? { ...response, model_id: modelId } : response;
 }
 
 export class ClaudeCodeAgent implements Agent {

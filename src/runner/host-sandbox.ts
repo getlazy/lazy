@@ -100,6 +100,7 @@
 
 import type { HostPermissionMode } from '../config/types';
 import { expandTilde } from '../utils/home';
+import { getScratchBaseDir } from '../builder/scratch';
 
 export type { HostPermissionMode };
 
@@ -241,7 +242,33 @@ export function buildSandboxSettings(
  */
 export function buildAgentSandboxArgs(cfg: HostPermissionConfig): string[] {
   if (cfg.mode !== 'sandbox') return [];
-  return ['--settings', JSON.stringify(buildSandboxSettings(cfg, /*interactive*/ false))];
+  return ['--settings', JSON.stringify(buildSandboxSettings(agentDenies(cfg), /*interactive*/ false))];
+}
+
+/**
+ * Agent-only additions to the deny lists.
+ *
+ * The builder scratch dir is the builder's writable exchange area with the
+ * HUMAN — deliberately not a channel to agents (see src/builder/scratch.ts).
+ * Container agents can't reach it at all (nothing mounts it), but a host-runner
+ * agent shares the filesystem with the builder, so it is denied explicitly:
+ * without this, `~/.lazy/scratch` would be as readable to an agent as any other
+ * path outside the worktree, and the boundary would hold only under Docker.
+ *
+ * Denies the whole scratch BASE dir, not this project's subdir: an agent has no
+ * business in any project's scratch.
+ *
+ * Caveat, stated honestly: this covers `permission_mode = "sandbox"`. Under
+ * `"bypass"` the host runner has no boundary of any kind (that is what the mode
+ * means, and the builder warns about it at launch), so nothing here applies.
+ */
+function agentDenies(cfg: HostPermissionConfig): HostPermissionConfig {
+  const scratchBase = getScratchBaseDir();
+  return {
+    ...cfg,
+    denyRead: [...cfg.denyRead, scratchBase],
+    denyWrite: [...cfg.denyWrite, scratchBase],
+  };
 }
 
 /**

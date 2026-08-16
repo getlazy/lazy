@@ -262,4 +262,42 @@ describe('lazy doctor <task-id>', () => {
     expectOutput(result, 'Parent:');
     expectOutput(result, 'backlog');
   });
+
+  // INVARIANT: unanswerable-is-not-healthy.
+  // A task with no live container cannot be asked what tools its agent got, and
+  // saying nothing would let a reader take silence for a clean bill of health.
+  // It reports the gap explicitly — and, because a missing container is a normal
+  // state for a task between turns, it must NOT count as an issue or fail the run.
+  test('reports agent container diagnostics as skipped when there is no live container', async () => {
+    const storage = await openTestStorage(ctx.root);
+    let taskShortId: string;
+    try {
+      const task = await storage.createTask('no container', undefined, undefined, 'no-container');
+      taskShortId = task.id.substring(0, 8);
+    } finally {
+      await storage.close();
+    }
+
+    const result = await ctx.lazy(['doctor', taskShortId]);
+    expectSuccess(result);
+    expectOutput(result, 'Agent container diagnostics: skipped');
+    expectOutput(result, 'No issues found');
+  });
+
+  test('--probe-agent is accepted in task mode', async () => {
+    const storage = await openTestStorage(ctx.root);
+    let taskShortId: string;
+    try {
+      const task = await storage.createTask('probe flag', undefined, undefined, 'probe-flag');
+      taskShortId = task.id.substring(0, 8);
+    } finally {
+      await storage.close();
+    }
+
+    // No container here, so the probe never runs — what is under test is that
+    // the flag parses rather than being rejected as unknown.
+    const result = await ctx.lazy(['doctor', taskShortId, '--probe-agent']);
+    expectSuccess(result);
+    expectOutputExcludes(result, 'Unknown flag');
+  });
 });

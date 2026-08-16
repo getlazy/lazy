@@ -300,7 +300,9 @@ export function ensureProtocolDir(dir: string): void {
  * Clean up all protocol files (used when task completes or container is torn down).
  */
 export function cleanProtocol(dir: string): void {
-  for (const file of ['command.json', 'response.json', 'status.json']) {
+  // waiting.json is included: a torn-down turn cannot still be blocked on a
+  // subtask, so leaving the marker behind would render a dead task as waiting.
+  for (const file of ['command.json', 'response.json', 'status.json', 'waiting.json']) {
     const p = join(dir, file);
     try { if (existsSync(p)) unlinkSync(p); } catch { /* best effort */ }
   }

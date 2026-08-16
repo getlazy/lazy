@@ -13,6 +13,7 @@ import {
   readHeartbeatEnvelope,
   DaemonConnectionLostError,
 } from './heartbeat';
+import { currentTraceparent } from '../tracing';
 import { getSocketPath } from './paths';
 import { readToken } from './lifecycle';
 import { findLazyRoot } from '../cli/init';
@@ -53,12 +54,26 @@ export class RpcApplicationError extends Error {
  * (`http://host.docker.internal:<webPort>`). Pure and exported so the
  * unix-vs-TCP branching is unit-testable without a live daemon.
  */
+/** `{ traceparent }` when this process has an active span, `{}` otherwise. */
+function traceparentHeader(): Record<string, string> {
+  const traceparent = currentTraceparent();
+  return traceparent ? { traceparent } : {};
+}
+
 export function buildDaemonRpcRequest(
   target: string,
   token: string,
   command: string,
   project: string,
   params: Record<string, unknown>,
+  /**
+   * Which daemon route family to post to. `rpc` (the default) is the full CLI
+   * pass-through, gated on the SHARED daemon token. `builder` is the narrow
+   * capture surface a builder container reaches with its per-identity MCP token
+   * — see the /builder/storage route in src/daemon/server.ts for why the two
+   * cannot be one route.
+   */
+  routePrefix: DaemonRoutePrefix = 'rpc',
 ): { url: string; options: Record<string, unknown> } {
   const isHttp = target.startsWith('http://') || target.startsWith('https://');
   const options: Record<string, unknown> = {
@@ -72,16 +87,20 @@ export function buildDaemonRpcRequest(
       // old to understand the header just replies with plain JSON, which
       // `rpc()` still handles.
       ...heartbeatRequestHeaders(),
+      // W3C trace context, so the daemon's request span lands in the same trace
+      // as the CLI command that made the call and `lazy stats timings` shows one
+      // request end to end. Empty when this process isn't tracing.
+      ...traceparentHeader(),
     },
     body: JSON.stringify(params),
   };
   let url: string;
   if (isHttp) {
     // TCP web server: target is the base URL.
-    url = `${target}/rpc/${command}`;
+    url = `${target}/${routePrefix}/${command}`;
   } else {
     // Unix socket: Bun routes the request to the socket file via `unix`.
-    url = `http://localhost/rpc/${command}`;
+    url = `http://localhost/${routePrefix}/${command}`;
     options.unix = target;
   }
   return { url, options };
@@ -99,6 +118,18 @@ export function buildDaemonRpcRequest(
  */
 export type DaemonCredentialSource = () => Promise<{ target: string; token: string } | null>;
 
+/**
+ * Daemon route family a client posts to.
+ *
+ * `rpc` — POST /rpc/<command>, the full CLI pass-through. Requires the SHARED
+ * daemon token; that is why host-side clients use it and containers do not.
+ *
+ * `builder` — POST /builder/<command>, the narrow capture surface authenticated
+ * with a builder-session MCP token. Today the one command is `storage`, and the
+ * daemon allowlists which Storage methods it will run (BUILDER_STORAGE_METHODS).
+ */
+export type DaemonRoutePrefix = 'rpc' | 'builder';
+
 export class DaemonClient {
   constructor(
     /** Either a unix socket path (host) or an http(s):// base URL (container). */
@@ -106,6 +137,13 @@ export class DaemonClient {
     private token: string,
     /** Optional re-read of the credential source, used once per 401. */
     private credentialSource?: DaemonCredentialSource,
+    /**
+     * Route family every call from this client goes to. Fixed per client
+     * because it is a property of the CREDENTIAL, not of the call: a client
+     * holding a builder MCP token can only ever reach /builder/*, and one
+     * holding the shared daemon token has no reason to leave /rpc/*.
+     */
+    private routePrefix: DaemonRoutePrefix = 'rpc',
   ) {}
 
   /**
@@ -134,13 +172,20 @@ export class DaemonClient {
    * reachable over TCP at the `target` carried by the daemon MCP config
    * (`http://host.docker.internal:<webPort>`) — the unix socket does not exist
    * in the container.
+   *
+   * `routePrefix` must match the KIND of token being presented. A container's
+   * daemon MCP config carries a per-identity MCP token, which /rpc/* rejects by
+   * design — such a caller passes 'builder' and reaches the narrow capture
+   * surface instead. Getting this wrong is a 401 on every call, which is
+   * exactly the bug this parameter exists to make unrepeatable.
    */
   static fromTarget(
     target: string,
     token: string,
     credentialSource?: DaemonCredentialSource,
+    routePrefix: DaemonRoutePrefix = 'rpc',
   ): DaemonClient {
-    return new DaemonClient(target, token, credentialSource);
+    return new DaemonClient(target, token, credentialSource, routePrefix);
   }
 
   /**
@@ -203,7 +248,9 @@ export class DaemonClient {
     project: string,
     params: Record<string, unknown>,
   ): Promise<Response> {
-    const { url, options } = buildDaemonRpcRequest(this.target, this.token, command, project, params);
+    const { url, options } = buildDaemonRpcRequest(
+      this.target, this.token, command, project, params, this.routePrefix,
+    );
     return await fetch(url, options as any);
   }
 }

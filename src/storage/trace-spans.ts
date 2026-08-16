@@ -29,7 +29,7 @@ import type { SpanRecord } from '../tracing/types';
  * on-disk size is bounded by the 128 MB high-water mark plus one batch.
  *
  * Pruning is by WHOLE TRACES, newest first — never by raw line count. Dropping
- * half a trace would leave orphaned spans and a broken tree in `lazy timings`.
+ * half a trace would leave orphaned spans and a broken tree in `lazy stats timings`.
  */
 export const PRUNE_TRIGGER_BYTES = 128 * 1024 * 1024;
 export const PRUNE_TARGET_BYTES = 64 * 1024 * 1024;

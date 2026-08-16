@@ -25,7 +25,7 @@ lazy init
 lazy builder # Ask it "what can you do?"
 
 # To review all the prompts that `lazy` uses run `lazy system prompts`
-# To view the content of individual prompts use `lazy view <prompt-code>`
+# To view the content of individual prompts use `lazy show <prompt-code>`
 
 # Or create tasks directly
 lazy create --code add-auth --goal "Add user authentication" --prompt "Use JWT tokens, bcrypt for passwords"
@@ -41,9 +41,9 @@ lazy ask <task-id> --message "why did you drop the retry?"
 # with the agent, use `lazy pair` to the agent's session but now with you in control
 lazy pair <task-id>
 
-# And if the tasks has ended, you can still go back and chat with the agent to
-# ask it questions and get more information on the reasoning.
-lazy chat <finished-task-id>
+# For a back-and-forth conversation instead of a single question — with a paused
+# task or with one that has long since finished — chat with its agent read-only.
+lazy chat <task-id>
 
 # Accept and merge to main
 lazy accept <task-id>
@@ -57,14 +57,15 @@ lazy reject <task-id> --reason "Needs to use sessions instead of JWT"
 # Or close it if you don't even want to do it
 lazy close <task-id> --reason "Won't do"
 
-# Sometimes you will want to stop the task and give it new direction
+# Sometimes you will want to stop the task and give it new direction with maybe a different model
+# or a different level of effort.
 lazy stop <task-id> --reason "We need to pivot"
-lazy unblock <task-id> --reason "New direction to pivot to"
+lazy unblock <task-id> --message "New direction to pivot to with a different model" --model some-different-model
 ```
 
 ## Core components
 
-When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a linux build of `lazy` with a different CLI commands that run inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
+When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a Linux build of `lazy` with a different CLI surface that runs inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
 
 When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware and there is a single daemon running for the project. Daemon runs task reconciliation, CI checks, PR comment harvesting and so on in the background and is the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check daemon state through `lazy daemon` commands.
 
@@ -93,10 +94,10 @@ Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the
 
 `lazy` is being actively developed. You can contribute by:
 
-- Sending me feedback at [feedback@getlazy.dev](feedback@getlazy.dev)
+- Sending me feedback at [feedback@getlazy.dev](mailto:feedback@getlazy.dev)
 - Reporting [bugs or feature](https://github.com/getlazy/lazy/issues) requests
 - Submitting [**Prompt** Requests](https://github.com/getlazy/lazy/issues) for fixes or enhancements.
-- Testing experimental features - if you are interested, send me an email to [testing@getlazy.dev](testing@getlazy.dev)
+- Testing experimental features - if you are interested, send me an email to [testing@getlazy.dev](mailto:testing@getlazy.dev)
 
 `lazy` is built using `lazy` itself. At this time, I am not accepting code contributions to its code base, which is why "Pull Requests" is not even offered.
 
@@ -118,7 +119,7 @@ Finally, finally, I also decided to make an experiment of building a useful soft
 * **Agents**: rather than working interactively with *coding* agents, `lazy` offers a way to work asynchronously with them *and* interactively with the intelligent orchestrator which is *also* aware of the prompts repository *and* task management features.
 * **Source control**: rather than dealing with low-level pinnings of `git`, `lazy` wraps these mechanics into a task lifecycle management.
 
-I see a lot of people building and running their own orchestration layer and I think it's great. I expected this and I'm certainly not part of the 1st wave but more of "fine, I'll do it myself" wave. I expect this trend to continue leading to fragmentation the likes of which we have not see since Linux distro ecosystem bloom.
+I see a lot of people building and running their own orchestration layer and I think it's great. I expected this and I'm certainly not part of the 1st wave but more of "fine, I'll do it myself" wave. I expect this trend to continue leading to fragmentation the likes of which we have not seen since Linux distro ecosystem bloom.
 
 ### Why name it `lazy`?
 
@@ -139,9 +140,9 @@ I hope you get as much fun from this (or more!) as I have.
 
 ### Why Not Just Use <X>?
 
-See above. Plus building building `lazy` is fun, building with `lazy` is fun and building `lazy` with `lazy` is *extra* fun. Occasionally it is also *extra* frustrating but hey, what is programming if not a perpetual act of [frustration](https://x.com/CodeWisdom/status/1452004401774739464).
+See above. Plus building `lazy` is fun, building with `lazy` is fun and building `lazy` with `lazy` is *extra* fun. Occasionally it is also *extra* frustrating but hey, what is programming if not a perpetual act of [frustration](https://x.com/CodeWisdom/status/1452004401774739464).
 
-### At what is `lazy` particularly good at compared to native Claude Code?
+### What is `lazy` particularly good at compared to native Claude Code?
 
 From the point of view of the quality of one-shot code or similar - nothing whatsoever. From the point of view of experience of software development, where Claude Code aptly leverages subagents to launch work in the background, `lazy` uses its task system to do the same. `lazy` plans the work and fires off tasks and then gives *you* the control to do something else while the task or tasks are running. The difference, to me, is similar to the difference between real-time strategy games, where your reflexes dominate the outcome (how many times *today* have you slammed ESC to stop Claude Code going off the rails?), to turn-based strategy games, where you asynchronously plan and make your moves and then let the opponent take its turn. To me, it is liberating to review after the agent's turn, instead of watching reams of text fly by, hoping to gain some semblance of control.
 
@@ -152,15 +153,15 @@ Beside that, `lazy` does a lot of little "quality of life" things that are other
 * After agent's turn `lazy` checks agent's work for file permission violations in order to make potential reward hacking (e.g. deleting tests it doesn't "like") obvious and rejectable by default.
 * `lazy` has specific verbs and specialized prompts for different types of tasks, similar to skills but that go well beyond that. For example, there is a built-in `redo` command which acts like smart rebase redoing the work already done, from scratch, on top of latest HEAD, repeating the exact same goal and prompt.
 
-### At what is `lazy` particularly bad at?
+### What is `lazy` particularly bad at?
 
-Originally, it was really annoying when I would be preparing a new release and I doing a lot of integration tests. This polishing would expose a number of smaller issues which in stable state are fine to fire off as small tasks but when you are trying to release, it becomes too heavy handed. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. But now you can use `lazy pair` without task ID, right on the branch that you want to modify (e.g. `release-v011`) and with it can go back to working in the traditional "micro-management" style which feels exactly right for small, last minute polishing tasks.
+Originally, it was really annoying when I would be preparing a new release and doing a lot of integration tests. This polishing would expose a number of smaller issues which in stable state are fine to fire off as small tasks but when you are trying to release, it becomes too heavy handed. The whole thing that makes `lazy` great to use in normal process, is what makes it not great to use when you have a number of very small issues that need more interactive polishing. But now you can use `lazy pair` without task ID, right on the branch that you want to modify (e.g. `release-v011`) and with it can go back to working in the traditional "micro-management" style which feels exactly right for small, last minute polishing tasks.
 
 Another thing that is annoying are bootstrapping failures: `lazy` failing so hard that I cannot fix it using `lazy`. But that is very rare these days and besides, it's only annoying to me.
 
 ### Why use Docker?
 
-I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastrophic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonomously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding `builder` layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of stopping to use LLMs to write code.
+I want to make the default onboarding path both safe and easy and I think docker is well established in the software development. Docker is not universally loved but it pretty much universally **used**. And it gave me one crucial thing: agents are isolated from the host's file system which minimizes the chances of catastrophic consequences of prompt injections. *They* could of course be prompt injected, they have access to the network after all and run autonomously. But the only way for them to affect your host machine is by injecting behavior into the code which you then blindly run on your box. By adding `builder` layer, which also runs isolated, as the first reviewer, I again lowered the chances of such attacks passing through. This doesn't eliminate them but I don't see how to eliminate that short of refusing to use agents to write code.
 
 ## The Details
 
@@ -384,6 +385,8 @@ An interactive session with Claude Code with the addition of `lazy`'s own system
 
 In `builder` mode, the assistant is strongly encouraged to *not* do anything itself but rather to create tasks and coordinate work of agents working on those tasks. It is actually *so* discouraged that I mount the repo as read-only into `builder`'s container.
 
+It does get one writable place — `~/.lazy/scratch/<project>/`, outside the repo entirely — for artifacts meant for *you*: a long accept message, a draft doc, a data dump. It can never be committed and no agent can read it. See [docs/builder-scratch-dir.md](docs/builder-scratch-dir.md).
+
 The user <-> `builder` <-> agent relationship follows a clear division of labor:
 
 - The **user** sets direction and make decisions, plan larger work ("release so and so will have features this and that")
@@ -396,10 +399,12 @@ The typical workflow:
 
 - You tell the `builder` what you want and you chat about it a bit
 - `builder` offers to create certain tasks, and then starts them thus launching agents
-- Agents work in autonomously and in parallel until they finish or need guidance, and `builder` and you review the results.
+- Agents work autonomously and concurrently until they finish or need guidance, and `builder` and you review the results.
 - You either accept or provide feedback at which point agents continue their work.
 
 Use `lazy blocked` to see what's ready for review, and `lazy loop` to review everything in sequence. Or ask the `builder` to wait for the tasks and let you know what it thinks of the work.
+
+To work through a curated pile of small tasks instead, give `lazy loop` the list: `lazy loop fix-a fix-b fix-c` starts each one in turn, waits for it, shows you the review gate, and moves on when you decide. `--backlog --parent <hub>` picks the list for you; `--pipeline` starts the next task while you review the current one. See [docs/design/loop-queue-mode.md](docs/design/loop-queue-mode.md).
 
 ### Agents
 
@@ -496,7 +501,7 @@ lazy review -i <task-id>
 
 This allows you to read the agent's summary of the last turn, ask questions about parts of it (by splitting hunks similar to the way `git add -p` does) and provide direct feedback to the agent that it should take on the next turn.
 
-When you only have one question and don't want the TUI, `lazy ask` runs the same read-only, plan-mode turn from the command line:
+When you only have one question and don't want the TUI, `lazy ask` runs the same read-only, reflective turn from the command line — the agent reflects and answers, it does not act:
 
 ```
 lazy ask <task-id> --message "why did you drop the retry?"
@@ -508,6 +513,16 @@ lazy ask <task-id> -m "summarize your diff" --json  # {taskId, answer, sessionId
 The task must be `blocked` or `conflict` and must have run at least once. The answer goes to stdout and progress to stderr, so it pipes cleanly. The ask never unblocks the task, commits, or touches the worktree — the task's status is restored when the answer comes back.
 
 With no `--message` and nothing piped, `$EDITOR` opens for the question, so a pasted stack trace or diff hunk keeps its line breaks. As everywhere else in `lazy`, what you type is saved to `.lazy/recovery/` before it is sent and is only discarded once the agent has answered.
+
+And when one question turns into a conversation, `lazy chat` is the interactive version of the same thing. Three commands, one axis — how much you want to say, and whether the agent may act:
+
+| Command | Shape | Agent may act? |
+| --- | --- | --- |
+| `lazy ask <task-id>` | one question, one answer, back to your prompt | no — reflective, read-only |
+| `lazy chat <task-id>` | interactive conversation until you exit | no — reflective, read-only |
+| `lazy pair <task-id>` | interactive, you drive the work | yes — edits, commands, commits |
+
+`ask` and `chat` never change the task: same status before and after, no commits, no worktree writes. `pair` is the escape hatch for when you want to take over ([below](#collaborative-pairing)).
 
 ### Follow ups
 
@@ -581,7 +596,7 @@ The memories are automatically injected into the agent's prompt and so they do u
 
 ### Reports
 
-Usually I work on multiple initiatives within the same project and my knowledge is usually more shallow than engineering level. Hence I act more either as a lead engineer or engineering manager and `lazy report` allows me to deliberately pass over the details one more time by going over the `lazy` tasks *and* independent commits and summarizing them ()
+Usually I work on multiple initiatives within the same project and my knowledge is usually more shallow than engineering level. Hence I act more either as a lead engineer or engineering manager and `lazy report` allows me to deliberately pass over the details one more time by going over the `lazy` tasks *and* independent commits and summarizing them.
 
 ```bash
 # To generate report and dump it as Markdown into stdout
@@ -733,19 +748,26 @@ After that I can unblock it or edit its model maybe and similar. But see below w
 
 #### Re `watch` and `stop` in spite of `lazy`'s asynchronous paradigm
 
-I consider the use of these actions a smell because it goes directly against the async first nature of `lazy`. So why even build them? I didn't at first but over time it became clear that for it's useful to sometimes observe the agent in its work, mostly for troubleshooting but sometimes things are taking much longer and I start to wonder. As for `stop`, honestly I rarely if ever want to change the direction for the agent: I think we are better off, all told, if we don't micromanage but again follow the async model. But rarely but sometimes the agent was started by the builder onto a truly wrong path or at the wrong time or something has gone astray e.g. same as with `watch` you want to observe it and sometimes, just sometimes you want to stop the agent.
+I consider the use of these actions a smell because it goes directly against the async first nature of `lazy`. So why even build them? I didn't at first but over time it became clear that it's useful to sometimes observe the agent in its work, mostly for troubleshooting but sometimes things are taking much longer and I start to wonder. As for `stop`, honestly I rarely if ever want to change the direction for the agent: I think we are better off, all told, if we don't micromanage but again follow the async model. But rarely but sometimes the agent was started by the builder onto a truly wrong path or at the wrong time or something has gone astray e.g. same as with `watch` you want to observe it and sometimes, just sometimes you want to stop the agent.
 
 So occasionally useful but if you find yourself using them more than a few times a week, I recommend trying to calibrate the model, effort, check how well prompts are written for your use case and so on. And of course, I would love to hear about it.
 
-### Historic Context
+### Chatting With an Agent
 
-I occasionally want to go back to the closed tasks and, similar to pairing, chat directly with the agent that performed the work:
+Sometimes one `lazy ask` question is not enough and you want a conversation — but you don't want the agent to *do* anything. That's `lazy chat`:
 
 ```bash
-lazy chat <finished-task-id>
+lazy chat <task-id>
 ```
 
-In this mode, there is no worktree and agent itself is running in planning mode, without access to things like bash and so on, and on a lower effort level by default (which you can override with `--effort`). This is useful to ask questions and understand more of the context and not to perform work, obviously, as the task has already been closed.
+The agent runs in a **reflective** mode: it reflects, looks things up and answers, but bash, edits and writes are denied outright, so exiting the mode inside Claude Code still buys no write access. Effort defaults to `medium` (override with `--effort`), because reflection is cheap compared to work.
+
+One command covers two situations, chosen from the task's own state:
+
+- **A paused task** (`blocked` or `conflict`) — its live session is resumed in its worktree, so the agent has the code in front of it. The task is left exactly as it was: same status, no commits, no worktree writes, no turn recorded. While the chat is open lazy holds the task's worktree lock, so a `start`/`unblock`/`sync` (yours or the daemon's) cannot begin a turn underneath you; those commands refuse until you exit.
+- **A finished task** — there is no worktree any more, so the session captured when the task closed is rehydrated and resumed in the project root. This is the "go back and understand what happened" mode.
+
+Either way the conversation is captured back into lazy storage when you exit, so it is searchable later.
 
 ### Confirmation Protocol
 
@@ -792,7 +814,7 @@ As [Herb Sutter](https://herbsutter.com/) memorably put it in his 2009 [Sharing 
 
 > Sharing requires waiting and overhead, and is a natural enemy of scalability
 
-Amen. He was (mostly) talking about runtime concurrency of a software system but concurrency in the process of a software engineer team has the same shape: different agents share the same resource, repository, and they must contend with each other to update the release branch in order to release their changes. `lazy` tries to deal with this by allowing working trains, where feature branches are branched off other feature branches that are still in flight, and so on, so that the changes can propagate with minimal differences throughout the code base. This is all happening without you paying attention to it, because the system moves forward together on every turn. And if you prefer *not* to do it that way, you simply branch of new features off the default branch and the upstream will be merged into the feature when you give the feature's main task another turn.
+Amen. He was (mostly) talking about runtime concurrency of a software system but concurrency in the process of a software engineer team has the same shape: different agents share the same resource, repository, and they must contend with each other to update the release branch in order to release their changes. `lazy` tries to deal with this by allowing working trains, where feature branches are branched off other feature branches that are still in flight, and so on, so that the changes can propagate with minimal differences throughout the code base. This is all happening without you paying attention to it, because the system moves forward together on every turn. And if you prefer *not* to do it that way, you simply branch new features off the default branch and the upstream will be merged into the feature when you give the feature's main task another turn.
 
 ### Shell
 
@@ -897,17 +919,19 @@ lazy wait task-1 task-2 task-n # First to finish will stop this
 
 ### Web Interface
 
-`lazy` has read-only, highly experimental, not anywhere near mature, web interface. To see run:
+`lazy` has an experimental web interface, built into the deaemon. To visit it, run:
 
 ```bash
-lazy server
+open $(lazy daemon dashboard-url) # opens your default browser at the dashboard URL
 ```
 
-The command will indicate the port on which it is running.
-
-It looks like this:
+`lazy daemon dashboard-url` prints the dashboard's URL, or exits with an error if the daemon isn't running (`lazy daemon start` to start it).
 
 ![web-ui-task](./images/web-ui-task.png)
+
+It's ugly as a sin but it has some interesting features of which the most interesting to me is asking agents directly from the task diff review, on exact line that one is interested in:
+
+![ask-agent](./images/ask-agent.png)
 
 ### Task Types
 
@@ -969,6 +993,17 @@ lazy system build lazy-runner
 This bypasses the current project's `lazy.toml` and builds the base image
 directly. Add `--no-cache` to force a clean rebuild.
 
+### Runner images are tagged with the lazy release version
+
+Every image lazy builds is tagged with the `lazy`'s <major>.<minor> release version
+e.g. `lazy-runner:0.20.0`, not `lazy-runner:latest`. You can always rebuild the image
+with `lazy upgrade` but even if you don't, `lazy` will automatically rebuild every 14
+days to or if it notices a change in `Dockerfile.lazy`.
+
+Older images stay on disk as build cache and for older `lazy` versions on the same host.
+`lazy doctor` lists them with their sizes and the `docker image rm` command to reclaim
+the space.
+
 ### "ANTHROPIC_API_KEY not set"
 
 Export your API key:
@@ -1025,11 +1060,11 @@ This can happen when there is a daemon from a deleted project squatting on a por
 - **Self-diagnosis**: Run `lazy doctor` to check installation, authentication, Docker, and driver configuration
 - **Command help**: `lazy <command> --help` for usage details
 - **System prompts**: `lazy system prompts` to see what instructions agents receive
-- **Prebuild base image**: `lazy system build lazy-runner` for projects whose `Dockerfile.lazy` uses `FROM lazy-runner`
+- **Prebuild base image**: `lazy system build lazy-runner` for projects whose `Dockerfile.lazy` uses `FROM lazy-runner` (built as `lazy-runner:<lazy version>`, plus a `:latest` alias)
 - **Issues**: Report bugs at [github.com/getlazy/lazy/issues](https://github.com/getlazy/lazy/issues)
 
 ## Links
 
 - **Repository**: [github.com/getlazy/lazy](https://github.com/getlazy/lazy)
 - **Issues**: [github.com/getlazy/lazy/issues](https://github.com/getlazy/lazy/issues)
-- **Claude Code**: [claude.ai/claude-code](https://claude.ai/claude-code)
+- **Claude Code**: [code.claude.com](https://code.claude.com)

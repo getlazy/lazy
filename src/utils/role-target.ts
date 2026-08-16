@@ -106,21 +106,23 @@ export function targetForSurface(target: RoleTarget, surface: LaunchSurface): Ro
   return adapted;
 }
 
-/**
- * Read the Anthropic credential from the process environment.
+/*
+ * REMOVED: `anthropicEnvVarsFromProcess()`.
  *
- * The canonical, *throwing* version is ClaudeCodeAgent.getAuthEnvVars() — used at
- * launch time where a missing credential is fatal. This reader is deliberately
- * tolerant (returns []): it is used where the daemon credential gate, not this
- * function, is the enforcement point.
+ * It read the Anthropic credential out of the CLIENT process's own environment,
+ * and its only callers were `lazy pair` (×2) and `lazy chat` — the three
+ * interactive host launches. That is the wrong source: the daemon owns the
+ * credential (see daemon/credential-gate.ts), so a shell exporting nothing —
+ * the normal case in a daemon-only-env setup, and what any freshly opened
+ * terminal looks like — silently handed Claude Code no credential at all and
+ * left it to fall through to the host store or a `/login` prompt.
+ *
+ * All three now go through `src/cli/interactive-auth.ts`, which sources the
+ * credential from the daemon over RPC. The function is deleted rather than left
+ * exported-but-unused so the next launch surface cannot reach for it: a tolerant
+ * reader that returns `[]` on a missing credential looks safe at the call site
+ * and is exactly what made this failure silent. Use `resolveAuthEnvFromDaemon`.
  */
-export function anthropicEnvVarsFromProcess(): AuthEnvVar[] {
-  const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (oauth) return [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauth }];
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (apiKey) return [{ key: 'ANTHROPIC_API_KEY', value: apiKey }];
-  return [];
-}
 
 /**
  * Env vars that keep Claude Code stable when pointed at a local backend that

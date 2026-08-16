@@ -11,6 +11,13 @@
  * record asynchronously, then forwards. The audit enqueue returns immediately —
  * no blocking I/O on the hot path.
  *
+ * Token usage is captured on both response paths (src/proxy/usage.ts). The
+ * enforcement path already buffers the body, so it just parses it. The
+ * streaming path tees the body: each chunk is forwarded to the client before
+ * the usage scanner sees it, nothing is buffered, and the audit record is
+ * enqueued when the stream ends. Only the terminal-error path (no response at
+ * all) records `usage: null`, because there genuinely is none.
+ *
  * Smart routing (opt-in): when `fallbacks` is configured, a primary that returns
  * 429/529 or is unreachable is rerouted to the next fallback target in order,
  * re-sending the (already-buffered) request body. Failover is EXPLICIT — it only
@@ -29,10 +36,11 @@
  */
 
 import { randomUUID } from 'crypto';
-import type { ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
+import type { ProxyAuditRecord, ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
 import { extractRequest } from './extractor';
 import { AuditQueue, type AuditSink } from './audit';
 import { enforceResponseBody } from './enforce';
+import { extractUsage, teeUsageStream } from './usage';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from './policy';
 import { logger } from '../utils/logger';
 
@@ -397,13 +405,18 @@ export function createProxyServer(
           }
         }
 
+        // The body is already buffered here, so usage is a straight read. Parse
+        // it from the ORIGINAL upstream text, not the rewritten one: a denial
+        // rewrite changes content, never the tokens the upstream billed.
+        const usage = extractUsage(isStream, respText);
+
         const durationMs = Date.now() - startMs;
         auditQueue.enqueue({
           id, seq: currentSeq, ts: startMs, role, taskId, backend: 'proxy', upstream: finalTarget.upstream,
           method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
           tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
           toolUses: extracted.toolUses, toolResults: extracted.toolResults,
-          status, usage: null, stopReason: enforced.stopReason, error: null, durationMs,
+          status, usage, stopReason: enforced.stopReason, error: null, durationMs,
           reroute, enforcement,
         });
 
@@ -416,8 +429,10 @@ export function createProxyServer(
 
       const durationMs = Date.now() - startMs;
 
-      // Enqueue audit record; fire-and-forget — never awaited on the hot path
-      auditQueue.enqueue({
+      // Everything about the record except `usage` is known now. `durationMs`
+      // deliberately stays "time to the upstream's response", not "time until
+      // the stream drained" — same number this record has always carried.
+      const record: ProxyAuditRecord = {
         id,
         seq: currentSeq,
         ts: startMs,
@@ -435,17 +450,42 @@ export function createProxyServer(
         toolUses: extracted.toolUses,
         toolResults: extracted.toolResults,
         status,
-        usage: null,     // response body is streamed through; usage captured in a future tier
+        usage: null,
         stopReason: null,
         error: null,
         durationMs,
         reroute,
         enforcement: null,
+      };
+
+      // Only a successful /v1/messages response carries token usage. For
+      // everything else (count_tokens, non-2xx, empty body) enqueue immediately
+      // and hand back the upstream stream untouched, exactly as before.
+      const canCaptureUsage =
+        extracted.endpoint === 'messages' && upstreamResp.ok && upstreamResp.body != null;
+
+      if (!canCaptureUsage) {
+        // Fire-and-forget — never awaited on the hot path.
+        auditQueue.enqueue(record);
+        return new Response(upstreamResp.body, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: respHeaders,
+        });
+      }
+
+      // Tee the body: every chunk is forwarded to the client BEFORE the scanner
+      // sees it, so this adds no latency and buffers nothing. The audit record
+      // is enqueued when the stream ends (or is cancelled/errors), with the
+      // usage the scanner observed.
+      const respContentType = upstreamResp.headers.get('content-type') ?? '';
+      const respIsStream =
+        respContentType.includes('text/event-stream') || extracted.stream === true;
+      const teed = teeUsageStream(upstreamResp.body!, respIsStream, (usage) => {
+        auditQueue.enqueue({ ...record, usage });
       });
 
-      // Stream the response body UNTOUCHED — return the upstream ReadableStream
-      // directly.
-      return new Response(upstreamResp.body, {
+      return new Response(teed, {
         status: upstreamResp.status,
         statusText: upstreamResp.statusText,
         headers: respHeaders,

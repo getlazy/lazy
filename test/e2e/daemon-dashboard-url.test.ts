@@ -2,12 +2,12 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 
-describe('lazy server', () => {
+describe('lazy daemon dashboard-url', () => {
   let ctx: TestContext;
 
-  // `lazy server` is a thin alias for the daemon's built-in web dashboard, so
-  // every test needs a real daemon running. The daemon serves the dashboard on
-  // its TCP web port; `lazy server` only ensures it's up and prints the URL.
+  // `lazy daemon dashboard-url` reads the running daemon's web dashboard port
+  // and prints its URL. Unlike the old `lazy server` alias, it does NOT
+  // auto-start the daemon — every test needs a real one running already.
   beforeEach(async () => {
     ctx = await setupTestLazy({ withDaemon: true });
   });
@@ -16,43 +16,47 @@ describe('lazy server', () => {
     await ctx.cleanup();
   });
 
-  // Run `lazy server` and return the dashboard base URL it prints. The daemon
-  // (started in beforeEach) is already serving the dashboard, so this returns
-  // promptly — there is no standalone server to spawn or tear down.
+  // Run `lazy daemon dashboard-url` and return the URL it prints.
   async function dashboardUrl(): Promise<string> {
-    const result = await ctx.lazy(['server']);
+    const result = await ctx.lazy(['daemon', 'dashboard-url']);
     expect(result.exitCode).toBe(0);
     // The daemon binds to 127.0.0.1 (loopback) by default, so the printed URL
     // uses the real interface, not a hardcoded `localhost` (which can resolve
     // to IPv6 ::1 and miss the IPv4 bind).
-    const match = result.stdout.match(/Web dashboard: (http:\/\/[\d.]+:\d+)/);
+    const match = result.stdout.match(/(http:\/\/[\d.]+:\d+)/);
     if (!match) {
-      throw new Error(`No web dashboard URL in output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+      throw new Error(`No dashboard URL in output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
     }
     return match[1];
   }
 
-  // INVARIANT: `lazy server` is a daemon alias — it does NOT start a standalone
-  // server. It ensures the daemon is running and prints the daemon's dashboard
-  // URL, then exits. The standalone/--port mode was removed (it was undocumented
-  // and at odds with the daemon-single-writer architecture).
-  test('prints the daemon dashboard URL and exits', async () => {
-    const result = await ctx.lazy(['server']);
+  // INVARIANT: prints ONLY the URL (no "Web dashboard:" label or other text) —
+  // this is a scripting-oriented command, e.g. `open $(lazy daemon dashboard-url)`.
+  test('prints just the daemon dashboard URL and exits 0', async () => {
+    const result = await ctx.lazy(['daemon', 'dashboard-url']);
     expect(result.exitCode).toBe(0);
     // INVARIANT: the URL reflects the actual loopback bind (127.0.0.1), not a
     // hardcoded `localhost` — `localhost` can resolve to IPv6 ::1 and fail to
     // reach the IPv4-only 127.0.0.1 bind, leaving the user on an empty page.
-    expect(result.stdout).toContain('Web dashboard: http://127.0.0.1:');
-    expect(result.stdout).not.toContain('http://localhost:');
+    expect(result.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   });
 
-  // INVARIANT: the standalone/--port flag is gone. `lazy server` takes no flags.
-  test('no longer advertises a --port flag in help', async () => {
-    const result = await ctx.lazy(['server', '--help']);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('Show the web dashboard URL');
-    expect(result.stdout).not.toContain('--port');
-    expect(result.stdout).not.toContain('standalone');
+  // INVARIANT: unlike the old `lazy server` alias, dashboard-url does NOT
+  // auto-start the daemon — it just reports what's there (or isn't), the same
+  // posture as `lazy daemon status`.
+  test('exits non-zero and does not start a daemon when none is running', async () => {
+    // Fresh project with no daemon started.
+    const bare = await setupTestLazy();
+    try {
+      const result = await bare.lazy(['daemon', 'dashboard-url']);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('daemon is not running');
+
+      const status = await bare.lazy(['daemon', 'status']);
+      expect(status.stdout).toContain('Daemon is not running');
+    } finally {
+      await bare.cleanup();
+    }
   });
 
   test('dashboard responds to HTTP requests on the daemon web port', async () => {
@@ -65,7 +69,7 @@ describe('lazy server', () => {
     expect(Array.isArray(data)).toBe(true);
   });
 
-  test('non-server commands still exit cleanly', async () => {
+  test('non-daemon commands still exit cleanly', async () => {
     const start = Date.now();
     const result = await ctx.lazy(['list']);
     const elapsed = Date.now() - start;

@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { TmuxDriver } from '../../src/terminal/tmux';
 import { VanillaTerminalDriver } from '../../src/terminal/vanilla';
-import { createTerminal, tmuxSessionName } from '../../src/terminal';
+import { createTerminal } from '../../src/terminal';
 
 describe('VanillaTerminalDriver', () => {
   test('isRich is false', () => {
@@ -59,12 +59,5 @@ describe('createTerminal factory', () => {
     const terminal = createTerminal();
     expect(terminal.isRich).toBe(false);
     expect(terminal).toBeInstanceOf(VanillaTerminalDriver);
-  });
-});
-
-describe('tmuxSessionName', () => {
-  test('generates predictable session name', () => {
-    expect(tmuxSessionName('abc12345')).toBe('lazy-abc12345');
-    expect(tmuxSessionName('fix-auth')).toBe('lazy-fix-auth');
   });
 });

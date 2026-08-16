@@ -5,7 +5,7 @@
  * This is the crux of the "OTel API surface without the OTel pipeline"
  * approach: we reuse the battle-tested tracer/context/propagation machinery
  * but own the tail end (persistence + query) so timings are answerable by
- * lazy itself (`lazy timings`).
+ * lazy itself (`lazy stats timings`).
  */
 import { hrTimeToMilliseconds } from '@opentelemetry/core';
 import type { ExportResult } from '@opentelemetry/core';

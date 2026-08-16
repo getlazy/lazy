@@ -14,6 +14,10 @@ import type { StatusChange, TagEvent } from '../../storage/types';
 import type { SupervisorStatus } from '../../protocol/types';
 import type { AgentFailureClass } from '../../agent/failure-taxonomy';
 import { parentTaskIdOf } from '../../task-target';
+import { readWorktreeMergeState, isMidMerge, describeMergeState, type WorktreeMergeState } from '../../git/operations';
+import { getWorktreePathForRef } from '../helpers';
+import { pathExists } from '../../utils/fs';
+import { TERMINAL_STATUSES } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
 import { showFileViewer } from '../tui/file-viewer';
@@ -21,6 +25,13 @@ import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
 import { logger } from '../../utils/logger';
 import { existsSync, readFileSync } from 'fs';
 import { turnText } from '../../utils/turn-content';
+import { loadConfig } from '../../config/loader';
+import {
+  loadTaskProtectionStatus,
+  protectionSummary,
+  protectionAdvice,
+  type TaskProtectionStatus,
+} from '../../protection/status';
 
 /**
  * Pre-loaded data for building task show output.
@@ -58,6 +69,24 @@ export interface TaskShowData {
    * can be derived. Shares the single derivation used by ls/blocked/active/watch.
    */
   workingSubstate: WorkingSubstate | null;
+  /**
+   * Merge state of the task's worktree, when one exists on disk.
+   *
+   * INVARIANT (fix-sync-silent-conflict): a task whose worktree is mid-merge must
+   * SAY so. A stranded merge used to be invisible on every status surface — the
+   * task read as a plain `blocked` and the only symptom was accept refusing much
+   * later with the wrong reason. Null when there is no worktree to read.
+   */
+  mergeState: WorktreeMergeState | null;
+  /**
+   * Read-only branch-protection status (add-protection-surfacing): is this
+   * task's accept gated, and does a `lazy approve` already sit pending?
+   *
+   * Null when no project root was available to read config/git from (e.g. the
+   * search command's line-number computation), NOT when nothing is protected —
+   * an unprotected task carries a status object saying so.
+   */
+  protection: TaskProtectionStatus | null;
 }
 
 /**
@@ -99,6 +128,19 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     }
   }
 
+  // Read the worktree's merge state for any task that still has a worktree. This
+  // is two cheap git calls and it is the ONLY thing that makes a stranded merge
+  // visible before accept trips over it (fix-sync-silent-conflict).
+  let mergeState: WorktreeMergeState | null = null;
+  if (root && !TERMINAL_STATUSES.has(task.status)) {
+    try {
+      const wt = getWorktreePathForRef(root, taskRef(task));
+      if (await pathExists(wt)) mergeState = await readWorktreeMergeState(wt);
+    } catch (err) {
+      logger.debug(`Task ${shortId(task.id)}: could not read worktree merge state: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   const turns = sess ? await storage.getSessionTurns(sess.id) : [];
   const commits = sess ? await storage.getSessionCommits(sess.id) : [];
   const comments = await storage.getTaskComments(task.id);
@@ -132,7 +174,22 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     // Non-critical
   }
 
-  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate };
+  // Branch-protection status. Read-only and best-effort: a project whose
+  // config or git we cannot read must still show the task, so this degrades to
+  // null rather than failing the command.
+  let protection: TaskProtectionStatus | null = null;
+  if (root) {
+    try {
+      const config = await loadConfig(root);
+      protection = await loadTaskProtectionStatus(storage, config, root, task, {
+        hasBranch: Boolean(sess?.git_branch),
+      });
+    } catch (err) {
+      logger.debug(`Task ${shortId(task.id)}: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection };
 }
 
 /**
@@ -145,7 +202,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * rendering is identical in both modes — only the grouping/headers differ.
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showChunks = false): string[] {
-  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
@@ -173,6 +230,28 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
   }
   outputLines.push(`  ${theme.label('Goal:')}    ${task.goal}`);
   outputLines.push(`  ${theme.label('Status:')}  ${theme.status(taskStatusText)}`);
+  // A mid-merge worktree is reported next to the status, because it CONTRADICTS
+  // it: `blocked` reads as "settled, waiting for you", and this says otherwise.
+  if (mergeState && isMidMerge(mergeState)) {
+    outputLines.push(
+      `  ${theme.label('Worktree:')} ${theme.warning(`unresolved merge — ${describeMergeState(mergeState)}`)}`,
+    );
+    outputLines.push(
+      `            ${dim(`A sync did not finish. Run \`lazy sync ${displayId(task)}\` to complete it.`)}`,
+    );
+  }
+  // Branch protection, next to the status because it is a fact about what this
+  // task can DO — a gated task reads as "ready to accept" until the accept is
+  // refused. Printed only when there is something to say, so an unprotected
+  // project's `show` output is byte-for-byte what it was.
+  const protectionValue = protection ? protectionSummary(protection) : null;
+  if (protection && protectionValue) {
+    const paint = protection.gated ? theme.warning : dim;
+    outputLines.push(`  ${theme.label('Protected:')} ${paint(protectionValue)}`);
+    for (const line of protectionAdvice(protection, displayId(task))) {
+      outputLines.push(`             ${dim(line)}`);
+    }
+  }
   outputLines.push(`  ${theme.label('Model:')}   ${theme.model(task.model ?? '-')}`);
   outputLines.push(`  ${theme.label('Agent:')}   ${task.agent_id}`);
   outputLines.push(`  ${theme.label('Type:')}    ${task.type ?? 'task'}`);
@@ -310,7 +389,23 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
         const usageSuffix = turn.usage
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
           : '';
-        const modelSuffix = turn.model && turn.model !== task.model ? ` | ${turn.model}` : '';
+        // Per-turn launch labels. `model` is the REQUEST-side resolution (usually
+        // a tier alias) and is only worth printing when it departs from the task's
+        // current model — that is the mid-task override a reviewer needs to see.
+        // `model_id` is what the agent itself reported, so it prints whenever it
+        // says something the alias doesn't. `effort` prints whenever recorded.
+        const launchLabels: string[] = [];
+        if (turn.model && turn.model !== task.model) launchLabels.push(turn.model);
+        if (turn.model_id && turn.model_id !== turn.model) launchLabels.push(turn.model_id);
+        if (turn.effort) launchLabels.push(`effort: ${turn.effort}`);
+        // What the agent reported about its own lazy tools at session start.
+        // Printed only when it is NEWS — i.e. the turn ran with no lazy tools —
+        // since the healthy case is every turn and would be pure noise. Absent
+        // (older turns, agents that report nothing) prints nothing at all.
+        if (turn.mcp_tools && / tools=0$/.test(turn.mcp_tools)) {
+          launchLabels.push(theme.error(`no lazy tools (${turn.mcp_tools})`));
+        }
+        const modelSuffix = launchLabels.length > 0 ? ` | ${launchLabels.join(' | ')}` : '';
         const checkSuffix = turn.check_exit_code !== undefined
           ? (turn.check_exit_code === 0
             ? ` | ${theme.status('check: OK')}`
@@ -736,7 +831,7 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
 
 /** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
 function buildShowJson(data: TaskShowData): Record<string, unknown> {
-  const { task, session: sess, turns, commits, comments, journal, followUps, children, retryStatus, autoReactStatus } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, children, retryStatus, autoReactStatus, mergeState } = data;
 
   const jsonData: Record<string, unknown> = {
     id: task.id,
@@ -776,6 +871,14 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       timestamp: t.timestamp,
       usage: t.usage,
       model: t.model ?? null,
+      // Null, not the alias, when the agent reported no concrete id — a consumer
+      // labelling experiment arms must be able to tell "ran on this exact model"
+      // from "we only ever knew the tier alias".
+      model_id: t.model_id ?? null,
+      effort: t.effort ?? null,
+      // Null means "never observed" (older turn, or an agent that reports no
+      // tool list) — deliberately distinct from an observed `tools=0`.
+      mcp_tools: t.mcp_tools ?? null,
       auto_triggered: t.auto_triggered ?? false,
       ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
       ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
@@ -814,6 +917,16 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
 
   if (autoReactStatus) {
     jsonData.auto_react_status = autoReactStatus;
+  }
+
+  // A scripted consumer must be able to see a stranded merge too — the text
+  // output is not the only surface that used to lie (fix-sync-silent-conflict).
+  if (mergeState && isMidMerge(mergeState)) {
+    jsonData.merge_state = {
+      merge_in_progress: mergeState.mergeInProgress,
+      unmerged_files: mergeState.unmergedFiles,
+      summary: describeMergeState(mergeState),
+    };
   }
 
   return jsonData;

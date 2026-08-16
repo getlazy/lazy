@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from '../../src/utils/spawn';
@@ -34,7 +34,17 @@ describe('resolveGitMountPaths', () => {
   let worktree: string;
 
   beforeAll(async () => {
-    root = await mkdtemp(join(tmpdir(), 'lazy-git-mounts-'));
+    // realpath, because these tests compare git's answers against paths we
+    // compose ourselves. `git rev-parse --path-format=absolute` reports paths
+    // rooted at the process's real cwd, with every symlink already resolved —
+    // so on a host whose temp dir is reached through one, a hand-composed
+    // `join(repo, '.git')` names the same directory by a spelling git will
+    // never print. macOS is exactly that host: `tmpdir()` is `/var/folders/…`
+    // and `/var` is a symlink to `/private/var`, so the comparison failed there
+    // while passing in Linux containers, where `/tmp` is a real directory.
+    // Resolving once here keeps the assertions about mount SPLIT rather than
+    // about path spelling.
+    root = await realpath(await mkdtemp(join(tmpdir(), 'lazy-git-mounts-')));
     repo = join(root, 'repo');
     worktree = join(root, 'wt');
     await mkdir(repo, { recursive: true });

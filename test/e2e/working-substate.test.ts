@@ -26,7 +26,7 @@ import { mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createStorage } from '../../src/storage';
 import type { Storage } from '../../src/storage';
-import { protocolDir as getProtocolDir } from '../../src/protocol';
+import { protocolDir as getProtocolDir, writeWaitingFile } from '../../src/protocol';
 import type { SupervisorStatus } from '../../src/protocol';
 import { getHome } from '../../src/utils/home';
 
@@ -259,6 +259,81 @@ describe('working-substate observability', () => {
     expect(result.stdout).toContain('Retry Count:    7');
     expect(result.stdout).toContain('transient_overload — API returned 529');
     expect(result.stdout).toContain('Next Attempt:   in 30s');
+  });
+
+  // INVARIANT: an agent parked inside a blocking lazy tool call renders as
+  // working(waiting on <task>), not working(agent). The marker is written by the
+  // daemon from the authenticated MCP call — nothing here parses agent output.
+  test('ls shows working(waiting on <task>) while a wait is in flight', async () => {
+    const taskId = await makeWorkingTask(ctx, 'waiting task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeWaitingFile(getProtocolDir(taskId), {
+      version: 1,
+      // The test process stands in for the daemon: readers only trust a marker
+      // whose writing pid is alive.
+      daemon_pid: process.pid,
+      waits: [{
+        id: 'w1',
+        tool: 'lazy_wait',
+        targets: ['child-task-id'],
+        labels: ['fix-foo'],
+        started_at: new Date(Date.now() - 2 * 60_000).toISOString(),
+      }],
+    });
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['list']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(waiting on fix-foo');
+  });
+
+  test('status and show render the waiting substate too', async () => {
+    const taskId = await makeWorkingTask(ctx, 'waiting status task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeWaitingFile(getProtocolDir(taskId), {
+      version: 1,
+      daemon_pid: process.pid,
+      waits: [{
+        id: 'w1',
+        tool: 'lazy_wait',
+        targets: ['child-task-id'],
+        labels: ['fix-foo'],
+        started_at: new Date().toISOString(),
+      }],
+    });
+    await writeAlivePidFile();
+
+    const status = await ctx.lazy(['status', taskId]);
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain('working(waiting on fix-foo');
+
+    const show = await ctx.lazy(['show', taskId]);
+    expect(show.exitCode).toBe(0);
+    expect(show.stdout).toContain('waiting on fix-foo');
+  });
+
+  // INVARIANT: a marker left behind by a daemon that is no longer running is a
+  // lie. Readers disbelieve it and fall back to the pre-existing substate.
+  test('a wait marker from a dead daemon is ignored', async () => {
+    const taskId = await makeWorkingTask(ctx, 'stale wait marker task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeWaitingFile(getProtocolDir(taskId), {
+      version: 1,
+      daemon_pid: 2 ** 31 - 1, // no such process
+      waits: [{
+        id: 'w1',
+        tool: 'lazy_wait',
+        targets: ['child-task-id'],
+        labels: ['fix-foo'],
+        started_at: new Date().toISOString(),
+      }],
+    });
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['list']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(agent)');
+    expect(result.stdout).not.toContain('waiting on');
   });
 
   test('status shows working(agent:answering) for an ask-phase task', async () => {

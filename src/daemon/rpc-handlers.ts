@@ -19,6 +19,28 @@
  */
 
 import { existsSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { RpcError } from './rpc-error';
+import {
+  requireString,
+  requireNonBlankString,
+  optionalString,
+  optionalBoolean,
+  optionalNumber,
+  optionalStringArray,
+  optionalEnum,
+} from './rpc-params';
+import {
+  handleReviewQueue,
+  handleReviewDiff,
+  handleReviewComments,
+  handleReviewPostComment,
+  handleReviewRetryAsk,
+  handleReviewWithdrawComment,
+  handleReviewUnblock,
+  handleReviewAccept,
+  handleReviewViolationDecision,
+} from './rpc-review';
 import { loadConfig } from '../config/loader';
 import { getAuthEnvVars } from '../capture/claude';
 import { credentialFromEnv } from './credential-gate';
@@ -35,7 +57,11 @@ import { isStructuredQuery, structuredSearch, buildTagHint } from '../search';
 import { getDiffStat, getDiffFull, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { getNewNotesSince } from '../cli/commands/shared';
 import { getWorktreePath, getBranchNameFromId, displayId, formatDate, shortId } from '../cli/helpers';
+import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
+import { pathExists } from '../utils/fs';
+import { saveConversationWithoutRegression } from '../import/conversation-storage';
 import { launchTask, writeDaemonMcpConfig, type StartTaskParams } from './task-launcher';
+import { raceWait, normalizeWaitInputs } from './wait-race';
 import { revokeBuilderMcpToken } from './mcp-tokens';
 import { hasDaemonContext, getDaemonContext } from './context';
 import type { ProgressEmitter } from './progress';
@@ -54,11 +80,10 @@ import {
   type LimitKey,
 } from './concurrency';
 
-export class RpcError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
-  }
-}
+// RpcError now lives in ./rpc-error so the input-validation helpers can raise
+// it without importing this module. Re-exported here: every existing importer
+// takes it from rpc-handlers.
+export { RpcError };
 
 /**
  * Single long-lived Storage instance for the daemon's project.
@@ -227,6 +252,18 @@ export async function handleRpc(
     case 'revokeDaemonMcpToken': return handleRevokeDaemonMcpToken(projectRoot, params);
     case 'getAuthEnv': return handleGetAuthEnv(projectRoot, params);
     case 'getCredentialState': return handleGetCredentialState(projectRoot, params);
+    // The review surface. In-process this port is injected straight into the
+    // daemon's own web handler; these commands are the same port over the wire,
+    // for a client that is not the daemon (a from-source web UI, a remote one).
+    case 'reviewQueue': return handleReviewQueue(projectRoot);
+    case 'reviewDiff': return handleReviewDiff(projectRoot, params);
+    case 'reviewComments': return handleReviewComments(projectRoot, params);
+    case 'reviewPostComment': return handleReviewPostComment(projectRoot, params);
+    case 'reviewRetryAsk': return handleReviewRetryAsk(projectRoot, params);
+    case 'reviewWithdrawComment': return handleReviewWithdrawComment(projectRoot, params);
+    case 'reviewUnblock': return handleReviewUnblock(projectRoot, params);
+    case 'reviewAccept': return handleReviewAccept(projectRoot, params);
+    case 'reviewViolationDecision': return handleReviewViolationDecision(projectRoot, params);
     case 'storage': return handleStorageCall(projectRoot, params);
     default: throw new RpcError(404, `Unknown RPC command: ${command}`);
   }
@@ -243,8 +280,15 @@ export async function handleRpc(
  * Throws a 404 when nothing matches, and a 400 listing the candidates when the
  * input is ambiguous — the caller sees the same actionable guidance the CLI
  * gives for any other task reference.
+ *
+ * Exported because the MCP `lazy_list` / `lazy_active` handlers filter by
+ * subtree too. They shape their own response, but the SCOPE of a `task_id`
+ * filter must be one definition: `lazy_list` used to return direct children
+ * only while `lazy list <id>` returned the whole subtree, so an agent that
+ * generalised from `lazy_active` (subtree on both surfaces) silently reviewed
+ * a truncated tree.
  */
-async function filterToSubtree(storage: Storage, tasks: Task[], taskFilter: string): Promise<Task[]> {
+export async function filterToSubtree(storage: Storage, tasks: Task[], taskFilter: string): Promise<Task[]> {
   const result = await storage.resolveTask(taskFilter);
   if (!result.task) {
     if (result.ambiguousMatches && result.ambiguousMatches.length > 0) {
@@ -314,10 +358,10 @@ export async function handleActive(projectRoot: string, params: Record<string, u
  * NEVER writes lazy.toml. See src/daemon/concurrency.ts.
  */
 export async function handleConcurrency(projectRoot: string, params: Record<string, unknown>) {
-  const action = (params.action as string) ?? 'get';
+  const action = optionalEnum(params, 'action', ['get', 'set', 'reset'] as const) ?? 'get';
 
   if (action === 'set' || action === 'reset') {
-    const key = params.key as LimitKey;
+    const key = optionalString(params, 'key') as LimitKey;
     if (!LIMIT_KEYS.includes(key)) {
       throw new RpcError(400, `Unknown limit key '${String(params.key)}'. Valid keys: ${LIMIT_KEYS.join(', ')}.`);
     }
@@ -330,8 +374,6 @@ export async function handleConcurrency(projectRoot: string, params: Record<stri
       }
       setLimitOverride(key, value);
     }
-  } else if (action !== 'get') {
-    throw new RpcError(400, `Unknown concurrency action '${action}'. Valid: get, set, reset.`);
   }
 
   const config = await loadConfig(projectRoot);
@@ -418,6 +460,14 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     autoReactStatus: data.autoReactStatus,
     supervisorStatus: data.supervisorStatus,
     workingSubstate: data.workingSubstate,
+    // A mid-merge worktree only reaches the CLI if it is serialized here — this
+    // list is explicit, so an omission silently restores the old lie that a
+    // stranded task is just `blocked` (fix-sync-silent-conflict).
+    mergeState: data.mergeState,
+    // Same rule as mergeState: protection only reaches the CLI if it is
+    // serialized here, and omitting it silently restores the old behavior
+    // where a gate was invisible until accept refused.
+    protection: data.protection,
   };
 }
 
@@ -491,10 +541,33 @@ function renderNotesDiff(comments: Comment[]): string {
   return lines.join('\n');
 }
 
+/**
+ * Diff a task's branch against its integration base.
+ *
+ * This is the ONE implementation behind both `lazy diff` and the `lazy_diff`
+ * MCP tool. MCP used to compute its own base ref, hardcoding the literal
+ * 'main' for top-level tasks and for tasks whose parent session was missing —
+ * so on a repo whose default branch is not `main`, or for a task targeting a
+ * release branch, an agent reviewed the wrong diff and reported it
+ * confidently. Do not reintroduce a second base-ref computation; add
+ * parameters here instead.
+ *
+ * Params:
+ *   taskId  — required task reference (short id or code)
+ *   full    — full patch instead of a --stat summary
+ *   files   — pathspecs to restrict the diff to
+ *   surface — which "how to get the full diff" hint to render ('cli' default,
+ *             or 'mcp' so an agent is told the tool call rather than a shell
+ *             command it may not be able to run)
+ */
 export async function handleDiff(projectRoot: string, params: Record<string, unknown>) {
   if (typeof params.taskId !== 'string' || !params.taskId) {
     throw new RpcError(400, 'taskId is required');
   }
+  const files = Array.isArray(params.files)
+    ? params.files.filter((f): f is string => typeof f === 'string' && f.length > 0)
+    : undefined;
+  const surface = params.surface === 'mcp' ? 'mcp' : 'cli';
 
   const storage = await getOrCreateStorage();
   const result = await storage.resolveTask(params.taskId);
@@ -569,9 +642,11 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
   const newNotes = noteCutoff ? getNewNotesSince(allNotes, noteCutoff) : allNotes;
   const notesDiffSection = renderNotesDiff(newNotes);
 
+  const diffRange = useTwoDotDiff ? `${fromRef}..HEAD` : `${fromRef}...HEAD`;
+
   let output = '';
   if (full) {
-    const diff = await getDiffFull(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
+    const diff = await getDiffFull(fromRef, 'HEAD', worktreePath, useTwoDotDiff, files);
     if (!diff && !notesDiffSection) {
       output = 'No changes.';
     } else {
@@ -581,7 +656,7 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
       output = parts.join('\n\n');
     }
   } else {
-    const stat = await getDiffStat(fromRef, 'HEAD', worktreePath, useTwoDotDiff);
+    const stat = await getDiffStat(fromRef, 'HEAD', worktreePath, useTwoDotDiff, files);
     if (!stat && newNotes.length === 0) {
       output = 'No changes.';
     } else {
@@ -590,142 +665,98 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
       if (newNotes.length > 0) {
         parts.push(` comments | ${newNotes.length} comment(s) added`);
       }
-      parts.push(`\nFor full diff: lazy diff ${displayId(task)} --full`);
+      // The hint names a call the CALLER can actually make: a shell command for
+      // the CLI, the tool call for an MCP client.
+      parts.push(surface === 'mcp'
+        ? `\nFor full diff: lazy_diff(task_id: "${displayId(task)}", full: true)`
+        : `\nFor full diff: lazy diff ${displayId(task)} --full`);
       output = parts.join('\n');
     }
   }
 
-  return { output };
+  return { output, diffRange, taskId: shortId(task.id) };
 }
 
 // --- Wait ---
 
-const WAIT_POLL_INTERVAL_MS = 1500;
-const WAIT_MAX_TIMEOUT_S = 600;
-
 /**
- * Long-poll until a task's turn count increases with an agent turn,
- * or the task status changes from 'working'.
+ * Long-poll until the FIRST of one or more tasks finishes its turn — its turn
+ * count increases with an agent turn, or its status changes from 'working'.
  *
- * This eliminates client-side polling — the daemon holds the connection
- * and checks storage internally.
+ * This eliminates client-side polling — the daemon holds ONE connection and
+ * races every task internally. The polling core lives in ./wait-race.ts.
  */
 export async function handleWait(projectRoot: string, params: Record<string, unknown>) {
-  if (typeof params.taskId !== 'string' || !params.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-
-  const timeoutSecs = Math.min(
-    typeof params.timeout === 'number' ? params.timeout : WAIT_MAX_TIMEOUT_S,
-    WAIT_MAX_TIMEOUT_S,
-  );
-
-  // Resolve task and capture initial state
+  const inputs = normalizeWaitInputs(params);
   const storage = await getOrCreateStorage();
-  const resolveResult = await storage.resolveTask(params.taskId);
-  if (!resolveResult.task) {
-    throw new RpcError(404, `Task not found: ${params.taskId}`);
-  }
-  const fullTaskId = resolveResult.task.id;
-  const initialStatus = resolveResult.task.status;
+  const result = await raceWait(storage, inputs, {
+    timeoutSecs: optionalNumber(params, 'timeout'),
+  });
 
-  // A task that was never started has nothing to wait for and never will —
-  // say so, instead of reporting "now backlog" and a bare non-zero exit. The
-  // CLI gave this guidance before `lazy wait` became a thin RPC wrapper.
-  const waitSession = await storage.getSessionByTaskId(fullTaskId);
-  if (!waitSession) {
-    const ref = displayId(resolveResult.task);
-    throw new RpcError(400, `Task ${ref} has no session. Start it with: lazy start ${ref}`);
-  }
-
-  const initialTurnCount = await storage.getTurnCountByTaskId(fullTaskId);
-
-  // If task is already not working, return immediately
-  if (initialStatus !== 'working') {
-    return {
-      task_id: fullTaskId,
-      status: initialStatus,
-      timed_out: false,
-    };
-  }
-
-  const deadline = Date.now() + timeoutSecs * 1000;
-
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, WAIT_POLL_INTERVAL_MS));
-
-    // Use the shared long-lived storage instance — no lock acquisition per poll
-    const task = await storage.getTask(fullTaskId);
-    if (!task) {
-      throw new RpcError(404, `Task disappeared: ${params.taskId}`);
-    }
-
-    // Status changed from working — done
-    if (task.status !== 'working') {
-      return {
-        task_id: fullTaskId,
-        status: task.status,
-        timed_out: false,
-      };
-    }
-
-    // Check if turn count increased with an agent turn
-    const currentTurnCount = await storage.getTurnCountByTaskId(fullTaskId);
-    if (currentTurnCount > initialTurnCount) {
-      // Verify the latest turn is from the agent
-      const sess = await storage.getSessionByTaskId(fullTaskId);
-      if (sess) {
-        const turns = await storage.getSessionTurns(sess.id);
-        const latestTurn = turns[turns.length - 1];
-        if (latestTurn && latestTurn.role === 'agent') {
-          return {
-            task_id: fullTaskId,
-            status: task.status,
-            turn_count: currentTurnCount,
-            latest_turn: {
-              sequence: latestTurn.sequence,
-              role: latestTurn.role,
-              timestamp: latestTurn.timestamp,
-            },
-            timed_out: false,
-          };
+  // Report a half-merged worktree on the winner. Computed here rather than in
+  // raceWait because only the daemon knows the project root — and every wait
+  // client (CLI, MCP, rpc-fallback) goes through this one handler, so they all
+  // tell the same truth (fix-sync-silent-conflict).
+  if (!result.timed_out) {
+    try {
+      const task = await storage.getTask(result.task_id);
+      if (task) {
+        const worktreePath = getWorktreePath(projectRoot, task);
+        if (await pathExists(worktreePath)) {
+          const state = await readWorktreeMergeState(worktreePath);
+          if (isMidMerge(state)) {
+            result.merge_state = {
+              merge_in_progress: state.mergeInProgress,
+              unmerged_files: state.unmergedFiles,
+              summary:
+                `Worktree has an unresolved merge (${describeMergeState(state)}). A sync did not ` +
+                `finish — run \`lazy sync ${result.display_id}\` to complete it.`,
+            };
+          }
         }
       }
+    } catch (err) {
+      // Observational only — never fail a wait because a worktree was unreadable.
+      logger.debug(`wait: could not read merge state for ${result.display_id}: ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  // Timed out
-  return {
-    task_id: fullTaskId,
-    status: 'working',
-    timed_out: true,
-  };
+  return result;
 }
 
 // --- Start Task ---
 
+/**
+ * The Actor union, as a runtime value.
+ *
+ * `params.actor as Actor` asserts to the compiler and checks nothing: an
+ * unrecognized string used to flow into a turn record and be attributed to an
+ * actor that does not exist. Kept next to the type so the two cannot drift
+ * unnoticed — adding a member to `Actor` without adding it here makes every
+ * caller using it a 400, which is loud rather than silent.
+ */
+const ACTORS = ['human', 'builder', 'agent', 'system', 'supervisor'] as const satisfies readonly Actor[];
+
 export async function handleStartTask(projectRoot: string, params: Record<string, unknown>) {
   const startParams: StartTaskParams = {
-    taskId: params.taskId as string,
-    modelOverride: params.modelOverride as string | undefined,
-    agentId: params.agentId as string | undefined,
-    forceLocal: params.forceLocal as boolean | undefined,
-    retargetOrphan: params.retargetOrphan as boolean | undefined,
-    effortOverride: params.effortOverride as string | undefined,
-    runnerOverride: params.runnerOverride as RunnerType | undefined,
-    actor: params.actor as Actor | undefined,
+    taskId: requireString(params, 'taskId'),
+    modelOverride: optionalString(params, 'modelOverride'),
+    agentId: optionalString(params, 'agentId'),
+    forceLocal: optionalBoolean(params, 'forceLocal'),
+    retargetOrphan: optionalBoolean(params, 'retargetOrphan'),
+    effortOverride: optionalString(params, 'effortOverride'),
+    // Not enum-checked here: resolveRunnerType owns the alias mapping and its
+    // own error text ("container" → docker, etc.).
+    runnerOverride: optionalString(params, 'runnerOverride') as RunnerType | undefined,
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!startParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   logger.info(`Starting task ${startParams.taskId.substring(0, 8)}`);
 
   // Root span for the whole start request. Stitches under the caller's trace
   // when a `traceparent` was propagated (CLI → daemon); otherwise starts a new
   // trace. This is the "request received" boundary on the daemon side.
-  const parentCtx = contextFromTraceparent(params.traceparent as string | undefined);
+  const parentCtx = contextFromTraceparent(optionalString(params, 'traceparent'));
   return withRootSpan('lazy.start', parentCtx, {
     'lazy.command': 'start',
     'lazy.task_id': startParams.taskId,
@@ -745,23 +776,16 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
   }
 
   const unblockParams: UnblockTaskParams = {
-    taskId: params.taskId as string,
-    message: params.message as string,
-    modelOverride: params.modelOverride as string | undefined,
-    approvedFiles: params.approvedFiles as string[] | undefined,
-    retargetOrphan: params.retargetOrphan as boolean | undefined,
-    notesInEditor: params.notesInEditor as boolean | undefined,
-    effortOverride: params.effortOverride as string | undefined,
+    taskId: requireString(params, 'taskId'),
+    message: requireString(params, 'message'),
+    modelOverride: optionalString(params, 'modelOverride'),
+    approvedFiles: optionalStringArray(params, 'approvedFiles'),
+    retargetOrphan: optionalBoolean(params, 'retargetOrphan'),
+    notesInEditor: optionalBoolean(params, 'notesInEditor'),
+    effortOverride: optionalString(params, 'effortOverride'),
     permissionMode,
-    actor: params.actor as Actor | undefined,
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!unblockParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-  if (!unblockParams.message) {
-    throw new RpcError(400, 'message is required');
-  }
 
   logger.info(`Unblocking task ${unblockParams.taskId.substring(0, 8)}`);
   return launchUnblockTask(projectRoot, unblockParams);
@@ -771,14 +795,11 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
 
 export async function handleAskTask(projectRoot: string, params: Record<string, unknown>) {
   const askParams: AskTaskParams = {
-    taskId: params.taskId as string,
-    message: params.message as string,
-    effortOverride: params.effortOverride as string | undefined,
-    actor: params.actor as Actor | undefined,
+    taskId: requireString(params, 'taskId'),
+    message: requireString(params, 'message'),
+    effortOverride: optionalString(params, 'effortOverride'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!askParams.taskId) throw new RpcError(400, 'taskId is required');
-  if (!askParams.message) throw new RpcError(400, 'message is required');
 
   logger.info(`Asking task ${askParams.taskId.substring(0, 8)}`);
   return launchAskTask(projectRoot, askParams);
@@ -788,14 +809,10 @@ export async function handleAskTask(projectRoot: string, params: Record<string, 
 
 export async function handleAcceptTaskPreflight(projectRoot: string, params: Record<string, unknown>) {
   const preflightParams: AcceptTaskPreflightParams = {
-    taskId: params.taskId as string,
-    approvedFiles: params.approvedFiles as string[] | undefined,
-    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+    taskId: requireString(params, 'taskId'),
+    approvedFiles: optionalStringArray(params, 'approvedFiles'),
+    acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
   };
-
-  if (!preflightParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   return acceptTaskPreflight(projectRoot, preflightParams);
 }
@@ -808,18 +825,14 @@ export async function handleAcceptTask(
   progress?: ProgressEmitter,
 ) {
   const acceptParams: AcceptTaskParams = {
-    taskId: params.taskId as string,
-    reason: params.reason as string | undefined,
-    approvedFiles: params.approvedFiles as string[] | undefined,
-    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
-    actor: params.actor as Actor | undefined,
-    callerTaskId: params.callerTaskId as string | undefined,
+    taskId: requireString(params, 'taskId'),
+    reason: optionalString(params, 'reason'),
+    approvedFiles: optionalStringArray(params, 'approvedFiles'),
+    acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
+    actor: optionalEnum(params, 'actor', ACTORS),
+    callerTaskId: optionalString(params, 'callerTaskId'),
     onProgress: progress,
   };
-
-  if (!acceptParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   return acceptTask(projectRoot, acceptParams);
 }
@@ -827,23 +840,18 @@ export async function handleAcceptTask(
 // --- Approve Task (edge-gate human approval) ---
 
 export async function handleApproveTaskPreflight(projectRoot: string, params: Record<string, unknown>) {
-  const taskId = params.taskId as string;
-  if (!taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
+  const taskId = requireString(params, 'taskId');
 
   return approveTaskPreflight(projectRoot, { taskId });
 }
 
 export async function handleApproveTask(projectRoot: string, params: Record<string, unknown>) {
   const approveParams: ApproveTaskParams = {
-    taskId: params.taskId as string,
-    token: params.token as string,
+    taskId: requireString(params, 'taskId'),
+    // The approval token stays OPTIONAL at this boundary: approveTask decides
+    // whether one is needed and produces the message that explains it.
+    token: optionalString(params, 'token') as string,
   };
-
-  if (!approveParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   return approveTask(projectRoot, approveParams);
 }
@@ -852,17 +860,11 @@ export async function handleApproveTask(projectRoot: string, params: Record<stri
 
 export async function handleRejectTask(projectRoot: string, params: Record<string, unknown>) {
   const rejectParams: RejectTaskParams = {
-    taskId: params.taskId as string,
-    reason: params.reason as string,
-    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+    taskId: requireString(params, 'taskId'),
+    reason: requireString(params, 'reason'),
+    acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!rejectParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-  if (!rejectParams.reason) {
-    throw new RpcError(400, 'reason is required');
-  }
 
   return rejectTask(projectRoot, rejectParams);
 }
@@ -871,17 +873,11 @@ export async function handleRejectTask(projectRoot: string, params: Record<strin
 
 export async function handleCloseTask(projectRoot: string, params: Record<string, unknown>) {
   const closeParams: CloseTaskParams = {
-    taskId: params.taskId as string,
-    reason: params.reason as string,
-    acceptDirtyWorktree: params.acceptDirtyWorktree as boolean | undefined,
+    taskId: requireString(params, 'taskId'),
+    reason: requireString(params, 'reason'),
+    acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!closeParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-  if (!closeParams.reason) {
-    throw new RpcError(400, 'reason is required');
-  }
 
   return closeTask(projectRoot, closeParams);
 }
@@ -890,16 +886,12 @@ export async function handleCloseTask(projectRoot: string, params: Record<string
 
 export async function handleStopTask(projectRoot: string, params: Record<string, unknown>) {
   const stopParams: StopTaskParams = {
-    taskId: params.taskId as string,
-    reason: params.reason as string,
-    actor: params.actor as Actor | undefined,
+    taskId: requireString(params, 'taskId'),
+    // Stop's reason must be non-blank: it is recorded as the human turn that
+    // explains why the task was halted, and "   " explains nothing.
+    reason: requireNonBlankString(params, 'reason'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-  if (!stopParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-  if (!stopParams.reason || !stopParams.reason.trim()) {
-    throw new RpcError(400, 'reason is required');
-  }
   return stopTask(projectRoot, stopParams);
 }
 
@@ -907,12 +899,9 @@ export async function handleStopTask(projectRoot: string, params: Record<string,
 
 export async function handleSubmitTask(projectRoot: string, params: Record<string, unknown>) {
   const submitParams: SubmitTaskParams = {
-    taskId: params.taskId as string,
+    taskId: requireString(params, 'taskId'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!submitParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   return submitTask(projectRoot, submitParams);
 }
@@ -921,14 +910,11 @@ export async function handleSubmitTask(projectRoot: string, params: Record<strin
 
 export async function handleResumeTask(projectRoot: string, params: Record<string, unknown>) {
   const resumeParams: ResumeTaskParams = {
-    taskId: params.taskId as string,
-    modelOverride: params.modelOverride as string | undefined,
-    effortOverride: params.effortOverride as string | undefined,
+    taskId: requireString(params, 'taskId'),
+    modelOverride: optionalString(params, 'modelOverride'),
+    effortOverride: optionalString(params, 'effortOverride'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!resumeParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   logger.info(`Resuming task ${resumeParams.taskId.substring(0, 8)}`);
   return resumeTask(projectRoot, resumeParams);
@@ -938,13 +924,9 @@ export async function handleResumeTask(projectRoot: string, params: Record<strin
 
 export async function handleSyncTask(projectRoot: string, params: Record<string, unknown>) {
   const syncParams: SyncTaskParams = {
-    taskId: params.taskId as string,
-    actor: params.actor as Actor | undefined,
+    taskId: requireString(params, 'taskId'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!syncParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
 
   return syncTask(projectRoot, syncParams);
 }
@@ -953,16 +935,10 @@ export async function handleSyncTask(projectRoot: string, params: Record<string,
 
 export async function handleReparentTask(projectRoot: string, params: Record<string, unknown>) {
   const reparentParams: ReparentTaskParams = {
-    taskId: params.taskId as string,
-    parent: params.parent as string,
+    taskId: requireString(params, 'taskId'),
+    parent: requireString(params, 'parent'),
+    actor: optionalEnum(params, 'actor', ACTORS),
   };
-
-  if (!reparentParams.taskId) {
-    throw new RpcError(400, 'taskId is required');
-  }
-  if (!reparentParams.parent) {
-    throw new RpcError(400, 'parent is required');
-  }
 
   return reparentTask(projectRoot, reparentParams);
 }
@@ -970,12 +946,26 @@ export async function handleReparentTask(projectRoot: string, params: Record<str
 // --- Get Daemon MCP Config ---
 
 export async function handleGetDaemonMcpConfig(projectRoot: string, params: Record<string, unknown>) {
-  const name = (params.name as string) || `builder-${Date.now()}`;
+  // Fallback label for a caller that supplied none. Random, not a clock reading:
+  // the label IS the MCP identity key, so two callers landing in the same
+  // millisecond would share a token and the first to revoke would take the
+  // other's tools away. `lazy builder` always passes its own `builder-<id>`.
+  const name = optionalString(params, 'name') || `builder-${randomUUID().split('-')[0]}`;
+  // The caller's own pid, when it sent one. `lazy builder` runs on the host
+  // beside the daemon, so this is a pid the daemon can test with kill(pid, 0) —
+  // it is what keeps a LIVE builder's token from being evicted by the registry's
+  // builder cap. Validated here because this is the external surface: a
+  // nonsense pid would silently make a live session look dead (or, worse,
+  // resolve to some unrelated process) instead of being refused.
+  const ownerPid = optionalNumber(params, 'ownerPid');
+  if (ownerPid !== undefined && (!Number.isInteger(ownerPid) || ownerPid <= 0)) {
+    throw new RpcError(400, `ownerPid must be a positive integer, got ${ownerPid}`);
+  }
   try {
     // Builder identity: no task id. A builder token is refused on any
     // task-scoped MCP claim, and a task token is refused on the builder
     // surface — see src/daemon/mcp-tokens.ts.
-    const configPath = await writeDaemonMcpConfig(projectRoot, name, { kind: 'builder' });
+    const configPath = await writeDaemonMcpConfig(projectRoot, name, { kind: 'builder' }, { ownerPid });
     return { configPath };
   } catch (err) {
     // Safety net: if writeDaemonMcpConfig hits an uninitialized daemon
@@ -1008,10 +998,7 @@ export async function handleGetDaemonMcpConfig(projectRoot: string, params: Reco
  * behind its back would leave the revoked token still accepted.
  */
 export async function handleRevokeDaemonMcpToken(projectRoot: string, params: Record<string, unknown>) {
-  const name = params.name as string;
-  if (!name) {
-    throw new RpcError(400, 'name is required');
-  }
+  const name = requireString(params, 'name');
   const revoked = await revokeBuilderMcpToken(projectRoot, name);
   return { revoked };
 }
@@ -1104,7 +1091,10 @@ export async function handleGetCredentialState(projectRoot: string, _params: Rec
  * All Storage methods that can be called via RPC.
  * Each entry maps the method name to a function that extracts args and calls storage.
  */
-const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, unknown>) => Promise<unknown> | unknown> = {
+// Exported so BUILDER_STORAGE_METHODS can be checked against it: an allowlist
+// entry that names a method this map does not have would 403 on the builder
+// surface and 404 on the full one, i.e. fail at runtime instead of at test time.
+export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, unknown>) => Promise<unknown> | unknown> = {
   // Path accessors (synchronous)
   getStoragePath: (s) => s.getStoragePath(),
   getTaskDir: (s, a) => s.getTaskDir(a.taskId as string),
@@ -1117,6 +1107,7 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
     a.code as string | undefined,
     a.type as string | undefined,
     a.agentId as string | undefined,
+    a.actor as Actor | undefined,
   ),
   getTask: (s, a) => s.getTask(a.taskId as string),
   resolveTask: (s, a) => s.resolveTask(a.input as string),
@@ -1208,8 +1199,19 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   listHunkApprovals: (s, a) => s.listHunkApprovals(a.taskId as string),
   createHunkApproval: (s, a) => s.createHunkApproval(a.taskId as string, a.hunkHash as string, a.actor as any, a.lineage as any),
 
+  // Review comments (anchored, threaded diff comments)
+  createReviewComment: (s, a) => s.createReviewComment(a.taskId as string, a.input as any),
+  getTaskReviewComments: (s, a) => s.getTaskReviewComments(a.taskId as string),
+  updateReviewComment: (s, a) => s.updateReviewComment(a.taskId as string, a.commentId as string, a.update as any),
+
   // Conversations
-  saveConversation: (s, a) => s.saveConversation(a.conversation as any),
+  // INVARIANT: capture never shortens a stored conversation. Enforced here, on the
+  // daemon side, so EVERY client — the in-container builder capture monitor, the
+  // CLI, importers — inherits it without having to remember. See
+  // saveConversationWithoutRegression for why a prefix write is always wrong.
+  saveConversation: async (s, a) => {
+    await saveConversationWithoutRegression(s, a.conversation as any);
+  },
   loadConversation: (s, a) => s.loadConversation(a.sessionId as string),
   listConversations: (s) => s.listConversations(),
   isConversationImported: (s, a) => s.isConversationImported(a.sessionId as string),
@@ -1250,6 +1252,11 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
   // Tracing
   appendTraceSpans: (s, a) => s.appendTraceSpans(a.spans as SpanRecord[]),
   readTraceSpans: (s, a) => s.readTraceSpans(a.sinceMs as number | undefined),
+
+  // Wait intervals
+  recordWaitStart: (s, a) => s.recordWaitStart(a.start as any),
+  recordWaitEnd: (s, a) => s.recordWaitEnd(a.id as string, a.endedAt as string, a.outcome as any),
+  readWaitIntervals: (s, a) => s.readWaitIntervals(a.filter as any),
 };
 
 /**
@@ -1259,12 +1266,23 @@ const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<string, un
  * CLI processes never touch .storage-lock at all.
  */
 export async function handleStorageCall(projectRoot: string, params: Record<string, unknown>) {
-  const method = params.method as string;
-  const args = (params.args as Record<string, unknown>) ?? {};
-
+  const method = params.method;
   if (!method || typeof method !== 'string') {
     throw new RpcError(400, 'Storage RPC requires a "method" parameter');
   }
+
+  // `args` is destructured by each STORAGE_METHODS entry, so a non-object here
+  // (an array, a string) silently yields undefined for every field it reads —
+  // a write with empty content instead of a rejected request.
+  const rawArgs = params.args;
+  if (rawArgs !== undefined && rawArgs !== null
+      && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+    throw new RpcError(
+      400,
+      `Storage RPC "args" must be a JSON object, got ${Array.isArray(rawArgs) ? 'array' : typeof rawArgs}`,
+    );
+  }
+  const args = (rawArgs as Record<string, unknown> | undefined) ?? {};
 
   const handler = STORAGE_METHODS[method];
   if (!handler) {
@@ -1275,4 +1293,63 @@ export async function handleStorageCall(projectRoot: string, params: Record<stri
   const result = handler(storage, args);
   // Handle both sync (getStoragePath, getTaskDir) and async methods
   return result instanceof Promise ? await result : result;
+}
+
+/**
+ * The ONLY Storage methods a builder container may call.
+ *
+ * WHY A SEPARATE, TINY LIST. `/rpc/storage` above exposes the WHOLE Storage
+ * interface and is therefore gated on the shared daemon token — the credential
+ * that also unlocks every `/rpc/<command>` CLI pass-through. A builder
+ * container does not hold that token and must not: its mounted credential is a
+ * per-identity MCP token, deliberately scoped to the narrow builder tool
+ * surface. Handing it the shared token so its conversation capture could write
+ * would give the container (and the agent running inside it) full CLI and full
+ * storage authority to fix a logging path.
+ *
+ * So the builder surface gets exactly what its SUPERVISOR needs and nothing
+ * else: persist a captured conversation, and read/stamp its own resume intent.
+ * Everything here is either a write the supervisor already performs on the
+ * human's behalf or a read of state the builder owns.
+ *
+ * Adding an entry widens what a compromised builder container can do. Do not
+ * add one to make an unrelated caller work — give that caller its own surface.
+ */
+export const BUILDER_STORAGE_METHODS: ReadonlySet<string> = new Set([
+  // Connectivity probe + the path RemoteStorage needs for getTaskDir().
+  'getStoragePath',
+  // Conversation capture — the reason this surface exists.
+  'saveConversation',
+  // Resume-intent stamp on exit, so `lazy upgrade` can relaunch the same
+  // conversation. Reads/writes only builder-resume-intents.
+  'listBuilderResumeIntents',
+  'saveBuilderResumeIntent',
+]);
+
+/**
+ * Handle a storage call from a builder container (POST /builder/storage).
+ *
+ * Authentication happens in the route (a builder-kind MCP token, never the
+ * shared daemon token); this is the AUTHORIZATION half — the allowlist above.
+ * Dispatch deliberately delegates to handleStorageCall so the two surfaces can
+ * never drift on argument validation or method semantics.
+ */
+export async function handleBuilderStorageCall(
+  projectRoot: string,
+  params: Record<string, unknown>,
+) {
+  const method = params.method;
+  if (!method || typeof method !== 'string') {
+    throw new RpcError(400, 'Builder storage call requires a "method" parameter');
+  }
+  if (!BUILDER_STORAGE_METHODS.has(method)) {
+    throw new RpcError(
+      403,
+      `Storage method "${method}" is not available on the builder surface. ` +
+      `A builder container may only call: ${[...BUILDER_STORAGE_METHODS].sort().join(', ')}. ` +
+      `The full storage surface lives at /rpc/storage and requires the shared daemon token, ` +
+      `which is deliberately not given to containers.`,
+    );
+  }
+  return handleStorageCall(projectRoot, params);
 }

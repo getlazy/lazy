@@ -12,8 +12,10 @@
 
 import type { DaemonClient } from '../daemon/client';
 import type { Storage, CreateTurnOptions } from './interface';
-import { normalizeTurnContent } from '../utils/turn-content';
+import { normalizeTurnContent, normalizeRecordContent } from '../utils/turn-content';
 import type { SpanRecord } from '../tracing/types';
+import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
+import type { WaitInterval, WaitOutcome } from '../types';
 import type {
   Task,
   Session,
@@ -43,7 +45,7 @@ import type {
   MemoryCompact,
   MemoryCompactInput,
 } from './types';
-import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage, TaskTarget } from '../types';
+import type { Actor, CommentSource, FileViolation, HunkApproval, HunkApprovalLineage, ReviewComment, ReviewCommentInput, ReviewCommentUpdate, TaskTarget } from '../types';
 import type { RunnerType } from '../config/types';
 
 export class RemoteStorage implements Storage {
@@ -88,8 +90,8 @@ export class RemoteStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task> {
-    return this.call<Task>('createTask', { goal, parentTaskId, branchedFromSha, code, type, agentId });
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: Actor): Promise<Task> {
+    return this.call<Task>('createTask', { goal, parentTaskId, branchedFromSha, code, type, agentId, actor });
   }
 
   async getTask(taskId: string): Promise<Task | null> {
@@ -332,7 +334,10 @@ export class RemoteStorage implements Storage {
   // --- Comments ---
 
   async createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment> {
-    return this.call<Comment>('createComment', { taskId, content, actor, source });
+    // Same reason as createTurn: normalize before the wire hop so the warning
+    // names the real caller, not the daemon's RPC handler.
+    const safe = normalizeRecordContent(content, 'remote-storage', 'createComment', 'Comment.content');
+    return this.call<Comment>('createComment', { taskId, content: safe, actor, source });
   }
 
   async getTaskComments(taskId: string): Promise<Comment[]> {
@@ -342,7 +347,8 @@ export class RemoteStorage implements Storage {
   // --- Journal ---
 
   async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
-    return this.call<JournalEntry>('appendJournalEntry', { taskId, content, actor });
+    const safe = normalizeRecordContent(content, 'remote-storage', 'appendJournalEntry', 'JournalEntry.content');
+    return this.call<JournalEntry>('appendJournalEntry', { taskId, content: safe, actor });
   }
 
   async getTaskJournal(taskId: string): Promise<JournalEntry[]> {
@@ -352,7 +358,8 @@ export class RemoteStorage implements Storage {
   // --- Follow-ups (task-level orthogonal-work discoveries) ---
 
   async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
-    return this.call<FollowUp>('createFollowUp', { taskId, content, sessionId });
+    const safe = normalizeRecordContent(content, 'remote-storage', 'createFollowUp', 'FollowUp.content');
+    return this.call<FollowUp>('createFollowUp', { taskId, content: safe, sessionId });
   }
 
   async getTaskFollowUps(taskId: string): Promise<FollowUp[]> {
@@ -372,6 +379,24 @@ export class RemoteStorage implements Storage {
     lineage?: HunkApprovalLineage,
   ): Promise<HunkApproval> {
     return this.call<HunkApproval>('createHunkApproval', { taskId, hunkHash, actor, lineage });
+  }
+
+  // --- Review Comments ---
+
+  async createReviewComment(taskId: string, input: ReviewCommentInput): Promise<ReviewComment> {
+    return this.call<ReviewComment>('createReviewComment', { taskId, input });
+  }
+
+  async getTaskReviewComments(taskId: string): Promise<ReviewComment[]> {
+    return this.call<ReviewComment[]>('getTaskReviewComments', { taskId });
+  }
+
+  async updateReviewComment(
+    taskId: string,
+    commentId: string,
+    update: ReviewCommentUpdate,
+  ): Promise<ReviewComment> {
+    return this.call<ReviewComment>('updateReviewComment', { taskId, commentId, update });
   }
 
   // --- Conversations ---
@@ -490,5 +515,19 @@ export class RemoteStorage implements Storage {
 
   async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
     return this.call<SpanRecord[]>('readTraceSpans', { sinceMs });
+  }
+
+  // --- Wait intervals ---
+
+  async recordWaitStart(start: WaitIntervalStart): Promise<void> {
+    await this.call<void>('recordWaitStart', { start });
+  }
+
+  async recordWaitEnd(id: string, endedAt: string, outcome: WaitOutcome): Promise<void> {
+    await this.call<void>('recordWaitEnd', { id, endedAt, outcome });
+  }
+
+  async readWaitIntervals(filter?: WaitIntervalFilter): Promise<WaitInterval[]> {
+    return this.call<WaitInterval[]>('readWaitIntervals', { filter });
   }
 }

@@ -34,7 +34,8 @@ import {
   heartbeatRequestHeaders,
 } from '../../src/daemon/heartbeat';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { createTask } from '../helpers/fixtures';
+import { createTaskBeforeDaemon } from '../helpers/fixtures';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 const TOKEN = 'responsiveness-token';
 
@@ -53,6 +54,10 @@ const LONG_RPC_S = 14;
  */
 const SHORT_RPC_BUDGET_MS = 2_000;
 
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
+
 describe('daemon responsiveness under a long operation', () => {
   let ctx: TestContext;
   let daemon: RunningDaemon;
@@ -63,9 +68,7 @@ describe('daemon responsiveness under a long operation', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
-    // Created BEFORE the daemon starts: the CLI subprocess needs the storage
-    // lock, which the running daemon holds for its whole lifetime.
-    shortTaskId = await createTask(ctx, 'Long operation task');
+    shortTaskId = await createTaskBeforeDaemon(ctx, 'Long operation task');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-responsive-'));
     socketPath = join(tmpDir, 'test.sock');
     // A long reconcile interval keeps the reconciler from transitioning the

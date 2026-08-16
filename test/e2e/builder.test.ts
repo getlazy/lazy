@@ -5,10 +5,36 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
+import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
 
-/** Replace the [runner] section's type value in a lazy.toml config string. */
-function setRunnerType(config: string, type: string): string {
-  return config.replace(/^type\s*=\s*"[^"]*"/m, `type = "${type}"`);
+/**
+ * Replace the [runner] section's type value in a lazy.toml config string, and
+ * pin the permission mode alongside it.
+ *
+ * The mode defaults to 'bypass' for the same reason the fake-binary suites do
+ * (see CLAUDE.md): none of these tests is ABOUT the OS sandbox — they assert on
+ * builder's CLI surface (disclosure, resume, --model, warning text). Leaving the
+ * product default of 'sandbox' made every one of them depend on `bwrap` and
+ * `socat` being installed, and lazy correctly refuses to run without them
+ * (`failIfUnavailable: true`, no silent unsandboxed fallback). The result was 13
+ * failures on any machine missing two packages, all reported as sandbox errors
+ * rather than as anything to do with the code under test.
+ *
+ * The one test that genuinely needs the real posture passes 'sandbox' explicitly
+ * and lives in a `sandboxSuiteSkipped`-gated block below.
+ *
+ * permission_mode must land INSIDE [runner], so it is emitted immediately after
+ * the type key it replaces.
+ */
+function setRunnerType(
+  config: string,
+  type: string,
+  permissionMode: 'sandbox' | 'bypass' = 'bypass',
+): string {
+  return config.replace(
+    /^type\s*=\s*"[^"]*"/m,
+    `type = "${type}"\npermission_mode = "${permissionMode}"`,
+  );
 }
 
 /**
@@ -168,7 +194,7 @@ describe('lazy builder', () => {
 
     expectSuccess(result);
     expectOutput(result, '--resume');
-    expectOutput(result, 'LAZY_LAST_SESSION_ID');
+    expectOutput(result, 'lazy builder list');
     expectOutput(result, 'Resume a specific session');
     expectOutput(result, '--import');
   });
@@ -185,28 +211,19 @@ describe('lazy builder', () => {
     expectError(result, 'lazy builder --resume <id> --import');
   });
 
-  // INVARIANT: --resume without LAZY_LAST_SESSION_ID errors clearly.
-  // No file scanning — env var is the only source for bare --resume.
-  test('--resume fails when LAZY_LAST_SESSION_ID is not set', async () => {
+  // INVARIANT: an explicit session ID is the ONLY resume source. There is no
+  // inference — bare --resume fails loudly and points at `lazy builder list`
+  // rather than silently starting a fresh session.
+  test('bare --resume fails with an actionable error', async () => {
     const result = await ctx.lazy(['builder', '--resume'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
-    expectError(result, 'LAZY_LAST_SESSION_ID is not set');
-  });
-
-  // INVARIANT: --resume (bare) reads from LAZY_LAST_SESSION_ID env var.
-  test('--resume reads session ID from env var', async () => {
-    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-
-    const result = await ctx.lazy(['builder', '--resume'], {
-      env: {
-        ...launchableBuilderEnv(ctx.root),
-        LAZY_LAST_SESSION_ID: sessionId,
-      },
-    });
-
-    expectOutput(result, 'Resuming session aaaaaaaa');
+    expectFailure(result);
+    expectError(result, '--resume needs a session ID');
+    expectError(result, 'lazy builder list');
+    // It must NOT fall back to starting a fresh session.
+    expectOutputExcludes(result, 'Launching Claude Code in a new session');
   });
 
   // INVARIANT: --resume <id> passes the ID directly to Claude.
@@ -231,45 +248,21 @@ describe('lazy builder', () => {
     expectOutputExcludes(result, 'Launching Claude Code in a new session');
   });
 
-  // INVARIANT: When LAZY_LAST_SESSION_ID is set in TTY mode, offer to resume.
-  // promptYesNo with LAZY_PROMPT_DEFAULTS="accept" returns true.
-  test('offers resume prompt in TTY mode when env var is set', async () => {
-    const sessionId = 'faceb00c-cafe-babe-dead-beefcafebabe';
-
+  // INVARIANT: no session is resumed unless the user names one. A bare
+  // `lazy builder` in TTY mode starts a fresh session — it never offers to
+  // resume, because nothing tracks a "previous" session per terminal.
+  test('bare builder in TTY mode starts a new session without a resume offer', async () => {
     const result = await ctx.lazy(['builder'], {
       env: {
         ...launchableBuilderEnv(ctx.root),
         LAZY_FORCE_TTY: '1',
         LAZY_PROMPT_DEFAULTS: 'accept',
-        LAZY_LAST_SESSION_ID: sessionId,
       },
     });
 
-    // Should show the yes/no prompt with session ID
-    expectOutput(result, 'Resume previous builder session faceb00c');
-    // Accepted → resuming
-    expectOutput(result, 'Resuming session faceb00c');
-    // Resume should skip disclosure
-    expectOutputExcludes(result, 'Launching Claude Code in a new session');
-  });
-
-  // INVARIANT: Declining resume in TTY mode starts a new session with disclosure.
-  test('declining resume in TTY mode starts new session', async () => {
-    const sessionId = 'faceb00c-cafe-babe-dead-beefcafebabe';
-
-    const result = await ctx.lazy(['builder'], {
-      env: {
-        ...launchableBuilderEnv(ctx.root),
-        LAZY_FORCE_TTY: '1',
-        LAZY_PROMPT_DEFAULTS: 'decline',
-        LAZY_LAST_SESSION_ID: sessionId,
-      },
-    });
-
-    // Should show the yes/no prompt
-    expectOutput(result, 'Resume previous builder session faceb00c');
-    // Declined → new session with disclosure
     expectOutput(result, 'Launching Claude Code in a new session');
+    expectOutputExcludes(result, 'Resume previous builder session');
+    expectOutputExcludes(result, 'Resuming session');
   });
 
   // INVARIANT: Without env var or flag, no resume prompt — straight to new session.
@@ -336,34 +329,12 @@ describe('lazy builder', () => {
     expect(result.exitCode).toBe(1);
   });
 
-  // INVARIANT: --autonomous on the host runner always adds a second warning
-  // naming the isolation posture. The severity depends on permission_mode:
-  // the default 'sandbox' confines Bash, 'bypass' does not. Asserting only the
-  // DANGER wording would fail on the safe default, which is now the norm.
-  test('--autonomous on the host under the OS sandbox names the sandbox posture', async () => {
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
-    writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
-
-    const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
-      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
-    });
-
-    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
-    expectOutput(result, '⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
-    expectOutput(result, 'Bash is confined to the worktree');
-  });
-
   test('--autonomous with permission_mode = "bypass" shows the full danger warning', async () => {
     const lazyTomlPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
-    // permission_mode must land inside [runner], so insert it after the type key.
     writeFileSync(
       lazyTomlPath,
-      setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation').replace(
-        /^type\s*=\s*"dangerously-host-process-without-any-isolation"$/m,
-        'type = "dangerously-host-process-without-any-isolation"\npermission_mode = "bypass"',
-      ),
+      setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation', 'bypass'),
     );
 
     const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
@@ -514,3 +485,52 @@ describe('lazy builder', () => {
     expectError(result, 'lazy builder --help');
   });
 });
+
+/**
+ * The one builder test that genuinely exercises the real OS sandbox posture.
+ *
+ * It is split out and gated because it is the only assertion here that CANNOT be
+ * made under `permission_mode = "bypass"` — it is checking the wording lazy uses
+ * when the sandbox IS active. Everything else in this file pins builder's CLI
+ * surface and runs under bypass (see setRunnerType above), so a machine without
+ * `bwrap`/`socat` loses exactly this one test instead of thirteen.
+ *
+ * INVARIANT (same rule as slowSuiteSkipped): a skipped sandbox block prints one
+ * line saying so. Never silently green-by-omission — the posture it covers is
+ * the PRODUCTION default.
+ */
+describe.skipIf(sandboxSuiteSkipped('lazy builder sandbox posture'))(
+  'lazy builder sandbox posture',
+  () => {
+    let ctx: TestContext;
+
+    beforeEach(async () => {
+      ctx = await setupTestLazy();
+    });
+
+    afterEach(async () => {
+      await ctx.cleanup();
+    });
+
+    // INVARIANT: --autonomous on the host runner always adds a second warning
+    // naming the isolation posture. The severity depends on permission_mode:
+    // the default 'sandbox' confines Bash, 'bypass' does not. Asserting only the
+    // DANGER wording would fail on the safe default, which is now the norm.
+    test('--autonomous on the host under the OS sandbox names the sandbox posture', async () => {
+      const lazyTomlPath = join(ctx.root, 'lazy.toml');
+      const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
+      writeFileSync(
+        lazyTomlPath,
+        setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation', 'sandbox'),
+      );
+
+      const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
+        env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+      });
+
+      expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
+      expectOutput(result, '⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
+      expectOutput(result, 'Bash is confined to the worktree');
+    });
+  },
+);

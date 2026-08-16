@@ -16,8 +16,6 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
-import { readFile, writeFile, readdir } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
@@ -28,63 +26,8 @@ import {
   heartbeatOnlyScenario,
   crashScenario,
 } from '../helpers/fake-claude';
-
-/**
- * Set the two watchdog guards for the project, and COMMIT the change.
- *
- * Production defaults are 2h (no-progress) and 60s (wind-down) — far too long
- * for a test. These are the real config keys the daemon reads and puts on the
- * wire, so tightening them exercises the same plumbing a user would.
- *
- * The commit is not optional: the daemon resolves a turn's config from the
- * TASK WORKTREE (loadConfig(root, { cwd: worktreePath })), and the worktree is
- * branched from main. An uncommitted lazy.toml edit would simply never reach
- * the supervisor — the turn would run with the 2h default and the test would
- * time out with no useful signal.
- */
-async function setGuards(
-  ctx: TestContext,
-  guards: { noProgressMs?: number; windDownMs?: number },
-): Promise<void> {
-  const configPath = join(ctx.root, 'lazy.toml');
-  const existing = await readFile(configPath, 'utf-8');
-  const lines = ['', '[agent]'];
-  if (guards.noProgressMs !== undefined) lines.push(`watchdog_output_timeout_ms = ${guards.noProgressMs}`);
-  if (guards.windDownMs !== undefined) lines.push(`wind_down_timeout_ms = ${guards.windDownMs}`);
-  await writeFile(configPath, `${existing}\n${lines.join('\n')}\n`);
-  ctx.git('add', 'lazy.toml');
-  const commit = ctx.git('commit', '-m', 'Tighten watchdog guards for this test');
-  if (commit.exitCode !== 0) {
-    throw new Error(`Failed to commit watchdog guards: ${commit.stderr}`);
-  }
-}
-
-/** Resolve a task's storage directory (external_path/tasks/<uuid…>). */
-async function taskDir(root: string, shortId: string): Promise<string> {
-  const toml = await readFile(join(root, 'lazy.toml'), 'utf-8');
-  const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
-  const tasksDir = m && m[1] ? join(m[1], 'tasks') : join(root, '.lazy', 'tasks');
-  const dirs = await readdir(tasksDir);
-  const dir = dirs.find(d => d.startsWith(shortId));
-  if (!dir) throw new Error(`No task directory for ${shortId} in ${tasksDir}`);
-  return join(tasksDir, dir);
-}
-
-/** The interrupt diagnostics the daemon recorded on a task's session. */
-async function sessionInterrupt(
-  root: string,
-  shortId: string,
-): Promise<{ interrupt_reason?: string; interrupt_exit_code?: number | null }> {
-  const raw = await readFile(join(await taskDir(root, shortId), 'session.json'), 'utf-8');
-  return JSON.parse(raw) as { interrupt_reason?: string; interrupt_exit_code?: number | null };
-}
-
-/** The agent turns recorded for a task, in order. */
-async function agentTurns(root: string, shortId: string): Promise<Array<Record<string, unknown>>> {
-  const raw = await readFile(join(await taskDir(root, shortId), 'turns.json'), 'utf-8');
-  const parsed = JSON.parse(raw) as { turns: Array<Record<string, unknown>> };
-  return parsed.turns.filter(t => t.role === 'agent');
-}
+import { setGuards, agentTurns, sessionInterrupt } from '../helpers/agent-seam';
+import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
 
 describe('agent binary seam (real supervisor, fake claude)', () => {
   let ctx: TestContext;
@@ -134,6 +77,54 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expect(turn!.argv).toContain('--output-format');
     expect(turn!.argv[turn!.argv.indexOf('--output-format') + 1]).toBe('stream-json');
     expect(turn!.argv).toContain('--verbose');
+  }, 90_000);
+
+  // Per-turn launch labels, end to end through the REAL supervisor and
+  // reconciler. Only this seam can assert the `model_id` half: the module mock
+  // replaces `launchSupervisorAsync`, so it never runs an agent and therefore
+  // never learns a concrete model id — it deliberately emits none. Here a real
+  // agent process reports one on its result line and it has to survive
+  // parseResponse → response → turn.
+  //
+  // INVARIANT: `model` and `model_id` are DIFFERENT things and neither stands in
+  // for the other. `model` is the tier alias the host requested; `model_id` is
+  // the dated snapshot that actually answered. An experiment comparing arms
+  // needs both — the alias to know which arm was asked for, the id to know what
+  // it got.
+  test('a turn records the requested model/effort and the concrete model id the agent reported', async () => {
+    const taskId = await createTask(ctx, 'Per-turn launch labels', 'Do the work');
+    await ctx.setClaudeScenario(successScenario({
+      sessionId: 'fake-sess-labels',
+      modelId: 'claude-opus-4-6-20260101',
+      commit: { message: 'Labelled work', files: [{ path: 'labelled.txt', content: 'done\n' }] },
+    }));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes', '--model', 'opus', '--effort', 'high']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const turns = await agentTurns(ctx.root, taskId);
+    expect(turns.length).toBeGreaterThan(0);
+    const last = turns[turns.length - 1];
+    expect(last.model).toBe('opus');
+    expect(last.effort).toBe('high');
+    expect(last.model_id).toBe('claude-opus-4-6-20260101');
+  }, 90_000);
+
+  // The other half of the same invariant: when the agent reports NO model
+  // identity, the turn records the alias alone. `model_id` must stay absent
+  // rather than being back-filled from `model` — "we only ever knew the tier"
+  // has to stay distinguishable from "we know the exact snapshot".
+  test('an agent that reports no model identity leaves model_id unset', async () => {
+    const taskId = await createTask(ctx, 'No reported model id', 'Do the work');
+    await ctx.setClaudeScenario(successScenario({ sessionId: 'fake-sess-no-id' }));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes', '--model', 'opus']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const turns = await agentTurns(ctx.root, taskId);
+    const last = turns[turns.length - 1];
+    expect(last.model).toBe('opus');
+    expect(last.model_id).toBeUndefined();
   }, 90_000);
 
   // INVARIANT (src/supervisor/watchdog.ts): a wind-down kill is NOT a failed
@@ -285,4 +276,68 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     const turns = await agentTurns(ctx.root, taskId);
     expect(String(turns[turns.length - 1].content)).toContain('Second turn done.');
   }, 150_000);
+});
+
+/**
+ * The same seam under the PRODUCTION host posture.
+ *
+ * Every test above runs with `permission_mode = "bypass"`, so that a missing
+ * sandbox dependency can never masquerade as a watchdog failure. That leaves
+ * the posture users actually get — `"sandbox"`, the config default — untested
+ * end to end on this seam: nothing proved that a real turn survives being run
+ * inside the sandbox, or that the settings reaching the agent are the ones
+ * host-sandbox.ts intends.
+ *
+ * Linux prerequisite: `bwrap` and `socat` on PATH. `failIfUnavailable: true` is
+ * deliberate — the sandbox failing is a hard error, never a silent fallback to
+ * an unsandboxed agent — so on a box without them `lazy start` refuses outright.
+ * That refusal is correct product behavior, but as a TEST result it is noise:
+ * it reports a missing package in the language of a sandbox failure, which
+ * reads like a supervisor regression. The block is therefore gated on the deps
+ * being present, and prints one line when it skips (never silently green — the
+ * posture it covers is the production default).
+ */
+describe.skipIf(sandboxSuiteSkipped('agent binary seam under the sandbox posture'))('agent binary seam under the sandbox posture', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ fakeClaude: true, hostPermissionMode: 'sandbox' });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT (src/runner/host-sandbox.ts): under `permission_mode = "sandbox"`
+  // the OS sandbox is the SOLE hard boundary. The three settings asserted here
+  // are what make that true — enabled, no silent fallback when it is
+  // unavailable, and no per-command escape hatch. Asserting them on the argv
+  // the agent actually received is the only way to catch a posture that was
+  // computed correctly and then dropped somewhere on the way to the process.
+  test('a turn runs to completion inside the sandbox, with the sandbox settings the agent gets', async () => {
+    const taskId = await createTask(ctx, 'Sandboxed turn', 'Do the work');
+    await ctx.setClaudeScenario(successScenario({
+      result: 'Sandboxed turn done.',
+      sessionId: 'fake-sess-sandbox',
+    }));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    expectOutput(await ctx.lazy(['show', taskId]), 'blocked');
+    const turns = await agentTurns(ctx.root, taskId);
+    expect(String(turns[turns.length - 1].content)).toContain('Sandboxed turn done.');
+
+    const turn = (await ctx.claudeInvocations()).find(i => i.argv.includes('-p'));
+    expect(turn).toBeDefined();
+    const settingsIndex = turn!.argv.indexOf('--settings');
+    expect(settingsIndex).toBeGreaterThanOrEqual(0);
+
+    const settings = JSON.parse(turn!.argv[settingsIndex + 1]) as {
+      sandbox: { enabled: boolean; failIfUnavailable: boolean; allowUnsandboxedCommands: boolean };
+    };
+    expect(settings.sandbox.enabled).toBe(true);
+    expect(settings.sandbox.failIfUnavailable).toBe(true);
+    expect(settings.sandbox.allowUnsandboxedCommands).toBe(false);
+  }, 90_000);
 });

@@ -7,13 +7,11 @@
  */
 
 import { join } from 'path';
-import { homedir } from 'os';
 import { readdir, readFile } from 'fs/promises';
 import { pathExists } from './fs';
 import { setupSandbox } from './sandbox';
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
-import { tmuxSessionName, createTmuxWatchSession } from '../terminal';
 import { loadConfig } from '../config/loader';
 import { resolveAgentModel } from './role-target';
 import { createRunner } from '../runner';
@@ -309,15 +307,6 @@ export async function autoResumeTask(
     // Store container name and update interaction timestamp
     await storage.updateSessionContainerName(session.id, containerName);
     await storage.updateSessionInteraction(session.id, 0);
-
-    // Create a detached tmux session for `lazy watch`
-    const tmuxSessName = tmuxSessionName(taskShortId);
-    if (runner.usesSandbox()) {
-      createTmuxWatchSession(tmuxSessName, ['docker', 'logs', '-f', containerName]);
-    } else {
-      const logFile = join(homedir(), '.lazy', 'logs', `${containerName}.log`);
-      createTmuxWatchSession(tmuxSessName, ['tail', '-f', logFile]);
-    }
 
     logger.info(`Auto-resumed task ${taskShortId} (consecutive interruptions: ${session.consecutive_interruptions})`);
     return true;

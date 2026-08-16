@@ -141,6 +141,8 @@ export interface MaintainFollowupResult {
   session_id: string;
   /** Full token usage of the follow-up invocation (incl. cache tokens). */
   usage: AgentResponse['usage'];
+  /** Concrete model id the agent reported for THIS invocation, when it reports one. */
+  model_id?: string;
 }
 
 /** Zero-usage fallback for a failed follow-up (no agent tokens were spent). */
@@ -193,17 +195,19 @@ export async function runMaintainFollowup(
   let responseText: string;
   let responseSessionId = sessionId;
   let usage: AgentResponse['usage'] = { ...ZERO_USAGE };
+  let reportedModelId: string | undefined;
   try {
     const parsed = agent.parseResponse(stdout, { workingDir: worktreePath });
     responseText = parsed.result;
     responseSessionId = parsed.session_id;
     usage = parsed.usage;
+    reportedModelId = parsed.model_id;
   } catch (err) {
     logError(`[maintain] Failed to parse response: ${err instanceof Error ? err.message : err}`);
     responseText = 'Maintained-files follow-up failed: could not parse agent response.';
   }
 
   log(`[maintain] Agent responded (${responseText.length} chars)`);
-  return { prompt, response: responseText, session_id: responseSessionId, usage };
+  return { prompt, response: responseText, session_id: responseSessionId, usage, model_id: reportedModelId };
 }
 

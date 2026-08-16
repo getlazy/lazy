@@ -18,6 +18,7 @@ import { randomUUID, randomBytes } from 'crypto';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { createAllHandlers, type McpToolContext } from '../mcp/tools';
+import { parseAndValidateToolCallBody } from '../mcp/tool-registry';
 
 
 export interface BuilderConfigFile {
@@ -108,10 +109,38 @@ export function startBuilderServer(
           );
         }
 
+        // INVARIANT: this route validates its own inputs. It is a second
+        // external surface onto the same tool handlers as the daemon's
+        // POST /mcp route, and `body.arguments ?? {}` here would reproduce the
+        // exact bug that route had — a missing envelope dispatching with empty
+        // arguments and corrupting state instead of failing. See
+        // src/mcp/validate-args.ts.
+        let raw: string;
         try {
-          const body = await req.json() as { arguments?: Record<string, unknown> };
-          const args = body.arguments ?? {};
-          const result = await handler(args);
+          raw = await req.text();
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: `Could not read request body: ${detail}` }, { status: 400 });
+        }
+
+        let body: unknown;
+        try {
+          body = raw.trim() === '' ? {} : JSON.parse(raw);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          return Response.json(
+            { error: `Request body is not valid JSON: ${detail}` },
+            { status: 400 },
+          );
+        }
+
+        const parsed = parseAndValidateToolCallBody(toolName, body);
+        if (!parsed.ok) {
+          return Response.json({ error: parsed.error }, { status: 400 });
+        }
+
+        try {
+          const result = await handler(parsed.args);
           return Response.json({ result });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);

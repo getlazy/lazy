@@ -132,22 +132,35 @@ export function heartbeatEvent(toolUseId: string, toolName = 'mcp__slow__tool'):
   return { type: 'tool_progress', heartbeat: true, parent_tool_use_id: toolUseId, tool_name: toolName };
 }
 
-/** The final `{"type":"result",…}` line — the agent's summary. */
+/**
+ * The final `{"type":"result",…}` line — the agent's summary.
+ *
+ * `modelId` reproduces how Claude Code reports the CONCRETE model it ran: a
+ * `modelUsage` map keyed by model id, not a flat field. Pass it when the test is
+ * about per-turn model identity; omit it and the turn records only the alias the
+ * host launched with, which is the honest shape for an agent that reports none.
+ */
 export function resultEvent(opts: {
   result: string;
   sessionId: string;
   inputTokens?: number;
   outputTokens?: number;
+  modelId?: string;
 }): Record<string, unknown> {
+  const inputTokens = opts.inputTokens ?? 100;
+  const outputTokens = opts.outputTokens ?? 200;
   return {
     type: 'result',
     subtype: 'success',
     result: opts.result,
     session_id: opts.sessionId,
     usage: {
-      input_tokens: opts.inputTokens ?? 100,
-      output_tokens: opts.outputTokens ?? 200,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
     },
+    ...(opts.modelId
+      ? { modelUsage: { [opts.modelId]: { inputTokens, outputTokens } } }
+      : {}),
   };
 }
 
@@ -160,6 +173,8 @@ export interface SuccessScenarioOptions {
   sessionId?: string;
   /** Files to write + commit before emitting the result (the "work"). */
   commit?: { message: string; files: Array<{ path: string; content: string }> };
+  /** Concrete model id to self-report via `modelUsage` (see `resultEvent`). */
+  modelId?: string;
 }
 
 /** Session start → a tool call → (optional commit) → result → exit 0. */
@@ -175,7 +190,11 @@ export function successScenario(opts: SuccessScenarioOptions = {}): ClaudeScenar
   }
   steps.push({
     kind: 'emit',
-    event: resultEvent({ result: opts.result ?? 'Fake agent completed the task.', sessionId }),
+    event: resultEvent({
+      result: opts.result ?? 'Fake agent completed the task.',
+      sessionId,
+      ...(opts.modelId ? { modelId: opts.modelId } : {}),
+    }),
   });
   return { steps };
 }
@@ -230,6 +249,43 @@ export function heartbeatOnlyScenario(opts: { sessionId?: string; beats?: number
 export function crashScenario(opts: { stderr?: string; exitCode?: number } = {}): ClaudeScenario {
   return {
     steps: [
+      { kind: 'stderr', text: opts.stderr ?? 'API Error: 500 internal server error\n' },
+      { kind: 'exit', code: opts.exitCode ?? 1 },
+    ],
+  };
+}
+
+/**
+ * The expensive crash: the agent works, REPORTS ITS TOKEN USAGE, and only then
+ * dies with a non-zero exit.
+ *
+ * This is the shape that used to lose money silently — the turn spent real
+ * tokens, said so on the wire, and the supervisor threw all of it away with the
+ * crash. The supervisor now salvages the reported usage onto the error response
+ * (src/supervisor/usage.ts) so it lands on a turn record.
+ */
+export function crashAfterReportingUsageScenario(opts: {
+  sessionId?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  stderr?: string;
+  exitCode?: number;
+} = {}): ClaudeScenario {
+  const sessionId = opts.sessionId ?? 'fake-sess-crash-usage';
+  return {
+    steps: [
+      { kind: 'emit', event: sessionStartEvent(sessionId) },
+      { kind: 'emit', event: toolUseEvent('toolu_1') },
+      { kind: 'emit', event: toolResultEvent('toolu_1') },
+      {
+        kind: 'emit',
+        event: resultEvent({
+          result: 'Fake agent got this far.',
+          sessionId,
+          inputTokens: opts.inputTokens ?? 4_000,
+          outputTokens: opts.outputTokens ?? 700,
+        }),
+      },
       { kind: 'stderr', text: opts.stderr ?? 'API Error: 500 internal server error\n' },
       { kind: 'exit', code: opts.exitCode ?? 1 },
     ],

@@ -4,6 +4,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync, statSync } f
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { extractEmbeddedAgentBinary } from '../../src/capture/claude';
+import { AGENT_SELFCHECK_SENTINEL } from '../../src/agent/binary-identity';
 
 /**
  * Tests for atomic agent binary replacement logic.
@@ -137,8 +138,17 @@ describe('extractEmbeddedAgentBinary staleness detection', () => {
   let embeddedPath: string;
   let destDir: string;
 
-  /** Above MIN_AGENT_BINARY_SIZE (1024) so the placeholder guard doesn't fire. */
-  const pad = (marker: string) => marker + 'x'.repeat(4096 - marker.length);
+  /**
+   * A stand-in "embedded binary": 4096 bytes (above MIN_AGENT_BINARY_SIZE) that
+   * looks like the real thing — ELF magic and the selfcheck sentinel — because
+   * extraction now REFUSES to install a file that is not the compiled agent
+   * (see test/unit/agent-binary-identity.test.ts). `marker` varies the content
+   * without varying the length, which is what these staleness tests are about.
+   */
+  const pad = (marker: string) => {
+    const head = '\u007fELF' /* ELF magic */ + AGENT_SELFCHECK_SENTINEL + ' 0.0.0-test ' + marker;
+    return head + 'x'.repeat(4096 - head.length);
+  };
 
   beforeEach(() => {
     testDir = join(tmpdir(), `lazy-extract-${randomUUID()}`);

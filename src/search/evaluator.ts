@@ -227,8 +227,12 @@ export function buildSearchResults(
       });
     }
 
-    // Turns
-    for (const turn of data.turns) {
+    // Turns.
+    //
+    // The array index is the locator: TaskData.turns comes straight from
+    // storage.getSessionTurns(), which is the same list (and order) lazy_show
+    // pages over, so the index doubles as a ready-made `offset`.
+    for (const [index, turn] of data.turns.entries()) {
       if (textContains(turn.content, term)) {
         results.push({
           entity_type: 'turn',
@@ -238,12 +242,14 @@ export function buildSearchResults(
           task_goal: taskGoal,
           content: turn.content,
           match_context: extractContext(turn.content, term),
+          entity_index: index,
+          turn_sequence: turn.sequence,
         });
       }
     }
 
     // Commits
-    for (const commit of data.commits) {
+    for (const [index, commit] of data.commits.entries()) {
       if (textContains(commit.message, term)) {
         results.push({
           entity_type: 'commit',
@@ -253,12 +259,13 @@ export function buildSearchResults(
           task_goal: taskGoal,
           content: commit.message,
           match_context: commit.message,
+          entity_index: index,
         });
       }
     }
 
     // Comments
-    for (const comment of data.comments) {
+    for (const [index, comment] of data.comments.entries()) {
       if (textContains(comment.content, term)) {
         results.push({
           entity_type: 'comment',
@@ -268,12 +275,13 @@ export function buildSearchResults(
           task_goal: taskGoal,
           content: comment.content,
           match_context: extractContext(comment.content, term),
+          entity_index: index,
         });
       }
     }
 
     // Follow-ups
-    for (const followUp of data.followUps) {
+    for (const [index, followUp] of data.followUps.entries()) {
       if (textContains(followUp.content, term)) {
         results.push({
           entity_type: 'followup',
@@ -283,6 +291,7 @@ export function buildSearchResults(
           task_goal: taskGoal,
           content: followUp.content,
           match_context: extractContext(followUp.content, term),
+          entity_index: index,
         });
       }
     }

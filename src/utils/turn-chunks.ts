@@ -29,20 +29,19 @@ export interface TurnChunk {
  * Does this turn open a new review chunk? A boundary is a genuine human/builder
  * review intervention — the point a reviewer actually cares about.
  *
- * Expressed via the actor model: a role='human' turn authored by a real
- * reviewer starts a chunk. That means actor 'human' or 'builder' — and, for
- * backward compatibility, legacy turns with no actor at all (absent === human).
- * Turns injected by automation are NOT boundaries and get absorbed into the
- * current chunk:
+ * Expressed via the actor model: a role='human' turn submitted by a reviewer
+ * starts a chunk. That means actor 'human' (CLI), 'builder' or 'agent' (both
+ * MCP) — and, for backward compatibility, legacy turns with no actor at all
+ * (absent === human). Turns injected by automation are NOT boundaries and get
+ * absorbed into the current chunk:
  *   - supervisor nudges       → actor 'supervisor'
  *   - reconciler/auto-deliver → actor 'system'
- *   - agent work/responses    → role 'agent' (never has an actor)
+ *   - agent work/responses    → role 'agent' (never has an actor; the actor
+ *     records who SUBMITTED a command, and an agent's own reply is not one)
  *
- * NOTE: the human-vs-builder distinction does not affect WHERE boundaries fall —
- * both are reviewer interventions — so chunking is correct today even though the
- * `builder-actor` task (which makes the MCP boundary tag turns as 'builder')
- * has not landed. Until it does, builder-originated turns simply carry
- * actor='human', which is still a boundary. See docs/spikes/chunked-turns.md.
+ * NOTE: which of human/builder/agent it is does not affect WHERE boundaries fall
+ * — all three are reviewer interventions, differing only in the channel that
+ * submitted them. See docs/spikes/chunked-turns.md.
  *
  * `auto_triggered` is a backstop for legacy turns predating actor population: an
  * auto-triggered human-role turn is automation even if its actor is missing.

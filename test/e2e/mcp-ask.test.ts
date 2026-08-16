@@ -12,6 +12,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -33,7 +34,7 @@ async function runMcpSession(
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env },
+    env: { ...process.env, ...MCP_SERVER_ENV_PINS },
   });
 
   const stdin = proc.stdin as import('bun').FileSink;

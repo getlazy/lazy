@@ -1,4 +1,4 @@
-import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
@@ -81,6 +81,38 @@ describe('lazy completion', () => {
     expectOutput(result, '--model');
     expectOutput(result, '--follow');
   });
+
+  // REGRESSION: the COMMAND_FLAGS table drifted from the real parseFlags tables
+  // — `start` was missing --effort/--runner and `create` was missing
+  // --priority/--effort/--runner, so flags that have shipped for months never
+  // tab-completed. These two commands are the ones a user types most.
+  for (const shell of ['--bash', '--zsh'] as const) {
+    test(`${shell} script completes every start and create flag`, async () => {
+      const result = await ctx.lazy(['completion', shell]);
+      expectSuccess(result);
+
+      const lines = result.stdout.split('\n');
+      // The flag table is emitted one line per command, as a case arm:
+      //   bash: `start) flags="--model --agent ..." ;;`
+      //   zsh:  `start) compadd -- --model --agent ... ;;`
+      // Anchor on the case label so the top-level command list (which also
+      // contains the word "start") can't match.
+      const lineFor = (cmd: string) =>
+        lines.find((l) => new RegExp(`^\\s*${cmd}\\)`).test(l) && l.includes('--'));
+
+      const startLine = lineFor('start');
+      expect(startLine, 'no flag line found for `start`').toBeDefined();
+      for (const flag of ['--model', '--agent', '--effort', '--runner', '--follow', '--yes', '--force-local']) {
+        expect(startLine!, `start completion missing ${flag}`).toContain(flag);
+      }
+
+      const createLine = lineFor('create');
+      expect(createLine, 'no flag line found for `create`').toBeDefined();
+      for (const flag of ['--goal', '--prompt', '--model', '--type', '--priority', '--code', '--parent', '--agent', '--effort', '--runner', '--tag']) {
+        expect(createLine!, `create completion missing ${flag}`).toContain(flag);
+      }
+    });
+  }
 
   // INVARIANT: completion must cover every canonical top-level command in the
   // dispatcher (src/index.ts commandMap). These were missing/added during the

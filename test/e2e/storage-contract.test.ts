@@ -332,6 +332,63 @@ describe('cross-backend storage row contract', () => {
         expect((await storage.getSessionTurns(session.id))[0]!.usage).toBeNull();
       });
 
+      // INVARIANT: wait intervals read back the same shape on every backend,
+      // including the OPEN interval (`ended_at`/`outcome` explicitly null) that
+      // a turn dying mid-wait leaves behind. Consumers subtracting waited time
+      // from an agent's wall-clock branch on exactly those nulls.
+      test('wait intervals round-trip, open ones keeping explicit nulls', async () => {
+        const task = await storage.createTask('waits');
+        const session = await storage.createSession(task.id, 'claude-code', 'lazy/w', 'sha');
+
+        await storage.recordWaitStart({
+          id: `${task.id}-open`,
+          task_id: task.id,
+          session_id: session.id,
+          turn_sequence: 0,
+          tool: 'lazy_wait',
+          waited_on: ['child-1'],
+          waited_on_labels: ['fix-foo'],
+          started_at: '2026-08-04T10:00:00.000Z',
+        });
+        await storage.recordWaitStart({
+          id: `${task.id}-closed`,
+          task_id: task.id,
+          session_id: null,
+          turn_sequence: null,
+          tool: 'lazy_ask',
+          waited_on: ['child-2'],
+          waited_on_labels: ['fix-bar'],
+          started_at: '2026-08-04T10:01:00.000Z',
+        });
+        await storage.recordWaitEnd(`${task.id}-closed`, '2026-08-04T10:02:00.000Z', 'completed');
+
+        const intervals = await storage.readWaitIntervals({ taskId: task.id });
+        expect(intervals.map(i => i.id)).toEqual([`${task.id}-open`, `${task.id}-closed`]);
+        expect(intervals[0]).toEqual({
+          id: `${task.id}-open`,
+          task_id: task.id,
+          session_id: session.id,
+          turn_sequence: 0,
+          tool: 'lazy_wait',
+          waited_on: ['child-1'],
+          waited_on_labels: ['fix-foo'],
+          started_at: '2026-08-04T10:00:00.000Z',
+          ended_at: null,
+          outcome: null,
+        });
+        expect(intervals[1]).toMatchObject({
+          session_id: null,
+          turn_sequence: null,
+          ended_at: '2026-08-04T10:02:00.000Z',
+          outcome: 'completed',
+        });
+
+        // Session filter narrows to the attributed one.
+        const bySession = await storage.readWaitIntervals({ sessionId: session.id });
+        expect(bySession.map(i => i.id)).toContain(`${task.id}-open`);
+        expect(bySession.map(i => i.id)).not.toContain(`${task.id}-closed`);
+      });
+
       // INVARIANT: JSONB columns round-trip as structured values, not JSON
       // text. postgres.js stores a JSON.stringify()'d argument as a JSON
       // *string* inside JSONB, so `turn.violations[0].status` was reading a

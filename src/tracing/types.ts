@@ -1,7 +1,7 @@
 /**
  * Persisted span schema — one JSONL row per finished span.
  *
- * This is the on-disk contract that `lazy timings` reads back. It is a flat,
+ * This is the on-disk contract that `lazy stats timings` reads back. It is a flat,
  * self-describing projection of an OpenTelemetry span: enough to reconstruct
  * the trace tree and answer "what was slow" without any OTel dependency at
  * read time.

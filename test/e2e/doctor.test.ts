@@ -1,11 +1,14 @@
-import { describe, test, beforeEach, afterEach } from 'bun:test';
-import { mkdirSync, writeFileSync, rmSync } from 'fs';
+import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, chmodSync, existsSync } from 'fs';
 import { join } from 'path';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
+import { storageDirFor } from '../helpers/storage';
 import { createStorage, type Storage } from '../../src/storage';
+import { spawn } from '../../src/utils/spawn';
+import { readProcessIdentity } from '../../src/utils/process-identity';
 
 describe('lazy doctor', () => {
   let ctx: TestContext;
@@ -110,6 +113,203 @@ describe('lazy doctor', () => {
   test('reports no stale storage lock in fresh project', async () => {
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, 'No stale storage lock');
+  });
+
+  // A wedged storage lock fails EVERY lazy command, so doctor is the only place
+  // left to diagnose and clear it from. Per the doctor-single-warning-surface
+  // convention, the remedy lives here and nowhere else.
+  describe('stale storage lock', () => {
+    let holderDir: string;
+    const holders: { kill: () => void }[] = [];
+
+    beforeEach(() => {
+      // The prefix deliberately avoids "lazy": the holder process runs from
+      // inside this directory, and a path containing "lazy" would read as a
+      // plausible lazy process to the command-line backstop.
+      holderDir = mkdtempSync(join(tmpdir(), 'strg-lock-doctor-'));
+    });
+
+    afterEach(() => {
+      for (const h of holders) h.kill();
+      holders.length = 0;
+      rmSync(holderDir, { recursive: true, force: true });
+    });
+
+    /** A real, live process that definitively never took the lock. */
+    function startForeignHolder(): number {
+      const binPath = join(holderDir, 'unrelated-system-daemon');
+      copyFileSync('/bin/sleep', binPath);
+      chmodSync(binPath, 0o755);
+      const proc = spawn([binPath, '120'], { stdout: 'ignore', stderr: 'ignore' });
+      holders.push({ kill: () => { try { proc.kill('SIGKILL'); } catch { /* already gone */ } } });
+      return proc.pid;
+    }
+
+    function writeStorageLock(pid: number): string {
+      // The lock lives in the EXTERNAL store, not <root>/.lazy — checking the
+      // repo-local path is exactly the bug that let doctor miss a real wedge.
+      const lockPath = join(storageDirFor(ctx.root), '.storage-lock');
+      writeFileSync(lockPath, JSON.stringify({ pid, acquired_at: new Date().toISOString() }, null, 2) + '\n');
+      return lockPath;
+    }
+
+    test('detects a lock whose pid was recycled to an unrelated live process', async () => {
+      const lockPath = writeStorageLock(startForeignHolder());
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'is stale');
+      expectOutput(result, lockPath);
+      expectOutput(result, `rm ${lockPath}`);
+    });
+
+    test('detects a lock whose pid no longer exists', async () => {
+      const lockPath = writeStorageLock(2_000_000);
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'is stale');
+      expectOutput(result, lockPath);
+    });
+
+    test('--yes clears the stale lock', async () => {
+      const lockPath = writeStorageLock(startForeignHolder());
+
+      const result = await ctx.lazy(['doctor', '--yes']);
+      expectOutput(result, `Removed stale storage lock: ${lockPath}`);
+      expect(existsSync(lockPath)).toBe(false);
+    });
+
+    test('--dry-run reports the removal without doing it', async () => {
+      const lockPath = writeStorageLock(startForeignHolder());
+
+      const result = await ctx.lazy(['doctor', '--dry-run']);
+      expectOutput(result, `Would remove stale storage lock: ${lockPath}`);
+      // No assertion that the file survives: the rest of the sweep goes on to
+      // use storage, and StorageLock reclaims a lock it can prove is stale.
+      // What --dry-run must not do is remove it ITSELF, which is what the
+      // "Would remove" line above reports.
+    });
+
+  });
+
+  // The other half of the wedged-lock story: a holder whose identity VERIFIES,
+  // so the stale-lock path above correctly declines to reclaim it. Doctor used
+  // to queue behind such a holder on every storage-backed check and then die of
+  // the very problem it exists to diagnose. It must now report the holder and
+  // still produce a full report.
+  describe('storage lock held by a live holder', () => {
+    let holderDir: string;
+    const holders: { kill: () => void }[] = [];
+
+    beforeEach(() => {
+      holderDir = mkdtempSync(join(tmpdir(), 'held-lock-doctor-'));
+    });
+
+    afterEach(() => {
+      for (const h of holders) h.kill();
+      holders.length = 0;
+      rmSync(holderDir, { recursive: true, force: true });
+    });
+
+    /**
+     * Write a lock file whose holder is a REAL live process AND whose recorded
+     * identity matches that process exactly — the identity fields come from the
+     * same reader `checkHolder` uses, so the verdict is "alive" by construction
+     * rather than by luck of the command-line backstop.
+     */
+    async function holdLockLive(acquiredAt: string = new Date().toISOString()): Promise<number> {
+      const binPath = join(holderDir, 'wedged-lazy-holder');
+      copyFileSync('/bin/sleep', binPath);
+      chmodSync(binPath, 0o755);
+      const proc = spawn([binPath, '120'], { stdout: 'ignore', stderr: 'ignore' });
+      holders.push({ kill: () => { try { proc.kill('SIGKILL'); } catch { /* already gone */ } } });
+
+      const identity = await readProcessIdentity(proc.pid);
+      if (!identity) throw new Error(`Could not read identity of holder pid ${proc.pid}`);
+      writeFileSync(
+        join(storageDirFor(ctx.root), '.storage-lock'),
+        JSON.stringify({
+          pid: proc.pid,
+          acquired_at: acquiredAt,
+          holder_started_at: identity.started,
+          holder_start_source: identity.startedSource,
+          holder_command: identity.command,
+        }, null, 2) + '\n',
+      );
+      return proc.pid;
+    }
+
+    test('reports the holder and still prints the rest of the report', async () => {
+      const pid = await holdLockLive();
+
+      const started = Date.now();
+      const result = await ctx.lazy(['doctor']);
+      const elapsedMs = Date.now() - started;
+
+      // The lock is NOT stale — the holder verifies — so doctor must not offer
+      // to remove it. Removing a live holder's lock corrupts the store.
+      expectOutputExcludes(result, 'is stale');
+      expectOutput(result, `held by pid ${pid}`);
+      // Checks that would have queued behind the lock are named as skipped,
+      // not silently dropped.
+      expectOutput(result, `(skipped — storage lock held by pid ${pid})`);
+      // ...and everything that does not need storage still ran.
+      expectOutput(result, 'Git installed');
+      expectOutput(result, 'Repository has commits');
+
+      // The point of the whole change: bounded time. The old behaviour waited
+      // out the full retry loop on EVERY storage-backed check. The ceiling here
+      // is deliberately loose — it is asserting "doesn't queue", not a budget.
+      expect(elapsedMs).toBeLessThan(25_000);
+    }, 40_000);
+
+    test('a freshly-taken lock is a warning, not a failure', async () => {
+      await holdLockLive();
+
+      const result = await ctx.lazy(['doctor']);
+      // A busy store is normal: FileStorage takes this lock per operation, so
+      // doctor must not fail a project just for catching one in flight. The
+      // exit code is not asserted — other checks in this suite's environment
+      // (Docker) legitimately fail, so it would not be measuring this lock.
+      expectOutput(result, 'the store is busy');
+      expectOutput(result, '✓ Storage lock available');
+      expectOutputExcludes(result, 'Storage lock is wedged');
+    }, 40_000);
+
+    test('a lock held far longer than any operation takes is a failure', async () => {
+      const pid = await holdLockLive(new Date(Date.now() - 10 * 60_000).toISOString());
+
+      const result = await ctx.lazy(['doctor']);
+      // The ✗ marker is the assertion that this check FAILED — the exit code
+      // alone would not distinguish it from an unrelated failing check.
+      expectOutput(result, '✗ Storage lock is wedged');
+      expectOutput(result, `pid ${pid}`);
+      // Aimed at the process, never at the file — see describeHeldStorageLock.
+      expectOutput(result, `ps -p ${pid}`);
+      expectFailure(result);
+    }, 40_000);
+
+    // INVARIANT: an age doctor cannot read is a FAILURE, not the soft "busy"
+    // warning. The warning's advice is "look again if this repeats", which is
+    // only useful when a re-run could answer differently — and it cannot here:
+    // the damaged timestamp is on disk, so every future run downgrades itself
+    // identically and an indefinitely-held lock stays invisible forever.
+    test('a live holder with an unreadable acquired_at is a failure, not a warning', async () => {
+      const pid = await holdLockLive();
+      // Strip acquired_at, leaving the identity fields intact so the holder
+      // still verifies as alive — this is the truncated-file / older-lazy shape.
+      const lockPath = join(storageDirFor(ctx.root), '.storage-lock');
+      const lock = JSON.parse(readFileSync(lockPath, 'utf-8'));
+      delete lock.acquired_at;
+      writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, '✗ Storage lock age is unreadable');
+      expectOutput(result, `pid ${pid}`);
+      // Aimed at the process, never at the file — see describeHeldStorageLock.
+      expectOutput(result, `ps -p ${pid}`);
+      expectOutputExcludes(result, 'the store is busy');
+      expectFailure(result);
+    }, 40_000);
   });
 
   test('reports auth status', async () => {
@@ -273,5 +473,88 @@ describe('lazy doctor', () => {
     } finally {
       rmSync(extDir, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * Doctor already degrades gracefully on a broken lazy.toml — it reports a
+   * failed 'lazy.toml parses' check and skips the config-dependent ones. But
+   * that code was unreachable in the one situation it was written for: with no
+   * daemon running, an ordinary command auto-starts one first, and auto-start's
+   * own credential gate calls loadConfig before it checks anything, so the CLI
+   * died at the auto-start boundary and doctor never ran a single check.
+   *
+   * These run the real CLI with LAZY_TEST='' so the production auto-start path
+   * actually executes (under LAZY_TEST it is bypassed entirely and the bug is
+   * invisible), and HOME pinned to a temp dir so a developer's real daemon
+   * directory is untouched. No daemon comes up: the failure happens in-process
+   * before any child is spawned.
+   */
+  describe('degraded mode when the daemon cannot auto-start', () => {
+    let tmpHome: string;
+
+    beforeEach(() => {
+      tmpHome = mkdtempSync(join(tmpdir(), 'lazy-doctor-degraded-'));
+    });
+
+    afterEach(() => {
+      rmSync(tmpHome, { recursive: true, force: true });
+    });
+
+    /** Auto-start live, and a credential present so the ONLY fault is the config. */
+    const autoStartLive = () => ({
+      HOME: tmpHome,
+      LAZY_TEST: '',
+      CLAUDE_CODE_OAUTH_TOKEN: 'fake-token-for-presence-check',
+    });
+
+    function breakConfig(): void {
+      writeFileSync(join(ctx.root, 'lazy.toml'), '[server]\nport = = 26024\n');
+    }
+
+    // INVARIANT: `lazy doctor` never dies of the problem it exists to diagnose.
+    // A broken lazy.toml with no daemon running is precisely when a user reaches
+    // for doctor, and it must answer.
+    test('a broken lazy.toml does not abort doctor at the auto-start boundary', async () => {
+      breakConfig();
+
+      const result = await ctx.lazy(['doctor'], { env: autoStartLive() });
+
+      // Doctor ran: checks that need no config are reported...
+      expectOutput(result, 'Git installed');
+      // ...the broken config is reported as its own failed check, with the
+      // parser's line-and-cause...
+      expectOutput(result, 'lazy.toml parses');
+      expectOutput(result, 'port = = 26024');
+      // ...and the config-dependent checks are skipped rather than silently
+      // evaluated against defaults the user never chose.
+      expectOutput(result, 'every config-dependent check is skipped');
+      // Reaching the summary at all is the proof it did not die early.
+      expectOutput(result, 'issue');
+    });
+
+    // The daemon's absence is stated, not silently papered over — a doctor run
+    // that skipped daemon-backed checks without saying so would be its own
+    // misdiagnosis.
+    test('doctor says why it is running without a daemon', async () => {
+      breakConfig();
+
+      const result = await ctx.lazy(['doctor'], { env: autoStartLive() });
+
+      expectError(result, 'could not be auto-started');
+      expectError(result, 'Continuing without it');
+      // The old behavior: a fatal `Error:` from the auto-start catch, nothing else.
+      expectOutputExcludes(result, 'All good!');
+    });
+
+    // INVARIANT: doctor is the ONLY command that degrades. Auto-start failing is
+    // fatal everywhere else — a command that silently runs daemon-less would
+    // bypass the daemon's single-owner guarantees on storage and auth.
+    test('other commands still fail hard on the same broken config', async () => {
+      breakConfig();
+
+      const result = await ctx.lazy(['list'], { env: autoStartLive() });
+      expectFailure(result);
+      expectError(result, 'Failed to parse');
+    });
   });
 });

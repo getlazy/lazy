@@ -140,25 +140,32 @@ describe('resolveDaemonBindHosts', () => {
 
 // Mechanism check: two listeners on the SAME port but different local IPs (the
 // loopback + bridge dual-bind the daemon relies on) is a valid socket setup.
-// 127.0.0.2 stands in for a second host interface — it's in the loopback range
-// and bindable on Linux without privileges.
+// SECOND_LOOPBACK_HOST stands in for a second host interface — it's in the
+// loopback range and bindable on Linux without privileges. Not every host has
+// it (macOS configures only 127.0.0.1 on lo0), so the suite is gated on the
+// address actually being bindable and says so when it skips; see
+// test/helpers/second-loopback.ts for why that costs no coverage.
 import { tryBindTcpPort } from '../../src/server';
+import { SECOND_LOOPBACK_HOST, secondLoopbackSuiteSkipped } from '../helpers/second-loopback';
 
-describe('dual-bind mechanism (same port, two interfaces)', () => {
-  test('a second interface can bind the exact port the primary already holds', () => {
-    const handler = async () => new Response('ok');
-    const primary = tryBindTcpPort(0, handler, 1, '127.0.0.1');
-    expect(primary).not.toBeNull();
-    const port = primary!.server.port!;
-    let secondary: ReturnType<typeof tryBindTcpPort> = null;
-    try {
-      secondary = tryBindTcpPort(port, handler, 1, '127.0.0.2');
-      expect(secondary).not.toBeNull();
-      expect(secondary!.server.port).toBe(port);
-      expect(secondary!.server.hostname).toBe('127.0.0.2');
-    } finally {
-      primary!.server.stop(true);
-      secondary?.server.stop(true);
-    }
-  });
-});
+describe.skipIf(secondLoopbackSuiteSkipped('dual-bind mechanism'))(
+  'dual-bind mechanism (same port, two interfaces)',
+  () => {
+    test('a second interface can bind the exact port the primary already holds', () => {
+      const handler = async () => new Response('ok');
+      const primary = tryBindTcpPort(0, handler, 1, '127.0.0.1');
+      expect(primary).not.toBeNull();
+      const port = primary!.server.port!;
+      let secondary: ReturnType<typeof tryBindTcpPort> = null;
+      try {
+        secondary = tryBindTcpPort(port, handler, 1, SECOND_LOOPBACK_HOST);
+        expect(secondary).not.toBeNull();
+        expect(secondary!.server.port).toBe(port);
+        expect(secondary!.server.hostname).toBe(SECOND_LOOPBACK_HOST);
+      } finally {
+        primary!.server.stop(true);
+        secondary?.server.stop(true);
+      }
+    });
+  },
+);

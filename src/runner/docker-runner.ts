@@ -11,11 +11,11 @@ import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RunnerType, RoleTarget } from '../config/types';
 
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { writeFile } from 'fs/promises';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
+import { redactSecrets } from '../utils/redact';
 import {
   checkTargetConnectivity,
   preflightRoleTarget,
@@ -40,18 +40,22 @@ import {
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { encodeProjectPath } from '../import/claude-code-logs';
 import { shouldMountProjectsDir, type BuilderLaunchProjects } from '../builder/projects-isolation';
+import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
 import {
   CONTAINER_CREDENTIAL_STORE,
   builderClaudeConfigPath,
-  mergeBuilderClaudeConfig,
-  resolveBuilderClaudeConfigBase,
+  builderClaudeSessionConfigPath,
+  persistBuilderSessionClaudeConfig,
+  writeBuilderSessionClaudeConfig,
   writeNeutralCredentialStore,
 } from '../builder/claude-home';
+import { assertDaemonMcpConfigMounted } from '../builder/mcp-config-check';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
 import dockerAgentInstructions from '../prompts/docker-agent-instructions.md' with { type: 'text' };
 import { writeToolPermissions } from '../mcp/config';
+import { READ_ONLY_TOOL_NAMES } from '../mcp/tool-access';
 
 // Agent packaging for tool checks. Instantiated once; stateless.
 const agentPackaging = new ClaudeCodePackaging();
@@ -70,30 +74,15 @@ export const PROJECT_LABEL = 'lazy.project';
  * Read-only MCP tools that should be pre-approved in the builder session.
  * These tools only read state and don't mutate tasks or trigger operations.
  * Mutating tools (create, start, accept, reject, etc.) require user confirmation.
+ *
+ * Sourced from the one classification of every tool (src/mcp/tool-access.ts) so
+ * the builder's pre-approval list and the ask turn's read-only toolset can never
+ * drift apart — a new write tool is a write tool for both, by default.
  */
-const BUILDER_READ_ONLY_TOOLS = [
-  'lazy_search',
-  'lazy_show',
-  'lazy_status',
-  'lazy_conversations',
-  'lazy_conversation_search',
-  'lazy_conversation_read',
-  // Reading shared memory is read-only; lazy_memory_save is a write and is
-  // deliberately absent, so it still requires user confirmation.
-  'lazy_memory_recall',
-  'lazy_list',
-  'lazy_blocked',
-  'lazy_active',
-  'lazy_diff',
-  'lazy_wait',
-];
+const BUILDER_READ_ONLY_TOOLS = [...READ_ONLY_TOOL_NAMES];
 
 /** Docker label key used to scope containers to a project root. */
 export const PROJECT_LABEL_KEY = 'lazy.project';
-
-export interface DockerRunnerOptions {
-  dockerAgentNoNetwork?: boolean;
-}
 
 export class DockerRunner implements Runner {
   readonly type: RunnerType;
@@ -101,14 +90,12 @@ export class DockerRunner implements Runner {
   // An idle container stays fully resident between turns → eligible for base reap.
   readonly reapsIdleRuns = true;
   protected readonly binary: string;
-  private options: DockerRunnerOptions;
   private lazyRoot: string | undefined;
   protected _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
 
-  constructor(binary: string = 'docker', type: RunnerType = 'docker', options?: DockerRunnerOptions, lazyRoot?: string) {
+  constructor(binary: string = 'docker', type: RunnerType = 'docker', lazyRoot?: string) {
     this.binary = binary;
     this.type = type;
-    this.options = options ?? {};
     this.lazyRoot = lazyRoot;
   }
 
@@ -202,6 +189,26 @@ export class DockerRunner implements Runner {
 
   async getRunLogs(runName: string, tailLines?: number): Promise<string | null> {
     return getContainerLogs(runName, tailLines, this.binary);
+  }
+
+  async execInRun(runName: string, argv: string[], opts?: { timeoutMs?: number }): Promise<number | null> {
+    // Output is inherited, not captured: the caller is passing a diagnostic
+    // through to a human, and re-printing a captured buffer would reorder
+    // stdout against stderr and delay every line to the end of the run.
+    //
+    // No `-t`: allocating a pty would translate newlines and inject control
+    // characters into output that gets pasted into issues. Nothing lazy runs
+    // this way colorizes, so there is nothing to gain for the cost.
+    const proc = spawn([this.binary, 'exec', runName, ...argv], {
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+      // The default 60s subprocess timeout is too short for what runs in here
+      // (the MCP self-test alone allows 20s, `--probe-agent` 90s), and a
+      // timeout kill would look exactly like a failing check.
+      timeout: opts?.timeoutMs ?? 300_000,
+    });
+    return await proc.exited;
   }
 
   async stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean> {
@@ -343,7 +350,11 @@ export class DockerRunner implements Runner {
     return agentPackaging.supervisorToolChecks();
   }
 
-  mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] } {
+  mcpServerConfig(
+    taskId: string,
+    worktreePath: string,
+    opts?: { readOnly?: boolean },
+  ): { command: string; args: string[] } {
     // The daemon is required in v0.11+ and always provides LAZY_DAEMON_CONFIG
     // when launching containers. MCP tool calls route through the daemon's
     // /mcp routes via HTTP proxy.
@@ -362,7 +373,16 @@ export class DockerRunner implements Runner {
     // repo mount. Writing next to it would fail with EROFS.
     return {
       command: 'lazy-agent',
-      args: ['mcp', '--daemon-config', daemonConfigTemplate, '--task-id', taskId, '--worktree', worktreePath],
+      args: [
+        'mcp',
+        '--daemon-config', daemonConfigTemplate,
+        '--task-id', taskId,
+        '--worktree', worktreePath,
+        // Read-only turns must be scoped HERE. Proxy handlers run the tool in
+        // the daemon, which does not inherit the supervisor's
+        // LAZY_MCP_READ_ONLY, so the in-handler guard cannot see this turn.
+        ...(opts?.readOnly ? ['--read-only'] : []),
+      ],
     };
   }
 
@@ -559,22 +579,28 @@ export class DockerRunner implements Runner {
     }
 
     // Prepare the builder's ~/.claude.json: persisted builder state (seeded once
-    // from the host's) + lazy's MCP server entry. Claude Code reads this at $HOME
-    // root, not inside ~/.claude/. It stays a separate file so the human's real
-    // config is never modified, but it is STABLE per project rather than a
-    // per-launch temp file — otherwise onboarding, folder-trust and model choices
-    // Claude Code writes during the session are discarded on exit and re-prompted
-    // on the next launch. Deliberately NOT added to tempFilesToClean.
-    const mergedConfigFile = builderClaudeConfigPath(dataDir);
-    const configBase = await resolveBuilderClaudeConfigBase(
-      mergedConfigFile,
-      join(getHome(), '.claude.json'),
-      (message) => logger.warn(message),
-    );
-    await writeFile(
-      mergedConfigFile,
-      JSON.stringify(mergeBuilderClaudeConfig(configBase, mcpArgs), null, 2) + '\n',
-    );
+    // from the host's) + THIS launch's lazy MCP server entry. Claude Code reads
+    // this at $HOME root, not inside ~/.claude/. It is a separate file so the
+    // human's real config is never modified.
+    //
+    // The mounted copy is PER LAUNCH and the persisted state is written back on
+    // exit. Mounting one stable file into every builder of a project was the
+    // cause of "builder comes up with no lazy_* tools after an upgrade": the
+    // entry carries a per-launch `--daemon-config` path, and a second launch
+    // rewriting the shared file in place is visible through the first
+    // container's bind mount — pointing it at a token file it never had. See
+    // src/builder/claude-home.ts for the full mechanism.
+    const persistedConfigFile = builderClaudeConfigPath(dataDir);
+    const mergedConfigFile = builderClaudeSessionConfigPath(tmpDir, builderId);
+    await writeBuilderSessionClaudeConfig({
+      sessionPath: mergedConfigFile,
+      persistedPath: persistedConfigFile,
+      hostConfigPath: join(getHome(), '.claude.json'),
+      mcpArgs,
+      onWarn: (message) => logger.warn(message),
+    });
+    // Removed only AFTER its state is folded back into the persisted file.
+    tempFilesToClean.push(mergedConfigFile);
 
     // Shadow the human's credential store inside the container. The builder runs
     // on the daemon credential; leaving the host's ~/.claude/.credentials.json
@@ -621,11 +647,19 @@ export class DockerRunner implements Runner {
       }
     }
 
+    // Builder scratch dir — writable, outside the repo, mounted at the SAME
+    // absolute path so a path the builder prints pastes into a host shell.
+    // Derived from lazyRoot alone (no config), so this runner and the
+    // host-process runner cannot disagree about where it is. See
+    // src/builder/scratch.ts. Never mounted into a task-agent container.
+    const scratchDir = await ensureBuilderScratchDir(lazyRoot);
+
     // Build container args: launch lazy-agent in builder mode.
     const dockerArgs = buildBuilderDockerArgs({
       binary: this.binary,
       builderId,
       lazyRoot,
+      scratchDir,
       dataDir,
       containerConfigFile,
       agentBinaryPath,
@@ -642,7 +676,15 @@ export class DockerRunner implements Runner {
     });
 
     if (debug) {
-      console.log('[DEBUG] Running builder container command:', dockerArgs.join(' '));
+      console.log('[DEBUG] Running builder container command:', redactSecrets(dockerArgs).join(' '));
+    }
+
+    // Fail loud BEFORE the container starts if the MCP credential the builder is
+    // about to be pointed at is not on disk. Without this the container starts,
+    // Claude Code's MCP child exits on a missing file, and the human discovers
+    // several turns later that the builder has no lazy_* tools at all.
+    if (useDaemonProxy) {
+      await assertDaemonMcpConfigMounted(daemonConfigPath!, mergedConfigFile);
     }
 
     logger.info('Launching builder container...');
@@ -655,6 +697,15 @@ export class DockerRunner implements Runner {
     });
 
     const exitCode = await proc.exited;
+
+    // Fold this session's ~/.claude.json (onboarding, folder trust, model
+    // choice, MCP approvals Claude Code wrote inside the container) back into
+    // the persisted per-project state, BEFORE the per-launch copy is unlinked.
+    await persistBuilderSessionClaudeConfig({
+      sessionPath: mergedConfigFile,
+      persistedPath: persistedConfigFile,
+      onWarn: (message) => logger.warn(message),
+    });
 
     // Clean up temp files
     for (const tmpFile of tempFilesToClean) {
@@ -674,6 +725,12 @@ export interface BuilderDockerArgsParams {
   builderId: string;
   lazyRoot: string;
   dataDir: string;
+  /**
+   * Builder scratch dir on the host (see src/builder/scratch.ts). Mounted
+   * read-write at the identical absolute path. BUILDER ONLY — no agent launch
+   * path takes this parameter, and none may ever mount it.
+   */
+  scratchDir: string;
   containerConfigFile: string;
   agentBinaryPath: string;
   /** Host home dir — source of the ~/.claude mount. */
@@ -706,7 +763,7 @@ export interface BuilderDockerArgsParams {
  */
 export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[] {
   const {
-    binary, builderId, lazyRoot, dataDir, containerConfigFile, agentBinaryPath,
+    binary, builderId, lazyRoot, dataDir, scratchDir, containerConfigFile, agentBinaryPath,
     home, projectsHostDir, neutralCredentialStore, mergedConfigFile, authEnvVars,
     imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug,
   } = params;
@@ -725,6 +782,12 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     '-v', `${lazyRoot}:${lazyRoot}:ro`,
     // Mount data dir read-write (conversation capture needs write access)
     '-v', `${dataDir}:${dataDir}`,
+    // Builder scratch dir: read-write, at the identical host path so anything
+    // the builder writes is readable by the human with the path as printed.
+    // Lives outside the repo (~/.lazy/scratch/<project-slug>), so it can never
+    // be committed. BUILDER ONLY — see src/builder/scratch.ts.
+    '-v', `${scratchDir}:${scratchDir}`,
+    '-e', `${SCRATCH_ENV_VAR}=${scratchDir}`,
     // Container-specific builder config (has host.docker.internal)
     '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
     // MCP binary for proxy tool access

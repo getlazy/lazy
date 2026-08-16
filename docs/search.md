@@ -3,7 +3,8 @@
 `lazy search` looks across tasks, prompts, turns, commits, notes, follow-ups,
 captured conversations, and shared memory records. The builder and task agents
 reach the same engine through the `lazy_search` MCP tool — **both surfaces share
-one parser and one evaluator**, so a query that works in one works in the other.
+one parser, one evaluator, and one fuzzy content loader**, so a query that works
+in one works in the other, and all three matching modes see the same content.
 
 `lazy search --help` is the authoritative reference for flags; this page explains
 the query language and the behavior that isn't obvious from a flag list.
@@ -136,6 +137,42 @@ Details worth knowing:
 - `NOT tag:x` never triggers a hint — it says nothing about whether `x` exists.
 - With `--json`, the hint appears as a top-level `hint` field. The MCP
   `lazy_search` tool returns the same field.
+
+## From a hit to the thing it hit
+
+Result excerpts are truncated (~500 chars over MCP) on purpose: search *locates*,
+`show` *reads*. So a hit that lives inside a task's own list — a turn, commit,
+comment or follow-up — carries a locator you can hand straight to `show`.
+
+- **CLI.** Turn hits print as `turn #12` in the TYPE column, so `lazy show
+  <task>` tells you which turn to look at without counting. With `--json`, each
+  hit's `context` carries `turn_seq` (the turn number) and `index` (its 0-based
+  position).
+- **MCP.** Each such hit carries `index`, and turn hits also carry
+  `turnSequence`. For turn, commit and comment hits `index` is the entity's
+  position in the very list `lazy_show` pages over, so it works as an `offset`
+  against that one section:
+
+  ```
+  lazy_search(query="reconciler")        -> {type: "turn", index: 7, turnSequence: 8, ...}
+  lazy_show(task_id, sections=["turns"], offset=7, limit=1)   # that exact turn, in full
+  ```
+
+  `sections=["commits"]` and `sections=["comments"]` work the same way.
+
+`index` and `turnSequence` are deliberately separate. `index` is a pagination
+offset; `turnSequence` is the turn's identity in rendered output. They coincide
+only when a session's sequences start at 0 and skip nothing.
+
+Follow-up hits are the exception: there is no `follow_ups` value in `lazy_show`'s
+`sections`, and none is needed — `lazy_show` always returns every follow-up in
+full as `follow_ups`, unpaged, because a task's follow-ups are its triage queue
+at review. So a follow-up hit's `index` is a position to read off in that array,
+not an offset to page to. Asking for `sections=["follow_ups"]` is a schema error,
+by design.
+
+Hits with no position in a per-task list — task, prompt, conversation, memory —
+carry neither field, rather than a misleading `index: 0`.
 
 ## Examples
 

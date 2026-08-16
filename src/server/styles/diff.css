@@ -1,0 +1,70 @@
+/*
+ * The diff renderer's styling. ONE renderer, so one stylesheet: the review
+ * surface and commit detail both render src/server/review-diff.ts, and both
+ * get their look from here.
+ *
+ * The `.diff-*` rules that used to live here belonged to a second renderer
+ * (@pierre/diffs) that put every line inside a Shadow DOM, where nothing
+ * outside could address it — which is why per-line comments needed their own
+ * renderer in the first place. That renderer is gone, and so are its rules.
+ */
+
+.rv-file { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 20px; overflow: hidden; }
+.rv-file-head { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); }
+.rv-file-path { font-family: var(--font-mono); font-weight: 600; }
+.rv-file-toggle { font-family: var(--font-ui); font-size: 11px; line-height: 1; padding: 2px 5px; border: 1px solid transparent; border-radius: 4px; background: none; color: var(--text-secondary); cursor: pointer; }
+.rv-file-toggle:hover { border-color: var(--border); }
+.rv-file[data-collapsed="1"] .rv-file-toggle { transform: rotate(-90deg); }
+.rv-file[data-collapsed="1"] .rv-file-head { border-bottom: 0; }
+.rv-file[data-collapsed="1"] .rv-diff-scroll, .rv-file[data-collapsed="1"] .rv-binary { display: none; }
+.rv-viewed { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-ui); font-size: 11px; color: var(--text-secondary); cursor: pointer; user-select: none; margin-left: 4px; }
+.rv-file[data-viewed="1"] .rv-viewed { color: #16a34a; }
+.rv-file[data-viewed="1"] .rv-file-path { opacity: 0.65; text-decoration: line-through; }
+.rv-stat-add { color: #16a34a; margin-left: auto; }
+.rv-stat-del { color: #dc2626; }
+.rv-binary { padding: 10px 12px; color: var(--text-secondary); }
+.rv-diff-scroll { overflow-x: auto; }
+table.rv-diff { min-width: 100%; border-collapse: collapse; margin: 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; }
+table.rv-diff td { border: 0; padding: 0 6px; white-space: pre; vertical-align: top; }
+tr.rv-hunk td { background: var(--bg-secondary); color: var(--text-secondary); padding: 4px 12px; white-space: pre; }
+tr.rv-add { background: rgba(22,163,74,0.12); }
+tr.rv-del { background: rgba(220,38,38,0.12); }
+tr.rv-line:target { outline: 2px solid var(--link); outline-offset: -2px; }
+td.rv-num { width: 1%; text-align: right; color: var(--text-secondary); user-select: none; }
+td.rv-gutter { width: 1%; }
+/* Default: never wrap. One diff line stays one row, so the row still lines up
+   with the line number its comment anchor is keyed on, and .rv-diff-scroll
+   handles the overflow. Wrapping is opt-in (.rv-wrap): it costs that 1:1
+   row/line correspondence visually, but the anchor data rides on the <tr>, so
+   comments keep working either way. */
+td.rv-code { width: 98%; white-space: pre; }
+.rv-wrap td.rv-code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.rv-wrap .rv-diff-scroll { overflow-x: visible; }
+.rv-add-comment { visibility: hidden; cursor: pointer; border: 1px solid var(--border); background: var(--link); color: #fff; border-radius: 3px; line-height: 1; padding: 0 5px; font-family: inherit; }
+tr.rv-line:hover .rv-add-comment, tr.rv-pair:hover .rv-add-comment { visibility: visible; }
+
+/* Side-by-side. One <tr> per split row holds both panes, so a row is as tall
+   as its taller side and the two panes cannot drift apart — including under
+   Wrap, and including when a thread expands underneath. The anchor data
+   (file/side/line + the id a queued-comment link targets) moves from the <tr>
+   onto the code cell of the side it belongs to, so there is still exactly one
+   anchor per diff line: unchanged data, one level down the tree. */
+tr.rv-pair td.rv-code { width: 50%; }
+tr.rv-pair td.rv-c-add { background: rgba(22,163,74,0.12); }
+tr.rv-pair td.rv-c-del { background: rgba(220,38,38,0.12); }
+/* Filler: the side of a change block that has no counterpart. Visibly inert,
+   so a lone deletion reads as "nothing replaced this". */
+tr.rv-pair td.rv-c-nil { background: var(--bg-secondary); }
+tr.rv-pair td.rv-pane-new { border-left: 1px solid var(--border); }
+td.rv-code:target { outline: 2px solid var(--link); outline-offset: -2px; }
+/* Wrap needs no special case here: it targets td.rv-code, which is what both
+   layouts use, and a paired row is as tall as its taller pane — so the two
+   sides stay level however far either of them wraps. */
+
+.rv-viewopts { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-family: var(--font-ui); font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; }
+.rv-viewopts button { font-family: var(--font-ui); font-size: 12px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
+.rv-viewopts button:hover { border-color: var(--link); }
+.rv-viewopts button[aria-pressed="true"] { border-color: var(--link); color: var(--link); background: rgba(37,99,235,0.10); }
+.rv-viewopts button[disabled] { opacity: 0.45; cursor: not-allowed; }
+.rv-viewopts button[disabled]:hover { border-color: var(--border); }
+.rv-viewopt-group { display: flex; align-items: center; gap: 6px; margin-right: 10px; }

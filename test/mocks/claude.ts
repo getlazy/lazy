@@ -8,6 +8,18 @@
  */
 
 import type { AgentResponse, TokenUsage } from '../../src/types';
+// Imported, not restated: this module REPLACES src/capture/claude.ts, and a mock
+// that invents its own tag shape keeps passing after the real one changes.
+// src/capture/image-tag.ts is a separate module, so importing it here is not
+// circular — the preload only aliases capture/claude.
+import { IMAGE_TAG, IMAGE_NAME, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from '../../src/capture/image-tag';
+import { AGENT_SELFCHECK_SENTINEL } from '../../src/agent/binary-identity';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { mkdir, writeFile } from 'fs/promises';
+
+export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
+const MOCK_IMAGE_REF = `${IMAGE_NAME}:${IMAGE_TAG}`;
 
 export interface SandboxConfig {
   worktreePath: string;
@@ -19,8 +31,8 @@ export function checkDocker(): void {
 }
 
 export async function ensureImage(): Promise<string> {
-  // No-op in tests, return default image name
-  return 'lazy-runner';
+  // No-op in tests, return the default version-tagged image ref
+  return MOCK_IMAGE_REF;
 }
 
 /**
@@ -30,7 +42,7 @@ export async function ensureImage(): Promise<string> {
  */
 export async function buildLazyRunnerImage(
   options: { binary?: string; noCache?: boolean } = {}
-): Promise<string> {
+): Promise<string[]> {
   const logPath = process.env.LAZY_MOCK_BUILD_LOG;
   if (logPath) {
     const { appendFile } = await import('fs/promises');
@@ -39,15 +51,75 @@ export async function buildLazyRunnerImage(
       JSON.stringify({ binary: options.binary ?? 'docker', noCache: options.noCache ?? false }) + '\n'
     );
   }
-  return 'lazy-runner';
+  return [MOCK_IMAGE_REF, 'lazy-runner:latest'];
 }
 
 export function resolveImageName(_lazyRoot: string): string {
-  return 'lazy-runner';
+  return MOCK_IMAGE_REF;
 }
 
+export function resolveImageRepository(_lazyRoot: string): { repository: string; isCustom: boolean } {
+  return { repository: 'lazy-runner', isCustom: false };
+}
+
+export async function resolveImageBuildTags(_lazyRoot: string): Promise<string[]> {
+  return [MOCK_IMAGE_REF, 'lazy-runner:latest'];
+}
+
+/**
+ * Mock of the staged image build used by `lazy upgrade`'s background rebuild.
+ * Records its options to LAZY_MOCK_BUILD_LOG (same channel as
+ * buildLazyRunnerImage) so tests can assert the staging tag and --no-cache.
+ */
+export async function buildProjectImageToTag(
+  _lazyRoot: string,
+  tag: string,
+  options: { binary?: string; noCache?: boolean; signal?: AbortSignal } = {},
+): Promise<string> {
+  const logPath = process.env.LAZY_MOCK_BUILD_LOG;
+  if (logPath) {
+    const { appendFileSync } = await import('fs');
+    appendFileSync(
+      logPath,
+      JSON.stringify({ stagedTag: tag, binary: options.binary ?? 'docker', noCache: options.noCache ?? false }) + '\n'
+    );
+  }
+  return `lazy-runner:${tag}`;
+}
+
+export async function tagImage(_sourceRef: string, _targetRefs: string[], _binary?: string): Promise<void> {
+  // No-op in tests — no real images exist to tag.
+}
+
+export async function removeImageTag(_ref: string, _binary?: string): Promise<boolean> {
+  return true;
+}
+
+export async function listLazyImages(): Promise<
+  Array<{ ref: string; repository: string; tag: string; id: string; size: string }>
+> {
+  // Tests never have real images; doctor's stale-image report is exercised
+  // against the real implementation in test/e2e/image-version-tag.test.ts.
+  return [];
+}
+
+/**
+ * A stand-in for the real agent binary that PASSES verifyAgentBinary().
+ *
+ * This used to return a path that did not exist. Callers only ever passed it to
+ * Docker as a bind-mount source, so nothing noticed — until `lazy upgrade` began
+ * verifying what it had just installed, at which point every upgrade test failed
+ * on a file the mock had never created. The mock must produce something that
+ * looks like the compiled agent (ELF magic + the selfcheck sentinel), because
+ * that is what the real one produces.
+ */
 export async function ensureAgentBinary(): Promise<string> {
-  return '/fake/path/to/lazy-agent';
+  const dir = join(tmpdir(), 'lazy-test-agent-binary');
+  const path = join(dir, 'lazy-agent');
+  await mkdir(dir, { recursive: true });
+  const head = '\u007fELF' /* ELF magic */ + AGENT_SELFCHECK_SENTINEL + ' 0.0.0-test';
+  await writeFile(path, head + 'x'.repeat(4096 - head.length), { mode: 0o755 });
+  return path;
 }
 
 export function hasAuthEnv(): boolean {
@@ -154,7 +226,53 @@ export async function runClaude(
 export async function runClaudeOneshot(
   prompt: string,
   _model?: string,
+  opts: { readOnly?: boolean } = {},
 ): Promise<AgentResponse> {
+  // --- Conversation ask (`lazy ask <conversation-id>`, lazy_conversation_ask) ---
+  //
+  // Same stage-marker dispatch as the report mock below, on its own markers.
+  // The `[ro]` suffix echoes whether the caller asked for a read-only one-shot,
+  // so a test can assert the lockdown is requested without spawning an agent.
+  //
+  //   LAZY_MOCK_CONV_ASK_IRRELEVANT — comma-separated 1-based excerpt indexes
+  //                                   whose map pass returns NOTHING_RELEVANT.
+  {
+    const ro = opts.readOnly ? '[ro]' : '';
+    if (prompt.includes('LAZY_CONV_ASK_STAGE: single')) {
+      const q = prompt.match(/## Question\n\n([^\n]*)/)?.[1] ?? '';
+      return {
+        result: `[conv-ask:single]${ro} mocked answer to: ${q}`,
+        session_id: 'mock-conv-ask',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    }
+    if (prompt.includes('LAZY_CONV_ASK_STAGE: map')) {
+      const idx = prompt.match(/## Excerpt (\d+) of (\d+)/)?.[1] ?? '?';
+      const failKeyword = process.env.LAZY_MOCK_FAIL_KEYWORD;
+      if (failKeyword && prompt.includes(failKeyword)) {
+        throw new Error('mock claude failure (sentinel matched)');
+      }
+      const irrelevant = (process.env.LAZY_MOCK_CONV_ASK_IRRELEVANT ?? '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+      if (irrelevant.includes(idx)) {
+        return { result: 'NOTHING_RELEVANT', session_id: `mock-conv-map-${idx}`, usage: { input_tokens: 1, output_tokens: 1 } };
+      }
+      return {
+        result: `[conv-ask:map:${idx}]${ro} mocked finding from excerpt ${idx}.`,
+        session_id: `mock-conv-map-${idx}`,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    }
+    if (prompt.includes('LAZY_CONV_ASK_STAGE: reduce')) {
+      const markers = Array.from(prompt.matchAll(/\[conv-ask:map:(\d+)\]/g)).map(mm => `[conv-ask:map:${mm[1]}]`);
+      return {
+        result: `[conv-ask:reduce]${ro} mocked answer from ${markers.length} excerpt(s): ${markers.join(' ')}`,
+        session_id: 'mock-conv-reduce',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+    }
+  }
+
   // Only fail at map stages — the reduce prompt may legitimately echo the
   // failure keyword in the failed-units list, and we don't want that to
   // cascade into a reduce failure too.
@@ -285,6 +403,36 @@ export async function resumeClaudeAsync(
 // --- Supervisor API ---
 
 /**
+ * The launch settings the host asked for, echoed onto a response exactly as the
+ * real supervisor does (`launchSettings` in src/supervisor/index.ts): `model` is
+ * the resolved value the host put in the command, `effort` the resolved effort.
+ *
+ * Deliberately NO `model_id`. This seam runs no agent, so nothing here ever
+ * learns a concrete model id — emitting a synthetic one would let a test pass on
+ * a value production never produces. Concrete-id coverage belongs to the fake-
+ * binary seam, where a real agent process reports it.
+ */
+function launchSettingsFromCommand(cmd: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...(typeof cmd.model_id === 'string' && cmd.model_id ? { model: cmd.model_id } : {}),
+    ...(typeof cmd.effort === 'string' && cmd.effort ? { effort: cmd.effort } : {}),
+  };
+}
+
+/** Read the command the host wrote, or `{}` when there is none to read. */
+async function readCommand(protocolDir: string): Promise<Record<string, unknown>> {
+  const { readFileSync, existsSync } = await import('fs');
+  const { join } = await import('path');
+  const commandPath = join(protocolDir, 'command.json');
+  if (!existsSync(commandPath)) return {};
+  try {
+    return JSON.parse(readFileSync(commandPath, 'utf-8')) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(`mock supervisor: failed to parse ${commandPath}: ${(err as Error).message}`);
+  }
+}
+
+/**
  * Mock of the supervisor's pre-accept handler. The mock agent optionally commits
  * (LAZY_MOCK_SHOULD_COMMIT), then the gate commands are re-run authoritatively —
  * exactly like the real handlePreAcceptCommand. Writes a single CompletedResponse
@@ -345,6 +493,7 @@ async function handleMockPreAccept(
     start_sha_work: preTurnSha,
     end_sha_work: postWorkSha,
     pre_accept: preAccept,
+    ...launchSettingsFromCommand(cmd),
   };
   writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));
 }
@@ -366,18 +515,18 @@ export async function launchSupervisorAsync(
     ? preTurnShaResult.stdout.toString().trim()
     : 'unknown';
 
+  // Launch settings the host asked for — echoed onto every response this
+  // invocation writes, exactly as the real supervisor does.
+  const launchSettings = launchSettingsFromCommand(await readCommand(protocolDir));
+
   // Pre-accept turn: a WRITE turn (mock agent may commit) followed by the
   // AUTHORITATIVE gate re-run. Mirrors src/supervisor/index.ts#handlePreAcceptCommand:
   // a single CompletedResponse carrying `pre_accept`, not a start-style bundle.
   {
-    const { readFileSync: readFs, existsSync: existsFs } = await import('fs');
-    const commandPath = join(protocolDir, 'command.json');
-    if (existsFs(commandPath)) {
-      const cmd = JSON.parse(readFs(commandPath, 'utf-8'));
-      if (cmd.type === 'pre_accept') {
-        await handleMockPreAccept(sandbox, protocolDir, cmd, preTurnSha);
-        return;
-      }
+    const cmd = await readCommand(protocolDir);
+    if (cmd.type === 'pre_accept') {
+      await handleMockPreAccept(sandbox, protocolDir, cmd, preTurnSha);
+      return;
     }
   }
 
@@ -498,6 +647,7 @@ export async function launchSupervisorAsync(
             start_sha_work: lastSha,
             end_sha_work: postPushbackSha,
             violations: finalViolations,
+            ...launchSettings,
             supervised: { kind: 'permission_pushback', prompt: 'Mock push-back prompt: you modified protected file(s). Revert or justify.' },
           });
           lastSha = postPushbackSha;
@@ -541,6 +691,7 @@ export async function launchSupervisorAsync(
             usage: { ...SUPERVISED_USAGE },
             start_sha_work: lastSha,
             end_sha_work: currentSha,
+            ...launchSettings,
             supervised: { kind: 'maintain', prompt: `Mock maintain nudge: you skipped ${skipped.map(s => s.title).join(', ')}. Update or justify.` },
           });
           lastSha = currentSha;
@@ -585,6 +736,7 @@ export async function launchSupervisorAsync(
     result: mockResp.result,
     session_id: mockResp.session_id,
     usage: mockResp.usage,
+    ...launchSettings,
     ...(pushbackTriggered ? { pushed_back: true } : {}),
     ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
     ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),

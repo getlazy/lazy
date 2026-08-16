@@ -36,6 +36,30 @@ export async function makeDaemonBaseDir(): Promise<string> {
   return await mkdtemp(join('/tmp', 'lzd-'));
 }
 
+/**
+ * Point `LAZY_DAEMON_BASE_DIR` at `dir` and return the undo.
+ *
+ * Use this instead of assigning the variable and `delete`-ing it in `afterEach`,
+ * for two reasons that both bit:
+ *
+ * 1. ORDER. `ctx.cleanup()` reaps the test daemon BY PIDFILE, and the pidfile
+ *    path is resolved from `LAZY_DAEMON_BASE_DIR` at the moment cleanup runs.
+ *    Clearing the variable first makes teardown look under the DEFAULT base dir
+ *    (`~/.lazy/daemon`) instead — where this project's pidfile never was — so
+ *    the daemon the suite started is never reaped by pidfile at all and lives on
+ *    to squat the shared 26024+ port window for the rest of the run. Call the
+ *    undo AFTER `ctx.cleanup()`.
+ * 2. RESTORE, don't delete. A `delete` clobbers an outer value; suites nest.
+ */
+export function pinDaemonBaseDir(dir: string): () => void {
+  const prior = process.env.LAZY_DAEMON_BASE_DIR;
+  process.env.LAZY_DAEMON_BASE_DIR = dir;
+  return () => {
+    if (prior === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+    else process.env.LAZY_DAEMON_BASE_DIR = prior;
+  };
+}
+
 /** Remove a directory created by {@link makeDaemonBaseDir}. */
 export async function removeDaemonBaseDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });

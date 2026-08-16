@@ -82,7 +82,7 @@ Options:
                         p  previous hunk
                         s  split this hunk at a context line
                         a  ask the agent a question about this hunk
-                            (resumes the agent's session in plan mode)
+                            (resumes the agent's session, read-only)
                         f  leave feedback on this hunk (saved as a comment)
                         q  quit (prompts to submit feedback as unblock)
 

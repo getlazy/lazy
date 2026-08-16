@@ -12,7 +12,8 @@ import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { createTask } from '../helpers/fixtures';
+import { createTaskBeforeDaemon } from '../helpers/fixtures';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 /** Check if a process with the given PID is alive. */
 function isAlive(pid: number): boolean {
@@ -55,6 +56,10 @@ function writePidFile(homeDir: string, runName: string, pid: number): void {
     JSON.stringify({ pid, startedAt: new Date().toISOString(), logFile: '/dev/null' }),
   );
 }
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
 
 describe('daemon stop supervisor termination', () => {
   let daemon: RunningDaemon;
@@ -103,7 +108,7 @@ describe('daemon stop supervisor termination', () => {
     configureHostProcessRunner(ctx.root);
 
     // Create a task so we have a known task ID in the project
-    const taskShortId = await createTask(ctx, 'Supervisor stop test task');
+    const taskShortId = await createTaskBeforeDaemon(ctx, 'Supervisor stop test task');
 
     // Start a dummy process that simulates a supervisor
     const dummy = spawnDummyProcess();
@@ -138,7 +143,7 @@ describe('daemon stop supervisor termination', () => {
     configureHostProcessRunner(ctx.root);
 
     // Create a task in this project
-    const ownedTaskId = await createTask(ctx, 'Owned task');
+    const ownedTaskId = await createTaskBeforeDaemon(ctx, 'Owned task');
 
     // Spawn two dummy processes: one "owned" by this project, one not
     const ownedDummy = spawnDummyProcess();

@@ -1,0 +1,310 @@
+:root {
+  --bg: #ffffff;
+  --bg-secondary: #f9fafb;
+  --text: #111827;
+  --text-secondary: #6b7280;
+  --border: #e5e7eb;
+  --link: #2563eb;
+  /* ui-monospace is what actually resolves SF Mono on macOS — naming
+     'SF Mono' does not, because it is not exposed to the browser under that
+     name, so the old stack silently fell through to Menlo. */
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  /* Prose, labels and chrome. Code is the exception on this surface, not the
+     rule — only things whose alignment or literalness matters get --font-mono. */
+  --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'Helvetica Neue', Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111827;
+    --bg-secondary: #1f2937;
+    --text: #f9fafb;
+    --text-secondary: #9ca3af;
+    --border: #374151;
+    --link: #60a5fa;
+  }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+nav {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+nav .brand { font-weight: bold; font-size: 16px; }
+nav .sep { color: var(--text-secondary); }
+.search-form { margin-left: auto; }
+.search-form input {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text);
+  width: 200px;
+}
+h1 { font-size: 18px; margin-bottom: 16px; }
+h2 { font-size: 16px; margin: 24px 0 12px; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 24px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+/* Goal/prose cells opt back out of the tabular font. */
+td.goal, td.wrap, th { font-family: var(--font-ui); }
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+th {
+  color: var(--text-secondary);
+  font-weight: normal;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+td.goal { white-space: normal; max-width: 400px; }
+td.wrap { white-space: normal; }
+tr:hover { background: var(--bg-secondary); }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #fff;
+}
+.detail-section {
+  margin-bottom: 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+.detail-section h2 { margin-top: 0; }
+.detail-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+}
+.detail-label {
+  color: var(--text-secondary);
+  min-width: 140px;
+  flex: none;
+}
+/* Detail values are ids, shas, branches and timestamps — literal strings where
+   a stray ligature or proportional digit is a readability bug. */
+.detail-row > span:last-child { font-family: var(--font-mono); }
+.detail-row > span:last-child a { font-family: inherit; }
+.turn-chunk {
+  margin-bottom: 16px;
+  padding: 8px 8px 4px 8px;
+  border-left: 3px solid var(--border);
+  background: var(--bg-secondary);
+  border-radius: 4px;
+}
+.turn-chunk-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.turn-auto {
+  display: inline-block;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--border);
+  color: var(--text-secondary);
+}
+.turn {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+.turn-header {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.turn-tokens {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-left: 8px;
+}
+.turn-content {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.turn-content p { margin-bottom: 8px; }
+.turn-content pre {
+  background: var(--bg-secondary);
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.turn-content code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.turn-content p code {
+  background: var(--bg-secondary);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.turn-content h1, .turn-content h2, .turn-content h3,
+.turn-content h4, .turn-content h5, .turn-content h6 {
+  margin: 12px 0 6px;
+  font-size: 14px;
+}
+.turn-content h1 { font-size: 16px; }
+.turn-content h2 { font-size: 15px; }
+.turn-content ul, .turn-content ol {
+  margin: 4px 0 8px 20px;
+}
+.turn-content blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  color: var(--text-secondary);
+  margin: 8px 0;
+}
+.turn-content hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+.commit-row {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.commit-sha {
+  font-family: var(--font-mono);
+  font-weight: bold;
+}
+.commit-message {
+  color: var(--text);
+}
+.note {
+  padding: 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+.note-date {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.note-content {
+  white-space: pre-wrap;
+  margin-top: 4px;
+}
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.filter-bar a {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.filter-bar a.active {
+  background: var(--link);
+  color: #fff;
+  border-color: var(--link);
+}
+.empty-state {
+  color: var(--text-secondary);
+  padding: 40px;
+  text-align: center;
+}
+.search-result {
+  padding: 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.search-result-type {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  letter-spacing: 0.5px;
+}
+.search-result-context {
+  white-space: pre-wrap;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  max-height: 100px;
+  overflow: hidden;
+}
+.prompt-link {
+  display: inline-block;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+  margin-right: 8px;
+  margin-bottom: 4px;
+}
+.breadcrumb {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+.breadcrumb a { color: var(--link); }
+.action-links {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.action-links a {
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+}
+.action-links a.primary {
+  background: var(--link);
+  color: #fff;
+  border-color: var(--link);
+}
+.review-link {
+  font-size: 11px;
+  white-space: nowrap;
+  margin-left: 6px;
+}
+.protection-note {
+  color: var(--text-secondary);
+  font-size: 0.9em;
+  margin-top: 0.25em;
+}

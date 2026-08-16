@@ -1,4 +1,6 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { join } from 'path';
+import { readFile, writeFile, unlink } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectError, expectFailure, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -53,7 +55,9 @@ describe('lazy upgrade', () => {
     expectSuccess(result);
     expectOutput(result, 'Upgrade dry run:');
     expectOutput(result, 'Rebuild: Docker image + agent binary');
-    expectOutput(result, 'No running containers found.');
+    // Pair sessions are host processes, so `upgrade` used to be blind to them
+    // and this line named containers only.
+    expectOutput(result, 'No running containers or interactive sessions found.');
     // The dry run must state that interrupted tasks come back on their own —
     // that is the reassurance the human needs before agreeing to a rebuild.
     // Wording moved from "auto-resumed" to "auto-resumes" in 023b2623.
@@ -205,6 +209,61 @@ describe('lazy upgrade', () => {
     const waitResult = await ctx.lazy(['upgrade', '--images', '--wait']);
     expectFailure(waitResult);
     expectError(waitResult, '--images does not stop running containers');
+  });
+
+  // The image rebuild no longer waits for the human's decision or for working
+  // agents: it starts immediately, under a staging tag. Both halves of that are
+  // user-visible promises and must be stated in the output — the human needs to
+  // know a build is running AND that nothing they are using has changed yet.
+  test('upgrade starts the image rebuild in the background under a staging tag', async () => {
+    const buildLogPath = join(ctx.root, 'upgrade-build-log.jsonl');
+    await writeFile(buildLogPath, '');
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_BUILD_LOG: buildLogPath },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'Rebuilding the container image in the background');
+    expectOutput(result, 'promoted only once you proceed');
+    expectOutput(result, 'rebuilt');
+    expectOutput(result, 'Upgrade complete.');
+
+    // The build must target the STAGING tag (not the canonical one) and bust
+    // the layer cache — a hash-matching rebuild would be a no-op.
+    const calls = JSON.parse(
+      '[' + (await readFile(buildLogPath, 'utf-8')).trim().split('\n').filter(Boolean).join(',') + ']'
+    ) as Array<{ stagedTag: string; noCache: boolean }>;
+    if (calls.length !== 1) {
+      throw new Error(`Expected exactly 1 staged image build, got ${calls.length}: ${JSON.stringify(calls)}`);
+    }
+    if (!calls[0].stagedTag.endsWith('-upgrade')) {
+      throw new Error(`Expected a staging tag ending in -upgrade, got "${calls[0].stagedTag}"`);
+    }
+    if (calls[0].noCache !== true) {
+      throw new Error('Expected the staged rebuild to pass --no-cache');
+    }
+
+    await unlink(buildLogPath);
+  });
+
+  // The dry run is where a human decides whether to run the real thing, so it
+  // must describe the staging/promote behavior they are agreeing to.
+  test('--dry-run explains the background rebuild and deferred promotion', async () => {
+    const result = await ctx.lazyMocked(['upgrade', '--dry-run'], MOCK_CLAUDE_SUCCESS);
+
+    expectSuccess(result);
+    expectOutput(result, 'starts in the background while you decide');
+    expectOutput(result, 'moves only once you proceed');
+  });
+
+  test('help documents that a cancelled upgrade leaves the current image untouched', async () => {
+    const result = await ctx.lazy(['upgrade', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, 'BACKGROUND');
+    expectOutput(result, 'leaves your current image exactly as it was');
+    expectOutput(result, 'the upgrade fails loudly');
   });
 
   test('upgrade with interrupted task auto-resumes it', async () => {

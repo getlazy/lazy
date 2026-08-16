@@ -18,7 +18,66 @@ export { allTools, createAllHandlers, type McpToolContext } from './tools';
 
 import { McpServer } from './server';
 import { allTools, createAllHandlers, type McpToolContext } from './tools';
+import { isReadOnlyTool } from './tool-access';
+import type { McpTool, McpToolHandler } from './types';
 import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
+
+/** Options shared by every MCP server entry point. */
+export interface McpServerOptions {
+  /**
+   * Serve only the read-only toolset (`--read-only`).
+   *
+   * Set for ask turns, which are read-only Q&A. This is the layer that actually
+   * holds in daemon-proxy mode: there the tool HANDLERS execute inside the
+   * daemon, which never sees the supervisor's `LAZY_MCP_READ_ONLY` env var, so
+   * the in-handler guard alone would be a no-op for containerized agents. Here
+   * the write tool is refused before it is ever proxied.
+   */
+  readOnly?: boolean;
+}
+
+/**
+ * The refusal a write tool returns on a read-only turn.
+ *
+ * Actionable on purpose — a competent model corrects course in the same turn
+ * instead of concluding lazy is broken and giving up on tools entirely.
+ */
+function readOnlyRefusal(toolName: string): McpToolHandler {
+  return async () => {
+    throw new Error(
+      `${toolName} is not available on a read-only turn — your final message is the answer. ` +
+      `Write it directly as text. Read-only lazy tools (lazy_show, lazy_list, lazy_search, ` +
+      `lazy_status, lazy_diff, …) are available and work normally.`,
+    );
+  };
+}
+
+/**
+ * Register every tool on the server, applying the read-only policy.
+ *
+ * On a read-only server the write tools stay REGISTERED but unadvertised, so
+ * they answer with the refusal above rather than "Unknown tool".
+ *
+ * Exported for `test/unit/mcp-read-only-toolset.test.ts`: the entry points that
+ * use it block on stdin forever, so the policy is only testable on its own.
+ */
+export function registerTools(
+  server: McpServer,
+  handlers: Map<string, McpToolHandler>,
+  tools: McpTool[],
+  opts?: McpServerOptions,
+): void {
+  for (const tool of tools) {
+    if (opts?.readOnly && !isReadOnlyTool(tool.name)) {
+      server.registerTool(tool, readOnlyRefusal(tool.name), { advertise: false });
+      continue;
+    }
+    const handler = handlers.get(tool.name);
+    if (handler) {
+      server.registerTool(tool, handler);
+    }
+  }
+}
 
 /**
  * Start the MCP server with the given task context.
@@ -33,20 +92,13 @@ import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with {
  * tools.ts → rpc-fallback → daemon/client.ts, which is a bigger change on a
  * legacy path — deliberately not done, and stated rather than left implicit.
  */
-export async function startMcpServer(ctx: McpToolContext): Promise<void> {
+export async function startMcpServer(ctx: McpToolContext, opts?: McpServerOptions): Promise<void> {
   const server = new McpServer(
     { name: 'lazy', version: '0.8.0' },
     { instructions: mcpServerInstructions },
   );
 
-  // Register all tools
-  const handlers = createAllHandlers(ctx);
-  for (const tool of allTools) {
-    const handler = handlers.get(tool.name);
-    if (handler) {
-      server.registerTool(tool, handler);
-    }
-  }
+  registerTools(server, createAllHandlers(ctx), allTools, opts);
 
   // Run the server (blocks until stdin closes)
   await server.run();
@@ -66,9 +118,16 @@ export async function startMcpServer(ctx: McpToolContext): Promise<void> {
  *   task the token belongs to: the daemon derives identity from the token and
  *   refuses (403) a claim that disagrees.
  */
-export async function startMcpServerDaemonProxy(daemonConfigPath: string, taskIdOverride?: string): Promise<void> {
-  const { readDaemonMcpConfig, createAllDaemonProxyHandlers } = await import('../daemon/mcp-proxy');
-  const config = readDaemonMcpConfig(daemonConfigPath);
+export async function startMcpServerDaemonProxy(
+  daemonConfigPath: string,
+  taskIdOverride?: string,
+  opts?: McpServerOptions,
+): Promise<void> {
+  const { readDaemonMcpConfigWithRetry, createAllDaemonProxyHandlers } = await import('../daemon/mcp-proxy');
+  // Retrying read: the daemon rewrites this file in place when it restarts onto
+  // a new port, and a torn read here would kill the server process before it
+  // ever serves a tool — costing the agent every lazy tool for the whole turn.
+  const config = await readDaemonMcpConfigWithRetry(daemonConfigPath);
 
   // Override taskId from CLI arg if provided (normal for agent sessions)
   if (taskIdOverride) {
@@ -80,16 +139,12 @@ export async function startMcpServerDaemonProxy(daemonConfigPath: string, taskId
     { instructions: mcpServerInstructions },
   );
 
-  // Create proxy handlers for all tools
-  const toolNames = allTools.map(t => t.name);
-  const handlers = createAllDaemonProxyHandlers(config, toolNames);
+  // Only mint proxy handlers for tools this server will actually serve — a
+  // read-only server must not hold a live proxy handler for a write tool.
+  const served = opts?.readOnly ? allTools.filter(t => isReadOnlyTool(t.name)) : allTools;
+  const handlers = createAllDaemonProxyHandlers(config, served.map(t => t.name));
 
-  for (const tool of allTools) {
-    const handler = handlers.get(tool.name);
-    if (handler) {
-      server.registerTool(tool, handler);
-    }
-  }
+  registerTools(server, handlers, allTools, opts);
 
   // Run the server (blocks until stdin closes)
   await server.run();

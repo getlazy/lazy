@@ -19,6 +19,7 @@ import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { theme } from '../theme';
 import { parentTaskIdOf } from '../../task-target';
 import { sanitizeUserText } from '../../utils/sanitize-text';
+import { pendingViolations } from '../../utils/turns';
 
 /**
  * Determine whether unblock should run in interactive mode.
@@ -116,6 +117,55 @@ export async function commandUnblock(args: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // --- Guard: conflict tasks require an explicit approve/revert decision ---
+    // Protected files are protected by DEFAULT: anything the caller does not
+    // approve gets reverted to its base commit by the daemon. So neither flag
+    // may be inferred — omitting both is an error, not "revert all".
+    //
+    // This runs before the orphan prompt and before $EDITOR: a pre-flight that
+    // can fail must never fire after the human has typed feedback (CLAUDE.md,
+    // "Never Lose Human Feedback").
+    //
+    // REGRESSION NOTE: this guard shipped in fix-unblock-conflict-guard and was
+    // silently dropped by the v0.11 daemon-lifecycle-rpc refactor, while the
+    // help text describing it survived. Restored by fix-violation-turn-detection.
+    {
+      const existingTurns = await storage.getSessionTurns(sess.id);
+      const violations = pendingViolations(existingTurns);
+      const hasViolations = task.status === 'conflict' && violations.length > 0;
+
+      // Contradictory flags — approving specific files and reverting everything
+      // cannot both be meant.
+      if (approvedFiles.length > 0 && noApproveFiles) {
+        console.error('Error: Cannot use both --approve-file and --no-approve-files together.');
+        console.error('Choose one: approve specific files, or explicitly revert all.');
+        process.exit(1);
+      }
+
+      // Misuse — the flags only mean anything when there is something to decide.
+      if (!hasViolations && (approvedFiles.length > 0 || noApproveFiles)) {
+        console.error(`Error: Task ${displayId(task)} has no file permission violations.`);
+        console.error('--approve-file and --no-approve-files are only meaningful for conflict tasks.');
+        process.exit(1);
+      }
+
+      // Non-interactive: there is no prompt to fall back on, so the decision
+      // must already be on the command line. --yes does NOT bypass this.
+      if (hasViolations && !isInteractiveMode(args) && approvedFiles.length === 0 && !noApproveFiles) {
+        console.error(`Error: Task ${displayId(task)} has ${violations.length} file permission violation(s).`);
+        console.error('\nViolated files:');
+        for (const v of violations) {
+          console.error(`  - ${v.file}`);
+        }
+        console.error('\nNeither approving nor reverting is the default — choose one:');
+        console.error(`  Approve all:     ${violations.map(v => `--approve-file ${v.file}`).join(' ')}`);
+        console.error('  Approve some:    --approve-file <file> (repeatable)');
+        console.error('  Revert all:      --no-approve-files (destructive)');
+        console.error('\nApproving in the feedback text has no effect — only these flags are read.');
+        process.exit(1);
+      }
+    }
+
     // Check for orphaned child — prompt in CLI, pass retargetOrphan to RPC
     let retargetOrphan = false;
     if (parentTaskIdOf(task)) {
@@ -181,8 +231,9 @@ export async function commandUnblock(args: string[]): Promise<void> {
         // to choose whether to approve or revert. Neither is "safe" — both require active choice.
         if (task.status === 'conflict' && approvedFiles.length === 0 && !noApproveFiles) {
           const existingTurns = await storage.getSessionTurns(sess.id);
-          const latestAgentTurn = existingTurns.filter(t => t.role === 'agent').pop();
-          const violations = latestAgentTurn?.violations?.filter(v => v.status === 'pending') ?? [];
+          // Must match what the daemon reverts against — see the
+          // violations-come-from-the-violation-turn invariant in utils/turns.ts.
+          const violations = pendingViolations(existingTurns);
 
           if (violations.length > 0) {
             console.log(`\n${theme.warning('⚠ File Permission Violations')}`);
@@ -496,7 +547,9 @@ Options:
   --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-4-8)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.
-  --approve-file <file>   Approve a violated file (repeatable, for conflict tasks)
+  --approve-file <file>   Keep the agent's changes to a violated file (repeatable,
+                      conflict tasks only). Every violated file you do NOT name is
+                      reverted to its base commit.
   --no-approve-files  Explicitly revert all violated files (for conflict tasks)
   --yes               Skip interactive prompts (non-interactive mode)
   --follow            Wait for the agent to finish, streaming output in real time
@@ -523,7 +576,10 @@ Upstream Merge:
 
 File Permission Violations (conflict status):
   When the agent modifies protected files, the task enters 'conflict' status.
-  Unblocking requires explicit approval or rejection — neither is the default:
+  Protected files are protected by DEFAULT: every violated file you do not
+  approve is reverted to its base commit and committed. Because both outcomes
+  are destructive in one direction or the other, neither is inferred —
+  unblocking a conflict task requires an explicit decision:
 
   Interactive mode:
     - Lists violated files with diff stats (+lines -lines)
@@ -541,6 +597,12 @@ File Permission Violations (conflict status):
     - Using --approve-file and --no-approve-files together: error
     - Using these flags when task has no violations: error
     - --yes does NOT bypass the conflict guard
+
+  Approving in the feedback text does nothing. Only these flags are read.
+
+  Not the same as 'lazy accept --approve-file': accept is all-or-nothing (every
+  violated file must be named or the accept is refused) and never reverts
+  anything. Unblock reverts whatever you leave out.
 
 Examples:
   lazy unblock abc123                                   # Interactive review

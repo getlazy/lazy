@@ -16,6 +16,8 @@ Read-only tools (safe to call freely):
 
 Write-capable tools (have side effects — use deliberately):
 
+- `lazy_conversation_ask` — Ask a question about a past builder conversation (`session_id` + `question`) and get an answer back. A throwaway read-only agent reads the stored transcript; nothing is written back — the conversation is immutable history. Prefer it over `lazy_conversation_read` when you want a specific fact or decision, since reading a long conversation in full can overflow your context.
+
 - `lazy_commit` — Stage and commit changes in the current task's worktree.
 - `lazy_create` — Create a task. When called by an agent, the new task is always a subtask of your own current task (you cannot create top-level tasks or tasks under another parent). Use it to decompose your task's own work into executable parts — not for orthogonal/out-of-scope discoveries, which you should record with `lazy_add_followup` instead.
 - `lazy_start` — Start a task. When called by an agent, you may only start your own subtasks.

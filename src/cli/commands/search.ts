@@ -2,6 +2,7 @@ import { requireStorage, shortId, parseFlags } from '../helpers';
 import type { SearchResult } from '../../storage';
 import type { Storage } from '../../storage/interface';
 import { theme, stripAnsi } from '../theme';
+import { docsFooter } from '../../docs/links';
 import { QueryParseError } from '../../search';
 import { loadTaskShowData, buildTaskShowLines } from './show';
 import { querySearch } from '../../daemon/rpc-fallback';
@@ -17,6 +18,20 @@ function resultDisplayId(result: SearchResult): string {
   // chars ("tasks-no") would hide which record matched.
   if (result.entity_type === 'memory') return result.entity_id;
   return result.task_code ?? shortId(result.task_id);
+}
+
+/**
+ * Label a hit with its locator, where the hit has one.
+ *
+ * A turn hit that reads only "turn" leaves the reader scanning `lazy show`
+ * output for the excerpt. The sequence is exactly what show prints
+ * (`--- Turn #12 ---`), so naming it turns a hit into a jump.
+ */
+function entityLabel(result: SearchResult): string {
+  if (result.entity_type === 'turn' && result.turn_sequence !== undefined) {
+    return `turn #${result.turn_sequence}`;
+  }
+  return result.entity_type;
 }
 
 function printResults(results: SearchResult[], groupByTask: boolean, hint?: string): void {
@@ -45,19 +60,19 @@ function printResults(results: SearchResult[], groupByTask: boolean, hint?: stri
       console.log(`${theme.taskId(resultDisplayId(firstResult))} - ${truncate(firstResult.task_goal, 60)}`);
 
       for (const result of taskResults) {
-        const typeLabel = result.entity_type.padEnd(6);
+        const typeLabel = entityLabel(result).padEnd(9);
         console.log(`  ${typeLabel}: ${truncate(result.match_context, 70)}`);
       }
       console.log('');
     });
   } else {
     // Flat list
-    console.log(`${theme.header('TASK'.padEnd(20))} ${theme.header('TYPE'.padEnd(8))} ${theme.header('MATCH')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(60)}`));
+    console.log(`${theme.header('TASK'.padEnd(20))} ${theme.header('TYPE'.padEnd(9))} ${theme.header('MATCH')}`);
+    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(9)} ${'─'.repeat(60)}`));
 
     for (const result of results) {
       console.log(
-        `${theme.pad(theme.taskId(resultDisplayId(result)), 20)} ${result.entity_type.padEnd(8)} ${truncate(result.match_context, 60)}`
+        `${theme.pad(theme.taskId(resultDisplayId(result)), 20)} ${entityLabel(result).padEnd(9)} ${truncate(result.match_context, 60)}`
       );
     }
   }
@@ -100,13 +115,30 @@ function findLineInShowOutput(showLines: string[], content: string): number | nu
 function buildMatchContext(result: SearchResult, showLines: string[], lineNum: number | null): Record<string, unknown> {
   const ctx: Record<string, unknown> = {};
 
-  // Extract turn sequence from the show output if this is a turn match
-  if (result.entity_type === 'turn' && lineNum !== null) {
-    const line = stripAnsi(showLines[lineNum - 1] || '');
-    const turnMatch = line.match(/#(\d+)\s+\[(\w+)\]/);
-    if (turnMatch) {
-      ctx.turn_seq = parseInt(turnMatch[1], 10);
-      ctx.role = turnMatch[2];
+  // The entity's 0-based position in that task's list of its kind — the locator
+  // that makes a hit addressable without re-scanning the section by hand. For
+  // turns, commits and comments that is the list `show` pages over; follow-ups
+  // are always rendered whole, so there it is a position to read off, not to
+  // page to.
+  if (result.entity_index !== undefined) {
+    ctx.index = result.entity_index;
+  }
+
+  if (result.entity_type === 'turn') {
+    // Prefer the sequence the search layer carries: it comes from the stored
+    // turn. The line scrape below is the fallback for a result produced before
+    // that field existed (or by a backend that cannot supply it) — it can only
+    // ever read back what show already rendered.
+    if (result.turn_sequence !== undefined) {
+      ctx.turn_seq = result.turn_sequence;
+    }
+    if (lineNum !== null) {
+      const line = stripAnsi(showLines[lineNum - 1] || '');
+      const turnMatch = line.match(/#(\d+)\s+\[(\w+)\]/);
+      if (turnMatch) {
+        if (ctx.turn_seq === undefined) ctx.turn_seq = parseInt(turnMatch[1], 10);
+        ctx.role = turnMatch[2];
+      }
     }
   }
 
@@ -343,5 +375,5 @@ Examples:
   lazy search 'tag:"My Feature Work"'                      # Multi-word tag (quote it)
   lazy search 'tag:launch AND status:blocked'              # Combine tag with status
   lazy search "design decision" --conversations            # Filter to conversations only
-  lazy search "auth" --json                                  # JSON output with line numbers`);
+  lazy search "auth" --json                                  # JSON output with line numbers${docsFooter('search')}`);
 }

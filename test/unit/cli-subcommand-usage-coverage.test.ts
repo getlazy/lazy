@@ -275,10 +275,14 @@ describe('CLI multiplexer subcommand help coverage', () => {
     const audits = await auditMultiplexers();
 
     const byCommand = new Map(audits.map((a) => [a.command, a]));
-    // `memory` is the third multiplexer (list/show/save/rm/history) — it must
-    // appear here for the same reason daemon/system do: the scan has to prove
-    // it found the real surface, not silently miss a command.
-    expect([...byCommand.keys()].sort()).toEqual(['daemon', 'memory', 'system']);
+    // `memory` (list/show/save/rm/history) and `stats` (read-only analytics)
+    // must appear here for the same reason daemon/system do: the scan has to
+    // prove it found the real surface, not silently miss a command.
+    expect([...byCommand.keys()].sort()).toEqual(['daemon', 'memory', 'stats', 'system']);
+
+    const stats = byCommand.get('stats')!;
+    expect(stats.dispatchable).toContain('tokens');
+    expect(Object.keys(stats.mapped)).toContain('tokens');
 
     const system = byCommand.get('system')!;
     expect(system.dispatchable).toContain('export-dockerfile');

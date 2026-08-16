@@ -24,6 +24,28 @@
  * token survives daemon restarts (the registry is on disk), so a 401 caused by
  * a moved port heals on refresh, while a 401 caused by a REVOKED token — the
  * session ended — finds the same token on disk and correctly does not retry.
+ *
+ * A MOVED PORT NEVER PRODUCES A 401. This healing was originally wired to the
+ * 401 branch alone, and that left the common case unhandled: when the daemon
+ * restarts onto a different port (the port window is shared across projects, so
+ * a restart that cannot re-bind moves up), nothing is listening at the old
+ * address and `fetch` fails at the TRANSPORT layer — ECONNREFUSED, not 401. The
+ * refreshed address sat unread in the mounted file for the rest of the turn
+ * while every tool call reported "the daemon appears to be down … relaunch",
+ * which is how agents lost their lazy tools mid-turn and never got them back.
+ * So a transport failure re-reads the same trusted file and retries once, on
+ * exactly the same terms as a 401.
+ *
+ * A REBUILD+RESTART IS A GAP, NOT A MOVE. Re-reading once heals a daemon that
+ * has already come back somewhere else, but a rebuild takes the daemon away for
+ * seconds to minutes. A tool call landing in that window found nothing
+ * listening, re-read an unchanged file, and died telling the human to relaunch
+ * their builder — losing the whole conversation for a routine restart. So a
+ * connection that was NEVER ESTABLISHED now waits, with backoff, for the daemon
+ * to come back (bounded — see RECONNECT_WINDOW_MS), re-reading the mounted file
+ * each round so a daemon that returns on a different port is picked up too.
+ * Nothing ran daemon-side, so nothing is replayed; a call lost MID-flight is
+ * still reported and never retried.
  */
 
 import { readFileSync } from 'fs';
@@ -71,6 +93,44 @@ export interface DaemonMcpConfig {
  */
 export type DaemonCredentialRefresh = () => Promise<boolean>;
 
+/** How many times a credential re-read is attempted before giving up. */
+const CONFIG_READ_ATTEMPTS = 3;
+/** Pause between credential re-read attempts — long enough for an in-place rewrite to land. */
+const CONFIG_READ_RETRY_MS = 50;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * How long a tool call waits for a daemon that is not answering at all.
+ *
+ * Sized for the operation this exists to survive: rebuilding the daemon binary
+ * and restarting it (`bun run ./src/index.ts daemon restart`, or an upgrade)
+ * takes tens of seconds on a warm cache. Waiting through it costs the caller a
+ * pause; NOT waiting costs the human their entire builder conversation, because
+ * the failure message's only remedy is to exit and relaunch.
+ *
+ * It is a bound, not an invitation to spin: after this the call fails with the
+ * same diagnosis it used to fail with immediately.
+ */
+const RECONNECT_WINDOW_MS = 90_000;
+
+/**
+ * How long a call waits for FRESH credentials once the daemon is answering but
+ * rejecting our token (401 that a re-read did not fix).
+ *
+ * Short on purpose. The daemon is up, so either the session's owner re-issues a
+ * token into the mounted file within a few seconds (the builder watches for a
+ * restarted daemon and re-mints — see src/builder/mcp-reissue.ts), or the token
+ * is genuinely gone and no amount of waiting will produce one.
+ */
+const REAUTH_WINDOW_MS = 20_000;
+
+/** Backoff bounds for the reconnect loop. */
+const RECONNECT_FIRST_DELAY_MS = 250;
+const RECONNECT_MAX_DELAY_MS = 2_000;
+/** How often the re-auth wait re-reads the mounted credential file. */
+const REAUTH_POLL_MS = 500;
+
 /**
  * Build a refresher bound to a config's `sourcePath`.
  *
@@ -78,6 +138,13 @@ export type DaemonCredentialRefresh = () => Promise<boolean>;
  * from — it never accepts credentials from the network and never relaxes the
  * auth check. Concurrent refreshes share one in-flight read so a burst of
  * simultaneous 401s causes one file read, not N.
+ *
+ * Torn reads are retried. The daemon rewrites these files with an in-place
+ * truncate-and-write (`refreshDaemonMcpConfigs` in src/daemon/task-launcher.ts)
+ * because a write-temp-then-rename would break the container's bind mount — so
+ * a reader that lands mid-write legitimately sees a truncated file. Treating
+ * that one bad parse as "nothing changed" would abandon the very refresh we
+ * were woken up for, so we re-read a few times before giving up.
  *
  * Returns null when the config has no file source (nothing to re-read).
  */
@@ -93,22 +160,35 @@ export function createDaemonConfigRefresher(
   return () => {
     if (inFlight) return inFlight;
     inFlight = (async () => {
-      let raw: string;
-      try {
-        raw = await readFile(sourcePath, 'utf-8');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log?.(`[daemon-mcp] could not re-read credentials from ${sourcePath}: ${msg}`);
-        return false;
+      let parsed: DaemonMcpConfigFile | null = null;
+      for (let attempt = 1; attempt <= CONFIG_READ_ATTEMPTS; attempt++) {
+        const last = attempt === CONFIG_READ_ATTEMPTS;
+        let raw: string;
+        try {
+          raw = await readFile(sourcePath, 'utf-8');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (last) {
+            log?.(`[daemon-mcp] could not re-read credentials from ${sourcePath}: ${msg}`);
+            return false;
+          }
+          await delay(CONFIG_READ_RETRY_MS);
+          continue;
+        }
+        try {
+          parsed = JSON.parse(raw) as DaemonMcpConfigFile;
+          break;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (last) {
+            log?.(`[daemon-mcp] credential file ${sourcePath} is not valid JSON: ${msg}`);
+            return false;
+          }
+          // Most likely a torn read: the daemon truncates this file in place.
+          await delay(CONFIG_READ_RETRY_MS);
+        }
       }
-      let parsed: DaemonMcpConfigFile;
-      try {
-        parsed = JSON.parse(raw) as DaemonMcpConfigFile;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log?.(`[daemon-mcp] credential file ${sourcePath} is not valid JSON: ${msg}`);
-        return false;
-      }
+      if (!parsed) return false;
       if (!parsed.token || !parsed.target) {
         log?.(`[daemon-mcp] credential file ${sourcePath} is missing token/target`);
         return false;
@@ -255,7 +335,9 @@ export function foreignDaemonDiagnosis(
 export function daemonUnreachableMessage(toolName: string, target: string, detail: string): string {
   return (
     `lazy MCP call '${toolName}' could not reach the daemon at ${target} (${detail}). ` +
-    `lazy then probed ${target}/daemon/status and got no answer either, so the ` +
+    `lazy retried until its reconnect window ran out — re-reading the mounted daemon ` +
+    `config each round, so a daemon that came back on another port would have been ` +
+    `picked up — then probed ${target}/daemon/status and got no answer either, so the ` +
     `daemon really is unreachable from here. ` +
     `The daemon appears to be down, or listening on a different address than when ` +
     `this builder launched (a daemon restart can move the port). Ensure the daemon ` +
@@ -361,6 +443,17 @@ export interface DaemonProxyOptions {
   refresh?: DaemonCredentialRefresh | null;
   /** Where to log refresh/retry activity. Defaults to console.error. */
   log?: (message: string) => void;
+  /**
+   * How long to keep retrying a daemon that is not answering at all.
+   * Defaults to {@link RECONNECT_WINDOW_MS}. 0 disables the wait (fail on the
+   * first unreachable attempt, after the one credential re-read).
+   */
+  reconnectWindowMs?: number;
+  /**
+   * How long to wait for fresh credentials after a 401 that a re-read did not
+   * fix. Defaults to {@link REAUTH_WINDOW_MS}. 0 disables the wait.
+   */
+  reauthWindowMs?: number;
 }
 
 /**
@@ -377,8 +470,10 @@ export function createDaemonProxyHandler(
   const refresh = options?.refresh === undefined
     ? createDaemonConfigRefresher(config, log)
     : options.refresh;
+  const reconnectWindowMs = options?.reconnectWindowMs ?? RECONNECT_WINDOW_MS;
+  const reauthWindowMs = options?.reauthWindowMs ?? REAUTH_WINDOW_MS;
 
-  const send = async (args: Record<string, unknown>): Promise<Response> => {
+  const sendOnce = async (args: Record<string, unknown>): Promise<Response> => {
     const encodedTool = encodeURIComponent(toolName);
     const encodedTask = encodeURIComponent(config.taskId || '_');
     const { url: base, init } = buildTargetRequest(
@@ -401,19 +496,117 @@ export function createDaemonProxyHandler(
       body: JSON.stringify({ arguments: args }),
     };
 
+    return await fetch(base, fetchOptions);
+  };
+
+  /**
+   * Relay a status line to our own MCP client.
+   *
+   * Progress must never be invented (see src/mcp/server.ts). These frames are
+   * not a keepalive standing in for absent work: each one states something this
+   * proxy is observably doing right now — retrying a connection that never
+   * established, or waiting on the credential file — and says plainly that the
+   * daemon is not answering. Nor are they load-bearing for the client's idle
+   * budget: both waits are capped well below it. They exist so the human sees
+   * "waiting for the daemon" instead of an unexplained pause.
+   */
+  const reporter = (ctx?: McpToolCallContext) => (message: string) => {
     try {
-      return await fetch(base, fetchOptions);
+      ctx?.reportProgress(message);
     } catch (err) {
-      // fetch throws (rather than returning a non-2xx) when the connection could
-      // not be established OR when an established connection died. Those need
-      // different advice, so classify instead of blaming a down daemon for both.
-      const detail = err instanceof Error ? err.message : String(err);
-      throw await classifyTransportFailure(toolName, config, detail);
+      // Reporting progress must never break the call it is reporting on.
+      log(`[daemon-mcp] '${toolName}' could not report progress: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
+  const send = async (
+    args: Record<string, unknown>,
+    ctx?: McpToolCallContext,
+  ): Promise<Response> => {
+    const report = reporter(ctx);
+    const startedAt = Date.now();
+    const deadline = startedAt + reconnectWindowMs;
+    let backoff = RECONNECT_FIRST_DELAY_MS;
+    let rounds = 0;
+
+    for (;;) {
+      try {
+        return await sendOnce(args);
+      } catch (err) {
+        // fetch throws (rather than returning a non-2xx) when the connection
+        // could not be established OR when an established connection died.
+        // Those need opposite handling, so classify instead of blaming a down
+        // daemon for both.
+        const detail = err instanceof Error ? err.message : String(err);
+
+        // A call lost MID-flight may already have run on the daemon, and lazy
+        // tools are not idempotent (a retried lazy_commit would commit twice).
+        // Report it — never replay it.
+        if (isMidFlightTransportFailure(detail)) {
+          throw await classifyTransportFailure(toolName, config, detail);
+        }
+
+        // Nothing was listening, so nothing executed: retrying is safe.
+        //
+        // Re-read the mounted config first — a daemon that came back on a
+        // different port has already rewritten it in place (see
+        // refreshDaemonMcpConfigs), and that is the only way this container can
+        // learn the new address. Then keep trying until the window is spent:
+        // during a rebuild the daemon is simply ABSENT for a while, and failing
+        // in that gap is what cost sessions their lazy tools for good.
+        if (refresh) {
+          if (rounds === 0) {
+            log(`[daemon-mcp] '${toolName}' could not reach ${config.target} (${detail}) — re-reading daemon credentials`);
+          }
+          await refresh();
+        }
+
+        if (Date.now() >= deadline) {
+          if (rounds > 0) {
+            log(`[daemon-mcp] '${toolName}' gave up after ${Math.round((Date.now() - startedAt) / 1000)}s waiting for the daemon at ${config.target}`);
+          }
+          throw await classifyTransportFailure(toolName, config, detail);
+        }
+
+        rounds++;
+        report(
+          `${toolName}: the daemon is not answering at ${config.target} — ` +
+          `waiting for it to come back (${Math.round((Date.now() - startedAt) / 1000)}s)`,
+        );
+        await delay(Math.min(backoff, Math.max(0, deadline - Date.now())));
+        backoff = Math.min(backoff * 2, RECONNECT_MAX_DELAY_MS);
+      }
+    }
+  };
+
+  /**
+   * Wait for the mounted credential file to offer something new.
+   *
+   * The security posture is unchanged: this only ever re-reads the same trusted
+   * local file the config was minted from, and a changed token still has to be
+   * accepted by the daemon on its own merits. What it buys is time for the
+   * session's owner to re-issue — the host-side builder watcher re-mints within
+   * a few seconds of noticing a restarted daemon, and without this wait the
+   * first tool call after the restart raced it and lost.
+   */
+  const awaitFreshCredentials = async (ctx?: McpToolCallContext): Promise<boolean> => {
+    if (!refresh || reauthWindowMs <= 0) return false;
+    const report = reporter(ctx);
+    const startedAt = Date.now();
+    const deadline = startedAt + reauthWindowMs;
+    while (Date.now() < deadline) {
+      await delay(Math.min(REAUTH_POLL_MS, Math.max(0, deadline - Date.now())));
+      if (await refresh()) return true;
+      report(
+        `${toolName}: the daemon rejected this session's credentials — ` +
+        `waiting for re-issued ones (${Math.round((Date.now() - startedAt) / 1000)}s)`,
+      );
+    }
+    return false;
+  };
+
   return async (args: Record<string, unknown>, ctx?: McpToolCallContext): Promise<unknown> => {
-    let response = await send(args);
+    let response = await send(args, ctx);
 
     // A 401 is recoverable when the daemon has rewritten the mounted config
     // with current credentials since launch. Re-read that trusted local file
@@ -421,7 +614,20 @@ export function createDaemonProxyHandler(
     if (response.status === 401 && refresh) {
       log(`[daemon-mcp] '${toolName}' got 401 — re-reading daemon credentials`);
       if (await refresh()) {
-        response = await send(args);
+        response = await send(args, ctx);
+      }
+    }
+
+    // Still 401, and the file had nothing new the moment we looked. A daemon
+    // that restarted without its token registry (moved, wiped by a repair, or
+    // evicted) will never accept the token this session holds — but its owner
+    // can mint a replacement bound to the SAME identity, and does. Give that a
+    // bounded moment to land rather than declaring the session unrecoverable.
+    // A 401 means the call did not execute, so re-sending is always safe.
+    if (response.status === 401 && refresh) {
+      if (await awaitFreshCredentials(ctx)) {
+        log(`[daemon-mcp] '${toolName}' picked up re-issued daemon credentials — retrying`);
+        response = await send(args, ctx);
       }
     }
 
@@ -443,16 +649,10 @@ export function createDaemonProxyHandler(
       // notifications, gives up on the call at its own idle limit and abandons
       // the merge. Each frame is evidence the daemon's handler is still running
       // — never a locally-invented keepalive (see src/mcp/server.ts).
-      const report = (message: string) => {
-        try {
-          ctx?.reportProgress(message);
-        } catch (err) {
-          // Reporting progress must never break the call it is reporting on: a
-          // failed write means our own client is gone, and the result still has
-          // to be read so the daemon's work is not misreported as lost.
-          log(`[daemon-mcp] '${toolName}' could not report progress: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      };
+      // A failed progress write means our own client is gone; the result still
+      // has to be read so the daemon's work is not misreported as lost — which
+      // is what `reporter` guarantees.
+      const report = reporter(ctx);
       const { status, body } = await readHeartbeatEnvelope(
         response,
         toolName,
@@ -504,7 +704,12 @@ export function createAllDaemonProxyHandlers(
 
   const handlers = new Map<string, McpToolHandler>();
   for (const name of toolNames) {
-    handlers.set(name, createDaemonProxyHandler(config, name, { refresh, log }));
+    handlers.set(name, createDaemonProxyHandler(config, name, {
+      refresh,
+      log,
+      reconnectWindowMs: options?.reconnectWindowMs,
+      reauthWindowMs: options?.reauthWindowMs,
+    }));
   }
   return handlers;
 }
@@ -555,4 +760,36 @@ export function readDaemonMcpConfig(configPath: string): DaemonMcpConfig {
     target: raw.target,
     sourcePath: configPath,
   };
+}
+
+/**
+ * Read a daemon MCP config file, retrying a torn or momentarily-missing read.
+ *
+ * Use this wherever the read happens while a daemon may be REWRITING the file
+ * (see refreshDaemonMcpConfigs, which truncates in place). The stdio MCP server
+ * reads it at spawn time, and a throw there kills the process — which costs the
+ * agent every lazy tool for the rest of the turn, with no client-side recovery,
+ * because Claude Code does not respawn a server that died during startup.
+ */
+export async function readDaemonMcpConfigWithRetry(configPath: string): Promise<DaemonMcpConfig> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= CONFIG_READ_ATTEMPTS; attempt++) {
+    try {
+      const raw = JSON.parse(await readFile(configPath, 'utf-8')) as DaemonMcpConfigFile;
+      return {
+        token: raw.token,
+        projectRoot: raw.projectRoot,
+        taskId: raw.taskId,
+        target: raw.target,
+        sourcePath: configPath,
+      };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < CONFIG_READ_ATTEMPTS) await delay(CONFIG_READ_RETRY_MS);
+    }
+  }
+  const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(
+    `Could not read daemon MCP config ${configPath} after ${CONFIG_READ_ATTEMPTS} attempts: ${msg}`,
+  );
 }

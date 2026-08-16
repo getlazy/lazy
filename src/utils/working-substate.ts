@@ -5,6 +5,7 @@
  *   - working(agent)            the agent (claude/cursor) is doing real work
  *   - working(agent:answering)  the agent is answering a question (`lazy ask`)
  *   - working(agent:pre-accept) the accept path is running its validation turn
+ *   - working(waiting on X)     the agent is BLOCKED on a subtask (`lazy_wait`)
  *   - working(harness:<phase>)  the supervisor is doing pre/post-turn work
  *   - not-alive                 no live run and no response — a stranded candidate
  *
@@ -23,6 +24,7 @@
 import { join } from 'path';
 import { readFile, stat } from 'fs/promises';
 import type { SupervisorPhase, SupervisorStatus } from '../protocol/types';
+import { readActiveWaits, type WaitingEntry } from '../protocol/waiting';
 import { elapsedFrom } from './elapsed';
 import { formatRetrySummary, type RetrySummaryInput } from './retry-summary';
 import { logger } from './logger';
@@ -57,6 +59,23 @@ export type WorkingSubstate =
        */
       retry?: RetrySummaryInput;
     }
+  | {
+      /**
+       * The agent is BLOCKED inside a lazy tool call waiting on another task —
+       * it is not doing work of its own. Distinguishing this from `agent` is the
+       * whole point: an agent that decomposed its work into subtasks otherwise
+       * looks identical to one that is thinking hard for twenty minutes.
+       *
+       * Derived from the daemon's own view of the in-flight blocking MCP call
+       * (`waiting.json`, written by src/daemon/wait-registry.ts) — never from
+       * agent output.
+       */
+      kind: 'waiting';
+      /** Display labels of the tasks being waited on (code or short id). */
+      targets: string[];
+      /** ISO timestamp the earliest in-flight wait started. */
+      since?: string;
+    }
   | { kind: 'not-alive' };
 
 /** Liveness inputs to the derivation, gathered from the runner + protocol dir. */
@@ -65,6 +84,11 @@ export interface LivenessContext {
   isAlive: boolean;
   /** True when a `response.json` is present (turn finished, reconcile imminent). */
   hasResponse: boolean;
+  /**
+   * In-flight blocking lazy-tool calls made BY this task, as recorded by the
+   * daemon. Empty/absent means the agent is not blocked on anything.
+   */
+  waits?: WaitingEntry[];
 }
 
 /** Phases where the agent itself is the active thing. Everything else is harness work. */
@@ -94,10 +118,19 @@ export function deriveWorkingSubstate(
     // substate rather than guessing.
     if (!status) return null;
     if (AGENT_PHASES.has(status.phase)) {
+      // PRECEDENCE: waiting is the most specific thing we can say about an
+      // agent-phase turn — the agent is provably parked inside a lazy tool call
+      // right now — so it outranks the ask/pre-accept flavors, which describe
+      // what the turn IS rather than what it is doing this second.
+      const waiting = deriveWaiting(ctx.waits);
+      if (waiting) return waiting;
       if (status.command_type === 'ask') return { kind: 'agent', answering: true };
       if (status.command_type === 'pre_accept') return { kind: 'agent', preAccept: true };
       return { kind: 'agent' };
     }
+    // A harness phase outranks any lingering wait marker: the supervisor, not
+    // the agent, is the active thing, so `harness:<phase>` is the more useful
+    // (and more current) answer.
     return {
       kind: 'harness',
       phase: status.phase,
@@ -121,6 +154,23 @@ export function deriveWorkingSubstate(
 
   // No live run and no response: a genuine stranded-completion candidate.
   return { kind: 'not-alive' };
+}
+
+/**
+ * Fold the in-flight wait set into a `waiting` substate, or null when nothing is
+ * in flight. Labels are deduped and ordered by wait start so the oldest thing
+ * being waited on is named first.
+ */
+function deriveWaiting(waits: WaitingEntry[] | undefined): WorkingSubstate | null {
+  if (!waits || waits.length === 0) return null;
+  const ordered = [...waits].sort((a, b) => (a.started_at ?? '').localeCompare(b.started_at ?? ''));
+  const targets: string[] = [];
+  for (const wait of ordered) {
+    for (const label of wait.labels ?? []) {
+      if (label && !targets.includes(label)) targets.push(label);
+    }
+  }
+  return { kind: 'waiting', targets, since: ordered[0]?.started_at };
 }
 
 /**
@@ -175,9 +225,12 @@ export async function computeWorkingSubstate(
   protoDir: string,
   isAlive: boolean,
 ): Promise<WorkingSubstate | null> {
-  const status = await readSupervisorStatusAsync(protoDir);
-  const hasResponse = await responseExists(protoDir);
-  return deriveWorkingSubstate(status, { isAlive, hasResponse });
+  const [status, hasResponse, waits] = await Promise.all([
+    readSupervisorStatusAsync(protoDir),
+    responseExists(protoDir),
+    readActiveWaits(protoDir),
+  ]);
+  return deriveWorkingSubstate(status, { isAlive, hasResponse, waits });
 }
 
 /** Max error-snippet length inside a substate label (tighter than the watch header). */
@@ -188,7 +241,7 @@ const SUBSTATE_SNIPPET_MAX = 60;
  * wrapper), e.g. `agent`, `agent:answering`, `harness:post_turn_check (3m00s)`,
  * `harness:post_turn_check cargo build (3m00s)`,
  * `harness:retrying attempt 7 (transient_overload): API 529 overloaded (47s)`,
- * `not-alive`.
+ * `waiting on fix-foo (2m10s)`, `not-alive`.
  *
  * `now` is injectable for deterministic tests.
  */
@@ -201,6 +254,24 @@ export function formatWorkingSubstate(
       if (substate.answering) return 'agent:answering';
       if (substate.preAccept) return 'agent:pre-accept';
       return 'agent';
+    case 'waiting': {
+      // Name what is being waited on when we cheaply can — "waiting" alone
+      // leaves the reader with the same "on what?" question the substate exists
+      // to answer. Long fan-outs are summarized rather than listed, because this
+      // label sits inside a `working(...)` cell in list/active output.
+      let label = 'waiting';
+      const [first, second, ...rest] = substate.targets;
+      if (first && second) {
+        label += rest.length > 0
+          ? ` on ${first}, ${second} +${rest.length}`
+          : ` on ${first}, ${second}`;
+      } else if (first) {
+        label += ` on ${first}`;
+      }
+      const elapsed = elapsedFrom(substate.since, now);
+      if (elapsed !== null) label += ` (${elapsed})`;
+      return label;
+    }
     case 'not-alive':
       return 'not-alive';
     case 'harness': {

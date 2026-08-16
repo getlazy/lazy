@@ -15,8 +15,7 @@ import {
 } from '../../utils/pairing-lock';
 import { runClaude } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
-import { resolveRoleTarget, preflightRoleTarget, targetEnvVars, anthropicEnvVarsFromProcess } from '../../utils/role-target';
-import { withLiveProxyTarget } from '../../daemon/auth-env';
+import { runInteractiveSupervisor } from '../../supervisor/interactive';
 import { createDriver } from '../../remote';
 import { isOfflineMode } from '../../utils/offline';
 import { logger, LogLevel } from '../../utils/logger';
@@ -24,7 +23,6 @@ import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { markMachineOneshotPrompt } from '../../import/machine-oneshot';
 import { getActor } from '../../constants';
-import { spawn } from '../../utils/spawn';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -205,44 +203,20 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
 
   const beforeSnapshot = await snapshotSessionFiles(root);
 
-  // Build claude command
-  const claudeArgs = ['claude'];
-  if (resumeSessionId) {
-    claudeArgs.push('--resume', resumeSessionId);
-  }
-  if (autonomous) {
-    claudeArgs.push('--dangerously-skip-permissions');
-  }
-  // Resolve the builder-role target (pair is an interactive builder session).
-  // A local backend (ollama/proxy) forces its model and base-URL env; preflight
-  // fails hard if it is unreachable rather than silently using anthropic.
-  const config = await loadConfig(root);
-  const pairTarget = resolveRoleTarget('builder', config);
-  await preflightRoleTarget('builder', pairTarget);
-  if (pairTarget.model) {
-    claudeArgs.push('--model', pairTarget.model);
-  }
-  // 'host': pair runs Claude Code as a HOST process even on a docker-runner
-  // project, so every address it is handed must be host-reachable — the same
-  // conversion preflight probed. See LaunchSurface in utils/role-target.
-  const pairEnvVars = targetEnvVars(
-    await withLiveProxyTarget(pairTarget, config),
-    anthropicEnvVarsFromProcess(),
-    'host',
-    { role: "builder" },
-  );
-
-  // Launch Claude Code interactively in the current directory
-  const proc = spawn(claudeArgs, {
+  // Claude Code runs UNDER a supervisor, not directly: a daemon restart moves
+  // the audit proxy to a new OS-assigned port and Claude Code never re-reads
+  // ANTHROPIC_BASE_URL, so an unsupervised session silently keeps talking to a
+  // dead address. The supervisor resolves the launch env (role target,
+  // credentials, proxy) through resolveInteractiveLaunch exactly as this call
+  // site used to, stops the session cleanly when the daemon generation changes,
+  // and resumes it against the new one. See src/supervisor/interactive.ts.
+  const { exitCode } = await runInteractiveSupervisor({
+    kind: 'pair',
+    root,
     cwd: process.cwd(),
-    stdin: 'inherit',
-    stdout: 'inherit',
-    stderr: 'inherit',
-    timeout: 0, // Long-running: interactive session runs until the user exits
-    env: { ...process.env, ...Object.fromEntries(pairEnvVars.map(v => [v.key, v.value])) },
+    ...(resumeSessionId ? { resumeSessionId } : {}),
+    ...(autonomous ? { autonomous } : {}),
   });
-
-  const exitCode = await proc.exited;
 
   // Capture conversation from JSONL files via the daemon.
   // Returns null if no conversation found or if capture failed (daemon unavailable).
@@ -402,13 +376,19 @@ export async function commandPair(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Credential enforcement is no longer done here. The daemon is the single
-    // enforcement point: `lazy pair` auto-starts the daemon (ensureDaemon),
-    // which refuses to start without a Claude Code OAuth token / Anthropic API
-    // key. A missing credential therefore surfaces as an actionable daemon
-    // error before we ever reach this point — clients pass through, they don't
-    // re-enforce. (Summarization runs in the same environment the daemon gate
-    // already validated, so it has the credential it needs.)
+    // Credential enforcement is not done here — it happens at the launch seam
+    // (src/cli/interactive-auth.ts), which both SOURCES the credential from the
+    // daemon and fails loud if it gets none.
+    //
+    // This comment used to claim the daemon gate alone was sufficient: `lazy
+    // pair` auto-starts the daemon (ensureDaemon), which refuses to start
+    // without a credential, so "clients pass through, they don't re-enforce."
+    // The gate is real, but it proved a different thing than the one that
+    // mattered. It proves the DAEMON's environment has a credential; pair then
+    // read its OWN shell for one, which is a separate environment that is
+    // routinely empty. The gate passed and pair still launched Claude Code with
+    // nothing — the `/login` bug. Now that both come from the daemon, "the gate
+    // proved it" is finally true of the credential pair actually uses.
 
     // Task must have a claude session ID to resume (or we'll start fresh)
     let claudeSessionId = sess.agent_session_id;
@@ -531,54 +511,32 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     try {
-      // Build claude command
-      const claudeArgs = ['claude'];
-      if (claudeSessionId) {
-        claudeArgs.push('--resume', claudeSessionId);
-      }
-      if (autonomous) {
-        claudeArgs.push('--dangerously-skip-permissions');
-      }
-      // Resolve the builder-role target (pair is an interactive builder session).
-      const config = await loadConfig(root);
-      const pairTarget = resolveRoleTarget('builder', config);
-      await preflightRoleTarget('builder', pairTarget);
-      if (pairTarget.model) {
-        claudeArgs.push('--model', pairTarget.model);
-      }
-      // 'host': pair runs Claude Code as a HOST process even on a docker-runner
-  // project, so every address it is handed must be host-reachable — the same
-  // conversion preflight probed. See LaunchSurface in utils/role-target.
-  const pairEnvVars = targetEnvVars(
-    await withLiveProxyTarget(pairTarget, config),
-    anthropicEnvVarsFromProcess(),
-    'host',
-    { role: "builder" },
-  );
-
-      // Launch Claude Code interactively in the worktree. Use ASYNC spawn +
-      // await (not spawnSync): inherited stdio still gives a normal interactive
-      // terminal, but the event loop keeps running for the duration of the
-      // session. That matters because `lazy pair` auto-starts the daemon as a
-      // CHILD process (via ensureDaemon); spawnSync would freeze the event loop
-      // for the whole session, so if that daemon child dies (e.g. another
-      // terminal runs `lazy upgrade`), the runtime can never reap it and it
-      // becomes a zombie that holds the storage lock. Keeping the loop alive
-      // lets the runtime reap exited children. (pairBranchless does the same.)
-      const proc = spawn(claudeArgs, {
+      // Claude Code runs UNDER a supervisor, not directly. The supervisor
+      // resolves the launch env (role target, credentials, proxy address)
+      // through resolveInteractiveLaunch exactly as this call site used to,
+      // registers the session so `lazy upgrade` can SEE it, and stops-and-
+      // resumes it when the daemon generation changes — an unsupervised session
+      // keeps talking to the restarted daemon's dead proxy port forever, because
+      // Claude Code reads ANTHROPIC_BASE_URL once at startup. See
+      // src/supervisor/interactive.ts.
+      //
+      // It spawns Claude Code with ASYNC spawn + await (not spawnSync):
+      // inherited stdio still gives a normal interactive terminal, but the event
+      // loop keeps running for the duration of the session. That matters because
+      // `lazy pair` auto-starts the daemon as a CHILD process (via ensureDaemon);
+      // spawnSync would freeze the event loop for the whole session, so if that
+      // daemon child dies (e.g. another terminal runs `lazy upgrade`), the
+      // runtime can never reap it and it becomes a zombie that holds the storage
+      // lock. Keeping the loop alive lets the runtime reap exited children.
+      ({ exitCode } = await runInteractiveSupervisor({
+        kind: 'pair',
+        root,
         cwd: worktreePath,
-        stdin: 'inherit',
-        stdout: 'inherit',
-        stderr: 'inherit',
-        timeout: 0, // Long-running: interactive session runs until the user exits
-        env: {
-          ...process.env,
-          ...Object.fromEntries(pairEnvVars.map(v => [v.key, v.value])),
-          LAZY_TASK: taskShortId,
-        },
-      });
-
-      exitCode = await proc.exited;
+        taskId: taskShortId,
+        ...(claudeSessionId ? { resumeSessionId: claudeSessionId } : {}),
+        ...(autonomous ? { autonomous } : {}),
+        extraEnv: { LAZY_TASK: taskShortId },
+      }));
     } finally {
       // Always transition back to blocked, clean up symlinks, and release lock.
       // The transition back to 'blocked' MUST happen even if Claude crashes.

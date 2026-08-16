@@ -18,6 +18,17 @@ export interface RunGitOptions {
   stderr?: 'pipe' | 'ignore';
   stdin?: Uint8Array;
   timeout?: number;
+  /**
+   * Extra environment for this invocation, MERGED over the current process
+   * env (Bun's `env` option replaces it wholesale, which would strip PATH,
+   * HOME and the git config discovery vars).
+   *
+   * Exists for the handful of git behaviours that have no command-line form —
+   * `GIT_INDEX_FILE` in particular, which is how `src/git/lfs.ts` reads
+   * attributes at an arbitrary ref on git versions predating
+   * `check-attr --source`.
+   */
+  env?: Record<string, string>;
 }
 
 /**
@@ -47,6 +58,7 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
   };
   if (options.cwd) spawnOpts.cwd = options.cwd;
   if (options.stdin) spawnOpts.stdin = options.stdin;
+  if (options.env) spawnOpts.env = { ...process.env, ...options.env };
   if (options.timeout !== undefined) spawnOpts.timeout = options.timeout;
 
   try {

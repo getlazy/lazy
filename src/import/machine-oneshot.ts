@@ -113,3 +113,36 @@ export async function isMachineOneshotSessionFile(filePath: string): Promise<boo
     await handle.close();
   }
 }
+
+/**
+ * Drop lazy's own machine one-shot JSONLs from a list of discovered session
+ * files.
+ *
+ * WHY EVERY SESSION-OWNERSHIP PATH NEEDS THIS
+ * -------------------------------------------
+ * `discoverProjectSessionFiles` returns every JSONL under the project's encoded
+ * projects dir(s) — and lazy's own `claude -p` housekeeping runs write there
+ * too (fidelity summaries on accept, `lazy report`, memory compaction), because
+ * `runClaudeOneshot` inherits the daemon's cwd. So a fidelity summary triggered
+ * by an accept lands in exactly the directory the builder/pair session-detection
+ * code scans, and — being brand new — it is the NEWEST file "created since
+ * launch". Every ownership rule in the codebase (`pickLaunchSessionId`,
+ * `pickActiveSessionFile`, capture's new-or-modified diff) then hands the human's
+ * session id, resume target, or captured conversation to a housekeeping run.
+ * A builder resumed onto such an id opens INSIDE the machine one-shot's
+ * conversation, so the human's terminal shows the fidelity prompt and its answer.
+ *
+ * The marker exists precisely so these files are distinguishable. Discovery
+ * stays honest (it reports what is on disk); the ownership paths filter, the
+ * same way the reimport/sweep discovery does — one predicate, one place.
+ *
+ * Not a content heuristic and not a loosened match: this calls the same
+ * head-anchored {@link isMachineOneshotSessionFile} predicate, so an unreadable
+ * or unmarked file is KEPT (treated as a real session) — the safe direction.
+ */
+export async function excludeMachineOneshots<T extends { filePath: string }>(
+  files: T[],
+): Promise<T[]> {
+  const verdicts = await Promise.all(files.map(f => isMachineOneshotSessionFile(f.filePath)));
+  return files.filter((_, i) => !verdicts[i]);
+}

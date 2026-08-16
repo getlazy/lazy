@@ -10,7 +10,7 @@
  *   supervisor writes status.json at phase boundaries (checkpoint/heartbeat)
  */
 
-import type { TokenUsage, MergeConflict, FileViolation } from '../types';
+import type { TokenUsage, AgentTokenUsage, MergeConflict, FileViolation } from '../types';
 import type { MaintainEntry } from '../config/types';
 import type { AgentFailureClass } from '../agent/failure-taxonomy';
 
@@ -29,7 +29,7 @@ import type { AgentFailureClass } from '../agent/failure-taxonomy';
  *
  * Integer only. Protocols either match or they don't; no semver, no ranges.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // --- Command (host → supervisor) ---
 
@@ -226,12 +226,26 @@ export interface CompletedResponse {
   status: 'completed';
   result: string;
   session_id: string;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  };
+  usage: AgentTokenUsage;
+  /**
+   * Launch settings THIS invocation ran under, echoed back so the reconciler can
+   * stamp them on the turn it records. Per-response (not per-bundle) because a
+   * bundle's supervised follow-ups are separate `claude -p` invocations and, for
+   * sync, run under different settings than the work phase.
+   *
+   * `model`/`effort` are what was requested (the resolved `--model`/`--effort`
+   * values from the command); `model_id` is the concrete id the agent itself
+   * reported, present only when it reports one.
+   */
+  model?: string;
+  model_id?: string;
+  effort?: string;
+  /**
+   * What the agent reported about its lazy MCP tools at session start, in the
+   * compact `lazy=<status> tools=<n>` form. Absent when the agent reported
+   * nothing to judge (an agent that does not enumerate its tools).
+   */
+  mcp_tools?: string;
   /** Merge conflicts captured before agent resolution (if any merges had conflicts) */
   merge_conflicts?: MergeConflict[];
   /** File permission violations detected after this invocation (FINAL set for the
@@ -301,6 +315,60 @@ export interface CompletedResponse {
     merged: boolean;
     conflicts: number;
   };
+  /**
+   * Set when the supervisor rolled back a half-merged worktree it found on
+   * arrival (see `WorktreeRecovery`). Carried on the response so the rollback is
+   * ATTRIBUTED — the reconciler journals it against the task — instead of
+   * existing only as a warning line in a container log nobody reads.
+   */
+  worktree_recovery?: WorktreeRecovery;
+  /**
+   * End-of-turn journal entries and follow-ups the agent left in its handoff
+   * file because the `lazy_*` tools were unreachable (see `AgentHandoffEntry`).
+   */
+  agent_handoff?: AgentHandoffEntry[];
+}
+
+/**
+ * One end-of-turn record an agent wrote to its handoff file instead of through
+ * an MCP tool, because the tool channel was down.
+ *
+ * Why this exists: the daemon MCP proxy is the agent's only channel to lazy
+ * state, and when it dies mid-turn — a daemon restart moving the port, a dead
+ * stdio child — the agent's retrospective has nowhere to go. Agents fell back to
+ * running the lazy CLI in the container, which fails with EROFS (the repo mount
+ * is read-only) and would bypass the daemon even if it could write. So instead
+ * the agent appends NDJSON to a file it can always write, in its own worktree,
+ * and the supervisor — which runs outside that failure mode and already owns a
+ * durable, daemon-owned write channel — carries it home on the response.
+ */
+export interface AgentHandoffEntry {
+  kind: 'journal' | 'followup';
+  content: string;
+}
+
+/**
+ * A mid-merge worktree the supervisor found before running a command, and what
+ * it did about it.
+ *
+ * This is a destructive act: rolling back discards whatever resolution was in
+ * the worktree, which may be an hour of a human's or an agent's work. It once
+ * happened silently — the only trace was a reflog line reading
+ * "reset: moving to HEAD" — and the merge simply vanished between two commands
+ * (fix-sync-silent-conflict). So it is recorded, the discarded state is saved to
+ * `.lazy/recovery/` as a patch first, and the response says so.
+ */
+export interface WorktreeRecovery {
+  /** What was found on arrival. */
+  found: 'merge_in_progress' | 'unmerged_files';
+  /** Human-readable one-liner: what was found and what was done. */
+  summary: string;
+  /** Paths that were unmerged at the time (may be empty for a staged merge). */
+  files: string[];
+  /** Where the discarded worktree state was saved, when saving succeeded. */
+  patch_path?: string;
+  /** Why the supervisor was in the worktree (`startup`, `sync`, `turn`, …). */
+  context: string;
 }
 
 /**
@@ -326,6 +394,19 @@ export interface ErrorResponse {
   status: 'error';
   error: string;
   phase: SupervisorPhase;
+  /**
+   * Tokens the agent reported before the turn died, when any could be salvaged
+   * from its final output (see src/supervisor/usage.ts).
+   *
+   * INVARIANT: a turn that spent tokens and then crashed must still be able to
+   * put those tokens on a TURN record. Without this field the reconciler had no
+   * usage to write on the error turn at all, so a crashed turn's cost either
+   * vanished or (worse) showed up only in the session total, which is how
+   * `session.total_usage > sum(turns)` gaps were produced.
+   *
+   * Absent means "nothing was reported" — never assume a default.
+   */
+  usage?: AgentTokenUsage;
   /** Process exit code (when available from agent crash) */
   exit_code?: number;
   /** Last N lines of stderr */
@@ -363,6 +444,33 @@ export interface ErrorResponse {
    * and pick up the conversation cleanly instead of orphaning it.
    */
   session_id?: string;
+  /**
+   * Launch settings the failed invocation ran under (the requested `--model` and
+   * `--effort`). A crash turn is still an agent turn, and "which model crashed"
+   * is exactly the question a model/effort comparison needs answered. No
+   * `model_id` counterpart: a crashed invocation produced no parseable result,
+   * so the agent never self-reported one.
+   */
+  model?: string;
+  effort?: string;
+  /** See `CompletedResponse.worktree_recovery` — same field, failing turn. */
+  worktree_recovery?: WorktreeRecovery;
+  /**
+   * See `CompletedResponse.agent_handoff` — same field, failing turn. Carried
+   * here too on purpose: a watchdog kill is exactly when an agent's own account
+   * of what it was doing is most worth keeping.
+   */
+  agent_handoff?: AgentHandoffEntry[];
+  /**
+   * State of the worktree's merge when the turn failed, after the supervisor
+   * tried to settle it. Present on merge-phase failures so the human is told
+   * whether their worktree is clean or still needs `git merge --abort`, instead
+   * of finding UU files hours later (fix-sync-silent-conflict).
+   */
+  merge_state?: {
+    settled: boolean;
+    detail: string;
+  };
 }
 
 export type Response = CompletedResponse | CompletedResponseBundle | ErrorResponse;

@@ -76,6 +76,22 @@ export interface TokenUsage {
   cacheReadTokens: number;
 }
 
+/**
+ * Token usage as the AGENT reports it (snake_case), before it is normalized to
+ * the camelCase `TokenUsage` we store. This is the shape that travels on the
+ * supervisor wire and comes back out of `Agent.parseResponse()`.
+ *
+ * Kept as one named type rather than re-inlined per call site so that every
+ * place which carries a dying turn's tokens — AgentResponse, CompletedResponse,
+ * ErrorResponse, the supervisor's error classes — is provably the same shape.
+ */
+export interface AgentTokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
 export interface Task {
   id: string;
   code: string | null;
@@ -224,8 +240,49 @@ export interface Turn {
   end_sha: string | null;
   /** Merge conflicts present at the start of this turn (before agent resolution) */
   merge_conflicts?: MergeConflict[];
-  /** Model used for this turn (sticky: next turn inherits if no explicit override) */
+  /**
+   * The model this turn was LAUNCHED with — the resolved value passed as
+   * `--model` (usually a tier alias like `opus`, or a concrete id for a local
+   * backend). Recorded on the human/builder turn that requests the work AND on
+   * the agent turn that answers it, so a mid-task `--model` override is visible
+   * on exactly the turns it applied to.
+   *
+   * Sticky: the next launch inherits it when no explicit override is given.
+   * That lookup is REQUEST-side and must only ever consider non-agent turns —
+   * see the `stickyModel` scans in src/daemon/task-lifecycle.ts.
+   */
   model?: string;
+  /**
+   * The CONCRETE model id the agent itself reported for this turn (e.g.
+   * `claude-opus-4-5-20251101`), when it reports one. Agent turns only.
+   *
+   * Deliberately separate from `model`: `model` is what was requested (an alias
+   * resolves to different snapshots over time), `model_id` is what actually ran.
+   * Absent means the agent did not report one — `model` is then the most
+   * specific identifier available for that turn, and the absence is the signal
+   * that it is an alias rather than a silent degradation.
+   */
+  model_id?: string;
+  /**
+   * Reasoning effort in force for this turn (`--effort`), as resolved at launch.
+   *
+   * Task-level `metadata.effort` is last-value-wins, so it cannot answer "which
+   * effort produced turn N". This field can. Absent means no effort was passed
+   * on this turn's launch (e.g. sync conflict-resolution invocations, or turns
+   * recorded before this field existed).
+   */
+  effort?: string;
+  /**
+   * What the agent reported about its own lazy MCP tools when this turn
+   * started: `lazy=<server status> tools=<count of mcp__lazy__* tools>`.
+   *
+   * Recorded because nothing else can answer "did that turn actually have its
+   * tools?" once the container is gone — the config lazy wrote proves only what
+   * was offered, not what the agent loaded. Absent for turns whose agent
+   * reported nothing (and for every turn recorded before this field existed),
+   * which is NOT the same as "had no tools".
+   */
+  mcp_tools?: string;
   /** Full prompt sent to agent (only for human turns that trigger agent work) */
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
@@ -514,6 +571,156 @@ export interface FollowUp {
 }
 
 /**
+ * Which side of a diff a review comment is anchored to. 'new' is the
+ * post-change side (added/context lines); 'old' is the pre-change side
+ * (removed/context lines).
+ */
+export type ReviewCommentSide = 'old' | 'new';
+
+/** Who wrote a review comment. */
+export type ReviewCommentRole = 'human' | 'agent';
+
+/**
+ * Delivery state of a human review comment that was dispatched to the task's
+ * agent as a read-only `ask` turn.
+ *
+ * - 'pending'  — persisted, ask in flight (or queued behind another ask)
+ * - 'answered' — the agent replied; the reply is a sibling comment in the thread
+ * - 'failed'   — the ask could not be delivered. The comment is STILL persisted
+ *                and visible; `ask_error` says why. Never a silent loss.
+ */
+export type ReviewCommentAskState = 'pending' | 'answered' | 'failed';
+
+/**
+ * What the reviewer meant by a message, chosen per message.
+ *
+ * - 'ask'     — a question. Dispatched to the agent as a read-only ask turn as
+ *               soon as the worktree is free; the answer joins the thread.
+ * - 'comment' — a change request or note. NOT dispatched. It accumulates and is
+ *               delivered later, batched with every other undelivered comment,
+ *               inside ONE unblock work turn.
+ *
+ * INVARIANT: a comment must never become a work turn on its own. That is the
+ * behaviour of the legacy `Comment` entity (one comment = one agent turn) and
+ * it is the thing this model deliberately replaces: a reviewer marking up ten
+ * lines should produce one turn, not ten. This mirrors how lazy already treats
+ * forge PR comments — collect, then react in batch.
+ */
+export type ReviewCommentIntent = 'ask' | 'comment';
+
+/**
+ * Delivery state of a 'comment'-intent review comment.
+ *
+ * - 'pending_delivery' — durable and visible, waiting for the next unblock
+ * - 'delivered'        — carried into an unblock work turn (`delivered_turn`)
+ *
+ * Only ever advances on a turn that actually launched, so a failed unblock
+ * leaves the comment pending for the next attempt rather than losing it.
+ */
+export type ReviewCommentDeliveryState = 'pending_delivery' | 'delivered';
+
+/**
+ * A review comment anchored to a line of a task's diff, threaded so a reviewer
+ * and the task's agent can hold a conversation about that line.
+ *
+ * INVARIANT: review comments are a SEPARATE store from `Comment`. Comments feed
+ * the daemon's comment auto-react loop (auto-deliver.ts), which would kick the
+ * agent into an unsolicited work turn. A review comment is dispatched
+ * explicitly and only as a read-only `ask`, so it must never enter that loop.
+ * This mirrors why FollowUp is its own store — see CLAUDE.md.
+ *
+ * INVARIANT: the anchor (file/line/side) and the thread are durable. The
+ * comment is persisted BEFORE any ask dispatch that could fail, so human
+ * feedback that never reached the agent still exists and is still visible.
+ */
+export interface ReviewComment {
+  id: string;
+  task_id: string;
+  /**
+   * Thread identity. The first (root) comment of a thread carries its own id
+   * here; every reply — human or agent — repeats the root's id.
+   */
+  thread_id: string;
+  /** Repo-relative path the comment is anchored to, as it appears in the diff. */
+  file: string;
+  /** 1-based line number within `side`. */
+  line: number;
+  side: ReviewCommentSide;
+  role: ReviewCommentRole;
+  content: string;
+  created_at: number;
+  actor?: Actor;
+  /**
+   * What the reviewer meant (human messages only; absent on agent replies).
+   * Absent on human messages written before intents existed — read those as
+   * 'ask', which is what they were.
+   */
+  intent?: ReviewCommentIntent;
+  /** Set on human 'ask'-intent comments. */
+  ask_state?: ReviewCommentAskState;
+  /** Why the ask failed. Present only when ask_state === 'failed'. */
+  ask_error?: string;
+  /** Set on human 'comment'-intent comments. */
+  delivery_state?: ReviewCommentDeliveryState;
+  /** Session turn number of the unblock turn that carried this comment. */
+  delivered_turn?: number;
+  /** Session turn number of the agent's answering turn, when known. */
+  turn_number?: number;
+  /**
+   * The diff line the comment was anchored to, captured at post time. Keeps the
+   * thread readable after the agent changes the file and the line moves — the
+   * reviewer still sees what they commented on.
+   */
+  anchor_snippet?: string;
+  /**
+   * When the reviewer withdrew this message, in ms since epoch. Set only on the
+   * reviewer's OWN messages, and only while nothing has reached the agent (a
+   * queued comment, or a question whose ask failed). A withdrawn message keeps
+   * its record and its place in the thread — it is retracted, not deleted — but
+   * is excluded from the queue, the counts, and any future unblock prompt.
+   *
+   * INVARIANT: one-way. There is no un-withdraw; a reviewer who changes their
+   * mind posts again. This is a deliberately narrow, additive widening of the
+   * "a review comment's words are immutable" rule: a human retracting their own
+   * words before anyone read them is not feedback being lost.
+   */
+  withdrawn_at?: number;
+}
+
+/** Caller-supplied fields when creating a review comment. */
+export interface ReviewCommentInput {
+  threadId?: string;
+  file: string;
+  line: number;
+  side: ReviewCommentSide;
+  role: ReviewCommentRole;
+  content: string;
+  actor?: Actor;
+  intent?: ReviewCommentIntent;
+  askState?: ReviewCommentAskState;
+  deliveryState?: ReviewCommentDeliveryState;
+  turnNumber?: number;
+  anchorSnippet?: string;
+}
+
+/**
+ * Mutable fields of a review comment: delivery bookkeeping, plus withdrawal.
+ *
+ * The body, the anchor and the intent are absent on purpose — those are
+ * immutable once written. `withdrawnAt` is the single exception, and it is
+ * one-way: it may be set, never cleared, and there is no `ReviewCommentInput`
+ * counterpart because a comment cannot be born withdrawn.
+ */
+export interface ReviewCommentUpdate {
+  askState?: ReviewCommentAskState;
+  askError?: string | null;
+  deliveryState?: ReviewCommentDeliveryState;
+  deliveredTurn?: number;
+  turnNumber?: number;
+  withdrawnAt?: number;
+}
+
+/**
  * Persistent record that a reviewer has marked a hunk as reviewed in
  * `lazy review -i`. Keyed by a content hash (see `src/utils/hunk-hash.ts`)
  * so a hunk's approval survives re-parses of the diff and is invalidated
@@ -559,10 +766,67 @@ export interface HunkApprovalLineage {
 export interface AgentResponse {
   result: string;
   session_id: string;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  };
+  usage: AgentTokenUsage;
+  /**
+   * Concrete model id the agent reported for this invocation, when it reports
+   * one. Normalized by the agent implementation — absent means the agent's
+   * output carried no model identity, NOT that a default should be assumed.
+   * Recorded on the turn as `Turn.model_id`.
+   */
+  model_id?: string;
+}
+
+/**
+ * Why a wait interval ended.
+ *
+ * There is deliberately no `abandoned` variant for "the MCP client disconnected
+ * mid-call": the daemon finishes such a call anyway (complete-anyway semantics),
+ * so from the wait's point of view it settled normally and its duration still
+ * belongs to the turn. A wait that genuinely never settled is recorded by the
+ * ABSENCE of an end record (`ended_at: null`), not by an outcome.
+ */
+export type WaitOutcome = 'completed' | 'error';
+
+/**
+ * One stretch of wall-clock an agent spent BLOCKED on another task, recorded
+ * from the daemon's own view of an in-flight blocking MCP call (`lazy_wait`,
+ * `lazy_ask`) — never from parsing agent output.
+ *
+ * This is time the agent was not working. Duration/economics reports must be
+ * able to subtract it from a turn's wall-clock, otherwise an agent that
+ * decomposed its work into subtasks looks arbitrarily slower than one that did
+ * everything inline.
+ *
+ * `ended_at: null` is a first-class readable state, not corruption: the turn (or
+ * the daemon) died mid-wait. Consumers should treat such an interval as open —
+ * bounded above by the turn's end — rather than discarding it.
+ */
+export interface WaitInterval {
+  /** Unique id for this wait; the start and end records are folded on it. */
+  id: string;
+  /** The WAITING task (the caller), not the task being waited on. */
+  task_id: string;
+  /** Session the wait happened in, or null when the task had no session. */
+  session_id: string | null;
+  /**
+   * Sequence the in-flight turn is expected to be recorded under (the next
+   * unused sequence at the moment the wait started). Best-effort attribution:
+   * agent turns are only written when the turn ends, so nothing with a
+   * guaranteed sequence exists yet. Consumers that need certainty should
+   * attribute by time overlap with the turn's own window and use this as a
+   * hint. Null when the sequence could not be determined.
+   */
+  turn_sequence: number | null;
+  /** MCP tool that blocked, e.g. `lazy_wait`. */
+  tool: string;
+  /** Task ids being waited on (an array — `lazy_wait` can race several). */
+  waited_on: string[];
+  /** Display labels (code or short id) for `waited_on`, same order. */
+  waited_on_labels: string[];
+  /** ISO timestamp the blocking call started. */
+  started_at: string;
+  /** ISO timestamp it settled, or null when it never did. */
+  ended_at: string | null;
+  /** How it settled, or null while open. */
+  outcome: WaitOutcome | null;
 }

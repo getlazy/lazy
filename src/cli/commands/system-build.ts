@@ -8,6 +8,7 @@
  */
 
 import { buildLazyRunnerImage } from '../../capture/claude';
+import { IMAGE_TAG, IMAGE_MAX_AGE_DAYS } from '../../capture/image-tag';
 import { parseFlags } from '../helpers';
 import { theme } from '../theme';
 import { logger } from '../../utils/logger';
@@ -51,8 +52,8 @@ export async function commandSystemBuild(args: string[]): Promise<void> {
   const noCache = parsed.flags.get('no-cache') === true;
 
   try {
-    const imageName = await buildLazyRunnerImage({ noCache });
-    console.log(`${theme.success('Built')} ${imageName}`);
+    const tags = await buildLazyRunnerImage({ noCache });
+    console.log(`${theme.success('Built')} ${tags.join(', ')}`);
   } catch (err) {
     logger.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -67,6 +68,15 @@ Prebuild a lazy system image, bypassing the current project's lazy.toml.
 Use this to build the base 'lazy-runner' image on a fresh machine — for
 example, when a project's custom Dockerfile does \`FROM lazy-runner\` and
 the base image doesn't exist yet.
+
+Images are tagged with lazy's major.minor version (lazy-runner:${IMAGE_TAG}). The
+base image also gets a \`:latest\` alias pointing at that same build, which is
+what \`FROM lazy-runner\` resolves to.
+
+The image carries Claude Code and the Dockerfile's own packages, not lazy
+itself — lazy-agent is mounted into the container at launch. It is rebuilt by
+\`lazy upgrade\`, when the Dockerfile changes, and automatically once it is more
+than ${IMAGE_MAX_AGE_DAYS} days old.
 
 Valid names:
   lazy-runner              The base Docker image used by agent containers

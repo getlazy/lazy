@@ -1,0 +1,132 @@
+:root {
+  --hm-empty: #ebedf0;
+  --hm-g1: #9be9a8;
+  --hm-g2: #40c463;
+  --hm-g3: #30a14e;
+  --hm-g4: #216e39;
+  --hm-o1: #fde0a7;
+  --hm-o2: #fdba5c;
+  --hm-o3: #f47d21;
+  --hm-o4: #c35711;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --hm-empty: #161b22;
+    --hm-g1: #0e4429;
+    --hm-g2: #006d32;
+    --hm-g3: #26a641;
+    --hm-g4: #39d353;
+    --hm-o1: #3d2000;
+    --hm-o2: #6d3a00;
+    --hm-o3: #d97706;
+    --hm-o4: #fdba5c;
+  }
+}
+.hm-scroll { overflow-x: auto; }
+.hm-day {
+  width: 13px;
+  height: 13px;
+  display: flex;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.hm-active { cursor: pointer; }
+.hm-active:hover {
+  outline: 1px solid var(--text-secondary);
+  outline-offset: -1px;
+}
+.hm-selected {
+  outline: 2px solid var(--link) !important;
+  outline-offset: -1px;
+}
+.hm-l, .hm-r {
+  width: 50%;
+  height: 100%;
+}
+.hm-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  vertical-align: middle;
+}
+.hm-legend-scale {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 20px;
+  flex-shrink: 0;
+}
+.hm-legend-title {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.hm-legend-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.hm-legend-text {
+  font-size: 10px;
+  color: var(--text-secondary);
+  padding: 0 4px;
+}
+.hm-months {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.hm-day-labels {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-align: right;
+  padding-right: 4px;
+  min-width: 28px;
+}
+.hm-report {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+.hm-report h3 {
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+.hm-report-stats {
+  display: flex;
+  gap: 24px;
+  font-size: 13px;
+}
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.stat-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  text-align: center;
+  text-decoration: none;
+  color: inherit;
+}
+.stat-card-link:hover {
+  border-color: var(--link);
+  text-decoration: none;
+}
+.stat-value {
+  font-size: 28px;
+  font-weight: bold;
+  line-height: 1.2;
+}
+.stat-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 4px;
+}

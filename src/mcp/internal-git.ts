@@ -27,7 +27,7 @@
 import { dirname } from 'path';
 import type { McpTool, McpToolHandler } from './types';
 import { INTERNAL_GIT_TOOL_NAME } from './types';
-import type { McpToolContext } from './tools';
+import { type McpToolContext, mcpActor } from './tools';
 import { runGit } from '../utils/git';
 import { requireStorage } from '../cli/helpers';
 import type { Storage } from '../storage';
@@ -51,7 +51,7 @@ export const internalGitTool: McpTool = {
     properties: {
       op: {
         type: 'string',
-        enum: ['merge', 'merge_abort', 'reset_hard_head', 'tag'],
+        enum: ['merge', 'merge_abort', 'merge_commit', 'reset_hard_head', 'tag'],
         description: 'The operation to perform',
       },
       target: { type: 'string', description: 'merge: ref or SHA to merge' },
@@ -115,7 +115,9 @@ async function allowedMergeRefs(
 
   const refs: string[] = [];
 
-  const parent = await resolveParentBranchWithFallback(task, storage, projectRoot);
+  // This runs in the AGENT's own MCP process, so any re-parent comment the
+  // resolution leaves behind is that agent's, not a human's.
+  const parent = await resolveParentBranchWithFallback(task, storage, projectRoot, mcpActor(ctx));
   if (parent.branch) {
     refs.push(parent.branch, `${remote}/${parent.branch}`);
   }
@@ -174,11 +176,25 @@ async function assertMergeTargetAllowed(
 
 /** `turn/<taskid8>/<phase>/<sha>` — the only tag names the supervisor may write. */
 function assertTagNameAllowed(taskId: string, name: string): void {
-  const expected = new RegExp(`^turn/${taskId.substring(0, 8)}/[a-z0-9-]+/[0-9a-f]{7,40}$`);
-  if (!expected.test(name)) {
+  const shortId = taskId.substring(0, 8);
+
+  // Structural comparison, not a RegExp built from `taskId`. This is a security
+  // check — it gates which tags the supervisor may write — and a task id
+  // carrying a regex metacharacter would silently weaken or break it rather
+  // than simply failing to match. Splitting on '/' gives the same guarantee
+  // with only static patterns, and states the four segments outright.
+  const parts = name.split('/');
+  const allowed =
+    parts.length === 4 &&
+    parts[0] === 'turn' &&
+    parts[1] === shortId &&
+    /^[a-z0-9-]+$/.test(parts[2]) &&
+    /^[0-9a-f]{7,40}$/.test(parts[3]);
+
+  if (!allowed) {
     throw new Error(
       `Refusing to write tag "${name}": supervisor tags must be of the form ` +
-      `turn/${taskId.substring(0, 8)}/<phase>/<sha>.`,
+      `turn/${shortId}/<phase>/<sha>.`,
     );
   }
 }
@@ -214,6 +230,32 @@ export function createInternalGitHandler(ctx: McpToolContext): McpToolHandler {
       case 'merge_abort':
         result = await runGit(['merge', '--abort'], { cwd });
         break;
+      case 'merge_commit': {
+        // Conclude a merge whose conflicts are already resolved. The merge
+        // itself was validated when it was STARTED (the `merge` case above), so
+        // no new target is being introduced here — the only thing this adds is
+        // the commit the container cannot create for itself.
+        //
+        // Both guards are refusals, not conveniences: without MERGE_HEAD this
+        // would commit arbitrary worktree changes as if they were a merge, and
+        // with unmerged paths it would commit conflict markers.
+        const mergeHead = await runGit(['rev-parse', '--verify', 'MERGE_HEAD'], { cwd });
+        if (mergeHead.exitCode !== 0) {
+          throw new Error(
+            `${INTERNAL_GIT_TOOL_NAME} merge_commit: no merge is in progress in ${cwd} ` +
+            `(MERGE_HEAD does not exist). Refusing to commit worktree changes as a merge.`,
+          );
+        }
+        const unmerged = await runGit(['diff', '--name-only', '--diff-filter=U'], { cwd });
+        if (unmerged.exitCode === 0 && unmerged.stdout.trim()) {
+          throw new Error(
+            `${INTERNAL_GIT_TOOL_NAME} merge_commit: refusing to commit a merge with unresolved ` +
+            `conflicts in ${cwd}:\n${unmerged.stdout.trim()}`,
+          );
+        }
+        result = await runGit(['commit', '-a', '--no-edit', '--no-verify'], { cwd });
+        break;
+      }
       case 'reset_hard_head':
         result = await runGit(['reset', '--hard', 'HEAD'], { cwd });
         break;

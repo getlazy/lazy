@@ -20,9 +20,32 @@ import {
   revokeBuilderMcpToken,
   peekMcpToken,
   clearMcpTokenCache,
+  MAX_BUILDER_TOKENS,
 } from '../../src/daemon/mcp-tokens';
 import { getMcpTokensPath } from '../../src/daemon/paths';
+import { spawn } from '../../src/utils/spawn';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+
+interface StoredRecord {
+  token: string;
+  kind: 'task' | 'builder';
+  label: string;
+  ownerPid?: number;
+}
+
+/** Read the registry straight off disk — the cap's effect is a file-level fact. */
+async function readRecords(root: string): Promise<StoredRecord[]> {
+  const parsed = JSON.parse(await readFile(getMcpTokensPath(root), 'utf-8'));
+  return parsed.tokens as StoredRecord[];
+}
+
+async function countBuilderRecords(root: string): Promise<number> {
+  return (await readRecords(root)).filter(t => t.kind === 'builder').length;
+}
+
+async function readBuilderRecord(root: string, label: string): Promise<StoredRecord | undefined> {
+  return (await readRecords(root)).find(t => t.kind === 'builder' && t.label === label);
+}
 
 describe('daemon MCP token registry', () => {
   let root: string;
@@ -137,6 +160,86 @@ describe('daemon MCP token registry', () => {
 
     expect(await lookupMcpIdentity(root, builder)).toBeNull();
     expect(await lookupMcpIdentity(root, task)).toEqual({ kind: 'task', taskId: 'task-a' });
+  });
+
+  // INVARIANT: the builder cap bounds RESIDUE, not live sessions. Evicting a
+  // live builder's token costs it every lazy_* tool for the rest of its session,
+  // silently — so a record whose owning process is still alive is evicted only
+  // after every record that is not. The old policy (oldest-created first) picked
+  // exactly the worst victim: the oldest builder is the likeliest long-running
+  // live one.
+  test("a live builder's token survives the 51st builder launch", async () => {
+    // Oldest of all, and live: the record the old policy would have dropped.
+    const live = await mintMcpToken(root, { kind: 'builder' }, 'builder-live', { ownerPid: process.pid });
+
+    // 50 leftovers from sessions that never revoked (SIGKILLed builder, daemon
+    // down at exit) — no owner pid, so none of them is provably live.
+    for (let i = 0; i < MAX_BUILDER_TOKENS; i++) {
+      await mintMcpToken(root, { kind: 'builder' }, `builder-residue-${i}`);
+    }
+
+    expect(await lookupMcpIdentity(root, live)).toEqual({ kind: 'builder' });
+    // The cap still holds — one residue record went instead.
+    expect(await peekMcpToken(root, { kind: 'builder' }, 'builder-residue-0')).toBeNull();
+    expect(await countBuilderRecords(root)).toBe(MAX_BUILDER_TOKENS);
+  });
+
+  // A pid that no longer exists is residue like any other: liveness is the
+  // signal, not the presence of the field.
+  test('a builder whose process has exited is evicted ahead of a live one', async () => {
+    const proc = spawn(['sleep', '60'], { stdout: 'ignore', stderr: 'ignore' });
+    const deadPid = proc.pid;
+    proc.kill();
+    await proc.exited;
+
+    const dead = await mintMcpToken(root, { kind: 'builder' }, 'builder-dead', { ownerPid: deadPid });
+    const live = await mintMcpToken(root, { kind: 'builder' }, 'builder-live', { ownerPid: process.pid });
+    for (let i = 0; i < MAX_BUILDER_TOKENS - 1; i++) {
+      await mintMcpToken(root, { kind: 'builder' }, `builder-residue-${i}`, { ownerPid: process.pid });
+    }
+
+    expect(await lookupMcpIdentity(root, dead)).toBeNull();
+    expect(await lookupMcpIdentity(root, live)).toEqual({ kind: 'builder' });
+  });
+
+  // The cap is a HARD cap: preferring live sessions changes the ORDER of
+  // eviction, never whether it happens. Otherwise a run of pid reuse could grow
+  // the registry without bound.
+  test('the cap still evicts when every retained builder is live', async () => {
+    const first = await mintMcpToken(root, { kind: 'builder' }, 'builder-0', { ownerPid: process.pid });
+    for (let i = 1; i <= MAX_BUILDER_TOKENS; i++) {
+      await mintMcpToken(root, { kind: 'builder' }, `builder-${i}`, { ownerPid: process.pid });
+    }
+
+    expect(await countBuilderRecords(root)).toBe(MAX_BUILDER_TOKENS);
+    // Oldest live record loses when there is nothing deader to drop.
+    expect(await lookupMcpIdentity(root, first)).toBeNull();
+    // The one just minted is never the victim.
+    expect(await peekMcpToken(root, { kind: 'builder' }, `builder-${MAX_BUILDER_TOKENS}`)).not.toBeNull();
+  });
+
+  // Task tokens have their own lifecycle (accept/reject/close revoke them) and
+  // are NOT subject to the builder cap — a busy project has more than 50 tasks.
+  test('the builder cap never evicts task tokens', async () => {
+    const task = await mintMcpToken(root, { kind: 'task', taskId: 'task-a' }, 'lazy-a');
+    for (let i = 0; i <= MAX_BUILDER_TOKENS; i++) {
+      await mintMcpToken(root, { kind: 'builder' }, `builder-${i}`);
+    }
+
+    expect(await lookupMcpIdentity(root, task)).toEqual({ kind: 'task', taskId: 'task-a' });
+  });
+
+  // The re-issue watcher and the relaunch loop come back for the SAME identity.
+  // A record minted before the owner pid existed (or by a caller that sent none)
+  // must be able to learn its owner, or the live session it belongs to stays
+  // first in line for eviction forever.
+  test('re-minting the same identity refreshes the owner pid without rotating the token', async () => {
+    const first = await mintMcpToken(root, { kind: 'builder' }, 'builder-1');
+    const again = await mintMcpToken(root, { kind: 'builder' }, 'builder-1', { ownerPid: process.pid });
+
+    expect(again).toBe(first);
+    const record = await readBuilderRecord(root, 'builder-1');
+    expect(record?.ownerPid).toBe(process.pid);
   });
 
   // INVARIANT: tokens survive a daemon restart. The shared token was deliberately

@@ -42,7 +42,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { mkdir, readdir, stat, rm, copyFile, utimes, readFile, writeFile } from 'fs/promises';
+import { mkdir, readdir, stat, rm, copyFile, utimes, readFile, writeFile, open } from 'fs/promises';
 import { join } from 'path';
 import { encodeProjectPath } from '../import/claude-code-logs';
 import { pathExists } from '../utils/fs';
@@ -69,50 +69,98 @@ export interface BuilderProjectsIsolation {
   hostDir: string;
   /**
    * True ONLY when this dir provably holds a CONTAINER-WRITTEN copy of the launch's
-   * resume target session — i.e. Claude created the JSONL here (the session file is
-   * present AND absent from this dir's seed manifest). Such a dir is known-writable
-   * by the container user, so the docker runner trusts it over a transient
-   * write-probe failure. See shouldMountProjectsDir.
+   * resume target session — Claude created the JSONL here (present AND absent from
+   * this dir's seed manifest), or Claude APPENDED to a seeded copy here (present,
+   * listed as seeded, but longer than its recorded seed-time size). Such a dir is
+   * known-writable by the container user, so the docker runner trusts it over a
+   * transient write-probe failure. See shouldMountProjectsDir.
    *
    * A merely-present session is NOT sufficient: seedProjectsDirFromHistory copies
    * every prior session into every freshly minted dir HOST-side, so a bare
-   * dirHasSession match is frequently a host-written SEEDED copy — no evidence the
-   * container user can write here. Seeded copies are recorded in a per-dir
-   * `.lazy-seeded.json` manifest and excluded from this trust (and skipped as
-   * resume targets, since they are stale snapshots — the live session lives in its
-   * birth dir or the shared dir).
+   * file-exists match is frequently a host-written SEEDED copy — no evidence the
+   * container user can write here. Seeded copies and their seed-time sizes are
+   * recorded in a per-dir `.lazy-seeded.json` manifest; an ungrown seeded copy is
+   * excluded from this trust.
    */
   holdsResumeSession: boolean;
 }
 
-/**
- * Does an isolation dir already contain the given session's JSONL? Claude writes
- * `<projects>/<encoded-cwd>/<session>.jsonl`; the encoded cwd is deterministic
- * because the repo is mounted at the same path inside every builder container.
- */
-async function dirHasSession(hostDir: string, encodedCwd: string, sessionId: string): Promise<boolean> {
-  return pathExists(join(hostDir, encodedCwd, `${sessionId}.jsonl`));
+/** Size and mtime of one copy of a session's JSONL. */
+interface SessionFileStat {
+  size: number;
+  mtimeMs: number;
 }
 
 /**
- * mtime of a session's JSONL inside an isolation dir, or null when the dir does
- * not hold it. Recency is how resume resolution ranks candidate dirs: every copy
- * of a session carries its source's mtime, so the newest copy is the one with the
- * most history.
+ * Size + mtime of a session's JSONL inside an isolation dir, or null when the dir
+ * does not hold it. SIZE is the primary evidence of how much history a copy has:
+ * a session JSONL is append-only, so the longest copy is the most complete one.
+ * (mtime alone is NOT that evidence — see scanResumeCandidates.)
  *
  * A dir we cannot stat is not a usable candidate, so it degrades to "does not hold
  * it" — but never silently: an unreadable isolation dir is worth surfacing,
  * because it usually means a permissions problem that will bite the mount too.
  */
-async function sessionMtimeMs(hostDir: string, encodedCwd: string, sessionId: string): Promise<number | null> {
+async function sessionFileStat(
+  hostDir: string,
+  encodedCwd: string,
+  sessionId: string,
+): Promise<SessionFileStat | null> {
   const file = join(hostDir, encodedCwd, `${sessionId}.jsonl`);
   try {
     const info = await stat(file);
-    return info.isFile() ? info.mtimeMs : null;
+    return info.isFile() ? { size: info.size, mtimeMs: info.mtimeMs } : null;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null; // normal: dir just doesn't hold it
     logger.warn(`Skipping builder session dir ${hostDir} as a resume candidate: ${(err as Error).message}`);
     return null;
+  }
+}
+
+/**
+ * Is `shorter` a byte-exact PREFIX of `longer` (and strictly shorter)? Session
+ * JSONLs are append-only, so a strict-prefix relation is proof that `longer` is
+ * the SAME conversation carried further — not a divergent line that merely happens
+ * to be bigger. Used to promote a seeded-but-grown copy over a stale
+ * container-written one when the manifest carries no seed-time size to compare
+ * against (a pre-v2 manifest).
+ *
+ * Reads in bounded chunks so a multi-MB transcript never lands in memory whole.
+ * Any read failure answers `false` — an unprovable relation must never promote.
+ */
+async function isStrictPrefixOf(shorterPath: string, longerPath: string): Promise<boolean> {
+  const CHUNK = 256 * 1024;
+  let a: Awaited<ReturnType<typeof open>> | null = null;
+  let b: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    a = await open(shorterPath, 'r');
+    b = await open(longerPath, 'r');
+    const [sa, sb] = [await a.stat(), await b.stat()];
+    if (sa.size === 0 || sa.size >= sb.size) return false;
+    const bufA = Buffer.alloc(CHUNK);
+    const bufB = Buffer.alloc(CHUNK);
+    let offset = 0;
+    while (offset < sa.size) {
+      const want = Math.min(CHUNK, sa.size - offset);
+      const ra = await a.read(bufA, 0, want, offset);
+      const rb = await b.read(bufB, 0, want, offset);
+      if (ra.bytesRead !== want || rb.bytesRead !== want) return false;
+      if (!bufA.subarray(0, want).equals(bufB.subarray(0, want))) return false;
+      offset += want;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`Could not compare builder session copies ${shorterPath} / ${longerPath}: ${(err as Error).message}`);
+    return false;
+  } finally {
+    for (const handle of [a, b]) {
+      if (!handle) continue;
+      try {
+        await handle.close();
+      } catch (err) {
+        logger.debug(`Could not close builder session file handle: ${(err as Error).message}`);
+      }
+    }
   }
 }
 
@@ -136,32 +184,37 @@ function seedManifestPath(hostDir: string): string {
 }
 
 /**
- * Read the set of session ids seeded into `hostDir`. Returns `null` when the dir
- * has NO manifest — a legacy/pre-manifest dir whose files are of unknown provenance
- * (they could be seeded copies), so callers must NOT grant it the write-trust fast
- * path (they fall back to the probe instead). Returns a (possibly empty) Set when a
- * manifest exists: an empty manifest is positive evidence that no file here is
- * seeded, so present files are container-written and trustworthy.
+ * Everything a dir's manifest records; null for a legacy/unreadable one.
+ *
+ * `seeded` is the set of session ids seedProjectsDirFromHistory copied in HOST-side.
+ * A null manifest means a legacy/pre-manifest dir whose files are of unknown
+ * provenance, so callers must NOT grant it the write-trust fast path (they fall back
+ * to the probe). An EMPTY manifest is positive evidence that no file here is seeded,
+ * so present files are container-written and trustworthy.
+ *
+ * `adopted` records the sessions a `lazy builder --resume <id> --import` deliberately
+ * took over (see adoption notes on resolveBuilderProjectsDir). Adopted ids stay in
+ * `seeded` too, so write TRUST is unaffected: the copy is still host-written and
+ * still probe-gated until Claude actually writes here. What adoption records is
+ * INTENT — the next plain `--resume <id>` resolves to this dir and proceeds silently
+ * instead of demanding `--import` again.
+ *
+ * `seededStats` (manifest v2) is the size+mtime each seeded copy had AT SEED TIME,
+ * refreshed on every re-seed. It is what makes a seeded-then-GROWN copy detectable:
+ * seeding is the only host-side writer, so a copy that is LONGER than its recorded
+ * seed size can only have been appended to by Claude inside the container. That
+ * copy is therefore container-written after all, and both resumable and
+ * write-trusted — the case that made this whole file mount a stale snapshot.
+ *
+ * Absent for pre-v2 manifests; absence means "unknown", never "not grown".
  */
-async function readSeedManifest(hostDir: string): Promise<Set<string> | null> {
-  return (await readManifest(hostDir))?.seeded ?? null;
+interface SeedManifest {
+  seeded: Set<string>;
+  adopted: Set<string>;
+  seededStats: Map<string, SessionFileStat>;
 }
 
-/**
- * Sessions this dir ADOPTED — a `lazy builder --resume <id> --import` deliberately
- * took over a session that had never run under isolation (see adoption notes on
- * resolveBuilderProjectsDir). Adopted ids stay in `seededSessionIds` too, so write
- * TRUST is unaffected: the copy is still host-written and still probe-gated until
- * Claude actually writes here. What adoption records is INTENT — the next plain
- * `--resume <id>` resolves to this dir and proceeds silently instead of demanding
- * `--import` again.
- */
-async function readAdoptedSessions(hostDir: string): Promise<Set<string>> {
-  return (await readManifest(hostDir))?.adopted ?? new Set();
-}
-
-/** Both id sets from a dir's manifest; null for a legacy/unreadable one. */
-async function readManifest(hostDir: string): Promise<{ seeded: Set<string>; adopted: Set<string> } | null> {
+async function readManifest(hostDir: string): Promise<SeedManifest | null> {
   let raw: string;
   try {
     raw = await readFile(seedManifestPath(hostDir), 'utf-8');
@@ -173,9 +226,27 @@ async function readManifest(hostDir: string): Promise<{ seeded: Set<string>; ado
   }
   const toSet = (value: unknown): Set<string> =>
     Array.isArray(value) ? new Set(value.filter((x): x is string => typeof x === 'string')) : new Set();
+  const toStats = (value: unknown): Map<string, SessionFileStat> => {
+    const out = new Map<string, SessionFileStat>();
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+    for (const [id, entry] of Object.entries(value as Record<string, unknown>)) {
+      const e = entry as { size?: unknown; mtimeMs?: unknown } | null;
+      if (!e || typeof e.size !== 'number' || typeof e.mtimeMs !== 'number') continue;
+      out.set(id, { size: e.size, mtimeMs: e.mtimeMs });
+    }
+    return out;
+  };
   try {
-    const parsed = JSON.parse(raw) as { seededSessionIds?: unknown; adoptedSessionIds?: unknown };
-    return { seeded: toSet(parsed?.seededSessionIds), adopted: toSet(parsed?.adoptedSessionIds) };
+    const parsed = JSON.parse(raw) as {
+      seededSessionIds?: unknown;
+      adoptedSessionIds?: unknown;
+      seededFileStats?: unknown;
+    };
+    return {
+      seeded: toSet(parsed?.seededSessionIds),
+      adopted: toSet(parsed?.adoptedSessionIds),
+      seededStats: toStats(parsed?.seededFileStats),
+    };
   } catch (err) {
     // A broken manifest must never strand a launch. Treat as "unknown provenance"
     // (same as legacy → null) so the dir is probe-gated rather than wrongly trusted.
@@ -184,12 +255,29 @@ async function readManifest(hostDir: string): Promise<{ seeded: Set<string>; ado
   }
 }
 
-/** Rewrite a dir's manifest, preserving whichever set is not being changed. */
-async function writeManifest(hostDir: string, seeded: Set<string>, adopted: Set<string>): Promise<void> {
+/** Rewrite a dir's manifest, preserving whichever field is not being changed. */
+async function writeManifest(hostDir: string, manifest: SeedManifest): Promise<void> {
+  const stats: Record<string, SessionFileStat> = {};
+  for (const id of [...manifest.seededStats.keys()].sort()) {
+    stats[id] = manifest.seededStats.get(id)!;
+  }
   await writeFile(
     seedManifestPath(hostDir),
-    JSON.stringify({ seededSessionIds: [...seeded].sort(), adoptedSessionIds: [...adopted].sort() }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        seededSessionIds: [...manifest.seeded].sort(),
+        adoptedSessionIds: [...manifest.adopted].sort(),
+        seededFileStats: stats,
+      },
+      null,
+      2,
+    ) + '\n',
   );
+}
+
+/** An empty manifest, for a dir that has none yet. */
+function emptyManifest(): SeedManifest {
+  return { seeded: new Set(), adopted: new Set(), seededStats: new Map() };
 }
 
 /**
@@ -197,12 +285,10 @@ async function writeManifest(hostDir: string, seeded: Set<string>, adopted: Set<
  * host-written). Called only on the explicit `--import` path.
  */
 async function recordAdoptedSession(hostDir: string, sessionId: string): Promise<void> {
-  const manifest = await readManifest(hostDir);
-  const seeded = manifest?.seeded ?? new Set<string>();
-  const adopted = manifest?.adopted ?? new Set<string>();
-  seeded.add(sessionId);
-  adopted.add(sessionId);
-  await writeManifest(hostDir, seeded, adopted);
+  const manifest = (await readManifest(hostDir)) ?? emptyManifest();
+  manifest.seeded.add(sessionId);
+  manifest.adopted.add(sessionId);
+  await writeManifest(hostDir, manifest);
 }
 
 /**
@@ -216,10 +302,16 @@ async function recordAdoptedSession(hostDir: string, sessionId: string): Promise
  * them), never correctness, and a genuinely-unwritable seeded copy can never be
  * wrongly trusted. Only sessions Claude writes AFTER the manifest exists are absent
  * from it and therefore trusted.
+ *
+ * Each recorded id also gets its file's CURRENT size+mtime in `seededFileStats`,
+ * which is the baseline growth is measured against later (see SeedManifest). The
+ * baseline is refreshed on every re-seed, so a legitimately-refreshed copy is never
+ * mistaken for one Claude appended to.
  */
 async function recordSeededSessions(hostDir: string, encodedCwd: string, newlySeeded: string[]): Promise<void> {
-  const existing = await readSeedManifest(hostDir);
-  const ids = existing ?? new Set<string>();
+  const existing = await readManifest(hostDir);
+  const manifest = existing ?? emptyManifest();
+  const toStat = new Set(newlySeeded);
   if (existing === null) {
     // First manifest for this dir — treat all currently-present sessions as seeded.
     let present: string[] = [];
@@ -230,12 +322,24 @@ async function recordSeededSessions(hostDir: string, encodedCwd: string, newlySe
     } catch {
       // No encodedCwd subdir yet (nothing present) — normal for a just-minted dir.
     }
-    for (const id of present) ids.add(id);
+    // Stat these too: a legacy dir's files are conservatively marked seeded, so
+    // without a baseline they could never earn their trust back. With one, the
+    // first time Claude appends to one it is recognized as container-written.
+    for (const id of present) {
+      manifest.seeded.add(id);
+      toStat.add(id);
+    }
   }
-  for (const id of newlySeeded) ids.add(id);
-  // Preserve adoptedSessionIds — losing it would make every later plain --resume of
-  // an adopted session demand --import again.
-  await writeManifest(hostDir, ids, await readAdoptedSessions(hostDir));
+  for (const id of newlySeeded) manifest.seeded.add(id);
+  for (const id of toStat) {
+    const info = await sessionFileStat(hostDir, encodedCwd, id);
+    if (info) manifest.seededStats.set(id, info);
+    // No stat (vanished, unreadable) → leave the baseline unknown rather than
+    // recording a wrong one; growth for that id simply stays undecidable.
+  }
+  // adoptedSessionIds is carried through by reusing the read manifest — losing it
+  // would make every later plain --resume of an adopted session demand --import again.
+  await writeManifest(hostDir, manifest);
 }
 
 /** How a resume target relates to per-builder isolation. */
@@ -247,18 +351,46 @@ export type ResumeSessionProvenance =
   /** Not found anywhere — a bogus id; let Claude report the miss. */
   | 'unknown';
 
-type ResumeCandidate = { iso: BuilderProjectsIsolation; mtimeMs: number; rank: number };
+type ResumeCandidate = {
+  iso: BuilderProjectsIsolation;
+  /** Absolute path of this copy's JSONL, for byte-level comparison. */
+  filePath: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  rank: number;
+  /** Listed as seeded but strictly longer than its recorded seed size ⇒ Claude appended here. */
+  grown: boolean;
+};
 
 /**
  * Scan the isolation root for copies of `resumeId`, split into the copies that may
  * be resumed directly and the host-seeded ones that may only be ADOPTED.
  *
- * Both lists are ranked by RECENCY, not by provenance: the newest copy is by
- * definition the one with the most history (a copy carries the source's mtime, and
- * only Claude appending to it makes it newer), so mounting it never resumes a stale
- * snapshot. Provenance breaks exact-mtime ties (container-written > legacy >
- * adopted) and — separately — decides write TRUST, which only a container-written
- * copy earns.
+ * RANKING IS BY LENGTH, NOT RECENCY. The old comment here claimed the newest copy
+ * is by definition the one with the most history — that is false, and it cost a
+ * user two hours of conversation. mtime moves for reasons that have nothing to do
+ * with content: merely MOUNTING a dir and opening its JSONL bumps the file's mtime
+ * without adding a byte. A session JSONL is append-only, so the number of BYTES is
+ * the honest measure of how much history a copy holds; mtime is only a tie-break.
+ *
+ * PROVENANCE OUTRANKS NEITHER — it decides which list a copy lands in, and that
+ * split is what the incident turned on. The complete transcript sat in a dir that
+ * had SEEDED it and then let Claude append two hours to it; nothing reclassified
+ * that copy, so it stayed in `seededOnly` while a frozen, two-hour-old
+ * container-written copy was the only entry in `usable` and won. Two mechanisms
+ * close that:
+ *
+ *   1. GROWTH (manifest v2): a seeded copy longer than its recorded seed-time size
+ *      can only have been appended to inside the container, so it is reclassified
+ *      as container-written — usable AND write-trusted.
+ *   2. PREFIX PROMOTION (pre-v2 manifests, which have no recorded size): if the
+ *      best seeded copy is strictly longer than the best usable one AND the usable
+ *      one's bytes are a strict prefix of it, it is the same conversation carried
+ *      further, so it is promoted — resumable, but NOT write-trusted, since a plain
+ *      host re-seed could also have extended it.
+ *
+ * A longer seeded copy that is NOT a prefix is a genuinely divergent line; we keep
+ * the usable pick and log loudly, naming both dirs, rather than silently choosing.
  */
 async function scanResumeCandidates(
   root: string,
@@ -274,30 +406,65 @@ async function scanResumeCandidates(
   }
   let usable: ResumeCandidate | null = null;
   let seededOnly: ResumeCandidate | null = null;
+  // Most bytes wins (most history); newest mtime, then provenance, break ties.
   const better = (a: ResumeCandidate | null, b: ResumeCandidate): boolean =>
-    !a || b.mtimeMs > a.mtimeMs || (b.mtimeMs === a.mtimeMs && b.rank > a.rank);
+    !a ||
+    b.sizeBytes > a.sizeBytes ||
+    (b.sizeBytes === a.sizeBytes &&
+      (b.mtimeMs > a.mtimeMs || (b.mtimeMs === a.mtimeMs && b.rank > a.rank)));
 
   for (const child of children) {
     const hostDir = join(root, child);
-    const mtimeMs = await sessionMtimeMs(hostDir, encodedCwd, resumeId);
-    if (mtimeMs === null) continue;
+    const info = await sessionFileStat(hostDir, encodedCwd, resumeId);
+    if (info === null) continue;
     const manifest = await readManifest(hostDir);
     // 2 = container-written (present, manifest-aware dir, not listed) ⇒ writable
     // 1 = legacy pre-manifest dir (provenance unknown) ⇒ probe-gated
-    // 0 = host-seeded copy ⇒ probe-gated, and resumable only once ADOPTED
+    // 0 = host-seeded copy ⇒ probe-gated, and resumable only once ADOPTED or GROWN
     const rank = manifest === null ? 1 : (manifest.seeded.has(resumeId) ? 0 : 2);
+    const seedBaseline = manifest?.seededStats.get(resumeId) ?? null;
+    // Growth is decidable only with a v2 baseline; without one it stays false and
+    // prefix promotion below is the fallback.
+    const grown = rank === 0 && seedBaseline !== null && info.size > seedBaseline.size;
     const candidate: ResumeCandidate = {
-      iso: { id: child, hostDir, holdsResumeSession: rank === 2 },
-      mtimeMs,
+      // A grown copy is container-written evidence just as strong as rank 2: only
+      // Claude, inside the container, can have added those bytes.
+      iso: { id: child, hostDir, holdsResumeSession: rank === 2 || grown },
+      filePath: join(hostDir, encodedCwd, `${resumeId}.jsonl`),
+      sizeBytes: info.size,
+      mtimeMs: info.mtimeMs,
       rank,
+      grown,
     };
     const adopted = manifest?.adopted.has(resumeId) ?? false;
-    if (rank > 0 || adopted) {
+    if (rank > 0 || adopted || grown) {
       if (better(usable, candidate)) usable = candidate;
     } else if (better(seededOnly, candidate)) {
       seededOnly = candidate;
     }
   }
+
+  if (usable && seededOnly && seededOnly.sizeBytes > usable.sizeBytes) {
+    const describe = (c: ResumeCandidate) => `${c.iso.hostDir} (${c.sizeBytes} bytes)`;
+    if (await isStrictPrefixOf(usable.filePath, seededOnly.filePath)) {
+      logger.info(
+        `Resuming ${resumeId} from ${seededOnly.iso.hostDir}: it holds a longer copy ` +
+        `(${seededOnly.sizeBytes} bytes) that extends the one in ${describe(usable)}. ` +
+        `Mounting the shorter copy would have dropped that history.`,
+      );
+      // Resumable, but NOT write-trusted: extension alone does not prove the
+      // CONTAINER wrote it (a host re-seed extends a copy too), and write trust is
+      // what lets a failing write-probe be overridden. Let the probe decide.
+      usable = { ...seededOnly, iso: { ...seededOnly.iso, holdsResumeSession: false } };
+    } else {
+      logger.warn(
+        `Two divergent copies of builder session ${resumeId} exist: resuming ${describe(usable)}, ` +
+        `but ${describe(seededOnly)} is longer and is NOT an extension of it. ` +
+        `Inspect both before continuing if history looks short.`,
+      );
+    }
+  }
+
   return { usable, seededOnly };
 }
 
@@ -578,11 +745,17 @@ export async function isTrustedResumeProjectsDir(opts: {
   if (!resumeId) return false;
   try {
     const encodedCwd = encodeProjectPath(lazyRoot);
-    if (!(await dirHasSession(hostDir, encodedCwd, resumeId))) return false;
-    const seeded = await readSeedManifest(hostDir);
+    const info = await sessionFileStat(hostDir, encodedCwd, resumeId);
+    if (info === null) return false;
+    const manifest = await readManifest(hostDir);
     // Trusted only with positive container-write evidence: a manifest exists
-    // (dir is manifest-aware) AND does not list this session (Claude wrote it here).
-    return seeded !== null && !seeded.has(resumeId);
+    // (dir is manifest-aware) AND does not list this session (Claude wrote it here)...
+    if (manifest === null) return false;
+    if (!manifest.seeded.has(resumeId)) return true;
+    // ...or it IS listed as seeded but has grown past its recorded seed size, which
+    // only Claude appending inside the container can do. Same evidence, later proof.
+    const baseline = manifest.seededStats.get(resumeId);
+    return baseline !== undefined && info.size > baseline.size;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn(`Could not determine builder projects write-trust for ${hostDir}; probe-gating: ${msg}`);
@@ -641,8 +814,9 @@ async function seedProjectsDirFromHistory(opts: {
   }
 
   // Build a union keyed by session filename; when the same session exists in
-  // several dirs (e.g. resumed-and-continued in one line), keep the newest.
-  const best = new Map<string, { path: string; atimeMs: number; mtimeMs: number }>();
+  // several dirs (e.g. resumed-and-continued in one line), keep the LONGEST —
+  // JSONLs are append-only, so bytes measure history and mtime does not.
+  const best = new Map<string, { path: string; atimeMs: number; mtimeMs: number; sizeBytes: number }>();
   for (const dir of sourceDirs) {
     let entries: string[];
     try {
@@ -662,8 +836,12 @@ async function seedProjectsDirFromHistory(opts: {
       }
       if (!info.isFile()) continue;
       const prev = best.get(entry);
-      if (!prev || info.mtimeMs > prev.mtimeMs) {
-        best.set(entry, { path: full, atimeMs: info.atimeMs, mtimeMs: info.mtimeMs });
+      if (
+        !prev ||
+        info.size > prev.sizeBytes ||
+        (info.size === prev.sizeBytes && info.mtimeMs > prev.mtimeMs)
+      ) {
+        best.set(entry, { path: full, atimeMs: info.atimeMs, mtimeMs: info.mtimeMs, sizeBytes: info.size });
       }
     }
   }
@@ -694,6 +872,17 @@ async function seedProjectsDirFromHistory(opts: {
       // Only a known host-seeded copy may be replaced, and only by newer content.
       if (!targetManifest?.seeded.has(sessionId)) continue;
       if (targetManifest.adopted.has(sessionId)) continue;
+      // A seeded copy that GREW past its recorded seed size was appended to by
+      // Claude in this dir — it is this line's own live history despite the seeded
+      // label, and overwriting it would lose turns. Same protection container-written
+      // files get above; growth is just how a seeded copy earns it.
+      const baseline = targetManifest.seededStats.get(sessionId);
+      if (baseline && destInfo.size > baseline.size) continue;
+      // Never trade a longer transcript for a shorter one. Session JSONLs only
+      // grow, so a shorter source is by definition an older snapshot — even when
+      // its mtime is newer (mounting a dir bumps mtime without adding content,
+      // which is exactly how a stale copy came to look freshest).
+      if (src.sizeBytes < destInfo.size) continue;
       if (src.mtimeMs <= destInfo.mtimeMs) continue;
     }
     try {

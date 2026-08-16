@@ -53,6 +53,41 @@ into `[protection]` (either value) stops it for good, as does having protection
 on. An explicit `enabled = false` means you know about the feature and said no,
 so lazy stops mentioning it.
 
+## Seeing a gate before it bites
+
+Protection is friction, and friction you meet for the first time as a refusal
+is just a surprise. Once a project protects anything, every read surface says
+so — before you try to accept.
+
+| Surface | What you see |
+| --- | --- |
+| `lazy show <task>` | a `Protected:` line — `yes (branch gate)`, `yes (task gate)`, or `yes (task gate + branch gate)` — followed by what each gate is and where the approval stands |
+| `lazy status <task>` | the same `Protected:` line, in the same words |
+| `lazy list` / `lazy active` / `lazy blocked` | a compact `[P]` marker on the goal, `[P][A]` when an approval is recorded and pending, plus a one-line legend under the table |
+| `lazy review <task>` | the gate in the header line (and above the hunks under `-i`), so you learn about it before you press `a` |
+| MCP `lazy_show` | a `protection` object — `gated`, `target_branch`, `task_gate`, `branch_gate`, `approval_pending`, `markers`, `summary` |
+| Web dashboard | the same `[P]` / `[P][A]` badge on the task list, and a `Protected` row on the task detail page |
+
+Two properties are deliberate:
+
+- **Additive only.** A project that protects nothing sees exactly the output it
+  saw before — no marker, no legend, no `Protected:` line. Markers sit in the
+  last column so no fixed-width column shifts, and they are ASCII (`[P]`, not a
+  shield emoji, whose width varies by terminal) so scripts can grep them.
+- **Read-only.** These surfaces report gates; they never arrange them. There is
+  no MCP write surface for `lazy protect` or `lazy approve` — see
+  [surface-asymmetries.md](surface-asymmetries.md). The builder can plan around
+  a gate without being able to open it.
+
+A task you listed in `protected_tasks` while `enabled = false` gets no marker —
+it gates nothing — but `lazy show` still reports it, as `no — listed in
+[protection].protected_tasks, but protection is disabled`. Silence there would
+leave you believing a gate was armed when it was not.
+
+All surfaces render one shared vocabulary (`src/protection/status.ts`), which
+also resolves the target branch exactly the way accept resolves it. A new
+surface renders those helpers; it does not re-derive protection from config.
+
 ## What a protected accept looks like
 
 With protection on, `lazy accept` of a task targeting a protected branch
@@ -64,7 +99,7 @@ says exactly what to do: merging into `main` requires human approval — run
 ```
 echo "your-passphrase" > .lazy/approve-passphrase   # once, out-of-band
 lazy approve <task>                                  # prompts for the passphrase
-lazy accept <task>                                   # consumes the approval
+lazy accept <task>                                   # consumes it once it completes
 ```
 
 - The passphrase file (default `.lazy/approve-passphrase`, configurable via
@@ -72,14 +107,25 @@ lazy accept <task>                                   # consumes the approval
   MCP. What makes the approval meaningful is that the passphrase is **outside
   the builder's context** — never paste it into a conversation with the
   builder.
-- One approval unlocks **exactly one** accept of that task. If the accept
-  fails afterwards (e.g. a merge conflict), approve again after resolving —
-  the content being merged has changed.
+- One approval unlocks **exactly one** accept of that task, and it is spent
+  **only when that accept completes**. Passing the gate merely reserves the
+  approval; it is consumed at the moment the merge becomes durable (the same
+  point that writes the accept tag, or that hands the merge to the forge). An
+  accept that fails or aborts at any phase — pre-flight, a pre-merge gate, the
+  merge itself — leaves the approval pending and says so in the failure, so
+  you fix the cause and re-run `lazy accept` **without approving again**.
+  Consumption happens inside accept's per-task lock, so two concurrent accepts
+  can never both spend one approval.
 - `lazy approve` checks enrollment **before** it prompts. With no passphrase
   file, it prints the enrollment instructions and exits non-zero without
   asking you to type a secret that could not possibly have matched. The
   interactive prompt names the file it checks against:
   `Approval passphrase (from .lazy/approve-passphrase):`.
+- The interactive prompt is **masked** — each character you type shows as `*`,
+  so the passphrase never reaches the screen, terminal scrollback, or a screen
+  share. Masking needs a real terminal: if stdin is not one, `lazy approve`
+  refuses and points you at piped stdin rather than falling back to an echoing
+  prompt.
 - `lazy approve` is CLI-only. There is deliberately **no MCP equivalent**;
   exposing one would let the builder approve its own work.
 - The MCP `lazy_accept` tool refuses protected accepts up front and **never
@@ -89,8 +135,9 @@ lazy accept <task>                                   # consumes the approval
 
 Task-to-task merges (a subtask accepted into its parent's `lazy/*` branch)
 are never protected by default — no friction in the inner loop. Re-entry of a
-task already in `merging` status is exempt — reaching that state already
-consumed an approval; re-entry only completes the authorized merge.
+task already in `merging` status is exempt — a human already approved the merge
+that reached that state (and it was spent when the forge took the merge over);
+re-entry only completes that authorized merge.
 
 ### CI and scripting
 
@@ -258,6 +305,15 @@ parallel mechanism — see [Approving the PR/MR counts](#approving-the-prmr-coun
 above. The accept path hands the gate a probe for it rather than checking the
 forge on its own branch of logic, so adding a future satisfier means adding it
 in one place.
+
+## A separate gate on the same path
+
+The [deleted-file resurrection guard](resurrection-guard.md) sits immediately
+after this one in the accept path and refuses a merge that would silently put
+back a file the target branch deleted. It is unrelated to protection — always
+on, no config, and it asks about the *content* of the merge rather than about
+who is allowed to make it — but it shares the enforcement point and the
+`--approve-file` approval channel.
 
 ## What this does NOT do
 

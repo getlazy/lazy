@@ -10,6 +10,16 @@ import { parentTaskIdOf, collectSubtreeIds } from '../../task-target';
 import { normalizeTag } from '../../utils/tags';
 import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
 import { orderQueuedTasks } from '../../daemon/concurrency';
+import { loadConfig } from '../../config/loader';
+import { logger } from '../../utils/logger';
+import {
+  loadProtectionContext,
+  contextIsInert,
+  protectionStatusForTask,
+  protectionMarkers,
+  PROTECTION_MARKER_LEGEND,
+  type TaskProtectionStatus,
+} from '../../protection/status';
 
 export interface TaskWithSession {
   task: Task;
@@ -30,11 +40,30 @@ export interface TaskWithSession {
    * ALL queued tasks in the project, so it is correct in any filtered view.
    */
   queuePosition?: { position: number; total: number };
+  /**
+   * Read-only protection status, present only when the project protects
+   * anything. Undefined in a stock project so nothing is computed and nothing
+   * is rendered — list output stays byte-for-byte what it was.
+   */
+  protection?: TaskProtectionStatus;
 }
 
 export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: string): Promise<TaskWithSession[]> {
   const runner = await createRunner(lazyRoot);
   const taskMap = new Map<string, TaskWithSession>();
+
+  // Protection facts resolved ONCE for the whole listing: one config read, one
+  // default-branch lookup, one resolve per protected entry — not N of each. An
+  // inert context (nothing protected anywhere) skips the per-task work below.
+  let protectionCtx = null as Awaited<ReturnType<typeof loadProtectionContext>> | null;
+  try {
+    const config = await loadConfig(lazyRoot);
+    const ctx = await loadProtectionContext(storage, config, lazyRoot);
+    if (!contextIsInert(ctx)) protectionCtx = ctx;
+  } catch (err) {
+    // A listing must never fail over an advisory marker.
+    logger.debug(`Protection markers unavailable for this listing: ${err instanceof Error ? err.message : err}`);
+  }
 
   // Drain-order positions for queued tasks, computed once against ALL queued
   // tasks in the project (not just this view) so "#N of M" is globally correct.
@@ -80,6 +109,17 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
       }
     }
 
+    let protection: TaskProtectionStatus | undefined;
+    if (protectionCtx) {
+      try {
+        protection = await protectionStatusForTask(storage, protectionCtx, task, {
+          hasBranch: Boolean(session?.git_branch),
+        });
+      } catch (err) {
+        logger.debug(`Task ${task.id}: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
     taskMap.set(task.id, {
       task,
       session,
@@ -89,6 +129,7 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
       crashed,
       workingSubstate,
       queuePosition: task.status === 'queued' ? queuePos.get(task.id) : undefined,
+      protection,
     });
   }
 
@@ -232,7 +273,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   const goal = task.goal.length > 30
     ? task.goal.substring(0, 28) + '..'
     : task.goal;
-  const goalWithTags = `${goal}${tagSuffix(task)}`;
+  const goalWithTags = goalCell(node, goal);
 
   const codeWithPrefix = `${prefix}${connector}${code}`;
   const fitsOnOneLine = codeWithPrefix.length <= 20;
@@ -308,6 +349,32 @@ function filterTreeByTag(tree: TaskWithSession[], tag: string): TaskWithSession[
     .map(node => ({ ...node, children: [] }));
 }
 
+/**
+ * The GOAL cell: protection markers, the goal, then tags.
+ *
+ * Markers live in the LAST column on purpose. Every other column is a padded
+ * fixed width that scripts slice by offset, so a new column — or a marker in an
+ * existing one — would shift them all. Here the addition is purely additive:
+ * a project with nothing protected renders exactly what it always did.
+ */
+function goalCell(node: TaskWithSession, goal: string): string {
+  const markers = node.protection ? protectionMarkers(node.protection) : '';
+  const prefix = markers ? `${theme.warning(markers)} ` : '';
+  return `${prefix}${goal}${tagSuffix(node.task)}`;
+}
+
+/** True when any node in the tree renders a protection marker. */
+function hasProtectionMarkers(nodes: TaskWithSession[]): boolean {
+  return nodes.some(n => (n.protection ? protectionMarkers(n.protection) !== '' : false) || hasProtectionMarkers(n.children));
+}
+
+/** Print the marker legend when a listing actually showed one. */
+function printProtectionLegend(tree: TaskWithSession[]): void {
+  if (!hasProtectionMarkers(tree)) return;
+  console.log('');
+  console.log(theme.separator(PROTECTION_MARKER_LEGEND));
+}
+
 /** Render a task's tags as a " #a #b" suffix (empty string when untagged). */
 function tagSuffix(task: Task): string {
   if (!task.tags || task.tags.length === 0) return '';
@@ -357,11 +424,12 @@ function renderListOutput(
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
       );
     }
   }
 
+  printProtectionLegend(tree);
   printCrashedFootnote(countCrashed(tree));
 }
 
@@ -515,11 +583,12 @@ function renderActiveOutput(
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
       );
     }
   }
 
+  printProtectionLegend(tree);
   printCrashedFootnote(countCrashed(tree));
 }
 
@@ -574,11 +643,12 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
       const model = task.model ?? '-';
       const taskType = task.type ?? 'task';
       console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${task.goal}${tagSuffix(task)}`
+        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
       );
     }
   }
 
+  printProtectionLegend(tree);
   printCrashedFootnote(countCrashed(tree));
 }
 

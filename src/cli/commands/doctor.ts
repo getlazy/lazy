@@ -7,8 +7,16 @@
  */
 
 import { existsSync, readdirSync, readFileSync, statfsSync } from 'fs';
+import { unlink } from 'fs/promises';
 import { join } from 'path';
+import { checkHolder, describeDeadReason, type HolderVerdict } from '../../utils/process-identity';
+import {
+  probeHeldStorageLock,
+  STORAGE_LOCK_FILENAME,
+  type HeldLockReport,
+} from '../../utils/storage-lock';
 import { getHome } from '../../utils/home';
+import { verifyAgentBinary, formatAgentBinaryError } from '../../agent/binary-identity';
 import { findLazyRoot, getDataDir } from '../init';
 import { getProjectName } from '../../storage';
 import { TERMINAL_STATUSES } from '../../types';
@@ -16,7 +24,7 @@ import { createStorage } from '../../storage';
 import { theme } from '../theme';
 import { shortId, displayId, parseFlags, taskRef } from '../helpers';
 import { repoHasCommits } from '../../git/operations';
-import { resolveImageName, calculateDockerfileHash } from '../../capture/claude';
+import { resolveImageName, calculateDockerfileHash, listLazyImages, type LazyImageInfo } from '../../capture/claude';
 import { loadConfig, loadRawConfig } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
@@ -40,6 +48,7 @@ import {
   importHarnessMemory,
   formatLongDescriptionNotice,
 } from '../../import/import-harness-memory';
+import { builderScratchDir, scratchDirSize, formatScratchBytes } from '../../builder/scratch';
 import { findHousekeepingConversations } from '../../import/housekeeping-conversation';
 import { runReimportBulk } from './import-conversation';
 import { requireStorage, tryRemoteStorage } from '../helpers';
@@ -52,6 +61,9 @@ import {
   AUDIT_LOG_SUBDIR,
 } from '../../proxy/audit-log';
 import { fetchDaemonCredentialState, ProxyUnavailableError } from '../../daemon/auth-env';
+import { inspectDaemonStateFiles } from '../../daemon/state-files';
+import { getDaemonDir, PID_FILE, SOCKET_FILE } from '../../daemon/paths';
+import { readDaemonLockPid, readPid } from '../../daemon/lifecycle';
 import { credentialFromEnv } from '../../daemon/credential-gate';
 import {
   assembleMemorySection,
@@ -63,6 +75,8 @@ import {
 import { isTTY, promptYesNo } from '../editor';
 import type { Storage } from '../../storage/interface';
 import { classifyProtectedTasks } from '../../protection/edge-gate';
+import { docsFooter, docsSuffix, type DocsPage } from '../../docs/links';
+import { inspectLfsEnvironment, type LfsEnvironmentReport } from '../../git/lfs';
 
 // ── types ────────────────────────────────────────────────────────────────
 
@@ -71,10 +85,101 @@ interface CheckResult {
   label: string;
   detail?: string;  // shown on failure
   warning?: string; // shown as yellow warning even when ok
+  /**
+   * Documentation page for this check, printed under a FAILURE as
+   * "Check documentation at <url>". A supplement only: `detail` still carries
+   * the whole remedy, and the pointer is omitted entirely when a project has
+   * disabled doc links.
+   */
+  docs?: DocsPage;
 }
 
 // Docker timeout mirrors the one in capture/claude.ts
 const DOCKER_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a doctor storage call may wait for the storage lock before failing.
+ *
+ * Doctor only ever READS through these handles, and a check it cannot run is a
+ * reported skip — so waiting is pure loss. The default retry loop stays exactly
+ * as it is for every command that has real work to do; this override is
+ * doctor-only on purpose (see StorageLockOptions).
+ *
+ * Two seconds is well past a healthy write (FileStorage holds the lock for the
+ * duration of one operation, milliseconds) and well short of the default loop.
+ */
+const DOCTOR_LOCK_TIMEOUT_MS = 2_000;
+
+/**
+ * How long the up-front probe watches the lock before calling it held.
+ *
+ * Same reasoning in the other direction: long enough that an ordinary daemon
+ * write is over before the window closes, short enough that a wedged store
+ * costs the report a second and a half rather than the whole sweep.
+ */
+const DOCTOR_LOCK_PROBE_MS = 1_500;
+
+/**
+ * A lock held this long by one acquire is not work in progress.
+ *
+ * FileStorage takes the lock per operation, so `acquired_at` is the start of a
+ * single read-modify-write. A minute of that is not a slow store, it is a
+ * process that will never let go — the only signal doctor has that separates a
+ * wedge from a busy moment, and the only one worth failing the sweep over.
+ */
+const WEDGED_LOCK_AGE_MS = 60_000;
+
+/**
+ * How long the daemon has to answer ONE storage read before doctor stops
+ * believing it is serving storage.
+ *
+ * This is the probe that separates "the daemon holds the lock, as it always
+ * does" from "the daemon holds the lock and is stuck": doctor reads task state
+ * THROUGH the daemon, so a daemon that answers is not an obstruction no matter
+ * how long it has held the file lock. Bounded because a hung daemon must cost
+ * the report a few seconds, not the whole sweep — blocking is the one thing a
+ * diagnostic may not do.
+ */
+const DOCTOR_DAEMON_READ_PROBE_MS = 3_000;
+
+/**
+ * The task id {@link daemonAnswersStorageRead} asks the daemon for.
+ *
+ * The nil UUID, and it must keep the canonical UUID shape: FileStorage treats a
+ * UUID-shaped id as already resolved and goes straight to a single file read,
+ * whereas any other input makes it list the tasks directory and — when nothing
+ * matches the prefix — read every task.json looking for a matching code. The
+ * probe would then get slower as the store grew, which is the one thing it must
+ * not do. Nothing is expected to be found; the read answering at all is the
+ * signal.
+ */
+const STORAGE_PROBE_TASK_ID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * How far in the future an `acquired_at` may sit before we stop believing it.
+ *
+ * The holder and this process share one clock, so the honest skew is zero; a
+ * small grace only absorbs sub-second rounding rather than admitting a real
+ * discrepancy. Anything beyond it is a timestamp we cannot reason about, and is
+ * treated the same as a missing one.
+ */
+const LOCK_CLOCK_SKEW_GRACE_MS = 5_000;
+
+/**
+ * Open storage for a doctor check.
+ *
+ * Prefers the daemon (it owns storage) so we never open a second FileStorage
+ * that contends on the storage lock; falls back to a direct handle that FAILS
+ * FAST rather than queueing. Callers must close only what they own.
+ */
+async function openDoctorStorage(root: string): Promise<{ storage: Storage; ownsStorage: boolean }> {
+  const remote = await tryRemoteStorage(root);
+  if (remote) return { storage: remote, ownsStorage: false };
+  return {
+    storage: await createStorage(root, { lockTimeoutMs: DOCTOR_LOCK_TIMEOUT_MS }),
+    ownsStorage: true,
+  };
+}
 
 // Minimum free disk space (1 GB)
 const MIN_FREE_BYTES = 1_000_000_000;
@@ -159,6 +264,7 @@ async function checkAuth(config: ResolvedConfig | null): Promise<CheckResult> {
         detail:
           `The daemon is running but holds no model credential — every agent it launches will fail to reach the model API.\n  ` +
           NO_CREDENTIAL_REMEDY,
+        docs: 'troubleshooting-credential',
       };
     }
     // null = the daemon RPC is bypassed by design (test / daemon-self mode).
@@ -190,6 +296,7 @@ async function checkAuth(config: ResolvedConfig | null): Promise<CheckResult> {
     detail:
       `No model credential found in this shell's environment, and the daemon could not be asked (${daemonReason}).\n  ` +
       NO_CREDENTIAL_REMEDY,
+    docs: 'troubleshooting-credential',
   };
 }
 
@@ -402,6 +509,78 @@ async function checkDataDir(root: string): Promise<CheckResult> {
   return { ok: true, label: `Data directory valid (${displayPath})` };
 }
 
+/**
+ * Report the builder scratch dir: where it is, how much is in it, and how to
+ * clear it. Nothing in lazy ever prunes it — the whole point is that artifacts
+ * survive for a human who may read them days later — so `lazy doctor` is the
+ * one place that says so and hands over the remedy. Never a failure: a big
+ * scratch dir is the feature working, not a fault.
+ */
+async function checkBuilderScratch(root: string): Promise<CheckResult> {
+  const dir = builderScratchDir(root);
+  const { bytes, entries } = await scratchDirSize(dir);
+  if (entries === 0) {
+    return { ok: true, label: `Builder scratch dir empty (${dir})` };
+  }
+  return {
+    ok: true,
+    label: `Builder scratch dir: ${entries} item(s), ${formatScratchBytes(bytes)} (${dir})`,
+    warning: bytes >= SCRATCH_LARGE_BYTES
+      ? `Builder artifacts are never pruned automatically. Delete what you no longer need: rm -rf ${dir}/*`
+      : undefined,
+  };
+}
+
+/**
+ * Recognise a daemon whose state files were deleted underneath it.
+ *
+ * The signature is unmistakable and, before this check existed, completely
+ * opaque: the daemon holds its `daemon.lock` (so it is definitely alive and
+ * definitely owns this directory) and usually still answers on its recorded web
+ * port, but `lazy.pid` and/or `lazy.sock` are gone. Every socket-based command
+ * then reported "Daemon is not running." against a daemon that was running
+ * fine, and `lazy daemon start` failed because the live daemon held the storage
+ * lock — with no non-destructive way out.
+ *
+ * Report-only: the daemon repairs its own files within seconds (see
+ * src/daemon/state-files.ts), so the remedy here is "wait, or restart if the
+ * daemon predates that repair" — not something doctor should do behind the
+ * user's back.
+ */
+async function checkDaemonStateFiles(root: string): Promise<CheckResult> {
+  const report = await inspectDaemonStateFiles(root);
+
+  if (!report.filesDeletedUnderLiveDaemon) {
+    return { ok: true, label: 'Daemon state files consistent' };
+  }
+
+  const missing = [
+    report.pidFilePresent ? null : PID_FILE,
+    report.socketFilePresent ? null : SOCKET_FILE,
+  ].filter((f): f is string => f !== null);
+
+  const who = report.lockPid !== null ? ` (PID ${report.lockPid})` : '';
+  const web = report.webPortListening && report.webPort !== null
+    ? ` It is still answering on its web port (${report.webPort}).`
+    : '';
+
+  return {
+    ok: false,
+    label: 'Daemon state files consistent',
+    detail:
+      `A daemon${who} is running and owns ${getDaemonDir(root)}, but ${missing.join(' and ')} ` +
+      `${missing.length > 1 ? 'are' : 'is'} missing — something deleted its state files while it was ` +
+      `running.${web} Commands that reach the daemon over its socket will report it as not running ` +
+      `until the file is back.\n` +
+      `  The daemon puts these files back itself within a few seconds — re-run ${theme.command('lazy doctor')} to confirm.\n` +
+      `  If it persists, that daemon predates the self-repair: ${theme.command('lazy daemon restart')} clears it. ` +
+      `Note that restarting interrupts running agent and pair sessions.`,
+  };
+}
+
+/** Size at which doctor starts nudging about manual cleanup (100 MB). */
+const SCRATCH_LARGE_BYTES = 100 * 1024 * 1024;
+
 // spawnSync (sync) is acceptable throughout this function: `lazy doctor` is a
 // one-shot CLI health check, not a daemon path — blocking here is fine.
 function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
@@ -461,7 +640,108 @@ async function checkImageUpToDate(root: string, imageName: string, binary: strin
   return { ok: true, label: 'Container image up to date' };
 }
 
-function checkStaleLocks(root: string): CheckResult {
+/**
+ * Report lazy-built container images that are NOT the one this lazy runs.
+ *
+ * Images are tagged with the lazy release version, so every upgrade leaves the
+ * previous version's image behind. That is deliberate — it is Docker build
+ * cache for the next build, and it is what an older lazy on the same host still
+ * runs — so this is a reclaimable-disk report, not a failure. Doctor is the one
+ * place that names them; nothing else nags about them.
+ */
+export async function checkStaleLazyImages(imageName: string, binary: string = 'docker'): Promise<CheckResult> {
+  let images: LazyImageInfo[];
+  try {
+    images = await listLazyImages(binary);
+  } catch {
+    // Runtime hiccup listing images is not a health signal of its own — the
+    // container-runtime checks above already cover an unavailable runtime.
+    return { ok: true, label: 'No stale runner images' };
+  }
+
+  // Anything sharing the current image's ID is the SAME image under another tag
+  // (the `:latest` alias), not a stale one.
+  const currentId = images.find(image => image.ref === imageName)?.id;
+  const stale = images.filter(image => image.ref !== imageName && (!currentId || image.id !== currentId));
+
+  if (stale.length === 0) {
+    return { ok: true, label: 'No stale runner images' };
+  }
+
+  const shown = stale.slice(0, 5).map(image => `${image.ref} (${image.size})`);
+  const more = stale.length > 5 ? `, +${stale.length - 5} more` : '';
+  return {
+    ok: true,
+    label: 'No stale runner images',
+    warning:
+      `${stale.length} older lazy image(s) still on disk: ${shown.join(', ')}${more}. ` +
+      `They are kept as build cache and for older lazy versions on this host. ` +
+      `Reclaim the space with: ${binary} image rm ${stale.map(image => image.ref).join(' ')}`,
+  };
+}
+
+/**
+ * Is the holder recorded in a pid-based lock file still the process at that pid?
+ *
+ * Never asks the bare "does this pid exist" question: pids get recycled, and a
+ * lock whose holder died without releasing it looks permanently held once the
+ * OS hands its number to an unrelated program. See src/utils/process-identity.
+ */
+async function lockHolderVerdict(lockData: {
+  pid?: unknown;
+  acquired_at?: unknown;
+  started_at?: unknown;
+  holder_started_at?: unknown;
+  holder_start_source?: unknown;
+}): Promise<HolderVerdict | null> {
+  if (typeof lockData.pid !== 'number') return null;
+  const acquiredAt =
+    typeof lockData.acquired_at === 'string'
+      ? lockData.acquired_at
+      : typeof lockData.started_at === 'string'
+        ? lockData.started_at
+        : null;
+  return checkHolder({
+    pid: lockData.pid,
+    started: typeof lockData.holder_started_at === 'string' ? lockData.holder_started_at : null,
+    startedSource:
+      lockData.holder_start_source === 'proc' || lockData.holder_start_source === 'ps'
+        ? lockData.holder_start_source
+        : null,
+    acquiredAt,
+  });
+}
+
+/**
+ * Verify the agent binary containers bind-mount is really the compiled agent.
+ *
+ * ~/.lazy/bin/lazy-agent is mounted at /usr/local/bin/lazy-agent in every
+ * container. When it is the wrong file — a bare Bun runtime is the case seen in
+ * the field — the container fails far from the cause, as `Script not found
+ * "builder"` or a silent MCP -32000 with no lazy_* tools. Doctor is where that
+ * gets diagnosed by name, on the host, before a launch.
+ */
+async function checkAgentBinary(): Promise<CheckResult> {
+  const binaryPath = join(getHome(), '.lazy', 'bin', 'lazy-agent');
+  if (!existsSync(binaryPath)) {
+    // Not an error: it is created on the next container launch or `lazy upgrade`.
+    return {
+      ok: true,
+      label: 'Agent binary',
+      warning: `not present at ${binaryPath} yet — it is built on the next container launch`,
+    };
+  }
+  const verdict = await verifyAgentBinary(binaryPath);
+  if (verdict.ok) return { ok: true, label: 'Agent binary' };
+  return {
+    ok: false,
+    label: 'Agent binary',
+    detail: formatAgentBinaryError(binaryPath, verdict.reason, { canRebuild: false }),
+    docs: 'agent-container',
+  };
+}
+
+async function checkStaleLocks(root: string): Promise<CheckResult> {
   const dataDir = getDataDir(root);
   const worktreesDir = join(root, dataDir, 'worktrees');
   if (!existsSync(worktreesDir)) {
@@ -477,15 +757,8 @@ function checkStaleLocks(root: string): CheckResult {
       if (!existsSync(lockPath)) continue;
       try {
         const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
-        if (lockData.pid) {
-          try {
-            process.kill(lockData.pid, 0);
-            // Process alive — lock is valid
-          } catch {
-            // Process dead — stale lock
-            stale.push(entry.name);
-          }
-        }
+        const verdict = await lockHolderVerdict(lockData);
+        if (verdict && !verdict.alive) stale.push(entry.name);
       } catch {
         stale.push(entry.name);
       }
@@ -503,31 +776,283 @@ function checkStaleLocks(root: string): CheckResult {
   };
 }
 
-function checkStorageLock(root: string): CheckResult {
-  const dataDir = getDataDir(root);
-  const lockPath = join(root, dataDir, '.storage-lock');
-  if (!existsSync(lockPath)) {
-    return { ok: true, label: 'No stale storage lock' };
+/**
+ * Where the storage lock actually lives.
+ *
+ * NOT `<root>/.lazy` — task state lives in the external store, so that is where
+ * FileStorage puts its lock. Checking the repo-local path meant doctor happily
+ * reported "no stale storage lock" while the real one, under the external path,
+ * was wedging every command. Postgres stores have no file lock at all.
+ */
+async function resolveStorageLockDir(root: string, config: ResolvedConfig): Promise<string | null> {
+  if (config.storage.backend !== 'external') return null;
+  if (config.storage.external_path) return config.storage.external_path;
+  // Same default createStorage() derives: ~/.lazy/<project-name>.
+  return join(getHome(), '.lazy', await getProjectName(root, config.remote.git_remote));
+}
+
+/**
+ * Detect a storage lock nobody will ever release.
+ *
+ * This is THE recovery surface for the wedged-lock failure: a user hitting it
+ * on a released binary has no other way out than `rm` on a path they have to
+ * read out of a stack trace. Returns the lock path alongside the result so the
+ * caller can offer to clear it.
+ */
+async function checkStorageLock(lockDir: string | null): Promise<{ result: CheckResult; stalePath: string | null }> {
+  const label = 'No stale storage lock';
+  if (!lockDir) return { result: { ok: true, label }, stalePath: null };
+
+  const lockPath = join(lockDir, STORAGE_LOCK_FILENAME);
+  if (!existsSync(lockPath)) return { result: { ok: true, label }, stalePath: null };
+
+  let lockData: { pid?: unknown };
+  try {
+    lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
+  } catch {
+    return {
+      result: {
+        ok: false,
+        label,
+        detail: `Storage lock file is unreadable and nothing will ever release it: ${lockPath}`,
+        docs: 'troubleshooting-storage-lock',
+      },
+      stalePath: lockPath,
+    };
   }
 
-  try {
-    const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'));
-    if (lockData.pid) {
-      try {
-        process.kill(lockData.pid, 0);
-        // Process alive — lock is valid
-        return { ok: true, label: 'No stale storage lock' };
-      } catch {
-        return {
-          ok: false,
-          label: 'No stale storage lock',
-          detail: `Storage lock held by dead process (pid ${lockData.pid}). Remove with: ${theme.command(`rm ${lockPath}`)}`,
-        };
-      }
-    }
-  } catch { /* fall through */ }
+  const verdict = await lockHolderVerdict(lockData);
+  if (!verdict || verdict.alive) return { result: { ok: true, label }, stalePath: null };
 
-  return { ok: true, label: 'No stale storage lock' };
+  return {
+    result: {
+      ok: false,
+      label,
+      detail:
+        `Storage lock at ${lockPath} is stale — ${describeDeadReason(verdict.reason)} ` +
+        `(pid ${(lockData as { pid: number }).pid}). Every lazy command will fail to acquire it until it is removed. ` +
+        `Remove with: ${theme.command(`rm ${lockPath}`)}`,
+      docs: 'troubleshooting-storage-lock',
+    },
+    stalePath: lockPath,
+  };
+}
+
+/**
+ * What a held storage lock MEANS for the rest of the report.
+ *
+ *   - `daemon-serving`   — the holder is this project's daemon and it answered a
+ *                          storage read. Not an obstruction: doctor reads task
+ *                          state through the daemon, not through the file lock.
+ *   - `daemon-stuck`     — the holder is this project's daemon and it did NOT
+ *                          answer in bounded time. Nothing can read task state.
+ *   - `foreign`          — somebody else is sitting on the lock.
+ */
+type HeldLockAssessment = 'daemon-serving' | 'daemon-stuck' | 'foreign';
+
+/**
+ * Can doctor still read task state while this lock is held?
+ *
+ * THE DAEMON HOLDS THE STORAGE LOCK FOR ITS ENTIRE LIFETIME. It takes it once
+ * at startup and never releases it (`getOrCreateStorage` in
+ * daemon/rpc-handlers.ts) — that is what makes it the store's single writer, and
+ * it is what a HEALTHY lazy install looks like. Treating that as "the store is
+ * busy" made every doctor run on a machine with a running daemon skip every
+ * check that reads task state, and — once the daemon had been up for a minute —
+ * fail the sweep with "storage lock is wedged".
+ *
+ * So the question is not "is the lock free" but "is anything serving storage".
+ * Two signals, in order, because the cheap one bounds the cost of the other:
+ *
+ *   1. Is the holder pid the daemon's? `daemon.lock` is written only by the
+ *      process that won the daemon lock, so it is the trustworthy record of who
+ *      owns this daemon dir; `lazy.pid` is the fallback for daemons started
+ *      without the flock (LAZY_TEST) or by an older build.
+ *   2. Does that daemon answer a real storage read, within a bounded window?
+ *      Evidence beats identity — a daemon whose event loop is wedged would
+ *      otherwise leave every subsequent check hanging on an RPC that never
+ *      returns.
+ *
+ * A foreign holder is never probed: the daemon's own reads would queue behind
+ * that lock, so the probe would buy nothing but its own timeout.
+ */
+async function assessHeldLock(root: string, held: HeldLockReport): Promise<HeldLockAssessment> {
+  const daemonPid = readDaemonLockPid(root) ?? readPid(root);
+  if (daemonPid === null || daemonPid !== held.pid) return 'foreign';
+  return (await daemonAnswersStorageRead(root)) ? 'daemon-serving' : 'daemon-stuck';
+}
+
+/** One bounded storage read through the daemon. Never throws, never blocks. */
+async function daemonAnswersStorageRead(root: string): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), DOCTOR_DAEMON_READ_PROBE_MS);
+  });
+  const read = (async () => {
+    try {
+      const storage = await tryRemoteStorage(root);
+      if (!storage) return false;
+      // A real read, not just a handshake: the daemon serves it under the same
+      // lock it is holding, so answering proves the lock is not an obstruction.
+      //
+      // Deliberately the CHEAPEST read in the interface, because the probe's
+      // cost is charged against a fixed timeout and a slow answer here would be
+      // misreported as a dead daemon — reintroducing the bug this fixes, just
+      // triggered by store size instead. A UUID-shaped id short circuits
+      // FileStorage's id resolution before it lists the tasks dir, so
+      // this is one failed file read on the daemon side no matter how many
+      // tasks exist; listTasks(), by contrast, reads and parses every task.json
+      // serially. A miss returns null rather than throwing, and null is the
+      // answer we want: we are probing liveness, not looking for a task.
+      await storage.getTask(STORAGE_PROBE_TASK_ID);
+      return true;
+    } catch {
+      // Any failure — no socket, a 500 from a daemon that cannot reach its own
+      // store, a transport error — means doctor cannot read through the daemon.
+      // The verdict is reported by the lock check itself, which names the
+      // holder and the remedy; re-throwing here would kill the whole sweep.
+      return false;
+    }
+  })();
+  try {
+    return await Promise.race([read, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Report a storage lock that a LIVE, verified holder is sitting on.
+ *
+ * Deliberately two verdicts, because doctor cannot prove which one it is
+ * looking at without waiting forever — and waiting is exactly what it must not
+ * do:
+ *
+ *   - Held for LESS than a minute → a warning. A store can be genuinely busy,
+ *     and failing the sweep over a daemon that happened to be mid-write would
+ *     make `lazy doctor` unreliable in precisely the healthy case. The human is
+ *     told what was skipped and that re-running is likely enough.
+ *   - Held for MORE than a minute → a failure. FileStorage takes this lock per
+ *     operation, so one acquire outliving a minute is not slow work, it is a
+ *     process that will never release it. That blocks every lazy command in the
+ *     project, so it earns a non-zero exit.
+ *
+ * Neither verdict offers to remove the file. The holder is verifiably the
+ * process that took it (that is what makes this case different from a stale
+ * lock), and deleting a live process's lock corrupts the store — so the remedy
+ * is aimed at the PROCESS.
+ *
+ * Both of those are about a FOREIGN holder. When the holder is this project's
+ * own daemon, neither applies: it holds the lock from startup to shutdown by
+ * design, so the age of the lock says nothing at all and the only question that
+ * matters is whether it is still serving storage (see assessHeldLock).
+ */
+function describeHeldStorageLock(
+  held: HeldLockReport | null,
+  lockDir: string,
+  assessment: HeldLockAssessment,
+): CheckResult {
+  const label = 'Storage lock available';
+  if (!held) return { ok: true, label };
+
+  const lockPath = join(lockDir, STORAGE_LOCK_FILENAME);
+
+  if (assessment === 'daemon-serving') {
+    return {
+      ok: true,
+      label: `Storage lock held by the daemon (pid ${held.pid}, as designed)`,
+    };
+  }
+
+  if (assessment === 'daemon-stuck') {
+    return {
+      ok: false,
+      label: 'Daemon holds the storage lock but is not serving storage',
+      detail:
+        `The lazy daemon (pid ${held.pid}) holds the storage lock — it takes it at startup and ` +
+        `holds it for its whole lifetime, which is normal — but it did not answer a storage read ` +
+        `within ${DOCTOR_DAEMON_READ_PROBE_MS}ms. Nothing can read or write task state while that ` +
+        `is true, so every lazy command in this project will hang or fail.\n` +
+        `  The checks that read task state were skipped — everything else in this report ran normally.\n` +
+        `  Check it with ${theme.command('lazy daemon status')}; if it is hung, ` +
+        `${theme.command('lazy daemon restart')} clears it (that interrupts running agent and pair ` +
+        `sessions). Do NOT delete ${lockPath} — the daemon is alive and removing its lock admits a ` +
+        `second writer, which corrupts the store.`,
+      docs: 'troubleshooting-storage-lock',
+    };
+  }
+
+  const rawAgeMs = held.acquiredAt ? Date.now() - new Date(held.acquiredAt).getTime() : NaN;
+  // An age we cannot read is not an age of zero. `acquired_at` is absent when
+  // the lock file was truncated mid-write or written by a lazy old enough not
+  // to record it; unparseable or implausibly future values are the same class
+  // of damage. Either way we cannot tell "busy for 3ms" from "wedged for an
+  // hour", and the probe has already established the harder half of the
+  // question: ONE holder, identity verified, unchanged for the whole window.
+  const ageKnown = Number.isFinite(rawAgeMs) && rawAgeMs >= -LOCK_CLOCK_SKEW_GRACE_MS;
+  const heldForMs = ageKnown ? Math.max(0, rawAgeMs) : NaN;
+  const heldFor = ageKnown ? `, taken ${formatTimeSince(held.acquiredAt!)}` : '';
+  const who = `pid ${held.pid}${held.command ? ` (${held.command})` : ''}`;
+  const skipped =
+    `The checks that read task state were skipped rather than queued behind it — ` +
+    `everything else in this report ran normally.`;
+  const remedy =
+    `Find out what that process is doing (${theme.command('lazy daemon status')}, ` +
+    `${theme.command(`ps -p ${held.pid}`)}). If it is hung, stop it and re-run ` +
+    `${theme.command('lazy doctor')} — do NOT delete ${lockPath} while it is alive, ` +
+    `that is a live holder and removing its lock corrupts the store.`;
+
+  // FAIL rather than warn when the age is unreadable. The soft warning says
+  // "come back and look again if this repeats", which is only useful advice
+  // when a re-run could produce a different answer — and here it cannot: the
+  // damaged timestamp is on disk, so every future doctor run reads the same
+  // unreadable value and downgrades itself the same way. A warning would make
+  // an indefinitely-held lock permanently invisible. The lock file lazy writes
+  // ALWAYS records acquired_at, so its absence is itself a defect worth a human
+  // looking at, independent of how long the lock has been held.
+  //
+  // The cost we are accepting: on a genuinely busy store whose lock file also
+  // has a damaged timestamp, a user gets a hard ✗ and a non-zero doctor exit
+  // for a lock that was only held milliseconds. The separate label keeps that
+  // honest — it says the age is unreadable, not that the store is wedged — but
+  // it is still a failing check on a healthy store. We take that trade because
+  // the remedy text tells them not to delete a live holder's lock, so the false
+  // positive costs a look at `ps`, not a corrupted store; and because the
+  // alternative silently hides real wedges forever.
+  if (!ageKnown) {
+    return {
+      ok: false,
+      label: 'Storage lock age is unreadable',
+      detail:
+        `The storage lock is held by ${who}, unchanged for the whole ${held.observedForMs}ms ` +
+        `probe, but ${lockPath} does not record a readable acquired_at — so there is no way ` +
+        `to tell a busy store from a wedged one, and this cannot resolve itself on a re-run. ` +
+        `Every lazy command in this project will block on that lock until the process ` +
+        `releases it or dies.\n  ${skipped}\n  ${remedy}`,
+      docs: 'troubleshooting-storage-lock',
+    };
+  }
+
+  if (heldForMs >= WEDGED_LOCK_AGE_MS) {
+    return {
+      ok: false,
+      label: 'Storage lock is wedged',
+      detail:
+        `The storage lock has been held by ${who}${heldFor} — one storage operation, ` +
+        `for longer than any real one takes. Every lazy command in this project will ` +
+        `block on it until that process releases it or dies.\n  ${skipped}\n  ${remedy}`,
+      docs: 'troubleshooting-storage-lock',
+    };
+  }
+
+  return {
+    ok: true,
+    label,
+    warning:
+      `The storage lock is held by ${who}${heldFor} and was still held after ` +
+      `${held.observedForMs}ms of watching — the store is busy. ${skipped}\n` +
+      `  If a re-run reports the same holder, it is not busy, it is stuck: ${remedy}`,
+  };
 }
 
 // ── exit code explanations ───────────────────────────────────────────────
@@ -572,12 +1097,18 @@ interface CrashedTask {
 /**
  * Find non-terminal tasks whose containers have crashed (stopped unexpectedly).
  * Returns info about each crashed task for display and optional auto-resume.
+ *
+ * THROWS when storage cannot be read. It used to swallow that and return an
+ * empty list, which doctor printed as "✓ No crashed task runs" — a green check
+ * for a question nobody answered. Under a running daemon that was the normal
+ * outcome, because this opened its OWN FileStorage and queued on the lock the
+ * daemon holds for life. It now reads through the daemon like every other
+ * storage-backed check, and the caller reports a failure to read as a skip.
  */
 async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTask[]> {
   const crashed: CrashedTask[] = [];
-  let storage;
+  const { storage, ownsStorage } = await openDoctorStorage(root);
   try {
-    storage = await createStorage(root);
     // Check interrupted tasks — these are the ones most likely to have crashed runs
     // Also check working/blocked tasks whose runs may have died without reconciliation
     const tasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
@@ -611,10 +1142,8 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
         });
       }
     }
-  } catch {
-    // Storage unavailable — skip
   } finally {
-    if (storage) await storage.close();
+    if (ownsStorage) await storage.close();
   }
   return crashed;
 }
@@ -654,10 +1183,23 @@ async function checkOrphanedContainers(root: string | null, binary: string = 'do
     const runningOrphans: string[] = [];
 
     if (root) {
-      let storage;
+      // Through the daemon when there is one: it holds the storage lock for its
+      // whole lifetime, so a private FileStorage here queues on it and then
+      // silently reports every container as "not ours".
+      let storage: Storage;
+      let ownsStorage: boolean;
       try {
-        storage = await createStorage(root);
-
+        ({ storage, ownsStorage } = await openDoctorStorage(root));
+      } catch (err) {
+        // Cannot read task state, so "is this container ours" is unanswerable.
+        // Report that instead of the green check the swallow used to print.
+        return {
+          ok: true,
+          label: 'No orphaned containers (skipped — could not read task state)',
+          warning: err instanceof Error ? err.message : String(err),
+        };
+      }
+      try {
         // Check stopped containers - orphaned if task belongs to this project
         for (const name of exitedNames) {
           const taskShortId = name.replace(/^lazy-/, '');
@@ -679,10 +1221,8 @@ async function checkOrphanedContainers(root: string | null, binary: string = 'do
             runningOrphans.push(name);
           }
         }
-      } catch {
-        // Storage unavailable — skip checks
       } finally {
-        if (storage) await storage.close();
+        if (ownsStorage) await storage.close();
       }
     }
 
@@ -920,6 +1460,59 @@ async function checkSplitStorage(root: string): Promise<CheckResult> {
   }
 }
 
+/**
+ * Would a commit made in this repository store LFS content correctly?
+ *
+ * THE single surface for the full LFS diagnosis. `lazy start` refuses on a
+ * broken environment with one generic line plus "Run `lazy doctor` for
+ * details" — the remedies live here and nowhere else (project convention:
+ * one warning surface).
+ *
+ * Report-only: doctor never runs `git lfs install`. Repairing a user's git
+ * config as a side effect of a diagnostic is the hidden side effect CLAUDE.md
+ * forbids; the human runs the printed command deliberately.
+ */
+async function checkLfsEnvironment(root: string, config: ResolvedConfig | null): Promise<CheckResult> {
+  const label = 'Git LFS filter configured';
+  let report: LfsEnvironmentReport;
+  try {
+    report = await inspectLfsEnvironment(root);
+  } catch (err) {
+    // A measurement failure is not a verdict — say the check could not run
+    // rather than reporting a healthy repo we never actually inspected.
+    return {
+      ok: true,
+      label,
+      warning: `Could not determine git LFS status: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (!report.usesLfs) {
+    return { ok: true, label: 'Git LFS not used by this repository' };
+  }
+
+  const version = report.binaryVersion ? ` (${report.binaryVersion})` : '';
+  if (report.problems.length === 0) {
+    return { ok: true, label: `${label}${version}` };
+  }
+
+  const mode = config?.git.lfs_check ?? 'refuse';
+  const consequence = mode === 'refuse'
+    ? 'Lazy will REFUSE to start tasks in this repository until this is fixed.'
+    : mode === 'warn'
+      ? 'Tasks still start ([git] lfs_check = "warn"), but their commits may be corrupt.'
+      : 'The start-time check is disabled ([git] lfs_check = "off"), so nothing will stop it.';
+
+  const detail =
+    `This repository tracks files with git LFS, but a commit made here would store raw file ` +
+    `content instead of an LFS pointer — silently, because git only errors on a broken LFS ` +
+    `filter when filter.lfs.required is true.\n\n` +
+    report.problems.map((p) => `  • ${p.message}\n    Fix: ${theme.command(p.remedy)}`).join('\n') +
+    `\n\n  ${consequence}`;
+
+  return { ok: false, label, detail, docs: 'lfs-guard' };
+}
+
 async function checkTaskBranchUpstreamTracking(): Promise<CheckResult> {
   try {
     // Get list of all local branches
@@ -1019,11 +1612,7 @@ async function checkReimportableConversations(root: string, dataDirAbs: string):
     // Prefer the daemon (it owns storage) so we never open a second FileStorage
     // that contends on the storage lock. Only when there's no daemon (or in
     // test mode) do we fall back to a direct read-only handle we must close.
-    storage = await tryRemoteStorage(root);
-    if (!storage) {
-      storage = await createStorage(root);
-      ownsStorage = true;
-    }
+    ({ storage, ownsStorage } = await openDoctorStorage(root));
     const missing = await listMissingConversations({ lazyRoot: root, dataDirAbs, storage });
     const { rotted, historical } = classifyMissingConversations(missing, Date.now());
 
@@ -1038,6 +1627,7 @@ async function checkReimportableConversations(root: string, dataDirAbs: string):
           `are on disk but never reached the store — live capture is not running. ` +
           `Check the daemon is up (${theme.command('lazy daemon status')}); it runs the capture sweep. ` +
           `Recover the missing ones with: ${theme.command('lazy doctor --reimport-conversations')}`,
+        docs: 'conversation-import',
       };
     }
 
@@ -1078,11 +1668,7 @@ async function checkImportableMemories(root: string, dataDirAbs: string): Promis
   let storage: Storage | null = null;
   let ownsStorage = false;
   try {
-    storage = await tryRemoteStorage(root);
-    if (!storage) {
-      storage = await createStorage(root);
-      ownsStorage = true;
-    }
+    ({ storage, ownsStorage } = await openDoctorStorage(root));
     const missing = await countImportableMemories({ lazyRoot: root, dataDirAbs, storage });
     if (missing === 0) {
       return { ok: true, label: 'Shared memory up to date' };
@@ -1123,11 +1709,7 @@ async function checkMemoryContext(root: string, config: ResolvedConfig): Promise
   let storage: Storage | null = null;
   let ownsStorage = false;
   try {
-    storage = await tryRemoteStorage(root);
-    if (!storage) {
-      storage = await createStorage(root);
-      ownsStorage = true;
-    }
+    ({ storage, ownsStorage } = await openDoctorStorage(root));
 
     const records = await storage.listMemories();
     const liveCount = records.filter(isLiveMemory).length;
@@ -1223,11 +1805,7 @@ async function checkProtectedTasksResolvable(root: string, config: ResolvedConfi
   try {
     // Prefer the daemon (it owns storage) so we never open a second FileStorage
     // that contends on the storage lock — same rule as the checks above.
-    storage = await tryRemoteStorage(root);
-    if (!storage) {
-      storage = await createStorage(root);
-      ownsStorage = true;
-    }
+    ({ storage, ownsStorage } = await openDoctorStorage(root));
 
     const { stale } = await classifyProtectedTasks(storage, listed);
     if (stale.length === 0) {
@@ -1550,6 +2128,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
     { name: 'reimport-conversations', takesValue: false },
     { name: 'purge-housekeeping-conversations', takesValue: false },
     { name: 'import-memory', takesValue: false },
+    { name: 'probe-agent', takesValue: false },
   ], 'doctor');
 
   const noResume = parsed.flags.get('no-resume') === true;
@@ -1558,11 +2137,12 @@ export async function commandDoctor(args: string[]): Promise<void> {
   const reimportConversationsFlag = parsed.flags.get('reimport-conversations') === true;
   const purgeHousekeepingFlag = parsed.flags.get('purge-housekeeping-conversations') === true;
   const importMemoryFlag = parsed.flags.get('import-memory') === true;
+  const probeAgent = parsed.flags.get('probe-agent') === true;
 
   // If a positional argument is provided, run task-specific diagnostics
   if (parsed.positional.length > 0) {
     const { commandDoctorTask } = await import('./doctor-task');
-    await commandDoctorTask(parsed.positional[0], { dryRun, yes });
+    await commandDoctorTask(parsed.positional[0], { dryRun, yes, probeAgent });
     return;
   }
 
@@ -1613,6 +2193,8 @@ export async function commandDoctor(args: string[]): Promise<void> {
   // Checks that require a lazy root
   const root = findLazyRoot();
   let crashedTasks: CrashedTask[] = [];
+  /** Set when the sweep found a storage lock nobody will ever release. */
+  let staleStorageLockPath: string | null = null;
 
   // Determine runner type for conditional checks.
   //
@@ -1634,10 +2216,85 @@ export async function commandDoctor(args: string[]): Promise<void> {
   if (root) {
     results.push(
       configError
-        ? { ok: false, label: 'lazy.toml parses', detail: configError }
+        ? { ok: false, label: 'lazy.toml parses', detail: configError, docs: 'troubleshooting-config' }
         : { ok: true, label: 'lazy.toml parses' },
     );
   }
+
+  // Detect — and clear — a wedged storage lock BEFORE anything else touches
+  // storage.
+  //
+  // Two reasons this cannot wait until its slot in the sweep below. A lock
+  // nobody will ever release fails every storage operation, doctor's own
+  // included, so a check that runs after them never runs at all: the command
+  // dies with the very error it exists to explain. And StorageLock now reclaims
+  // locks it can prove are stale, which would quietly consume the evidence
+  // before the check could report it. What survives to here is precisely the
+  // wedge the automatic path cannot resolve on its own.
+  let storageLockResult: CheckResult | null = null;
+  const storageLockDir = root && !configError ? await resolveStorageLockDir(root, config!) : null;
+  if (root && !configError) {
+    const storageLock = await checkStorageLock(storageLockDir);
+    storageLockResult = storageLock.result;
+    staleStorageLockPath = storageLock.stalePath;
+    if (staleStorageLockPath) {
+      if (storageLockResult.detail) console.log(`${theme.error('✗')} ${storageLockResult.detail}\n`);
+      if (dryRun) {
+        console.log(`Would remove stale storage lock: ${staleStorageLockPath}\n`);
+      } else {
+        const proceed = yes || !isTTY()
+          ? yes
+          : await promptYesNo(`Remove the stale storage lock at ${staleStorageLockPath}?`, true);
+        if (proceed) {
+          try {
+            await unlink(staleStorageLockPath);
+            console.log(theme.success(`Removed stale storage lock: ${staleStorageLockPath}\n`));
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.log(theme.error(`Could not remove ${staleStorageLockPath}: ${message}\n`));
+          }
+        } else {
+          console.log(`Left in place. Remove it yourself with: ${theme.command(`rm ${staleStorageLockPath}`)}\n`);
+        }
+      }
+    }
+  }
+
+  // The other half of the lock problem, and the one the automatic paths cannot
+  // touch: a holder whose identity VERIFIES. Nothing may reclaim that lock —
+  // the process at that pid really is the one that took it — so doctor's only
+  // options are to queue behind it or to work around it. Queueing is how doctor
+  // used to spend the whole retry loop, per storage call, and arrive at a report
+  // full of unexplained "(check skipped)" lines. So: look once, in bounded time,
+  // and if something is sitting there, say who and skip the checks that would
+  // block. A report that names its own gaps beats a report that never prints.
+  //
+  // Only reached when the lock is NOT stale — a stale lock was just offered for
+  // removal above, and the probe deliberately returns nothing for one.
+  let heldLock: HeldLockReport | null = null;
+  if (storageLockDir && !staleStorageLockPath) {
+    heldLock = await probeHeldStorageLock(join(storageLockDir, STORAGE_LOCK_FILENAME), {
+      windowMs: DOCTOR_LOCK_PROBE_MS,
+    });
+  }
+  // A held lock is only an obstruction when nothing is serving storage. The
+  // daemon holds this lock for its entire lifetime by design, and doctor reads
+  // task state THROUGH the daemon — so the normal, healthy case must run the
+  // full sweep rather than skip half of it. See assessHeldLock.
+  const lockAssessment: HeldLockAssessment = heldLock && root
+    ? await assessHeldLock(root, heldLock)
+    : 'foreign';
+  const lockBlocks = heldLock !== null && lockAssessment !== 'daemon-serving';
+  const heldLockSummary = heldLock
+    ? lockAssessment === 'daemon-stuck'
+      ? `daemon pid ${heldLock.pid} is not serving storage`
+      : `storage lock held by pid ${heldLock.pid}`
+    : '';
+  /** Report a check that was not run because it would have queued on the lock. */
+  const skippedForLock = (label: string): CheckResult => ({
+    ok: true,
+    label: `${label} (skipped — ${heldLockSummary})`,
+  });
 
   const runnerType = config?.runner?.type ?? 'docker';
   // createRunner loads config itself, so it throws on the same broken file.
@@ -1665,7 +2322,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
     }
   }
   if (runnerError) {
-    results.push({ ok: false, label: 'Runner available', detail: runnerError });
+    results.push({ ok: false, label: 'Runner available', detail: runnerError, docs: 'troubleshooting-daemon' });
   }
 
   const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
@@ -1683,10 +2340,16 @@ export async function commandDoctor(args: string[]): Promise<void> {
           results.push({ ok: true, label: check.what, warning: check.reason });
           break;
         case 'fail':
-          results.push({ ok: false, label: check.what, detail: check.reason });
+          results.push({ ok: false, label: check.what, detail: check.reason, docs: 'agent-container' });
           break;
       }
     }
+  }
+
+  // Only container runners bind-mount the agent binary; in host-process mode the
+  // supervisor IS lazy itself and no such file is involved.
+  if (isContainerRunner) {
+    results.push(await checkAgentBinary());
   }
 
   results.push(await checkAuth(configError ? null : config ?? null));
@@ -1713,6 +2376,8 @@ export async function commandDoctor(args: string[]): Promise<void> {
     );
   } else if (root) {
     results.push(await checkDataDir(root));
+    results.push(await checkBuilderScratch(root));
+    results.push(await checkDaemonStateFiles(root));
 
     // Offline mode status — always surface when it expires (or that it won't).
     const offlineStatus = await resolveOfflineStatus(join(root, '.lazy'), config!.remote.offline);
@@ -1737,7 +2402,12 @@ export async function commandDoctor(args: string[]): Promise<void> {
       const imageName = await resolveImageName(root);
       results.push(checkContainerImage(imageName, runnerType));
       results.push(await checkImageUpToDate(root, imageName, runnerType));
-      if (runnerType === 'docker') {
+      results.push(await checkStaleLazyImages(imageName, runnerType));
+      // The orphan check reads every candidate container's task out of storage;
+      // with the lock held it would queue once per container.
+      if (lockBlocks) {
+        results.push(skippedForLock('No orphaned containers'));
+      } else if (runnerType === 'docker') {
         results.push(await checkOrphanedContainers(root));
       } else {
         results.push(await checkOrphanedContainers(root, 'podman'));
@@ -1745,39 +2415,70 @@ export async function commandDoctor(args: string[]): Promise<void> {
     }
 
     // Detect crashed runs for non-terminal tasks (works for both runner types)
-    if (runner) {
-      crashedTasks = await findCrashedTasks(root, runner);
-      if (crashedTasks.length === 0) {
-        results.push({ ok: true, label: 'No crashed task runs' });
-      } else {
-        const interrupted = crashedTasks.filter(c => c.taskStatus === 'interrupted');
-        const other = crashedTasks.filter(c => c.taskStatus !== 'interrupted');
-        const parts: string[] = [];
-        if (interrupted.length > 0) {
-          parts.push(`${interrupted.length} interrupted`);
+    if (runner && lockBlocks) {
+      results.push(skippedForLock('No crashed task runs'));
+    } else if (runner) {
+      try {
+        crashedTasks = await findCrashedTasks(root, runner);
+        if (crashedTasks.length === 0) {
+          results.push({ ok: true, label: 'No crashed task runs' });
+        } else {
+          const interrupted = crashedTasks.filter(c => c.taskStatus === 'interrupted');
+          const other = crashedTasks.filter(c => c.taskStatus !== 'interrupted');
+          const parts: string[] = [];
+          if (interrupted.length > 0) {
+            parts.push(`${interrupted.length} interrupted`);
+          }
+          if (other.length > 0) {
+            parts.push(`${other.length} with dead run`);
+          }
+          results.push({
+            ok: false,
+            label: 'No crashed task runs',
+            detail: `${crashedTasks.length} task(s) with crashed runs (${parts.join(', ')})`,
+          });
         }
-        if (other.length > 0) {
-          parts.push(`${other.length} with dead run`);
-        }
+      } catch (err) {
+        // Say what could not be checked, rather than printing a green check for
+        // a question that was never asked.
+        const message = err instanceof Error ? err.message : String(err);
         results.push({
-          ok: false,
-          label: 'No crashed task runs',
-          detail: `${crashedTasks.length} task(s) with crashed runs (${parts.join(', ')})`,
+          ok: true,
+          label: 'No crashed task runs (skipped — could not read task state)',
+          warning: message,
         });
       }
     }
 
-    results.push(checkStaleLocks(root));
-    results.push(checkStorageLock(root));
+    results.push(await checkStaleLocks(root));
+    // Result computed up front (see the storage-lock block near the top), but
+    // reported here so the sweep's output keeps its usual order.
+    if (storageLockResult) results.push(storageLockResult);
+    if (storageLockDir) results.push(describeHeldStorageLock(heldLock, storageLockDir, lockAssessment));
     results.push(await checkSplitStorage(root));
-    results.push(await checkReimportableConversations(root, join(root, config!.data.path)));
-    results.push(await checkImportableMemories(root, join(root, config!.data.path)));
-    results.push(await checkMemoryContext(root, config!));
-    results.push(await checkCredentialAccepted(join(root, config!.data.path)));
-    results.push(await checkLegacyProxyAuditLog(root));
-    results.push(await checkProtectedTasksResolvable(root, config!));
+    if (lockBlocks) {
+      // Every check in this block reads through Storage EXCEPT the credential
+      // one, which now reads the project-local audit log instead. Each of the
+      // rest would spend the acquire timeout and then report itself skipped
+      // with no reason given; naming the holder once, up front, is the whole
+      // point of the probe.
+      results.push(skippedForLock('Conversation capture is live'));
+      results.push(skippedForLock('Shared memory up to date'));
+      results.push(skippedForLock('Injected memory context'));
+      results.push(await checkCredentialAccepted(join(root, config!.data.path)));
+      results.push(skippedForLock('No legacy proxy audit log in the store'));
+      results.push(skippedForLock('Protected tasks resolvable'));
+    } else {
+      results.push(await checkReimportableConversations(root, join(root, config!.data.path)));
+      results.push(await checkImportableMemories(root, join(root, config!.data.path)));
+      results.push(await checkMemoryContext(root, config!));
+      results.push(await checkCredentialAccepted(join(root, config!.data.path)));
+      results.push(await checkLegacyProxyAuditLog(root));
+      results.push(await checkProtectedTasksResolvable(root, config!));
+    }
     results.push(await checkDefaultBranchProtectionResolvable(root, config!));
     results.push(await checkTaskBranchUpstreamTracking());
+    results.push(await checkLfsEnvironment(root, config));
     results.push(checkDiskSpace(root));
 
     // Remote driver checks and config validation
@@ -1810,6 +2511,10 @@ export async function commandDoctor(args: string[]): Promise<void> {
       console.log(theme.error(`\u2717 ${r.label}`));
       if (r.detail) {
         console.log(`  ${r.detail}`);
+      }
+      if (r.docs) {
+        const pointer = docsSuffix(r.docs, '');
+        if (pointer) console.log(`  ${pointer}`);
       }
     }
   }
@@ -1874,7 +2579,7 @@ export function doctorUsage(): void {
        lazy doctor --reimport-conversations [--yes]
        lazy doctor --purge-housekeeping-conversations [--yes]
        lazy doctor --import-memory [--yes]
-       lazy doctor <task-id> [--dry-run] [--yes]
+       lazy doctor <task-id> [--dry-run] [--yes] [--probe-agent]
 
 Check the health of your lazy installation, or diagnose a specific task.
 
@@ -1895,6 +2600,9 @@ Options:
                              + per-builder isolation dirs) into lazy-owned shared memory;
                              skips records already present
   --dry-run                  Show task issues without offering fixes (task mode only)
+  --probe-agent              Task mode only: have the in-container doctor start a real
+                             claude process to confirm the agent itself sees the lazy
+                             tools. Off by default because it bills a model request
   --yes, -y                  Apply all fixes / skip the re-import, import-memory, or
                              purge confirmation prompt
 
@@ -1930,6 +2638,8 @@ Task-level checks (with task ID):
   - Local/remote branch divergence
   - Status mismatch (task has work but status is still backlog)
   - Orphaned worktree (directory exists but not registered in git)
+  - Agent MCP wiring, by running "lazy-agent doctor" inside the task's container and
+    passing its output through (skipped, not failed, when there is no live container)
 
-Exit code is 0 if all checks pass, 1 if any issues are found.`);
+Exit code is 0 if all checks pass, 1 if any issues are found.${docsFooter('troubleshooting')}`);
 }

@@ -1,3 +1,8 @@
 [test]
-timeout = 30000
+# NOTE: do NOT put `timeout` here. Bun's bunfig parser does not read the key from
+# the [test] section at all, so it silently has no effect while reading as though
+# the suite were configured — which is exactly how every test in a multi-file run
+# stayed on bun's 5000ms default. The mechanisms that DO work are `--timeout`
+# (wired into the test scripts in package.json) and setDefaultTimeout(). See the
+# End-to-End Testing section of CLAUDE.md.
 preload = ["./test/preload-generate.ts"]

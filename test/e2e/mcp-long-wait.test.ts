@@ -23,6 +23,7 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { spawn } from '../../src/utils/spawn';
 import { HEARTBEAT_HEADER, heartbeatEnvelopeResponse } from '../../src/daemon/heartbeat';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 const TOKEN = 'test-token';
@@ -139,7 +140,7 @@ describe('MCP long tool calls survive the daemon idle timeout', () => {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env },
+      env: { ...process.env, ...MCP_SERVER_ENV_PINS },
     });
 
     const lines: JsonRpcLine[] = [];

@@ -11,10 +11,13 @@ import { theme } from '../theme';
 export { buildSystemPromptForResume, buildResumePrompt } from '../../daemon/task-lifecycle';
 
 export async function commandResume(args: string[]): Promise<void> {
-  // Deprecation notice: `lazy resume` is structurally `lazy unblock` with no
-  // message after the stop→blocked unification. Keep the alias working but
-  // steer users toward `lazy unblock`.
-  console.error(`[deprecated] 'lazy resume' is deprecated. Use 'lazy unblock <task>' (with no --message) instead. This alias will be removed in a future release.`);
+  // This used to announce itself as deprecated in favour of a messageless
+  // `lazy unblock` — a call that cannot succeed: unblock rejects empty
+  // feedback ("Empty feedback.") and refuses to run with none at all ("No
+  // feedback provided."). Nothing else expresses a no-feedback resume, so the
+  // command is not deprecated; the notice just points at the right tool for
+  // the OTHER case. Same wording as lazy_resume's MCP description, on purpose.
+  console.error(`[note] 'lazy resume' resumes a task with NO new feedback. To send guidance instead, use 'lazy unblock <task> --message "..."' — unblock requires non-empty feedback, so it cannot express a no-feedback resume.`);
 
   // Parse and validate flags
   const parsed = parseFlags(args, [

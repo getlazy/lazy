@@ -21,7 +21,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
 import { createTask, disablePreAccept, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
-import { readTaskStatus, readTurns, type StoredTurn } from '../helpers/storage';
+import { readTaskStatus, readTurns, writeTurns, type StoredTurn } from '../helpers/storage';
 
 /**
  * The agent turn carrying the FINAL violation set. With the bundle model
@@ -139,9 +139,17 @@ describe('file permission violations', () => {
     expect(status).toBe('blocked');
   });
 
-  // INVARIANT: Unblocking a conflict task without --approve-file reverts ALL violated files.
-  // Default behavior is safe: all violations are rejected and files are reverted to base SHA.
-  test('unblock without --approve-file reverts all violated files', async () => {
+  // INVARIANT: protected files are protected by DEFAULT — neither approving nor
+  // reverting is inferred. Omitting both flags on a conflict task is an ERROR, and
+  // --no-approve-files is the explicit way to revert every violated file.
+  //
+  // This test previously asserted the opposite ("omission reverts all"), encoding
+  // the pre-fix-unblock-conflict-guard behavior. The guard that superseded it
+  // shipped in da2b1d0c, was silently dropped by the v0.11 daemon-lifecycle-rpc
+  // refactor (leaving the help text describing a guard that no longer existed),
+  // and is restored by fix-violation-turn-detection. Approve-by-omission destroys
+  // protected files the reviewer never ruled on — the destructive direction.
+  test('unblock refuses without a decision, and --no-approve-files reverts all', async () => {
     // Set up protected pattern and existing file
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
@@ -172,9 +180,26 @@ describe('file permission violations', () => {
     // Verify task is in conflict with pending violations
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
-    // Unblock without --approve-file → all violations rejected and reverted
-    const unblockResult = await ctx.lazyMocked(
+    // Unblock with NEITHER flag → refused, nothing touched.
+    const refused = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Fix the issue without modifying tests', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {},
+    );
+    expectFailure(refused);
+    expectError(refused, 'file permission violation');
+    expectError(refused, 'test.spec.ts');
+    // Prose approval is not a channel — the incident's unblock said it was
+    // approving the files while passing no flag at all.
+    expectError(refused, 'feedback text has no effect');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
+
+    // Unblock with the explicit revert-all → all violations rejected and reverted.
+    const unblockResult = await ctx.lazyMocked(
+      [
+        'unblock', taskId, '--message', 'Fix the issue without modifying tests',
+        '--no-approve-files', '--follow',
+      ],
       MOCK_CLAUDE_SUCCESS,
       {},
     );
@@ -191,6 +216,69 @@ describe('file permission violations', () => {
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     const fileContent = readFileSync(join(worktreePath, 'test.spec.ts'), 'utf-8');
     expect(fileContent).toBe(originalContent);
+  });
+
+  // INVARIANT (violations-come-from-the-violation-turn): the CLI guard must read
+  // violations from the latest agent turn that HAS them, not from the latest agent
+  // turn. A supervised push-back or maintained-files nudge adds a further agent
+  // turn carrying no violations, and the naive `.pop()` the guard used to do landed
+  // on that nudge reply, saw none, and let the unblock through with no decision —
+  // after which the daemon (which reads the right turn) reverted every file.
+  //
+  // The nudge turn is the whole point of this test: a fixture whose violation turn
+  // is last passes even against the buggy code. Real nudge turns need a live
+  // supervisor, so the shape is seeded directly into storage.
+  test('unblock is still refused when nudge turns follow the violation turn', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns');
+
+    writeFileSync(join(ctx.root, 'test.spec.ts'), 'describe("existing tests", () => {});\n');
+    ctx.git('add', 'test.spec.ts');
+    ctx.git('commit', '-m', 'Add existing test file');
+
+    const taskId = await createTask(ctx, 'Fix something', 'Fix the bug');
+
+    const mockFiles = JSON.stringify([
+      { path: 'test.spec.ts', content: 'describe("modified tests", () => { /* changed */ });\n' },
+    ]);
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles } },
+    );
+    await runReconcile(ctx.root, ctx.protocolBase);
+    expectSuccess(startResult);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
+
+    // Seed the incident's shape: the violation turn, then a permission push-back
+    // exchange and a maintained-files exchange whose agent replies carry none.
+    const turns = readTurns(ctx.root, taskId);
+    expect(violationTurn(turns)).toBeDefined();
+    const nextSeq = Math.max(...turns.map(t => Number(t.sequence ?? 0))) + 1;
+    writeTurns(ctx.root, taskId, [
+      ...turns,
+      { role: 'human', content: '## Permission Violation Review', turn_type: 'nudge', sequence: nextSeq },
+      { role: 'agent', content: 'push-back reply', turn_type: 'nudge', sequence: nextSeq + 1 },
+      { role: 'human', content: '## Maintained Files Review', turn_type: 'nudge', sequence: nextSeq + 2 },
+      { role: 'agent', content: 'maintain reply', turn_type: 'nudge', sequence: nextSeq + 3 },
+    ]);
+    // The naive lookup this replaced finds nothing on this input.
+    const seeded = readTurns(ctx.root, taskId);
+    expect(seeded.filter(t => t.role === 'agent').pop()?.violations ?? []).toHaveLength(0);
+
+    // Against the pre-fix guard this SUCCEEDS and the file is silently reverted.
+    const refused = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'approving the test changes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {},
+    );
+    expectFailure(refused);
+    expectError(refused, 'file permission violation');
+    expectError(refused, 'test.spec.ts');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
   });
 
   // INVARIANT: --approve-file allows selective approval of violated files.
@@ -320,13 +408,14 @@ describe('file permission violations', () => {
     await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(startResult);
 
-    // Resolve violations by unblocking (default = all rejected).
+    // Resolve violations by unblocking. There is no default — the revert has to be
+    // asked for explicitly (--no-approve-files); omitting it is refused.
     // Second mock turn creates another non-protected file so the branch has real changes to merge.
     const mockFiles2 = JSON.stringify([
       { path: 'fix2.ts', content: 'export const fix2 = true;\n' },
     ]);
     const unblockResult = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'Fix without modifying tests', '--follow'],
+      ['unblock', taskId, '--message', 'Fix without modifying tests', '--no-approve-files', '--follow'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_FILES: mockFiles2 } },
     );

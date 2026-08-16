@@ -153,6 +153,23 @@ export async function elevatedMergeAbort(cwd: string): Promise<GitResult> {
   return elevate(cwd, { op: 'merge_abort' }, () => runGit(['merge', '--abort'], { cwd }));
 }
 
+/**
+ * Conclude an in-progress merge whose conflicts are already resolved, host-side.
+ *
+ * The daemon refuses unless MERGE_HEAD exists and no unmerged paths remain, so
+ * this can only ever finish a merge that was already validated when it started.
+ * It exists so a complete resolution is never thrown away just because the agent
+ * could not create the merge commit itself.
+ */
+export async function elevatedMergeCommit(cwd: string): Promise<GitResult> {
+  log('[git] Committing resolved merge');
+  return elevate(
+    cwd,
+    { op: 'merge_commit' },
+    () => runGit(['commit', '-a', '--no-edit', '--no-verify'], { cwd }),
+  );
+}
+
 /** `git reset --hard HEAD` — discards worktree state only, never moves a ref. */
 export async function elevatedResetHardHead(cwd: string): Promise<GitResult> {
   return elevate(cwd, { op: 'reset_hard_head' }, () => runGit(['reset', '--hard', 'HEAD'], { cwd }));

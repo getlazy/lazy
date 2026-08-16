@@ -6,18 +6,14 @@
  */
 
 import type { SearchResult } from '../../storage';
-import type { Storage } from '../../storage/interface';
 import Fuse from 'fuse.js';
-import { turnText } from '../../utils/turn-content';
+import { FUZZY_SEARCH_OPTIONS, type SearchableItem } from '../../search/searchable';
 
-export interface SearchableItem {
-  type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'conversation' | 'memory';
-  taskId: string;
-  taskCode: string | null;
-  taskGoal: string;
-  content: string;
-  context?: string;
-}
+// The loader and the item shape have ONE owner (src/search/searchable.ts).
+// This module used to carry its own near-identical copy; they drifted silently
+// — see the note there. Re-exported so existing callers keep their import.
+export { getAllSearchableContent } from '../../search/searchable';
+export type { SearchableItem } from '../../search/searchable';
 
 function getMatchContext(content: string, matchStart: number, matchLength: number): string {
   const contextChars = 40;
@@ -39,135 +35,8 @@ function truncate(str: string, maxLen: number): string {
   return cleaned.substring(0, maxLen - 3) + '...';
 }
 
-export async function getAllSearchableContent(storage: Storage): Promise<SearchableItem[]> {
-  const items: SearchableItem[] = [];
-  const tasks = await storage.listTasks();
-
-  for (const task of tasks) {
-    const taskContent = task.code ? `${task.code} ${task.goal}` : task.goal;
-    items.push({
-      type: 'task',
-      taskId: task.id,
-      taskCode: task.code,
-      taskGoal: task.goal,
-      content: taskContent,
-    });
-
-    if (task.prompt) {
-      items.push({
-        type: 'prompt',
-        taskId: task.id,
-        taskCode: task.code,
-        taskGoal: task.goal,
-        content: task.prompt,
-      });
-    }
-
-    const comments = await storage.getTaskComments(task.id);
-    for (const comment of comments) {
-      items.push({
-        type: 'comment',
-        taskId: task.id,
-        taskCode: task.code,
-        taskGoal: task.goal,
-        content: comment.content,
-        context: `Comment (${comment.created_at})`,
-      });
-    }
-
-    const followUps = await storage.getTaskFollowUps(task.id);
-    for (const followUp of followUps) {
-      items.push({
-        type: 'followup',
-        taskId: task.id,
-        taskCode: task.code,
-        taskGoal: task.goal,
-        content: followUp.content,
-        context: `Follow-up (${followUp.created_at})`,
-      });
-    }
-
-    const session = await storage.getSessionByTaskId(task.id);
-    if (session) {
-      const turns = await storage.getSessionTurns(session.id);
-      for (const turn of turns) {
-        items.push({
-          type: 'turn',
-          taskId: task.id,
-          taskCode: task.code,
-          taskGoal: task.goal,
-          content: turnText(turn),
-          context: `Turn ${turn.sequence} (${turn.role})`,
-        });
-      }
-
-      const commits = await storage.getSessionCommits(session.id);
-      for (const commit of commits) {
-        items.push({
-          type: 'commit',
-          taskId: task.id,
-          taskCode: task.code,
-          taskGoal: task.goal,
-          content: commit.message,
-          context: `Commit ${commit.sha.substring(0, 7)}`,
-        });
-      }
-    }
-  }
-
-  const conversations = await storage.listConversations();
-  for (const conv of conversations) {
-    if (conv.summary) {
-      items.push({
-        type: 'conversation',
-        taskId: conv.sessionId,
-        taskCode: null,
-        taskGoal: conv.summary,
-        content: conv.summary,
-        context: `Conversation summary`,
-      });
-    }
-
-    for (const msg of conv.messages) {
-      if (msg.text) {
-        items.push({
-          type: 'conversation',
-          taskId: conv.sessionId,
-          taskCode: null,
-          taskGoal: conv.summary || '(conversation)',
-          content: msg.text,
-          context: `Conversation (${msg.role})`,
-        });
-      }
-    }
-  }
-
-  // Memory records are project-level, not per-task: taskId/taskGoal carry the
-  // record's own identity so results still render a useful line.
-  const memories = await storage.listMemories();
-  for (const memory of memories) {
-    items.push({
-      type: 'memory',
-      taskId: memory.name,
-      taskCode: null,
-      taskGoal: `memory: ${memory.name}`,
-      content: `${memory.name}\n${memory.description}\n${memory.body}`,
-      context: `Memory (${memory.type})`,
-    });
-  }
-
-  return items;
-}
-
 export function fuzzySearch(items: SearchableItem[], query: string): SearchResult[] {
-  const fuse = new Fuse(items, {
-    keys: ['content'],
-    includeScore: true,
-    includeMatches: true,
-    threshold: 0.4,
-    ignoreLocation: true,
-    minMatchCharLength: 2,
-  });
+  const fuse = new Fuse(items, FUZZY_SEARCH_OPTIONS);
 
   const fuseResults = fuse.search(query);
 
@@ -191,6 +60,8 @@ export function fuzzySearch(items: SearchableItem[], query: string): SearchResul
       task_goal: item.taskGoal,
       content: item.content,
       match_context: matchedContent,
+      ...(item.entityIndex !== undefined ? { entity_index: item.entityIndex } : {}),
+      ...(item.turnSequence !== undefined ? { turn_sequence: item.turnSequence } : {}),
     };
   });
 }

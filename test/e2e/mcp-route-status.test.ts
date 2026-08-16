@@ -27,10 +27,15 @@ import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { heartbeatRequestHeaders, isHeartbeatEnvelope, readHeartbeatEnvelope } from '../../src/daemon/heartbeat';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
-import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 const TOKEN = 'test-token-mcp-status';
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
 
 describe('MCP route preserves handler status', () => {
   let ctx: TestContext;
@@ -39,6 +44,7 @@ describe('MCP route preserves handler status', () => {
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
+  let restoreDaemonBaseDir: (() => void) | undefined;
   /**
    * The BUILDER's own MCP token. /mcp routes no longer accept the shared daemon
    * token — identity comes from a per-identity token (see
@@ -57,7 +63,7 @@ describe('MCP route preserves handler status', () => {
     restoreConfig = pinConfig(ctx.root);
     // The MCP token registry lives in the daemon state dir — isolate it.
     daemonBaseDir = await makeDaemonBaseDir();
-    process.env.LAZY_DAEMON_BASE_DIR = daemonBaseDir;
+    restoreDaemonBaseDir = pinDaemonBaseDir(daemonBaseDir);
     clearMcpTokenCache();
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-mcp-status');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-mcp-status-'));
@@ -71,9 +77,13 @@ describe('MCP route preserves handler status', () => {
     restoreConfig?.();
     restoreConfig = undefined;
     clearMcpTokenCache();
-    delete process.env.LAZY_DAEMON_BASE_DIR;
-    await removeDaemonBaseDir(daemonBaseDir);
+    // Reap the daemon FIRST: cleanup resolves its pidfile through
+    // LAZY_DAEMON_BASE_DIR, so unpinning before this looks under the default
+    // base dir and leaves the daemon running.
     await ctx.cleanup();
+    restoreDaemonBaseDir?.();
+    restoreDaemonBaseDir = undefined;
+    await removeDaemonBaseDir(daemonBaseDir);
     await rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -97,14 +107,40 @@ describe('MCP route preserves handler status', () => {
     } as any);
   }
 
+  /**
+   * An argument mistake the SCHEMA cannot catch, so it still reaches the
+   * handler — which is what these two tests are about.
+   *
+   * `task_id` is declared `type: ['string', 'array']` with no constraint on an
+   * array's contents, so an empty array satisfies the schema and passes the
+   * route's validator (added in fix-mcp-arg-validation); `normalizeWaitInputs`
+   * then raises RpcError(400, 'taskId is required') from inside the handler.
+   * These tests used to omit `task_id` entirely, but that case is now rejected
+   * at the ROUTE — which would still be a 400, and so would still pass, while
+   * silently no longer exercising the handler-to-HTTP status path this file
+   * exists to pin. The omitted case is covered separately below.
+   */
+  const HANDLER_LEVEL_BAD_ARGS = { task_id: [] as string[] };
+
   // INVARIANT: an argument error from a tool handler arrives as 400. A 500 here
   // would tell the caller the daemon broke when in fact their call was wrong.
   test('a 400 from a tool handler arrives as HTTP 400 (plain reply)', async () => {
-    const resp = await call('_', 'lazy_wait', {}); // task_id omitted
+    const resp = await call('_', 'lazy_wait', HANDLER_LEVEL_BAD_ARGS);
 
     expect(resp.status).toBe(400);
     const body = await resp.json() as { error?: string };
     expect(body.error).toContain('taskId is required');
+  });
+
+  // The schema check runs BEFORE dispatch, so an omitted required parameter is
+  // a 400 from the route itself and the handler never runs. Same status, an
+  // earlier and more specific message (see test/e2e/mcp-arg-validation.test.ts).
+  test('an omitted required parameter is a 400 from the route, before dispatch', async () => {
+    const resp = await call('_', 'lazy_wait', {});
+
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as { error?: string };
+    expect(body.error).toContain("Missing required parameter 'task_id'");
   });
 
   // INVARIANT: the heartbeat envelope carries the REAL status in its final
@@ -112,7 +148,7 @@ describe('MCP route preserves handler status', () => {
   // a flattened status inside the envelope is invisible until the client
   // reconstructs it — same defect, one layer down.
   test('a 400 from a tool handler arrives as 400 inside the heartbeat envelope', async () => {
-    const resp = await call('_', 'lazy_wait', {}, { enveloped: true });
+    const resp = await call('_', 'lazy_wait', HANDLER_LEVEL_BAD_ARGS, { enveloped: true });
 
     expect(resp.status).toBe(200); // headers precede the outcome, by design
     expect(isHeartbeatEnvelope(resp)).toBe(true);

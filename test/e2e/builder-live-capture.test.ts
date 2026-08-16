@@ -23,7 +23,9 @@ import { installFakeAgentBinary } from '../helpers/fake-agent-binary';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-import { getTokenPath, getWebPortPath } from '../../src/daemon/paths';
+import { getWebPortPath } from '../../src/daemon/paths';
+import { mintMcpToken } from '../../src/daemon/mcp-tokens';
+import { mergeBuilderClaudeConfig } from '../../src/builder/claude-home';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -47,7 +49,9 @@ describe('builder live conversation capture', () => {
     home = await mkdtemp(join(tmpdir(), 'lazy-e2e-home-'));
     await mkdir(join(home, '.claude', 'projects'), { recursive: true });
     binDir = await mkdtemp(join(tmpdir(), 'lazy-e2e-bin-'));
-    await installFakeAgentBinary(binDir);
+    // `mcp` must run the real server: the supervisor's preflight starts it and
+    // requires an `initialize` response before it will launch Claude Code.
+    await installFakeAgentBinary(binDir, AGENT_ENTRY);
   });
 
   afterEach(async () => {
@@ -56,15 +60,37 @@ describe('builder live conversation capture', () => {
     await rm(binDir, { recursive: true, force: true });
   });
 
-  /** Write the daemon MCP config the supervisor reads (as the runner mounts it). */
+  /**
+   * Write the daemon MCP config the supervisor reads (as the runner mounts it),
+   * and the `~/.claude.json` the launcher writes next to it.
+   *
+   * The token must be a BUILDER-kind MCP token, exactly what
+   * `writeDaemonMcpConfig` mints in production — never the shared daemon token.
+   * This fixture used the shared token, and that alone is why this suite could
+   * not see the bug it exists to catch: capture posted to `/rpc/storage`, which
+   * only the shared token opens, so it passed here and 401'd every 30 seconds in
+   * every real builder session. Capture now goes to `/builder/storage`, which
+   * takes this token and refuses the shared one.
+   */
   async function writeDaemonConfig(): Promise<string> {
-    const token = (await readFile(getTokenPath(ctx.root), 'utf-8')).trim();
+    const token = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-testbuilder');
     const port = (await readFile(getWebPortPath(ctx.root), 'utf-8')).trim();
     const path = join(ctx.root, '.lazy', 'tmp', 'daemon-mcp-builder-test.json');
     await mkdir(join(ctx.root, '.lazy', 'tmp'), { recursive: true });
     await writeFile(
       path,
       JSON.stringify({ token, projectRoot: ctx.root, taskId: '', target: `http://127.0.0.1:${port}` }, null, 2),
+    );
+
+    // The launcher writes this on the host and bind-mounts it to $HOME in the
+    // container (src/builder/claude-home.ts); the supervisor's preflight reads
+    // it to find the MCP server it must probe.
+    await writeFile(
+      join(home, '.claude.json'),
+      JSON.stringify(
+        mergeBuilderClaudeConfig({}, ['mcp', '--daemon-config', path, '--worktree', ctx.root]),
+        null, 2,
+      ),
     );
     return path;
   }

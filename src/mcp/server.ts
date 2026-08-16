@@ -23,6 +23,7 @@
  */
 
 import type { McpTool, McpToolCallContext, McpToolHandler } from './types';
+import { validateToolArgs, isPlainObject } from './validate-args';
 
 const JSONRPC_VERSION = '2.0' as const;
 const MCP_PROTOCOL_VERSION = '2024-11-05';
@@ -60,7 +61,7 @@ export interface McpServerIo {
 }
 
 export class McpServer {
-  private tools = new Map<string, { definition: McpTool; handler: McpToolHandler }>();
+  private tools = new Map<string, { definition: McpTool; handler: McpToolHandler; advertise: boolean }>();
   private serverInfo: { name: string; version: string };
   private instructions?: string;
   private write: (line: string) => void = line => { process.stdout.write(line); };
@@ -72,9 +73,15 @@ export class McpServer {
 
   /**
    * Register a tool with its definition and handler.
+   *
+   * `advertise: false` registers the handler WITHOUT listing the tool in
+   * `tools/list`. That combination exists for read-only turns: the write tools
+   * are hidden from discovery, but a model working from stale context that
+   * calls one anyway gets the handler's actionable refusal instead of a bare
+   * "Unknown tool", which reads like the server is broken.
    */
-  registerTool(definition: McpTool, handler: McpToolHandler): void {
-    this.tools.set(definition.name, { definition, handler });
+  registerTool(definition: McpTool, handler: McpToolHandler, opts?: { advertise?: boolean }): void {
+    this.tools.set(definition.name, { definition, handler, advertise: opts?.advertise !== false });
   }
 
   /**
@@ -226,7 +233,7 @@ export class McpServer {
           jsonrpc: JSONRPC_VERSION,
           id: message.id,
           result: {
-            tools: Array.from(this.tools.values()).map(t => t.definition),
+            tools: Array.from(this.tools.values()).filter(t => t.advertise).map(t => t.definition),
           },
         });
         break;
@@ -295,24 +302,28 @@ export class McpServer {
       return;
     }
 
-    // Validate that args only contain known parameters
-    const args = params?.arguments ?? {};
-    const knownKeys = Object.keys(tool.definition.inputSchema.properties ?? {});
-    const providedKeys = Object.keys(args);
-    const unknownKeys = providedKeys.filter(k => !knownKeys.includes(k));
-
-    if (unknownKeys.length > 0) {
-      const suggestions = unknownKeys.map(uk => {
-        const closest = findClosestMatch(uk, knownKeys);
-        return closest ? `${uk} (did you mean: ${closest}?)` : uk;
-      });
+    // Validate arguments against the tool's declared inputSchema — unknown
+    // parameters, missing required ones, wrong types, enum and length
+    // violations. Shares one validator with the daemon's HTTP route and the
+    // builder server so all three surfaces accept exactly the same calls
+    // (see src/mcp/validate-args.ts).
+    const rawArgs = params?.arguments;
+    if (rawArgs !== undefined && rawArgs !== null && !isPlainObject(rawArgs)) {
       this.sendResponse({
         jsonrpc: JSONRPC_VERSION,
         id: message.id!,
-        error: {
-          code: -32602,
-          message: `Unknown parameter(s): ${suggestions.join(', ')}. Valid parameters: ${knownKeys.join(', ')}`,
-        },
+        error: { code: -32602, message: `"arguments" must be an object mapping parameter names to values` },
+      });
+      return;
+    }
+    const args = (rawArgs as Record<string, unknown> | undefined) ?? {};
+
+    const failure = validateToolArgs(tool.definition.inputSchema, args);
+    if (failure) {
+      this.sendResponse({
+        jsonrpc: JSONRPC_VERSION,
+        id: message.id!,
+        error: { code: -32602, message: failure },
       });
       return;
     }
@@ -414,42 +425,3 @@ export class McpServer {
   }
 }
 
-/**
- * Compute Levenshtein distance between two strings.
- */
-function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1]
-        ? dp[i - 1][j - 1]
-        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-    }
-  }
-  return dp[m][n];
-}
-
-/**
- * Find the closest match for a string among candidates.
- * Returns null if no candidate is close enough (threshold: 60% similarity).
- */
-function findClosestMatch(input: string, candidates: string[]): string | null {
-  if (candidates.length === 0) return null;
-  let best = '';
-  let bestDist = Infinity;
-  for (const c of candidates) {
-    const dist = levenshtein(input.toLowerCase(), c.toLowerCase());
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = c;
-    }
-  }
-  // Only suggest if the distance is reasonable (within 60% of the longer string)
-  const maxLen = Math.max(input.length, best.length);
-  if (bestDist <= maxLen * 0.6) return best;
-  return null;
-}

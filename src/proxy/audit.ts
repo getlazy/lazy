@@ -21,11 +21,23 @@ export interface AuditSink {
   append(record: ProxyAuditRecord): Promise<void>;
 }
 
+/**
+ * How many consecutive failures with the SAME message are collapsed into one
+ * log line. A sink that cannot append at all (an unwritable log path, a full
+ * disk) would otherwise emit one warning per forwarded request and drown the
+ * daemon log. Every distinct failure is still reported the first time it is
+ * seen, and the suppressed count is reported when the run of identical
+ * failures is summarized.
+ */
+const REPEAT_WARN_INTERVAL = 100;
+
 export class AuditQueue {
   private sink: AuditSink;
   // Serial promise chain: each enqueue() tacks on a new .then() so appends
   // never overlap even when many requests are in-flight simultaneously.
   private chain: Promise<void> = Promise.resolve();
+  private lastFailure: string | null = null;
+  private repeatCount = 0;
 
   constructor(sink: AuditSink) {
     this.sink = sink;
@@ -36,8 +48,22 @@ export class AuditQueue {
     this.chain = this.chain.then(async () => {
       try {
         await this.sink.append(record);
+        this.lastFailure = null;
+        this.repeatCount = 0;
       } catch (err) {
-        logger.warn(`[proxy] audit append failed for seq=${record.seq}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        if (message !== this.lastFailure) {
+          this.lastFailure = message;
+          this.repeatCount = 0;
+          logger.warn(`[proxy] audit append failed for seq=${record.seq}: ${message}`);
+          return;
+        }
+        this.repeatCount++;
+        if (this.repeatCount % REPEAT_WARN_INTERVAL === 0) {
+          logger.warn(
+            `[proxy] audit append still failing (${this.repeatCount} more records dropped, latest seq=${record.seq}): ${message}`,
+          );
+        }
       }
     });
   }

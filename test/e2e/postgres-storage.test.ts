@@ -312,6 +312,52 @@ describeWithPg('PostgresStorage', () => {
     expect(typeof turns[0].timestamp).toBe('number');
   });
 
+  // INVARIANT: per-turn launch labels round-trip through the SQL columns, and a
+  // turn written without them reads back with them ABSENT — not back-filled from
+  // the task's current model/effort, which would invent history. `model_id` in
+  // particular must never inherit the alias in `model`: absence is the signal
+  // that only the tier alias was ever known.
+  test('turn model_id and effort round-trip; unlabelled turns stay unlabelled', async () => {
+    const task = await storage.createTask('Test task');
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/test', 'abc');
+
+    await storage.createTurn({
+      sessionId: session.id,
+      sequence: 0,
+      role: 'agent',
+      content: 'Labelled turn',
+      model: 'opus',
+      modelId: 'claude-opus-4-6-20260101',
+      effort: 'high',
+    });
+    await storage.createTurn({
+      sessionId: session.id,
+      sequence: 1,
+      role: 'agent',
+      content: 'Alias-only turn',
+      model: 'opus',
+    });
+
+    const turns = await storage.getSessionTurns(session.id);
+    expect(turns[0].model).toBe('opus');
+    expect(turns[0].model_id).toBe('claude-opus-4-6-20260101');
+    expect(turns[0].effort).toBe('high');
+    expect(turns[1].model).toBe('opus');
+    // ABSENT, not null — the cross-backend row contract (see
+    // test/e2e/storage-contract.test.ts and `dropNullOptionals` in
+    // src/storage/postgres-storage.ts): an optional field that was never set
+    // has no key on ANY backend, so `'model_id' in turn` answers the same
+    // whether the caller is on Postgres or FileStorage. `getSessionTurns` is
+    // not raw `SELECT *` — it maps every row through `rowToTurn`, which drops
+    // the NULLs on optional columns exactly as `model`/`prompt` already were.
+    expect(turns[1]).not.toHaveProperty('model_id');
+    expect(turns[1]).not.toHaveProperty('effort');
+    expect(turns[1].model_id).toBeUndefined();
+    expect(turns[1].effort).toBeUndefined();
+    // The point of the invariant: absence is never filled in from the alias.
+    expect(turns[1].model_id).not.toBe('opus');
+  });
+
   test('getTurnCountByTaskId returns correct count', async () => {
     const task = await storage.createTask('Test task');
     const session = await storage.createSession(task.id, 'claude-code', 'lazy/test', 'abc');

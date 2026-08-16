@@ -21,7 +21,38 @@ import { getDataDir } from '../init';
 import { ansi } from './terminal';
 import { loadConfig } from '../../config/loader';
 import type { ResolvedConfig } from '../../config/types';
-import { turnText } from '../../utils/turn-content';
+import { turnText, MISSING_RECORD_CONTENT } from '../../utils/turn-content';
+import { logger } from '../../utils/logger';
+import {
+  loadTaskProtectionStatus,
+  protectionHeadline,
+  type TaskProtectionStatus,
+} from '../../protection/status';
+
+/**
+ * Read-only protection status for the review header, or null when it cannot be
+ * resolved. Review must open for a task whatever the config says, so a failure
+ * here is a missing line, never a failed review.
+ *
+ * The target branch is deliberately NOT taken from ReviewData: review resolves
+ * a top-level task's target with `getRemoteDefaultBranch`, while accept — the
+ * thing the gate actually stops — resolves it from the task's stored target.
+ * The header must describe the gate that fires.
+ */
+async function loadReviewProtection(
+  storage: Storage,
+  root: string,
+  task: Task,
+  config?: ResolvedConfig,
+): Promise<TaskProtectionStatus | null> {
+  try {
+    const cfg = config ?? await loadConfig(root);
+    return await loadTaskProtectionStatus(storage, cfg, root, task);
+  } catch (err) {
+    logger.debug(`Review: could not resolve protection status for ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
 
 // ── Review result ──────────────────────────────────────────────────────
 
@@ -61,6 +92,12 @@ export interface ReviewData {
   childTasks: Task[];
   /** Parent task, null if no parent. */
   parentTask: Task | null;
+  /**
+   * Read-only protection status, or null when it could not be resolved.
+   * Rendered in the header so a reviewer sees the gate (and any pending
+   * approval) before they press `a`, not after accept refuses.
+   */
+  protection: TaskProtectionStatus | null;
 }
 
 export async function loadReviewData(
@@ -190,6 +227,7 @@ export async function loadReviewData(
     task, session, turns, commits, comments, unseenComments, journal, followUps,
     diffStat, diffFull, worktreePath, targetBranch, lastAgentTurn,
     turnInfoMap, taskTree, childTasks, parentTask,
+    protection: await loadReviewProtection(storage, root, task, config),
   };
 }
 
@@ -238,6 +276,7 @@ async function loadReviewDataForSubtask(
       taskTree: null,
       childTasks,
       parentTask,
+      protection: await loadReviewProtection(storage, root, task, config),
     };
   }
 
@@ -298,6 +337,7 @@ async function loadReviewDataForSubtask(
     taskTree: null,
     childTasks,
     parentTask,
+    protection: await loadReviewProtection(storage, root, task, config),
   };
 }
 
@@ -355,6 +395,20 @@ function buildTaskNavItem(opts: {
     children: opts.children,
     expanded: opts.expanded,
   };
+}
+
+/**
+ * Text of a comment / journal entry / follow-up, safe to render.
+ *
+ * Storage already substitutes a placeholder for records persisted without
+ * content, so this is the second layer: review is a READ-ONLY surface over
+ * whatever a store happens to contain, and a single defective record must never
+ * take down a review of a task tree (a content-less journal entry on a release
+ * hub is exactly how `lazy review release-v021` died on `entry.content.split`).
+ * The placeholder keeps such a record visible instead of blank.
+ */
+function entryText(record: { content?: unknown }): string {
+  return turnText(record, MISSING_RECORD_CONTENT) || MISSING_RECORD_CONTENT;
 }
 
 /**
@@ -447,7 +501,7 @@ export function buildNavItemsForTask(
     const sorted = [...data.comments].reverse();
     const commentChildren: NavItem[] = sorted.map(note => {
       const isUnseen = data.unseenComments.some(n => n.id === note.id);
-      const firstLine = note.content.split('\n')[0];
+      const firstLine = entryText(note).split('\n')[0];
       const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
       return {
         key: `${keyPrefix}comment:${note.id}`,
@@ -473,7 +527,7 @@ export function buildNavItemsForTask(
   if (data.journal.length > 0) {
     const sorted = [...data.journal].reverse();
     const journalChildren: NavItem[] = sorted.map(entry => {
-      const firstLine = entry.content.split('\n')[0];
+      const firstLine = entryText(entry).split('\n')[0];
       const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
       return {
         key: `${keyPrefix}journal-entry:${entry.id}`,
@@ -497,7 +551,7 @@ export function buildNavItemsForTask(
   if (data.followUps.length > 0) {
     const sorted = [...data.followUps].reverse();
     const followUpChildren: NavItem[] = sorted.map(f => {
-      const firstLine = f.content.split('\n')[0];
+      const firstLine = entryText(f).split('\n')[0];
       const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
       return {
         key: `${keyPrefix}followup:${f.id}`,
@@ -1046,7 +1100,7 @@ function getCommentsContent(data: ReviewData): string[] {
       ? ansi.fg.yellow + ansi.bold + ' NEW ' + ansi.reset
       : '';
     lines.push(ansi.dim + `[${formatDate(note.created_at)}]` + ansi.reset + marker);
-    lines.push(...note.content.split('\n'));
+    lines.push(...entryText(note).split('\n'));
     lines.push('');
   }
 
@@ -1065,7 +1119,7 @@ function getSingleCommentContent(data: ReviewData, noteId: string): string[] {
   }
   lines.push(ansi.dim + `Date: ${formatDate(note.created_at)}` + ansi.reset);
   lines.push('');
-  lines.push(...note.content.split('\n'));
+  lines.push(...entryText(note).split('\n'));
   return lines;
 }
 
@@ -1080,7 +1134,7 @@ function getJournalContent(data: ReviewData): string[] {
   for (const entry of sorted) {
     const who = entry.actor ? ansi.dim + ` (${entry.actor})` + ansi.reset : '';
     lines.push(ansi.dim + `[${formatDate(entry.created_at)}]` + ansi.reset + who);
-    lines.push(...entry.content.split('\n'));
+    lines.push(...entryText(entry).split('\n'));
     lines.push('');
   }
 
@@ -1096,7 +1150,7 @@ function getFollowUpsContent(data: ReviewData): string[] {
   const sorted = [...data.followUps].reverse();
   for (const f of sorted) {
     lines.push(ansi.dim + `[${formatDate(f.created_at)}]` + ansi.reset);
-    lines.push(...f.content.split('\n'));
+    lines.push(...entryText(f).split('\n'));
     lines.push('');
   }
 
@@ -1110,7 +1164,7 @@ function getSingleJournalEntryContent(data: ReviewData, entryId: string): string
   const lines: string[] = [];
   lines.push(ansi.dim + `Date: ${formatDate(entry.created_at)}` + (entry.actor ? ` · ${entry.actor}` : '') + ansi.reset);
   lines.push('');
-  lines.push(...entry.content.split('\n'));
+  lines.push(...entryText(entry).split('\n'));
   return lines;
 }
 
@@ -1121,7 +1175,7 @@ function getSingleFollowUpContent(data: ReviewData, followUpId: string): string[
   const lines: string[] = [];
   lines.push(ansi.dim + `Date: ${formatDate(f.created_at)}` + ansi.reset);
   lines.push('');
-  lines.push(...f.content.split('\n'));
+  lines.push(...entryText(f).split('\n'));
   return lines;
 }
 
@@ -2033,7 +2087,8 @@ async function updateContentFromNav(state: LayoutState, dataMap: Map<string, Rev
   }
 }
 
-function buildStatusLine(data: ReviewData): string {
+/** Exported for unit tests: the review header is not reachable without a TTY. */
+export function buildStatusLine(data: ReviewData): string {
   const parts: string[] = [];
   parts.push(`${displayId(data.task)}`);
   parts.push(`Status: ${data.task.status}`);
@@ -2044,6 +2099,12 @@ function buildStatusLine(data: ReviewData): string {
   }
   if (data.followUps.length > 0) {
     parts.push(`${data.followUps.length} follow-up(s)`);
+  }
+  // Last, and only when there is a gate: the reviewer should learn that accept
+  // needs `lazy approve` here, not from accept refusing.
+  const protection = data.protection ? protectionHeadline(data.protection) : null;
+  if (protection) {
+    parts.push(protection);
   }
   return parts.join('  │  ');
 }

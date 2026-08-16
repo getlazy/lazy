@@ -20,6 +20,7 @@ import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -84,6 +85,7 @@ async function runMcpSession(
         ...process.env,
         LAZY_PROTOCOL_BASE: ctx.protocolBase,
         ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
+        ...MCP_SERVER_ENV_PINS,
       },
     },
   );

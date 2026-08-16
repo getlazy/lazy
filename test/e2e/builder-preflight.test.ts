@@ -47,6 +47,20 @@ describe('preflightAgentBinary', () => {
     await expect(preflightAgentBinary('echo')).rejects.toThrow(/did not identify the lazy agent/);
   });
 
+  // The field failure, reproduced exactly: the file mounted at
+  // /usr/local/bin/lazy-agent was a bare Bun runtime. `bun selfcheck` behaves
+  // identically to what the human saw — exit 1, EMPTY stdout, and the one line
+  // that explains it (`error: Script not found "selfcheck"`) on stderr.
+  //
+  // INVARIANT: the preflight reads stderr. It used to pipe it and never read it,
+  // so the report said `output: <no output>` while the binary had said precisely
+  // what it was — and the same runtime then failed the container's real argv as
+  // `Script not found "builder"`, looking like an unrelated second bug.
+  test('surfaces the stderr of a bare Bun runtime and names the diagnosis', async () => {
+    await expect(preflightAgentBinary('bun')).rejects.toThrow(/Script not found/);
+    await expect(preflightAgentBinary('bun')).rejects.toThrow(/BARE BUN RUNTIME/);
+  });
+
   // A non-existent command simulates a missing / non-executable mount. The
   // preflight must fail loudly with an actionable exec error, not hang or pass.
   test('rejects a missing binary with an actionable error', async () => {

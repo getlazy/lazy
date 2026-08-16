@@ -26,7 +26,6 @@ import { createDriver, type RemoteComment } from '../../remote';
 import { commandAccept } from './accept';
 import { theme, dim } from '../theme';
 import { getActor } from '../../constants';
-import { tmuxSessionName, killTmuxWatchSession } from '../../terminal';
 import { reparentChildren, formatReparentWarning } from '../orphan';
 import { parentTaskIdOf } from '../../task-target';
 import { sanitizeUserText } from '../../utils/sanitize-text';
@@ -294,8 +293,6 @@ export async function cleanupTaskContainer(
   if (session.container_name) {
     await storage.updateSessionContainerName(session.id, null);
   }
-  // Clean up the tmux watch session if one exists
-  killTmuxWatchSession(tmuxSessionName(tRef));
 }
 
 /**

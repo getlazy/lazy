@@ -18,10 +18,12 @@ import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RoleTarget } from '../config/types';
 import type { BuilderLaunchProjects } from '../builder/projects-isolation';
+import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
 import { getAuthEnvVars as getDefaultAuthEnvVars } from '../capture/claude';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { encodeProjectPath } from '../import/claude-code-logs';
 import { logger } from '../utils/logger';
+import { redactSecrets } from '../utils/redact';
 import {
   checkTargetConnectivity,
   preflightRoleTarget,
@@ -272,7 +274,7 @@ export class HostProcessRunner implements Runner {
     ];
 
     if (debug) {
-      console.log('[DEBUG] Launching supervisor process:', supervisorArgs.join(' '));
+      console.log('[DEBUG] Launching supervisor process:', redactSecrets(supervisorArgs).join(' '));
     }
 
     logger.info('Launching supervisor process...');
@@ -351,7 +353,7 @@ export class HostProcessRunner implements Runner {
     }
 
     if (debug) {
-      console.log('[DEBUG] Running Claude command:', claudeArgs.join(' '));
+      console.log('[DEBUG] Running Claude command:', redactSecrets(claudeArgs).join(' '));
     }
 
     logger.info('Running Claude Code...');
@@ -445,6 +447,16 @@ export class HostProcessRunner implements Runner {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Host-process runs have no inside to enter — the agent is a plain process on
+   * this machine, sharing this filesystem and this HOME. Anything an exec would
+   * show is already reachable locally, so callers get null and say so rather
+   * than being handed a fake success.
+   */
+  async execInRun(_runName: string, _argv: string[], _opts?: { timeoutMs?: number }): Promise<number | null> {
+    return null;
   }
 
   /**
@@ -586,11 +598,24 @@ export class HostProcessRunner implements Runner {
     ];
   }
 
-  mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] } {
+  mcpServerConfig(
+    taskId: string,
+    worktreePath: string,
+    opts?: { readOnly?: boolean },
+  ): { command: string; args: string[] } {
     const lazyCmd = getLazyCliCommand();
     return {
       command: lazyCmd[0],
-      args: [...lazyCmd.slice(1), 'mcp', '--task-id', taskId, '--worktree', worktreePath],
+      args: [
+        ...lazyCmd.slice(1),
+        'mcp',
+        '--task-id', taskId,
+        '--worktree', worktreePath,
+        // Belt and braces here: this mode executes tools in-process, so it also
+        // inherits the supervisor's LAZY_MCP_READ_ONLY. The flag makes the
+        // read-only scope explicit and visible in ~/.claude.json.
+        ...(opts?.readOnly ? ['--read-only'] : []),
+      ],
     };
   }
 
@@ -672,6 +697,13 @@ export class HostProcessRunner implements Runner {
     // that backend rather than the inherited shell's default endpoint.
     const builderEnvVars = this.getAuthEnvVars(this.builderTarget(), { role: 'builder' });
 
+    // Builder scratch dir — same contract as the container runner: a writable
+    // place outside the repo, at the path the human reads. Derived from lazyRoot
+    // by the same helper, so the two runners cannot drift. `lazy builder` also
+    // passes it as `--add-dir` so the OS sandbox and the file tools treat it as
+    // a workspace dir. See src/builder/scratch.ts.
+    const scratchDir = await ensureBuilderScratchDir(lazyRoot);
+
     const claudeArgs = [
       'claude',
       '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
@@ -679,7 +711,7 @@ export class HostProcessRunner implements Runner {
     ];
 
     if (debug) {
-      console.log('[DEBUG] Launching Claude Code directly:', claudeArgs.join(' '));
+      console.log('[DEBUG] Launching Claude Code directly:', redactSecrets(claudeArgs).join(' '));
     }
 
     logger.info('Launching Claude Code...');
@@ -695,6 +727,7 @@ export class HostProcessRunner implements Runner {
       env: {
         ...process.env,
         ...Object.fromEntries(builderEnvVars.map(v => [v.key, v.value])),
+        [SCRATCH_ENV_VAR]: scratchDir,
       },
     });
 

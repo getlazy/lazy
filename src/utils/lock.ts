@@ -11,11 +11,22 @@
 import { stat, readFile, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { pathExists } from './fs';
+import { checkHolder, selfIdentity, type StartTimeSource } from './process-identity';
 
 export interface LockInfo {
   pid: number;
   started_at: string;
+  /** The lazy command that took the lock, e.g. 'lazy start'. Display only. */
   command: string;
+  /**
+   * Identity of the holder OS process, captured at acquire time. A pid alone
+   * cannot distinguish the holder from whatever the OS later recycles that
+   * number to — see src/utils/process-identity.ts. Optional: locks written by
+   * older lazy versions have neither, and fall back to the backstops there.
+   */
+  holder_started_at?: string;
+  holder_start_source?: StartTimeSource;
+  holder_command?: string;
 }
 
 const LOCK_FILENAME = '.lazy-lock';
@@ -25,18 +36,6 @@ const LOCK_FILENAME = '.lazy-lock';
  */
 export function getLockPath(worktreePath: string): string {
   return join(worktreePath, LOCK_FILENAME);
-}
-
-/**
- * Check if a process is still running by sending signal 0.
- */
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -62,9 +61,18 @@ export async function readLock(worktreePath: string): Promise<LockInfo | null> {
       return null;
     }
 
-    // Check if the owning process is still alive
-    if (!isProcessRunning(lock.pid)) {
-      // Stale lock — process has exited, clean up
+    // Is the RECORDED HOLDER still there? "Something is alive at that pid" is
+    // not the same question: pids get recycled, and a lock whose holder died
+    // without releasing it would otherwise look held forever once the OS handed
+    // its number to an unrelated program.
+    const verdict = await checkHolder({
+      pid: lock.pid,
+      started: lock.holder_started_at ?? null,
+      startedSource: lock.holder_start_source ?? null,
+      acquiredAt: lock.started_at ?? null,
+    });
+    if (!verdict.alive) {
+      // Stale lock — holder is gone (exited, defunct, or its pid recycled).
       await removeLock(worktreePath);
       return null;
     }
@@ -87,10 +95,15 @@ export async function acquireLock(worktreePath: string, command: string): Promis
     throw new Error(`Cannot acquire lock: worktree directory does not exist: ${worktreePath}`);
   }
 
+  const self = await selfIdentity();
   const lock: LockInfo = {
     pid: process.pid,
     started_at: new Date().toISOString(),
     command,
+    ...(self?.started && self.startedSource
+      ? { holder_started_at: self.started, holder_start_source: self.startedSource }
+      : {}),
+    ...(self?.command ? { holder_command: self.command } : {}),
   };
 
   const lockPath = getLockPath(worktreePath);

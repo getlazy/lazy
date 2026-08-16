@@ -23,6 +23,7 @@
 import { join } from 'path';
 import { requireLazyRoot, requireStorage, parseFlags, type LineRange, sliceLines } from '../helpers';
 import { theme } from '../theme';
+import { docsFooter } from '../../docs/links';
 import { isTTY, promptYesNo } from '../editor';
 import { loadConfig } from '../../config/loader';
 import {
@@ -414,5 +415,5 @@ Examples:
   lazy import-conversation bc77e1b1     # Import specific session
   lazy import-conversation --all        # Re-import everything
   lazy import-conversation --show-imported        # Show imported list
-  lazy import-conversation --show bc77e1b1        # Show full conversation`);
+  lazy import-conversation --show bc77e1b1        # Show full conversation${docsFooter('conversation-import')}`);
 }

@@ -4,24 +4,19 @@ node_modules/
 lazy
 lazy-agent
 
-# Lazy storage - we WANT to track these files in git
-# .lazy/tasks/ contains the file-based storage (JSON files)
-# .lazy/version.json tracks the storage schema version
-
-# But we DON'T want to track these:
+# Per-task sandbox dir and the per-worktree session lock (src/utils/lock.ts).
+# Both are NOT covered by the `.lazy` rule below: gitignore matches whole path
+# components, so `.lazy` matches a file/dir named exactly `.lazy` and never the
+# `.lazy-task-sandbox` / `.lazy-lock` prefixes. These rules are load-bearing.
+#
+# .lazy-lock is runtime state that a crashed session leaves behind — git's
+# porcelain already excludes it (src/git/operations.ts) and `lazy init` lists it
+# as ignorable, but without this entry it shows up untracked in every worktree
+# and is trivially swept into a `git add -A`. It must also never be TRACKED: a
+# tracked lock makes every worktree that releases it show a spurious
+# `D .lazy-lock`, which is exactly how it once got committed by accident.
 .lazy-task-sandbox/
-# Per-worktree session lock (src/utils/lock.ts). Never tracked: a tracked lock
-# makes every worktree that releases it show a spurious `D .lazy-lock`.
 .lazy-lock
-.lazy/worktrees/
-.lazy/bin/
-.lazy/logs/
-.lazy/recovery/
-.lazy/tasks/*.tmp.*
-.lazy/tasks/*.backup.*
-.lazy/tasks/*/protocol/
-.lazy/storage.lock
-.lazy/tmp
 
 # Bun build temporary files
 *.bun-build
@@ -39,7 +34,16 @@ dist/
 
 .DS_Store
 .env
-.lazy/tasks/*/*.tmp.*
-.lazy/tasks/*/*.backup.*
-.lazy/.reconcile-lock
+
+# Ignore this repo's ENTIRE .lazy directory.
+#
+# Task storage is never in-repo — the in-repo/orphan-branch backends are gone
+# (src/config/loader.ts rejects them), so everything that lands in ./.lazy is
+# local runtime state (worktrees, recovery, signals.db, tmp, the lazy-agent
+# binary, builder-projects). None of it belongs in git, and nothing under .lazy
+# has ever been tracked here.
+#
+# This matches what `lazy init` now writes into a user's project (see
+# LAZY_IGNORE_ENTRIES in src/cli/init.ts): one blanket `.lazy/` rule instead of
+# an enumeration that goes stale every time lazy writes a new file there.
 .lazy

@@ -1,0 +1,86 @@
+/*
+ * The review surface: everything around the diff. The diff itself is styled by
+ * diff.css, which commit detail shares — nothing here may be required for a
+ * diff to read correctly, or the two pages drift apart again.
+ */
+
+body { padding-bottom: 68px; }
+.rv-queue td { white-space: normal; }
+.rv-badge { display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 11px; background: var(--bg-secondary); border: 1px solid var(--border); }
+.rv-badge.rv-pending { border-color: #d97706; color: #d97706; }
+/* Threads and the comment form live in the same scrolling table, so without
+   this they inherit the width of the longest code line and drift off-screen
+   the moment the reviewer scrolls right. */
+tr.rv-thread-row .rv-thread, tr.rv-form-row .rv-form { position: sticky; left: 0; max-width: min(900px, calc(100vw - 80px)); }
+tr.rv-thread-row td { padding: 8px 12px; background: var(--bg-secondary); white-space: normal; }
+.rv-thread { border-left: 3px solid var(--link); padding-left: 10px; }
+.rv-msg { margin-bottom: 8px; }
+.rv-msg-head { font-size: 11px; color: var(--text-secondary); }
+.rv-msg-body { font-family: var(--font-ui); white-space: pre-wrap; word-break: break-word; }
+.rv-msg-agent .rv-msg-head { color: #16a34a; }
+.rv-state { font-size: 11px; }
+.rv-state-pending { color: #d97706; }
+.rv-state-failed { color: #dc2626; }
+.rv-state-queued { color: var(--text-secondary); }
+.rv-state-delivered { color: #16a34a; }
+.rv-state-withdrawn { color: var(--text-secondary); font-style: italic; }
+/* A withdrawn message keeps its place in the thread — struck through, not gone,
+   so the reviewer can see what they took back. */
+.rv-msg-withdrawn .rv-msg-body { text-decoration: line-through; color: var(--text-secondary); }
+.rv-state-hint { color: var(--text-secondary); }
+.rv-retry, .rv-withdraw { display: inline; }
+.rv-withdraw button { font-family: var(--font-ui); font-size: 11px; padding: 1px 8px; margin: 4px 0 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
+.rv-retry button { font-family: var(--font-ui); font-size: 11px; padding: 1px 8px; margin: 4px 0 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); cursor: pointer; }
+.rv-pending-box { border: 1px solid #d97706; border-radius: 4px; padding: 8px 12px; margin-bottom: 16px; }
+.rv-queued-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.rv-queued-item { border-top: 1px dashed var(--border); padding: 6px 0; }
+.rv-queued-item:first-child { border-top: 0; }
+.rv-queued-where { font-family: var(--font-mono); font-size: 11px; }
+.rv-form-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.rv-hint { font-size: 11px; color: var(--text-secondary); }
+.rv-warn { font-size: 11px; color: #d97706; margin-bottom: 6px; }
+.rv-form textarea, .rv-actions textarea { width: 100%; box-sizing: border-box; font-family: var(--font-ui); font-size: 14px; line-height: 1.5; padding: 10px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
+.rv-form button, .rv-actions button, .rv-dialog button { font-family: var(--font-ui); font-size: 13px; padding: 5px 12px; margin-top: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text); cursor: pointer; }
+.rv-form button:hover, .rv-actions button:hover, .rv-dialog button:hover { border-color: var(--link); }
+.rv-form button.rv-primary, .rv-actions button.rv-primary, .rv-dialog button.rv-primary { background: var(--link); border-color: var(--link); color: #fff; }
+.rv-actions { border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin: 24px 0; }
+.rv-actions > form { margin: 0; }
+.rv-actions label { display: block; margin-bottom: 6px; }
+.rv-accept-form { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+/* margin:auto is what centres a modal <dialog>; the layout's global
+   `* { margin: 0 }` reset wipes the UA default, which pinned this to a corner
+   of the viewport. Restate it here rather than exempting dialog from the
+   reset, which would change every other page. */
+dialog.rv-dialog { width: min(680px, calc(100vw - 40px)); font-family: var(--font-ui); margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); box-shadow: 0 16px 40px rgba(0,0,0,0.32); }
+dialog.rv-dialog::backdrop { background: rgba(0,0,0,0.45); }
+dialog.rv-dialog .rv-accept-form { margin: 0; padding: 24px; border-top: 0; }
+dialog.rv-dialog label { font-size: 15px; margin-bottom: 10px; }
+dialog.rv-dialog textarea { font-size: 15px; line-height: 1.55; padding: 12px 14px; min-height: 120px; }
+dialog.rv-dialog button { font-size: 14px; padding: 7px 16px; }
+dialog.rv-dialog .rv-form-actions { justify-content: flex-end; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.rv-statusbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex; gap: 6px 18px; flex-wrap: wrap; align-items: center; padding: 8px 20px; background: var(--bg-secondary); border-top: 1px solid var(--border); font-size: 12px; }
+.rv-statusbar .rv-sb-sep { color: var(--text-secondary); }
+.rv-statusbar[data-rv-askable="0"] .rv-sb-ask { color: #d97706; }
+.rv-notice { padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 16px; }
+.rv-notice-err { border-color: #dc2626; color: #dc2626; }
+.rv-violations { border: 1px solid #d97706; border-radius: 4px; padding: 12px 14px; margin-bottom: 16px; }
+.rv-violations[data-resolved="1"] { border-color: #16a34a; }
+.rv-violation-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.rv-violation-item { padding: 2px 0; display: flex; align-items: center; gap: 8px; }
+.rv-violation-mark { flex: none; width: 1.4em; text-align: center; }
+.rv-violation-state { font-size: 11px; color: #d97706; margin-left: auto; }
+[data-approved="1"] > .rv-violation-state { color: #16a34a; }
+.rv-decide-state { font-size: 11px; font-weight: 600; color: #d97706; }
+[data-approved="1"] .rv-decide-state { color: #16a34a; }
+.rv-violation-mark::before { content: '⛔'; }
+[data-approved="1"] .rv-violation-mark::before { content: '✅'; }
+.rv-file-protected { border-color: #d97706; }
+.rv-file-protected .rv-file-head { background: rgba(217,119,6,0.10); }
+/* The one ⛔/✅ control, in the header of the file it decides. */
+.rv-decide { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+.rv-decide-btn { font-family: var(--font-ui); font-size: 11px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
+.rv-decide-btn:hover { border-color: var(--link); }
+/* The chosen answer is lit and the other dimmed, so the CURRENT state is
+   readable at a glance instead of inferred from an empty checkbox. */
+.rv-decide-btn.rv-decide-on { border-color: #d97706; color: #d97706; background: rgba(217,119,6,0.12); font-weight: 600; }
+.rv-decide-btn[value="1"].rv-decide-on { border-color: #16a34a; color: #16a34a; background: rgba(22,163,74,0.12); }

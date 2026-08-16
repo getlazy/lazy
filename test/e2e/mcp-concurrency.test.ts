@@ -23,6 +23,7 @@ import { resolve, join } from 'path';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { spawn } from '../../src/utils/spawn';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 const TOKEN = 'test-token';
@@ -92,7 +93,7 @@ describe('MCP tool calls do not serialize behind a long call', () => {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env },
+      env: { ...process.env, ...MCP_SERVER_ENV_PINS },
     });
 
     const lines: JsonRpcLine[] = [];
@@ -112,15 +113,19 @@ describe('MCP tool calls do not serialize behind a long call', () => {
     })();
 
     const stdin = proc.stdin as import('bun').FileSink;
-    const send = (id: number, name: string) => {
+    // Arguments must satisfy each tool's declared inputSchema — the MCP server
+    // validates before dispatch, so a call missing a required parameter is
+    // refused locally and never reaches the transport this test is about. The
+    // stub above ignores the values; only their presence matters here.
+    const send = (id: number, name: string, args: Record<string, unknown> = {}) => {
       stdin.write(JSON.stringify({
-        jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: {} },
+        jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args },
       }) + '\n');
       stdin.flush();
     };
 
     // Long write first...
-    send(1, 'lazy_accept');
+    send(1, 'lazy_accept', { task_id: 'sometask' });
     await slowRunning;
 
     // ...then two reads that must not wait for it.

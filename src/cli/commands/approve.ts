@@ -1,7 +1,8 @@
 import { parseFlags } from '../helpers';
-import { isTTY, promptLine, readStdinIfPiped } from '../editor';
+import { isTTY, promptSecret, PromptCancelledError, readStdinIfPiped } from '../editor';
 import { queryApproveTask, queryApproveTaskPreflight } from '../../daemon/rpc-fallback';
 import { theme } from '../theme';
+import { docsFooter } from '../../docs/links';
 
 /**
  * `lazy approve <task>` — record a one-shot human approval that unlocks
@@ -49,10 +50,20 @@ export async function commandApprove(args: string[]): Promise<void> {
       process.exit(1);
     }
     // Name the source of truth so the human knows what they are being asked
-    // for and where to change it.
-    token = await promptLine(
-      sourceLabel ? `Approval passphrase (from ${sourceLabel})` : 'Approval passphrase',
-    );
+    // for and where to change it. promptSecret, never promptLine: this is a
+    // secret, and an echoed one is visible in scrollback and screen shares.
+    try {
+      token = await promptSecret(
+        sourceLabel ? `Approval passphrase (from ${sourceLabel})` : 'Approval passphrase',
+      );
+    } catch (err) {
+      if (err instanceof PromptCancelledError) {
+        console.error('Aborted: no approval recorded.');
+        process.exit(130);
+      }
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
   }
 
   if (!token.trim()) {
@@ -67,7 +78,11 @@ export async function commandApprove(args: string[]): Promise<void> {
     if (result.replacedPending) {
       console.log('(A previous unconsumed approval was replaced.)');
     }
-    console.log(`The next ${theme.command('lazy accept ' + result.displayId)} into a protected branch will consume it.`);
+    console.log(
+      `The next ${theme.command('lazy accept ' + result.displayId)} into a protected branch ` +
+      `will consume it — but only if it completes. A failed accept leaves the approval pending, ` +
+      `so you can retry without approving again.`,
+    );
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
@@ -103,6 +118,5 @@ Examples:
 There is deliberately NO --yes for this command, and no MCP equivalent: the
 approval token must originate outside the builder/agent context, or the gate is
 decoration. Piped stdin is the supported script-friendly path — the passphrase
-comes from your secret store, not from anything an agent can reach.
-See docs/protected-branches.md.`);
+comes from your secret store, not from anything an agent can reach.${docsFooter('protected-branches')}`);
 }

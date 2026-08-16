@@ -135,6 +135,45 @@ describe('lazy_internal_git', () => {
     expect(ok.exit_code).toBe(0);
   });
 
+  test('tag name validation is structural, not a RegExp built from the task id', async () => {
+    // INVARIANT: `turn/<taskid8>/<phase>/<sha>` is checked by splitting on '/'
+    // and comparing the four segments, NOT by interpolating the task id into a
+    // RegExp. A task id carrying a regex metacharacter must fail the check like
+    // any other mismatch — it must never be able to alter what the check means.
+    // The check gates which refs the supervisor may write, so weakening it is a
+    // privilege escalation, not a cosmetic bug.
+    const head = git(worktree, 'rev-parse', 'HEAD').substring(0, 8);
+    // Exactly 8 chars, all legal in a git ref name, and all regex metacharacters:
+    // interpolated into a pattern, `a+b(c)dd` means "one-or-more a, b, c, dd".
+    const handler = createInternalGitHandler({ ...ctx, taskId: 'a+b(c)dd' });
+
+    // The literal id is the only namespace this task may write.
+    const ok = await handler({ op: 'tag', name: `turn/a+b(c)dd/pre/${head}` }) as any;
+    expect(ok.exit_code).toBe(0);
+
+    // The old dynamic RegExp accepted this — a namespace that is NOT this
+    // task's. Structural comparison rejects it.
+    await expect(
+      handler({ op: 'tag', name: `turn/aaabcdd/pre/${head}` }),
+    ).rejects.toThrow(/Refusing to write tag/);
+  });
+
+  test('rejects tag names with the wrong segment count or charset', async () => {
+    const handler = createInternalGitHandler(ctx);
+    const short = ctx.taskId.substring(0, 8);
+    const head = git(worktree, 'rev-parse', 'HEAD').substring(0, 8);
+    for (const name of [
+      `turn/${short}/pre`,                       // too few segments
+      `turn/${short}/pre/${head}/extra`,         // too many segments
+      `turns/${short}/pre/${head}`,              // wrong literal prefix
+      `turn/${short}/PRE/${head}`,               // phase charset
+      `turn/${short}/pre/${head.toUpperCase()}`, // sha charset
+      `turn/${short}/pre/abcdef`,                // sha too short
+    ]) {
+      await expect(handler({ op: 'tag', name })).rejects.toThrow(/Refusing to write tag/);
+    }
+  });
+
   test('rejects unknown ops instead of passing them to git', async () => {
     const handler = createInternalGitHandler(ctx);
     await expect(handler({ op: 'push' })).rejects.toThrow(/unknown op/);

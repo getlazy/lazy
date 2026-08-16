@@ -32,14 +32,15 @@ import type { StoredConversation } from '../../src/storage/types';
 import type { Storage } from '../../src/storage/interface';
 
 /**
- * Minimal in-memory Storage stub — the sweep only ever calls two conversation
+ * Minimal in-memory Storage stub — the sweep only ever calls three conversation
  * methods, and a real FileStorage would need the storage lock the daemon holds.
  * Counts isConversationImported calls so the "don't re-parse history" fast path
- * is observable.
+ * is observable. `loadConversation` is what the no-regression guard reads to
+ * compare an incoming capture against what is already stored.
  */
 function makeStorageStub(preloaded: string[] = []) {
   const saved = new Map<string, StoredConversation>();
-  for (const id of preloaded) saved.set(id, { sessionId: id } as StoredConversation);
+  for (const id of preloaded) saved.set(id, { sessionId: id, messages: [] } as unknown as StoredConversation);
   const stub = {
     saved,
     importedChecks: 0,
@@ -47,6 +48,9 @@ function makeStorageStub(preloaded: string[] = []) {
     async isConversationImported(sessionId: string): Promise<boolean> {
       stub.importedChecks++;
       return saved.has(sessionId);
+    },
+    async loadConversation(sessionId: string): Promise<StoredConversation | null> {
+      return saved.get(sessionId) ?? null;
     },
     async saveConversation(conv: StoredConversation): Promise<void> {
       stub.saveCalls.push(conv.sessionId);
@@ -251,6 +255,54 @@ describe('capture sweep', () => {
     await utimes(file, future, future);
     const second = await sweepConversations({ ...opts(), storage, cursor });
     expect(second.captured).toEqual([sid]);
+  });
+
+  /**
+   * INVARIANT: capture never SHORTENS a stored conversation.
+   *
+   * Session JSONLs are append-only, so a copy whose messages are a strict prefix of
+   * what is stored is an older snapshot of the same line — never a legitimate
+   * update. The sweep re-parses whenever size/mtime changed, and a stale copy's
+   * mtime moves for reasons that add no content (merely mounting its dir does it).
+   * That is how a 3555-message conversation was overwritten with a 2989-message
+   * prefix, leaving the user unable to see their own latest conversation via
+   * `lazy view`. See src/import/conversation-storage.ts.
+   */
+  test('never replaces a stored conversation with a strict prefix of itself', async () => {
+    const sid = 'e5555555-0000-0000-0000-00000000000f';
+    const file = await seedShared(sid, 5);
+    const storage = makeStorageStub();
+    const cursor = createSweepCursor();
+
+    const first = await sweepConversations({ ...opts(), storage, cursor });
+    expect(first.captured).toEqual([sid]);
+    const full = storage.saved.get(sid)!.messages.length;
+    expect(full).toBe(10);
+
+    // The same session, but an EARLIER copy of it wins discovery (in the incident:
+    // a frozen copy in another projects dir whose mtime had just been bumped).
+    await writeFile(file, jsonlBody(sid, lazyRoot, 2));
+    const second = await sweepConversations({ ...opts(), storage, cursor });
+
+    expect(second.captured).toEqual([]);
+    expect(second.skippedRegressions).toEqual([sid]);
+    expect(storage.saved.get(sid)!.messages.length).toBe(full);
+  });
+
+  test('a DIVERGENT rewrite is still stored — only provable prefixes are refused', async () => {
+    // The guard must stay narrow: a session whose messages genuinely differ is not
+    // a truncation, and refusing it would freeze the store against real updates.
+    const sid = 'e6666666-0000-0000-0000-000000000010';
+    const file = await seedShared(sid, 3);
+    const storage = makeStorageStub();
+    const cursor = createSweepCursor();
+    await sweepConversations({ ...opts(), storage, cursor });
+
+    await writeFile(file, jsonlBody('e6666666-0000-0000-0000-000000000010-fork', lazyRoot, 1)
+      .replace(/"sessionId":"[^"]*"/g, `"sessionId":"${sid}"`));
+    const second = await sweepConversations({ ...opts(), storage, cursor });
+    expect(second.captured).toEqual([sid]);
+    expect(second.skippedRegressions).toEqual([]);
   });
 
   /**

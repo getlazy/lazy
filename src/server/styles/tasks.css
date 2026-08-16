@@ -1,0 +1,22 @@
+.sort-link {
+  color: var(--text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.sort-link:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+.sort-link.sort-active {
+  color: var(--text);
+}
+.protection-badge {
+  color: var(--warning, #d29922);
+  font-weight: 600;
+  cursor: help;
+}
+.protection-legend {
+  color: var(--text-secondary);
+  font-size: 0.85em;
+  margin-top: 0.75em;
+}

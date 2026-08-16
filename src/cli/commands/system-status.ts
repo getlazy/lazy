@@ -23,6 +23,7 @@ import { resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { isDaemonRunning, readPid } from '../../daemon';
 import { theme } from '../theme';
 import { VERSION } from '../../version';
+import { builderScratchDir } from '../../builder/scratch';
 
 const LABEL_WIDTH = 11;
 
@@ -80,6 +81,12 @@ export async function commandSystemStatus(_args: string[]): Promise<void> {
 
   // ── Storage backend ──────────────────────────────────────────────────────
   line('Storage', config.storage.backend);
+
+  // ── Builder scratch dir ──────────────────────────────────────────────────
+  // Where builder artifacts land. Named here because it lives outside the repo,
+  // so nothing else would ever lead the human to it. Size and cleanup guidance
+  // belong to `lazy doctor` (single warning surface), not here.
+  line('Scratch', builderScratchDir(root));
 
   // ── Daemon ───────────────────────────────────────────────────────────────
   // Cheap liveness check (flock + PID alive) — no socket RPC. Use

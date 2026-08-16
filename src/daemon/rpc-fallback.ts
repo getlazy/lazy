@@ -204,15 +204,25 @@ export async function querySearch(params: {
 
 export interface DiffResult {
   output: string;
+  /** The git range the diff was computed over, e.g. `main...HEAD`. */
+  diffRange: string;
+  /** The resolved task's canonical short id. */
+  taskId: string;
 }
 
 export async function queryDiff(params: {
   taskId: string;
   full?: boolean;
+  /** Restrict the diff to these pathspecs. */
+  files?: string[];
+  /** Which "how to get the full diff" hint to render. Default 'cli'. */
+  surface?: 'cli' | 'mcp';
 }): Promise<DiffResult> {
   const rpc = await tryRpc<DiffResult>('diff', {
     taskId: params.taskId,
     full: params.full,
+    files: params.files?.length ? params.files : undefined,
+    surface: params.surface,
   });
   if (rpc) return rpc;
 
@@ -228,8 +238,17 @@ export async function queryDiff(params: {
 
 // --- Wait ---
 
+export interface WaitTaskSnapshot {
+  task_id: string;
+  display_id: string;
+  code: string | null;
+  status: string;
+}
+
 export interface WaitResult {
   task_id: string;
+  /** Task code, or short id when the task has no code. */
+  display_id?: string;
   status: string;
   timed_out: boolean;
   turn_count?: number;
@@ -238,15 +257,34 @@ export interface WaitResult {
     role: string;
     timestamp: number;
   };
+  /** Every task waited on, with its status at return time. */
+  tasks?: WaitTaskSnapshot[];
+  /** Tasks still working at return time (excludes the winner). */
+  pending?: WaitTaskSnapshot[];
+  /**
+   * Present ONLY when the winner's worktree holds an unresolved merge — a task
+   * that is mid-merge must never read as a settled `blocked`
+   * (fix-sync-silent-conflict).
+   */
+  merge_state?: { merge_in_progress: boolean; unmerged_files: string[]; summary: string };
 }
 
+/**
+ * Wait for the FIRST of one or more tasks to finish its turn.
+ *
+ * `taskIds` races the whole set inside a SINGLE daemon request — N parallel
+ * client-side waits would burn a connection per task and still leave the losers
+ * to cancel.
+ */
 export async function queryWait(params: {
-  taskId: string;
+  taskId?: string;
+  taskIds?: string[];
   timeout?: number;
 }): Promise<WaitResult> {
   try {
     const rpc = await tryRpc<WaitResult>('wait', {
       taskId: params.taskId,
+      taskIds: params.taskIds,
       timeout: params.timeout,
     });
     if (rpc) return rpc;
@@ -362,9 +400,16 @@ export interface DaemonMcpConfigResult {
 
 export async function queryDaemonMcpConfig(params: {
   name?: string;
+  /**
+   * pid of the session that will own this credential — `lazy builder` passes
+   * its own. The daemon uses it to keep a LIVE builder's token out of the
+   * eviction path when the registry's builder cap trips (see mcp-tokens.ts).
+   */
+  ownerPid?: number;
 }): Promise<DaemonMcpConfigResult> {
   const rpc = await tryRpc<DaemonMcpConfigResult>('getDaemonMcpConfig', {
     name: params.name,
+    ownerPid: params.ownerPid,
   });
   if (rpc) return rpc;
 
@@ -610,11 +655,13 @@ export async function queryRejectTask(params: {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  actor?: Actor;
 }): Promise<RejectTaskRpcResult> {
   const rpc = await tryRpc<RejectTaskRpcResult>('rejectTask', {
     taskId: params.taskId,
     reason: params.reason,
     acceptDirtyWorktree: params.acceptDirtyWorktree,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -636,11 +683,13 @@ export async function queryCloseTask(params: {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  actor?: Actor;
 }): Promise<CloseTaskRpcResult> {
   const rpc = await tryRpc<CloseTaskRpcResult>('closeTask', {
     taskId: params.taskId,
     reason: params.reason,
     acceptDirtyWorktree: params.acceptDirtyWorktree,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -684,9 +733,11 @@ export interface SubmitTaskRpcResult {
 
 export async function querySubmitTask(params: {
   taskId: string;
+  actor?: Actor;
 }): Promise<SubmitTaskRpcResult> {
   const rpc = await tryRpc<SubmitTaskRpcResult>('submitTask', {
     taskId: params.taskId,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -712,11 +763,13 @@ export async function queryResumeTask(params: {
   taskId: string;
   modelOverride?: string;
   effortOverride?: string;
+  actor?: Actor;
 }): Promise<ResumeTaskRpcResult> {
   const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
     taskId: params.taskId,
     modelOverride: params.modelOverride,
     effortOverride: params.effortOverride,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 
@@ -763,10 +816,12 @@ export interface ReparentTaskRpcResult {
 export async function queryReparentTask(params: {
   taskId: string;
   parent: string;
+  actor?: Actor;
 }): Promise<ReparentTaskRpcResult> {
   const rpc = await tryRpc<ReparentTaskRpcResult>('reparentTask', {
     taskId: params.taskId,
     parent: params.parent,
+    actor: params.actor,
   });
   if (rpc) return rpc;
 

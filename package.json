@@ -1,18 +1,19 @@
 {
   "name": "lazy",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "type": "module",
   "bin": {
     "lazy": "./src/index.ts"
   },
   "scripts": {
     "dev": "bun run generate:version && bun run ensure:agent-placeholder && bun run src/index.ts",
+    "dev:server": "bun --watch ./src/dev/web-server.ts",
     "build": "bun run generate:version && bun run typecheck && bun run scripts/build.ts",
     "install:local": "bun run build && mkdir -p ~/.lazy/bin && mv lazy ~/.lazy/bin/lazy && mv lazy-agent ~/.lazy/bin/lazy-agent && echo 'Installation to ~/.lazy.bin complete.'",
     "generate:version": "test -f scripts/generate-version.ts && bun run scripts/generate-version.ts || true",
-    "test": "bun run generate:version && bun run ensure:agent-placeholder && bun test",
-    "test:e2e": "bun run generate:version && bun run ensure:agent-placeholder && bun test test/e2e/",
-    "test:all": "bun run generate:version && bun run ensure:agent-placeholder && LAZY_SLOW_TESTS=1 bun test",
+    "test": "bun run generate:version && bun run ensure:agent-placeholder && bun test --timeout 30000",
+    "test:e2e": "bun run generate:version && bun run ensure:agent-placeholder && bun test --timeout 30000 test/e2e/",
+    "test:all": "bun run generate:version && bun run ensure:agent-placeholder && LAZY_SLOW_TESTS=1 bun test --timeout 30000",
     "ensure:agent-placeholder": "test -f lazy-agent || echo placeholder > lazy-agent",
     "prepare": "bun run generate:version && bun run ensure:agent-placeholder",
     "typecheck": "tsc --noEmit"
@@ -26,9 +27,10 @@
     "@opentelemetry/context-async-hooks": "^2.9.0",
     "@opentelemetry/core": "^2.9.0",
     "@opentelemetry/sdk-trace-base": "^2.9.0",
-    "@pierre/diffs": "^1.1.11",
     "diff": "^8.0.3",
     "fuse.js": "^7.1.0",
+    "github-slugger": "^2.0.0",
+    "marked": "^18.0.9",
     "postgres": "^3.4.8"
   }
 }

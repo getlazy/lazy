@@ -205,6 +205,11 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
   // left behind by a crash, then start a fresh daemon.
   // startDaemonServer's flock ensures only one daemon wins if multiple
   // callers race to start.
+  //
+  // The isDaemonRunning check above is not what makes this safe — two callers
+  // can both pass it and one then loses the flock race. cleanupStaleFiles
+  // itself refuses while a live process holds the daemon lock, so a loser
+  // cannot delete the winner's files.
   cleanupStaleFiles(projectRoot);
   await startDaemonBackground(projectRoot);
   return true;

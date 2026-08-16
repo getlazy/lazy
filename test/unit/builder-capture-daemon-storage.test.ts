@@ -23,6 +23,11 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildDaemonRpcRequest } from '../../src/daemon/client';
 import { buildBuilderStorageFactory } from '../../src/supervisor/builder';
+import {
+  BUILDER_STORAGE_METHODS,
+  STORAGE_METHODS,
+  handleBuilderStorageCall,
+} from '../../src/daemon/rpc-handlers';
 import type { Storage } from '../../src/storage/interface';
 
 describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
@@ -55,6 +60,77 @@ describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
     );
     expect(url).toBe('http://localhost/rpc/storage');
     expect(options.unix).toBe('/home/user/.lazy/daemon/lazy.sock');
+  });
+
+  // INVARIANT: the route family is a property of the CREDENTIAL, not of the
+  // caller's intent. A builder container holds a per-identity MCP token, which
+  // /rpc/* refuses by design — so its storage calls must land on /builder/*.
+  // Routing them at /rpc/* is the 401-every-30-seconds bug this fixes; the
+  // alternative "fixes" (ship the shared token into the container, or teach
+  // /rpc/* to accept MCP tokens) both widen a deliberate boundary.
+  test('routePrefix "builder" targets /builder/storage over TCP', () => {
+    const { url } = buildDaemonRpcRequest(
+      'http://host.docker.internal:26024',
+      'builder-mcp-token',
+      'storage',
+      '/repo',
+      { method: 'saveConversation', args: {} },
+      'builder',
+    );
+    expect(url).toBe('http://host.docker.internal:26024/builder/storage');
+  });
+
+  test('routePrefix "builder" targets /builder/storage over the unix socket too', () => {
+    const { url, options } = buildDaemonRpcRequest(
+      '/home/user/.lazy/daemon/lazy.sock',
+      'builder-mcp-token',
+      'storage',
+      '/repo',
+      {},
+      'builder',
+    );
+    expect(url).toBe('http://localhost/builder/storage');
+    expect(options.unix).toBe('/home/user/.lazy/daemon/lazy.sock');
+  });
+
+  test('the default prefix stays "rpc" — existing daemon-token callers are unchanged', () => {
+    const { url } = buildDaemonRpcRequest('http://127.0.0.1:26024', 't', 'list', '/repo', {});
+    expect(url).toBe('http://127.0.0.1:26024/rpc/list');
+  });
+});
+
+describe('BUILDER_STORAGE_METHODS — the capture allowlist', () => {
+  // INVARIANT: a builder container may call FOUR storage methods. The list is
+  // the security boundary of the /builder/storage surface: everything on it is
+  // something the SUPERVISOR does on the human's behalf (persist this session's
+  // conversation, stamp/read its own resume intent). Widening it widens what a
+  // compromised builder container can do to the store — give a new caller its
+  // own surface instead of adding an entry here.
+  test('contains exactly the four capture methods', () => {
+    expect([...BUILDER_STORAGE_METHODS].sort()).toEqual([
+      'getStoragePath',
+      'listBuilderResumeIntents',
+      'saveBuilderResumeIntent',
+      'saveConversation',
+    ]);
+  });
+
+  test('every allowlisted method actually exists on the full storage surface', () => {
+    for (const method of BUILDER_STORAGE_METHODS) {
+      expect(STORAGE_METHODS[method]).toBeDefined();
+    }
+  });
+
+  test('a non-allowlisted method is refused with 403, before any storage is opened', async () => {
+    await expect(
+      handleBuilderStorageCall('/repo', { method: 'saveTask', args: {} }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  test('a missing method is a 400', async () => {
+    await expect(
+      handleBuilderStorageCall('/repo', { args: {} }),
+    ).rejects.toMatchObject({ status: 400 });
   });
 });
 

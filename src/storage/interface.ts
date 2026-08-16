@@ -43,9 +43,14 @@ import type {
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  ReviewComment,
+  ReviewCommentInput,
+  ReviewCommentUpdate,
 } from './types';
 import type { SpanRecord } from '../tracing/types';
 import type { RunnerType } from '../config/types';
+import type { WaitInterval, WaitOutcome } from '../types';
+import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
 
 /**
  * Options for creating a new turn
@@ -62,7 +67,22 @@ export interface CreateTurnOptions {
   endShaWork?: string;
   mergeConflicts?: MergeConflict[];
   violations?: FileViolation[];
+  /** Model this turn was launched with (request side — usually a tier alias). */
   model?: string;
+  /**
+   * Concrete model id the agent self-reported for this turn (agent turns only).
+   * Omit when the agent reported none — never fall back to the alias here, or
+   * the alias-vs-concrete distinction becomes unrecoverable.
+   */
+  modelId?: string;
+  /** Reasoning effort in force for this turn, as resolved at launch. */
+  effort?: string;
+  /**
+   * What the agent reported about its own lazy MCP tools at session start
+   * (`lazy=<status> tools=<n>`). Omit when the agent reported nothing — absent
+   * means "unknown", never "had none". See `Turn.mcp_tools`.
+   */
+  mcpTools?: string;
   prompt?: string;
   /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
   actor?: Actor;
@@ -123,9 +143,13 @@ export interface Storage {
   // --- Tasks ---
 
   /**
-   * Create a new task
+   * Create a new task.
+   *
+   * `actor` records the CHANNEL the creation came through (MCP → 'builder' or
+   * 'agent', CLI → omitted, which reads as human). It is stamped on the initial
+   * 'backlog' status-changelog entry so "who created this task" is auditable.
    */
-  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task>;
+  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: Actor): Promise<Task>;
 
   /**
    * Get a task by ID (supports prefix matching and code lookup)
@@ -528,6 +552,50 @@ export interface Storage {
     lineage?: HunkApprovalLineage,
   ): Promise<HunkApproval>;
 
+  // --- Review Comments (anchored, threaded diff comments) ---
+
+  /**
+   * Persist an anchored review comment (file + line + diff side) or a reply in
+   * an existing thread.
+   *
+   * INVARIANT: Human feedback is saved FIRST, before any failable dispatch
+   * (ask launch, agent resume, network). A comment that never reaches the agent
+   * MUST still exist and be visible. See CLAUDE.md "Never Lose Human Feedback".
+   *
+   * INVARIANT: This is a PASSIVE write, like follow-ups — it MUST NOT feed the
+   * comment auto-react loop. Review comments reach the agent only through an
+   * explicit, read-only `ask` turn, or batched into an unblock work turn; they
+   * are NOT `Comment` records and never start a turn by themselves.
+   */
+  createReviewComment(taskId: string, input: ReviewCommentInput): Promise<ReviewComment>;
+
+  /**
+   * Get all review comments for a task, oldest first.
+   */
+  getTaskReviewComments(taskId: string): Promise<ReviewComment[]>;
+
+  /**
+   * Update the delivery bookkeeping on a review comment: ask state (pending →
+   * answered/failed) for 'ask' intent, delivery state (pending_delivery →
+   * delivered) for 'comment' intent.
+   *
+   * The comment body, its anchor, and its intent are immutable — only delivery
+   * state may change, so a failed ask degrades to a visible error and an
+   * unblock that never launched leaves its comments pending for the next
+   * attempt, rather than either losing the human's words.
+   *
+   * `withdrawnAt` is the one deliberate exception, and it is not an edit: it
+   * records that the reviewer retracted their OWN message before it reached the
+   * agent. The record and its thread survive; the message is simply excluded
+   * from the queue and from any future unblock. It is one-way — implementations
+   * must set it, never clear it.
+   */
+  updateReviewComment(
+    taskId: string,
+    commentId: string,
+    update: ReviewCommentUpdate,
+  ): Promise<ReviewComment>;
+
   // --- Conversations ---
 
   /**
@@ -736,7 +804,34 @@ export interface Storage {
 
   /**
    * Read persisted trace spans, optionally filtered to those starting at or
-   * after `sinceMs` (epoch ms). Powers the `lazy timings` readout.
+   * after `sinceMs` (epoch ms). Powers the `lazy stats timings` readout.
    */
   readTraceSpans(sinceMs?: number): Promise<SpanRecord[]>;
+
+  // --- Wait intervals ---
+
+  /**
+   * Record that a task's agent has BLOCKED on another task (an in-flight
+   * `lazy_wait`/`lazy_ask`). Written by the daemon at the moment the blocking
+   * MCP call starts — see src/daemon/wait-registry.ts.
+   *
+   * Persisted so duration/economics reports can subtract waited time from an
+   * agent's wall-clock; without it, decomposing work into subtasks makes an
+   * agent look arbitrarily slower than one that did everything inline.
+   */
+  recordWaitStart(start: WaitIntervalStart): Promise<void>;
+
+  /**
+   * Close a previously started wait interval. An interval that never gets this
+   * call (the turn or the daemon died mid-wait) stays readable with
+   * `ended_at: null` — that is a documented state, not corruption.
+   */
+  recordWaitEnd(id: string, endedAt: string, outcome: WaitOutcome): Promise<void>;
+
+  /**
+   * Read wait intervals in start order, optionally filtered by task or session.
+   * Consumers attribute an interval to a turn via `turn_sequence` (best-effort)
+   * or by time overlap with the turn's window.
+   */
+  readWaitIntervals(filter?: WaitIntervalFilter): Promise<WaitInterval[]>;
 }

@@ -3,7 +3,7 @@
  */
 
 import { join } from 'path';
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { TestContext, MockAgentResponse } from './setup';
 import { extractTaskId } from './assertions';
 import { runReconcile } from './reconcile';
@@ -23,6 +23,40 @@ export async function createTask(
     throw new Error(`Failed to create task: ${result.stderr}\n${result.stdout}`);
   }
   return extractTaskId(result.stdout);
+}
+
+/**
+ * Create a task that a daemon-based test will operate on, asserting that the
+ * daemon has not been started yet.
+ *
+ * WHY THIS EXISTS: `startDaemonServer()` in a test process opens storage and
+ * holds `<dataDir>/.storage-lock` for the daemon's whole lifetime. `ctx.lazy()`
+ * runs the CLI as a SUBPROCESS, so it is a different pid and sees a live
+ * holder — it then retries for ~7 seconds and fails with a message about two
+ * projects sharing one store, which is both slow and a lie. Every daemon suite
+ * already creates its fixtures first; this makes that ordering explicit and
+ * enforced instead of folklore, and turns the 7s mystery into an immediate,
+ * accurate error.
+ *
+ * Use `createTask` as normal for tests with no in-process daemon.
+ */
+export async function createTaskBeforeDaemon(
+  ctx: TestContext,
+  goal: string,
+  prompt?: string,
+): Promise<string> {
+  const lockPath = join(ctx.root, '.lazy', '.storage-lock');
+  if (existsSync(lockPath)) {
+    throw new Error(
+      `createTaskBeforeDaemon('${goal}') was called while the storage lock is held ` +
+      `(${lockPath}).\n` +
+      `An in-process daemon holds that lock for its lifetime, and \`lazy create\` runs ` +
+      `as a subprocess, so it would retry for ~7s and then fail with a misleading ` +
+      `"storage paths collide" error.\n` +
+      `Move this call above startDaemonServer() in the test's setup.`,
+    );
+  }
+  return createTask(ctx, goal, prompt);
 }
 
 /**

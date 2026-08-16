@@ -28,6 +28,8 @@ export interface PushbackResult {
   session_id: string;
   /** Full token usage of the push-back invocation (incl. cache tokens). */
   usage: AgentResponse['usage'];
+  /** Concrete model id the agent reported for THIS invocation, when it reports one. */
+  model_id?: string;
 }
 
 /**
@@ -82,16 +84,18 @@ export async function runPermissionPushback(
   let responseText: string;
   let responseSessionId = sessionId;
   let usage: AgentResponse['usage'] = { ...ZERO_USAGE };
+  let reportedModelId: string | undefined;
   try {
     const parsed = agent.parseResponse(stdout, { workingDir: worktreePath });
     responseText = parsed.result;
     responseSessionId = parsed.session_id;
     usage = parsed.usage;
+    reportedModelId = parsed.model_id;
   } catch (err) {
     logError(`[pushback] Failed to parse response: ${err instanceof Error ? err.message : err}`);
     responseText = 'Push-back failed: could not parse agent response.';
   }
 
   log(`[pushback] Agent responded (${responseText.length} chars)`);
-  return { prompt, response: responseText, session_id: responseSessionId, usage };
+  return { prompt, response: responseText, session_id: responseSessionId, usage, model_id: reportedModelId };
 }

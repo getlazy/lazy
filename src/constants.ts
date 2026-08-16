@@ -12,8 +12,19 @@ export const LAZY_COAUTHOR_TRAILER = 'Co-Authored-By: Lazy <noreply@getlazy.dev>
 
 /**
  * Detect the current actor from the LAZY_ACTOR environment variable.
- * MCP tool handlers set LAZY_ACTOR=builder when invoking CLI commands.
  * Defaults to 'human' (CLI usage).
+ *
+ * SCOPE: this is the FALLBACK for the default (CLI/human) channel. It is
+ * meaningful only in the process that read it: inside the daemon — one
+ * long-lived process serving every channel, where LAZY_ACTOR is never set — it
+ * reports 'human' for a builder's MCP call. Lifecycle code running in the
+ * daemon must therefore take the actor from its params
+ * (`params.actor ?? getActor()`); the MCP boundary threads the real channel
+ * through the RPC layer rather than relying on this. See {@link MCP_ACTOR}.
+ *
+ * Nothing in lazy sets LAZY_ACTOR any more (the MCP server used to, back when
+ * it shelled out to the CLI). It survives as an override for wrappers and for
+ * the daemonless in-process paths the e2e suite drives.
  */
 export function getActor(): Actor {
   return process.env.LAZY_ACTOR === 'builder' ? 'builder' : 'human';

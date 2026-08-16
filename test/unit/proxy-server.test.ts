@@ -590,3 +590,199 @@ describe('proxy smart routing (failover)', () => {
     fallback.server.stop();
   });
 });
+
+// ---- Token usage capture ----
+
+/** Anthropic's SSE shape for a streamed turn, including the cumulative usage. */
+function sseTurn(): string {
+  const events: Array<Record<string, unknown>> = [
+    {
+      type: 'message_start',
+      message: {
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        usage: {
+          input_tokens: 31,
+          output_tokens: 1,
+          cache_creation_input_tokens: 512,
+          cache_read_input_tokens: 4096,
+        },
+      },
+    },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 275 } },
+    { type: 'message_stop' },
+  ];
+  return events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
+}
+
+/** Serve `text` as a real chunked SSE stream, so the proxy exercises its tee. */
+function sseResponse(text: string): Response {
+  const chunks = text.match(/[\s\S]{1,16}/g) ?? [];
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const next = chunks.shift();
+      if (next === undefined) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new TextEncoder().encode(next));
+    },
+  });
+  return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+}
+
+describe('proxy usage capture', () => {
+  test('captures usage from a streamed response without altering the body', async () => {
+    const body = sseTurn();
+    const upstream = createControllableUpstream(() => sseResponse(body));
+    const ms = createMockSink();
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: upstream.url },
+      ms.sink,
+    );
+    await waitForFlush(20);
+
+    const resp = await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [], stream: true }),
+    });
+    expect(resp.status).toBe(200);
+    // INVARIANT: the tee is byte-transparent — the client sees the upstream
+    // bytes exactly, or the proxy has corrupted an agent's conversation.
+    expect(await resp.text()).toBe(body);
+
+    await waitForFlush();
+    // Exactly one record per request, even though the enqueue now happens at
+    // stream end rather than at response start.
+    expect(ms.records.length).toBe(1);
+    expect(ms.records[0].usage).toEqual({
+      inputTokens: 31,
+      outputTokens: 275,
+      cacheCreationInputTokens: 512,
+      cacheReadInputTokens: 4096,
+    });
+    expect(ms.records[0].status).toBe(200);
+    expect(ms.records[0].durationMs).not.toBeNull();
+
+    proxy.stop();
+    upstream.server.stop();
+  });
+
+  test('captures usage from a non-streaming JSON response', async () => {
+    const upstream = createControllableUpstream(() =>
+      Response.json({
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        usage: { input_tokens: 8, output_tokens: 19, cache_read_input_tokens: 100 },
+      }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: upstream.url },
+      ms.sink,
+    );
+    await waitForFlush(20);
+
+    await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    });
+    await waitForFlush();
+    expect(ms.records[0].usage).toEqual({
+      inputTokens: 8,
+      outputTokens: 19,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: 100,
+    });
+
+    proxy.stop();
+    upstream.server.stop();
+  });
+
+  test('records usage on the enforcement path, which already buffers the body', async () => {
+    // A request declaring tools takes the enforcement path. Nothing is denied
+    // here, so the body is forwarded verbatim — but usage must still land.
+    const upstream = createControllableUpstream(() =>
+      Response.json({
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tu-1', name: 'Read', input: { file_path: '/tmp/x' } }],
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 60, output_tokens: 12 },
+      }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: upstream.url },
+      ms.sink,
+    );
+    await waitForFlush(20);
+
+    await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [],
+        tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+      }),
+    });
+    await waitForFlush();
+    expect(ms.records[0].enforcement ?? null).toBeNull();
+    expect(ms.records[0].usage).toEqual({
+      inputTokens: 60,
+      outputTokens: 12,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+    });
+
+    proxy.stop();
+    upstream.server.stop();
+  });
+
+  // INVARIANT: usage is only ever read from a successful messages response.
+  // Everything else keeps the untouched passthrough and a null usage.
+  test('leaves usage null for non-messages endpoints and error responses', async () => {
+    const upstream = createControllableUpstream(({ count }) =>
+      count === 1
+        ? Response.json({ input_tokens: 42 })
+        : Response.json({ type: 'error', error: { type: 'overloaded_error' } }, { status: 500 }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: upstream.url },
+      ms.sink,
+    );
+    await waitForFlush(20);
+    const pp = portOf(proxy);
+
+    await fetch(`http://127.0.0.1:${pp}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [] }),
+    });
+    const errResp = await fetch(`http://127.0.0.1:${pp}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [] }),
+    });
+    expect(errResp.status).toBe(500);
+
+    await waitForFlush();
+    expect(ms.records.length).toBe(2);
+    expect(ms.records[0].endpoint).toBe('count_tokens');
+    expect(ms.records[0].usage).toBeNull();
+    expect(ms.records[1].status).toBe(500);
+    expect(ms.records[1].usage).toBeNull();
+
+    proxy.stop();
+    upstream.server.stop();
+  });
+});

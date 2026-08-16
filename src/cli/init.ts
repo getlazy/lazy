@@ -349,12 +349,141 @@ function checkAuthSetup(): void {
   }
 }
 
+/**
+ * Ignore entries `lazy init` ensures are present in the project's .gitignore.
+ *
+ * `.lazy/` is deliberately a single blanket rule rather than an enumeration of
+ * the paths lazy writes: nothing lazy puts in a project's `.lazy/` is meant to
+ * be tracked, and every enumerated list goes stale the moment lazy learns to
+ * write a new file there (each staleness being a fresh chance to leak runtime
+ * state into someone's commit).
+ *
+ * `.lazy-task-sandbox/` and `.lazy-lock` are NOT covered by `.lazy/`: gitignore
+ * matches whole path components, so `.lazy/` matches a directory named exactly
+ * `.lazy` and never these sibling prefixes. They need their own entries.
+ */
+export const LAZY_IGNORE_ENTRIES = [
+  '.env',
+  '.lazy-task-sandbox/',
+  '.lazy-lock',
+  '.lazy/',
+];
+
+/**
+ * Entries written by older versions of `lazy init`, back when the in-repo
+ * storage backend kept task JSON in `.lazy/tasks/` and that state was
+ * deliberately committed — so only the runtime subpaths could be ignored.
+ *
+ * That backend is gone (`src/config/loader.ts` rejects `backend = "in-repo"`
+ * and `"orphan-branch"`), so these are removed and replaced by `.lazy/`.
+ */
+const LEGACY_LAZY_IGNORE_ENTRIES = [
+  '.lazy/worktrees/',
+  '.lazy/bin/',
+  '.lazy/logs/',
+  '.lazy/recovery/',
+  '.lazy/tasks/*/*.tmp.*',
+  '.lazy/tasks/*/*.backup.*',
+  '.lazy/tasks/*/protocol/',
+  '.lazy/storage.lock',
+  '.lazy/.reconcile-lock',
+  '.lazy/tmp',
+  '.lazy/approve-passphrase',
+];
+
+/**
+ * Reconcile the project's .gitignore with LAZY_IGNORE_ENTRIES.
+ *
+ * Idempotent: repeated runs converge on the same file. Any legacy enumerated
+ * `.lazy/...` entry is dropped rather than left alongside the blanket rule, and
+ * an existing blanket `.lazy/` is left in place (older versions of init actively
+ * stripped it — that anti-migration is gone).
+ *
+ * Returns true if the file changed.
+ */
+export async function updateGitignore(targetDir: string): Promise<boolean> {
+  const gitignorePath = join(targetDir, '.gitignore');
+
+  if (!existsSync(gitignorePath)) {
+    writeFileSync(gitignorePath, LAZY_IGNORE_ENTRIES.join('\n') + '\n');
+    return true;
+  }
+
+  const before = readFileSync(gitignorePath, 'utf-8');
+
+  // Drop the legacy enumerated entries and the legacy `.workshop/` rule.
+  // Line-exact matching only: a user's own `.lazy/tasks/*/protocol/` comment or
+  // a negation (`!.lazy/keep-me`) is left untouched.
+  const kept = before.split('\n').filter(line => {
+    const trimmed = line.trim();
+    if (trimmed === LEGACY_DIR + '/') return false;
+    return !LEGACY_LAZY_IGNORE_ENTRIES.includes(trimmed);
+  });
+
+  const present = new Set(kept.map(line => line.trim()));
+  const missing = LAZY_IGNORE_ENTRIES.filter(entry => !present.has(entry));
+
+  let text = kept.join('\n');
+  if (missing.length > 0) {
+    text = text.trimEnd() + '\n' + missing.join('\n') + '\n';
+  }
+
+  if (text === before) return false;
+  writeFileSync(gitignorePath, text);
+  return true;
+}
+
+/**
+ * A .gitignore entry does nothing for files git already tracks. Projects set up
+ * under the old in-repo storage backend may still have `.lazy/**` committed, so
+ * adding `.lazy/` silently changes nothing for them.
+ *
+ * Tell the human and hand them the command — do NOT run it. That state may be
+ * the only copy of their task history, and untracking it as an init side effect
+ * would be exactly the kind of hidden side effect CLAUDE.md forbids.
+ */
+export async function warnAboutTrackedLazyFiles(targetDir: string): Promise<void> {
+  // Nothing can be tracked outside a git repo — no check to run, nothing to say.
+  if (!existsSync(join(targetDir, '.git'))) return;
+
+  const result = await runGit(['ls-files', '-z', '--', LAZY_DIR], { cwd: targetDir });
+  if (result.exitCode !== 0) {
+    // Not fatal: the ignore rule is written either way. Say so rather than
+    // pretending we checked.
+    console.log('');
+    console.log(`Note: could not check for tracked files under ${LAZY_DIR}/ (git: ${result.stderr || 'failed'}).`);
+    return;
+  }
+
+  const tracked = result.stdout.split('\0').filter(Boolean);
+  if (tracked.length === 0) return;
+
+  console.log('');
+  console.log(`Warning: git is already tracking ${tracked.length} file(s) under ${LAZY_DIR}/`);
+  console.log(`  The new ${LAZY_DIR}/ ignore rule does NOT untrack files git already knows about,`);
+  console.log('  so they will keep showing up in commits until you untrack them yourself.');
+  console.log('');
+  console.log('  To stop tracking them (files stay on disk, nothing is deleted):');
+  console.log(`    ${theme.command(`git rm -r --cached ${LAZY_DIR}`)}`);
+  console.log('');
+  console.log('  Then commit that change. Back the directory up first if it holds task');
+  console.log('  history you care about — lazy will not do it for you.');
+}
+
 export async function init(targetDir: string = process.cwd(), options: InitOptions = {}): Promise<void> {
   const lazyPath = join(targetDir, LAZY_DIR);
 
   // Check for both new and legacy directories
   if (existsSync(lazyPath)) {
     console.log(`Lazy already initialized in ${targetDir}`);
+    // Still reconcile .gitignore. Without this, a project initialized before
+    // the blanket `.lazy/` rule can never converge onto it — the enumerated
+    // entries were written by init, so init is the thing that must retire them.
+    // Silent when nothing changes.
+    if (await updateGitignore(targetDir)) {
+      console.log(`Updated .gitignore: lazy now ignores ${LAZY_DIR}/ wholesale`);
+      await warnAboutTrackedLazyFiles(targetDir);
+    }
     return;
   }
   const legacyPath = join(targetDir, LEGACY_DIR);
@@ -455,41 +584,9 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   }
 
   // Update .gitignore
-  const gitignorePath = join(targetDir, '.gitignore');
-  const ignoreEntries = [
-    '.env',
-    '.lazy-task-sandbox/',
-    '.lazy-lock',
-    '.lazy/worktrees/',
-    '.lazy/bin/',
-    '.lazy/logs/',
-    '.lazy/recovery/',
-    '.lazy/tasks/*/*.tmp.*',
-    '.lazy/tasks/*/*.backup.*',
-    '.lazy/tasks/*/protocol/',
-    '.lazy/storage.lock',
-    '.lazy/.reconcile-lock',
-    '.lazy/tmp',
-    // The edge-gate approval passphrase must never be committed: once in the
-    // repo it is inside the builder's context and the friction dissolves.
-    '.lazy/approve-passphrase',
-  ];
-
-  if (existsSync(gitignorePath)) {
-    let text = readFileSync(gitignorePath, 'utf-8');
-    // Remove old .lazy/ or .workshop/ ignore if present
-    text = text.replace(/^\.lazy\/\s*$/gm, '');
-    text = text.replace(/^\.workshop\/\s*$/gm, '');
-    for (const entry of ignoreEntries) {
-      if (!text.includes(entry)) {
-        text = text.trimEnd() + '\n' + entry + '\n';
-      }
-    }
-    writeFileSync(gitignorePath, text);
-  } else {
-    writeFileSync(gitignorePath, ignoreEntries.join('\n') + '\n');
-  }
+  await updateGitignore(targetDir);
   console.log('Adding lazy entries to .gitignore');
+  await warnAboutTrackedLazyFiles(targetDir);
 
   // Display storage location
   let storageDesc: string;

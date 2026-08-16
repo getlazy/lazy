@@ -296,4 +296,23 @@ describe('task codes', () => {
     expectFailure(result);
     expectError(result, 'Invalid code');
   });
+
+  /**
+   * REGRESSION: a code that is exactly 36 characters long — the length of a UUID.
+   * Task-id resolution used to take the "this is a full UUID" fast path on length
+   * alone, so such a task appeared in `lazy list` but every lookup by its code
+   * failed with "No task found matching". Resolution now keys off the UUID shape.
+   */
+  test('resolves a task whose code is exactly 36 characters', async () => {
+    const code = 'fix-approval-burned-on-failed-accept';
+    if (code.length !== 36) throw new Error(`fixture must be 36 chars, got ${code.length}`);
+
+    const createResult = await ctx.lazy(['create', '--goal', 'Fix approval', '--code', code]);
+    expectSuccess(createResult);
+
+    const showResult = await ctx.lazy(['show', code]);
+    expectSuccess(showResult);
+    expectOutput(showResult, 'Fix approval');
+    expectOutput(showResult, `Code:    ${code}`);
+  });
 });

@@ -14,8 +14,18 @@
 import { chmod, mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 
-/** Install a `lazy-agent` executable in `binDir`; returns its path. */
-export async function installFakeAgentBinary(binDir: string): Promise<string> {
+/**
+ * Install a `lazy-agent` executable in `binDir`; returns its path.
+ *
+ * `agentEntry` (path to src/agent-entry.ts) makes `lazy-agent mcp` run the REAL
+ * MCP server under bun. The supervisor's launch preflight does not merely check
+ * that the binary exists — it starts the MCP server the way Claude Code will and
+ * requires a JSON-RPC `initialize` response (`probeLazyMcpServerStartup`). A
+ * stub that exits non-zero for `mcp` therefore aborts every supervisor launch,
+ * which is not a property of the code under test. Omit it only for suites that
+ * never reach that probe.
+ */
+export async function installFakeAgentBinary(binDir: string, agentEntry?: string): Promise<string> {
   await mkdir(binDir, { recursive: true });
   const binPath = join(binDir, 'lazy-agent');
   await writeFile(
@@ -26,6 +36,13 @@ export async function installFakeAgentBinary(binDir: string): Promise<string> {
       '  echo "lazy-agent ok (fake, e2e)"',
       '  exit 0',
       'fi',
+      ...(agentEntry
+        ? [
+            'if [ "$1" = "mcp" ]; then',
+            `  exec bun run ${JSON.stringify(agentEntry)} "$@"`,
+            'fi',
+          ]
+        : []),
       'echo "fake lazy-agent: unsupported invocation: $*" >&2',
       'exit 64',
       '',

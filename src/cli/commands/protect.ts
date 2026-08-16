@@ -25,6 +25,7 @@ import { loadConfig, resolveConfigPath } from '../../config/loader';
 import { setSectionStringArray, setSectionBoolean, TomlEditError } from '../../config/toml-edit';
 import { branchExists, getRemoteDefaultBranch } from '../../git/operations';
 import { theme } from '../theme';
+import { docsFooter } from '../../docs/links';
 import type { Storage } from '../../storage';
 import type { Task } from '../../types';
 
@@ -399,5 +400,5 @@ Examples:
   lazy protect add-auth off             # Remove the task gate
 
 This command has no MCP equivalent on purpose: the builder must not manage
-its own gates. See docs/protected-branches.md.`);
+its own gates.${docsFooter('protected-branches')}`);
 }

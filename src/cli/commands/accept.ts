@@ -13,6 +13,7 @@ import { queryAcceptTaskPreflight, queryAcceptTask } from '../../daemon/rpc-fall
 import { theme } from '../theme';
 import { createPhaseDisplay } from '../phase-display';
 import { getActor } from '../../constants';
+import { docsFooter, docsUrl } from '../../docs/links';
 
 export async function commandAccept(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -63,8 +64,8 @@ export async function commandAccept(args: string[]): Promise<void> {
       const task = await resolveTaskOrExit(storage, taskId);
       const activeChildren = await getActiveChildren(task.id, storage);
       if (activeChildren.length > 0) {
-        const plural = activeChildren.length === 1 ? 'child' : 'children';
-        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${plural}; they'll be automatically re-parented and synced on the next sync — no action needed.`));
+        const one = activeChildren.length === 1;
+        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${one ? 'child' : 'children'}; ${one ? "it'll" : "they'll"} be automatically re-parented on accept. Run \`lazy sync\` on ${one ? 'it' : 'each'} afterwards — until then ${one ? 'its' : 'their'} merge base is behind this merge, which is how deletions silently reappear (see ${docsUrl('resurrection-guard') ?? 'docs/resurrection-guard.md'}).`));
         for (const child of activeChildren) {
           console.log(`  ${theme.taskId(displayId(child))} [${theme.status(child.status)}] ${child.goal}`);
         }
@@ -402,8 +403,13 @@ Options:
   --yes                 Skip interactive prompts (non-interactive mode)
   --wait                If merge fails due to pending CI checks, poll until checks
                         complete, then retry the merge. Timeout: 10 minutes.
-  --approve-file <file> Approve a violated file (repeatable). Required when accepting
-                        a conflict task — all violated files must be listed.
+  --approve-file <file> Approve a file (repeatable). Required when accepting a conflict
+                        task — all violated files must be listed. Also required when the
+                        merge would re-add a file the target branch deleted; accept
+                        refuses and names the files until each one is approved.
+                        All-or-nothing: a file left out makes accept REFUSE. Accept
+                        never reverts anything — unlike 'lazy unblock --approve-file',
+                        where a file left out is reverted to its base commit.
 
 Reason input priority: --reason flag > piped stdin > interactive prompt > "LGTM"
 
@@ -446,5 +452,5 @@ Examples:
   lazy accept abc12345 --yes                    # Accept without prompts (uses "LGTM")
   lazy accept abc12345 --reason "Ship it" --yes # Accept with reason, no prompts
   lazy accept abc12345 --wait                   # Wait for CI checks before merging
-  lazy accept abc12345 --approve-file a.ts --approve-file b.ts --yes  # Accept conflict task, approving violated files`);
+  lazy accept abc12345 --approve-file a.ts --approve-file b.ts --yes  # Accept conflict task, approving violated files${docsFooter('protected-branches')}`);
 }

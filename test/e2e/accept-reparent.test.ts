@@ -221,9 +221,16 @@ describe('accept re-parents unfinished children', () => {
   });
 
   // INVARIANT: The pre-accept note about active children must describe what
-  // lazy actually does (automatic re-parent + sync, no manual action) and must
-  // NOT use the non-lazy "rebasing" concept or imply the user must act.
-  test('pre-accept note conveys no action needed and never mentions rebasing', async () => {
+  // lazy actually does and must NOT use the non-lazy "rebasing" concept.
+  //
+  // This test previously asserted the note said "no action needed". That was
+  // false: re-parenting only rewrites parent_task_id — it never touches the
+  // child's worktree (see reparentChildren in src/cli/orphan.ts), so until the
+  // child is synced its merge base is behind the merge that just landed. That
+  // is precisely the stale-base condition that let the v0.12 release resurrect
+  // deleted files (docs/resurrection-guard.md), so the note now names
+  // `lazy sync` instead of promising there is nothing to do.
+  test('pre-accept note names lazy sync and never mentions rebasing', async () => {
     // 1. Create and start a parent task
     const parentId = await createTask(ctx, 'Parent task', 'Do parent work');
     await startAndWait(parentId);
@@ -242,8 +249,8 @@ describe('accept re-parents unfinished children', () => {
     expectSuccess(acceptResult);
 
     // 4. Note must not use "rebasing" (not a lazy concept) and must tell the
-    //    user no manual action is required.
+    //    user the one thing that IS required of them afterwards.
     expectOutputExcludes(acceptResult, 'rebasing');
-    expectOutput(acceptResult, 'no action needed');
+    expectOutput(acceptResult, 'lazy sync');
   });
 });

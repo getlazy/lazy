@@ -15,7 +15,7 @@
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { findFullTaskId } from '../helpers/storage';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
@@ -24,22 +24,27 @@ import { mintMcpToken, peekMcpToken, clearMcpTokenCache } from '../../src/daemon
 describe('MCP token revocation on session end', () => {
   let ctx: TestContext;
   let daemonBaseDir: string;
+  let restoreDaemonBaseDir: (() => void) | undefined;
 
   beforeEach(async () => {
     // Set BEFORE setupTestLazy so the CLI subprocesses inherit it: the token
     // registry lives in the daemon state dir, and a test must never touch the
     // developer's real one.
     daemonBaseDir = await makeDaemonBaseDir();
-    process.env.LAZY_DAEMON_BASE_DIR = daemonBaseDir;
+    restoreDaemonBaseDir = pinDaemonBaseDir(daemonBaseDir);
     clearMcpTokenCache();
     ctx = await setupTestLazy();
   });
 
   afterEach(async () => {
     clearMcpTokenCache();
-    delete process.env.LAZY_DAEMON_BASE_DIR;
-    await removeDaemonBaseDir(daemonBaseDir);
+    // Reap the daemon FIRST: cleanup resolves its pidfile through
+    // LAZY_DAEMON_BASE_DIR, so unpinning before this looks under the default
+    // base dir and leaves the daemon running.
     await ctx.cleanup();
+    restoreDaemonBaseDir?.();
+    restoreDaemonBaseDir = undefined;
+    await removeDaemonBaseDir(daemonBaseDir);
   });
 
   test('closing a task revokes its token, and only its own', async () => {

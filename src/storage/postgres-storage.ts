@@ -8,9 +8,17 @@
 import postgres from 'postgres';
 import { randomUUID } from 'crypto';
 import type { Storage, CreateTurnOptions } from './interface';
-import { normalizeTurnContent } from '../utils/turn-content';
+import { normalizeTurnContent, normalizeRecordContent, repairRecordContents } from '../utils/turn-content';
 import type { SpanRecord } from '../tracing/types';
 import { appendSpansJsonl, readSpansJsonl } from './trace-spans';
+import {
+  appendWaitStartJsonl,
+  appendWaitEndJsonl,
+  readWaitIntervalsJsonl,
+  type WaitIntervalStart,
+  type WaitIntervalFilter,
+} from './wait-intervals';
+import type { WaitInterval, WaitOutcome } from '../types';
 import type {
   Task,
   TaskTarget,
@@ -45,6 +53,9 @@ import type {
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  ReviewComment,
+  ReviewCommentInput,
+  ReviewCommentUpdate,
   FeedbackDelivery,
 } from './types';
 import { isTerminalStatus, DEFAULT_TASK_TYPE, DEFAULT_TASK_PRIORITY, type TaskType } from '../types';
@@ -101,6 +112,9 @@ const TURN_OPTIONAL_COLUMNS = [
   'merge_conflicts',
   'violations',
   'model',
+  'model_id',
+  'effort',
+  'mcp_tools',
   'prompt',
   'actor',
   'check_exit_code',
@@ -134,7 +148,7 @@ const HUNK_APPROVAL_OPTIONAL_COLUMNS = [
 const ACTOR_ONLY_OPTIONAL_COLUMNS = ['actor'] as const;
 
 /** Optional (`?`) fields of `BuilderResumeIntent` (camelCase — see loadBuilderResumeIntent). */
-const BUILDER_RESUME_INTENT_OPTIONAL_COLUMNS = ['sessionId', 'upgradePid', 'upgradeHost'] as const;
+const BUILDER_RESUME_INTENT_OPTIONAL_COLUMNS = ['sessionId', 'upgradePid', 'upgradeHost', 'reason'] as const;
 
 export class PostgresStorage implements Storage {
   private sql: ReturnType<typeof postgres>;
@@ -263,6 +277,15 @@ export class PostgresStorage implements Storage {
     if (version < 12) {
       await this.migrateToV12();
     }
+    if (version < 13) {
+      await this.migrateToV13();
+    }
+    if (version < 14) {
+      await this.migrateToV14();
+    }
+    if (version < 15) {
+      await this.migrateToV15();
+    }
   }
 
   private async migrateToV1(): Promise<void> {
@@ -356,7 +379,10 @@ export class PostgresStorage implements Storage {
           usage JSONB,
           timestamp BIGINT NOT NULL,
           check_exit_code INTEGER,
-          check_output TEXT
+          check_output TEXT,
+          model_id TEXT,
+          effort TEXT,
+          mcp_tools TEXT
         )
       `;
 
@@ -412,6 +438,35 @@ export class PostgresStorage implements Storage {
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS feedback_delivery TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
+      `;
+
+      // Migration: add model_id/effort columns if missing (for existing
+      // databases). NULL is the honest reading for every pre-existing row —
+      // those turns were written before the launch settings were captured, and
+      // backfilling them from today's task-level model/effort would invent
+      // history that never happened. Old turns stay readable with both NULL.
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS model_id TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+      await sql`
+        DO $ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS effort TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $
+      `;
+
+      // Migration: add mcp_tools — what the agent reported about its own lazy
+      // MCP tools at session start. NULL on every pre-existing row is the
+      // honest reading: those turns were never observed, which is not the same
+      // as having had no tools.
+      await sql`
+        DO $ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS mcp_tools TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $
       `;
 
       // Commits table
@@ -862,13 +917,57 @@ export class PostgresStorage implements Storage {
     });
   }
 
+  private async migrateToV13(): Promise<void> {
+    // Anchored, threaded review comments made against a task's diff in the web
+    // review surface, plus the agent's replies.
+    //
+    // INVARIANT: this is a SEPARATE table from `comments`. Comments feed the
+    // daemon's comment auto-react loop (which starts a work turn); a review
+    // comment must only ever reach the agent through an explicit, read-only
+    // `ask`, or batched into an unblock work turn. Sharing the table would
+    // silently kick the agent into coding, once per commented line.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`
+        CREATE TABLE IF NOT EXISTS review_comments (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          file TEXT NOT NULL,
+          line INTEGER NOT NULL,
+          side TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          actor TEXT,
+          intent TEXT,
+          ask_state TEXT,
+          ask_error TEXT,
+          delivery_state TEXT,
+          delivered_turn INTEGER,
+          turn_number INTEGER,
+          anchor_snippet TEXT,
+          withdrawn_at BIGINT
+        )
+      `;
+      await sql`CREATE INDEX IF NOT EXISTS idx_review_comments_task ON review_comments(task_id, created_at)`;
+      await sql`CREATE INDEX IF NOT EXISTS idx_review_comments_thread ON review_comments(thread_id)`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (13, '12')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
   async createTask(
     goal: string,
     parentTaskId?: string,
     branchedFromSha?: string,
     code?: string,
     type?: string,
-    agentId?: string
+    agentId?: string,
+    actor?: Actor
   ): Promise<Task> {
     // Reject duplicate codes against non-terminal tasks
     if (code) {
@@ -906,7 +1005,7 @@ export class PostgresStorage implements Storage {
       )
     `;
 
-    await this.recordStatusChange(id, 'backlog', now);
+    await this.recordStatusChange(id, 'backlog', now, actor);
 
     return {
       id,
@@ -965,7 +1064,9 @@ export class PostgresStorage implements Storage {
     const [exact] = this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE id = ${input}`);
     if (exact) return { task: exact };
 
-    if (input.match(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/)) {
+    // Same shape validateCode() accepts — dots included, or codes like
+    // 'release-v0.5' would skip code lookup entirely and fall to prefix matching.
+    if (input.match(/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/)) {
       const codeMatches = this.rowsToTasks(await this.sql`SELECT * FROM tasks WHERE code = ${input}`);
       if (codeMatches.length === 0) {
         // Fall through to prefix matching
@@ -1384,7 +1485,7 @@ export class PostgresStorage implements Storage {
         start_sha, end_sha, start_sha_work, end_sha_work,
         merge_conflicts, violations, usage, timestamp,
         check_exit_code, check_output, auto_triggered, turn_type,
-        feedback_delivery
+        feedback_delivery, model_id, effort, mcp_tools
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${content},
@@ -1396,7 +1497,8 @@ export class PostgresStorage implements Storage {
         ${options.usage ? this.sql.json(options.usage as any) : null}, ${now},
         ${options.checkExitCode ?? null}, ${options.checkOutput ?? null},
         ${options.autoTriggered ?? false}, ${storedTurnType},
-        ${storedFeedbackDelivery}
+        ${storedFeedbackDelivery}, ${options.modelId ?? null}, ${options.effort ?? null},
+        ${options.mcpTools ?? null}
       )
     `;
 
@@ -1425,6 +1527,9 @@ export class PostgresStorage implements Storage {
       ...(options.autoTriggered ? { auto_triggered: true } : {}),
       ...(storedTurnType ? { turn_type: storedTurnType } : {}),
       ...(storedFeedbackDelivery ? { feedback_delivery: storedFeedbackDelivery } : {}),
+      ...(options.modelId ? { model_id: options.modelId } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.mcpTools ? { mcp_tools: options.mcpTools } : {}),
     };
   }
 
@@ -1610,6 +1715,7 @@ export class PostgresStorage implements Storage {
   async createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment> {
     const id = randomUUID();
     const now = Date.now();
+    content = normalizeRecordContent(content, 'postgres-storage', 'createComment', 'Comment.content');
 
     await this.sql`
       INSERT INTO comments (id, task_id, content, created_at, actor, source)
@@ -1627,12 +1733,18 @@ export class PostgresStorage implements Storage {
     const rows = await this.sql<Record<string, unknown>[]>`
       SELECT * FROM comments WHERE task_id = ${taskId} ORDER BY created_at ASC
     `;
-    return rows.map(row => dropNullOptionals<Comment>(row, COMMENT_OPTIONAL_COLUMNS));
+    // Legacy rows can carry a NULL/absent content (see repairRecordContents).
+    return repairRecordContents(
+      rows.map(row => dropNullOptionals<Comment>(row, COMMENT_OPTIONAL_COLUMNS)),
+      'comment',
+      'postgres-storage',
+    );
   }
 
   async appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry> {
     const id = randomUUID();
     const now = Date.now();
+    content = normalizeRecordContent(content, 'postgres-storage', 'appendJournalEntry', 'JournalEntry.content');
 
     await this.sql`
       INSERT INTO journal_entries (id, task_id, content, created_at, actor)
@@ -1646,12 +1758,17 @@ export class PostgresStorage implements Storage {
     const rows = await this.sql<Record<string, unknown>[]>`
       SELECT * FROM journal_entries WHERE task_id = ${taskId} ORDER BY created_at ASC
     `;
-    return rows.map(row => dropNullOptionals<JournalEntry>(row, JOURNAL_OPTIONAL_COLUMNS));
+    return repairRecordContents(
+      rows.map(row => dropNullOptionals<JournalEntry>(row, JOURNAL_OPTIONAL_COLUMNS)),
+      'journal',
+      'postgres-storage',
+    );
   }
 
   async createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp> {
     const id = randomUUID();
     const now = Date.now();
+    content = normalizeRecordContent(content, 'postgres-storage', 'createFollowUp', 'FollowUp.content');
 
     // INVARIANT: a plain INSERT — no status change, no signal, no auto-react.
     await this.sql`
@@ -1666,7 +1783,11 @@ export class PostgresStorage implements Storage {
     const rows = await this.sql<Record<string, unknown>[]>`
       SELECT * FROM follow_ups WHERE task_id = ${taskId} ORDER BY created_at ASC
     `;
-    return rows.map(row => dropNullOptionals<FollowUp>(row, FOLLOW_UP_OPTIONAL_COLUMNS));
+    return repairRecordContents(
+      rows.map(row => dropNullOptionals<FollowUp>(row, FOLLOW_UP_OPTIONAL_COLUMNS)),
+      'follow-up',
+      'postgres-storage',
+    );
   }
 
   async listHunkApprovals(taskId: string): Promise<HunkApproval[]> {
@@ -1704,6 +1825,63 @@ export class PostgresStorage implements Storage {
       SELECT * FROM hunk_approvals WHERE task_id = ${taskId} AND hunk_hash = ${hunkHash}
     `;
     return dropNullOptionals<HunkApproval>(existing!, HUNK_APPROVAL_OPTIONAL_COLUMNS);
+  }
+
+  // --- Review Comments ---
+
+  async createReviewComment(taskId: string, input: ReviewCommentInput): Promise<ReviewComment> {
+    const id = randomUUID();
+    // A root comment is its own thread; a reply carries the root's id.
+    const threadId = input.threadId ?? id;
+    const now = Date.now();
+    const [row] = await this.sql<ReviewComment[]>`
+      INSERT INTO review_comments (
+        id, task_id, thread_id, file, line, side, role, content, created_at,
+        actor, intent, ask_state, ask_error, delivery_state, delivered_turn,
+        turn_number, anchor_snippet
+      )
+      VALUES (
+        ${id}, ${taskId}, ${threadId}, ${input.file}, ${input.line}, ${input.side},
+        ${input.role}, ${input.content}, ${now},
+        ${input.actor ?? null}, ${input.intent ?? null}, ${input.askState ?? null}, ${null},
+        ${input.deliveryState ?? null}, ${null},
+        ${input.turnNumber ?? null}, ${input.anchorSnippet ?? null}
+      )
+      RETURNING *
+    `;
+    return row;
+  }
+
+  async getTaskReviewComments(taskId: string): Promise<ReviewComment[]> {
+    return this.sql<ReviewComment[]>`
+      SELECT * FROM review_comments WHERE task_id = ${taskId} ORDER BY created_at ASC
+    `;
+  }
+
+  async updateReviewComment(
+    taskId: string,
+    commentId: string,
+    update: ReviewCommentUpdate,
+  ): Promise<ReviewComment> {
+    // Only delivery bookkeeping and withdrawal are mutable — the human's words,
+    // the anchor, and the intent are immutable once written. COALESCE leaves
+    // untouched fields alone; ask_error is explicitly clearable by passing null.
+    // withdrawn_at is COALESCEd like the rest, which also makes it one-way.
+    const [row] = await this.sql<ReviewComment[]>`
+      UPDATE review_comments SET
+        withdrawn_at = COALESCE(${update.withdrawnAt ?? null}, withdrawn_at),
+        ask_state = COALESCE(${update.askState ?? null}, ask_state),
+        delivery_state = COALESCE(${update.deliveryState ?? null}, delivery_state),
+        delivered_turn = COALESCE(${update.deliveredTurn ?? null}, delivered_turn),
+        turn_number = COALESCE(${update.turnNumber ?? null}, turn_number),
+        ask_error = ${update.askError === undefined ? this.sql`ask_error` : update.askError}
+      WHERE id = ${commentId} AND task_id = ${taskId}
+      RETURNING *
+    `;
+    if (!row) {
+      throw new Error(`Review comment not found: ${commentId} (task ${taskId})`);
+    }
+    return row;
   }
 
   async saveConversation(conversation: StoredConversation): Promise<void> {
@@ -1825,21 +2003,57 @@ export class PostgresStorage implements Storage {
     return row ?? null;
   }
 
+  private async migrateToV14(): Promise<void> {
+    // Builder resume intents gain WHY the builder was stopped. An intent
+    // written by the daemon while reaping the previous generation's children
+    // must NOT make the wrapper wait for a daemon restart — that restart has
+    // already happened by then, so the wait would never end. Nullable: an
+    // intent written by an older lazy is an upgrade intent, which is exactly
+    // the pre-existing behavior.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE builder_resume_intents ADD COLUMN IF NOT EXISTS reason TEXT`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (14, '13')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV15(): Promise<void> {
+    // A reviewer can retract their own review comment before it reaches the
+    // agent. Recorded as a timestamp rather than a delete, so the record and
+    // its thread survive; nullable, because every existing comment is simply
+    // not withdrawn. The V13 CREATE TABLE above carries the column too, for
+    // databases created fresh after this point.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE review_comments ADD COLUMN IF NOT EXISTS withdrawn_at BIGINT`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (15, '14')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 
   async saveBuilderResumeIntent(intent: BuilderResumeIntent): Promise<void> {
     await this.sql`
-      INSERT INTO builder_resume_intents (builder_id, project_root, session_id, created_at, upgrade_pid, upgrade_host)
+      INSERT INTO builder_resume_intents (builder_id, project_root, session_id, created_at, upgrade_pid, upgrade_host, reason)
       VALUES (
         ${intent.builderId}, ${intent.projectRoot}, ${intent.sessionId ?? null}, ${intent.createdAt},
-        ${intent.upgradePid ?? null}, ${intent.upgradeHost ?? null}
+        ${intent.upgradePid ?? null}, ${intent.upgradeHost ?? null}, ${intent.reason ?? null}
       )
       ON CONFLICT (builder_id) DO UPDATE SET
         project_root = EXCLUDED.project_root,
         session_id = EXCLUDED.session_id,
         created_at = EXCLUDED.created_at,
         upgrade_pid = EXCLUDED.upgrade_pid,
-        upgrade_host = EXCLUDED.upgrade_host
+        upgrade_host = EXCLUDED.upgrade_host,
+        reason = EXCLUDED.reason
     `;
   }
 
@@ -1855,7 +2069,8 @@ export class PostgresStorage implements Storage {
         session_id AS "sessionId",
         created_at AS "createdAt",
         upgrade_pid AS "upgradePid",
-        upgrade_host AS "upgradeHost"
+        upgrade_host AS "upgradeHost",
+        reason AS "reason"
     `;
     if (!row) return null;
     // Normalize SQL NULLs to absent optional fields.
@@ -1874,7 +2089,8 @@ export class PostgresStorage implements Storage {
             session_id AS "sessionId",
             created_at AS "createdAt",
             upgrade_pid AS "upgradePid",
-            upgrade_host AS "upgradeHost"
+            upgrade_host AS "upgradeHost",
+            reason AS "reason"
           FROM builder_resume_intents WHERE project_root = ${projectRoot} ORDER BY created_at DESC
         `
       : await this.sql<BuilderResumeIntent[]>`
@@ -1884,7 +2100,8 @@ export class PostgresStorage implements Storage {
             session_id AS "sessionId",
             created_at AS "createdAt",
             upgrade_pid AS "upgradePid",
-            upgrade_host AS "upgradeHost"
+            upgrade_host AS "upgradeHost",
+            reason AS "reason"
           FROM builder_resume_intents ORDER BY created_at DESC
         `;
     return rows.map(row =>
@@ -2149,34 +2366,51 @@ export class PostgresStorage implements Storage {
         WHERE ph.content ILIKE ${pattern}
       `,
 
-      this.sql<(Turn & { task_id: string; task_goal: string; task_code: string | null })[]>`
-        SELECT t.*, s.task_id, tasks.goal as task_goal, tasks.code as task_code
-        FROM turns t
-        INNER JOIN sessions s ON t.session_id = s.id
-        INNER JOIN tasks ON s.task_id = tasks.id
-        WHERE t.content ILIKE ${pattern}
+      // The entity_index columns below carry the hit's position in the list
+      // `show` pages over, so a hit is directly addressable. Each is ranked in
+      // an inner query and filtered OUTSIDE it: a window function is evaluated
+      // AFTER WHERE, so ranking in the same query would number only the
+      // MATCHING rows and report a position that does not exist.
+      this.sql<(Turn & { task_id: string; task_goal: string; task_code: string | null; entity_index: number })[]>`
+        SELECT * FROM (
+          SELECT t.*, s.task_id, tasks.goal as task_goal, tasks.code as task_code,
+                 (ROW_NUMBER() OVER (PARTITION BY t.session_id ORDER BY t.sequence ASC))::int - 1 AS entity_index
+          FROM turns t
+          INNER JOIN sessions s ON t.session_id = s.id
+          INNER JOIN tasks ON s.task_id = tasks.id
+        ) ranked
+        WHERE ranked.content ILIKE ${pattern}
       `,
 
-      this.sql<(Commit & { task_id: string; task_goal: string; task_code: string | null })[]>`
-        SELECT c.*, s.task_id, tasks.goal as task_goal, tasks.code as task_code
-        FROM commits c
-        INNER JOIN sessions s ON c.session_id = s.id
-        INNER JOIN tasks ON s.task_id = tasks.id
-        WHERE c.message ILIKE ${pattern}
+      this.sql<(Commit & { task_id: string; task_goal: string; task_code: string | null; entity_index: number })[]>`
+        SELECT * FROM (
+          SELECT c.*, s.task_id, tasks.goal as task_goal, tasks.code as task_code,
+                 (ROW_NUMBER() OVER (PARTITION BY c.session_id ORDER BY c.timestamp ASC))::int - 1 AS entity_index
+          FROM commits c
+          INNER JOIN sessions s ON c.session_id = s.id
+          INNER JOIN tasks ON s.task_id = tasks.id
+        ) ranked
+        WHERE ranked.message ILIKE ${pattern}
       `,
 
-      this.sql<(Comment & { task_goal: string; task_code: string | null })[]>`
-        SELECT c.*, t.goal as task_goal, t.code as task_code
-        FROM comments c
-        INNER JOIN tasks t ON c.task_id = t.id
-        WHERE c.content ILIKE ${pattern}
+      this.sql<(Comment & { task_goal: string; task_code: string | null; entity_index: number })[]>`
+        SELECT * FROM (
+          SELECT c.*, t.goal as task_goal, t.code as task_code,
+                 (ROW_NUMBER() OVER (PARTITION BY c.task_id ORDER BY c.created_at ASC))::int - 1 AS entity_index
+          FROM comments c
+          INNER JOIN tasks t ON c.task_id = t.id
+        ) ranked
+        WHERE ranked.content ILIKE ${pattern}
       `,
 
-      this.sql<(FollowUp & { task_goal: string; task_code: string | null })[]>`
-        SELECT f.*, t.goal as task_goal, t.code as task_code
-        FROM follow_ups f
-        INNER JOIN tasks t ON f.task_id = t.id
-        WHERE f.content ILIKE ${pattern}
+      this.sql<(FollowUp & { task_goal: string; task_code: string | null; entity_index: number })[]>`
+        SELECT * FROM (
+          SELECT f.*, t.goal as task_goal, t.code as task_code,
+                 (ROW_NUMBER() OVER (PARTITION BY f.task_id ORDER BY f.created_at ASC))::int - 1 AS entity_index
+          FROM follow_ups f
+          INNER JOIN tasks t ON f.task_id = t.id
+        ) ranked
+        WHERE ranked.content ILIKE ${pattern}
       `,
 
       this.sql<StoredConversation[]>`
@@ -2242,6 +2476,8 @@ export class PostgresStorage implements Storage {
         task_goal: turn.task_goal,
         content: turnText(turn),
         match_context: turnText(turn).slice(0, 200),
+        entity_index: turn.entity_index,
+        turn_sequence: turn.sequence,
       });
     }
 
@@ -2254,6 +2490,7 @@ export class PostgresStorage implements Storage {
         task_goal: commit.task_goal,
         content: commit.message,
         match_context: commit.message,
+        entity_index: commit.entity_index,
       });
     }
 
@@ -2266,6 +2503,7 @@ export class PostgresStorage implements Storage {
         task_goal: comment.task_goal,
         content: comment.content,
         match_context: comment.content.slice(0, 200),
+        entity_index: comment.entity_index,
       });
     }
 
@@ -2278,6 +2516,7 @@ export class PostgresStorage implements Storage {
         task_goal: followUp.task_goal,
         content: followUp.content,
         match_context: followUp.content.slice(0, 200),
+        entity_index: followUp.entity_index,
       });
     }
 
@@ -2320,5 +2559,22 @@ export class PostgresStorage implements Storage {
 
   async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
     return readSpansJsonl(this.getStoragePath(), sinceMs);
+  }
+
+  // --- Wait intervals ---
+  // JSONL under the storage path, exactly like trace spans: append-only
+  // observability data with no relational consumers, so it does not earn a
+  // table (or a migration) and stays byte-identical across backends.
+
+  async recordWaitStart(start: WaitIntervalStart): Promise<void> {
+    await appendWaitStartJsonl(this.getStoragePath(), start);
+  }
+
+  async recordWaitEnd(id: string, endedAt: string, outcome: WaitOutcome): Promise<void> {
+    await appendWaitEndJsonl(this.getStoragePath(), id, endedAt, outcome);
+  }
+
+  async readWaitIntervals(filter?: WaitIntervalFilter): Promise<WaitInterval[]> {
+    return readWaitIntervalsJsonl(this.getStoragePath(), filter);
   }
 }

@@ -7,15 +7,47 @@
 import type { Task, Session, Turn, Commit, Comment, JournalEntry, FollowUp, SearchResult, TaskPromptVersion } from '../storage';
 import type { TokenUsage } from '../types';
 import { renderMarkdown } from './markdown';
-import { renderDiff, diffStyles, diffScripts } from './diff';
+import {
+  parseUnifiedDiff,
+  renderReviewDiff,
+  diffViewOptionsHtml,
+  diffViewScript,
+} from './review-diff';
+import { STYLESHEET_PATH } from './styles';
 import { parentTaskIdOf } from '../task-target';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import { turnText } from '../utils/turn-content';
+import {
+  protectionMarkers,
+  protectionHeadline,
+  protectionSummary,
+  protectionAdvice,
+  PROTECTION_MARKER_LEGEND,
+  type TaskProtectionStatus,
+} from '../protection/status';
 
 export interface TaskWithSession {
   task: Task;
   session: Session | null;
   turnCount?: number;
+  /**
+   * Read-only protection status, present only when the project protects
+   * something. Computed by src/protection/status.ts — the dashboard renders
+   * the shared vocabulary rather than re-deriving gates from config.
+   */
+  protection?: TaskProtectionStatus;
+}
+
+/**
+ * The protection badge for a table row: the shared `[P]` / `[P][A]` markers,
+ * with the shared phrasing as the tooltip. Empty string when nothing is gated.
+ */
+function protectionBadge(protection: TaskProtectionStatus | null | undefined): string {
+  if (!protection) return '';
+  const markers = protectionMarkers(protection);
+  if (!markers) return '';
+  const title = protectionHeadline(protection) ?? '';
+  return `<span class="protection-badge" title="${escapeHtml(title)}">${escapeHtml(markers)}</span> `;
 }
 
 function shortId(id: string): string {
@@ -99,300 +131,14 @@ function getTaskStatus(task: Task, session: Session | null): string {
   return task.status;
 }
 
-export function layoutHtml(title: string, content: string, extraStyles: string = ''): string {
+export function layoutHtml(title: string, content: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)} - Lazy</title>
-  <style>
-    :root {
-      --bg: #ffffff;
-      --bg-secondary: #f9fafb;
-      --text: #111827;
-      --text-secondary: #6b7280;
-      --border: #e5e7eb;
-      --link: #2563eb;
-      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, monospace;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #111827;
-        --bg-secondary: #1f2937;
-        --text: #f9fafb;
-        --text-secondary: #9ca3af;
-        --border: #374151;
-        --link: #60a5fa;
-      }
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: var(--font-mono);
-      font-size: 14px;
-      line-height: 1.6;
-      color: var(--text);
-      background: var(--bg);
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-    a { color: var(--link); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    nav {
-      display: flex;
-      gap: 16px;
-      align-items: center;
-      padding: 12px 0;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 24px;
-    }
-    nav .brand { font-weight: bold; font-size: 16px; }
-    nav .sep { color: var(--text-secondary); }
-    .search-form { margin-left: auto; }
-    .search-form input {
-      font-family: var(--font-mono);
-      font-size: 13px;
-      padding: 4px 8px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--bg-secondary);
-      color: var(--text);
-      width: 200px;
-    }
-    h1 { font-size: 18px; margin-bottom: 16px; }
-    h2 { font-size: 16px; margin: 24px 0 12px; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-bottom: 24px;
-    }
-    th, td {
-      text-align: left;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--border);
-      white-space: nowrap;
-    }
-    th {
-      color: var(--text-secondary);
-      font-weight: normal;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    td.goal { white-space: normal; max-width: 400px; }
-    td.wrap { white-space: normal; }
-    tr:hover { background: var(--bg-secondary); }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-size: 12px;
-      color: #fff;
-    }
-    .detail-section {
-      margin-bottom: 24px;
-      padding: 16px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--bg-secondary);
-    }
-    .detail-section h2 { margin-top: 0; }
-    .detail-row {
-      display: flex;
-      gap: 8px;
-      padding: 4px 0;
-    }
-    .detail-label {
-      color: var(--text-secondary);
-      min-width: 140px;
-    }
-    .turn-chunk {
-      margin-bottom: 16px;
-      padding: 8px 8px 4px 8px;
-      border-left: 3px solid var(--border);
-      background: var(--bg-secondary);
-      border-radius: 4px;
-    }
-    .turn-chunk-header {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      color: var(--text-secondary);
-      margin-bottom: 8px;
-    }
-    .turn-auto {
-      display: inline-block;
-      font-size: 10px;
-      padding: 0 5px;
-      border-radius: 3px;
-      background: var(--border);
-      color: var(--text-secondary);
-    }
-    .turn {
-      margin-bottom: 12px;
-      padding: 12px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--bg);
-    }
-    .turn-header {
-      font-size: 12px;
-      color: var(--text-secondary);
-      margin-bottom: 8px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .turn-tokens {
-      color: var(--text-secondary);
-      font-size: 11px;
-      margin-left: 8px;
-    }
-    .turn-content {
-      font-size: 13px;
-      max-height: 300px;
-      overflow-y: auto;
-    }
-    .turn-content p { margin-bottom: 8px; }
-    .turn-content pre {
-      background: var(--bg-secondary);
-      padding: 8px;
-      border-radius: 4px;
-      overflow-x: auto;
-      margin: 8px 0;
-    }
-    .turn-content code {
-      font-family: var(--font-mono);
-      font-size: 12px;
-    }
-    .turn-content p code {
-      background: var(--bg-secondary);
-      padding: 1px 4px;
-      border-radius: 2px;
-    }
-    .turn-content h1, .turn-content h2, .turn-content h3,
-    .turn-content h4, .turn-content h5, .turn-content h6 {
-      margin: 12px 0 6px;
-      font-size: 14px;
-    }
-    .turn-content h1 { font-size: 16px; }
-    .turn-content h2 { font-size: 15px; }
-    .turn-content ul, .turn-content ol {
-      margin: 4px 0 8px 20px;
-    }
-    .turn-content blockquote {
-      border-left: 3px solid var(--border);
-      padding-left: 12px;
-      color: var(--text-secondary);
-      margin: 8px 0;
-    }
-    .turn-content hr {
-      border: none;
-      border-top: 1px solid var(--border);
-      margin: 12px 0;
-    }
-    .commit-row {
-      padding: 8px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .commit-sha {
-      font-weight: bold;
-    }
-    .commit-message {
-      color: var(--text);
-    }
-    .note {
-      padding: 12px;
-      margin-bottom: 8px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--bg);
-    }
-    .note-date {
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-    .note-content {
-      white-space: pre-wrap;
-      margin-top: 4px;
-    }
-    .filter-bar {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 16px;
-    }
-    .filter-bar a {
-      padding: 4px 12px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      font-size: 13px;
-    }
-    .filter-bar a.active {
-      background: var(--link);
-      color: #fff;
-      border-color: var(--link);
-    }
-    .empty-state {
-      color: var(--text-secondary);
-      padding: 40px;
-      text-align: center;
-    }
-    .search-result {
-      padding: 12px;
-      margin-bottom: 8px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-    }
-    .search-result-type {
-      font-size: 11px;
-      text-transform: uppercase;
-      color: var(--text-secondary);
-      letter-spacing: 0.5px;
-    }
-    .search-result-context {
-      white-space: pre-wrap;
-      font-size: 13px;
-      color: var(--text-secondary);
-      margin-top: 4px;
-      max-height: 100px;
-      overflow: hidden;
-    }
-    .prompt-link {
-      display: inline-block;
-      padding: 4px 12px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      font-size: 13px;
-      margin-right: 8px;
-      margin-bottom: 4px;
-    }
-    .breadcrumb {
-      font-size: 13px;
-      color: var(--text-secondary);
-      margin-bottom: 16px;
-    }
-    .breadcrumb a { color: var(--link); }
-    .action-links {
-      display: flex;
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .action-links a {
-      padding: 6px 16px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      font-size: 13px;
-    }
-    .action-links a.primary {
-      background: var(--link);
-      color: #fff;
-      border-color: var(--link);
-    }
-    ${diffStyles}
-    ${extraStyles}
-  </style>
+  <link rel="stylesheet" href="${STYLESHEET_PATH}">
 </head>
 <body>
   <nav>
@@ -400,6 +146,7 @@ export function layoutHtml(title: string, content: string, extraStyles: string =
     <span class="sep">|</span>
     <a href="/">dashboard</a>
     <a href="/tasks">tasks</a>
+    <a href="/review">review</a>
     <a href="/search">search</a>
     <form class="search-form" action="/search" method="get">
       <input type="text" name="q" placeholder="search..." />
@@ -463,39 +210,36 @@ export function taskListHtml(
     return `<th><a href="${href}" class="sort-link${isActive ? ' sort-active' : ''}">${label}${indicator}</a></th>`;
   }
 
-  const rows = tasksWithSessions.map(({ task, session, turnCount }) => {
+  const rows = tasksWithSessions.map(({ task, session, turnCount, protection }) => {
     const status = getTaskStatus(task, session);
     const lastActive = session?.last_interaction_at ? formatDate(session.last_interaction_at) : '-';
     const duration = session ? formatDuration(session.total_duration_ms) : '-';
     const tokens = formatTokenUsage(session?.total_usage ?? null);
     const turns = turnCount !== undefined && turnCount > 0 ? String(turnCount) : '-';
 
+    // A task the human has to act on gets a direct link to the review page —
+    // that page IS the pull request here, and hunting for it via task detail
+    // was the slowest step in the whole loop.
+    const reviewLink = (status === 'blocked' || status === 'conflict')
+      ? ` <a class="review-link" href="/review/${task.id}" title="Review changes">review →</a>`
+      : '';
     return `<tr>
       <td><a href="/tasks/${task.id}">${escapeHtml(displayId(task))}</a></td>
-      <td>${statusBadge(status)}</td>
+      <td>${statusBadge(status)}${reviewLink}</td>
       <td>${escapeHtml(task.model ?? '-')}</td>
       <td>${escapeHtml(turns)}</td>
       <td>${escapeHtml(lastActive)}</td>
       <td>${escapeHtml(duration)}</td>
       <td>${escapeHtml(tokens)}</td>
-      <td class="goal">${escapeHtml(task.goal)}</td>
+      <td class="goal">${protectionBadge(protection)}${escapeHtml(task.goal)}</td>
     </tr>`;
   }).join('\n');
 
-  const extraStyles = `
-    .sort-link {
-      color: var(--text-secondary);
-      text-decoration: none;
-      white-space: nowrap;
-    }
-    .sort-link:hover {
-      color: var(--text);
-      text-decoration: none;
-    }
-    .sort-link.sort-active {
-      color: var(--text);
-    }
-  `;
+  const anyProtected = tasksWithSessions.some(t => t.protection && protectionMarkers(t.protection));
+  const legend = anyProtected
+    ? `<div class="protection-legend">${escapeHtml(PROTECTION_MARKER_LEGEND)}</div>`
+    : '';
+
 
   return layoutHtml('Tasks', `
     <h1>Tasks</h1>
@@ -511,7 +255,25 @@ export function taskListHtml(
         ${rows}
       </tbody>
     </table>
-  `, extraStyles);
+    ${legend}
+  `);
+}
+
+/**
+ * The "Protected" detail row, or empty string when there is nothing to say.
+ * Word-for-word the same summary and advice `lazy show` prints.
+ */
+function protectionDetailRow(
+  protection: TaskProtectionStatus | null | undefined,
+  taskDisplayId: string,
+): string {
+  if (!protection) return '';
+  const summary = protectionSummary(protection);
+  if (!summary) return '';
+  const advice = protectionAdvice(protection, taskDisplayId)
+    .map(line => `<div class="protection-note">${escapeHtml(line)}</div>`)
+    .join('');
+  return `<div class="detail-row"><span class="detail-label">Protected</span><span>${escapeHtml(summary)}${advice}</span></div>`;
 }
 
 export function taskDetailHtml(
@@ -525,6 +287,8 @@ export function taskDetailHtml(
   children: Task[],
   promptVersions: TaskPromptVersion[],
   parentTask?: Task | null,
+  protection?: TaskProtectionStatus | null,
+  baseBranch?: string,
 ): string {
   const status = getTaskStatus(task, session);
   const taskDisplayId = displayId(task);
@@ -534,7 +298,7 @@ export function taskDetailHtml(
   let content = `
     <h1>Task ${escapeHtml(taskDisplayId)}</h1>
     <div class="action-links">
-      ${session ? `<a href="/tasks/${task.id}/pr" class="primary">View PR Diff</a>` : ''}
+      ${session ? `<a href="/review/${task.id}" class="primary">Review changes</a>` : ''}
     </div>
     <div class="detail-section">
       <h2>Details</h2>
@@ -548,6 +312,7 @@ export function taskDetailHtml(
       ${task.close_reason ? `<div class="detail-row"><span class="detail-label">Reason</span><span>${escapeHtml(task.close_reason)}</span></div>` : ''}
       ${parentId ? `<div class="detail-row"><span class="detail-label">Parent</span><span><a href="/tasks/${parentId}">${escapeHtml(parentTask ? displayId(parentTask) : shortId(parentId))}</a></span></div>` : ''}
       ${task.branched_from_sha ? `<div class="detail-row"><span class="detail-label">Branched From</span><span>${escapeHtml(task.branched_from_sha.substring(0, 8))}</span></div>` : ''}
+      ${protectionDetailRow(protection, taskDisplayId)}
     </div>
   `;
 
@@ -559,6 +324,7 @@ export function taskDetailHtml(
         <h2>Session (${escapeHtml(session.agent_id)})</h2>
         <div class="detail-row"><span class="detail-label">Status</span><span>${statusBadge(sessionStatus)}</span></div>
         <div class="detail-row"><span class="detail-label">Branch</span><span>${escapeHtml(session.git_branch)}</span></div>
+        ${baseBranch ? `<div class="detail-row"><span class="detail-label">Base</span><span>${escapeHtml(baseBranch)}</span></div>` : ''}
         <div class="detail-row"><span class="detail-label">Started</span><span>${escapeHtml(formatDate(session.started_at))}</span></div>
         ${session.last_interaction_at ? `<div class="detail-row"><span class="detail-label">Last Interaction</span><span>${escapeHtml(formatDate(session.last_interaction_at))}</span></div>` : ''}
         <div class="detail-row"><span class="detail-label">Duration</span><span>${escapeHtml(formatDuration(session.total_duration_ms))}</span></div>
@@ -765,24 +531,30 @@ export function promptVersionHtml(task: Task, version: TaskPromptVersion | null,
   `);
 }
 
-export async function commitDetailHtml(
-  task: Task,
-  commit: Commit,
-  diffText: string,
-  viewMode: 'side-by-side' | 'unified',
-): Promise<string> {
+/**
+ * The commit detail page.
+ *
+ * Uses the same renderer as the review surface. There was a second one
+ * (@pierre/diffs) here, which produced a prettier, syntax-highlighted diff but
+ * moved every line into a Shadow DOM — nothing outside the shadow root can
+ * address a line, which is why inline comments needed their own renderer in
+ * the first place. Two diff components meant two looks, two sets of behaviour
+ * (collapse, wrap) and one of them structurally unable to grow the feature the
+ * surface exists for. So: one renderer.
+ *
+ * The side-by-side view this page used to offer is back, built into the shared
+ * renderer, so it arrived here without a line of change on this page — which is
+ * the payoff of having one renderer. Syntax highlighting is still the
+ * outstanding cost.
+ *
+ * No comment affordances and no "Viewed" ticks here — this is a historical
+ * commit, not a change under review.
+ */
+export function commitDetailHtml(task: Task, commit: Commit, diffText: string): string {
   const taskDisplayId = displayId(task);
   const breadcrumb = `<div class="breadcrumb"><a href="/tasks/${task.id}">Task ${escapeHtml(taskDisplayId)}</a> &rsaquo; Commit</div>`;
-
-  const viewToggle = `
-    <div class="diff-view-toggle">
-      <a href="/tasks/${task.id}/commits/${commit.id}?view=side-by-side" class="${viewMode === 'side-by-side' ? 'active' : ''}">Side by side</a>
-      <a href="/tasks/${task.id}/commits/${commit.id}?view=unified" class="${viewMode === 'unified' ? 'active' : ''}">Unified</a>
-    </div>
-  `;
-
-  const diffMode = viewMode === 'side-by-side' ? 'split' : 'unified';
-  const renderedDiff = await renderDiff(diffText, diffMode);
+  const files = parseUnifiedDiff(diffText);
+  const rendered = renderReviewDiff(files, new Map(), { allowComments: false, allowViewed: false });
 
   return layoutHtml(`Commit ${escapeHtml(commit.sha.substring(0, 8))}`, `
     ${breadcrumb}
@@ -793,44 +565,9 @@ export async function commitDetailHtml(
       <div class="detail-row"><span class="detail-label">Status</span><span>${statusBadge(commit.status)}</span></div>
       <div class="detail-row"><span class="detail-label">Time</span><span>${escapeHtml(formatDate(commit.timestamp))}</span></div>
     </div>
-    ${viewToggle}
-    ${renderedDiff}
-    ${diffScripts}
-  `);
-}
-
-export function taskPrHtml(
-  task: Task,
-  session: Session,
-  commits: Commit[],
-  baseBranch?: string,
-): string {
-  const taskDisplayId = displayId(task);
-  const parentId = parentTaskIdOf(task);
-  const breadcrumb = `<div class="breadcrumb"><a href="/tasks/${task.id}">Task ${escapeHtml(taskDisplayId)}</a> &rsaquo; PR</div>`;
-
-  const commitList = commits.length > 0 ? `
-    <div class="detail-section">
-      <h2>Commits (${commits.length})</h2>
-      ${commits.map(c => `
-        <div class="commit-row">
-          <a href="/tasks/${task.id}/commits/${c.id}" class="commit-sha">${escapeHtml(c.sha.substring(0, 8))}</a>
-          <span class="commit-message">${escapeHtml(c.message)}</span>
-        </div>
-      `).join('')}
-    </div>
-  ` : '';
-
-  return layoutHtml(`PR - Task ${taskDisplayId}`, `
-    ${breadcrumb}
-    <h1>Pull Request: ${escapeHtml(task.goal)}</h1>
-    <div class="detail-section">
-      <div class="detail-row"><span class="detail-label">Branch</span><span>${escapeHtml(session.git_branch)}</span></div>
-      <div class="detail-row"><span class="detail-label">Base</span><span>${escapeHtml(baseBranch ?? (parentId ? 'lazy/' + shortId(parentId) : 'main'))}</span></div>
-      <div class="detail-row"><span class="detail-label">Duration</span><span>${escapeHtml(formatDuration(session.total_duration_ms))}</span></div>
-      ${session.total_usage ? `<div class="detail-row"><span class="detail-label">Token Usage</span><span>${escapeHtml(formatTokenCount(totalInputTokens(session.total_usage)))} in, ${escapeHtml(formatTokenCount(session.total_usage.outputTokens))} out</span></div>` : ''}
-    </div>
-    ${commitList}
+    ${diffViewOptionsHtml()}
+    <div id="commit-diff">${rendered}</div>
+    ${diffViewScript('#commit-diff')}
   `);
 }
 
@@ -907,7 +644,7 @@ export function searchResultsHtml(results: SearchResult[], query: string): strin
     return layoutHtml('Search', `
       <h1>Search</h1>
       <form action="/search" method="get">
-        <input type="text" name="q" placeholder="Search tasks, turns, commits, notes..." style="font-family:var(--font-mono);font-size:14px;padding:8px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text);width:100%;max-width:500px;" autofocus />
+        <input type="text" name="q" placeholder="Search tasks, turns, commits, notes..." style="font-family:var(--font-ui);font-size:14px;padding:8px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text);width:100%;max-width:500px;" autofocus />
       </form>
     `);
   }
@@ -921,9 +658,15 @@ export function searchResultsHtml(results: SearchResult[], query: string): strin
 
   const resultItems = results.map(r => {
     const rDisplayId = r.task_code ?? shortId(r.task_id);
+    // A turn hit knows its sequence, and the turn detail route is keyed by
+    // sequence — so link the hit straight at the turn instead of dropping the
+    // reader on the task page to hunt for the excerpt.
+    const typeLabel = r.entity_type === 'turn' && r.turn_sequence !== undefined
+      ? `<a class="search-result-type" href="/tasks/${r.task_id}/turns/${r.turn_sequence}">turn #${r.turn_sequence}</a>`
+      : `<span class="search-result-type">${escapeHtml(r.entity_type)}</span>`;
     return `
     <div class="search-result">
-      <span class="search-result-type">${escapeHtml(r.entity_type)}</span>
+      ${typeLabel}
       <a href="/tasks/${r.task_id}">${escapeHtml(rDisplayId)}</a>
       &mdash; ${escapeHtml(r.task_goal)}
       <div class="search-result-context">${escapeHtml(r.match_context)}</div>
@@ -1327,7 +1070,7 @@ export function dashboardHtml(stats: DashboardStats): string {
             const lastActive = session?.last_interaction_at ? formatDate(session.last_interaction_at) : '-';
             return `<tr>
               <td><a href="/tasks/${task.id}">${escapeHtml(displayId(task))}</a></td>
-              <td>${statusBadge(status)}</td>
+              <td>${statusBadge(status)} <a class="review-link" href="/review/${task.id}">review &rarr;</a></td>
               <td>${escapeHtml(lastActive)}</td>
               <td class="goal">${escapeHtml(task.goal)}</td>
             </tr>`;
@@ -1449,140 +1192,6 @@ export function dashboardHtml(stats: DashboardStats): string {
     </script>
   `;
 
-  const extraStyles = `
-    :root {
-      --hm-empty: #ebedf0;
-      --hm-g1: #9be9a8;
-      --hm-g2: #40c463;
-      --hm-g3: #30a14e;
-      --hm-g4: #216e39;
-      --hm-o1: #fde0a7;
-      --hm-o2: #fdba5c;
-      --hm-o3: #f47d21;
-      --hm-o4: #c35711;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --hm-empty: #161b22;
-        --hm-g1: #0e4429;
-        --hm-g2: #006d32;
-        --hm-g3: #26a641;
-        --hm-g4: #39d353;
-        --hm-o1: #3d2000;
-        --hm-o2: #6d3a00;
-        --hm-o3: #d97706;
-        --hm-o4: #fdba5c;
-      }
-    }
-    .hm-scroll { overflow-x: auto; }
-    .hm-day {
-      width: 13px;
-      height: 13px;
-      display: flex;
-      border-radius: 2px;
-      overflow: hidden;
-    }
-    .hm-active { cursor: pointer; }
-    .hm-active:hover {
-      outline: 1px solid var(--text-secondary);
-      outline-offset: -1px;
-    }
-    .hm-selected {
-      outline: 2px solid var(--link) !important;
-      outline-offset: -1px;
-    }
-    .hm-l, .hm-r {
-      width: 50%;
-      height: 100%;
-    }
-    .hm-swatch {
-      display: inline-block;
-      width: 12px;
-      height: 12px;
-      border-radius: 2px;
-      vertical-align: middle;
-    }
-    .hm-legend-scale {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      padding-top: 20px;
-      flex-shrink: 0;
-    }
-    .hm-legend-title {
-      font-size: 11px;
-      color: var(--text-secondary);
-      margin-bottom: 4px;
-    }
-    .hm-legend-bar {
-      display: flex;
-      align-items: center;
-      gap: 2px;
-    }
-    .hm-legend-text {
-      font-size: 10px;
-      color: var(--text-secondary);
-      padding: 0 4px;
-    }
-    .hm-months {
-      font-size: 11px;
-      color: var(--text-secondary);
-    }
-    .hm-day-labels {
-      font-size: 11px;
-      color: var(--text-secondary);
-      text-align: right;
-      padding-right: 4px;
-      min-width: 28px;
-    }
-    .hm-report {
-      margin-top: 16px;
-      padding: 12px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--bg);
-    }
-    .hm-report h3 {
-      font-size: 14px;
-      margin-bottom: 8px;
-    }
-    .hm-report-stats {
-      display: flex;
-      gap: 24px;
-      font-size: 13px;
-    }
-    .stat-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 12px;
-      margin-bottom: 24px;
-    }
-    .stat-card {
-      padding: 16px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--bg-secondary);
-      text-align: center;
-      text-decoration: none;
-      color: inherit;
-    }
-    .stat-card-link:hover {
-      border-color: var(--link);
-      text-decoration: none;
-    }
-    .stat-value {
-      font-size: 28px;
-      font-weight: bold;
-      line-height: 1.2;
-    }
-    .stat-label {
-      font-size: 12px;
-      color: var(--text-secondary);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-top: 4px;
-    }
-  `;
 
   return layoutHtml('Dashboard', `
     <h1>Dashboard</h1>
@@ -1595,7 +1204,7 @@ export function dashboardHtml(stats: DashboardStats): string {
     ${recentSection}
     ${viewAllLink}
     ${chartScript}
-  `, extraStyles);
+  `);
 }
 
 export function errorHtml(title: string, message: string): string {

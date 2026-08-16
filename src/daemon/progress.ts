@@ -219,6 +219,8 @@ export class PhaseReporter {
 export const ACCEPT_PHASES = {
   preflight: { id: 'preflight', label: 'Pre-flight validation' },
   edgeGate: { id: 'edge-gate', label: 'Branch-protection gate' },
+  resurrection: { id: 'resurrection', label: 'Deleted-file resurrection check' },
+  lfs: { id: 'lfs', label: 'Git LFS pointer check' },
   remoteState: { id: 'remote-state', label: 'Check remote merge state' },
   preAccept: { id: 'pre-accept', label: 'Pre-accept validation turn', optional: true },
   protection: { id: 'protection', label: 'Target-branch protection check', optional: true },
@@ -247,6 +249,8 @@ export function acceptPhasePlan(preAcceptEnabled: boolean): PlannedPhase[] {
   const p = ACCEPT_PHASES;
   return [
     p.edgeGate,
+    p.resurrection,
+    p.lfs,
     ...(preAcceptEnabled ? [p.preAccept] : []),
     p.protection,
     p.remoteRef,

@@ -17,12 +17,19 @@
  */
 
 import { randomUUID } from 'crypto';
-import { cp, mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
+import { mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
 import { join } from 'path';
 import type { Storage, CreateTurnOptions } from './interface';
-import { normalizeTurnContent } from '../utils/turn-content';
+import { normalizeTurnContent, normalizeRecordContent, repairRecordContents } from '../utils/turn-content';
 import type { SpanRecord } from '../tracing/types';
 import { appendSpansJsonl, readSpansJsonl } from './trace-spans';
+import {
+  appendWaitStartJsonl,
+  appendWaitEndJsonl,
+  readWaitIntervalsJsonl,
+  type WaitIntervalStart,
+  type WaitIntervalFilter,
+} from './wait-intervals';
 import { getDataDir } from '../cli/init';
 import type {
   Task,
@@ -74,17 +81,24 @@ import type {
   CommentSource,
   HunkApproval,
   HunkApprovalLineage,
+  ReviewComment,
+  ReviewCommentInput,
+  ReviewCommentUpdate,
+  ReviewCommentsFile,
 } from './types';
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { normalizeTagOrThrow } from '../utils/tags';
 import { targetFromLegacy, parentTaskIdOf } from '../task-target';
-import type { TaskTarget } from '../types';
+import type { TaskTarget, WaitInterval, WaitOutcome } from '../types';
 import type { RunnerType } from '../config/types';
 import { assertValidTransition } from '../task-state-machine';
 import { StorageLock } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
 
 const STORAGE_VERSION = 1;
+
+/** Canonical UUID shape (8-4-4-4-12 hex), as produced by randomUUID() for task ids. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Legacy model aliases → current names (removed in remove-model-aliases) */
 const LEGACY_MODEL_MAP: Record<string, string> = {
@@ -96,6 +110,12 @@ const LEGACY_MODEL_MAP: Record<string, string> = {
 export interface FileStorageOptions {
   /** Override the base path instead of computing from lazyRoot + dataDir */
   basePath?: string;
+  /**
+   * Fail an operation after this long waiting for the storage lock instead of
+   * running the default retry loop. Only for read-only diagnostics that must
+   * not block (`lazy doctor`) — see StorageLockOptions.
+   */
+  lockTimeoutMs?: number;
 }
 
 export class FileStorage implements Storage {
@@ -107,7 +127,9 @@ export class FileStorage implements Storage {
   constructor(lazyRoot: string, options?: FileStorageOptions) {
     this.basePath = options?.basePath ?? join(lazyRoot, getDataDir(lazyRoot));
     this.tasksPath = join(this.basePath, 'tasks');
-    this.lock = new StorageLock(lazyRoot, options?.basePath);
+    this.lock = new StorageLock(lazyRoot, options?.basePath, {
+      acquireTimeoutMs: options?.lockTimeoutMs,
+    });
   }
 
   // --- Path accessors ---
@@ -160,15 +182,6 @@ export class FileStorage implements Storage {
       }
     }
     return migrated;
-  }
-
-  private async exists(path: string): Promise<boolean> {
-    try {
-      await stat(path);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   private taskDir(taskId: string): string {
@@ -426,56 +439,54 @@ export class FileStorage implements Storage {
   }
 
   /**
-   * Atomic write for a task directory
+   * Write a set of files into a task's directory, each atomically.
    *
-   * Creates a temp directory, writes all files, then atomically renames.
+   * Stages every file in a temp directory and then renames them into place
+   * one by one. A rename within a filesystem is atomic, so a reader either
+   * sees the whole old file or the whole new one — which is what lets reads
+   * run without the storage lock.
+   *
+   * INVARIANT: this must NEVER swap the task DIRECTORY itself. The previous
+   * implementation copied the directory, renamed the original aside and moved
+   * the copy into place, which had two failure modes that both bit in
+   * production:
+   *
+   *   1. It wrote back a snapshot of every OTHER file taken before this
+   *      operation started, so an interleaved write was not merely raced on
+   *      one field — the loser's entire write was reverted. An acknowledged
+   *      `lazy edit --prompt` was silently rolled back this way (see
+   *      CLAUDE.md, "Never Lose Human Feedback").
+   *   2. Between the two renames the task directory did not exist, so a
+   *      concurrent lock-free reader saw the task VANISH — observed as
+   *      "404 Task not found" from a `start` racing an `edit`.
+   *
+   * Writing only the named files also makes the cost O(files written) rather
+   * than O(directory size).
    */
   private async atomicWriteTask(taskId: string, files: Record<string, unknown>): Promise<void> {
-    // Serialize concurrent async operations on the same task directory.
-    // The StorageLock (file-based) handles inter-process exclusion but is
-    // re-entrant within the same process, so two concurrent async operations
-    // (e.g. RPC handler + reconcile loop) can interleave at await points and
-    // corrupt each other's temp→real rename sequence.
+    // Serialize concurrent async operations on the same task directory, so two
+    // writers cannot interleave their stage→rename sequences.
     return this.taskMutex.withLock(taskId, async () => {
       const taskDir = this.taskDir(taskId);
       const tmpDir = `${taskDir}.tmp.${Date.now()}`;
 
       try {
-        // Create temp directory
+        await mkdir(taskDir, { recursive: true });
         await mkdir(tmpDir, { recursive: true });
 
-        // If updating, copy existing files first
-        if (await this.exists(taskDir)) {
-          const entries = await readdir(taskDir, { withFileTypes: true });
-          for (const entry of entries) {
-            if (entry.name.includes('.tmp') || entry.name.includes('.backup')) continue;
-            if (entry.isFile()) {
-              const content = await readFile(join(taskDir, entry.name), 'utf-8');
-              await writeFile(join(tmpDir, entry.name), content, 'utf-8');
-            } else if (entry.isDirectory()) {
-              await cp(join(taskDir, entry.name), join(tmpDir, entry.name), { recursive: true });
-            }
-          }
-        }
-
-        // Write new/updated files
+        // Stage every file first, so a failure to serialize one of them leaves
+        // the task directory completely untouched.
         for (const [filename, data] of Object.entries(files)) {
           await this.writeJson(join(tmpDir, filename), data);
         }
 
-        // Atomic swap
-        if (await this.exists(taskDir)) {
-          const backupDir = `${taskDir}.backup.${Date.now()}`;
-          await rename(taskDir, backupDir);
-          await rename(tmpDir, taskDir);
-          await rm(backupDir, { recursive: true, force: true });
-        } else {
-          await rename(tmpDir, taskDir);
+        for (const filename of Object.keys(files)) {
+          await rename(join(tmpDir, filename), join(taskDir, filename));
         }
-      } catch (err) {
-        // Cleanup temp on failure
+      } finally {
+        // Always clear the staging directory — on success it is empty, on
+        // failure it holds partial writes that must not linger.
         await rm(tmpDir, { recursive: true, force: true });
-        throw err;
       }
     });
   }
@@ -484,7 +495,7 @@ export class FileStorage implements Storage {
    * Find task ID by prefix match or code lookup.
    *
    * Resolution order:
-   * 1. Full UUID (36 chars) -> exact match
+   * 1. Canonical UUID shape -> taken as the id itself (never retried as a code)
    * 2. Hex prefix -> directory prefix match
    * 3. Otherwise -> search tasks by code field
    */
@@ -497,8 +508,20 @@ export class FileStorage implements Storage {
    * Find task ID with full resolution details (for error reporting).
    */
   private async findTaskIdWithDetails(input: string): Promise<{ id: string | null; ambiguousIds?: string[] }> {
-    if (input.length === 36) {
-      return { id: input }; // Full UUID
+    // Take the id fast path on UUID SHAPE, never on length alone: a task code can
+    // be exactly 36 characters long (e.g. 'fix-approval-burned-on-failed-accept'),
+    // and treating it as an id made every lookup by that code fail with "No task
+    // found matching" while the task sat there in `lazy list`.
+    //
+    // A UUID-shaped input stays in the id namespace even when no such task exists
+    // — it is NOT retried as a code. That keeps an id miss to one failed file read
+    // instead of a full-store scan (the code branch below reads every task.json),
+    // which `lazy doctor`'s storage liveness probe depends on: it deliberately
+    // looks up the nil UUID against a store of unbounded size under a fixed
+    // timeout. The two namespaces are disjoint by shape, so nothing is lost unless
+    // someone names a task code as a canonical UUID.
+    if (UUID_PATTERN.test(input)) {
+      return { id: input };
     }
 
     try {
@@ -682,7 +705,7 @@ export class FileStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string): Promise<Task> {
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: Actor): Promise<Task> {
     return this.lock.withLock(async () => {
       // Reject duplicate codes against non-terminal tasks
       if (code) {
@@ -726,7 +749,7 @@ export class FileStorage implements Storage {
         'reviews.json': { reviews: [] },
         'comments.json': { comments: [] },
         'follow-ups.json': { follow_ups: [] },
-        'status-changelog.json': { changes: [{ status: 'backlog', timestamp: now }] },
+        'status-changelog.json': { changes: [{ status: 'backlog', timestamp: now, ...(actor ? { actor } : {}) }] },
         'tag-history.json': { events: [] },
       });
 
@@ -809,11 +832,20 @@ export class FileStorage implements Storage {
           const now = Date.now();
           task.status = newStatus;
           task.completed_at = task.completed_at ?? session.ended_at;
-          // Persist the fix (best-effort, self-healing) — lock only for the write
+          // Persist the fix (best-effort, self-healing) — lock only for the
+          // write. Re-read task.json INSIDE the lock and apply just the two
+          // healed fields: `task` was loaded before this await-heavy sweep, and
+          // atomicWriteTask replaces the whole file, so writing the stale object
+          // would silently revert any field another operation changed meanwhile
+          // (e.g. an accepted `lazy edit --prompt`).
           try {
             await this.lock.withLock(async () => {
+              const current = await this.readTask(join(this.taskDir(task.id), 'task.json'));
+              if (!current) return;
+              current.status = newStatus;
+              current.completed_at = current.completed_at ?? session.ended_at;
               const changelog = await this.readAndAppendStatusChange(task.id, newStatus, now);
-              await this.atomicWriteTask(task.id, { 'task.json': task, 'status-changelog.json': changelog });
+              await this.atomicWriteTask(task.id, { 'task.json': current, 'status-changelog.json': changelog });
             });
           } catch {
             // In-memory fix still applies for this query
@@ -1489,6 +1521,9 @@ export class FileStorage implements Storage {
         mergeConflicts,
         violations,
         model,
+        modelId,
+        effort,
+        mcpTools,
         prompt,
         actor,
         checkExitCode,
@@ -1541,6 +1576,9 @@ export class FileStorage implements Storage {
         ...(mergeConflicts && mergeConflicts.length > 0 ? { merge_conflicts: mergeConflicts } : {}),
         ...(violations && violations.length > 0 ? { violations } : {}),
         ...(model ? { model } : {}),
+        ...(modelId ? { model_id: modelId } : {}),
+        ...(effort ? { effort } : {}),
+        ...(mcpTools ? { mcp_tools: mcpTools } : {}),
         ...(prompt ? { prompt } : {}),
         ...(actor ? { actor } : {}),
         ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
@@ -2008,7 +2046,7 @@ export class FileStorage implements Storage {
       const comment: Comment = {
         id: randomUUID(),
         task_id: fullId,
-        content,
+        content: normalizeRecordContent(content, 'file-storage', 'createComment', 'Comment.content'),
         created_at: Date.now(),
         ...(actor ? { actor } : {}),
         ...(source ? { source } : {}),
@@ -2041,7 +2079,11 @@ export class FileStorage implements Storage {
       }
     }
 
-    return comments.sort((a, b) => a.created_at - b.created_at);
+    // Records written before the MCP/`/rpc` boundaries validated their arguments
+    // can lack `content` entirely; substitute a visible placeholder so a defective
+    // record renders rather than crashing every reader (see repairRecordContents).
+    return repairRecordContents(comments, 'comment', 'file-storage')
+      .sort((a, b) => a.created_at - b.created_at);
   }
 
   // --- Journal ---
@@ -2068,7 +2110,7 @@ export class FileStorage implements Storage {
       const entry: JournalEntry = {
         id: randomUUID(),
         task_id: fullId,
-        content,
+        content: normalizeRecordContent(content, 'file-storage', 'appendJournalEntry', 'JournalEntry.content'),
         created_at: Date.now(),
         ...(actor ? { actor } : {}),
       };
@@ -2086,7 +2128,8 @@ export class FileStorage implements Storage {
     if (!fullId) return [];
 
     const journal = await this.readJournal(this.taskDir(fullId));
-    return journal.sort((a, b) => a.created_at - b.created_at);
+    return repairRecordContents(journal, 'journal', 'file-storage')
+      .sort((a, b) => a.created_at - b.created_at);
   }
 
   // --- Follow-ups (task-level orthogonal-work discoveries) ---
@@ -2108,7 +2151,7 @@ export class FileStorage implements Storage {
       const followUp: FollowUp = {
         id: randomUUID(),
         task_id: fullId,
-        content,
+        content: normalizeRecordContent(content, 'file-storage', 'createFollowUp', 'FollowUp.content'),
         created_at: Date.now(),
         ...(sessionId ? { session_id: sessionId } : {}),
       };
@@ -2129,7 +2172,8 @@ export class FileStorage implements Storage {
     if (!fullId) return [];
 
     const followUps = await this.readFollowUps(this.taskDir(fullId));
-    return followUps.sort((a, b) => a.created_at - b.created_at);
+    return repairRecordContents(followUps, 'follow-up', 'file-storage')
+      .sort((a, b) => a.created_at - b.created_at);
   }
 
   // --- Hunk Approvals ---
@@ -2181,6 +2225,91 @@ export class FileStorage implements Storage {
 
       await this.atomicWriteTask(fullId, { 'hunk-approvals.json': { approvals } });
       return approval;
+    });
+  }
+
+  // --- Review Comments ---
+
+  private reviewCommentsPath(fullId: string): string {
+    return join(this.taskDir(fullId), 'review-comments.json');
+  }
+
+  async getTaskReviewComments(taskId: string): Promise<ReviewComment[]> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return [];
+    const file = await this.readJson<ReviewCommentsFile>(this.reviewCommentsPath(fullId));
+    return (file?.review_comments ?? []).sort((a, b) => a.created_at - b.created_at);
+  }
+
+  async createReviewComment(taskId: string, input: ReviewCommentInput): Promise<ReviewComment> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      const file = await this.readJson<ReviewCommentsFile>(this.reviewCommentsPath(fullId));
+      const comments = file?.review_comments ?? [];
+
+      const id = randomUUID();
+      const comment: ReviewComment = {
+        id,
+        task_id: fullId,
+        // A root comment is its own thread; a reply carries the root's id.
+        thread_id: input.threadId ?? id,
+        file: input.file,
+        line: input.line,
+        side: input.side,
+        role: input.role,
+        content: input.content,
+        created_at: Date.now(),
+        ...(input.actor ? { actor: input.actor } : {}),
+        ...(input.intent ? { intent: input.intent } : {}),
+        ...(input.askState ? { ask_state: input.askState } : {}),
+        ...(input.deliveryState ? { delivery_state: input.deliveryState } : {}),
+        ...(input.turnNumber !== undefined ? { turn_number: input.turnNumber } : {}),
+        ...(input.anchorSnippet ? { anchor_snippet: input.anchorSnippet } : {}),
+      };
+      comments.push(comment);
+
+      await this.atomicWriteTask(fullId, { 'review-comments.json': { review_comments: comments } });
+      return comment;
+    });
+  }
+
+  async updateReviewComment(
+    taskId: string,
+    commentId: string,
+    update: ReviewCommentUpdate,
+  ): Promise<ReviewComment> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) {
+        throw new Error(`Task not found: ${taskId}`);
+      }
+
+      const file = await this.readJson<ReviewCommentsFile>(this.reviewCommentsPath(fullId));
+      const comments = file?.review_comments ?? [];
+      const existing = comments.find(c => c.id === commentId);
+      if (!existing) {
+        throw new Error(`Review comment not found: ${commentId} (task ${taskId})`);
+      }
+
+      // Only delivery bookkeeping and withdrawal are mutable — the human's
+      // words, the anchor, and the intent are immutable once written.
+      // Withdrawal is one-way: set, never cleared.
+      if (update.withdrawnAt !== undefined) existing.withdrawn_at = update.withdrawnAt;
+      if (update.askState !== undefined) existing.ask_state = update.askState;
+      if (update.deliveryState !== undefined) existing.delivery_state = update.deliveryState;
+      if (update.deliveredTurn !== undefined) existing.delivered_turn = update.deliveredTurn;
+      if (update.turnNumber !== undefined) existing.turn_number = update.turnNumber;
+      if (update.askError !== undefined) {
+        if (update.askError === null) delete existing.ask_error;
+        else existing.ask_error = update.askError;
+      }
+
+      await this.atomicWriteTask(fullId, { 'review-comments.json': { review_comments: comments } });
+      return existing;
     });
   }
 
@@ -2694,7 +2823,10 @@ export class FileStorage implements Storage {
         // Search turns
         const turnsFile = await this.readJson<TurnsFile>(join(taskDir, 'turns.json'));
         if (turnsFile) {
-          for (const turn of turnsFile.turns) {
+          // The array index is the locator: turns.json is the same list, in the
+          // same order, that getSessionTurns() returns and `show` pages over,
+          // so the index doubles as a ready-made `offset`.
+          for (const [index, turn] of turnsFile.turns.entries()) {
             if (this.textMatches(turn.content, query)) {
               results.push({
                 entity_type: 'turn',
@@ -2704,6 +2836,8 @@ export class FileStorage implements Storage {
                 task_goal: taskGoal,
                 content: turn.content,
                 match_context: this.extractContext(turn.content, query),
+                entity_index: index,
+                turn_sequence: turn.sequence,
               });
             }
           }
@@ -2712,7 +2846,7 @@ export class FileStorage implements Storage {
         // Search commits
         const commitsFile = await this.readJson<CommitsFile>(join(taskDir, 'commits.json'));
         if (commitsFile) {
-          for (const commit of commitsFile.commits) {
+          for (const [index, commit] of commitsFile.commits.entries()) {
             if (this.textMatches(commit.message, query)) {
               results.push({
                 entity_type: 'commit',
@@ -2722,6 +2856,7 @@ export class FileStorage implements Storage {
                 task_goal: taskGoal,
                 content: commit.message,
                 match_context: commit.message,
+                entity_index: index,
               });
             }
           }
@@ -2729,7 +2864,7 @@ export class FileStorage implements Storage {
 
         // Search comments
         const comments = await this.readComments(taskDir);
-        for (const comment of comments) {
+        for (const [index, comment] of comments.entries()) {
           if (this.textMatches(comment.content, query)) {
             results.push({
               entity_type: 'comment',
@@ -2739,13 +2874,14 @@ export class FileStorage implements Storage {
               task_goal: taskGoal,
               content: comment.content,
               match_context: this.extractContext(comment.content, query),
+              entity_index: index,
             });
           }
         }
 
         // Search follow-ups
         const followUps = await this.readFollowUps(taskDir);
-        for (const followUp of followUps) {
+        for (const [index, followUp] of followUps.entries()) {
           if (this.textMatches(followUp.content, query)) {
             results.push({
               entity_type: 'followup',
@@ -2755,6 +2891,7 @@ export class FileStorage implements Storage {
               task_goal: taskGoal,
               content: followUp.content,
               match_context: this.extractContext(followUp.content, query),
+              entity_index: index,
             });
           }
         }
@@ -2891,5 +3028,19 @@ export class FileStorage implements Storage {
 
   async readTraceSpans(sinceMs?: number): Promise<SpanRecord[]> {
     return readSpansJsonl(this.basePath, sinceMs);
+  }
+
+  // --- Wait intervals ---
+
+  async recordWaitStart(start: WaitIntervalStart): Promise<void> {
+    await appendWaitStartJsonl(this.basePath, start);
+  }
+
+  async recordWaitEnd(id: string, endedAt: string, outcome: WaitOutcome): Promise<void> {
+    await appendWaitEndJsonl(this.basePath, id, endedAt, outcome);
+  }
+
+  async readWaitIntervals(filter?: WaitIntervalFilter): Promise<WaitInterval[]> {
+    return readWaitIntervalsJsonl(this.basePath, filter);
   }
 }

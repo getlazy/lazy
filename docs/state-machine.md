@@ -11,7 +11,7 @@ Lazy tasks can be in one of the following statuses:
 - **`backlog`** — Task created but not yet started. No session exists.
 - **`working`** — Agent is actively working. Container/process is running.
 - **`blocked`** — Agent completed a turn and is waiting for human review/feedback.
-- **`conflict`** — Agent completed a turn but file permission violations were detected. Semantically "blocked with violations" — the task cannot be accepted until violations are resolved.
+- **`conflict`** — Agent completed a turn but file permission violations were detected. Semantically "blocked with violations" — the task cannot be accepted until violations are resolved. Leaving `conflict` requires an explicit approve/revert decision on every violated file; neither `lazy unblock` nor `lazy accept` infers one. See [Resolving a conflict task](lazy-toml.md#resolving-a-conflict-task).
 - **`pairing`** — Human is working interactively with Claude Code in the task worktree.
 - **`interrupted`** — Agent crashed or was killed unexpectedly.
 - **`merging`** — A merge is in flight. Two shapes, distinguished by the `accept_in_flight_from` task metadata key: without it, the merge lives on the forge (PR/MR submitted, waiting for CI and merge) and a later accept re-enters to ask the forge what happened; with it, a LOCAL merge phase is running right now inside an accept, and the marker records the status to restore if that phase aborts or dies. `merging` is stamped at the START of the merge phase, so a task reads `merging` for the whole time it is being merged — not for the last instant of it.
@@ -130,12 +130,28 @@ orthogonal to it.
 Mechanically: CLI commands default to `getActor()` (env-var / `human`). MCP tool
 handlers set the actor at origination — `MCP_ACTOR` (`builder`) for the builder,
 `AGENT_ACTOR` (`agent`) when the tool context carries a task id — and thread it
-through the RPC layer, because turn-creating lifecycle ops (start, unblock, ask,
-resume, stop, sync) persist their turn in the **daemon** — a shared process that
-can't see the caller's channel from its own environment. Read surfaces
+through the RPC layer, because lifecycle ops persist their records in the
+**daemon** — a shared process that can't see the caller's channel from its own
+environment, and whose `getActor()` therefore reports `human` for every caller.
+Everything an operation writes carries that one threaded actor: the turn, every
+status transition it makes, and any comment it leaves. That covers the
+turn-creating ops (start, unblock, ask, resume, stop, sync) *and* the ones that
+never launch an agent (reject, close, submit, reparent), plus task creation —
+whose channel lands on the initial `backlog` status-changelog entry — and
+journal entries. Read surfaces
 (`lazy show`, the web dashboard, the MCP `lazy_show` turns section, fidelity /
 report digests) label a human-role turn by its authoring actor so `builder` and
 `supervisor` turns are distinguishable from what a person typed.
+
+**An absent actor is not a bug — it means one of two things.** On a
+**`role: 'agent'`** turn, an actor is never written: the field records who
+submitted a *command*, and an agent's own reply is not one (`lazy show` labels
+those by role). On a **human-role** turn or a status change, absent means the
+default channel — a CLI/human action, or a record written before the actor was
+populated. Only the non-default channels (`builder`, `agent`, `system`,
+`supervisor`) are stamped, so legacy records and new CLI records read the same
+way. Turn-creating commands are the exception: they always write an explicit
+actor on the human-role turn, `human` included.
 
 ### Text intake is sanitized at the boundary
 
@@ -197,13 +213,24 @@ acting inside its own subtree).
   - On exit, synthesizes summary turn, transitions back to blocked
 
 - **`lazy ask <task>`** — blocked|conflict → working → blocked|conflict (status-neutral)
-  - Read-only: resumes the agent session in plan mode to answer one question
+  - Read-only and reflective: resumes the agent session (Claude Code plan mode plus
+    hard tool denials) to answer one question
   - Opens $EDITOR for the question (or reads from --message/stdin)
   - Records the question as a human turn before launching, the answer as an agent turn
   - Restores the **pre-ask** status when the turn completes, so an ask never
     mutates task state — the transient `working` window exists only so the
     reconciler and concurrent callers see the task as busy while the agent runs
   - If the agent crashes mid-ask the task lands in `interrupted` like any other turn
+
+- **`lazy chat <task>`** — no transition at all (status-neutral)
+  - On a `blocked`/`conflict` task: resumes the live agent session interactively in the
+    worktree, read-only and reflective (same denials as ask). No status change, no turn,
+    no commits — the only durable effect is the session log captured to storage on exit
+  - Holds the worktree lock (`.lazy-lock`, command `lazy chat`) for the chat's duration,
+    so start/unblock/sync/resume refuse while a chat is open rather than starting a turn
+    underneath it
+  - On a terminal task: rehydrates the captured session JSONL and resumes it in the
+    project root (no worktree exists)
 
 - **`lazy accept <task>`** — blocked|merging → merging → complete
   - Refuses if uncommitted changes exist
@@ -385,6 +412,75 @@ caller who is watching; the task's own status answers it for everyone else
 `agent:pre-accept` (`src/utils/working-substate.ts`, derived from the
 supervisor's `command_type`) exists because a bare `working` during an accept is
 indistinguishable from a human having unblocked the task by hand.
+
+## Waiting on subtasks
+
+An agent that decomposes its work into subtasks drives them with blocking lazy
+tools — `lazy_wait` (long-poll until a subtask finishes its turn) and `lazy_ask`
+(resume a subtask's agent and wait for its answer). For that whole stretch the
+parent agent is doing nothing, yet every read surface showed it as
+`working(agent)`: indistinguishable from an agent thinking hard for twenty
+minutes.
+
+**The signal is the call itself, not the agent's output.** Every agent tool call
+— container runner and host-process runner alike — is forwarded by
+`src/daemon/mcp-proxy.ts` to the daemon's `POST /mcp/:taskId/:toolName` route and
+authenticates with a per-session MCP token. So `handleMcpToolCall` already knows
+which task is blocked, on what, and since when. Nothing here parses agent stdout.
+
+| Piece | Where |
+| --- | --- |
+| Which tools park the caller | `BLOCKING_WAIT_TOOLS` in `src/daemon/wait-registry.ts` (`lazy_wait`, `lazy_ask`) |
+| Wrapping a blocking call | `trackWait()`, called from `handleMcpToolCall` |
+| Live marker readers see | `waiting.json` in the task's protocol dir (`src/protocol/waiting.ts`) |
+| Substate derivation + label | `src/utils/working-substate.ts` (`{ kind: 'waiting' }`) |
+| Durable intervals | `Storage.recordWaitStart/recordWaitEnd/readWaitIntervals` |
+
+**Rendering.** `working(waiting on fix-foo (2m10s))` across `lazy list`,
+`lazy active`, `lazy status`, `lazy show`, `lazy watch`, and the MCP `substate`
+field — all of them go through the shared derivation, so they cannot drift. Two
+concurrent waits list both labels; a larger fan-out summarizes
+(`waiting on a, b +2`).
+
+**Precedence.** Within an agent phase, `waiting` outranks `agent:answering` and
+`agent:pre-accept`: those say what the turn *is*, `waiting` says what it is doing
+this second. A harness phase outranks `waiting` — there the supervisor, not the
+agent, is the active thing. A dead run still reads `not-alive`; a wait marker
+never resurrects a stranded task.
+
+**Clearing is on settle, not on response delivery.** `trackWait` clears from a
+`finally`, so a call whose MCP client already disconnected — which the daemon
+finishes anyway (complete-anyway semantics) — still clears. The marker also
+carries the writing daemon's pid: a reader that finds that pid dead treats the
+whole file as stale and reports no waits, so a SIGKILLed daemon degrades to the
+pre-existing `working(agent)` rather than to a lie. `cleanProtocol` removes the
+file at turn teardown, and a clean daemon stop clears every marker it owns.
+
+### Persisted wait intervals
+
+The same bookkeeping writes a durable record, because waited time is not the
+agent's time: a turn that spent two hours blocked on a subtask must not bill
+those two hours to the agent in duration or economics reports.
+
+Intervals live in `<storagePath>/waits/intervals.jsonl` — shared JSONL used by
+every backend (the same reasoning as trace spans: telemetry-shaped, append-only
+data earns no table and no migration, and the cross-backend row shape is
+byte-identical by construction).
+
+The file is **event-structured**: a wait writes one `start` line when it begins
+and one `end` line when it settles, folded on read. That is what makes a crash
+readable — an interval whose `end` never arrived reads back with
+`ended_at: null` and `outcome: null`, the documented "died mid-wait" shape,
+rather than vanishing. Consumers should treat such an interval as open, bounded
+above by the turn's end.
+
+`turn_sequence` is **best-effort by construction**: agent turns are only written
+when the turn ends, so at wait time the only thing available is the next unused
+sequence. A consumer that needs certainty should attribute by time overlap with
+the turn's own window and use the field as a hint.
+
+Every write is wrapped in a catch: a wait that cannot be recorded still waits.
+An agent must never lose `lazy_wait` because an observability write failed.
 
 ## Agent Failure Classification
 
@@ -863,7 +959,8 @@ State machine behavior is tested in:
 - **`test/e2e/auto-resume.test.ts`** — Crash diagnostics, circuit breaker, and feedback redelivery on auto/manual resume
 - **`test/unit/merging-status.test.ts`** — Merging status transitions
 - **`test/e2e/pair.test.ts`** — Pairing state transitions and stale pairing sweep
-- **`test/e2e/agent-binary-seam.test.ts`** — `working → blocked` and `working → interrupted` driven by a REAL supervisor: watchdog kills (wind-down keeps the summary and blocks; no-progress interrupts), SIGTERM→SIGKILL escalation, in-turn crash retry, and session resume. Uses the fake-`claude`-binary seam (`setupTestLazy({ fakeClaude: true })`) so nothing in `src/` is mocked — the other e2e suites reach these transitions through a module mock that replaces the supervisor entirely
+- **`test/e2e/agent-binary-seam.test.ts`** — `working → blocked` and `working → interrupted` driven by a REAL supervisor: watchdog kills (wind-down keeps the summary and blocks; no-progress interrupts), SIGTERM→SIGKILL escalation, in-turn crash retry, and session resume. Uses the fake-`claude`-binary seam (`setupTestLazy({ fakeClaude: true })`) so nothing in `src/` is mocked — the other e2e suites reach these transitions through a module mock that replaces the supervisor entirely. Also covers the sandbox permission posture (`hostPermissionMode: 'sandbox'`), which needs `bwrap` and `socat` on Linux
+- **`test/e2e/auto-resume-binary-seam.test.ts`** — `interrupted → working → blocked` closed autonomously after a REAL watchdog kill: the reconciler resumes a genuinely crashed turn, the resumed agent receives the crash-context prefix, and unconsumed feedback is re-delivered verbatim. Assertions are on the argv the fake agent actually received, so they cover the prompt as *delivered*, not as composed — the one step `auto-resume.test.ts` cannot reach, because it fabricates its crash and stops at `command.json`
 
 When modifying state transitions, ensure tests cover:
 - Valid transitions (should succeed)

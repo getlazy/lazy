@@ -19,6 +19,7 @@ import {
   conversationStats,
   type SessionFileInfo,
 } from './claude-code-logs';
+import { excludeMachineOneshots } from './machine-oneshot';
 import { toStoredConversation } from './conversation-storage';
 import type { Storage } from '../storage';
 import { tryRemoteStorage } from '../cli/helpers';
@@ -38,7 +39,7 @@ export type SessionSnapshot = Map<string, { mtimeMs: number; size: number }>;
  * {mtimeMs, size}.
  */
 export async function snapshotSessionFiles(lazyRoot: string): Promise<SessionSnapshot> {
-  const files = await discoverProjectSessionFiles(lazyRoot);
+  const files = await excludeMachineOneshots(await discoverProjectSessionFiles(lazyRoot));
   const snapshot: SessionSnapshot = new Map();
   for (const f of files) {
     snapshot.set(f.sessionId, { mtimeMs: f.mtimeMs, size: f.size });
@@ -86,7 +87,12 @@ export async function captureNewOrModifiedConversations(
   storage: Storage,
   alreadyCaptured?: SessionSnapshot,
 ): Promise<CaptureResult> {
-  const files = await discoverProjectSessionFiles(lazyRoot);
+  // lazy's own machine one-shots are not conversations and are never owned by
+  // this run, even though they are written into the same dir while it runs (a
+  // fidelity summary from an accept made during the session). Excluding them
+  // here keeps them out of the store AND out of `newestSessionId`, which callers
+  // use as the resume target. See src/import/machine-oneshot.ts.
+  const files = await excludeMachineOneshots(await discoverProjectSessionFiles(lazyRoot));
 
   const owned = files.filter(f => isNewOrModified(f, before));
 

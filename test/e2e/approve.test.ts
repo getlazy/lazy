@@ -105,6 +105,31 @@ describe('protected branches: lazy approve + protected accepts', () => {
     expect(log.stdout).toContain('Protection test approved');
   });
 
+  // INVARIANT: the approval is still SINGLE-USE. Deferring consumption to the
+  // point the merge lands must not let an approval outlive the accept it paid
+  // for — a completed accept leaves no live approval behind.
+  test('a successful accept leaves no live approval behind', async () => {
+    await enableProtection(ctx);
+    const taskId = await setupBlockedTask(ctx, 'single-use');
+
+    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    expectSuccess(approveResult);
+    expectOutput(await ctx.lazy(['show', taskId]), 'Approval pending');
+
+    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    expectSuccess(acceptResult);
+    expectOutput(acceptResult, 'accepted and merged');
+
+    // Nothing left for a second accept to spend.
+    const show = await ctx.lazy(['show', taskId]);
+    expectSuccess(show);
+    expect(show.stdout).not.toContain('Approval pending');
+
+    const list = await ctx.lazy(['list', '--all']);
+    expectSuccess(list);
+    expect(list.stdout).not.toContain('[P][A]');
+  }, 30000);
+
   test('approve with wrong passphrase is refused and does not unlock accept', async () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'wrong-pass');
@@ -198,6 +223,24 @@ describe('protected branches: lazy approve + protected accepts', () => {
     expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
   }, 30000);
 
+  // INVARIANT: the passphrase prompt is MASKED, so it needs a real TTY. When
+  // it cannot have one it refuses loudly and names the piped route — it must
+  // never fall back to an echoing line reader, which is the bug the mask
+  // exists to fix. (LAZY_FORCE_TTY makes isTTY() true without a real TTY, so
+  // this exercises exactly that gap.)
+  test('the passphrase prompt refuses rather than echoing when it cannot mask', async () => {
+    await enableProtection(ctx);
+    const taskId = await setupBlockedTask(ctx, 'no-mask');
+
+    const approveResult = await ctx.lazy(['approve', taskId], {
+      env: { LAZY_FORCE_TTY: '1' },
+    });
+
+    expectFailure(approveResult);
+    expectError(approveResult, 'not an interactive terminal');
+    expectError(approveResult, 'pipe the value instead');
+  }, 30000);
+
   // INVARIANT: an approval is scoped to its task — approving task A does not
   // unlock a protected accept of task B.
   test('approval of one task does not unlock another task', async () => {
@@ -276,5 +319,93 @@ describe('protected branches: lazy approve + protected accepts', () => {
     const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
+  }, 30000);
+});
+
+/**
+ * INVARIANT: approval consumption is atomic with accept completion.
+ *
+ * An accept that FAILS after passing the branch-protection gate must leave the
+ * human's one-shot approval intact, so the retry needs no second
+ * `lazy approve`. Observed live (2026-08-15): a human approved a task merging
+ * into protected `main`; two accepts failed (one in pre-flight, one at the
+ * merge on a dirty destination) and the next accept was refused with "No
+ * approval recorded" — the approval had been spent by an accept that merged
+ * nothing. The gate used to CONSUME the record while checking it; it now only
+ * RESERVES it, and accept spends it where the merge becomes durable.
+ *
+ * Its own describe block because it needs the mock remote driver active on the
+ * daemon (LAZY_MOCK_ACCEPT_GATES='[]'), which is a suite-level setting: a
+ * blocking pre-merge gate is the deterministic way to fail an accept at a phase
+ * AFTER the protection gate, and the gate list is varied per test through
+ * <protocolBase>/mock-accept-gates.json (see accept-gates.test.ts).
+ */
+describe('protected branches: a failed accept does not spend the approval', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      daemonEnv: { LAZY_MOCK_ACCEPT_GATES: '[]' },
+    });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  /** Gate warnings the daemon's mock driver picks up on the next accept. */
+  function setGates(gates: Array<{ gate: string; message: string }>) {
+    writeFileSync(join(ctx.protocolBase, 'mock-accept-gates.json'), JSON.stringify(gates));
+  }
+
+  test('the approval survives a failed accept and unlocks the retry', async () => {
+    await enableProtection(ctx);
+    const taskId = await setupBlockedTask(ctx, 'survives');
+
+    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    expectSuccess(approveResult);
+
+    // Fail the accept at the pre-merge gates — well past the protection gate.
+    setGates([{ gate: 'ci', message: 'CI checks failing: lint, test' }]);
+
+    const failed = await ctx.lazy(['accept', taskId, '--yes']);
+    expectFailure(failed);
+    expectError(failed, 'Merge blocked by pre-merge gates');
+    // The failure must SAY the approval survived — silence here is what sent
+    // the human back to `lazy approve` for an approval they still had.
+    expectError(failed, 'was NOT consumed');
+
+    // The approval is still recorded and pending.
+    const show = await ctx.lazy(['show', taskId]);
+    expectSuccess(show);
+    expectOutput(show, 'Approval pending');
+
+    // Fix the cause, then retry WITHOUT approving again.
+    setGates([]);
+
+    const retry = await ctx.lazy(['accept', taskId, '--yes']);
+    expectSuccess(retry);
+    expectOutput(retry, 'accepted and merged');
+  }, 30000);
+
+  // The approval survives repeated failures, not just the first one — the
+  // reported incident took two failed accepts to burn it.
+  test('repeated failed accepts leave the approval intact', async () => {
+    await enableProtection(ctx);
+    const taskId = await setupBlockedTask(ctx, 'twice');
+
+    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+
+    setGates([{ gate: 'ci', message: 'CI checks failing: lint, test' }]);
+    expectFailure(await ctx.lazy(['accept', taskId, '--yes']));
+    expectFailure(await ctx.lazy(['accept', taskId, '--yes']));
+
+    expectOutput(await ctx.lazy(['show', taskId]), 'Approval pending');
+
+    setGates([]);
+    const retry = await ctx.lazy(['accept', taskId, '--yes']);
+    expectSuccess(retry);
+    expectOutput(retry, 'accepted and merged');
   }, 30000);
 });

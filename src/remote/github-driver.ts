@@ -60,6 +60,7 @@ import { spawn } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
+import { remoteUrlHasHost, remoteUrlHost, remoteUrlHostContains, remoteUrlPath } from './remote-url';
 
 export interface GhResult {
   stdout: string;
@@ -107,26 +108,119 @@ function parsePrNumberFromUrl(url: string): number | undefined {
   return match ? parseInt(match[1], 10) : undefined;
 }
 
+/** A GitHub remote resolved into the pieces `gh` needs to address it. */
+export interface GitHubRemoteRef {
+  /** Lowercased host: `github.com`, or a GitHub Enterprise Server hostname. */
+  host: string;
+  /** `owner/repo` — never host-qualified. This is what API paths take. */
+  ownerRepo: string;
+  /** True for github.com (or a subdomain of it), false for a GHES install. */
+  isDotCom: boolean;
+}
+
 /**
- * Parse a GitHub remote URL and extract the repository identifier (owner/repo).
- * Supports both SSH and HTTPS formats.
- * Returns null if the URL is not a valid GitHub URL.
+ * Parse a GitHub remote URL into host + owner/repo.
+ *
+ * Host extraction is shared with the host CHECKS (remote-url.ts), so scp
+ * syntax, ssh://, https:// and credential-bearing URLs all work, and any
+ * GitHub Enterprise Server hostname parses the same as github.com.
+ *
+ * Returns null when the URL has no host (a local path) or when the path is not
+ * exactly two segments — GitHub repos are always `owner/repo`, never nested.
  *
  * Examples:
- *   git@github.com:getlazy/lazy-dev.git -> getlazy/lazy-dev
- *   https://github.com/getlazy/lazy-dev.git -> getlazy/lazy-dev
- *   https://github.com/getlazy/lazy-dev -> getlazy/lazy-dev
+ *   git@github.com:getlazy/lazy-dev.git      -> github.com, getlazy/lazy-dev
+ *   https://github.com/getlazy/lazy-dev      -> github.com, getlazy/lazy-dev
+ *   git@github.mycorp.com:team/app.git       -> github.mycorp.com, team/app
+ */
+export function parseGitHubRemote(url: string): GitHubRemoteRef | null {
+  const host = remoteUrlHost(url);
+  const path = remoteUrlPath(url);
+  if (!host || !path) return null;
+
+  const segments = path.split('/').filter(Boolean);
+  if (segments.length !== 2) return null;
+
+  return {
+    host,
+    ownerRepo: `${segments[0]}/${segments[1]}`,
+    isDotCom: remoteUrlHasHost(url, 'github.com'),
+  };
+}
+
+/**
+ * The value for `gh --repo`, which takes `[HOST/]OWNER/REPO`.
+ *
+ * A bare `owner/repo` is resolved by gh against its DEFAULT host, so a GitHub
+ * Enterprise Server repo must carry its hostname or every `--repo` call is
+ * pointed at github.com. github.com repos keep the bare form they have always
+ * had.
  */
 function parseGitHubRepoIdentifier(url: string): string | null {
-  // SSH format: git@github.com:owner/repo.git or git@github.com:owner/repo
-  const sshMatch = url.match(/git@github\.com:([^/]+\/[^/]+?)(\.git)?$/);
-  if (sshMatch) return sshMatch[1];
+  const ref = parseGitHubRemote(url);
+  if (!ref) return null;
+  return ref.isDotCom ? ref.ownerRepo : `${ref.host}/${ref.ownerRepo}`;
+}
 
-  // HTTPS format: https://github.com/owner/repo or https://user:token@github.com/owner/repo
-  const httpsMatch = url.match(/https:\/\/(?:[^@]+@)?github\.com\/([^/]+\/[^/]+?)(\.git)?$/);
-  if (httpsMatch) return httpsMatch[1];
+/** What a remote URL means for the `gh auth` check: which host to pin, and how to word it. */
+interface AuthTarget {
+  /** Host to hand to `gh --hostname`, or null when the URL names no host to pin. */
+  host: string | null;
+  /** The same host when it is a GitHub Enterprise Server install, else null. Governs WORDING only. */
+  enterpriseHost: string | null;
+}
 
-  return null;
+/**
+ * Resolve the host the `gh auth` check must verify against, and whether it is
+ * an Enterprise install.
+ *
+ * `gh` keeps a separate login per host, so the host is what has to be handed to
+ * `--hostname`: bare `gh auth status` exits 0 when gh is logged into ANY host,
+ * which proves nothing about the host lazy will actually push to. Both
+ * directions of that are real — an Enterprise remote passing on a github.com
+ * login, and a github.com remote passing on an Enterprise-only one — so every
+ * resolvable host is pinned, github.com included.
+ *
+ * dot-com is canonicalised to `github.com` rather than passed through
+ * verbatim: `remoteUrlHasHost` matches subdomains, and `ssh.github.com` is a
+ * real GitHub endpoint (the port-443 SSH workaround). `gh` knows dot-com only
+ * as `github.com`, so pinning the literal subdomain would fail a login that is
+ * perfectly valid.
+ *
+ * `enterpriseHost` is deliberately separate from `host`. Enterprise hostnames
+ * are arbitrary (`github.mycorp.com`, `git.mycorp.com`, `code.internal.example`),
+ * so "not github.com" is the only test that holds — "mentions github" would
+ * miss most real installs. It governs wording only: the host suffix on the
+ * label and the longer `--hostname` remedy stay reserved for Enterprise, so a
+ * dot-com report reads exactly as it always has.
+ */
+function authTargetOf(url: string): AuthTarget {
+  const host = remoteUrlHost(url);
+  if (host === null) return { host: null, enterpriseHost: null };
+  if (remoteUrlHasHost(url, 'github.com')) return { host: 'github.com', enterpriseHost: null };
+  return { host, enterpriseHost: host };
+}
+
+/**
+ * The health check for "does the configured remote look like GitHub at all".
+ *
+ * Extracted so the Enterprise auth-failure path can report it too: an
+ * Enterprise host with no gh login is often a remote that is not GitHub at
+ * all, and that diagnosis is otherwise unreachable once the auth check has
+ * returned.
+ */
+function remoteShapeCheck(url: string, remoteName: string): HealthCheck {
+  // github.com (or a subdomain), or a host that merely mentions "github" —
+  // the latter is the GitHub Enterprise Server escape hatch, so a self-hosted
+  // github.mycorp.com does not get a spurious "does not appear to be GitHub".
+  if (!remoteUrlHasHost(url, 'github.com') && !remoteUrlHostContains(url, 'github')) {
+    return {
+      state: 'warn',
+      what: `Git remote ${remoteName}`,
+      reason: `Remote points to ${url}, which does not appear to be GitHub`,
+    };
+  }
+  return { state: 'ok', what: `Git remote ${remoteName}` };
 }
 
 /**
@@ -141,7 +235,9 @@ export function detectGitHub(repoDir: string, remoteName: string = 'origin'): Dr
     const exitCode = proc.exitCode ?? 1;
     const url = proc.stdout ? proc.stdout.toString().trim() : '';
 
-    if (exitCode === 0 && url.includes('github.com')) {
+    // Host comparison, not a substring test: `https://evil.com/github.com/x.git`
+    // is not a GitHub remote. Handles scp syntax (git@github.com:o/r.git) too.
+    if (exitCode === 0 && remoteUrlHasHost(url, 'github.com')) {
       return {
         name: 'GitHub',
         tomlOverrides: { 'remote.driver': 'github' },
@@ -707,8 +803,7 @@ export class GitHubDriver implements RepositoryDriver {
         if (jobMatch) {
           const jobId = jobMatch[1];
           try {
-            const logResult = await this.gh([
-              'api',
+            const logResult = await this.ghApi([
               `repos/{owner}/{repo}/actions/jobs/${jobId}/logs`,
             ]);
             if (logResult.exitCode === 0 && logResult.stdout) {
@@ -794,8 +889,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // Step 1: Try submitting an approving PR review via the GitHub API
-    const reviewResult = await this.gh([
-      'api',
+    const reviewResult = await this.ghApi([
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--method', 'POST',
       '--field', `body=${reason}`,
@@ -844,8 +938,7 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // Step 1: Try submitting a REQUEST_CHANGES PR review via the GitHub API
-    const reviewResult = await this.gh([
-      'api',
+    const reviewResult = await this.ghApi([
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--method', 'POST',
       '--field', `body=${reason}`,
@@ -1038,13 +1131,43 @@ export class GitHubDriver implements RepositoryDriver {
     }
     checks.push({ state: 'ok', what: 'gh CLI installed' });
 
-    // 2. Check gh auth status
-    const authStatus = await this.gh(['auth', 'status']);
+    // Resolve the configured remote once, up front. The auth check below has to
+    // pin the host lazy will actually talk to, and check 4 reports on the same
+    // URL — one `git remote get-url` serves both.
+    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
+    const { host: authHost, enterpriseHost } =
+      remoteUrl.exitCode === 0 ? authTargetOf(remoteUrl.stdout) : { host: null, enterpriseHost: null };
+    const authLabel = enterpriseHost ? `GitHub authentication (${enterpriseHost})` : 'GitHub authentication';
+
+    // 2. Check gh auth status — for the remote's host, not just for *a* host.
+    // Bare `gh auth status` exits 0 when gh is logged into ANY host, so it
+    // passes on an Enterprise remote whose only login is github.com, and
+    // equally on a github.com remote whose only login is an Enterprise host.
+    // Pinning --hostname makes the check mean what it says in both directions,
+    // and scopes the token-scope check below to that host's token too. With no
+    // remote at all, or a URL with no host to pin (a local path), the bare form
+    // stands — there is nothing to name, and check 4 carries that diagnosis.
+    const authStatus = await this.gh(
+      authHost ? ['auth', 'status', '--hostname', authHost] : ['auth', 'status'],
+    );
     if (authStatus.exitCode !== 0) {
-      checks.push({ state: 'fail', what: 'GitHub authentication', reason: 'Run: gh auth login' });
+      checks.push({
+        state: 'fail',
+        what: authLabel,
+        reason: enterpriseHost
+          ? `gh is not authenticated to ${enterpriseHost}, the host of remote '${this.remoteName}'. Run: gh auth login --hostname ${enterpriseHost}`
+          : 'Run: gh auth login',
+      });
+      // An Enterprise host with no gh login is often a remote that is not a
+      // GitHub host at all (driver = "github" pointed at something else), and
+      // check 4 below is unreachable once we return. Say both, so the user is
+      // not sent chasing a `gh auth login` that can never succeed. A github.com
+      // remote needs no such diagnosis — it is unambiguously GitHub — so that
+      // path still returns with the auth failure alone.
+      if (enterpriseHost) checks.push(remoteShapeCheck(remoteUrl.stdout, this.remoteName));
       return checks;
     }
-    checks.push({ state: 'ok', what: 'GitHub authentication' });
+    checks.push({ state: 'ok', what: authLabel });
 
     // 3. Check for overly broad token scopes from auth status output
     const authOutput = `${authStatus.stdout}\n${authStatus.stderr}`;
@@ -1061,21 +1184,11 @@ export class GitHubDriver implements RepositoryDriver {
     }
 
     // 4. Check that the configured git remote exists and points to GitHub
-    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
     if (remoteUrl.exitCode !== 0) {
       checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <github-url>` });
       return checks;
     }
-    const url = remoteUrl.stdout;
-    if (!url.includes('github.com')) {
-      checks.push({
-        state: 'warn',
-        what: `Git remote ${this.remoteName}`,
-        reason: `Remote points to ${url}, which does not appear to be GitHub`,
-      });
-    } else {
-      checks.push({ state: 'ok', what: `Git remote ${this.remoteName}` });
-    }
+    checks.push(remoteShapeCheck(remoteUrl.stdout, this.remoteName));
 
     // 5. Check repo visibility and comment sync status
     const repoView = await this.gh(['repo', 'view', '--json', 'isPrivate']);
@@ -1123,7 +1236,14 @@ export class GitHubDriver implements RepositoryDriver {
   // --- Import methods ---
 
   canImport(url: string): boolean {
-    return /^https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url);
+    if (!/^https?:\/\//i.test(url)) return false;
+    // github.com, or a host that merely mentions "github" — the same GitHub
+    // Enterprise Server escape hatch the doctor check uses, so a PR URL on a
+    // self-hosted github.mycorp.com is importable. Host, not substring: a
+    // /github.com/ path segment on someone else's server does not qualify.
+    if (!remoteUrlHasHost(url, 'github.com') && !remoteUrlHostContains(url, 'github')) return false;
+    const path = remoteUrlPath(url);
+    return path !== null && /^[^/]+\/[^/]+\/pull\/\d+/.test(path);
   }
 
   async importUrl(url: string, _opts: ImportOptions): Promise<ImportResult> {
@@ -1321,6 +1441,42 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   /**
+   * The configured remote resolved into host + owner/repo, or null when the
+   * remote is missing or is not a GitHub-shaped URL.
+   */
+  private async getRemoteRef(): Promise<GitHubRemoteRef | null> {
+    const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
+    if (remoteUrl.exitCode !== 0) {
+      logger.debug(`getRemoteRef: failed to get URL for remote ${this.remoteName}: ${remoteUrl.stderr}`);
+      return null;
+    }
+    const ref = parseGitHubRemote(remoteUrl.stdout);
+    if (!ref) {
+      logger.debug(`getRemoteRef: remote ${this.remoteName} is not a GitHub owner/repo URL`);
+    }
+    return ref;
+  }
+
+  /**
+   * Run `gh api`, pinning the host for a GitHub Enterprise Server remote.
+   *
+   * `gh pr` / `gh run` / `gh repo` derive their host from the repository they
+   * act on. `gh api` does NOT: it sends every request to gh's *default* host —
+   * github.com unless `GH_HOST` or a single configured host says otherwise —
+   * and only `--hostname` overrides that. So on a GHES remote an unqualified
+   * `gh api repos/{owner}/{repo}/...` silently asks github.com about a repo
+   * that lives somewhere else.
+   *
+   * github.com remotes get no flag, so their invocations are byte-identical to
+   * what they were.
+   */
+  private async ghApi(args: string[], cwd?: string): Promise<GhResult> {
+    const ref = await this.getRemoteRef();
+    const hostArgs = ref && !ref.isDotCom ? ['--hostname', ref.host] : [];
+    return this.gh(['api', ...hostArgs, ...args], cwd);
+  }
+
+  /**
    * Check if the current repo is private. Caches the result for the driver lifetime.
    * Returns true if private, false if public. Defaults to false (public) on error
    * to err on the side of safety (skipping comment sync).
@@ -1440,8 +1596,8 @@ export class GitHubDriver implements RepositoryDriver {
     // Use since parameter on the API request for issue comments (supported natively).
     // For review comments, the API supports since but only for updated_at, so we
     // fetch all and filter in code for consistency.
-    const result = await this.gh([
-      'api', endpoint,
+    const result = await this.ghApi([
+      endpoint,
       '--paginate',
     ]);
 
@@ -1523,12 +1679,13 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   async isTargetBranchProtected(targetBranch: string): Promise<boolean> {
-    const repoIdentifier = await this.getRepoIdentifier();
-    if (!repoIdentifier) return false;
+    // The API path takes a bare owner/repo — on a GHES remote the host travels
+    // via ghApi's --hostname, never as a path segment.
+    const ref = await this.getRemoteRef();
+    if (!ref) return false;
 
-    const result = await this.gh([
-      'api',
-      `repos/${repoIdentifier}/branches/${encodeURIComponent(targetBranch)}/protection`,
+    const result = await this.ghApi([
+      `repos/${ref.ownerRepo}/branches/${encodeURIComponent(targetBranch)}/protection`,
       '--silent',
     ]);
 
@@ -1544,15 +1701,14 @@ export class GitHubDriver implements RepositoryDriver {
     // If auto_approve previously submitted an approval (and accept failed later),
     // that approval must not trick the non-auto-approve path into thinking
     // a human reviewed it.
-    const userResult = await this.gh(['api', 'user', '--jq', '.login']);
+    const userResult = await this.ghApi(['user', '--jq', '.login']);
     const currentUser = userResult.exitCode === 0 ? userResult.stdout.trim() : '';
 
     const jqFilter = currentUser
       ? `[.[] | select(.state == "APPROVED" and .user.login != "${currentUser}")] | length`
       : '[.[] | select(.state == "APPROVED")] | length';
 
-    const result = await this.gh([
-      'api',
+    const result = await this.ghApi([
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--jq', jqFilter,
     ]);

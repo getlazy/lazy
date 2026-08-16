@@ -20,6 +20,7 @@ import { join } from 'path';
 import { requireStorage, requireLazyRoot, parseFlags, formatDate } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped, promptYesNo } from '../editor';
 import { theme } from '../theme';
+import { docsFooter } from '../../docs/links';
 import { sanitizeUserText } from '../../utils/sanitize-text';
 import { getActor } from '../../constants';
 import {
@@ -640,5 +641,5 @@ Examples:
   lazy memory compact
   lazy memory compact --mechanical
   lazy memory compact --show
-  lazy search 'in:memories "credentials"'`);
+  lazy search 'in:memories "credentials"'${docsFooter('memory')}`);
 }

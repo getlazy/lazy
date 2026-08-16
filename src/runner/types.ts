@@ -124,6 +124,22 @@ export interface Runner {
   getRunLogs(runName: string, tailLines?: number): Promise<string | null>;
 
   /**
+   * Run a command INSIDE an existing run, streaming its output straight through
+   * to this process's stdout/stderr, and resolve with its exit code.
+   *
+   * Returns null when this runner has no inside to reach — a host-process run is
+   * not an environment you can enter; its agent already runs on this machine
+   * with this machine's filesystem, so there is nothing a remote exec would show
+   * that a local command cannot.
+   *
+   * Used by `lazy doctor <task-id>` to run `lazy-agent doctor` where the agent
+   * actually lives. That question cannot be answered from the host: the MCP
+   * config, the tool permissions and the daemon route being diagnosed are all
+   * inside the container, and several of them are written per turn.
+   */
+  execInRun(runName: string, argv: string[], opts?: { timeoutMs?: number }): Promise<number | null>;
+
+  /**
    * Stop a running process/container. Returns true if successfully stopped.
    *
    * Default is an immediate kill: a task supervisor has no shutdown work to do,
@@ -193,8 +209,18 @@ export interface Runner {
   /**
    * MCP server config for Claude Code integration.
    * Returns the command and args that Claude Code should use to spawn the MCP server.
+   *
+   * `opts.readOnly` asks for a server that serves only the read-only toolset —
+   * the supervisor sets it for ask turns. It must be honored in the ARGS (not
+   * just by an env var on the supervisor): in daemon-proxy mode the handlers
+   * execute in the daemon, so only the in-container server can withhold a write
+   * tool from a containerized agent.
    */
-  mcpServerConfig(taskId: string, worktreePath: string): { command: string; args: string[] };
+  mcpServerConfig(
+    taskId: string,
+    worktreePath: string,
+    opts?: { readOnly?: boolean },
+  ): { command: string; args: string[] };
 
   /** Human-readable label for the run in CLI output (e.g., "Container", "Process"). */
   readonly runLabel: string;

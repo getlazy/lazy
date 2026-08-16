@@ -14,15 +14,26 @@ export {
   waitForDaemonStop,
   readPid,
   readToken,
+  readWebPort,
   cleanupStaleFiles,
+  cleanupOwnDaemonFiles,
+  probeDaemonLockSync,
+  readDaemonLockPid,
   acquireDaemonLock,
   releaseDaemonLock,
   blockingFlock,
   type DaemonStatus,
+  type DaemonLockState,
+  type CleanupOutcome,
 } from './lifecycle';
+export {
+  inspectDaemonStateFiles,
+  startDaemonStateFileWatch,
+  type DaemonStateFileReport,
+} from './state-files';
 export { startDaemonServer, type RunningDaemon, type DaemonServerOptions } from './server';
 export { formatDashboardUrl } from './dashboard-url';
-export { enumerateDaemons, writeDaemonRoot, type DaemonRecord } from './registry';
+export { enumerateDaemons, writeDaemonRoot, type DaemonRecord, type DaemonIdentity } from './registry';
 export { ensureDaemon } from './auto-start';
 export { DaemonClient, DaemonNotRunningError, NotALazyProjectError, tryRpc } from './client';
 export { setDaemonContext, getDaemonContext } from './context';

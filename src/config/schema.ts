@@ -9,6 +9,11 @@
  *
  * When you add, rename, or remove a key here, also update
  * docs/lazy-toml.md so the user-facing reference stays in sync.
+ *
+ * A key missing from this schema is reported to the user as an unknown option
+ * even though it works, so test/unit/config-schema-drift.test.ts cross-checks
+ * this table against everything lazy.toml.example documents (commented-out
+ * examples included) and fails on drift in either direction.
  */
 
 /**
@@ -27,7 +32,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
   storage: ['backend', 'external_path', 'postgres_ssl'],
-  git: ['default_branch_prefix'],
+  git: ['default_branch_prefix', 'lfs_check'],
   output: ['shortid_length'],
   // `graceful_exit_timeout_ms` is the pre-rename spelling of
   // `wind_down_timeout_ms`. Kept known (not unknown) so an existing lazy.toml
@@ -45,12 +50,17 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
   docker: ['dockerfile'],
-  runner: ['type', 'docker_agent_no_network', 'permission_mode', 'sandbox_allowed_domains', 'sandbox_deny_read', 'sandbox_deny_write', 'sandbox_allow_weaker_nested'],
+  runner: ['type', 'permission_mode', 'sandbox_allowed_domains', 'sandbox_deny_read', 'sandbox_deny_write', 'sandbox_allow_weaker_nested'],
   ollama: ['enabled', 'model', 'endpoint'],
   // 'fallback' is an array of tables ([[proxy.fallback]]); its inner keys
   // (upstream, model) are validated by the config loader, not this scan.
-  proxy: ['enabled', 'port', 'bind', 'upstream', 'fallback', 'retry_after_threshold'],
+  // 'policy' is a nested table ([proxy.policy]); its inner keys (enforce,
+  // connector_allowlist, deny_secret_path_reads, deny_path_globs,
+  // egress_allowlist) are likewise resolved by the config loader.
+  proxy: ['enabled', 'port', 'bind', 'upstream', 'fallback', 'retry_after_threshold', 'policy'],
+  memory: ['warn_bytes'],
   documents: ['path'],
+  docs: ['url'],
   worktree: ['include'],
   permissions: ['protected'],
   protection: ['enabled', 'protected_branches', 'protected_tasks', 'gate_default_branch', 'passphrase_file'],

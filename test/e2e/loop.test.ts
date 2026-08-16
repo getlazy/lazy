@@ -51,4 +51,65 @@ describe('lazy loop', () => {
     expectFailure(result);
     expectError(result, 'lazy loop requires an interactive terminal');
   });
+
+  // --- Queue mode (`lazy loop <task...>`) ---
+
+  test('usage documents both modes and the queue flags', async () => {
+    const result = await ctx.lazy(['loop', '--help']);
+    expectSuccess(result);
+    expectOutput(result, '--pipeline');
+    expectOutput(result, '--backlog');
+    expectOutput(result, '--parent');
+    expectOutput(result, '--tag');
+    // The queue is an argument list, not persisted state — the help must say so,
+    // because "resume with this command" is the whole interruption story.
+    expectOutput(result, 'The queue is not persisted');
+  });
+
+  test('rejects mixing explicit task IDs with selection filters', async () => {
+    // Guessing which wins would be a silent surprise; refusing is the contract.
+    const result = await ctx.lazy(['loop', 'some-task', '--backlog']);
+    expectFailure(result);
+    expectError(result, 'not both');
+  });
+
+  test('rejects --pipeline without a queue', async () => {
+    // --pipeline pre-starts the NEXT queued task; reactive mode has no queue.
+    const result = await ctx.lazy(['loop', '--pipeline']);
+    expectFailure(result);
+    expectError(result, '--pipeline applies to a task queue');
+  });
+
+  test('argument errors are reported even without a TTY', async () => {
+    // INVARIANT: argument validation precedes the TTY guard. Reporting
+    // "requires an interactive terminal" for a malformed invocation would hide
+    // the actual mistake from anyone scripting or piping.
+    const result = await ctx.lazy(['loop', 'a', '--tag', 'x']);
+    expectFailure(result);
+    expectError(result, 'not both');
+  });
+
+  test('queue mode still requires a TTY', async () => {
+    const taskId = await createTask(ctx, 'Queue task', 'Do some work');
+    const result = await ctx.lazy(['loop', taskId]);
+    expectFailure(result);
+    expectError(result, 'lazy loop requires an interactive terminal');
+  });
+
+  test('one bad task reference fails the whole run before anything starts', async () => {
+    // INVARIANT: the queue resolves all-or-nothing (same rule as `lazy wait`'s
+    // multi-task race). Silently racing the valid subset would leave the human
+    // believing they queued work that was never touched.
+    const good = await createTask(ctx, 'Real task', 'Do some work');
+    const result = await ctx.lazy(['loop', good, 'no-such-task-ref'], {
+      env: { LAZY_FORCE_TTY: '1' },
+    });
+    expectFailure(result);
+    expectError(result, 'no-such-task-ref');
+
+    // The good task must NOT have been started by the failed run.
+    const status = await ctx.lazy(['show', good]);
+    expectSuccess(status);
+    expectOutput(status, 'backlog');
+  });
 });

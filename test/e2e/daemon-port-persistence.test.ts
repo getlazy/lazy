@@ -28,6 +28,12 @@ import { readToken, readWebPort, writeWebPort } from '../../src/daemon/lifecycle
 import { daemonMcpConfigDir } from '../../src/daemon/task-launcher';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
+import { getOrCreateStorage, closeAllStorage } from '../../src/daemon/rpc-handlers';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
 
 describe('daemon restart resilience', () => {
   let ctx: TestContext;
@@ -56,6 +62,10 @@ describe('daemon restart resilience', () => {
       try { await d.stop(); } catch { /* ignore */ }
     }
     daemons.length = 0;
+    // Let the daemon's lazy background Storage init settle and close it before
+    // the temp dirs go away, so it cannot reject on a path we just deleted.
+    await getOrCreateStorage().catch(() => { /* never initialized, or already torn down */ });
+    await closeAllStorage();
     restoreConfig?.();
     restoreConfig = undefined;
     process.env.HOME = originalHome;

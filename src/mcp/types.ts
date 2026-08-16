@@ -6,7 +6,11 @@
 
 /** JSON Schema property for MCP tool parameters. */
 export interface McpToolPropertySchema {
-  type: string;
+  /**
+   * JSON Schema type. An array of types declares a union — e.g. `['string',
+   * 'array']` for a parameter that takes one task reference or several.
+   */
+  type: string | string[];
   description?: string;
   enum?: string[];
   minLength?: number;

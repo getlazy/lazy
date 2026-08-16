@@ -47,6 +47,14 @@ export interface DaemonStatus {
   socketPath?: string;
   uptime?: number;
   version?: string;
+  /**
+   * Opaque id minted fresh every time a daemon process starts. Two readings
+   * carrying DIFFERENT ids came from different daemon processes — which is
+   * exactly the question a child that holds a daemon-issued address needs
+   * answered (see src/daemon/generation.ts for why this and not pid/uptime).
+   * Absent when the daemon predates this field.
+   */
+  instanceId?: string;
   /** UTC ISO timestamp the daemon binary was built, or 'dev' when run from source. */
   buildTime?: string;
   /** Git short SHA of the source the daemon is running (dev mode only; null/absent
@@ -168,41 +176,187 @@ export function writeWebPort(projectRoot: string, port: number): void {
   }
 }
 
+/** Result of probing `daemon.lock` for a live holder. See probeDaemonLockSync. */
+export type DaemonLockState =
+  /** Something holds the lock — a live daemon owns this project's daemon dir. */
+  | 'held'
+  /** We acquired the lock, so nothing held it — no daemon owns this dir. */
+  | 'free'
+  /** No lock file, or flock unavailable — no conclusion either way. */
+  | 'unknown';
+
 /**
- * Remove stale daemon files (PID, socket).
- * Called when we detect the daemon is dead but files remain.
+ * Probe whether this project's `daemon.lock` is currently held by a live process.
+ *
+ * This is the ONE signal about daemon liveness that a process which is not the
+ * daemon cannot forge or destroy: the lock is held on an open file descriptor
+ * for the daemon's entire lifetime, the OS releases it on exit/crash/SIGKILL,
+ * and flock never preempts a held lock. Unlinking the lock FILE does not
+ * release the lock either — so even a hostile racer cannot make a running
+ * daemon look dead through it.
+ *
+ * Never creates the lock file: an absent lock file means "no conclusion"
+ * (daemons started under LAZY_TEST=1 skip the lock, and dirs predating flock
+ * enforcement have none), not "free".
+ *
+ * flock conflicts even within a single process when two separate file
+ * descriptors are used, so this probe correctly reports 'held' when it runs
+ * inside the daemon that holds the lock. That is why the daemon's own cleanup
+ * path must identify itself (see cleanupOwnDaemonFiles) rather than go through
+ * the guarded cleanup.
+ *
+ * Sync mirrors the rest of this module (one-shot CLI/startup code, never a hot
+ * path); `probeDaemonLock` in ./process-identity.ts is the async equivalent for
+ * the registry, which scans many dirs at once and takes a dir rather than a
+ * project root.
  */
-export function cleanupStaleFiles(projectRoot: string): void {
+export function probeDaemonLockSync(projectRoot: string): DaemonLockState {
+  const lockPath = getDaemonLockPath(projectRoot);
+  let fd: number;
+  try {
+    fd = openSync(lockPath, constants.O_RDWR);
+  } catch {
+    // ENOENT / EACCES — nothing can be concluded from the lock.
+    return 'unknown';
+  }
+  try {
+    return tryFlockNonBlocking(fd) ? 'free' : 'held';
+  } catch {
+    // FFI/dlopen unavailable on this platform — no conclusion.
+    return 'unknown';
+  } finally {
+    // Closing releases anything the probe just acquired.
+    try { closeSync(fd); } catch { /* fd already gone; nothing to release */ }
+  }
+}
+
+/**
+ * Read the PID recorded inside `daemon.lock` by acquireDaemonLock.
+ *
+ * The lock holder writes its pid there for diagnostics. Unlike `lazy.pid` this
+ * record is only ever written by a process that actually won the lock, which
+ * makes it the recoverable source of "who owns this daemon dir" when `lazy.pid`
+ * has been deleted underneath a running daemon.
+ */
+export function readDaemonLockPid(projectRoot: string): number | null {
+  const lockPath = getDaemonLockPath(projectRoot);
+  if (!existsSync(lockPath)) return null;
+  try {
+    const pid = parseInt(readFileSync(lockPath, 'utf-8').trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Outcome of a guarded {@link cleanupStaleFiles} call. */
+export type CleanupOutcome =
+  /** The files were stale and have been removed. */
+  | 'removed'
+  /** There was nothing to remove. */
+  | 'nothing-to-remove'
+  /** Refused: a live process holds the daemon lock for this dir. */
+  | 'refused-lock-held'
+  /** Refused: the recorded PID belongs to a process that is still alive. */
+  | 'refused-pid-alive';
+
+/** Unlink the PID and socket files, no questions asked. Internal. */
+function unlinkStateFiles(projectRoot: string): CleanupOutcome {
   const pidPath = getPidPath(projectRoot);
   const socketPath = getSocketPath(projectRoot);
+  let removed = false;
 
   if (existsSync(pidPath)) {
+    removed = true;
     try { unlinkSync(pidPath); } catch { /* ignore — another process may have removed it */ }
   }
   if (existsSync(socketPath)) {
+    removed = true;
     try { unlinkSync(socketPath); } catch { /* ignore — another process may have removed it */ }
   }
+  return removed ? 'removed' : 'nothing-to-remove';
+}
+
+/**
+ * Remove STALE daemon files (PID, socket) — only after proving they are stale.
+ *
+ * WHY THE GUARD EXISTS: this function used to take a projectRoot and nothing
+ * else, so it had no notion of WHOSE files it was deleting; "stale" was assumed
+ * by each caller. A `lazy daemon start` that then LOST the singleton race had
+ * already deleted the incumbent's `lazy.pid` and `lazy.sock`, and because the
+ * old liveness check read exactly those two files, every later command
+ * concluded "dead", cleaned up again, and tried to start a daemon that could
+ * never win the lock — a permanent wedge against a daemon that was running
+ * fine, with no recovery short of killing it.
+ *
+ * So staleness is now ESTABLISHED here, not asserted by the caller:
+ *   - the daemon lock is held by a live process → refuse (a daemon owns this dir)
+ *   - the recorded PID is alive → refuse (something is using these files)
+ *
+ * Refusing is cheap and safe in the wrong direction: a leftover PID/socket file
+ * no longer makes a dead daemon look alive (isDaemonRunning prefers the lock)
+ * and a starting daemon unlinks a stale socket and overwrites the PID file
+ * itself. A wrongly-permitted delete, by contrast, wedges the project. When in
+ * doubt, refuse.
+ *
+ * The daemon removing its OWN files (clean shutdown, failed-start teardown)
+ * must use {@link cleanupOwnDaemonFiles} — this guard would refuse it, since
+ * the daemon holds its own lock and its own PID is alive.
+ */
+export function cleanupStaleFiles(projectRoot: string): CleanupOutcome {
+  if (probeDaemonLockSync(projectRoot) === 'held') return 'refused-lock-held';
+
+  const pid = readPid(projectRoot);
+  if (pid !== null && isProcessAlive(pid)) return 'refused-pid-alive';
+
+  return unlinkStateFiles(projectRoot);
+}
+
+/**
+ * Remove the calling daemon's OWN PID and socket files, unconditionally.
+ *
+ * Only a daemon process may call this, and only for state it wrote itself:
+ * clean shutdown (src/daemon/server.ts stop) and failed-start teardown. The
+ * ownership guard in {@link cleanupStaleFiles} would refuse both — the daemon
+ * holds the lock and its own PID is alive — which is exactly the guard working
+ * as intended, so the owner says so explicitly instead of weakening it.
+ */
+export function cleanupOwnDaemonFiles(projectRoot: string): void {
+  unlinkStateFiles(projectRoot);
 }
 
 /**
  * Unified daemon liveness check — the SINGLE function that all code paths
  * must use to determine whether the daemon is running.
  *
- * Checks three signals, all of which must be true:
+ * Primary signal: the flock on `daemon.lock`. Held → a daemon owns this dir and
+ * is running. Free → nothing owns it, whatever files are lying around. This is
+ * deliberately the same evidence `acquireDaemonLock` uses to refuse a second
+ * daemon, so start and liveness can never disagree.
+ *
+ * INVARIANT: liveness must rest on evidence a losing racer cannot destroy.
+ * Before this, the answer came from the socket file plus the PID file — the very
+ * two files `cleanupStaleFiles` deletes. Deleting them therefore made a running
+ * daemon look dead, and the wrong answer then re-triggered the cleanup that
+ * caused it: a self-reinforcing wedge (see cleanupStaleFiles). An flock cannot
+ * be faked, and unlinking the lock file does not release it.
+ *
+ * Fallback (lock verdict 'unknown' — no lock file, or flock unavailable on this
+ * platform): the original three file-based signals, all of which must hold:
  *   1. Socket file exists (daemon created it on startup)
  *   2. Token file is readable (daemon created it on startup)
  *   3. PID file exists and process is alive (kill -0)
+ * A dir with no lock file is either a daemon started under LAZY_TEST=1 (which
+ * skips the lock) or one predating flock enforcement.
  *
- * This is synchronous and fast (~microseconds): file stat + kill(pid, 0).
- * No network I/O, no flock probing.
- *
- * After a crash, the socket and token files remain but the process is dead.
- * The PID check catches this case — the previous fast-path (socket+token
- * existence only) did not, causing `lazy daemon start` to say "already
- * running" while `lazy daemon status` (which connects to the socket) said
- * "not running".
+ * Synchronous and fast (~microseconds): open + flock + close, or file stat +
+ * kill(pid, 0). No network I/O.
  */
 export function isDaemonRunning(projectRoot: string): boolean {
+  const lock = probeDaemonLockSync(projectRoot);
+  if (lock === 'held') return true;
+  if (lock === 'free') return false;
+
   const socketPath = getSocketPath(projectRoot);
   if (!existsSync(socketPath)) return false;
 
@@ -245,13 +399,14 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { uptime?: number; version?: string; buildTime?: string; codeSha?: string; webPort?: number; bindHost?: string; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
+    const data = await response.json() as { uptime?: number; version?: string; instanceId?: string; buildTime?: string; codeSha?: string; webPort?: number; bindHost?: string; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
     return {
       running: true,
       pid: pid ?? undefined,
       socketPath,
       uptime: data.uptime,
       version: data.version,
+      instanceId: data.instanceId,
       buildTime: data.buildTime,
       codeSha: data.codeSha,
       webPort: data.webPort,
@@ -315,11 +470,14 @@ export async function waitForDaemon(projectRoot: string, timeoutMs: number = 500
  *
  * `expectedPid` (the OLD daemon's pid, captured before shutdown) is the precise
  * signal and should always be passed for a restart. Without it we fall back to
- * `isDaemonRunning`, which keys on the socket FILE — but the daemon removes its
- * socket (via cleanupStaleFiles) as one of the LAST steps before exit, while the
- * process is still alive and finishing cleanup. Returning then lets a new daemon
- * start whose freshly-written socket/PID get clobbered by the old daemon's
- * trailing cleanup. Waiting on the actual process death avoids that handoff race.
+ * `isDaemonRunning`, which is lock-based: the daemon releases its flock as the
+ * very LAST step of exit, after removing its own socket/PID files, so the
+ * fallback no longer returns "stopped" while the old daemon is still finishing
+ * cleanup. (It used to key on the socket FILE, which the daemon removes while
+ * still alive — returning then let a new daemon start whose freshly-written
+ * socket/PID got clobbered by the old daemon's trailing cleanup.) Waiting on the
+ * actual process death is still the precise signal and remains preferred, since
+ * a daemon dir with no lock file falls back to those same file signals.
  */
 export async function waitForDaemonStop(
   projectRoot: string,
@@ -428,6 +586,20 @@ function tryFlock(fd: number, operation: number): boolean {
 }
 
 /**
+ * Attempt a NON-BLOCKING exclusive flock on an already-open fd. Returns true if
+ * the lock was acquired (i.e. nobody else held it), false if it is held.
+ *
+ * Exposed for the daemon registry's identity check: taking the lock on a
+ * daemon dir's `daemon.lock` proves no daemon owns that dir, whatever its
+ * pidfile says (see src/daemon/process-identity.ts). The caller owns the fd and
+ * must close it to release anything this acquired. Throws if the native flock
+ * bindings are unavailable, which callers treat as "no conclusion".
+ */
+export function tryFlockNonBlocking(fd: number): boolean {
+  return tryFlock(fd, LOCK_EX | LOCK_NB);
+}
+
+/**
  * Clear O_CLOEXEC on a file descriptor so it survives exec().
  * Used when passing a lock fd to a forked daemon child process.
  */
@@ -473,6 +645,14 @@ export function blockingFlock(projectRoot: string, timeoutMs: number): { fd: num
 }
 
 /**
+ * How long {@link acquireDaemonLock} keeps retrying before it believes a
+ * refusal. See the WHY in that function — this window exists to outlast a
+ * liveness PROBE holding the lock, not to wait out an incumbent daemon.
+ */
+const ACQUIRE_RETRY_ATTEMPTS = 10;
+const ACQUIRE_RETRY_DELAY_MS = 10;
+
+/**
  * Try to acquire an exclusive daemon lock using flock(2).
  *
  * This is the SOLE singleton enforcement mechanism. The lock is held for
@@ -482,6 +662,25 @@ export function blockingFlock(projectRoot: string, timeoutMs: number): { fd: num
  *
  * Returns the file descriptor on success (caller must keep it open),
  * or null if another daemon holds the lock.
+ *
+ * WHY THE RETRY IS NOT SUPERSTITION: liveness probing proves a lock is FREE by
+ * momentarily taking it (probeDaemonLockSync here, probeDaemonLock in
+ * ./process-identity.ts). That is the only way to ask flock(2) a question —
+ * flock exposes no "who holds this?" query, and fcntl's F_GETLK answers about
+ * POSIX record locks, which are a completely separate mechanism that does not
+ * interact with flock at all. Probing therefore opens a microseconds-wide window
+ * in which a legitimate start can be refused by a probe rather than by a daemon.
+ * A single-shot attempt turns that into `Another daemon is already running` when
+ * none is — the same class of false liveness verdict this module exists to
+ * eliminate. And probes are frequent: every CLI invocation calls
+ * isDaemonRunning, and the riskiest moment is exactly "no daemon running, two
+ * commands starting at once" (a script, two terminals, a shell right after
+ * boot).
+ *
+ * Retrying closes that window at zero cost to a REAL refusal: a genuine
+ * incumbent holds its lock for its entire lifetime, so a true conflict still
+ * returns null — just ~100ms later, once per losing start. Do not collapse this
+ * back to one attempt.
  */
 export function acquireDaemonLock(projectRoot: string): number | null {
   const lockPath = getDaemonLockPath(projectRoot);
@@ -491,8 +690,18 @@ export function acquireDaemonLock(projectRoot: string): number | null {
   const fd = openSync(lockPath, constants.O_CREAT | constants.O_RDWR, 0o644);
 
   try {
-    // Try non-blocking exclusive lock
-    if (!tryFlock(fd, LOCK_EX | LOCK_NB)) {
+    // Try non-blocking exclusive lock, retrying briefly (see WHY above).
+    // Bun.sleepSync matches blockingFlock's approach: a truly blocking
+    // flock(LOCK_EX) would stall the event loop with no timeout at all.
+    let locked = false;
+    for (let attempt = 0; attempt < ACQUIRE_RETRY_ATTEMPTS; attempt++) {
+      if (tryFlock(fd, LOCK_EX | LOCK_NB)) {
+        locked = true;
+        break;
+      }
+      if (attempt < ACQUIRE_RETRY_ATTEMPTS - 1) Bun.sleepSync(ACQUIRE_RETRY_DELAY_MS);
+    }
+    if (!locked) {
       closeSync(fd);
       return null;
     }

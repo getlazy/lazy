@@ -35,6 +35,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { findFullTaskId, readSessionJson, readTaskStatus, setTaskMetadata, setTaskStatus } from '../helpers/storage';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -65,7 +66,7 @@ class AgentSession {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env },
+      env: { ...process.env, ...MCP_SERVER_ENV_PINS },
     });
     this.stdin = this.proc.stdin as import('bun').FileSink;
     this.reader = (this.proc.stdout as ReadableStream<Uint8Array>).getReader();

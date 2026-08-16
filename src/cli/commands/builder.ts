@@ -21,7 +21,7 @@ import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, tryRemoteStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
 import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
-import { isTTY, promptLine, promptYesNo } from '../editor';
+import { isTTY, promptLine } from '../editor';
 import { getProjectName } from '../../storage';
 import { theme } from '../theme';
 import { createRunner, refreshRunnerProxyTargets, type Runner } from '../../runner';
@@ -31,6 +31,7 @@ import { queryDaemonMcpConfig, queryConcurrency } from '../../daemon/rpc-fallbac
 import { checkDaemonHealth } from '../../daemon/lifecycle';
 import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
 import { revokeBuilderMcpToken } from '../../builder/mcp-session';
+import { startBuilderMcpReissueWatcher } from '../../builder/mcp-reissue';
 import {
   resolveBuilderProjectsDirForLaunch,
   isTrustedResumeProjectsDir,
@@ -38,6 +39,7 @@ import {
   type BuilderLaunchProjects,
 } from '../../builder/projects-isolation';
 import { detectBuilderLaunchSessionId } from '../../builder/session-detect';
+import { ensureBuilderScratchDir } from '../../builder/scratch';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { resolveBuilderChattiness, renderChattinessSnippet } from '../../config/chattiness';
 import { buildMemorySection } from '../../memory';
@@ -156,20 +158,6 @@ async function commandBuilderList(_lazyRoot: string): Promise<void> {
   } finally {
     await storage.close();
   }
-}
-
-// --- Resume helpers ---
-
-/**
- * Get the last builder session ID from the LAZY_LAST_SESSION_ID env var.
- * This is the only source — no file scanning or marker files.
- * The env var is inherently terminal-scoped, which prevents race conditions
- * between concurrent builder sessions in different terminals.
- */
-function getLastSessionId(): string | null {
-  const envId = process.env.LAZY_LAST_SESSION_ID;
-  if (envId && envId.trim()) return envId.trim();
-  return null;
 }
 
 // --- Main command ---
@@ -309,32 +297,19 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const systemPrompt = await buildSystemPrompt(root, runner);
 
   // Determine if we're resuming and which session ID to use.
-  // Resume source: LAZY_LAST_SESSION_ID env var (terminal-scoped) or explicit --resume <id>.
+  // Resume source: an explicit --resume <id> and nothing else.
   let resumeId: string | null = null;
-  const lastSessionId = getLastSessionId();
 
   if (resumeArg === true) {
-    // Bare --resume: use LAZY_LAST_SESSION_ID env var
-    if (!lastSessionId) {
-      console.error('LAZY_LAST_SESSION_ID is not set.');
-      console.error('Use --resume <id> with an explicit session ID, or set the env var.');
-      console.error(`Find session IDs with: lazy builder list`);
-      process.exit(1);
-    }
-    resumeId = lastSessionId;
-    console.log(`Resuming session ${resumeId.substring(0, 8)}`);
+    // Bare --resume: there is no way to infer which session was meant.
+    console.error('--resume needs a session ID.');
+    console.error('Usage: lazy builder --resume <session-id>');
+    console.error('Find session IDs with: lazy builder list');
+    process.exit(1);
   } else if (typeof resumeArg === 'string') {
     // Explicit session ID — pass directly to Claude (no storage scanning)
     resumeId = resumeArg;
     console.log(`Resuming session ${resumeId.substring(0, 8)}`);
-  } else if (lastSessionId && isTTY()) {
-    // No --resume flag but LAZY_LAST_SESSION_ID is set — offer to resume
-    const shortId = lastSessionId.substring(0, 8);
-    const shouldResume = await promptYesNo(`Resume previous builder session ${shortId}?`);
-    if (shouldResume) {
-      resumeId = lastSessionId;
-      console.log(`Resuming session ${shortId}`);
-    }
   }
 
   const isResuming = resumeId !== null;
@@ -410,6 +385,15 @@ export async function commandBuilder(args: string[]): Promise<void> {
   }
 
   await markBuilderRun(root);
+
+  // Builder scratch dir: the one writable place the builder has outside the
+  // repo, at a path the human can open directly. Created before launch so the
+  // path we print (and hand Claude Code via --add-dir) always exists. Both
+  // runners resolve it with the same helper. See src/builder/scratch.ts.
+  const scratchDir = await ensureBuilderScratchDir(root);
+  console.log('');
+  console.log(`Scratch dir (writable, outside the repo, readable by you at this path):`);
+  console.log(`  ${scratchDir}`);
 
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
@@ -503,6 +487,11 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
     const claudeExtraArgs = [
       ...builderPermissionArgs,
+      // Make the scratch dir a workspace dir so Claude Code's file tools (and,
+      // on the host runner, the OS sandbox) can write there — the repo/worktree
+      // is otherwise the only writable workspace. The path is identical inside
+      // a container because the mount uses the host path.
+      '--add-dir', scratchDir,
       ...(rid ? ['--resume', rid] : []),
       ...(resolvedModel ? ['--model', resolvedModel] : []),
       '--effort', builderEffort,
@@ -511,27 +500,58 @@ export async function commandBuilder(args: string[]): Promise<void> {
     if (runner.usesSandbox()) {
       // Container mode: use daemon MCP proxy so tool calls route through the daemon.
       // The daemon generates the MCP config (it knows its own webPort and token).
-      // The name is this builder session's MCP identity label: the daemon binds
-      // the minted token to it, and we hand it back on exit to revoke that
-      // token (see revokeBuilderMcpToken). Keep it in a const — a second
-      // `builder-${Date.now()}` would be a different, unrevokable label.
-      const daemonMcpName = `builder-${Date.now()}`;
-      const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
-        name: daemonMcpName,
-      });
-
-      // Still need a builder config for conversation capture (the supervisor reads it)
-      // but we don't start a separate HTTP server. `id` is this builder's stable
+      //
+      // Order matters: the builder config is generated FIRST because its `id` is
+      // what keys the MCP identity label below. `id` is this builder's stable
       // identifier — it matches the `lazy-builder-<id>` container name and is how
-      // a resume intent written by `lazy upgrade` is keyed.
+      // a resume intent written by `lazy upgrade` is keyed. (We still need a
+      // builder config for conversation capture — the supervisor reads it — but
+      // we don't start a separate HTTP server.)
       const dataDir = config.data.path;
       const { configPath, config: builderConfig, id } = generateBuilderConfig(root, dataDir);
       writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
+
+      // This builder session's MCP identity label: the daemon binds the minted
+      // token to it, and we hand it back on exit to revoke that token (see
+      // revokeBuilderMcpToken). Keep it in a const — a second computation would
+      // be a different, unrevokable label.
+      //
+      // Keyed on `id`, NOT on the clock. `builder-${Date.now()}` collided
+      // whenever two builders launched in the same millisecond: mintMcpToken
+      // reuses by identity key, so both got the same token and both worked —
+      // until the first one exited and revoked the shared label out from under
+      // the one still running, costing it every lazy_* tool for the rest of its
+      // session. `id` is a random uuid slice drawn per launch, so it does not
+      // degenerate under concurrency the way a clock reading does, and it is the
+      // same value the mounted ~/.claude.json is keyed on.
+      const daemonMcpName = `builder-${id}`;
+      const { configPath: daemonConfigPath } = await queryDaemonMcpConfig({
+        name: daemonMcpName,
+        // This process is the builder session's owner: it lives exactly as long
+        // as the session does, and revokes the token on the way out. Telling the
+        // daemon our pid is what lets it evict dead builders' tokens ahead of
+        // ours when the registry's builder cap trips — before, the OLDEST token
+        // went first, which preferentially disarmed the longest-running live
+        // builder (every lazy_* tool gone, silently, mid-session).
+        ownerPid: process.pid,
+      });
 
       // Stamp the launch instant BEFORE the container starts: it is the cut that
       // separates this run's session files from everything already on disk
       // (including the history seeded into the projects dir above).
       const launchedAtMs = Date.now();
+
+      // Watch for a restarted daemon for as long as this builder runs. A daemon
+      // that comes back without our token record (registry moved by an upgrade,
+      // cleared by a repair, label evicted) would otherwise 401 every lazy tool
+      // for the rest of the session, with "relaunch the builder" as the only
+      // remedy. The watcher asks for a credential again under THIS session's own
+      // label — same identity, same revoke-on-exit — and the daemon rewrites the
+      // mounted config in place. See src/builder/mcp-reissue.ts.
+      const mcpReissue = startBuilderMcpReissueWatcher({
+        name: daemonMcpName,
+        projectRoot: root,
+      });
 
       try {
         const result = await runner.launchBuilderInteractive(
@@ -552,8 +572,11 @@ export async function commandBuilder(args: string[]): Promise<void> {
         return { exitCode: result.exitCode, sessionId, builderId: id };
       } finally {
         // The builder supervisor has exited (normally, by upgrade-stop, or by
-        // throwing) — its token must die with the session. Best effort: a
-        // crashed daemon must never break builder exit.
+        // throwing) — its token must die with the session. Stop asking for
+        // credentials BEFORE revoking, so a re-issue can never race the revoke
+        // and leave a live token behind a dead session. Best effort: a crashed
+        // daemon must never break builder exit.
+        await mcpReissue.stop();
         await revokeBuilderMcpToken(daemonMcpName);
         for (const tmpFile of [daemonConfigPath, configPath]) {
           try {
@@ -606,7 +629,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
 }
 
 export function builderUsage(): void {
-  console.log(`Usage: lazy builder [list | --resume [id]]
+  console.log(`Usage: lazy builder [list | --resume <id>]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
 
@@ -622,15 +645,13 @@ Subcommands:
   list, ls             List captured builder conversations
 
 Resume options:
-  --resume             Resume the session from LAZY_LAST_SESSION_ID
   --resume <id>        Resume a specific session by Claude session ID
   --import             Adopt a session that has never run under lazy's builder
                        isolation (use with --resume <id>; without it such a
                        resume errors instead of adopting silently)
 
 When a builder session exits, the session ID is printed so you can resume it
-with --resume <id>. Set LAZY_LAST_SESSION_ID in your shell to enable bare
---resume and the interactive resume prompt.
+with --resume <id>. Use 'lazy builder list' to look up an earlier session ID.
 
 The interactive system prompt warning is automatically skipped when resuming.
 
@@ -659,7 +680,6 @@ Flags:
 Examples:
   lazy builder                    # Start new session
   lazy builder --resume <uuid>    # Resume a specific session
-  lazy builder --resume           # Resume from LAZY_LAST_SESSION_ID
   lazy builder list               # List captured conversations
   lazy builder --autonomous       # Run without permission prompts
   lazy builder --model mythos     # Run the builder on a specific model`);

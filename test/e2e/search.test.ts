@@ -474,6 +474,57 @@ describe('lazy search', () => {
       expectOutput(grouped, 'Reconciler task');
     });
 
+    // INVARIANT: a turn hit must name WHICH turn matched. Search excerpts are
+    // truncated by design (search locates, `show` reads), so a hit labelled
+    // only "turn" leaves the reader scanning show output for the excerpt. The
+    // sequence is what show prints as `--- Turn #N ---`.
+    test('turn hits are labelled with the turn sequence', async () => {
+      const taskId = await createTask(ctx, 'Turn locator task', 'Fix the widget');
+
+      await startAndReconcile(ctx, taskId, {
+        mockResponse: {
+          result: 'Rewrote the widget_locator_marker path.',
+          session_id: 'mock-sess-locator',
+          usage: { input_tokens: 100, output_tokens: 200 },
+        },
+      });
+
+      const result = await ctx.lazy(['search', 'in:turns widget_locator_marker']);
+      expectSuccess(result);
+      expectOutput(result, 'turn #');
+
+      // The sequence printed must be the one `show` renders for that turn.
+      const seq = result.stdout.match(/turn #(\d+)/)![1];
+      const shown = await ctx.lazy(['show', taskId]);
+      expectSuccess(shown);
+      expect(shown.stdout).toMatch(new RegExp(`#${seq} \\[agent\\][^\\n]*widget_locator_marker`));
+    });
+
+    // --json carries the locator as structured data: turn_seq from the stored
+    // turn (not scraped back out of rendered show output), plus index — the
+    // entity's offset in the list show pages over.
+    test('--json turn hits carry turn_seq and index', async () => {
+      const taskId = await createTask(ctx, 'Json locator task', 'Fix the gadget');
+
+      await startAndReconcile(ctx, taskId, {
+        mockResponse: {
+          result: 'Rewrote the gadget_locator_marker path.',
+          session_id: 'mock-sess-json-locator',
+          usage: { input_tokens: 100, output_tokens: 200 },
+        },
+      });
+
+      const result = await ctx.lazy(['search', 'in:turns gadget_locator_marker', '--json']);
+      expectSuccess(result);
+
+      const parsed = JSON.parse(result.stdout);
+      const turnMatch = parsed.matches.find((m: any) => m.match_type === 'turn');
+      expect(turnMatch).toBeDefined();
+      expect(typeof turnMatch.context.turn_seq).toBe('number');
+      expect(typeof turnMatch.context.index).toBe('number');
+      expect(turnMatch.context.index).toBeGreaterThanOrEqual(0);
+    });
+
     // in:commits searches commit messages.
     test('in:commits searches commit messages', async () => {
       const taskId = await createTask(ctx, 'Commit search task', 'Make some commits');

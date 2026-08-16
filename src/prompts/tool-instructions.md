@@ -34,6 +34,9 @@ Available tools:
   lazy_start         Start one of YOUR subtasks (params: task_id, model?). You may only start
                      tasks you created as children of your current task — not arbitrary tasks.
   lazy_wait          Block until a task finishes its current turn (params: task_id, timeout?)
+                     task_id also takes an ARRAY — the call then returns as soon as the
+                     FIRST of those tasks finishes and names it, with the rest reported as
+                     still pending. Prefer that over guessing which one will finish first.
   lazy_show          Show a task's summary/sections (params: task_id, sections?, offset?, limit?)
   lazy_diff          Show a task's branch diff (params: task_id, full?, files?, ...)
   lazy_unblock       Give a blocked subtask feedback and resume it (params: task_id, feedback, ...)
@@ -52,6 +55,10 @@ Available tools:
   lazy_conversations       List past builder conversations with timestamps and summaries
   lazy_conversation_search Search across past builder conversations (params: query)
   lazy_conversation_read   Read a full past builder conversation (params: session_id)
+  lazy_conversation_ask    Ask a past builder conversation a question and get an answer
+                           (params: session_id, question). A throwaway read-only agent
+                           reads the stored transcript; nothing is written back. Prefer
+                           over _read when you want one fact, not the whole transcript.
 
   Ownership: lazy_show / lazy_diff / lazy_wait / lazy_unblock / lazy_accept / lazy_reject /
   lazy_close / lazy_create / lazy_start / lazy_edit only work on YOUR OWN task or its direct

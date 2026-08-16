@@ -573,3 +573,88 @@ describe('runBuilderRelaunchLoop', () => {
     expect(refreshes).toBe(0);
   });
 });
+
+/**
+ * A resume intent written by a DAEMON RESTART, not by `lazy upgrade`.
+ *
+ * The two look identical to the wrapper apart from `reason`, and the difference
+ * is load-bearing: upgrade writes its intent BEFORE restarting the daemon, so
+ * there is a restart still to wait for; a daemon restart writes it FROM the
+ * daemon that has already come up, so there is nothing left to wait for. Running
+ * the upgrade wait on a daemon-restart intent compares a baseline taken after
+ * the restart against the very daemon that caused it, and never returns.
+ */
+describe('runBuilderRelaunchLoop — daemon-restart intent', () => {
+  test('relaunches immediately without waiting for a daemon restart', async () => {
+    const storage = fakeStorage([intent({ reason: 'daemon-restart', sessionId: 'sess-dr' })]);
+    const resumeIds: (string | null)[] = [];
+    let statusCalls = 0;
+    let call = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      // Same healthy daemon on every poll: an upgrade-style wait would spin here
+      // forever, so finishing at all proves the wait was skipped.
+      daemonStatus: async (): Promise<DaemonStatus> => {
+        statusCalls++;
+        return { running: true, pid: 1, buildTime: 'b1', uptime: 100, instanceId: 'gen-2' };
+      },
+      launch: async (rid) => {
+        resumeIds.push(rid);
+        call++;
+        return { exitCode: 0, sessionId: null, builderId: 'abcd1234' };
+      },
+    }));
+    expect(call).toBe(2);
+    expect(resumeIds).toEqual([null, 'sess-dr']);
+    expect(storage.intents.size).toBe(0);
+    // One readiness probe, not a poll loop.
+    expect(statusCalls).toBe(1);
+    expect(result.exitCode).toBe(0);
+  });
+
+  // The daemon that stopped the builder is gone again: relaunching would point
+  // the child at nothing. Fail with the resume command, and LEAVE the intent so
+  // the session stays recoverable.
+  test('daemon unreachable → does not relaunch, keeps the intent, prints manual resume', async () => {
+    const storage = fakeStorage([intent({ reason: 'daemon-restart', sessionId: 'sess-dr' })]);
+    const errors: string[] = [];
+    let call = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      daemonStatus: async (): Promise<DaemonStatus> => ({ running: false }),
+      launch: async () => { call++; return { exitCode: 0, sessionId: null, builderId: 'abcd1234' }; },
+      errorOut: (m) => errors.push(m),
+    }));
+    expect(call).toBe(1);
+    expect(result).toEqual({ exitCode: 1, sessionId: null });
+    expect(storage.intents.size).toBe(1);
+    const joined = errors.join('\n');
+    expect(joined).toContain('lazy builder --resume sess-dr');
+    // Must NOT blame an upgrade that never ran.
+    expect(joined).not.toContain("'lazy upgrade' process exited");
+  });
+
+  // An absent `reason` is an upgrade intent (every intent written before this
+  // existed). Back-compat matters: those are durable records on disk.
+  test('intent without a reason still takes the upgrade wait path', async () => {
+    const storage = fakeStorage([intent({ sessionId: 'sess-up' })]);
+    const seen: DaemonStatus[] = [];
+    let call = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      daemonStatus: async (): Promise<DaemonStatus> => {
+        // First call is the wait's baseline; the next reports a restart.
+        const status: DaemonStatus = seen.length === 0
+          ? { running: true, pid: 1, buildTime: 'old' }
+          : { running: true, pid: 2, buildTime: 'new' };
+        seen.push(status);
+        return status;
+      },
+      launch: async () => { call++; return { exitCode: 0, sessionId: null, builderId: 'abcd1234' }; },
+    }));
+    expect(call).toBe(2);
+    // A baseline plus at least one poll — i.e. it really waited.
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(result.exitCode).toBe(0);
+  });
+});

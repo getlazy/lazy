@@ -20,18 +20,27 @@ import type { Runner } from '../runner/types';
 import { execWithWatchdog, WatchdogTimeoutError, GracefulExitTimeoutError } from './watchdog';
 import { findLatestSessionFile } from '../agent/session-discovery';
 import { runGit } from '../utils/git';
+import type { AgentTokenUsage } from '../types';
+import { addAgentUsage, attachUsage, readUsage, usageFromRawOutput } from './usage';
+import { hostname } from 'os';
+import { McpToolsUnavailableError } from './mcp-setup';
+import { formatMcpObservation, verifyInitMcpTools } from './mcp-verify';
 
 export { WatchdogTimeoutError, GracefulExitTimeoutError };
 
 export interface WorkResult {
   result: string;
   session_id: string;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  };
+  usage: AgentTokenUsage;
+  /** Concrete model id the agent reported, when it reports one (see AgentResponse). */
+  model_id?: string;
+  /**
+   * What the agent reported about its lazy MCP tools at session start, in the
+   * compact `lazy=<status> tools=<n>` form. Recorded on the turn so `lazy show`
+   * can answer "did that turn have its tools?" after the container is gone.
+   * Undefined when the agent reported nothing to judge.
+   */
+  mcp_tools?: string;
 }
 
 /** Structured error from a Claude Code crash (exit code != 0) */
@@ -40,14 +49,24 @@ export class CrashError extends Error {
   stderr: string;
   stdoutError: string | undefined;
   durationMs: number;
+  /** Tokens the agent reported before it crashed, when any could be salvaged. */
+  usage?: AgentTokenUsage;
 
-  constructor(opts: { message: string; exitCode: number; stderr: string; stdoutError?: string; durationMs: number }) {
+  constructor(opts: {
+    message: string;
+    exitCode: number;
+    stderr: string;
+    stdoutError?: string;
+    durationMs: number;
+    usage?: AgentTokenUsage;
+  }) {
     super(opts.message);
     this.name = 'CrashError';
     this.exitCode = opts.exitCode;
     this.stderr = opts.stderr;
     this.stdoutError = opts.stdoutError;
     this.durationMs = opts.durationMs;
+    this.usage = opts.usage;
   }
 }
 
@@ -61,13 +80,26 @@ export class FatalAgentError extends Error {
   failureClass: AgentFailureClass;
   failureReason: string;
   attempts: number;
+  /**
+   * Tokens spent across EVERY attempt in the turn that ended here — set by
+   * runWork's ledger, not by a single launch. A turn that burned three retries
+   * before giving up spent all three; attributing only the last would under-count.
+   */
+  usage?: AgentTokenUsage;
 
-  constructor(opts: { message: string; failureClass: AgentFailureClass; failureReason: string; attempts: number }) {
+  constructor(opts: {
+    message: string;
+    failureClass: AgentFailureClass;
+    failureReason: string;
+    attempts: number;
+    usage?: AgentTokenUsage;
+  }) {
     super(opts.message);
     this.name = 'FatalAgentError';
     this.failureClass = opts.failureClass;
     this.failureReason = opts.failureReason;
     this.attempts = opts.attempts;
+    this.usage = opts.usage;
   }
 }
 
@@ -126,6 +158,22 @@ function classifyFailure(agent: Agent, err: unknown, errorMessage: string): Agen
 }
 
 /**
+ * Recover the tokens a dying turn already spent, so they can ride out on the
+ * error and land on a turn record.
+ *
+ * A crashed or killed turn has usually paid for most of its context already —
+ * dropping that is how sessions ended up with totals no turn accounts for. This
+ * never throws and never blocks the failure path: when nothing is salvageable it
+ * says so in the log and returns undefined, so the loss is visible rather than
+ * silent (CLAUDE.md: never swallow).
+ */
+function salvageUsage(raw: string | undefined, context: string): AgentTokenUsage | undefined {
+  return usageFromRawOutput(raw, (reason) => {
+    log(`[work] No token usage recoverable after ${context}: ${reason}. This turn's tokens will not be attributed.`);
+  });
+}
+
+/**
  * Execute the agent once and return the result or throw on error.
  * When watchdogTimeoutMs > 0, monitors output and kills hung processes.
  */
@@ -160,6 +208,10 @@ async function executeAgent(
   const effectiveWindDownMs = windDownTimeoutMs ?? 0;
   const activityStream = agent.activityStream();
 
+  // What the agent reported about its own lazy tools at session start, kept so
+  // it can ride out on the successful turn as well as on the failure.
+  let mcpObservation: string | undefined;
+
   const {
     stdout: output,
     stderr,
@@ -169,15 +221,56 @@ async function executeAgent(
     windDownElapsedMs,
     resultLine,
     sessionId: streamSessionId,
+    abortReason,
   } = await execWithWatchdog(claudeArgs, {
     cwd: worktreePath,
     env: process.env as Record<string, string>,
     timeoutMs: effectiveTimeout,
     activityStream,
     windDownTimeoutMs: effectiveWindDownMs,
+    // Line 1 of the agent's own stream is the only place that says whether THIS
+    // turn actually has its lazy tools. `prepareTurnMcp` proves we wrote a
+    // config; this proves the agent loaded one. See supervisor/mcp-verify.ts.
+    abortOnSessionStart: (event) => {
+      const verdict = verifyInitMcpTools(event);
+      if (verdict.outcome === 'unknown') {
+        // Absence of evidence is not evidence of absence: a future agent
+        // release that stops reporting these fields, or an agent that never
+        // did, must not have its turns killed. Log so the blind spot is at
+        // least visible, and let the turn run.
+        log(`[work] Could not verify this turn's lazy MCP tools — ${verdict.reason}. Letting the turn run.`);
+        return null;
+      }
+      mcpObservation = formatMcpObservation(verdict.observation);
+      if (verdict.outcome === 'ok') {
+        log(`[work] Agent reports its lazy MCP tools at session start (${mcpObservation}).`);
+        return null;
+      }
+      return verdict.reason;
+    },
   });
 
   const runtime = Date.now() - launchTime;
+
+  // Positive evidence the turn had NO lazy tools. Kill first, then fail the
+  // turn with the same error prepareTurnMcp uses, so both blind spots land in
+  // the one human-visible path. Checked before the guard branches below: the
+  // abort is why the process died, and reporting it as a timeout would send
+  // the human looking at watchdog settings for an MCP problem.
+  if (abortReason) {
+    throw new McpToolsUnavailableError(
+      `This turn's agent started with NO lazy_* tools — ${abortReason}. Killed it after ` +
+      `${runtime}ms rather than letting it run.\n` +
+      `  Container/host: ${hostname()}\n` +
+      `  Observed at session start: ${mcpObservation ?? 'unavailable'}\n` +
+      `An agent without lazy tools cannot read task history, record follow-ups, or reach any ` +
+      `lazy state, so its turn is not trustworthy. Note that \`claude mcp list\` printing ` +
+      `"✔ Connected" does NOT contradict this: it proves only that the MCP server process ` +
+      `starts and answers \`initialize\`, never that it registered any tools or that the agent ` +
+      `loaded them. Run \`lazy-agent doctor\` inside the agent container to find out which ` +
+      `link is broken, and \`lazy daemon status\` on the host.`,
+    );
+  }
 
   // No-progress kill. Whether this is retriable is decided by the caller (see
   // the WatchdogTimeoutError branch in runWork) — it needs the turn's start SHA
@@ -187,6 +280,7 @@ async function executeAgent(
     throw new WatchdogTimeoutError(effectiveTimeout, runtime, {
       progressBased: !!activityStream,
       capturedResult: !!resultLine,
+      usage: salvageUsage(resultLine ?? output, 'no-progress watchdog kill'),
     });
   }
 
@@ -203,7 +297,7 @@ async function executeAgent(
           `[work] Agent did not exit within ${effectiveWindDownMs}ms of its final result; killed ` +
           `during wind-down. Summary was captured — treating the turn as successful.`,
         );
-        return parsed;
+        return { ...parsed, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
       } catch (parseErr) {
         log(
           `[work] Wind-down kill: captured result could not be parsed ` +
@@ -224,6 +318,7 @@ async function executeAgent(
       durationMs: runtime,
       elapsedSinceSignalMs: windDownElapsedMs ?? effectiveWindDownMs,
       sessionId: recoveredSessionId,
+      usage: salvageUsage(resultLine ?? output, 'wind-down kill with an unparseable result'),
     });
   }
 
@@ -262,6 +357,7 @@ async function executeAgent(
       stderr: stderrTail,
       stdoutError,
       durationMs: runtime,
+      usage: salvageUsage(errorSource, `agent crash (exit ${exitCode})`),
     });
   }
 
@@ -276,7 +372,8 @@ async function executeAgent(
   // `output` holds only a bounded tail of the stream, but the result line is
   // always retained in full.
   try {
-    return agent.parseResponse(resultLine ?? output, { workingDir: worktreePath }) as WorkResult;
+    const parsed = agent.parseResponse(resultLine ?? output, { workingDir: worktreePath }) as WorkResult;
+    return { ...parsed, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
   } catch (parseErr) {
     throw new CrashError({
       message: parseErr instanceof Error ? parseErr.message : String(parseErr),
@@ -284,6 +381,7 @@ async function executeAgent(
       stderr: '',
       stdoutError: output.substring(0, 500),
       durationMs: Date.now() - launchTime,
+      usage: salvageUsage(resultLine ?? output, 'unparseable agent response'),
     });
   }
 }
@@ -479,6 +577,28 @@ export async function runWork(
   /** Watchdog kills in this turn, counted separately from ordinary crashes. */
   let watchdogKills = 0;
 
+  /**
+   * Tokens spent by attempts that FAILED, accumulated across the retry loop.
+   *
+   * INVARIANT: retries are internal to one turn, so every attempt's tokens
+   * belong to that turn's record. Before this ledger existed, a turn that
+   * crashed twice and then succeeded recorded only the successful attempt's
+   * usage — the rest was spent, billed, and attributed to nothing.
+   */
+  let failedAttemptUsage: AgentTokenUsage | undefined;
+
+  /**
+   * Throw out of the retry loop with the turn's accumulated usage attached, so
+   * the supervisor can put it on the wire no matter which exit path ended the
+   * turn.
+   */
+  // Annotated on the VARIABLE, not just the arrow: TypeScript only treats a
+  // function expression as never-returning for control-flow analysis when the
+  // binding itself is explicitly typed.
+  const fail: (err: unknown) => never = (err) => {
+    throw attachUsage(err, failedAttemptUsage);
+  };
+
   while (true) {
     const isRetry = retryState.count > 0;
     log(`[work] ${isRetry ? `Retry ${retryState.count}: ` : ''}Running ${agent.id}${currentSessionId ? ' (resume)' : ''}...`);
@@ -499,13 +619,35 @@ export async function runWork(
       }
 
       log(`[work] Response captured. Session: ${result.session_id.substring(0, 8)}...`);
+
+      // Fold in what the failed attempts of THIS turn cost, so the turn record
+      // reflects the whole turn rather than just its last launch.
+      if (failedAttemptUsage) {
+        log(`[work] Attributing ${retryState.count} failed attempt(s) of this turn to its turn record.`);
+        return { ...result, usage: addAgentUsage(failedAttemptUsage, result.usage)! };
+      }
       return result;
 
     } catch (err) {
       const runtime = Date.now() - launchTime;
       const errorMessage = err instanceof Error ? err.message : String(err);
 
+      // Bank this attempt's tokens before deciding what to do with the failure —
+      // every path out of here (retry, give up, rethrow) must keep them.
+      failedAttemptUsage = addAgentUsage(failedAttemptUsage, readUsage(err));
+
       logError(`[work] ${agent.id} failed after ${runtime}ms: ${errorMessage}`);
+
+      // INVARIANT: a turn that provably started with no lazy tools is NEVER
+      // retried. Nothing about relaunching the same container with the same
+      // config would give it tools; retrying would just burn three more turns
+      // and bury the diagnosis under backoff noise. The human has to fix the
+      // wiring, so fail straight out to them.
+      if (err instanceof McpToolsUnavailableError) {
+        retryState.nextDelayMs = undefined;
+        if (onRetryStateChange) onRetryStateChange(retryState);
+        fail(err);
+      }
 
       // INVARIANT: a watchdog kill that CAPTURED WORK is never retried — the
       // agent's work is already on disk, so relaunching would either repeat it
@@ -533,7 +675,7 @@ export async function runWork(
           );
           retryState.nextDelayMs = undefined;
           if (onRetryStateChange) onRetryStateChange(retryState);
-          throw err;
+          fail(err);
         }
 
         retryState.nextDelayMs = decision.delayMs;
@@ -544,7 +686,7 @@ export async function runWork(
           await _sleepOverride(decision.delayMs);
         } else if (protocolDir) {
           if (await sleepWithCommandCheck(protocolDir, decision.delayMs)) {
-            throw new Error('Retry canceled: new command arrived');
+            fail(new Error('Retry canceled: new command arrived'));
           }
         } else {
           await Bun.sleep(decision.delayMs);
@@ -558,7 +700,7 @@ export async function runWork(
       // (Reaching here at all means the captured result was unparseable; a
       // parseable one is returned as a successful turn — see executeAgent.)
       if (err instanceof GracefulExitTimeoutError) {
-        throw err;
+        fail(err);
       }
 
       // Handle 'Prompt is too long' as a non-retriable session error.
@@ -588,7 +730,7 @@ export async function runWork(
         // Already running without a session — prompt/turn-history itself is too large.
         // Retrying won't help since the prompt won't get shorter.
         logError('[work] Prompt too long even without session resume. Cannot recover.');
-        throw new Error('Prompt is too long even without session resume. The prompt or turn history may need to be truncated.');
+        fail(new Error('Prompt is too long even without session resume. The prompt or turn history may need to be truncated.'));
       }
 
       // Handle 'No conversation found with session ID' — the session doesn't exist
@@ -630,7 +772,7 @@ export async function runWork(
         // Fast-fail detection: 3 consecutive crashes under 10s = crash loop
         if (retryState.consecutiveFastFails >= 3) {
           logError('[work] Detected crash loop (3 fast failures). Stopping retries.');
-          throw new Error(`Crash loop detected: ${errorMessage}`);
+          fail(new Error(`Crash loop detected: ${errorMessage}`));
         }
       } else {
         retryState.consecutiveFastFails = 0;
@@ -659,6 +801,7 @@ export async function runWork(
           failureClass: failure.class,
           failureReason: failure.reason,
           attempts: retryState.count,
+          usage: failedAttemptUsage,
         });
       }
 
@@ -678,7 +821,7 @@ export async function runWork(
       } else if (protocolDir) {
         const newCommandArrived = await sleepWithCommandCheck(protocolDir, delay);
         if (newCommandArrived) {
-          throw new Error('Retry canceled: new command arrived');
+          fail(new Error('Retry canceled: new command arrived'));
         }
       } else {
         await Bun.sleep(delay);

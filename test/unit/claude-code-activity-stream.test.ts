@@ -40,6 +40,49 @@ describe('ClaudeCodeActivityStream.parseLine', () => {
     expect(ev?.sessionId).toBe('sess-1');
   });
 
+  // INVARIANT (init-line-is-ground-truth): the init line is the ONLY place the
+  // agent reports what it actually loaded — which MCP servers connected and
+  // which tools exist in its own process. Everything else lazy can observe is
+  // what it ASKED for. Dropping these fields is what left a toolless turn
+  // undetectable while `claude mcp list` printed "✔ Connected".
+  test('system/init carries the mcp servers and tool names the agent loaded', () => {
+    const ev = stream.parseLine(JSON.stringify({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'sess-1',
+      mcp_servers: [{ name: 'lazy', status: 'connected' }],
+      tools: ['Bash', 'mcp__lazy__lazy_status'],
+    }));
+    expect(ev?.kind).toBe('session_start');
+    expect(ev?.mcpServers).toEqual([{ name: 'lazy', status: 'connected' }]);
+    expect(ev?.toolNames).toEqual(['Bash', 'mcp__lazy__lazy_status']);
+  });
+
+  // INVARIANT (absence-is-not-zero): an init line without these fields — an
+  // older or future agent, or a different agent entirely — must leave them
+  // undefined. `undefined` means "the agent said nothing"; only `[]` is
+  // evidence of "none". Conflating the two would kill healthy turns.
+  test('system/init without mcp fields leaves them undefined, not empty', () => {
+    const ev = stream.parseLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1' }));
+    expect(ev?.mcpServers).toBeUndefined();
+    expect(ev?.toolNames).toBeUndefined();
+  });
+
+  // The parser must never throw on an odd shape — a malformed field costs the
+  // observation, never the turn.
+  test('system/init with malformed mcp fields does not throw', () => {
+    const ev = stream.parseLine(JSON.stringify({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'sess-1',
+      mcp_servers: [{ status: 'connected' }, 'nonsense', { name: 'lazy' }],
+      tools: ['Bash', 42, null],
+    }));
+    expect(ev?.kind).toBe('session_start');
+    expect(ev?.mcpServers).toEqual([{ name: 'lazy' }]);
+    expect(ev?.toolNames).toEqual(['Bash']);
+  });
+
   test('assistant tool_use is a tool_start carrying id and name', () => {
     const ev = stream.parseLine(JSON.stringify({
       type: 'assistant',

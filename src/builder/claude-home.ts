@@ -55,8 +55,34 @@
  * because lazy has to inject its own `mcpServers.lazy` entry without editing the
  * human's real file. That copy used to be a per-launch temp file, so every write
  * Claude Code made to it was discarded when the builder exited and the human
- * re-answered the same prompts on every launch. We keep the merge, but the
- * target is now a stable per-project file so the state survives.
+ * re-answered the same prompts on every launch. We keep the merge, and the
+ * state still persists — but the file the container MOUNTS is per-launch again,
+ * with the persisted file used as the seed and the write-back target.
+ *
+ * ── Why the mounted copy must be per-launch ─────────────────────────────────
+ *
+ * `mcpServers.lazy.args` carries `--daemon-config <path>`, and that path is
+ * minted PER LAUNCH (`daemon-mcp-builder-<ts>.json`) and bind-mounted read-only
+ * into exactly one container. A single stable file holding a per-launch path is
+ * a cross-session clobber waiting to happen: the second launch rewrites the file
+ * in place, and because a single-file bind mount pins the inode, the rewrite is
+ * immediately visible inside the FIRST launch's still-running container. That
+ * container then tells Claude Code to start the lazy MCP server against a path
+ * it does not have mounted, the server exits, and the builder silently loses
+ * every `lazy_*` tool.
+ *
+ * `lazy upgrade` makes that collision near-certain rather than theoretical: it
+ * stops every builder container of the project at once, and each host wrapper
+ * unblocks off the same daemon-healthy poll and relaunches within milliseconds
+ * of the others (the incident that prompted this: two builder tokens minted
+ * 153 ms apart, and the surviving container mounted the earlier one while the
+ * shared config named the later one).
+ *
+ * So: seed the per-launch copy from the persisted file, mount the copy, and
+ * write it back to the persisted file on exit — MINUS `mcpServers.lazy`, which
+ * is re-derived on every launch and must never be persisted stale. Nothing a
+ * launch writes can reach another launch's container, and the persisted file
+ * can never name a per-launch path at all.
  */
 
 import { readFile, writeFile } from 'fs/promises';
@@ -94,9 +120,26 @@ export async function writeNeutralCredentialStore(tmpDir: string, builderId: str
   return path;
 }
 
-/** Path of the stable, persisted `~/.claude.json` the builder container mounts. */
+/**
+ * Path of the stable, persisted builder `~/.claude.json` STATE.
+ *
+ * This file is the seed and the write-back target — it is deliberately NOT the
+ * file mounted into a container (see `builderClaudeSessionConfigPath` and the
+ * module header). It never carries a per-launch `--daemon-config` path.
+ */
 export function builderClaudeConfigPath(dataDir: string): string {
   return join(dataDir, 'builder-claude-config.json');
+}
+
+/**
+ * Path of the PER-LAUNCH `~/.claude.json` copy the container actually mounts.
+ *
+ * Per-builder-id, so two builders of the same project — including two that
+ * `lazy upgrade` relaunches milliseconds apart — can never write each other's
+ * mount. Lives beside the other per-launch builder temp files.
+ */
+export function builderClaudeSessionConfigPath(tmpDir: string, builderId: string): string {
+  return join(tmpDir, `builder-claude-${builderId}.json`);
 }
 
 /**
@@ -146,6 +189,75 @@ export async function resolveBuilderClaudeConfigBase(
   const persisted = await readJsonObject(persistedPath, onWarn);
   if (persisted) return persisted;
   return (await readJsonObject(hostConfigPath, onWarn)) ?? {};
+}
+
+/**
+ * Write this launch's `~/.claude.json` copy — the file the container mounts.
+ *
+ * Seeded from the persisted per-project state (falling back to the human's real
+ * config on first launch), with THIS launch's `mcpServers.lazy` entry merged in.
+ * Returns the path written, which is what the caller bind-mounts.
+ */
+export async function writeBuilderSessionClaudeConfig(opts: {
+  sessionPath: string;
+  persistedPath: string;
+  hostConfigPath: string;
+  mcpArgs: string[];
+  onWarn: (message: string) => void;
+}): Promise<string> {
+  const base = await resolveBuilderClaudeConfigBase(
+    opts.persistedPath, opts.hostConfigPath, opts.onWarn,
+  );
+  await writeFile(
+    opts.sessionPath,
+    JSON.stringify(mergeBuilderClaudeConfig(base, opts.mcpArgs), null, 2) + '\n',
+  );
+  return opts.sessionPath;
+}
+
+/**
+ * Fold whatever Claude Code wrote into this launch's mounted copy back into the
+ * persisted per-project state, on container exit.
+ *
+ * This is what keeps onboarding, folder-trust and model choices from being
+ * re-prompted on every launch — the reason the config was made stable in the
+ * first place — WITHOUT a stable file being the thing two concurrent containers
+ * mount.
+ *
+ * `mcpServers.lazy` is dropped on the way through. It names this launch's
+ * `--daemon-config` file, which is deleted when the session ends; persisting it
+ * would put a dangling path back into the seed for the next launch. It is
+ * re-derived on every launch, so nothing is lost by not persisting it.
+ *
+ * Never throws: a builder that has already exited must not fail because
+ * housekeeping did. Returns true when the state was persisted.
+ */
+export async function persistBuilderSessionClaudeConfig(opts: {
+  sessionPath: string;
+  persistedPath: string;
+  onWarn: (message: string) => void;
+}): Promise<boolean> {
+  const session = await readJsonObject(opts.sessionPath, opts.onWarn);
+  // Absent (a launch that never started a container) or unparseable — the
+  // existing persisted state is still the best we have; leave it alone.
+  if (!session) return false;
+
+  const servers = { ...((session.mcpServers as Record<string, unknown>) ?? {}) };
+  delete servers.lazy;
+  const next: Record<string, unknown> = { ...session };
+  if (Object.keys(servers).length > 0) next.mcpServers = servers;
+  else delete next.mcpServers;
+
+  try {
+    await writeFile(opts.persistedPath, JSON.stringify(next, null, 2) + '\n');
+    return true;
+  } catch (err) {
+    opts.onWarn(
+      `Could not persist builder Claude config to ${opts.persistedPath}: ${(err as Error).message}. ` +
+      `Onboarding/model choices from this session may be re-prompted next launch.`,
+    );
+    return false;
+  }
 }
 
 async function readJsonObject(

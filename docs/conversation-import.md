@@ -23,6 +23,18 @@ are captured as they go:
   + `stat` plus one small head-read per session, and a session is parsed only
   when it is new or has changed since the last pass.
 
+### Capture never shortens a conversation
+
+The same session exists in several projects dirs, and a stale copy can be
+touched — mounted, refreshed — without gaining a byte. Capture used to re-parse
+whatever it found and blind-write it, so a stale copy could replace a stored
+conversation with an earlier snapshot of itself; the user then could not read
+their newest turns via `lazy view` at all. A capture whose messages are a strict
+prefix of what is already stored (same message uuids, position for position,
+fewer of them) is now refused, and the refusal is logged. This is deliberately
+narrow: a conversation that genuinely *diverged* is still stored, because there
+the on-disk copy is the truth.
+
 ### What is deliberately NOT captured
 
 Lazy runs its own machine-generated `claude -p` one-shots — the PR/commit
@@ -42,6 +54,36 @@ already lands on the task as a turn, so capturing the session too is noise.
 
 Deliberately-skipped one-shots never count as uncaptured, so the capture-rot
 check below stays honest instead of going red after every accept.
+
+### One-shots are also excluded from session *ownership*
+
+Skipping capture is only half of it. `runClaudeOneshot` inherits the daemon's
+cwd, so a one-shot's JSONL lands in the very projects dir that every
+"which session was this launch running?" rule scans — and, being brand new, it
+is by construction the newest file *created since launch*. That is the whole of
+`pickLaunchSessionId` and rule 1 of `pickActiveSessionFile`.
+
+The consequence, if the ownership rules do not filter: a fidelity summary fired
+by an accept made *during* a builder or `lazy pair` session wins "newest session
+this launch owns". Its id is stamped as the resume target and printed as
+`lazy builder --resume <id>`, so the next builder opens **inside** the
+housekeeping conversation — the human's terminal shows the fidelity prompt as a
+user turn and answers it. That is a real incident, not a hypothetical.
+
+So every ownership and capture path filters with the same head-anchored
+predicate that discovery uses (`excludeMachineOneshots` in
+`src/import/machine-oneshot.ts`):
+
+- `detectBuilderLaunchSessionId` (host-side builder recovery)
+- `detectInteractiveSessionId` (`lazy pair` / `lazy chat`)
+- `getSessionFileTimes` → `pickActiveSessionFile` (in-container supervisor)
+- `snapshotSessionFiles` / `captureNewOrModifiedConversations`, whose
+  `newestSessionId` callers use as the resume target
+
+Discovery itself stays honest — it reports what is on disk; the ownership paths
+filter. Unreadable or unmarked files are **kept** (treated as real sessions),
+which is the safe direction: a redundant capture costs nothing, handing a
+human's resume target to housekeeping costs the session.
 
 ### Purging housekeeping conversations captured before the marker
 
@@ -159,6 +201,50 @@ report-only and never writes.
 lazy doctor --reimport-conversations          # Preview, then confirm
 lazy doctor --reimport-conversations --yes    # Recover without prompting
 ```
+
+## Using what is stored: `lazy ask <conversation-id>`
+
+Claude Code's own retention ages old sessions out of `/resume`; lazy's store
+keeps them. Reading one back has always worked (`lazy show <session-id>`,
+`lazy builder list`, `lazy search --conversations`) — `lazy ask` is the verb for
+asking one a question instead of reading the whole thing:
+
+```
+lazy builder list                                   # find the session id
+lazy ask 4f8c2a1b -m "what did we decide about retention?"
+lazy ask 4f8c2a1b                                   # no -m: opens $EDITOR
+lazy ask 4f8c2a1b -m "..." --json                   # structured answer
+```
+
+`lazy ask` takes either kind of id: a task id asks that task's live agent (see
+`lazy ask --help`), a conversation session id — full, or any unique prefix —
+asks the stored transcript. An ambiguous prefix is an error, never a silent pick.
+
+**Nothing is written back.** A conversation is immutable history and an ask is a
+read of it: no turn, no comment, and the ask's own `claude -p` session is marked
+as a machine one-shot so it is never captured as a *new* conversation. The
+answer goes to stdout and that is all. The agent is locked down to match — it
+gets no Bash, Write or Edit, so it can only read the transcript it was handed.
+
+Agents and the builder get the same thing as `lazy_conversation_ask`
+(`session_id` + `question`). Prefer it over `lazy_conversation_read` when you
+want one fact rather than the whole transcript — a long conversation read in
+full can overflow the caller's own context.
+
+### Transcripts too large for one pass
+
+The prompt is passed as a single `claude -p` argument, and one argv element is
+capped at 128 KiB on Linux — that, not the context window, is the binding limit.
+A transcript over the 96 KiB budget is therefore split at **message boundaries**
+into consecutive excerpts: each is read for what bears on the question, and a
+final pass writes one answer from those findings. `--json` reports `chunks` and
+`relevantChunks` so you can see it happened.
+
+Every degradation is reported rather than absorbed. An excerpt that fails to
+read, a single message too large to pass whole, findings that did not fit in the
+final pass — each comes back as a warning (on stderr, or in `warnings` under
+`--json`). If *every* excerpt fails, the ask fails; you never get a confident
+answer built from silently-dropped input.
 
 ## Onboarding: `lazy init` offers to inherit history
 

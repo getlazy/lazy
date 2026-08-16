@@ -26,6 +26,7 @@
 
 import { join } from 'path';
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
+import { excludeMachineOneshots } from '../import/machine-oneshot';
 import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
 
@@ -107,7 +108,14 @@ export async function detectBuilderLaunchSessionId(opts: {
   const { lazyRoot, projectsHostDir, launchedAtMs, resumeId, homeDirAbs = getHome() } = opts;
 
   const scan = async (projectsDir: string): Promise<string | null> => {
-    const files = await discoverProjectSessionFiles(lazyRoot, projectsDir);
+    // lazy's own `claude -p` housekeeping runs (the accept-time fidelity summary
+    // above all) write their JSONL into this very dir and are, by construction,
+    // the newest file "created since launch" — so without this filter the newest
+    // -owned rule below hands back a machine one-shot's session id and the next
+    // builder resumes INTO that housekeeping conversation.
+    const files = await excludeMachineOneshots(
+      await discoverProjectSessionFiles(lazyRoot, projectsDir),
+    );
     // `null` resumeId here on purpose: the resume fallback is applied ONCE, by
     // the caller below, after every candidate dir has been scanned. Applying it
     // per-dir would let the isolation dir answer `resumeId` and stop the scan

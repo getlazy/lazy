@@ -15,17 +15,18 @@ import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import type { Storage } from '../storage';
 import { TERMINAL_STATUSES } from '../types';
 import { isBlockedStatus } from '../task-state-machine';
-import type { TokenUsage, Task } from '../types';
+import type { TokenUsage, AgentTokenUsage, Task } from '../types';
+import { toTurnUsage, rollUpSessionUsage } from './usage-recording';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus, removeProtocolDir } from '../protocol';
-import type { CompletedResponse, ErrorResponse } from '../protocol';
+import type { CompletedResponse, ErrorResponse, WorktreeRecovery, AgentHandoffEntry } from '../protocol';
 import { completedResponses } from '../protocol';
 import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
+import { launchSettingsFromResponse } from './turns';
 import { checkLock, removeLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
-import { tmuxSessionName, killTmuxWatchSession } from '../terminal';
 import { getDataDir } from '../cli/init';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
@@ -312,7 +313,6 @@ export async function reapIdleContainers(storage: Storage, lazyRoot: string, run
         await runner.removeRun(session.container_name);
       }
       await storage.updateSessionContainerName(session.id, null);
-      killTmuxWatchSession(tmuxSessionName(shortId(taskId)));
       logger.info(`Reaped idle container for task ${shortId(taskId)} — freed a concurrency slot`);
     } catch (err) {
       logger.warn(`Failed to reap idle container for task ${shortId(taskId)}: ${err instanceof Error ? err.message : err}`);
@@ -447,7 +447,6 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   // interrupting — interrupting would re-run the agent and lose the completion.
   if (await recoverStrandedCompletion(storage, taskId, session, worktreePath, protoDir)) {
     await storage.updateSessionContainerName(session.id, null);
-    killTmuxWatchSession(tmuxSessionName(taskShortId));
     if (await taskRunner.runExists(containerName)) {
       await taskRunner.removeRun(containerName);
     }
@@ -467,7 +466,6 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     await storage.updateTaskStatus(taskId, 'interrupted', 'system');
     await storage.recordInterrupt(session.id, { reason, exit_code: exitCode, logs });
     await storage.updateSessionContainerName(session.id, null);
-    killTmuxWatchSession(tmuxSessionName(taskShortId));
     clearStatus(protoDir);
     await taskRunner.removeRun(containerName);
 
@@ -485,11 +483,75 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
     logs: null,
   });
   await storage.updateSessionContainerName(session.id, null);
-  killTmuxWatchSession(tmuxSessionName(taskShortId));
   clearStatus(protoDir);
 
   // Auto-resume if circuit breaker allows
   await maybeAutoResume(storage, taskId, session.id, lazyRoot);
+}
+
+/**
+ * Interrupt a working task whose supervisor was stopped because the DAEMON
+ * restarted, and resume it against the new daemon.
+ *
+ * Called by the restart reaper (src/daemon/restart-reaper.ts) after it has
+ * stopped the previous generation's run. It exists rather than letting the
+ * ordinary crash path handle it because two of that path's answers would be
+ * wrong here:
+ *
+ *  - The RECORDED REASON. Step 4 turns an exit code into "container exited with
+ *    …", which blames the agent for something lazy did to it. `lazy show` should
+ *    say the daemon restarted.
+ *  - The CIRCUIT BREAKER. Consecutive interruptions exist to stop a task that
+ *    keeps crashing from being resumed forever. A daemon restart is not the task
+ *    crashing, and at MAX_CONSECUTIVE_INTERRUPTIONS = 3 an ordinary upgrade
+ *    cycle could exhaust a task's budget and strand it. So the counter is reset
+ *    rather than incremented.
+ *
+ * Everything else is the same as the crash path — same statuses, same protocol
+ * cleanup, same auto-resume, same budget and concurrency gates — because the
+ * recovery itself is identical: the turn is gone, the branch is intact, run it
+ * again. The one thing NOT carried over is the crash path's response/log
+ * capture: there is no exit code or container log worth attributing here, which
+ * is the whole reason this function exists.
+ */
+export async function interruptForDaemonRestart(
+  storage: Storage,
+  taskId: string,
+  lazyRoot: string,
+): Promise<boolean> {
+  const taskShortId = shortId(taskId);
+  const session = await storage.getSessionByTaskId(taskId);
+  if (!session) return false;
+
+  const task = await storage.getTask(taskId);
+  if (!task || task.status !== 'working') return false;
+
+  await storage.updateTaskStatus(taskId, 'interrupted', 'system');
+  await storage.recordInterrupt(session.id, {
+    reason:
+      'Stopped by lazy: the daemon restarted, which invalidated this turn’s ' +
+      'connection to the audit proxy. Resuming against the new daemon.',
+    exit_code: null,
+    logs: null,
+  });
+  // Not the task's fault — see the doc comment. Skipped when the session is
+  // user-stopped: resetConsecutiveInterruptions also clears `user_stopped`
+  // (that is how manual resume re-arms auto-resume), and a daemon restart must
+  // never undo a human's `lazy stop`.
+  if (!shouldSkipAutoResumeForUserStop(session)) {
+    await storage.resetConsecutiveInterruptions(session.id);
+  }
+  await storage.updateSessionContainerName(session.id, null);
+
+  // The dead supervisor's last status line describes a turn that no longer
+  // exists. Left behind it is read as live progress by anything polling the
+  // protocol dir, and the resumed turn writes over it only once it gets going.
+  // Same clear the crash path does.
+  clearStatus(getProtocolDir(taskId));
+
+  logger.info(`Task ${taskShortId}: interrupted by daemon restart, resuming against the new daemon`);
+  await maybeAutoResume(storage, taskId, session.id, lazyRoot);
+  return true;
 }
 
 /**
@@ -842,24 +904,23 @@ function supervisedHeading(kind: 'permission_pushback' | 'maintain'): string {
   }
 }
 
-/** Convert a protocol usage block to the storage TokenUsage shape (incl. cache). */
-function toTurnUsage(usage: CompletedResponse['usage'] | undefined): TokenUsage | undefined {
-  if (!usage) return undefined;
-  return {
-    inputTokens: usage.input_tokens ?? 0,
-    outputTokens: usage.output_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-  };
+/**
+ * Roll up every invocation's usage in a bundle (work + supervised follow-ups).
+ *
+ * See src/utils/usage-recording.ts for the invariant this must be called under:
+ * only where the corresponding turn(s) are written.
+ */
+async function rollUpBundleUsage(
+  storage: Storage,
+  sessionId: string,
+  responses: Array<{ usage?: AgentTokenUsage }>,
+  taskShortId: string,
+): Promise<void> {
+  for (const resp of responses) {
+    await rollUpSessionUsage(storage, sessionId, toTurnUsage(resp.usage, `Task ${taskShortId}`), `Task ${taskShortId}`);
+  }
 }
 
-/**
- * Record a supervised follow-up (push-back / maintain nudge) as a discrete turn
- * pair: a `supervisor`-actored prompt turn carrying the supervisor's prompt, then
- * the agent's reply turn — modeled the same way a human→agent exchange is. The
- * reply turn carries the follow-up invocation's OWN usage (incl. cache tokens),
- * SHA window (so its diff shows only its commits), and any re-detected violations.
- */
 async function recordSupervisedTurns(
   storage: Storage,
   sessionId: string,
@@ -890,6 +951,7 @@ async function recordSupervisedTurns(
       role: 'agent',
       content: enrichResponseWithPlanContent(resp.result, worktreePath),
       usage: toTurnUsage(resp.usage),
+      ...launchSettingsFromResponse(resp),
       startSha: resp.start_sha_work,
       endSha: resp.end_sha_work,
       startShaWork: resp.start_sha_work,
@@ -900,6 +962,111 @@ async function recordSupervisedTurns(
       turnType: 'nudge',
     });
   }
+}
+
+/**
+ * Journal a worktree rollback the supervisor performed, attributed to it.
+ *
+ * INVARIANT (fix-sync-silent-conflict): rolling back a half-merged worktree is
+ * never silent. Whatever was in that worktree may have been a real in-progress
+ * resolution — a human's or an agent's — and the only record of its destruction
+ * used to be a line in a container log that dies with the container. The journal
+ * is the right home: durable, attributed, and never fed back into a prompt.
+ *
+ * Best-effort by design: a journal write must never fail the turn it annotates.
+ */
+async function journalWorktreeRecovery(
+  storage: Storage,
+  taskId: string,
+  recovery: WorktreeRecovery | undefined,
+): Promise<void> {
+  if (!recovery) return;
+  const lines = [recovery.summary];
+  if (recovery.files.length > 0) {
+    lines.push(`Unmerged files: ${recovery.files.join(', ')}`);
+  }
+  if (recovery.patch_path) {
+    lines.push(`Recovery patch: ${recovery.patch_path}`);
+  }
+  try {
+    await storage.appendJournalEntry(taskId, lines.join('\n'), 'supervisor');
+    logger.warn(`Task ${shortId(taskId)}: ${recovery.summary}`);
+  } catch (err) {
+    logger.warn(
+      `Task ${shortId(taskId)}: could not journal a worktree rollback (${recovery.summary}): ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Persist the end-of-turn journal entries and follow-ups an agent could not
+ * write itself because its `lazy_*` tools were unreachable.
+ *
+ * The supervisor collected these from the agent's handoff file (see
+ * src/supervisor/turn-handoff.ts) and carried them home on the response; this is
+ * where they finally reach Storage — through the daemon, like every other write,
+ * so nothing bypasses storage ownership.
+ *
+ * Idempotent by CONTENT, for two reasons: the reconciler can re-run over a
+ * response it has already consumed, and an agent whose tools came BACK may have
+ * both written the file and made the tool call. Same rule as error turns.
+ *
+ * Best-effort by design: failing to persist a retrospective must not fail the
+ * turn it belongs to — but it is warned about loudly, because a lost
+ * retrospective is exactly what this whole mechanism exists to prevent.
+ */
+async function persistAgentHandoff(
+  storage: Storage,
+  taskId: string,
+  entries: AgentHandoffEntry[] | undefined,
+): Promise<void> {
+  if (!entries || entries.length === 0) return;
+  const taskShortId = shortId(taskId);
+
+  let existingJournal: string[] = [];
+  let existingFollowUps: string[] = [];
+  try {
+    existingJournal = (await storage.getTaskJournal(taskId)).map(e => e.content);
+    existingFollowUps = (await storage.getTaskFollowUps(taskId)).map(f => f.content);
+  } catch (err) {
+    logger.debug(
+      `Task ${taskShortId}: could not read existing journal/follow-ups for handoff dedup: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  let recorded = 0;
+  for (const entry of entries) {
+    const content = entry.content.trim();
+    if (!content) continue;
+    try {
+      if (entry.kind === 'journal') {
+        if (existingJournal.includes(content)) continue;
+        await storage.appendJournalEntry(taskId, content, 'agent');
+        existingJournal.push(content);
+      } else {
+        if (existingFollowUps.includes(content)) continue;
+        await storage.createFollowUp(taskId, content);
+        existingFollowUps.push(content);
+      }
+      recorded++;
+    } catch (err) {
+      logger.warn(
+        `Task ${taskShortId}: could not persist an end-of-turn ${entry.kind} the agent handed off: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Count what was actually written, not what was offered: a reconciler re-run
+  // and an agent whose tools came back mid-turn both hand off content that is
+  // already in the store, and reporting those as "recorded" would be a lie.
+  if (recorded === 0) return;
+  logger.info(
+    `Task ${taskShortId}: recorded ${recorded} end-of-turn handoff entr` +
+    `${recorded === 1 ? 'y' : 'ies'} the agent could not write itself (lazy tools were unavailable)`,
+  );
 }
 
 export async function handleCompletedResponse(
@@ -945,6 +1112,10 @@ async function recordSyncTurns(
   const mergeResp = responses[0];
   const resolutionResp = responses[1]; // present only when the merge had conflicts
   const sync = mergeResp.sync!;
+
+  await journalWorktreeRecovery(storage, taskId, mergeResp.worktree_recovery);
+  // The conflict-resolution response (when there was one) carries the handoff.
+  await persistAgentHandoff(storage, taskId, mergeResp.agent_handoff ?? resolutionResp?.agent_handoff);
 
   // Store the upstream merge SHA for accurate diff scope (mirrors the work path).
   // Idempotent (sets the same value), so it's safe outside the recorded guard.
@@ -1009,6 +1180,7 @@ async function recordSyncTurns(
           role: 'agent',
           content: enrichResponseWithPlanContent(resolutionResp.result, worktreePath),
           usage: toTurnUsage(resolutionResp.usage),
+          ...launchSettingsFromResponse(resolutionResp),
           startSha: resolutionResp.start_sha_work,
           endSha: resolutionResp.end_sha_work,
           startShaWork: resolutionResp.start_sha_work,
@@ -1018,16 +1190,9 @@ async function recordSyncTurns(
       }
 
       // Roll up token usage from every invocation (the conflict-resolution agent,
-      // when present — the announcement carries zero).
-      for (const resp of responses) {
-        const usage = toTurnUsage(resp.usage);
-        if (!usage) continue;
-        try {
-          await storage.updateSessionUsage(session.id, usage);
-        } catch {
-          logger.debug(`Task ${taskShortId}: could not capture token usage`);
-        }
-      }
+      // when present — the announcement carries zero). Inside `!alreadyRecorded`
+      // with the turn writes, per the invariant on rollUpSessionUsage.
+      await rollUpBundleUsage(storage, session.id, responses, taskShortId);
 
       // Record the merge commit(s).
       const existingCommits = await storage.getSessionCommits(session.id);
@@ -1091,6 +1256,9 @@ export async function handleCompletedResponses(
     return;
   }
 
+  await journalWorktreeRecovery(storage, taskId, work?.worktree_recovery);
+  await persistAgentHandoff(storage, taskId, work?.agent_handoff);
+
   // Reconcile Claude session ID with what the agent actually wrote. With multiple
   // invocations the LAST one's session id points at the JSONL that exists now
   // (each resume can rotate the id), so trust the latest non-empty session id.
@@ -1149,6 +1317,7 @@ export async function handleCompletedResponses(
       role: 'agent',
       content: enrichedResult,
       usage: turnUsage,
+      ...launchSettingsFromResponse(work),
       startSha: turnStartSha,
       endSha: turnEndSha,
       startShaWork: turnStartShaWork,
@@ -1168,6 +1337,17 @@ export async function handleCompletedResponses(
     if (supervised.length > 0) {
       await recordSupervisedTurns(storage, session.id, supervised, worktreePath);
     }
+
+    // Accumulate token usage into session totals — sum EVERY invocation's usage
+    // (work + each supervised follow-up), so per-turn token costs roll up fully.
+    //
+    // INVARIANT: the session rollup lives INSIDE the same guard as the turn
+    // write, so the two can never diverge. It used to sit outside: a reconciler
+    // re-run over an unconsumed response.json (the consume happens later, after
+    // several fallible steps) skipped the turn as already-recorded but re-added
+    // its usage, leaving the session total permanently above the sum of its
+    // turns. Any rollup added here must stay inside this branch.
+    await rollUpBundleUsage(storage, session.id, responses, taskShortId);
   }
 
   // INVARIANT (CLAUDE.md — never lose human feedback): the agent responded, so
@@ -1181,18 +1361,6 @@ export async function handleCompletedResponses(
     await storage.markFeedbackConsumed(session.id);
   } catch (err) {
     logger.debug(`Task ${taskShortId}: could not mark feedback consumed: ${err instanceof Error ? err.message : err}`);
-  }
-
-  // Accumulate token usage into session totals — sum EVERY invocation's usage
-  // (work + each supervised follow-up), so per-turn token costs roll up fully.
-  for (const resp of responses) {
-    const usage = toTurnUsage(resp.usage);
-    if (!usage) continue;
-    try {
-      await storage.updateSessionUsage(session.id, usage);
-    } catch {
-      logger.debug(`Task ${taskShortId}: could not capture token usage`);
-    }
   }
 
   // Detect and record new commits
@@ -1234,16 +1402,20 @@ export async function handleCompletedResponses(
   // pending_sync is managed by the daemon sync retry loop (src/daemon/sync-retry.ts).
   // The reconciler does not touch the counter — only syncTask resets it on launch.
 
-  // Reset consecutive interruptions counter — a successful turn means the agent is healthy
+  // Reset consecutive interruptions counter — a successful turn means the agent is healthy.
+  // This is the CRASH circuit breaker, not a budget counter: it must re-arm after a
+  // healthy turn, otherwise old crashes accumulate forever and block legitimate
+  // auto-resume. Deliberately kept (see the auto-react note directly below).
   await storage.resetConsecutiveInterruptions(session.id);
 
-  // Reset auto-react counters — a successful turn means recovery worked
-  try {
-    const { resetAutoReactCounters } = await import('../daemon/auto-react-budget');
-    await resetAutoReactCounters(storage, taskId);
-  } catch {
-    // Non-critical — counters can accumulate but won't cause harm
-  }
+  // INVARIANT: auto-react budget counters are NOT reset here. A successful turn is
+  // not human review, and resetting on every turn zeroes the per-task counters
+  // between auto-triggered turns — the gate can then never be reached and
+  // auto-react loops without bound. Counters reset only on human unblock/resume
+  // or terminal state (docs/release/v0.11-walkthrough.md, "Reset triggers").
+  // History: removed by 0cf4c1b5 (MR!364), silently resurrected by the bad v0.12
+  // release merge 5857bdb0, removed again here. Guarded by
+  // test/unit/reconcile-budget-counter-survival.test.ts — do not re-add.
 
   // Clean up protocol files for this turn (response consumed)
   consumeResponse(protoDir);
@@ -1312,6 +1484,16 @@ export async function handleErrorResponse(
     lines.push(`Runtime: ${secs}s`);
   }
   lines.push(`Phase: ${response.phase}`);
+  // A merge phase that failed says what it did about the half-merged worktree.
+  // Without this the human sees "merge failed" and has no idea whether files are
+  // still conflicted on disk (fix-sync-silent-conflict).
+  if (response.merge_state) {
+    lines.push(
+      response.merge_state.settled
+        ? 'Worktree: merge aborted, worktree is clean.'
+        : `Worktree: NOT settled — ${response.merge_state.detail}`,
+    );
+  }
   if (response.stdout_error && response.stdout_error !== response.error) {
     lines.push('');
     lines.push('Stdout error:');
@@ -1325,17 +1507,46 @@ export async function handleErrorResponse(
 
   const turnContent = lines.join('\n');
 
-  // Record error turn (idempotent: check last turn isn't already an agent turn)
+  await journalWorktreeRecovery(storage, taskId, response.worktree_recovery);
+  // A crashed or watchdog-killed turn is exactly when the agent's own account of
+  // what it was doing matters most — persist it before recording the error turn.
+  await persistAgentHandoff(storage, taskId, response.agent_handoff);
+
+  // Record error turn. Idempotency is CONTENT-based: the same error must not be
+  // recorded twice, but a *different* error must always be recorded.
+  //
+  // This used to skip whenever the last turn was an agent turn — which silently
+  // swallowed exactly the errors this task exists to surface. A sync that
+  // conflicted, ran a resolution agent (agent turn), and THEN failed to conclude
+  // the merge recorded nothing at all: the task went back to blocked looking
+  // settled while the worktree was still mid-merge (fix-sync-silent-conflict).
   const existingTurns = await storage.getSessionTurns(session.id);
-  const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
-  if (lastTurn?.role !== 'agent') {
+  const alreadyRecorded = existingTurns.some(t => t.role === 'agent' && t.content === turnContent);
+  if (!alreadyRecorded) {
     const seq = await storage.getNextTurnSequence(session.id);
+    // Tokens the dying turn had already spent, salvaged by the supervisor from
+    // the agent's final output (src/supervisor/usage.ts). Absent for turns that
+    // died before reporting anything, and for supervisors older than this field.
+    const errorUsage = toTurnUsage(response.usage, `Task ${taskShortId}`);
     await storage.createTurn({
       sessionId: session.id,
       sequence: seq,
       role: 'agent',
       content: turnContent,
+      // A crash turn still records what it ran under — "model X keeps crashing"
+      // is a real finding, and dropping the labels here would silently exclude
+      // failures from any model/effort comparison.
+      ...(response.model ? { model: response.model } : {}),
+      ...(response.effort ? { effort: response.effort } : {}),
+      ...(errorUsage ? { usage: errorUsage } : {}),
     });
+    // Roll the same tokens into the session total, inside the same idempotency
+    // guard as the turn write (see rollUpSessionUsage). A crashed turn's tokens
+    // were previously dropped on the floor entirely — the turn had no usage and
+    // nothing was added to the session.
+    if (errorUsage) {
+      await rollUpSessionUsage(storage, session.id, errorUsage, `Task ${taskShortId}`);
+    }
     logger.debug(`Task ${taskShortId}: recorded agent error turn`);
   }
 

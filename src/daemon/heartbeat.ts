@@ -42,6 +42,7 @@
  * behaviour instead of choking on NDJSON.
  */
 
+import { startEnvelopeSpan } from './envelope-span';
 import type { ProgressEmitter, ProgressEvent } from './progress';
 
 /**
@@ -158,10 +159,15 @@ export function heartbeatRequestHeaders(): Record<string, string> {
  * returns the status/body it wants to send. A throw is still handled (reported
  * as a 500 inside the envelope) so a bug cannot leave the client hanging on a
  * stream that never terminates.
+ *
+ * `signal` is the request's own `AbortSignal`. It is used for tracing only —
+ * the work is deliberately NOT cancelled when the client vanishes (see the
+ * comment on the heartbeat timer below) — but recording the abort is what makes
+ * a reaped long request visible in `lazy stats timings` instead of simply absent.
  */
 export function heartbeatEnvelopeResponse(
   produce: EnvelopeProducer,
-  options?: { intervalMs?: number },
+  options?: { intervalMs?: number; signal?: AbortSignal },
 ): Response {
   const intervalMs = options?.intervalMs ?? HEARTBEAT_INTERVAL_MS;
   const encoder = new TextEncoder();
@@ -169,12 +175,21 @@ export function heartbeatEnvelopeResponse(
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // The writer's own span, nested under the request span from
+      // src/daemon/request-span.ts. It answers the question a "the daemon
+      // blipped" report actually turns on: did this request keep writing until
+      // it produced a result, or did it stop being heard from partway through?
+      // `lazy.heartbeat.count` is the evidence — a long, healthy `wait` shows a
+      // heartbeat every 5s; a request killed mid-flight stops.
+      const writerSpan = startEnvelopeSpan();
+
       // Sent before any work begins: the connection is never idle from birth,
       // and the client knows the framing before the first heartbeat is due.
       controller.enqueue(line({ lazyEnvelope: 1 } satisfies EnvelopePreamble));
 
       const started = Date.now();
       let settled = false;
+      let heartbeats = 0;
       // Label of the phase the handler last entered, mirrored onto every
       // heartbeat so a liveness tick says WHAT is alive, not merely that
       // something is. Cleared when the phase closes.
@@ -197,6 +212,7 @@ export function heartbeatEnvelopeResponse(
         if (settled) return;
         try {
           controller.enqueue(line({ heartbeat: Date.now() - started, phase: currentPhase }));
+          heartbeats++;
         } catch {
           // The client hung up. Nothing to keep alive; stop writing. The work
           // itself is already in flight and is deliberately NOT cancelled — a
@@ -204,6 +220,9 @@ export function heartbeatEnvelopeResponse(
           clearInterval(timer);
         }
       }, intervalMs);
+
+      const onAbort = () => writerSpan.reaped(heartbeats);
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
 
       let result: EnvelopeResult;
       try {
@@ -214,14 +233,17 @@ export function heartbeatEnvelopeResponse(
       } finally {
         settled = true;
         clearInterval(timer);
+        options?.signal?.removeEventListener('abort', onAbort);
       }
 
       try {
         controller.enqueue(line(result));
         controller.close();
+        writerSpan.delivered(result.status, heartbeats);
       } catch {
         // Client already gone — the response is undeliverable, and there is no
         // one left to report that to. The work completed regardless.
+        writerSpan.undeliverable(result.status, heartbeats);
       }
     },
   });

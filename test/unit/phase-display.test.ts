@@ -33,9 +33,9 @@ describe('createPhaseDisplay (non-TTY)', () => {
     });
     display.close();
 
-    expect(output()).toContain('accept ab12cd34 — 9 phases');
+    expect(output()).toContain('accept ab12cd34 — 11 phases');
     expect(output()).toContain(' 1. Branch-protection gate');
-    expect(output()).toContain('9. Clean up worktree and children');
+    expect(output()).toContain('11. Clean up worktree and children');
   });
 
   // Optional phases are announced too — a listed phase that is later explicitly

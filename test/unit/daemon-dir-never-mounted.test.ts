@@ -151,6 +151,10 @@ function builderArgs(binary: string, daemonConfigPath?: string): string[] {
     builderId: 'a1b2c3d4',
     lazyRoot: PROJECT_ROOT,
     dataDir: `${PROJECT_ROOT}/.lazy`,
+    // Builder scratch dir — outside the repo AND outside the daemon dir. This
+    // test only cares that it never exposes daemon state; the scratch mount's
+    // own contract lives in test/unit/builder-scratch-mount.test.ts.
+    scratchDir: `${HOME}/.lazy/scratch/lazy-invariant-project-deadbeef`,
     containerConfigFile: `${PROJECT_ROOT}/.lazy/tmp/builder-container-a1b2c3d4.json`,
     agentBinaryPath: '/usr/local/share/lazy-agent',
     home: HOME,

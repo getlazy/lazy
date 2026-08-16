@@ -12,12 +12,16 @@
 
 import { existsSync } from 'fs';
 import { createAllHandlers, type McpToolContext } from '../mcp/tools';
+import { findToolDefinition, parseAndValidateToolCallBody } from '../mcp/tool-registry';
+import { validateToolArgs, describeArgsFailure } from '../mcp/validate-args';
 import { getWorktreePath } from '../cli/helpers';
 import { logger } from '../utils/logger';
 import { RpcError, getOrCreateStorage } from './rpc-handlers';
 import { RpcApplicationError } from './client';
 import { lookupMcpIdentity } from './mcp-tokens';
 import type { ProgressEmitter } from './progress';
+import { trackWait, BLOCKING_WAIT_TOOLS } from './wait-registry';
+import type { Storage } from '../storage/interface';
 
 /**
  * HTTP status a daemon route should answer with for a handler error.
@@ -161,6 +165,29 @@ export async function authorizeMcpCall(
 }
 
 /**
+ * Turn a POST /mcp/:taskId/:toolName request body into validated tool arguments.
+ *
+ * INVARIANT — this route is an EXTERNAL SURFACE and validates its own inputs.
+ * It is reachable by anything holding a session's MCP token, including an agent
+ * hand-rolling the documented HTTP fallback, and the well-behaved MCP client
+ * plumbing is not the only caller. A body missing the `{"arguments": {...}}`
+ * envelope, or arguments that violate the tool's declared inputSchema, must be
+ * a 400 that names the field — NOT a dispatch with silently-empty arguments.
+ *
+ * This is the fix for the commit whose message was the literal string
+ * "undefined": `{"message": "..."}` posted without the envelope made
+ * `args.message` undefined, and lazy_commit ran `git commit -m undefined`. A
+ * corrupt write is strictly worse than a rejected call.
+ *
+ * @throws RpcError 400 with the offending field and the expected envelope shape
+ */
+export function parseMcpToolCallBody(toolName: string, body: unknown): Record<string, unknown> {
+  const parsed = parseAndValidateToolCallBody(toolName, body);
+  if (!parsed.ok) throw new RpcError(400, parsed.error);
+  return parsed.args;
+}
+
+/**
  * Execute an MCP tool call on behalf of an agent.
  *
  * @param projectRoot - The project root path
@@ -181,6 +208,19 @@ export async function handleMcpToolCall(
 ): Promise<unknown> {
   if (!existsSync(projectRoot)) {
     throw new RpcError(400, `Project root does not exist: ${projectRoot}`);
+  }
+
+  // Schema check before ANY side effect — before storage, before the worktree
+  // is resolved, before a handler runs. Defence in depth: the route already
+  // validated (parseMcpToolCallBody), but this function is the shared entry
+  // point for tool dispatch, so it must not depend on its caller having done
+  // it. An unknown tool name falls through to the 404 below.
+  const definition = findToolDefinition(toolName);
+  if (definition) {
+    const failure = validateToolArgs(definition.inputSchema, args);
+    if (failure) {
+      throw new RpcError(400, describeArgsFailure(toolName, definition.inputSchema, failure));
+    }
   }
 
   // Get the daemon's long-lived storage singleton
@@ -219,5 +259,52 @@ export async function handleMcpToolCall(
 
   logger.debug(`MCP tool call: ${toolName} (task=${taskId || 'builder'}, worktree=${worktreePath})`);
 
-  return handler(args);
+  // A task agent making a BLOCKING call is parked, not working. Record it for
+  // the duration so read surfaces can say `working(waiting on <task>)` and so
+  // the waited time is subtractable from the turn's wall-clock. Builder calls
+  // (taskId === '') have no task to attribute anything to.
+  if (!taskId || !BLOCKING_WAIT_TOOLS.has(toolName)) {
+    return handler(args);
+  }
+
+  return trackWait(
+    {
+      storage,
+      taskId,
+      tool: toolName,
+      targets: await resolveWaitTargets(storage, args),
+    },
+    () => handler(args),
+  );
+}
+
+/**
+ * Resolve the `task_id` argument of a blocking tool into ids plus display
+ * labels. Best-effort: an unresolvable reference is carried through verbatim as
+ * its own label, because a wait on a mistyped id is still a wait.
+ */
+async function resolveWaitTargets(
+  storage: Storage,
+  args: Record<string, unknown>,
+): Promise<{ id: string; label: string }[]> {
+  const raw = args.task_id;
+  const inputs = (Array.isArray(raw) ? raw : [raw]).filter(
+    (v): v is string => typeof v === 'string' && v.trim() !== '',
+  );
+
+  const out: { id: string; label: string }[] = [];
+  for (const input of inputs) {
+    const ref = input.trim();
+    try {
+      const { task } = await storage.resolveTask(ref);
+      if (task) {
+        out.push({ id: task.id, label: task.code || task.id.slice(0, 8) });
+        continue;
+      }
+    } catch (err) {
+      logger.debug(`wait targets: could not resolve '${ref}': ${(err as Error).message}`);
+    }
+    out.push({ id: ref, label: ref });
+  }
+  return out;
 }

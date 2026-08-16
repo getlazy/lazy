@@ -125,4 +125,94 @@ describe('MCP tools with injected storage', () => {
     expect((searchResult as any).count).toBeGreaterThan(0);
     expect((searchResult as any).results).toBeDefined();
   });
+
+  /**
+   * Seed a task with a session and `contents.length` turns, then return its id.
+   * Sequences deliberately start at 1 so a test can tell an index apart from a
+   * sequence number.
+   */
+  async function seedTurns(goal: string, contents: string[]): Promise<string> {
+    const task = await storage.createTask(goal);
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/seed', 'a'.repeat(40));
+    for (const [i, content] of contents.entries()) {
+      await storage.createTurn({
+        sessionId: session.id,
+        sequence: i + 1,
+        role: i % 2 === 0 ? 'human' : 'agent',
+        content,
+      });
+    }
+    return task.id;
+  }
+
+  // INVARIANT: a turn hit must be directly addressable. Search excerpts are
+  // truncated by design (search LOCATES, lazy_show READS), so a hit that names
+  // only its task means paging through lazy_show by hand to find which turn
+  // matched. `index` is the turn's offset in the very list lazy_show pages
+  // over; `turnSequence` is the number lazy_show reports.
+  test('lazy_search turn hits carry index and turnSequence usable with lazy_show', async () => {
+    const taskId = await seedTurns('Turn locator task', [
+      'opening instructions, nothing notable',
+      'considered several options here',
+      'settled on the widget_locator_marker approach for good reasons',
+      'wrapped up and committed',
+    ]);
+
+    const handlers = createAllHandlers(ctx);
+    const searchResult = await handlers.get('lazy_search')!({ query: 'widget_locator_marker' }) as any;
+
+    const turnHit = searchResult.results.find((r: any) => r.type === 'turn');
+    expect(turnHit).toBeDefined();
+    expect(turnHit.index).toBe(2);
+    // Sequences start at 1 in this fixture, so a surface that confused the two
+    // would report 3 here — and send lazy_show to the wrong turn.
+    expect(turnHit.turnSequence).toBe(3);
+
+    // The round trip the locator exists for: feed index straight back as
+    // lazy_show's offset and land on exactly the turn that matched.
+    const shown = await handlers.get('lazy_show')!({
+      task_id: taskId,
+      sections: ['turns'],
+      offset: turnHit.index,
+      limit: 1,
+    }) as any;
+    expect(shown.turns.length).toBe(1);
+    expect(shown.turns[0].sequence).toBe(turnHit.turnSequence);
+    expect(shown.turns[0].content).toContain('widget_locator_marker');
+  });
+
+  // Same locator on the fuzzy path, which loads content through an entirely
+  // separate reader (getAllSearchableContent) — an easy place for the field to
+  // silently go missing.
+  test('lazy_search fuzzy turn hits carry the same locator', async () => {
+    await seedTurns('Fuzzy locator task', [
+      'opening instructions',
+      'the parallelogram_marker showed up during review',
+    ]);
+
+    const handlers = createAllHandlers(ctx);
+    const searchResult = await handlers.get('lazy_search')!({
+      query: 'paralelogram_marker',
+      fuzzy: true,
+      filter: 'turns',
+    }) as any;
+
+    const turnHit = searchResult.results.find((r: any) => r.content.includes('parallelogram_marker'));
+    expect(turnHit).toBeDefined();
+    expect(turnHit.index).toBe(1);
+    expect(turnHit.turnSequence).toBe(2);
+  });
+
+  // A task/prompt hit has no position in any per-task list. Emitting index: 0
+  // there would read as "the first turn" and send lazy_show somewhere wrong.
+  test('lazy_search task hits carry no locator', async () => {
+    const handlers = createAllHandlers(ctx);
+    await handlers.get('lazy_create')!({ goal: 'Task with no session at all, mentions kumquat' });
+
+    const searchResult = await handlers.get('lazy_search')!({ query: 'kumquat' }) as any;
+    const taskHit = searchResult.results.find((r: any) => r.type === 'task');
+    expect(taskHit).toBeDefined();
+    expect(taskHit.index).toBeUndefined();
+    expect(taskHit.turnSequence).toBeUndefined();
+  });
 });

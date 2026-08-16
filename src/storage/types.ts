@@ -41,6 +41,14 @@ import type {
   MemoryCompactCoverage,
   HunkApproval,
   HunkApprovalLineage,
+  ReviewComment,
+  ReviewCommentInput,
+  ReviewCommentUpdate,
+  ReviewCommentSide,
+  ReviewCommentRole,
+  ReviewCommentAskState,
+  ReviewCommentIntent,
+  ReviewCommentDeliveryState,
 } from '../types';
 
 // Re-export domain types that are used as-is
@@ -80,6 +88,14 @@ export type {
   MemoryCompactCoverage,
   HunkApproval,
   HunkApprovalLineage,
+  ReviewComment,
+  ReviewCommentInput,
+  ReviewCommentUpdate,
+  ReviewCommentSide,
+  ReviewCommentRole,
+  ReviewCommentAskState,
+  ReviewCommentIntent,
+  ReviewCommentDeliveryState,
 };
 
 /**
@@ -227,6 +243,15 @@ export interface HunkApprovalsFile {
 }
 
 /**
+ * Internal format for review-comments.json — anchored, threaded diff comments
+ * made by a human reviewing a task's diff in the web review surface, plus the
+ * agent's replies.
+ */
+export interface ReviewCommentsFile {
+  review_comments: ReviewComment[];
+}
+
+/**
  * Internal format for memories.json — the current set of memory records,
  * keyed by name (tombstoned records stay in the array; see MemoryRecord).
  */
@@ -263,6 +288,28 @@ export interface SearchResult {
   task_goal: string;
   content: string;
   match_context: string;
+  /**
+   * 0-based position of this entity within its task's own list, in the SAME
+   * order `lazy show` and `lazy_show` page over: turns by sequence, commits and
+   * comments and follow-ups by time. Pass it straight as `lazy_show`'s `offset`
+   * (with `limit: 1` and that one section) to land on exactly this entity.
+   *
+   * Search excerpts are truncated by design — search locates, `show` reads — so
+   * without this a hit meant paging through the section by hand.
+   *
+   * Absent for hits that have no position in a per-task list (task, prompt,
+   * conversation, memory).
+   */
+  entity_index?: number;
+  /**
+   * The turn's own sequence number, as `lazy show` prints it (`Turn #12`) and
+   * `lazy_show` reports it. Turn hits only.
+   *
+   * Deliberately separate from `entity_index`: sequence is the turn's identity
+   * in rendered output, index is its offset for pagination. They coincide only
+   * when a session's sequences happen to start at 0 and skip nothing.
+   */
+  turn_sequence?: number;
 }
 
 // --- Conversation types ---
@@ -554,4 +601,17 @@ export interface BuilderResumeIntent {
   upgradePid?: number;
   /** Hostname of the machine `upgradePid` is valid on. */
   upgradeHost?: string;
+  /**
+   * WHY the builder was stopped, which decides what the wrapper does next:
+   *
+   *  - `'upgrade'` (default when absent) — `lazy upgrade` wrote this BEFORE
+   *    rebuilding, so the wrapper must WAIT for the daemon to come back with
+   *    the new version before relaunching.
+   *  - `'daemon-restart'` — the daemon that just started wrote this while
+   *    reaping the previous generation's children. There is nothing to wait
+   *    for: the new daemon is, by construction, already serving. Waiting would
+   *    hang forever, because the restart the wait watches for has already
+   *    happened by the time the builder sees the intent.
+   */
+  reason?: 'upgrade' | 'daemon-restart';
 }

@@ -252,24 +252,84 @@ describe('enforceEdgeGate — satisfiers', () => {
   // INVARIANT: the forge is checked BEFORE the stored approval so an
   // already-approved PR does not silently burn the human's one-shot
   // `lazy approve` record — it stays pending for an accept that needs it.
+  // Not even commit() spends it: there was nothing local to satisfy.
   test('a forge approval does not consume a pending lazy-approve record', async () => {
     const storage = fakeStorage();
     await recordHumanApproval(storage, 'task-1');
 
-    await enforce(storage, async () => true);
+    const clearance = await enforce(storage, async () => true);
+    expect(clearance.usesLocalApproval).toBe(false);
+    await clearance.commit();
 
     expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
   });
 
-  // INVARIANT: with no forge approval, the local one-shot approval still
-  // satisfies the gate — and is consumed, so it unlocks exactly one accept.
-  test('falls through to the lazy-approve record when the forge has no approval', async () => {
+  // INVARIANT: approval consumption is atomic with accept completion. Passing
+  // the gate only RESERVES the record; it is spent by commit(), which the
+  // accept calls at the point the merge is durable. A gate check that consumed
+  // eagerly burned the approval on accepts that then failed in pre-flight or
+  // mid-merge, forcing the human to approve again for a merge that never
+  // happened.
+  test('passing the gate does not consume the lazy-approve record', async () => {
     const storage = fakeStorage();
     await recordHumanApproval(storage, 'task-1');
 
-    await enforce(storage, async () => false);
+    const clearance = await enforce(storage, async () => false);
+    expect(clearance.gated).toBe(true);
+    expect(clearance.usesLocalApproval).toBe(true);
+
+    // The accept dies after the gate: the approval must still be there.
+    expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
+
+    // …and must still satisfy the retry.
+    const retry = await enforce(storage, async () => false);
+    expect(retry.usesLocalApproval).toBe(true);
+  });
+
+  // INVARIANT: the approval is still SINGLE-USE. commit() — called only where
+  // the merge is durable — spends it, so it cannot unlock a second accept.
+  test('commit() consumes the record, and the gate then refuses', async () => {
+    const storage = fakeStorage();
+    await recordHumanApproval(storage, 'task-1');
+
+    const clearance = await enforce(storage, async () => false);
+    await clearance.commit();
 
     expect(await peekHumanApproval(storage, 'task-1')).toBeNull();
+    await expect(enforce(storage, async () => false)).rejects.toBeInstanceOf(EdgeGateRefusedError);
+  });
+
+  // A second commit() must not throw or resurrect anything — accept's finalize
+  // path is re-entrant, and a double spend of an already-empty slot is a no-op.
+  test('commit() is safe to call twice', async () => {
+    const storage = fakeStorage();
+    await recordHumanApproval(storage, 'task-1');
+
+    const clearance = await enforce(storage, async () => false);
+    await clearance.commit();
+    await clearance.commit();
+
+    expect(await peekHumanApproval(storage, 'task-1')).toBeNull();
+  });
+
+  // INVARIANT: an unprotected merge reserves nothing, so its commit() can
+  // never touch an approval the human recorded for a later, protected accept.
+  test('an ungated merge never consumes an approval', async () => {
+    const storage = fakeStorage();
+    await recordHumanApproval(storage, 'task-1');
+
+    const clearance = await enforceEdgeGate({
+      storage,
+      config: config(),
+      projectRoot: '/tmp/does-not-matter',
+      taskId: 'task-1',
+      displayId: 'add-auth',
+      edge: { sourceBranch: 'lazy/add-auth', targetBranch: 'lazy/parent' },
+    });
+    expect(clearance.gated).toBe(false);
+    await clearance.commit();
+
+    expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
   });
 
   // INVARIANT: no satisfier of either kind means REFUSAL. This is the whole

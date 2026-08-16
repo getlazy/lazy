@@ -37,6 +37,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
     },
     git: {
       default_branch_prefix: 'lazy',
+      lfs_check: 'refuse',
     },
     output: {
       shortid_length: 8,
@@ -90,6 +91,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       max_auto_turns: 3,
     },
     memory: { warn_bytes: 4096 },
+    docs: { url: 'https://docs.getlazy.dev' },
     proxy: null,
   };
 

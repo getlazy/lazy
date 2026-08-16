@@ -35,7 +35,8 @@
 import { log } from './log';
 import { spawn } from '../utils/spawn';
 import { formatWatchdogMs } from '../utils/watchdog-turn';
-import type { AgentActivityStream } from '../agent/activity-stream';
+import type { AgentActivityEvent, AgentActivityStream } from '../agent/activity-stream';
+import type { AgentTokenUsage } from '../types';
 
 /** Grace period between SIGTERM and SIGKILL (ms). */
 const KILL_GRACE_MS = 5000;
@@ -87,11 +88,17 @@ export class WatchdogTimeoutError extends Error {
   capturedWork: boolean;
   /** Relaunch attempts made within this turn before the error escaped. */
   attempts: number;
+  /**
+   * Tokens the agent reported before the kill, when any could be salvaged.
+   * Set by the thrower (executeAgent/runWork) via `attachUsage`; the supervisor
+   * puts it on the wire so the killed turn's cost lands on a turn record.
+   */
+  usage?: AgentTokenUsage;
 
   constructor(
     timeoutMs: number,
     durationMs: number,
-    opts?: { progressBased?: boolean; capturedResult?: boolean; attempts?: number },
+    opts?: { progressBased?: boolean; capturedResult?: boolean; attempts?: number; usage?: AgentTokenUsage },
   ) {
     const window = formatWatchdogMs(timeoutMs);
     super(
@@ -107,6 +114,7 @@ export class WatchdogTimeoutError extends Error {
     this.capturedResult = opts?.capturedResult ?? false;
     this.capturedWork = opts?.capturedResult ?? false;
     this.attempts = opts?.attempts ?? 1;
+    this.usage = opts?.usage;
   }
 }
 
@@ -138,12 +146,20 @@ export class GracefulExitTimeoutError extends Error {
    * orphaning the conversation.
    */
   sessionId?: string;
+  /**
+   * Tokens the agent reported in the result it emitted before the kill. This
+   * error means that result was UNPARSEABLE as a response — but an unparseable
+   * response can still carry a readable `usage` object, and those tokens were
+   * really spent. See src/supervisor/usage.ts.
+   */
+  usage?: AgentTokenUsage;
 
   constructor(opts: {
     timeoutMs: number;
     durationMs: number;
     elapsedSinceSignalMs: number;
     sessionId?: string;
+    usage?: AgentTokenUsage;
   }) {
     super(
       `Killed ${Math.round(opts.elapsedSinceSignalMs / 1000)}s after the agent emitted its final ` +
@@ -155,6 +171,7 @@ export class GracefulExitTimeoutError extends Error {
     this.durationMs = opts.durationMs;
     this.elapsedSinceSignalMs = opts.elapsedSinceSignalMs;
     this.sessionId = opts.sessionId;
+    this.usage = opts.usage;
   }
 }
 
@@ -181,6 +198,18 @@ export interface WatchdogResult {
   resultLine?: string;
   /** Session id observed in the stream, if the agent reports one. */
   sessionId?: string;
+  /**
+   * The agent's session-start event, verbatim as parsed. Carried out so the
+   * caller can inspect what the agent reported about itself (which MCP servers
+   * connected, which tools it loaded) without re-parsing the stream.
+   */
+  sessionStartEvent?: AgentActivityEvent;
+  /**
+   * Set when `abortOnSessionStart` asked for the run to be killed, and why.
+   * Distinct from the two guards: the run was not slow, it was launched into a
+   * state the caller declared unusable.
+   */
+  abortReason?: string;
 }
 
 /**
@@ -220,9 +249,24 @@ export async function execWithWatchdog(
      * 0 or omitted disables the wind-down guard.
      */
     windDownTimeoutMs?: number;
+    /**
+     * Inspect the agent's session-start event and, by returning a reason, kill
+     * the run immediately.
+     *
+     * This is for launch-state problems the agent itself reveals on line 1 —
+     * today: a turn that got none of its lazy MCP tools. Such a turn cannot
+     * produce trustworthy work, so letting it run to completion only burns
+     * tokens and produces a plausible-looking result nobody should trust. The
+     * kill deliberately reuses the same SIGTERM→SIGKILL path as the guards
+     * rather than inventing a second one.
+     *
+     * Kept as a callback so the watchdog stays agnostic about what "usable"
+     * means; the lazy-specific judgement lives in `supervisor/mcp-verify.ts`.
+     */
+    abortOnSessionStart?: (event: AgentActivityEvent) => string | null;
   },
 ): Promise<WatchdogResult> {
-  const { cwd, env, timeoutMs, activityStream, windDownTimeoutMs } = opts;
+  const { cwd, env, timeoutMs, activityStream, windDownTimeoutMs, abortOnSessionStart } = opts;
   const enabled = timeoutMs > 0;
   const windDownEnabled = !!activityStream && (windDownTimeoutMs ?? 0) > 0;
 
@@ -253,6 +297,8 @@ export async function execWithWatchdog(
   let resultSeenAt: number | null = null;
   let resultLine: string | undefined;
   let sessionId: string | undefined;
+  let sessionStartEvent: AgentActivityEvent | undefined;
+  let abortReason: string | undefined;
   /** Tool calls emitted but not yet completed — diagnostics for a kill message. */
   const inFlightTools = new Map<string, string>();
   const launchTime = Date.now();
@@ -294,8 +340,21 @@ export async function execWithWatchdog(
     }, KILL_GRACE_MS);
   }
 
+  /** Kill because the caller declared the run's launch state unusable. */
+  function killForAbort(reason: string) {
+    if (abortReason) return;
+    abortReason = reason;
+    log(`[watchdog] Aborting the run at session start: ${reason}. Sending SIGTERM.`);
+    if (watchdogTimer) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+    proc.kill('SIGTERM');
+    scheduleSigkill('session-start abort');
+  }
+
   function killForNoProgress() {
-    if (killedDuringWindDown) return;
+    if (killedDuringWindDown || abortReason) return;
     killedByWatchdog = true;
     const elapsed = Date.now() - launchTime;
     const stuck = inFlightTools.size > 0
@@ -311,7 +370,7 @@ export async function execWithWatchdog(
 
   function killForWindDown() {
     // If the no-progress guard already started killing, don't double-kill.
-    if (killedByWatchdog) return;
+    if (killedByWatchdog || abortReason) return;
     killedDuringWindDown = true;
     windDownElapsedMs = resultSeenAt !== null ? Date.now() - resultSeenAt : (windDownTimeoutMs ?? 0);
     log(
@@ -324,7 +383,7 @@ export async function execWithWatchdog(
 
   function resetWatchdog() {
     if (!enabled) return;
-    if (killedByWatchdog || killedDuringWindDown) return; // Don't reset after we've started killing
+    if (killedByWatchdog || killedDuringWindDown || abortReason) return; // Don't reset after we've started killing
     // Once the result has landed, the wind-down guard owns the process. Leaving
     // the no-progress timer running would just race it to the same kill.
     if (resultSeenAt !== null) return;
@@ -350,6 +409,14 @@ export async function execWithWatchdog(
         return; // liveness only — see the invariant above
       case 'session_start':
         if (event.sessionId) sessionId = event.sessionId;
+        sessionStartEvent = event;
+        if (abortOnSessionStart) {
+          const reason = abortOnSessionStart(event);
+          if (reason) {
+            killForAbort(reason);
+            return; // Killing, not advancing — do not reset the liveness timer.
+          }
+        }
         break;
       case 'tool_start':
         if (event.toolUseId) inFlightTools.set(event.toolUseId, event.toolName ?? event.toolUseId);
@@ -497,5 +564,7 @@ export async function execWithWatchdog(
     windDownElapsedMs,
     resultLine,
     sessionId,
+    sessionStartEvent,
+    abortReason,
   };
 }

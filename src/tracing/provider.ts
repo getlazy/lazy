@@ -6,7 +6,7 @@
  * against the multi-second git/docker/network operations we instrument (see the
  * measured overhead in docs/spikes/timings.md). An off-switch would only create
  * two code paths to reason about and — as the original `LAZY_TRACE` gate proved
- * — a `lazy timings` that silently reports nothing because a knob nobody knew
+ * — a `lazy stats timings` that silently reports nothing because a knob nobody knew
  * about was unset.
  *
  * `initTracing()` registers:
@@ -50,7 +50,7 @@ export function initTracing(service: string, sink: SpanSink): void {
   const exporter = new JsonlSpanExporter(sink, service);
   provider = new BasicTracerProvider({
     // Batch so a burst of spans flushes together and Storage writes stay off
-    // the hot path. Short delay keeps `lazy timings` fresh after a command.
+    // the hot path. Short delay keeps `lazy stats timings` fresh after a command.
     spanProcessors: [new BatchSpanProcessor(exporter, { scheduledDelayMillis: 500 })],
   });
   trace.setGlobalTracerProvider(provider);
@@ -59,6 +59,13 @@ export function initTracing(service: string, sink: SpanSink): void {
 /**
  * Flush and tear down. CLI processes are short-lived, so callers must flush
  * before exit or batched spans are lost. Safe to call when never initialized.
+ *
+ * Deregisters the globals as well as dropping the local handle. OTel's global
+ * registration is write-once: `setGlobalTracerProvider` on an already-registered
+ * global is IGNORED (it logs and returns), so without `trace.disable()` a
+ * shutdown/re-init pair leaves `isTracingEnabled()` reporting true while every
+ * `getTracer()` still hands back the dead provider's tracer — tracing silently
+ * off with no error anywhere.
  */
 export async function shutdownTracing(): Promise<void> {
   if (!provider) return;
@@ -67,5 +74,7 @@ export async function shutdownTracing(): Promise<void> {
     await provider.shutdown();
   } finally {
     provider = null;
+    trace.disable();
+    context.disable();
   }
 }

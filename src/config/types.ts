@@ -131,6 +131,19 @@ export type ChattinessLevel = 'terse' | 'normal' | 'chatty';
 export const VALID_CHATTINESS_LEVELS: readonly ChattinessLevel[] = ['terse', 'normal', 'chatty'] as const;
 
 /**
+ * Strictness of the start-time git LFS environment check.
+ *
+ * `"refuse"` is the default because the failure it prevents is silent: git
+ * commits raw file content instead of an LFS pointer without erroring, and the
+ * damage is only discovered when a push is rejected. `"warn"` and `"off"` exist
+ * for repositories that carry `filter=lfs` attributes but deliberately do not
+ * run LFS locally — never as a way to make a real breakage quieter.
+ */
+export type LfsCheckMode = 'refuse' | 'warn' | 'off';
+
+export const VALID_LFS_CHECK_MODES: readonly LfsCheckMode[] = ['refuse', 'warn', 'off'] as const;
+
+/**
  * A single maintained-file group. The inverse of a protected pattern: files
  * agents are *expected* to keep up to date as they work (docs, CHANGELOG,
  * architecture diagrams). Agents may skip them, but a turn that touches none of
@@ -218,6 +231,14 @@ export interface LazyConfig {
   };
   git?: {
     default_branch_prefix?: string;
+    /**
+     * What to do when a task starts in a repository that uses git LFS but
+     * whose LFS filter would not actually run. `"refuse"` (default) blocks the
+     * start, `"warn"` records a warning and starts anyway, `"off"` disables the
+     * check. The accept-time pointer guard is NOT affected by this key — a raw
+     * blob on an LFS path is refused at merge regardless.
+     */
+    lfs_check?: LfsCheckMode;
   };
   output?: {
     shortid_length?: number;
@@ -429,6 +450,19 @@ export interface LazyConfig {
      */
     warn_bytes?: number;
   };
+  /**
+   * Hosted documentation lazy points at from errors, warnings and help text
+   * ("Check documentation at <url>"). Unrelated to [documents], which is where
+   * a PROJECT's own reference documents live.
+   */
+  docs?: {
+    /**
+     * Base URL of the documentation site (default: https://docs.getlazy.dev).
+     * Point it at a fork's or an enterprise mirror's docs; set it to "" (or
+     * false) to suppress documentation pointers entirely.
+     */
+    url?: string | false;
+  };
   limits?: {
     /** Max live agent task containers before new starts queue (default: 8). */
     max_concurrent_agents?: number;
@@ -482,6 +516,7 @@ export interface ResolvedConfig {
   };
   git: {
     default_branch_prefix: string;
+    lfs_check: LfsCheckMode;
   };
   output: {
     shortid_length: number;
@@ -636,6 +671,14 @@ export interface ResolvedConfig {
      * never a truncation.
      */
     warn_bytes: number;
+  };
+  /** Hosted documentation lazy links to (see LazyConfig.docs). */
+  docs: {
+    /**
+     * Validated base URL with any trailing slash removed, or null when
+     * documentation pointers are disabled.
+     */
+    url: string | null;
   };
   limits: {
     /** Max live agent task containers before new starts queue (default: 8). */

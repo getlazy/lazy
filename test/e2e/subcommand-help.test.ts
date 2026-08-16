@@ -100,4 +100,27 @@ describe('subcommand --help routing', () => {
       expectOutput(result, 'Usage: lazy daemon <subcommand>');
     });
   });
+
+  describe('lazy stats', () => {
+    test('bare -h prints the parent usage', async () => {
+      for (const flag of ['-h', '--help']) {
+        const result = await ctx.lazy(['stats', flag]);
+        expectSuccess(result);
+        expectOutput(result, 'Usage: lazy stats <subcommand>');
+      }
+    });
+
+    test('tokens/timings -h print their own usage', async () => {
+      const cases: Array<[string, string]> = [
+        ['tokens', 'Usage: lazy stats tokens'],
+        ['timings', 'Usage: lazy stats timings'],
+      ];
+      for (const [sub, expected] of cases) {
+        const result = await ctx.lazy(['stats', sub, '-h']);
+        expectSuccess(result);
+        expectOutput(result, expected);
+        expectOutputExcludes(result, 'Usage: lazy stats <subcommand>');
+      }
+    });
+  });
 });

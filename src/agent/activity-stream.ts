@@ -63,10 +63,30 @@ export type AgentActivityKind =
    */
   | 'result';
 
+/** One MCP server as the agent itself reports it at session start. */
+export interface AgentMcpServerStatus {
+  name: string;
+  /** Agent-defined; Claude Code uses `connected` / `failed` / `needs-auth`. */
+  status?: string;
+}
+
 export interface AgentActivityEvent {
   kind: AgentActivityKind;
   /** Present on `session_start` (and on `result`, which repeats it). */
   sessionId?: string;
+  /**
+   * Present on `session_start` when the agent reports its MCP servers.
+   *
+   * `undefined` means the agent said nothing about MCP servers — NOT that it
+   * has none. Only an empty array is evidence of "none". Agents with no
+   * equivalent in their stream (Cursor) leave this undefined always.
+   */
+  mcpServers?: AgentMcpServerStatus[];
+  /**
+   * Present on `session_start` when the agent reports the tools it loaded.
+   * Same `undefined` vs `[]` distinction as `mcpServers`.
+   */
+  toolNames?: string[];
   /** Present on `tool_start` / `tool_end` / `heartbeat`. */
   toolUseId?: string;
   /** Human-readable tool name, for diagnostics ("MCP tool `x` in flight"). */
@@ -144,7 +164,17 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
 
     if (type === 'system') {
       if (msg.subtype === 'init' && typeof msg.session_id === 'string') {
-        return { kind: 'session_start', sessionId: msg.session_id };
+        // The init line is the only place the agent tells us what it actually
+        // loaded — which MCP servers connected and which tools exist in ITS
+        // process. Everything else in lazy can observe only what we *asked*
+        // for. Both fields stay optional: a release that stops emitting them,
+        // or an agent that never did, must read as "unknown", never as "zero".
+        return {
+          kind: 'session_start',
+          sessionId: msg.session_id,
+          mcpServers: parseMcpServers(msg.mcp_servers),
+          toolNames: parseToolNames(msg.tools),
+        };
       }
       return { kind: 'progress' };
     }
@@ -164,6 +194,33 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
 
     return { kind: 'progress' };
   }
+}
+
+/**
+ * `mcp_servers` from an init line, or `undefined` if the field is absent or not
+ * an array. Entries without a string `name` are dropped rather than rejecting
+ * the whole list — a partially-understood report is still better evidence than
+ * none, and `parseLine` must never throw.
+ */
+function parseMcpServers(value: unknown): AgentMcpServerStatus[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const servers: AgentMcpServerStatus[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const rec = entry as Record<string, unknown>;
+    if (typeof rec.name !== 'string') continue;
+    servers.push({
+      name: rec.name,
+      status: typeof rec.status === 'string' ? rec.status : undefined,
+    });
+  }
+  return servers;
+}
+
+/** `tools` from an init line, or `undefined` if absent / not an array. */
+function parseToolNames(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((t): t is string => typeof t === 'string');
 }
 
 /** Extract the content blocks of an Anthropic-shaped message, defensively. */

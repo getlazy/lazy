@@ -130,7 +130,11 @@ describe('daemon MCP 401 credential refresh', () => {
       token: 'a', projectRoot: '/proj', taskId: '', target: `http://localhost:${port}`,
     });
     const config = readDaemonMcpConfig(path);
-    const handler = createDaemonProxyHandler(config, 'lazy_show', { log: () => {} });
+    // reauthWindowMs: 0 keeps this test about REQUEST COUNT. A 401 that a
+    // re-read cannot fix now also waits briefly for the session's owner to
+    // re-issue a credential (daemon-mcp-reconnect.test.ts covers that); the
+    // wait sends no requests, so it would only make this test slower.
+    const handler = createDaemonProxyHandler(config, 'lazy_show', { log: () => {}, reauthWindowMs: 0 });
 
     // File changes, so a retry IS attempted — and still fails.
     await writeFile(path, JSON.stringify({
@@ -148,7 +152,9 @@ describe('daemon MCP 401 credential refresh', () => {
     const path = await writeConfigFile({
       token: 'a', projectRoot: '/proj', taskId: '', target: `http://localhost:${port}`,
     });
-    const handler = createDaemonProxyHandler(readDaemonMcpConfig(path), 'lazy_list', { log: () => {} });
+    // reauthWindowMs: 0 — see the note above: the re-issue wait issues no
+    // requests, and this test is about not spending a second round trip.
+    const handler = createDaemonProxyHandler(readDaemonMcpConfig(path), 'lazy_list', { log: () => {}, reauthWindowMs: 0 });
 
     await expect(handler({})).rejects.toThrow(/401/);
     expect(seen).toEqual(['Bearer a']);

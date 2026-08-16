@@ -14,11 +14,21 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
+import { checkHolderSync, selfIdentitySync, type StartTimeSource } from './process-identity';
 
 export interface PairingLockInfo {
   pid: number;
   started_at: string;
   user: string;
+  /**
+   * Identity of the pairing process, captured at acquire time. A pid alone
+   * cannot distinguish the holder from whatever the OS later recycles that
+   * number to — see src/utils/process-identity.ts. Optional: locks written by
+   * older lazy versions have neither, and fall back to the backstops there.
+   */
+  holder_started_at?: string;
+  holder_start_source?: StartTimeSource;
+  holder_command?: string;
 }
 
 const PAIRING_LOCK_FILENAME = 'pairing-lock';
@@ -29,18 +39,6 @@ const PAIRING_LOCK_FILENAME = 'pairing-lock';
  */
 export function getPairingLockPath(worktreePath: string): string {
   return join(worktreePath, '.lazy-task-sandbox', PAIRING_LOCK_FILENAME);
-}
-
-/**
- * Check if a process is still running by sending signal 0.
- */
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -66,9 +64,18 @@ export function readPairingLock(worktreePath: string): PairingLockInfo | null {
       return null;
     }
 
-    // Check if the owning process is still alive
-    if (!isProcessRunning(lock.pid)) {
-      // Stale lock — process has exited, clean up
+    // Is the RECORDED HOLDER still there? "Something is alive at that pid" is
+    // not the same question: pids get recycled, and a pairing lock left behind
+    // by a killed `lazy pair` would otherwise block every automated command on
+    // that task forever once the OS handed its number to an unrelated program.
+    const verdict = checkHolderSync({
+      pid: lock.pid,
+      started: lock.holder_started_at ?? null,
+      startedSource: lock.holder_start_source ?? null,
+      acquiredAt: lock.started_at ?? null,
+    });
+    if (!verdict.alive) {
+      // Stale lock — holder is gone (exited, defunct, or its pid recycled).
       removePairingLock(worktreePath);
       return null;
     }
@@ -86,10 +93,15 @@ export function readPairingLock(worktreePath: string): PairingLockInfo | null {
  * Creates the lock file with current process info.
  */
 export function acquirePairingLock(worktreePath: string): void {
+  const self = selfIdentitySync();
   const lock: PairingLockInfo = {
     pid: process.pid,
     started_at: new Date().toISOString(),
     user: process.env.USER || process.env.USERNAME || 'unknown',
+    ...(self?.started && self.startedSource
+      ? { holder_started_at: self.started, holder_start_source: self.startedSource }
+      : {}),
+    ...(self?.command ? { holder_command: self.command } : {}),
   };
 
   const lockPath = getPairingLockPath(worktreePath);

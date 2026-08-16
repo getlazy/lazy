@@ -147,6 +147,73 @@ describe('lazy start', () => {
     expectError(result, 'Unknown flag: --goal');
   });
 
+  // INVARIANT: `lazy start` creates nothing. Inline creation was removed
+  // deliberately in `remove-start-inline-create` (commit a709663) — a task
+  // created and started in one step cannot have a forgotten --parent or --code
+  // corrected, and wrong parenting was the project's largest source of rework.
+  // Creation flags belong to `lazy create`, where `lazy edit` can still fix
+  // them while the task sits in the backlog.
+  //
+  // Do NOT "fix" this by adding the flags back: that reverses a design decision
+  // and needs explicit human approval. Rationale: docs/surface-asymmetries.md
+  // section 9.
+  for (const flag of ['--code', '--prompt', '--type', '--parent'] as const) {
+    test(`rejects the creation flag ${flag} (inline creation removed)`, async () => {
+      const result = await ctx.lazy(['start', flag, 'whatever']);
+
+      expectFailure(result);
+      expectError(result, `Unknown flag: ${flag}`);
+    });
+  }
+
+  test('missing task ID explains the create-then-start workflow', async () => {
+    const result = await ctx.lazy(['start']);
+
+    expectFailure(result);
+    expectError(result, 'Task ID is required');
+    // The guidance must name `lazy create` AND show --code, since "I wanted a
+    // task code" is the reason people reach for a create mode on `start`.
+    expectError(result, 'lazy create');
+    expectError(result, '--code');
+  });
+
+  // Parity with `lazy create`: the run-time overrides `start` does accept must
+  // actually be accepted. These were silently absent from tab-completion.
+  //
+  // `--runner` is deliberately NOT exercised on the success path: forcing the
+  // host runner drags in the bwrap/socat sandbox dependency, which this suite
+  // otherwise has no need of. Its parsing is covered by the rejection test
+  // below, which reaches the same boundary check without launching anything.
+  test('accepts --effort alongside --model on an existing task', async () => {
+    const taskId = await createTask(ctx, 'Override test', 'Do the work');
+
+    const result = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--effort', 'high'],
+      MOCK_CLAUDE_SUCCESS,
+    );
+
+    expectSuccess(result);
+    expectOutput(result, 'Started task');
+  });
+
+  test('rejects an invalid --effort before starting anything', async () => {
+    const taskId = await createTask(ctx, 'Bad effort', 'Do the work');
+
+    const result = await ctx.lazy(['start', taskId, '--yes', '--effort', 'banana']);
+
+    expectFailure(result);
+    expectError(result, "Invalid effort 'banana'");
+  });
+
+  test('rejects an invalid --runner before starting anything', async () => {
+    const taskId = await createTask(ctx, 'Bad runner', 'Do the work');
+
+    const result = await ctx.lazy(['start', taskId, '--yes', '--runner', 'vm']);
+
+    expectFailure(result);
+    expectError(result, "Invalid runner 'vm'");
+  });
+
   test('fails if existing task has no prompt', async () => {
     const taskId = await createTask(ctx, 'Task without prompt');
 

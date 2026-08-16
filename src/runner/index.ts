@@ -9,7 +9,6 @@
  */
 
 export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck } from './types';
-export type { DockerRunnerOptions } from './docker-runner';
 export { PROJECT_LABEL_KEY } from './docker-runner';
 
 import type { Runner } from './types';
@@ -108,12 +107,12 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
 
   switch (runnerType) {
     case 'docker': {
-      const runner = new DockerRunner('docker', 'docker', undefined, lazyRoot);
+      const runner = new DockerRunner('docker', 'docker', lazyRoot);
       runner.setRoleTargets(roleTargets);
       return runner;
     }
     case 'podman': {
-      const runner = new PodmanRunner(undefined, lazyRoot);
+      const runner = new PodmanRunner(lazyRoot);
       runner.setRoleTargets(roleTargets);
       return runner;
     }

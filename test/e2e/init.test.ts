@@ -231,24 +231,18 @@ describe('lazy init', () => {
     expect(result.stdout).not.toContain('export ANTHROPIC_API_KEY');
   });
 
-  test('adds all transient files to gitignore', async () => {
+  // Full .gitignore matrix (migration, idempotence, tracked-file warning) lives
+  // in test/e2e/init-gitignore.test.ts. This is the smoke check.
+  test('adds lazy entries to gitignore', async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
     initGitRepo(tmpDir);
 
     await runLazy(tmpDir, ['init', '--skip-auth-check', '--non-interactive']);
 
-    const gitignore = readFileSync(join(tmpDir, '.gitignore'), 'utf-8');
-    expect(gitignore).toContain('.lazy-task-sandbox/');
-    expect(gitignore).toContain('.lazy/worktrees/');
-    expect(gitignore).toContain('.lazy/bin/');
-    expect(gitignore).toContain('.lazy/logs/');
-    expect(gitignore).toContain('.lazy/recovery/');
-    expect(gitignore).toContain('.lazy/tasks/*/*.tmp.*');
-    expect(gitignore).toContain('.lazy/tasks/*/*.backup.*');
-    expect(gitignore).toContain('.lazy/tasks/*/protocol/');
-    expect(gitignore).toContain('.lazy/storage.lock');
-    expect(gitignore).toContain('.lazy/.reconcile-lock');
-    expect(gitignore).toContain('.lazy/tmp');
+    const lines = readFileSync(join(tmpDir, '.gitignore'), 'utf-8').split('\n').map(l => l.trim());
+    expect(lines).toContain('.lazy/');
+    expect(lines).toContain('.lazy-task-sandbox/');
+    expect(lines).toContain('.lazy-lock');
   });
 
   test('no Dockerfile → no Dockerfile prompt shown', async () => {

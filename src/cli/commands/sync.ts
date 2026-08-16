@@ -28,17 +28,6 @@ export async function commandSync(args: string[]): Promise<void> {
  * running an agent work phase. This is the foundation for decoupling
  * sync from unblock.
  */
-/**
- * Compute a deterministic signature from a set of CI failures.
- * Used to deduplicate CI failure comments — same signature means same failures.
- */
-export function ciFailureSignature(failed: Array<{ name: string; url?: string }>): string {
-  return failed
-    .map(f => f.url ? `${f.name}|${f.url}` : f.name)
-    .sort()
-    .join('\n');
-}
-
 export async function commandSyncTask(args: string[]): Promise<void> {
   const taskId = args[0];
   if (!taskId) {

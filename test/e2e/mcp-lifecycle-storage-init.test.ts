@@ -28,6 +28,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -59,7 +60,7 @@ class McpSession {
   constructor(root: string, worktreePath: string) {
     this.proc = Bun.spawn(
       ['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', '', '--worktree', worktreePath],
-      { cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { ...process.env } },
+      { cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ...MCP_SERVER_ENV_PINS } },
     );
     this.stdin = this.proc.stdin as import('bun').FileSink;
     this.reader = (this.proc.stdout as ReadableStream<Uint8Array>).getReader();

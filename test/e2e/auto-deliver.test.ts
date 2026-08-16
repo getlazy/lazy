@@ -9,9 +9,7 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';

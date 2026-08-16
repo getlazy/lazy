@@ -17,10 +17,16 @@ import { join } from 'path';
 import type { MergeConflict, AgentResponse } from '../types';
 import { log, logError, logWarn } from './log';
 import { runGit, type GitResult } from '../utils/git';
-import { elevatedMerge, elevatedMergeAbort } from './elevated-git';
-import { hasUpstreamChanges } from '../git/operations';
+import { elevatedMerge, elevatedMergeAbort, elevatedMergeCommit } from './elevated-git';
+import {
+  hasUpstreamChanges,
+  readWorktreeMergeState,
+  describeMergeState,
+  isMidMerge,
+} from '../git/operations';
 import { safeArgvPrompt } from '../agent/argv-safety';
 import { ClaudeCodeActivityStream } from '../agent/activity-stream';
+import { extractModelId } from '../agent/claude-code';
 import { execWithWatchdog } from './watchdog';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
 import mergeConflictResolutionResumeTemplate from '../prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
@@ -254,142 +260,192 @@ export async function runSyncWithUpstream(
   log('[merge] Merge has conflicts. Using Claude Code to resolve...');
   const conflicts = await captureConflicts(worktreePath, parentBranch);
 
-  // Run Claude Code with a scoped merge-only prompt (with retries)
-  // When resuming an existing session, use a shorter prompt that leverages prior context
-  const standalonePrompt = mergeConflictResolutionTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
-  const resumePrompt = mergeConflictResolutionResumeTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
-
-  function buildClaudeArgs(shouldResume: boolean): string[] {
-    const prompt = shouldResume ? resumePrompt : standalonePrompt;
-    return buildMergeClaudeArgs(prompt, modelId, agentSessionId, shouldResume);
+  // INVARIANT (fix-sync-silent-conflict): from here on the worktree is
+  // half-merged, so EVERY exit from this function — including a throw from the
+  // agent runner, from an elevated git call the daemon rejected, or from any
+  // future code added below — must leave the worktree settled. That guarantee
+  // lives in exactly one place rather than being re-derived at each throw site.
+  try {
+    return await resolveConflictsWithAgent();
+  } catch (err) {
+    throw await withSettledWorktree(worktreePath, err);
   }
 
-  // Track whether we should try resuming. Start with resume if session exists.
-  let useResume = !!agentSessionId;
-  let lastError: Error | null = null;
+  // Run Claude Code with a scoped merge-only prompt (with retries)
+  async function resolveConflictsWithAgent(): Promise<SyncWithUpstreamResult> {
+    // When resuming an existing session, use a shorter prompt that leverages prior context
+    const standalonePrompt = mergeConflictResolutionTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
+    const resumePrompt = mergeConflictResolutionResumeTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
 
-  for (let attempt = 0; attempt <= MERGE_MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      log(`[merge] Retrying Claude Code for conflict resolution (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})...`);
-      // Clear stale merge state and re-create the conflicted merge for this
-      // attempt. The agent resolves an in-progress merge; it cannot start one.
-      const restarted = await restartConflictedMerge(worktreePath, target, mergeCommitMessage);
-      if (restarted.exitCode === 0) {
-        const postMergeSha = await getHeadSha(worktreePath);
-        log(`[merge] Re-attempted merge applied cleanly. Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
-        return { merged: true, preMergeSha, postMergeSha, targetSha: resolvedTargetSha, conflicts };
+    function buildClaudeArgs(shouldResume: boolean): string[] {
+      const prompt = shouldResume ? resumePrompt : standalonePrompt;
+      return buildMergeClaudeArgs(prompt, modelId, agentSessionId, shouldResume);
+    }
+
+    // Track whether we should try resuming. Start with resume if session exists.
+    let useResume = !!agentSessionId;
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= MERGE_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        log(`[merge] Retrying Claude Code for conflict resolution (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})...`);
+      } else {
+        log('[merge] Running Claude Code for conflict resolution...');
       }
-    } else {
-      log('[merge] Running Claude Code for conflict resolution...');
-    }
 
-    if (useResume) {
-      log(`[merge] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
-    }
+      // INVARIANT: every resolution attempt is handed a worktree with the
+      // conflicted merge actually in progress — the agent can only RESOLVE a
+      // merge, never start one (moving HEAD needs the read-only common dir).
+      // The condition is the worktree's state, NOT the attempt number: the
+      // resume→standalone fallback below rewinds the counter, and when that
+      // was tied to `attempt > 0` the fallback agent was handed a worktree
+      // with nothing to merge and the sync failed with the baffling
+      // "HEAD did not advance" (fix-sync-silent-conflict).
+      if (!await hasMergeInProgress(worktreePath)) {
+        const restarted = await restartConflictedMerge(worktreePath, target, mergeCommitMessage);
+        if (restarted.exitCode === 0) {
+          const postMergeSha = await getHeadSha(worktreePath);
+          log(`[merge] Re-attempted merge applied cleanly. Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
+          return { merged: true, preMergeSha, postMergeSha, targetSha: resolvedTargetSha, conflicts };
+        }
+        if (!await hasMergeInProgress(worktreePath)) {
+          // Neither clean nor conflicted: the merge could not be re-created at
+          // all (a rejected elevated call, a wedged index). Retrying would just
+          // hand the agent an empty worktree again.
+          throw new Error(
+            `Could not re-create the conflicted merge of ${targetLabel} for conflict resolution: ` +
+            `${restarted.stderr.trim() || `git merge exited ${restarted.exitCode}`}`,
+          );
+        }
+      }
 
-    const claudeArgs = buildClaudeArgs(useResume);
-    const { stderr, exitCode, resultLine, sessionId, hung } = await runMergeAgent(
-      claudeArgs,
-      worktreePath,
-      '[merge]',
-      guards,
-    );
-
-    if (hung) {
-      // No forward progress for the configured window. Retrying a wedged agent
-      // just wedges again, so fail out rather than burning the retry budget.
-      await abortMergeIfInProgress(worktreePath);
-      throw new Error(
-        `Merge-and-fix agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
-      );
-    }
-
-    if (exitCode !== 0) {
-      logError(`[merge] Claude Code failed with exit code ${exitCode} (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})`);
-      logError(`[merge] stderr: ${stderr.slice(-500)}`);
-      await abortMergeIfInProgress(worktreePath);
-
-      // If we were using --resume and it failed, fall back to standalone mode
-      // (session may be expired or not found) and don't count this as a retry
       if (useResume) {
-        log('[merge] Resume failed — falling back to standalone Claude Code...');
-        useResume = false;
-        // Rewind attempt counter so this doesn't count against retries
-        attempt--;
+        log(`[merge] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
+      }
+
+      const claudeArgs = buildClaudeArgs(useResume);
+      const { stderr, exitCode, resultLine, sessionId, hung } = await runMergeAgent(
+        claudeArgs,
+        worktreePath,
+        '[merge]',
+        guards,
+      );
+
+      if (hung) {
+        // No forward progress for the configured window. Retrying a wedged agent
+        // just wedges again, so fail out rather than burning the retry budget.
+        // (The worktree is settled by the caller's catch — see the INVARIANT above.)
+        throw new Error(
+          `Merge-and-fix agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+        );
+      }
+
+      if (exitCode !== 0) {
+        logError(`[merge] Claude Code failed with exit code ${exitCode} (attempt ${attempt + 1}/${MERGE_MAX_RETRIES + 1})`);
+        logError(`[merge] stderr: ${stderr.slice(-500)}`);
+        await abortMergeIfInProgress(worktreePath);
+
+        // If we were using --resume and it failed, fall back to standalone mode
+        // (session may be expired or not found) and don't count this as a retry.
+        // The next iteration re-creates the conflicted merge, because that is
+        // keyed on worktree state rather than on this rewound counter.
+        if (useResume) {
+          log('[merge] Resume failed — falling back to standalone Claude Code...');
+          useResume = false;
+          // Rewind attempt counter so this doesn't count against retries
+          attempt--;
+          continue;
+        }
+
+        lastError = new Error(`Merge-and-fix Claude Code exited with code ${exitCode}`);
         continue;
       }
 
-      lastError = new Error(`Merge-and-fix Claude Code exited with code ${exitCode}`);
-      continue;
-    }
-
-    // Verify the merge was actually completed:
-    // 1. No unmerged files remain
-    const statusResult = await runGit(
-      ['diff', '--name-only', '--diff-filter=U'],
-      { cwd: worktreePath },
-    );
-
-    const unmergedFiles = statusResult.stdout;
-    if (unmergedFiles) {
-      await abortMergeIfInProgress(worktreePath);
-      lastError = new Error(`Merge-and-fix incomplete. Unmerged files remain:\n${unmergedFiles}`);
-      continue;
-    }
-
-    // 2. MERGE_HEAD should not exist (merge was committed, not left in progress)
-    if (await hasMergeInProgress(worktreePath)) {
-      await abortMergeIfInProgress(worktreePath);
-      lastError = new Error('Merge-and-fix incomplete: merge is still in progress (MERGE_HEAD exists). Claude resolved conflicts but did not commit the merge.');
-      continue;
-    }
-
-    // 3. HEAD must have advanced (a merge commit was actually created)
-    const postMergeSha = await getHeadSha(worktreePath);
-    if (postMergeSha === preMergeSha) {
-      lastError = new Error('Merge-and-fix incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
-      continue;
-    }
-
-    log(`[merge] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
-    log('[merge] Merge-and-fix completed successfully.');
-
-    // Capture the agent's conflict-resolution response so the reconciler can
-    // record it as a discrete agent turn (its own text, session, and usage).
-    // The result event is byte-identical to the old single-blob output, so it
-    // parses the same way. Best-effort: if it is missing or unparseable, fall
-    // back to a placeholder so a conflict merge always yields an agent turn
-    // rather than silently dropping it. Deliberately NOT falling back to raw
-    // stdout — under stream-json that is an NDJSON transcript, not a summary.
-    let resolution: AgentResponse;
-    try {
-      if (!resultLine) throw new Error('agent emitted no result event');
-      resolution = JSON.parse(resultLine) as AgentResponse;
-    } catch (err) {
-      logWarn(
-        `[merge] Could not read the agent's resolution summary ` +
-        `(${err instanceof Error ? err.message : String(err)}); recording a placeholder turn.`,
+      // Verify the merge was actually completed:
+      // 1. No unmerged files remain
+      const statusResult = await runGit(
+        ['diff', '--name-only', '--diff-filter=U'],
+        { cwd: worktreePath },
       );
-      resolution = {
-        result: 'Resolved merge conflicts.',
-        session_id: sessionId ?? agentSessionId ?? '',
-        usage: { input_tokens: 0, output_tokens: 0 },
+
+      const unmergedFiles = statusResult.stdout;
+      if (unmergedFiles) {
+        await abortMergeIfInProgress(worktreePath);
+        lastError = new Error(`Merge-and-fix incomplete. Unmerged files remain:\n${unmergedFiles}`);
+        continue;
+      }
+
+      // 2. Conflicts are all resolved but the merge was never committed.
+      //    Conclude it host-side instead of throwing the resolution away: the
+      //    agent cannot create a merge commit from inside the container, and
+      //    aborting here discards a COMPLETE resolution and asks for it again
+      //    from scratch — which is how a 61-minute hub merge was lost and then
+      //    silently rescued by a re-run (fix-sync-silent-conflict). The daemon
+      //    re-checks both conditions before it will commit anything.
+      if (await hasMergeInProgress(worktreePath)) {
+        log('[merge] Conflicts resolved but merge left uncommitted — committing it host-side.');
+        const committed = await elevatedMergeCommit(worktreePath);
+        if (committed.exitCode !== 0) {
+          await abortMergeIfInProgress(worktreePath);
+          lastError = new Error(
+            'Merge-and-fix incomplete: conflicts were resolved but the merge commit could not be ' +
+            `created: ${committed.stderr.trim() || `git commit exited ${committed.exitCode}`}`,
+          );
+          continue;
+        }
+      }
+
+      // 3. HEAD must have advanced (a merge commit was actually created)
+      const postMergeSha = await getHeadSha(worktreePath);
+      if (postMergeSha === preMergeSha) {
+        lastError = new Error('Merge-and-fix incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
+        continue;
+      }
+
+      log(`[merge] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
+      log('[merge] Merge-and-fix completed successfully.');
+
+      // Capture the agent's conflict-resolution response so the reconciler can
+      // record it as a discrete agent turn (its own text, session, and usage).
+      // The result event is byte-identical to the old single-blob output, so it
+      // parses the same way. Best-effort: if it is missing or unparseable, fall
+      // back to a placeholder so a conflict merge always yields an agent turn
+      // rather than silently dropping it. Deliberately NOT falling back to raw
+      // stdout — under stream-json that is an NDJSON transcript, not a summary.
+      let resolution: AgentResponse;
+      try {
+        if (!resultLine) throw new Error('agent emitted no result event');
+        const parsed = JSON.parse(resultLine) as Record<string, unknown>;
+        const reportedModelId = extractModelId(parsed);
+        resolution = {
+          ...(parsed as unknown as AgentResponse),
+          ...(reportedModelId ? { model_id: reportedModelId } : {}),
+        };
+      } catch (err) {
+        logWarn(
+          `[merge] Could not read the agent's resolution summary ` +
+          `(${err instanceof Error ? err.message : String(err)}); recording a placeholder turn.`,
+        );
+        resolution = {
+          result: 'Resolved merge conflicts.',
+          session_id: sessionId ?? agentSessionId ?? '',
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      }
+
+      return {
+        merged: true,
+        preMergeSha,
+        postMergeSha,
+        targetSha: resolvedTargetSha,
+        conflicts,
+        resolution,
       };
     }
 
-    return {
-      merged: true,
-      preMergeSha,
-      postMergeSha,
-      targetSha: resolvedTargetSha,
-      conflicts,
-      resolution,
-    };
+    // All retries exhausted (the caller's catch settles the worktree).
+    throw lastError ?? new Error('Merge-and-fix failed after all retries');
   }
-
-  // All retries exhausted
-  await abortMergeIfInProgress(worktreePath);
-  throw lastError ?? new Error('Merge-and-fix failed after all retries');
 }
 
 /**
@@ -436,111 +492,133 @@ export async function runSyncWithRemote(
   log('[remote-sync] Merge has conflicts. Using Claude Code to resolve...');
   const conflicts = await captureConflicts(worktreePath, remoteBranch);
 
+  // INVARIANT (fix-sync-silent-conflict): see runSyncWithUpstream — from here
+  // the worktree is half-merged, and no exit from this function may leave it
+  // that way.
+  try {
+    return await resolveRemoteConflictsWithAgent();
+  } catch (err) {
+    throw await withSettledWorktree(worktreePath, err);
+  }
+
   // Run Claude Code with a scoped merge-only prompt
-  // When resuming an existing session, use a shorter prompt that leverages prior context
-  const standalonePrompt = remoteBranchMergeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
-  const resumePrompt = remoteBranchMergeResumeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
+  async function resolveRemoteConflictsWithAgent(): Promise<MergeConflict[]> {
+    // When resuming an existing session, use a shorter prompt that leverages prior context
+    const standalonePrompt = remoteBranchMergeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
+    const resumePrompt = remoteBranchMergeResumeTemplate.replace(/\{\{remoteBranch\}\}/g, remoteBranch);
 
-  // Record HEAD before Claude runs so we can verify it advanced
-  const preMergeSha = await getHeadSha(worktreePath);
-  log(`[remote-sync] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
+    // Record HEAD before Claude runs so we can verify it advanced
+    const preMergeSha = await getHeadSha(worktreePath);
+    log(`[remote-sync] Pre-merge HEAD: ${preMergeSha.substring(0, 8)}`);
 
-  let useResume = !!agentSessionId;
+    let useResume = !!agentSessionId;
 
-  if (useResume) {
-    log(`[remote-sync] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
-  }
-  log('[remote-sync] Running Claude Code for conflict resolution...');
-
-  const prompt = useResume ? resumePrompt : standalonePrompt;
-  let claudeArgs = buildMergeClaudeArgs(prompt, modelId, agentSessionId, useResume);
-
-  const { stderr, exitCode, hung } = await runMergeAgent(
-    claudeArgs,
-    worktreePath,
-    '[remote-sync]',
-    guards,
-  );
-
-  if (hung) {
-    await abortMergeIfInProgress(worktreePath);
-    throw new Error(
-      `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
-    );
-  }
-
-  if (exitCode !== 0) {
-    logError(`[remote-sync] Claude Code failed with exit code ${exitCode}`);
-    logError(`[remote-sync] stderr: ${stderr.slice(-500)}`);
-    await abortMergeIfInProgress(worktreePath);
-
-    // If we were using --resume and it failed, fall back to standalone mode
     if (useResume) {
-      log('[remote-sync] Resume failed — falling back to standalone Claude Code...');
-      useResume = false;
-      const fallbackPrompt = standalonePrompt;
-      claudeArgs = buildMergeClaudeArgs(fallbackPrompt, modelId, undefined, false);
+      log(`[remote-sync] Using --resume with existing session ${agentSessionId!.substring(0, 8)}...`);
+    }
+    log('[remote-sync] Running Claude Code for conflict resolution...');
 
-      // Re-create the conflicted merge the fallback attempt is meant to resolve
-      // (the failure path above aborted it).
-      const restarted = await restartConflictedMerge(worktreePath, remoteBranch, mergeCommitMessage);
-      if (restarted.exitCode === 0) {
-        log('[remote-sync] Re-attempted merge applied cleanly.');
-        return conflicts;
+    const prompt = useResume ? resumePrompt : standalonePrompt;
+    let claudeArgs = buildMergeClaudeArgs(prompt, modelId, agentSessionId, useResume);
+
+    const { stderr, exitCode, hung } = await runMergeAgent(
+      claudeArgs,
+      worktreePath,
+      '[remote-sync]',
+      guards,
+    );
+
+    if (hung) {
+      throw new Error(
+        `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+      );
+    }
+
+    if (exitCode !== 0) {
+      logError(`[remote-sync] Claude Code failed with exit code ${exitCode}`);
+      logError(`[remote-sync] stderr: ${stderr.slice(-500)}`);
+      await abortMergeIfInProgress(worktreePath);
+
+      // If we were using --resume and it failed, fall back to standalone mode
+      if (useResume) {
+        log('[remote-sync] Resume failed — falling back to standalone Claude Code...');
+        useResume = false;
+        const fallbackPrompt = standalonePrompt;
+        claudeArgs = buildMergeClaudeArgs(fallbackPrompt, modelId, undefined, false);
+
+        // Re-create the conflicted merge the fallback attempt is meant to resolve
+        // (the failure path above aborted it). The agent can only RESOLVE a
+        // merge, never start one — handing it a worktree with no merge in
+        // progress is the defect this whole file was audited for.
+        const restarted = await restartConflictedMerge(worktreePath, remoteBranch, mergeCommitMessage);
+        if (restarted.exitCode === 0) {
+          log('[remote-sync] Re-attempted merge applied cleanly.');
+          return conflicts;
+        }
+        if (!await hasMergeInProgress(worktreePath)) {
+          throw new Error(
+            `Could not re-create the conflicted merge of ${remoteBranch} for conflict resolution: ` +
+            `${restarted.stderr.trim() || `git merge exited ${restarted.exitCode}`}`,
+          );
+        }
+
+        const {
+          stderr: fallbackStderr,
+          exitCode: fallbackExitCode,
+          hung: fallbackHung,
+        } = await runMergeAgent(claudeArgs, worktreePath, '[remote-sync]', guards);
+
+        if (fallbackHung) {
+          throw new Error(
+            `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+          );
+        }
+
+        if (fallbackExitCode !== 0) {
+          logError(`[remote-sync] Fallback Claude Code failed with exit code ${fallbackExitCode}`);
+          logError(`[remote-sync] stderr: ${fallbackStderr.slice(-500)}`);
+          throw new Error(`Sync-with-remote Claude Code exited with code ${fallbackExitCode}`);
+        }
+      } else {
+        throw new Error(`Sync-with-remote Claude Code exited with code ${exitCode}`);
       }
+    }
 
-      const {
-        stderr: fallbackStderr,
-        exitCode: fallbackExitCode,
-        hung: fallbackHung,
-      } = await runMergeAgent(claudeArgs, worktreePath, '[remote-sync]', guards);
+    // Verify the merge was actually completed:
+    // 1. No unmerged files remain
+    const statusResult = await runGit(
+      ['diff', '--name-only', '--diff-filter=U'],
+      { cwd: worktreePath },
+    );
 
-      if (fallbackHung) {
-        await abortMergeIfInProgress(worktreePath);
+    const unmergedFiles = statusResult.stdout;
+    if (unmergedFiles) {
+      throw new Error(`Sync-with-remote incomplete. Unmerged files remain:\n${unmergedFiles}`);
+    }
+
+    // 2. Conflicts resolved but merge left uncommitted — conclude it host-side
+    //    rather than discarding a complete resolution (see runSyncWithUpstream).
+    if (await hasMergeInProgress(worktreePath)) {
+      log('[remote-sync] Conflicts resolved but merge left uncommitted — committing it host-side.');
+      const committed = await elevatedMergeCommit(worktreePath);
+      if (committed.exitCode !== 0) {
         throw new Error(
-          `Sync-with-remote agent made no forward progress for ${guards?.noProgressTimeoutMs}ms and was killed`,
+          'Sync-with-remote incomplete: conflicts were resolved but the merge commit could not be ' +
+          `created: ${committed.stderr.trim() || `git commit exited ${committed.exitCode}`}`,
         );
       }
-
-      if (fallbackExitCode !== 0) {
-        logError(`[remote-sync] Fallback Claude Code failed with exit code ${fallbackExitCode}`);
-        logError(`[remote-sync] stderr: ${fallbackStderr.slice(-500)}`);
-        await abortMergeIfInProgress(worktreePath);
-        throw new Error(`Sync-with-remote Claude Code exited with code ${fallbackExitCode}`);
-      }
-    } else {
-      throw new Error(`Sync-with-remote Claude Code exited with code ${exitCode}`);
     }
+
+    // 3. HEAD must have advanced (a merge commit was actually created)
+    const postMergeSha = await getHeadSha(worktreePath);
+    if (postMergeSha === preMergeSha) {
+      throw new Error('Sync-with-remote incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
+    }
+
+    log(`[remote-sync] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
+    log('[remote-sync] Sync-with-remote completed successfully.');
+    return conflicts;
   }
-
-  // Verify the merge was actually completed:
-  // 1. No unmerged files remain
-  const statusResult = await runGit(
-    ['diff', '--name-only', '--diff-filter=U'],
-    { cwd: worktreePath },
-  );
-
-  const unmergedFiles = statusResult.stdout;
-  if (unmergedFiles) {
-    await abortMergeIfInProgress(worktreePath);
-    throw new Error(`Sync-with-remote incomplete. Unmerged files remain:\n${unmergedFiles}`);
-  }
-
-  // 2. MERGE_HEAD should not exist (merge was committed, not left in progress)
-  if (await hasMergeInProgress(worktreePath)) {
-    await abortMergeIfInProgress(worktreePath);
-    throw new Error('Sync-with-remote incomplete: merge is still in progress (MERGE_HEAD exists). Claude resolved conflicts but did not commit the merge.');
-  }
-
-  // 3. HEAD must have advanced (a merge commit was actually created)
-  const postMergeSha = await getHeadSha(worktreePath);
-  if (postMergeSha === preMergeSha) {
-    throw new Error('Sync-with-remote incomplete: HEAD did not advance. Claude may have aborted the merge without committing.');
-  }
-
-  log(`[remote-sync] Post-merge HEAD: ${postMergeSha.substring(0, 8)}`);
-  log('[remote-sync] Sync-with-remote completed successfully.');
-  return conflicts;
 }
 
 /**
@@ -635,6 +713,74 @@ export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
   }
   logError(`[merge] Failed to abort merge: ${result.stderr}`);
   return false;
+}
+
+/**
+ * Bring a worktree back to a settled state after a failed merge attempt, and
+ * describe — always — what was found and what was done about it.
+ *
+ * INVARIANT (fix-sync-silent-conflict): a sync must never return, successfully
+ * or not, with a half-applied merge in the worktree. Every failure path in the
+ * merge phase goes through here, and the description it returns is appended to
+ * the error the caller raises, so the failure the human sees names the actual
+ * state of their worktree instead of leaving them to discover UU files later.
+ *
+ * A failed abort is NOT swallowed: it comes back as `settled: false` with an
+ * actionable message, because a worktree we could not settle is precisely the
+ * situation that has to be shouted about.
+ */
+export async function settleConflictedWorktree(
+  cwd: string,
+): Promise<{ settled: boolean; detail: string }> {
+  const before = await readWorktreeMergeState(cwd);
+  if (!isMidMerge(before)) {
+    return { settled: true, detail: 'Worktree is settled (no merge in progress).' };
+  }
+
+  let abortStderr = '';
+  if (before.mergeInProgress) {
+    const aborted = await elevatedMergeAbort(cwd);
+    if (aborted.exitCode !== 0) {
+      abortStderr = aborted.stderr.trim();
+      logError(`[merge] Failed to abort merge: ${abortStderr}`);
+    }
+  }
+
+  const after = await readWorktreeMergeState(cwd);
+  if (!isMidMerge(after)) {
+    log('[merge] Aborted in-progress merge; worktree is settled.');
+    return {
+      settled: true,
+      detail: `Aborted the in-progress merge (${describeMergeState(before)}); the worktree is back to its pre-merge state.`,
+    };
+  }
+
+  return {
+    settled: false,
+    detail:
+      `The worktree is STILL mid-merge and could not be settled automatically ` +
+      `(${describeMergeState(after)})${abortStderr ? `; git merge --abort said: ${abortStderr}` : ''}. ` +
+      `Run \`git merge --abort\` in ${cwd} — nothing else will touch it.`,
+  };
+}
+
+/**
+ * Wrap an error raised inside the merge phase with the settled state of the
+ * worktree, so no merge failure can reach a caller without saying what happened
+ * to the files on disk.
+ */
+async function withSettledWorktree(cwd: string, err: unknown): Promise<Error> {
+  const message = err instanceof Error ? err.message : String(err);
+  let detail: string;
+  try {
+    detail = (await settleConflictedWorktree(cwd)).detail;
+  } catch (settleErr) {
+    detail =
+      `Could not even determine the worktree's merge state afterwards ` +
+      `(${settleErr instanceof Error ? settleErr.message : String(settleErr)}). ` +
+      `Inspect ${cwd} by hand.`;
+  }
+  return new Error(`${message}\n${detail}`);
 }
 
 /**

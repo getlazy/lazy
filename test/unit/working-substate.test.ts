@@ -158,6 +158,105 @@ describe('deriveWorkingSubstate', () => {
     const s = deriveWorkingSubstate(null, { isAlive: true, hasResponse: false });
     expect(s).toBeNull();
   });
+
+  // INVARIANT: an in-flight blocking lazy-tool call means the agent is parked,
+  // not working. Distinguishing that from `agent` is the whole point of the
+  // substate — an orchestrating parent otherwise looks like one thinking hard.
+  test('alive + work phase + an in-flight wait → waiting on the target', () => {
+    const s = deriveWorkingSubstate(baseStatus, {
+      isAlive: true,
+      hasResponse: false,
+      waits: [
+        {
+          id: 'w1',
+          tool: 'lazy_wait',
+          targets: ['task-1'],
+          labels: ['fix-foo'],
+          started_at: '2026-05-17T10:01:00.000Z',
+        },
+      ],
+    });
+    expect(s).toEqual({ kind: 'waiting', targets: ['fix-foo'], since: '2026-05-17T10:01:00.000Z' });
+  });
+
+  // Concurrent waits: labels are deduped and ordered oldest-first, and `since`
+  // is the earliest start so the elapsed counter reflects the whole block.
+  test('multiple waits dedupe labels and take the earliest start', () => {
+    const s = deriveWorkingSubstate(baseStatus, {
+      isAlive: true,
+      hasResponse: false,
+      waits: [
+        {
+          id: 'w2',
+          tool: 'lazy_wait',
+          targets: ['task-2'],
+          labels: ['fix-bar', 'fix-foo'],
+          started_at: '2026-05-17T10:02:00.000Z',
+        },
+        {
+          id: 'w1',
+          tool: 'lazy_wait',
+          targets: ['task-1'],
+          labels: ['fix-foo'],
+          started_at: '2026-05-17T10:01:00.000Z',
+        },
+      ],
+    });
+    expect(s).toEqual({
+      kind: 'waiting',
+      targets: ['fix-foo', 'fix-bar'],
+      since: '2026-05-17T10:01:00.000Z',
+    });
+  });
+
+  // INVARIANT: waiting outranks the ask/pre-accept flavors. Those describe what
+  // the turn IS; waiting describes what it is doing right now, which is nothing.
+  test('waiting outranks agent:answering', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, command_type: 'ask' },
+      {
+        isAlive: true,
+        hasResponse: false,
+        waits: [
+          { id: 'w1', tool: 'lazy_ask', targets: ['t'], labels: ['fix-foo'], started_at: '2026-05-17T10:01:00.000Z' },
+        ],
+      },
+    );
+    expect(s).toMatchObject({ kind: 'waiting' });
+  });
+
+  // INVARIANT: a harness phase outranks a lingering wait marker — the
+  // supervisor, not the agent, is the active thing during those phases.
+  test('a harness phase outranks a lingering wait marker', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, phase: 'post_turn_check' },
+      {
+        isAlive: true,
+        hasResponse: false,
+        waits: [
+          { id: 'w1', tool: 'lazy_wait', targets: ['t'], labels: ['fix-foo'], started_at: '2026-05-17T10:01:00.000Z' },
+        ],
+      },
+    );
+    expect(s).toMatchObject({ kind: 'harness', phase: 'post_turn_check' });
+  });
+
+  test('an empty wait set falls through to agent', () => {
+    const s = deriveWorkingSubstate(baseStatus, { isAlive: true, hasResponse: false, waits: [] });
+    expect(s).toEqual({ kind: 'agent' });
+  });
+
+  // A dead run is a dead run — a stale marker must never mask not-alive.
+  test('waits do not resurrect a not-alive task', () => {
+    const s = deriveWorkingSubstate(baseStatus, {
+      isAlive: false,
+      hasResponse: false,
+      waits: [
+        { id: 'w1', tool: 'lazy_wait', targets: ['t'], labels: ['fix-foo'], started_at: '2026-05-17T10:01:00.000Z' },
+      ],
+    });
+    expect(s).toEqual({ kind: 'not-alive' });
+  });
 });
 
 describe('formatWorkingSubstate', () => {
@@ -239,6 +338,40 @@ describe('formatWorkingSubstate', () => {
     ).toBe('harness:retrying (3m00s)');
   });
 
+  // INVARIANT: name what is being waited on. A bare `waiting` leaves the reader
+  // with the same "on what?" question the substate exists to answer.
+  test('waiting on one target with elapsed', () => {
+    expect(
+      formatWorkingSubstate(
+        { kind: 'waiting', targets: ['fix-foo'], since: '2026-05-17T10:00:00.000Z' },
+        now,
+      ),
+    ).toBe('waiting on fix-foo (3m00s)');
+  });
+
+  test('waiting on two targets lists both', () => {
+    expect(
+      formatWorkingSubstate(
+        { kind: 'waiting', targets: ['fix-foo', 'fix-bar'], since: '2026-05-17T10:00:00.000Z' },
+        now,
+      ),
+    ).toBe('waiting on fix-foo, fix-bar (3m00s)');
+  });
+
+  // Long fan-outs are summarized — the label sits inside a `working(...)` cell.
+  test('waiting on many targets summarizes the tail', () => {
+    expect(
+      formatWorkingSubstate(
+        { kind: 'waiting', targets: ['a', 'b', 'c', 'd'], since: '2026-05-17T10:00:00.000Z' },
+        now,
+      ),
+    ).toBe('waiting on a, b +2 (3m00s)');
+  });
+
+  test('waiting with no targets or timestamp degrades to a bare label', () => {
+    expect(formatWorkingSubstate({ kind: 'waiting', targets: [] }, now)).toBe('waiting');
+  });
+
   test('harness without a parseable timestamp omits elapsed', () => {
     expect(
       formatWorkingSubstate({ kind: 'harness', phase: 'writing_response' }, now),
@@ -253,6 +386,12 @@ describe('renderWorkingStatus', () => {
     expect(renderWorkingStatus({ kind: 'agent' }, now)).toBe('working(agent)');
     expect(renderWorkingStatus({ kind: 'agent', answering: true }, now)).toBe('working(agent:answering)');
     expect(renderWorkingStatus({ kind: 'not-alive' }, now)).toBe('working(not-alive)');
+    expect(
+      renderWorkingStatus(
+        { kind: 'waiting', targets: ['fix-foo'], since: '2026-05-17T10:00:00.000Z' },
+        now,
+      ),
+    ).toBe('working(waiting on fix-foo (3m00s))');
   });
 
   test('null substate → plain working', () => {

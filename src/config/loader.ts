@@ -1,16 +1,53 @@
 import { join, resolve, isAbsolute, dirname, basename } from 'path';
 import type { LazyConfig, ResolvedConfig, StorageBackendConfig, RoleName, RoleTarget, RoleTargetConfig } from './types';
-import { VALID_EFFORT_LEVELS, VALID_HOST_PERMISSION_MODES, VALID_CHATTINESS_LEVELS, VALID_ROLE_BACKENDS } from './types';
+import { VALID_EFFORT_LEVELS, VALID_HOST_PERMISSION_MODES, VALID_CHATTINESS_LEVELS, VALID_ROLE_BACKENDS, VALID_LFS_CHECK_MODES } from './types';
 import { listAgents } from '../agent/registry';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, DEFAULT_MEMORY_WARN_BYTES } from './constants';
 import { pathExists, readFile } from '../utils/fs';
 import { expandTilde } from '../utils/home';
 import { validateMounts } from '../capture/mounts';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from '../proxy/policy';
+import { DEFAULT_DOCS_URL, normalizeDocsUrl, setDocsBaseUrl } from '../docs/links';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
 let _configOverrideWarned = false;
+
+/**
+ * Reset the once-per-process latch on the config-override warning.
+ * Test-only seam: the latch makes the warning unobservable after the first
+ * emission, so a suite covering more than one case needs to clear it.
+ */
+export function resetConfigOverrideWarning(): void {
+  _configOverrideWarned = false;
+}
+
+/**
+ * Decide whether the "using config from <dir>, not the git root" warning is worth
+ * printing. Task worktrees are a normal, constant part of using lazy and their
+ * lazy.toml is usually byte-identical to the git root's — the same tracked file on
+ * a branch that never touched it. Warning there fires on nearly every command from
+ * a worktree, says nothing, and (as of 2026-08-08) has actively misdirected
+ * debugging of an unrelated CLI wedge.
+ *
+ * So: identical content → silent. Anything else → warn, including every failure
+ * mode. A comparison that cannot be made must never swallow a warning that might
+ * be real, and must never take the command down with it.
+ */
+async function configOverrideIsMeaningful(configPath: string, rootConfigPath: string): Promise<boolean> {
+  try {
+    const [override, rootConfig] = await Promise.all([
+      readFile(configPath, 'utf-8'),
+      readFile(rootConfigPath, 'utf-8'),
+    ]);
+    return override !== rootConfig;
+  } catch {
+    // Unreadable git-root config (no repo, file missing, permissions) — fall back
+    // to today's behaviour and warn. Deliberate suppression of a read error: the
+    // only consequence is that the user sees the warning they'd have seen before.
+    return true;
+  }
+}
 
 /**
  * Find the nearest lazy.toml by walking up from startDir, stopping at lazyRoot.
@@ -27,8 +64,10 @@ async function findConfigDir(lazyRoot: string, startDir?: string): Promise<strin
   while (true) {
     if (await pathExists(join(dir, CONFIG_FILENAME))) {
       if (dir !== root && !_configOverrideWarned) {
-        _configOverrideWarned = true;
-        console.warn(`Warning: Using ${CONFIG_FILENAME} from ${dir} (not the git root ${root})`);
+        if (await configOverrideIsMeaningful(join(dir, CONFIG_FILENAME), join(root, CONFIG_FILENAME))) {
+          _configOverrideWarned = true;
+          console.warn(`Warning: Using ${CONFIG_FILENAME} from ${dir} (not the git root ${root})`);
+        }
       }
       return dir;
     }
@@ -68,6 +107,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   },
   git: {
     default_branch_prefix: 'lazy',
+    lfs_check: 'refuse',
   },
   output: {
     shortid_length: 8,
@@ -172,6 +212,9 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   proxy: null,
   memory: {
     warn_bytes: DEFAULT_MEMORY_WARN_BYTES,
+  },
+  docs: {
+    url: DEFAULT_DOCS_URL,
   },
   limits: {
     max_concurrent_agents: 8,
@@ -386,6 +429,7 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
 
   // If no config file exists (and LAZY_CONFIG was not set), return defaults
   if (!(await pathExists(configPath))) {
+    setDocsBaseUrl(DEFAULT_CONFIG.docs.url);
     return DEFAULT_CONFIG;
   }
 
@@ -543,6 +587,15 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     }
   }
 
+  // Validate the git LFS check mode. External input at a boundary: an
+  // unrecognised value must not silently degrade a safety check to "off".
+  if (!VALID_LFS_CHECK_MODES.includes(config.git.lfs_check as never)) {
+    throw new Error(
+      `Invalid lfs_check value "${config.git.lfs_check}" in lazy.toml [git] section. ` +
+      `Valid values: ${VALID_LFS_CHECK_MODES.join(', ')}`
+    );
+  }
+
   // Validate Ollama config
   if (config.ollama.enabled && !config.ollama.model) {
     throw new Error(
@@ -576,6 +629,12 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
       `Invalid warn_bytes = ${config.memory.warn_bytes} in lazy.toml [memory] section: must be a positive integer (bytes).`,
     );
   }
+
+  // Documentation base URL. Validated (and normalized: trailing slash dropped,
+  // "" / false → disabled) rather than passed through, because a typo here is
+  // silent otherwise — every doc pointer would render an unreachable link and
+  // nothing would ever say why.
+  config.docs.url = normalizeDocsUrl(parsed.docs?.url);
 
   // Validate custom mounts. Fail loud on structurally invalid entries (missing
   // target, unknown type, bind without source, etc.) so the user sees an
@@ -675,6 +734,11 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     }
   }
 
+  // Install the docs base for this process. Doc pointers are built deep inside
+  // guards and thrown errors that never see a ResolvedConfig; this is the one
+  // place the configured value reaches them. See src/docs/links.ts.
+  setDocsBaseUrl(config.docs.url);
+
   return config;
 }
 
@@ -762,10 +826,23 @@ ${pathLine}
 [git]
 # Default prefix for lazy branches (e.g., "lazy/abc123")
 default_branch_prefix = "lazy"
+# Git LFS environment check at task start, for repos that use LFS.
+# "refuse" (default) blocks the start when the LFS filter would not run,
+# "warn" starts anyway and records a warning, "off" disables the check.
+# The accept-time guard against raw blobs on LFS paths always runs.
+# lfs_check = "refuse"
 
 [output]
 # Length of shortened IDs displayed in output
 shortid_length = 8
+
+[docs]
+# Where "Check documentation at <url>" pointers in errors, warnings and command
+# help point. Defaults to the docs for THIS version of lazy —
+# https://docs.getlazy.dev/v<major.minor> — so a pointer keeps resolving after
+# the docs move on. A value set here is used exactly as written and never gains
+# a version segment; set "" to turn documentation pointers off entirely.
+# url = "https://docs.internal.example.com/lazy"
 
 [agent]
 # Default agent type to use for sessions
@@ -809,7 +886,7 @@ agent_id = "claude-code"
 [server]
 # Default port for the web dashboard server
 port = 26024
-# Interval in seconds for background sync when running lazy server (0 to disable)
+# Interval in seconds for the daemon's background sync (0 to disable)
 # sync_interval = 60
 # Network interface the daemon's TCP server binds to. Defaults to loopback
 # ("127.0.0.1") so the dashboard, /mcp, and /rpc endpoints are reachable only

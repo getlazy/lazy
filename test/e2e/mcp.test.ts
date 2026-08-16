@@ -11,6 +11,8 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
+import { readTaskJson } from '../helpers/storage';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -36,7 +38,7 @@ async function runMcpSession(
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env },
+    env: { ...process.env, ...MCP_SERVER_ENV_PINS },
   });
 
   const stdin = proc.stdin as import('bun').FileSink;
@@ -87,7 +89,7 @@ describe('lazy-agent mcp', () => {
   beforeEach(async () => {
     // Storage-dependent MCP tools (lazy_status/create/show/comment/...) reach
     // storage through requireStorage(). The MCP server is spawned WITHOUT
-    // LAZY_TEST=1 (see runMcpSession's `env: { ...process.env }`), so it must
+    // LAZY_TEST=1 (runMcpSession pins it off, see MCP_SERVER_ENV_PINS), so it must
     // reach a real daemon over RPC — exactly like the pairing/builder MCP
     // server does in production. A daemonless setup leaves those tools with no
     // storage backend (requireStorage exits "Daemon is not running"), and the
@@ -155,7 +157,7 @@ describe('lazy-agent mcp', () => {
     // surfaces — the agent read-only gate lives inside lazy_memory_save's
     // handler, not in tool registration, so agents still see the tool and get a
     // clear server-side rejection instead of a mystery missing tool.
-    expect(result.tools.length).toBe(36);
+    expect(result.tools.length).toBe(37);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
@@ -169,6 +171,7 @@ describe('lazy-agent mcp', () => {
       'lazy_close',
       'lazy_comment',
       'lazy_commit',
+      'lazy_conversation_ask',
       'lazy_conversation_read',
       'lazy_conversation_search',
       'lazy_conversations',
@@ -756,7 +759,7 @@ describe('lazy-agent mcp', () => {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: { ...process.env },
+      env: { ...process.env, ...MCP_SERVER_ENV_PINS },
     });
 
     const stdin = proc.stdin as import('bun').FileSink;
@@ -1172,8 +1175,8 @@ describe('lazy-agent mcp', () => {
 
   // INVARIANT: lazy_active's optional task_id filters to the task's SUBTREE —
   // it and ALL descendants — mirroring `lazy active <task_id>` on the CLI.
-  // (lazy_list's task_id is direct-children only; these are deliberately
-  // different filters.)
+  // lazy_list's task_id uses the SAME scope; both go through filterToSubtree,
+  // so there is one definition of what a task_id filter means.
   test('lazy_active task_id filters to the task subtree, including grandchildren', async () => {
     const rootShortId = await createTask(ctx, 'Subtree root', 'Root work');
     expect((await ctx.lazyMocked(['start', rootShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
@@ -1222,5 +1225,170 @@ describe('lazy-agent mcp', () => {
     const notFound = responses.find(r => r.id === 3)!.result as { content: Array<{ text: string }>; isError?: boolean };
     expect(notFound.isError).toBe(true);
     expect(notFound.content[0].text).toContain('Task not found: no-such-task');
+  });
+
+  // -----------------------------------------------------------------------
+  // lazy_list scope — same as `lazy list [<id>]`
+  // -----------------------------------------------------------------------
+
+  // INVARIANT: lazy_list's task_id filters to the task's SUBTREE — it and ALL
+  // descendants — exactly like `lazy list <id>` and like lazy_active's own
+  // task_id. It used to return DIRECT CHILDREN only while its own description
+  // promised the subtree, so an agent reviewing a decomposed task silently saw
+  // a truncated tree and could conclude grandchild work did not exist.
+  test('lazy_list task_id returns the whole subtree, including grandchildren', async () => {
+    const rootShortId = await createTask(ctx, 'List subtree root', 'Root work');
+    const rootFullId = await fullTaskId(ctx, rootShortId);
+
+    const childCreate = await ctx.lazy(['create', '--goal', 'List subtree child', '--parent', rootFullId]);
+    expect(childCreate.exitCode).toBe(0);
+    const childShortId = extractTaskId(childCreate.stdout);
+    const childFullId = await fullTaskId(ctx, childShortId);
+
+    const grandCreate = await ctx.lazy(['create', '--goal', 'List subtree grandchild', '--parent', childFullId]);
+    expect(grandCreate.exitCode).toBe(0);
+    const grandShortId = extractTaskId(grandCreate.stdout);
+
+    const outsiderShortId = await createTask(ctx, 'Outside the list subtree');
+
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_list', arguments: { task_id: rootShortId } } },
+    ]);
+
+    const parsed = JSON.parse(
+      (responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> }).content[0].text,
+    );
+    const ids = parsed.tasks.map((t: { id: string }) => t.id);
+    expect(ids).toContain(rootShortId);
+    expect(ids).toContain(childShortId);
+    expect(ids).toContain(grandShortId); // the whole point — was missing before
+    expect(ids).not.toContain(outsiderShortId);
+  });
+
+  // INVARIANT: `all` and `task_id` are INDEPENDENT — `all` decides which tasks
+  // are in play, `task_id` narrows them to a subtree. `all` used to be ignored
+  // whenever task_id was present, so asking for a subtree's closed subtasks
+  // returned a non-terminal-only answer with no indication anything was hidden.
+  test('lazy_list honors all together with task_id', async () => {
+    const rootShortId = await createTask(ctx, 'All+subtree root', 'Root work');
+    const rootFullId = await fullTaskId(ctx, rootShortId);
+
+    const childCreate = await ctx.lazy(['create', '--goal', 'Closed child', '--parent', rootFullId]);
+    expect(childCreate.exitCode).toBe(0);
+    const childShortId = extractTaskId(childCreate.stdout);
+    expect((await ctx.lazy(['close', childShortId, '--reason', 'not needed', '--yes'])).exitCode).toBe(0);
+
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_list', arguments: { task_id: rootShortId } } },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_list', arguments: { task_id: rootShortId, all: true } } },
+    ]);
+
+    const parse = (id: number) => JSON.parse(
+      (responses.find(r => r.id === id)!.result as { content: Array<{ text: string }> }).content[0].text,
+    );
+
+    const withoutAll = parse(2).tasks.map((t: { id: string }) => t.id);
+    expect(withoutAll).toContain(rootShortId);
+    expect(withoutAll).not.toContain(childShortId); // terminal, excluded by default
+
+    const withAll = parse(3).tasks.map((t: { id: string }) => t.id);
+    expect(withAll).toContain(rootShortId);
+    expect(withAll).toContain(childShortId); // `all` is honored WITH task_id
+  });
+
+  // -----------------------------------------------------------------------
+  // lazy_diff base ref — one implementation, shared with `lazy diff`
+  // -----------------------------------------------------------------------
+
+  // INVARIANT: lazy_diff computes NO base ref of its own. It routes through the
+  // daemon's handleDiff — the same code path `lazy diff` uses — so base-ref
+  // resolution lives in exactly one place. The MCP side used to derive its own
+  // base and fall back to the LITERAL branch name 'main' for every top-level
+  // task, so a task targeting a release branch was diffed against main and
+  // reported that branch's commits as its own work, with no error anywhere.
+  test('lazy_diff bases the diff on the task target branch, not the literal main', async () => {
+    expect(ctx.git('checkout', '-b', 'release-x').exitCode).toBe(0);
+    // A commit that exists on release-x but not on main. Diffed against main it
+    // would be attributed to the task; against release-x it correctly vanishes.
+    writeFileSync(join(ctx.root, 'release-only.txt'), 'shipped on release-x\n');
+    expect(ctx.git('add', 'release-only.txt').exitCode).toBe(0);
+    expect(ctx.git('commit', '-m', 'release-x only').exitCode).toBe(0);
+    expect(ctx.git('checkout', 'main').exitCode).toBe(0);
+
+    const create = await ctx.lazy(['create', '--goal', 'Diff base ref', '--prompt', 'Work']);
+    expect(create.exitCode).toBe(0);
+    const taskShortId = extractTaskId(create.stdout);
+    expect((await ctx.lazyMocked(['start', taskShortId], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', taskShortId])).exitCode).toBe(0);
+    // Point the started task at release-x through the supported route. (Setting
+    // the target at create time does not survive `lazy start`, which rewrites a
+    // top-level task's target to the repo default — a separate bug, filed as a
+    // follow-up; reparent keeps this test about the diff base and nothing else.)
+    expect((await ctx.lazyMocked(['reparent', taskShortId, '--parent', 'release-x', '--yes'], MOCK_CLAUDE_SUCCESS)).exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', taskShortId])).exitCode).toBe(0);
+    const taskFullId = await fullTaskId(ctx, taskShortId);
+
+    const responses = await runMcpSession(ctx.root, taskFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_diff', arguments: { task_id: taskShortId } } },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.diff_range).toBe('release-x...HEAD');
+    // The canonical short id, not whatever string the caller passed in.
+    expect(parsed.task_id).toBe(taskShortId);
+    // release-x's own commit is NOT the task's work.
+    expect(parsed.diff).not.toContain('release-only.txt');
+    // The "how to see everything" hint must name a call an MCP client can make.
+    if (parsed.diff.includes('For full diff')) {
+      expect(parsed.diff).toContain('lazy_diff(');
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // lazy_create: runner and priority on the AGENT path
+  // -----------------------------------------------------------------------
+
+  // INVARIANT: every field lazy_create advertises on its schema is applied on
+  // the agent path too. runner and priority used to be read and then dropped
+  // when ctx.taskId was set: an agent asking for priority 'urgent' got a
+  // normal-priority task and no error at all. Neither field widens the agent's
+  // blast radius — the parent is still forced to the calling task — so they are
+  // honored; silent acceptance was the one unacceptable option.
+  test('lazy_create applies runner and priority when called by an agent', async () => {
+    const parentShortId = await createTask(ctx, 'Runner/priority parent');
+    const parentFullId = await fullTaskId(ctx, parentShortId);
+
+    const responses = await runMcpSession(ctx.root, parentFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      {
+        method: 'tools/call',
+        id: 2,
+        params: {
+          name: 'lazy_create',
+          arguments: { goal: 'Honors runner and priority', runner: 'host', priority: 'urgent' },
+        },
+      },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+
+    // Echoed back, so the caller can see what it actually got. 'host' is the
+    // user-facing alias; the stored runner type is the canonical spelling.
+    expect(parsed.runner).toBe('dangerously-host-process-without-any-isolation');
+    expect(parsed.priority).toBe('urgent');
+    expect(parsed.parent_task_id).toBe(parentShortId);
+
+    // And PERSISTED — the response echoing them would be worthless on its own.
+    const stored = readTaskJson(ctx.root, parsed.id);
+    expect(stored.priority).toBe('urgent');
+    expect(stored.runner_type).toBe('dangerously-host-process-without-any-isolation');
   });
 });

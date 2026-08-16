@@ -519,11 +519,21 @@ export async function deleteBranch(branch: string, cwd?: string): Promise<void> 
   }
 }
 
-export async function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): Promise<string> {
+/**
+ * Pathspecs to restrict a diff to, appended after a `--` separator. Empty or
+ * undefined means "the whole tree". Applied to the uncommitted-changes section
+ * too, so a filtered diff never leaks files the caller excluded.
+ */
+function withPathspecs(args: string[], paths?: string[]): string[] {
+  if (!paths || paths.length === 0) return args;
+  return [...args, '--', ...paths];
+}
+
+export async function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false, paths?: string[]): Promise<string> {
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = await runGit(['diff', '--no-color', '--stat', range], { cwd });
+  const result = await runGit(withPathspecs(['diff', '--no-color', '--stat', range], paths), { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
@@ -531,7 +541,7 @@ export async function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?:
 
   // If toRef is HEAD and there are uncommitted changes, include them
   if (toRef === 'HEAD' && await hasUncommittedChanges(cwd)) {
-    const uncommittedStat = await runGit(['diff', '--no-color', '--stat', 'HEAD'], { cwd });
+    const uncommittedStat = await runGit(withPathspecs(['diff', '--no-color', '--stat', 'HEAD'], paths), { cwd });
     if (uncommittedStat.exitCode === 0 && uncommittedStat.stdout) {
       output += '\n--- Uncommitted changes ---\n' + uncommittedStat.stdout;
     }
@@ -540,11 +550,11 @@ export async function getDiffStat(fromRef: string, toRef: string = 'HEAD', cwd?:
   return output;
 }
 
-export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false): Promise<string> {
+export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false, paths?: string[]): Promise<string> {
   // Two-dot diff shows tree difference (for captured upstream SHA).
   // Three-dot diff compares against merge-base (for branch comparison).
   const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
-  const result = await runGit(['diff', '--no-color', range], { cwd });
+  const result = await runGit(withPathspecs(['diff', '--no-color', range], paths), { cwd });
   if (result.exitCode !== 0) {
     return '';
   }
@@ -552,13 +562,64 @@ export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?:
 
   // If toRef is HEAD and there are uncommitted changes, include them
   if (toRef === 'HEAD' && await hasUncommittedChanges(cwd)) {
-    const uncommittedDiff = await runGit(['diff', '--no-color', 'HEAD'], { cwd });
+    const uncommittedDiff = await runGit(withPathspecs(['diff', '--no-color', 'HEAD'], paths), { cwd });
     if (uncommittedDiff.exitCode === 0 && uncommittedDiff.stdout) {
       output += '\n\n--- Uncommitted changes ---\n' + uncommittedDiff.stdout;
     }
   }
 
   return output;
+}
+
+/**
+ * Whether a worktree is sitting in the middle of a merge, and how far along.
+ *
+ * Every surface that reports on a task's worktree needs this: a mid-merge
+ * worktree is not "a few uncommitted changes", it is an unfinished operation
+ * that a human or an agent has to conclude. Reporting it as ordinary dirt (or,
+ * worse, as nothing at all) is how a half-merged worktree once reached a human
+ * as a bare `blocked` task (fix-sync-silent-conflict).
+ */
+export interface WorktreeMergeState {
+  /** MERGE_HEAD exists — a merge was started and never concluded. */
+  mergeInProgress: boolean;
+  /** Paths git still reports as unmerged (conflict markers on disk). */
+  unmergedFiles: string[];
+}
+
+/** True when the worktree is mid-merge in any form. */
+export function isMidMerge(state: WorktreeMergeState): boolean {
+  return state.mergeInProgress || state.unmergedFiles.length > 0;
+}
+
+/**
+ * One-line human summary of a mid-merge worktree, or null when it is settled.
+ * Shared so `show`, `wait`, `status` and `accept` all say the same thing.
+ */
+export function describeMergeState(state: WorktreeMergeState): string | null {
+  if (!isMidMerge(state)) return null;
+  const count = state.unmergedFiles.length;
+  if (state.mergeInProgress) {
+    return count > 0
+      ? `merge in progress with ${count} unresolved conflict(s): ${state.unmergedFiles.join(', ')}`
+      : 'merge in progress: conflicts are resolved but the merge is not committed';
+  }
+  return `${count} unmerged file(s) with no merge in progress: ${state.unmergedFiles.join(', ')}`;
+}
+
+export async function readWorktreeMergeState(cwd?: string): Promise<WorktreeMergeState> {
+  const mergeHead = await runGit(['rev-parse', '--verify', 'MERGE_HEAD'], { cwd });
+  const unmerged = await runGit(['diff', '--name-only', '--diff-filter=U'], { cwd });
+  return {
+    // `rev-parse --verify MERGE_HEAD` prints the sha; a zero exit with no sha
+    // means we did not actually observe a MERGE_HEAD, so it must not be read as
+    // "mid-merge" — that would strand every caller on a false positive.
+    mergeInProgress: mergeHead.exitCode === 0 && mergeHead.stdout.trim().length > 0,
+    unmergedFiles:
+      unmerged.exitCode === 0
+        ? unmerged.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        : [],
+  };
 }
 
 export async function hasUncommittedChanges(cwd?: string): Promise<boolean> {

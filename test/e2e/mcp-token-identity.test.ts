@@ -31,7 +31,7 @@ import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
-import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { findFullTaskId, taskFilePath } from '../helpers/storage';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
@@ -41,8 +41,13 @@ import {
   peekMcpToken,
   clearMcpTokenCache,
 } from '../../src/daemon/mcp-tokens';
+import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 const SHARED_TOKEN = 'shared-daemon-token-identity-test';
+
+// This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
+// startDaemonServer() sets process-wide from leaking into later test files.
+isolateInProcessDaemonEnv();
 
 describe('per-task MCP token identity', () => {
   let ctx: TestContext;
@@ -51,6 +56,7 @@ describe('per-task MCP token identity', () => {
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
+  let restoreDaemonBaseDir: (() => void) | undefined;
 
   let taskAShort: string;
   let taskBShort: string;
@@ -66,7 +72,7 @@ describe('per-task MCP token identity', () => {
     // registry lives in the daemon state dir, and a test must never touch the
     // developer's real one.
     daemonBaseDir = await makeDaemonBaseDir();
-    process.env.LAZY_DAEMON_BASE_DIR = daemonBaseDir;
+    restoreDaemonBaseDir = pinDaemonBaseDir(daemonBaseDir);
     clearMcpTokenCache();
 
     ctx = await setupTestLazy();
@@ -94,9 +100,13 @@ describe('per-task MCP token identity', () => {
     restoreConfig?.();
     restoreConfig = undefined;
     clearMcpTokenCache();
-    delete process.env.LAZY_DAEMON_BASE_DIR;
-    await removeDaemonBaseDir(daemonBaseDir);
+    // Reap the daemon FIRST: cleanup resolves its pidfile through
+    // LAZY_DAEMON_BASE_DIR, so unpinning before this looks under the default
+    // base dir and leaves the daemon running.
     await ctx.cleanup();
+    restoreDaemonBaseDir?.();
+    restoreDaemonBaseDir = undefined;
+    await removeDaemonBaseDir(daemonBaseDir);
     await rm(tmpDir, { recursive: true, force: true });
   });
 

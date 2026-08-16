@@ -62,6 +62,15 @@ external_path = ""
 [git]
 # Default prefix for lazy branches (e.g., "lazy/abc123")
 default_branch_prefix = "lazy"
+# Git LFS environment check at task start, for repos that use LFS.
+# With a broken or missing LFS filter git commits raw file content instead of a
+# pointer and does NOT error (filter.lfs.required = false), producing a branch
+# that cannot be pushed. Lazy refuses to launch an agent into that environment.
+#   "refuse" (default) — block the start; run `lazy doctor` for the diagnosis
+#   "warn"             — start anyway, record a warning
+#   "off"              — disable the check
+# The accept-time guard against raw blobs on LFS paths always runs regardless.
+# lfs_check = "refuse"
 
 [output]
 # Length of shortened IDs displayed in output
@@ -131,7 +140,7 @@ agent_id = "claude-code"
 [server]
 # Default port for the web dashboard server
 port = 26024
-# Interval in seconds for background sync when running lazy server (0 to disable)
+# Interval in seconds for the daemon's background sync (0 to disable)
 # sync_interval = 60
 
 [runner]
@@ -181,18 +190,33 @@ driver = "local"
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]
-# Auto-detected or manually set toolchain (e.g., "node", "rust", "ruby-rails")
-# Determines which built-in Dockerfile to use for agent containers.
-# See available toolchains: base, bun, node, deno, rust, go, cpp, ruby-rails,
-# ruby-rails-rust, dotnet, python, python-ml, java, kotlin, swift
-toolchain = ""
-# Path to custom Dockerfile (relative to project root, empty = use built-in default)
-# When set, overrides the toolchain Dockerfile.
+# Path to custom Dockerfile (relative to project root, empty = use the base
+# image: Ubuntu with Claude Code + passwordless sudo; agents apt-get what they need)
 dockerfile = ""
 
 [documents]
 # Path to a directory of documents to mount into the agent container
 # path = ""
+
+[docs]
+# Where "Check documentation at <url>" pointers in errors, warnings and command
+# help point. Distinct from [documents] above, which mounts a directory of
+# reference documents into the agent container — this is just the link domain.
+#
+# Defaults to the docs for THIS version of lazy —
+# https://docs.getlazy.dev/v<major.minor>. The site keeps one directory per
+# minor release and never rewrites an old one, so a pointer printed by the
+# build you are running today still resolves years from now.
+#
+# Point it at your own mirror if you run a fork or an internal copy of the
+# docs. A value set here is used EXACTLY as written: lazy appends the page
+# path and nothing else, so no version segment is added — a mirror owns its
+# own layout.
+# url = "https://docs.internal.example.com/lazy"
+#
+# Set to "" (or false) to turn documentation pointers off entirely. Every
+# message that carries one is fully actionable without it.
+# url = ""
 
 [features]
 # Enable experimental features. Set individual flags or use all = true.
@@ -212,10 +236,15 @@ dockerfile = ""
 # Invalid entries fail loudly at load time (missing target, unknown type, a bind
 # with no source, a volume that sets source) — never silently skipped.
 #
-# One source is refused outright: lazy's daemon state dir (~/.lazy/daemon/, or
-# LAZY_DAEMON_BASE_DIR) — and anything containing it, e.g. ~/.lazy or $HOME. It
-# holds the shared daemon token and the per-task MCP token registry, so a
-# container that could read it could act as any other task, or as the builder.
+# Two sources are refused outright, along with anything containing them (e.g.
+# ~/.lazy or $HOME):
+#   - lazy's daemon state dir (~/.lazy/daemon/, or LAZY_DAEMON_BASE_DIR). It
+#     holds the shared daemon token and the per-task MCP token registry, so a
+#     container that could read it could act as any other task, or as the
+#     builder.
+#   - the builder scratch dir (~/.lazy/scratch/, or LAZY_SCRATCH_BASE_DIR). It
+#     is the builder's scratchpad for handing documents to you, deliberately
+#     not readable by agents.
 #
 # Bind a host path into the container (source may be absolute or project-relative):
 # [[mounts]]
@@ -370,3 +399,16 @@ post_turn_timeout = 300
 # [[proxy.fallback]]
 # upstream = "http://host.docker.internal:11434"   # e.g. local Ollama
 # model = "qwen3.5:35b-a3b-coding-nvfp4"           # optional model override
+#
+# Mechanistic policy plane — deterministic, injection-proof deny rules applied to
+# every tool call BEFORE it executes. ON by default with a closed posture, so you
+# do not need this table either: inherited claude.ai connectors (mcp__claude_ai_*)
+# are denied allowlist-only, and reads of well-known secret paths are denied.
+# Denials are recorded in the audit trail (`lazy stats audit --denied`).
+#
+# [proxy.policy]
+# enforce = true                       # false = pure passthrough/audit, no enforcement
+# connector_allowlist = ["mcp__claude_ai_gmail_search_threads"]   # exact tool names
+# deny_secret_path_reads = true        # ~/.ssh, .env, credentials, private keys, ...
+# deny_path_globs = ["/etc/**", "**/*.key"]   # extra absolute-path globs to deny
+# egress_allowlist = ["api.github.com"]       # hosts WebFetch may reach (empty = any)

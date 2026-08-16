@@ -13,6 +13,7 @@ import { buildMountArgs } from './mounts';
 import { buildGitMountArgsFor } from './git-mounts';
 import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
 import { logger } from '../utils/logger';
+import { redactSecrets } from '../utils/redact';
 import { isOfflineMode } from '../utils/offline';
 import { spawn, spawnSync } from '../utils/spawn';
 import { safeArgvPrompt } from '../agent/argv-safety';
@@ -23,6 +24,12 @@ import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' }
 // exact same embedded text as the single source of truth — never copy it.
 export { DEFAULT_DOCKERFILE };
 import { getHome } from '../utils/home';
+import { toTurnUsage } from '../utils/usage-recording';
+import { VERSION } from '../version';
+import { IMAGE_NAME, DOCKERFILE_HASH_LABEL, IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from './image-tag';
+
+// Re-exported so callers keep importing the image identity from one place.
+export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
 
 // Embedded at build/compile time — the agent binary is bundled into the lazy executable.
 // In dev mode this resolves to the placeholder file on disk (which is empty/tiny).
@@ -30,9 +37,12 @@ import { getHome } from '../utils/home';
 // A placeholder lazy-agent file must exist at the project root for this import to resolve.
 import embeddedAgentBinaryPath from '../../lazy-agent' with { type: 'file' };
 
-// Minimum size for a valid agent binary (real binaries are several MB).
-// The placeholder file is intentionally small so we can distinguish it.
-const MIN_AGENT_BINARY_SIZE = 1024;
+import {
+  verifyAgentBinary,
+  verifyAgentBinaryBytes,
+  formatAgentBinaryError,
+  MIN_AGENT_BINARY_SIZE,
+} from '../agent/binary-identity';
 
 export interface SandboxConfig {
   worktreePath: string;
@@ -41,8 +51,16 @@ export interface SandboxConfig {
 
 
 
-const IMAGE_NAME = 'lazy-runner';
-const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
+/**
+ * `lazy-runner:latest` is still written on every base-image build, as an alias
+ * for the version tag. Nothing lazy runs resolves through it — but custom
+ * Dockerfiles do (`FROM lazy-runner`, documented in the README and in
+ * src/prompts/setup-dockerfile.md), and those would break outright if the tag
+ * disappeared. Keeping it pointed at the newest build preserves that contract
+ * and keeps it fresh rather than frozen.
+ */
+const LATEST_ALIAS_TAG = 'latest';
+
 // Timeout for Docker inspection commands (ms). Prevents process hangs if Docker daemon is unresponsive.
 const DOCKER_TIMEOUT_MS = 10_000;
 
@@ -131,18 +149,38 @@ export async function calculateDockerfileHash(lazyRoot: string): Promise<string>
 }
 
 /**
- * Determine the Docker image name to use.
+ * Determine the Docker image REPOSITORY (name without tag) to use.
  * Default behavior uses 'lazy-runner'. Custom Dockerfiles use 'lazy-custom-{hash}'.
  */
-export async function resolveImageName(lazyRoot: string): Promise<string> {
+export async function resolveImageRepository(lazyRoot: string): Promise<{ repository: string; isCustom: boolean }> {
   const { isCustom, content } = await getDockerfileContent(lazyRoot);
 
   if (isCustom) {
     const hash = createHash('sha256').update(content).digest('hex').substring(0, 12);
-    return `lazy-custom-${hash}`;
+    return { repository: `lazy-custom-${hash}`, isCustom: true };
   }
 
-  return IMAGE_NAME;
+  return { repository: IMAGE_NAME, isCustom: false };
+}
+
+/**
+ * Determine the full Docker image reference to run — always tagged with lazy's
+ * major.minor version (see IMAGE_TAG), never `:latest`.
+ */
+export async function resolveImageName(lazyRoot: string): Promise<string> {
+  const { repository } = await resolveImageRepository(lazyRoot);
+  return `${repository}:${IMAGE_TAG}`;
+}
+
+/**
+ * Tags written by a build of `repository`. The base runner image also gets the
+ * `:latest` alias so `FROM lazy-runner` in custom Dockerfiles keeps resolving;
+ * a custom image's repository name is already content-addressed by its
+ * Dockerfile hash, so an alias there would only add clutter nothing reads.
+ */
+function buildTagsFor(repository: string): string[] {
+  const versioned = `${repository}:${IMAGE_TAG}`;
+  return repository === IMAGE_NAME ? [versioned, `${repository}:${LATEST_ALIAS_TAG}`] : [versioned];
 }
 
 /**
@@ -172,17 +210,88 @@ async function getImageDockerfileHash(imageName: string, binary: string = 'docke
 }
 
 /**
- * List existing Docker images with the lazy Dockerfile hash label.
- * Returns image names sorted by creation date (most recent first).
+ * When the image was built, per the container runtime, or null if it cannot be
+ * determined (image missing, runtime hiccup, unparseable timestamp).
+ *
+ * Null means "no opinion" everywhere it is used: an unreadable timestamp must
+ * never be treated as "infinitely old" and trigger a multi-minute rebuild on
+ * every single container launch.
+ *
+ * Note this is the BUILD time of the underlying image, not of the tag —
+ * `docker tag` does not touch it. That is what makes it usable as the freshness
+ * signal: `lazy upgrade` promotes a freshly-BUILT image onto the tag, so the
+ * timestamp genuinely advances there, while a re-tag of an old image does not
+ * pretend to be fresh.
  */
-async function listExistingLazyImages(binary: string = 'docker'): Promise<string[]> {
+async function getImageCreatedAt(imageName: string, binary: string = 'docker'): Promise<Date | null> {
+  const inspect = spawn(
+    [binary, 'image', 'inspect', imageName, '--format', '{{.Created}}'],
+    { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
+  );
+
+  const [stdout, exitCode] = await Promise.all([
+    new Response(inspect.stdout).text(),
+    inspect.exited,
+  ]);
+  if (exitCode !== 0) return null;
+
+  const raw = stdout.trim();
+  if (!raw) return null;
+  const created = new Date(raw);
+  return Number.isNaN(created.getTime()) ? null : created;
+}
+
+/**
+ * Is a built image past its freshness window? See src/capture/image-tag.ts for
+ * why age — not the version tag — is the axis that matters.
+ */
+export async function isImageTooOld(
+  imageName: string,
+  binary: string = 'docker',
+): Promise<{ tooOld: boolean; ageDays: number | null }> {
+  const created = await getImageCreatedAt(imageName, binary);
+  if (!created) return { tooOld: false, ageDays: null };
+  const ageMs = Date.now() - created.getTime();
+  return { tooOld: ageMs > IMAGE_MAX_AGE_MS, ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)) };
+}
+
+/** One image built by lazy, as reported by `docker images`. */
+export interface LazyImageInfo {
+  /** Full reference, e.g. `lazy-runner:0.21`. */
+  ref: string;
+  repository: string;
+  tag: string;
+  /** Image ID — two refs with the same ID are two tags on one image. */
+  id: string;
+  /** Human-readable size string from the container runtime, e.g. `2.31GB`. */
+  size: string;
+}
+
+/**
+ * List existing Docker images with the lazy Dockerfile hash label.
+ * Returns them sorted by creation date (most recent first), as docker does.
+ */
+export async function listLazyImages(binary: string = 'docker'): Promise<LazyImageInfo[]> {
   const proc = spawn(
-    [binary, 'images', '--filter', `label=${DOCKERFILE_HASH_LABEL}`, '--format', '{{.Repository}}:{{.Tag}}'],
+    [binary, 'images', '--filter', `label=${DOCKERFILE_HASH_LABEL}`, '--format', '{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}'],
     { stdout: 'pipe', stderr: 'ignore' }
   );
   const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   if (exitCode !== 0) return [];
-  return stdout.trim().split('\n').filter(line => line && line !== '<none>:<none>');
+
+  const images: LazyImageInfo[] = [];
+  for (const line of stdout.trim().split('\n')) {
+    if (!line.trim()) continue;
+    const [repository, tag, id, size] = line.split('\t');
+    if (!repository || !tag || repository === '<none>' || tag === '<none>') continue;
+    images.push({ ref: `${repository}:${tag}`, repository, tag, id: id ?? '', size: size ?? '' });
+  }
+  return images;
+}
+
+/** Image references only — used by the offline fallback below. */
+async function listExistingLazyImages(binary: string = 'docker'): Promise<string[]> {
+  return (await listLazyImages(binary)).map(image => image.ref);
 }
 
 /**
@@ -205,18 +314,29 @@ async function writeDockerfileToTempDir(content: string): Promise<{ buildCwd: st
 async function runDockerBuild(
   buildCwd: string,
   dockerfilePath: string,
-  imageName: string,
+  tags: string[],
   hash: string,
   binary: string,
   noCache: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) throw new Error('Container build cancelled before it started');
+
+  const tagArgs = tags.flatMap(tag => ['-t', tag]);
   const proc = spawn(
-    [binary, 'build', ...(noCache ? ['--no-cache'] : []), '-t', imageName, '--label', `${DOCKERFILE_HASH_LABEL}=${hash}`, '-f', dockerfilePath, '.'],
-    // Image builds download toolchains (bun, Claude Code, Playwright+Chromium) and
-    // can legitimately take many minutes. The default 60s subprocess timeout kills
+    [binary, 'build', ...(noCache ? ['--no-cache'] : []), ...tagArgs, '--label', `${DOCKERFILE_HASH_LABEL}=${hash}`, '-f', dockerfilePath, '.'],
+    // Image builds download packages (apt, the Claude Code installer, and whatever
+    // else the project's Dockerfile fetches) and can legitimately take many
+    // minutes. The default 60s subprocess timeout kills
     // the build mid-download, surfacing as "Canceled: context canceled" (exit 130).
     { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe', timeout: 20 * 60_000 }
   );
+
+  // Cancellation (`lazy upgrade` aborted while its background rebuild is still
+  // running): kill the client. Layers already built stay in the runtime's build
+  // cache, so a later upgrade is warm rather than starting from scratch.
+  const onAbort = () => { try { proc.kill(); } catch { /* already exited */ } };
+  signal?.addEventListener('abort', onAbort, { once: true });
 
   const outputPromise = new Response(proc.stdout).text();
   const stderrPromise = new Response(proc.stderr).text();
@@ -225,7 +345,9 @@ async function runDockerBuild(
     outputPromise,
     stderrPromise,
     proc.exited,
-  ]);
+  ]).finally(() => signal?.removeEventListener('abort', onAbort));
+
+  if (signal?.aborted) throw new Error('Container build cancelled');
 
   logger.stream('Container build stdout:\n' + stdout);
   logger.stream('Container build stderr:\n' + stderr);
@@ -240,8 +362,28 @@ async function runDockerBuild(
   logger.debug('Container build completed successfully');
 }
 
-async function buildImage(lazyRoot: string, imageName: string, currentHash: string, binary: string = 'docker', noCache: boolean = false): Promise<void> {
-  logger.info(`Building ${imageName} container image...`);
+async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false): Promise<void> {
+  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache);
+}
+
+/**
+ * Build the project's resolved image (custom Dockerfile or the embedded
+ * default) and write it under the given tags.
+ *
+ * Split out of `buildImage` so a caller can build the SAME image content under
+ * a tag that is not the canonical one — `lazy upgrade` builds to a staging tag
+ * while the human is still deciding, and only moves the canonical tag once they
+ * have said go (see src/upgrade/background-image-build.ts).
+ */
+async function buildImageWithTags(
+  lazyRoot: string,
+  tags: string[],
+  currentHash: string,
+  binary: string = 'docker',
+  noCache: boolean = false,
+  signal?: AbortSignal,
+): Promise<void> {
+  logger.info(`Building ${tags[0]} container image...`);
 
   const customPath = await resolveCustomDockerfile(lazyRoot);
 
@@ -263,7 +405,65 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
     logger.debug('Using embedded default Dockerfile');
   }
 
-  await runDockerBuild(buildCwd, dockerfileName, imageName, currentHash, binary, noCache);
+  await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal);
+}
+
+/**
+ * The canonical tags a build of THIS project's image writes — the version tag,
+ * plus the `:latest` alias for the base runner repository.
+ *
+ * `lazy upgrade` needs these separately from the build itself: it builds to a
+ * staging tag first and promotes onto exactly these refs afterwards, so a
+ * cancelled upgrade leaves every canonical tag pointing where it did before.
+ */
+export async function resolveImageBuildTags(lazyRoot: string): Promise<string[]> {
+  const { repository } = await resolveImageRepository(lazyRoot);
+  return buildTagsFor(repository);
+}
+
+/**
+ * Build the project's image under a caller-chosen TAG of its own repository
+ * (e.g. `lazy-runner:0.21-upgrade`), leaving the canonical tags untouched.
+ *
+ * Always builds — no hash short-circuit — because the only caller is an
+ * explicit force-rebuild. Returns the full ref that was written.
+ */
+export async function buildProjectImageToTag(
+  lazyRoot: string,
+  tag: string,
+  options: { binary?: string; noCache?: boolean; signal?: AbortSignal } = {},
+): Promise<string> {
+  const binary = options.binary ?? 'docker';
+  await checkDocker(binary);
+
+  const { repository } = await resolveImageRepository(lazyRoot);
+  const ref = `${repository}:${tag}`;
+  const currentHash = await calculateDockerfileHash(lazyRoot);
+  await buildImageWithTags(lazyRoot, [ref], currentHash, binary, options.noCache ?? false, options.signal);
+  return ref;
+}
+
+/** Point additional refs at an existing image. Fails hard — no silent skip. */
+export async function tagImage(sourceRef: string, targetRefs: string[], binary: string = 'docker'): Promise<void> {
+  for (const target of targetRefs) {
+    if (target === sourceRef) continue;
+    const proc = spawn([binary, 'tag', sourceRef, target], { stdout: 'ignore', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (exitCode !== 0) {
+      throw new Error(`Failed to tag ${sourceRef} as ${target}: ${stderr.trim() || `exit code ${exitCode}`}`);
+    }
+  }
+}
+
+/**
+ * Drop a tag from an image. Best-effort by design: this only ever removes a
+ * staging alias whose layers are also reachable through the canonical tag or
+ * the build cache, so a failure here is cosmetic and must not fail an upgrade
+ * that has otherwise succeeded. Returns whether the tag is gone.
+ */
+export async function removeImageTag(ref: string, binary: string = 'docker'): Promise<boolean> {
+  const proc = spawn([binary, 'rmi', ref], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
+  return (await proc.exited) === 0;
 }
 
 /**
@@ -274,21 +474,24 @@ async function buildImage(lazyRoot: string, imageName: string, currentHash: stri
  *
  * Unlike `ensureImage`, this always builds — it does not check whether the
  * image already exists or whether the Dockerfile hash has changed.
+ *
+ * Returns every tag written: the version tag first, then the `:latest` alias.
  */
-export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean } = {}): Promise<string> {
+export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean } = {}): Promise<string[]> {
   const binary = options.binary ?? 'docker';
   const noCache = options.noCache ?? false;
 
   await checkDocker(binary);
 
-  logger.info(`Building ${IMAGE_NAME} container image...`);
+  const tags = buildTagsFor(IMAGE_NAME);
+  logger.info(`Building ${tags[0]} container image...`);
   logger.debug('Using embedded default Dockerfile');
 
   const hash = createHash('sha256').update(DEFAULT_DOCKERFILE).digest('hex');
   const { buildCwd, dockerfilePath } = await writeDockerfileToTempDir(DEFAULT_DOCKERFILE);
-  await runDockerBuild(buildCwd, dockerfilePath, IMAGE_NAME, hash, binary, noCache);
+  await runDockerBuild(buildCwd, dockerfilePath, tags, hash, binary, noCache);
 
-  return IMAGE_NAME;
+  return tags;
 }
 
 /**
@@ -303,22 +506,49 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
   await checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
-  const imageName = await resolveImageName(lazyRoot);
+  const { repository } = await resolveImageRepository(lazyRoot);
+  const imageName = `${repository}:${IMAGE_TAG}`;
   const currentHash = await calculateDockerfileHash(lazyRoot);
   const imageHash = await getImageDockerfileHash(imageName, binary);
-  const noCache = options?.noCache ?? false;
+  let noCache = options?.noCache ?? false;
 
   if (imageHash === currentHash) {
-    logger.debug('Container image is up to date ✓');
-    return imageName;
+    // The Dockerfile text matches — but its text is not what goes stale. What
+    // it PULLS is unpinned (apt packages, the Claude Code installer, the base
+    // image, and whatever else a project's own Dockerfile fetches), and that
+    // drifts with wall-clock time, so an old-enough image is rebuilt regardless.
+    const { tooOld, ageDays } = await isImageTooOld(imageName, binary);
+    if (!tooOld) {
+      logger.debug('Container image is up to date ✓');
+      return imageName;
+    }
+    // --no-cache is not optional on this path: with the Dockerfile text
+    // unchanged, every layer is a cache hit, so a cached build would re-fetch
+    // nothing AND return the identical image — leaving the created timestamp
+    // untouched and re-triggering this same rebuild on every launch forever.
+    noCache = true;
+    logger.info(
+      `Container image ${imageName} is ${ageDays} days old (older than ${IMAGE_MAX_AGE_DAYS} days) — ` +
+      `rebuilding it so the agent gets a current Claude Code (this can take several minutes).`
+    );
+  } else if (imageHash === null) {
+    // Image missing. Say WHY in one line: on a host that upgraded lazy this is
+    // the first sign that a multi-minute build is happening, and "not found"
+    // alone reads like something is broken when in fact an older image is
+    // sitting right there as build cache.
+    const older = (await listLazyImages(binary))
+      .filter(image => image.repository === repository && image.tag !== IMAGE_TAG && image.tag !== LATEST_ALIAS_TAG)
+      .map(image => image.tag);
+    const olderNote = older.length > 0
+      ? ` Older image(s) for ${repository} (${older.join(', ')}) are kept as build cache — run \`lazy doctor\` for details.`
+      : '';
+    logger.info(`Container image ${imageName} not found — building it for lazy ${VERSION} (this can take several minutes).${olderNote}`);
+  } else {
+    logger.info(`Dockerfile has changed, rebuilding ${imageName}...`);
   }
 
-  // Image needs building (missing or outdated)
-  const buildReason = imageHash === null ? 'Container image not found.' : 'Dockerfile has changed, rebuilding image...';
-  logger.info(buildReason);
-
   try {
-    await buildImage(lazyRoot, imageName, currentHash, binary, noCache);
+    await buildImage(lazyRoot, repository, currentHash, binary, noCache);
     return imageName;
   } catch (buildErr) {
     // If not offline, just propagate the build error
@@ -332,7 +562,7 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
 
     // If the target image exists (just outdated), use it as-is
     if (imageHash !== null) {
-      logger.warn(`Using existing image "${imageName}" (Dockerfile hash differs — image may be outdated).`);
+      logger.warn(`Using existing image "${imageName}" (a rebuild was wanted — image may be outdated).`);
       return imageName;
     }
 
@@ -422,9 +652,31 @@ export async function extractEmbeddedAgentBinary(
     return null;
   }
 
-  // In dev mode, the import resolves to a tiny placeholder file.
-  // Only proceed if the embedded file is a real binary (> MIN_AGENT_BINARY_SIZE).
-  if (embedded.length < MIN_AGENT_BINARY_SIZE) {
+  // Verify the bytes are actually the compiled agent before they become the
+  // file every container bind-mounts.
+  //
+  // A size floor alone is not enough: in DEV mode this import resolves to the
+  // repo's own ./lazy-agent, which is a 12-byte placeholder after `bun install`
+  // but can also be a bare Bun runtime or a stale build left by an interrupted
+  // `bun run build`. Any such file over 1KB used to be copied to
+  // ~/.lazy/bin/lazy-agent and mounted into every container — the exact failure
+  // reported in the field ('Script not found "builder"' / an empty selfcheck).
+  const verdict = verifyAgentBinaryBytes(embedded);
+  if (!verdict.ok) {
+    if (embedded.length < MIN_AGENT_BINARY_SIZE) {
+      // The ordinary dev-mode placeholder. Silent: the caller builds from source.
+      return null;
+    }
+    if (embeddedPath.startsWith('/$bunfs') || embeddedPath.startsWith('$bunfs')) {
+      // Compiled mode: the binary embedded at build time is wrong. Nothing
+      // downstream can recover from this, so fail loud rather than mount it.
+      throw new Error(formatAgentBinaryError(embeddedPath, verdict.reason, { canRebuild: false }));
+    }
+    // Dev mode with a real-looking but wrong ./lazy-agent. Say so, then let the
+    // caller rebuild from source rather than installing this file.
+    logger.warn(
+      `Ignoring ${embeddedPath}: ${verdict.reason}. Rebuilding the agent binary from source.`,
+    );
     return null;
   }
 
@@ -509,6 +761,13 @@ export async function ensureAgentBinary(): Promise<string> {
   if (!sourceRoot) {
     // No source available and no embedded binary found
     if (existsSync(binaryPath)) {
+      // Verify rather than trust. This path returns a file nobody in this
+      // process produced — whatever a previous install, a partial upgrade or a
+      // stray copy left behind — straight into a container bind mount.
+      const cached = await verifyAgentBinary(binaryPath);
+      if (!cached.ok) {
+        throw new Error(formatAgentBinaryError(binaryPath, cached.reason, { canRebuild: false }));
+      }
       logger.debug('Using cached agent binary (source not available for rebuild)');
       return binaryPath;
     }
@@ -528,8 +787,16 @@ export async function ensureAgentBinary(): Promise<string> {
   if (existsSync(binaryPath) && existsSync(hashFile)) {
     const storedHash = readFileSync(hashFile, 'utf-8').trim();
     if (storedHash === currentHash) {
-      logger.debug('Agent binary is up to date');
-      return binaryPath;
+      // The hash says the SOURCE has not changed; it says nothing about whether
+      // the file on disk is still the binary that hash was recorded for.
+      const cached = await verifyAgentBinary(binaryPath);
+      if (cached.ok) {
+        logger.debug('Agent binary is up to date');
+        return binaryPath;
+      }
+      logger.warn(
+        `Cached agent binary at ${binaryPath} failed verification (${cached.reason}). Rebuilding.`,
+      );
     }
   }
 
@@ -543,9 +810,19 @@ export async function ensureAgentBinary(): Promise<string> {
   // get the new binary. No window where the file is missing.
   const tmpPath = join(binDir, `.tmp-lazy-agent-${randomUUID()}`);
 
+  // Build with cwd set to the OUTPUT directory, not the source root.
+  //
+  // `bun build --compile` writes a `.<hash>.bun-build` temp file in its cwd and
+  // renames it onto --outfile. That rename fails across filesystems (ENOENT),
+  // and bun leaves the ~190MB temp file behind in the cwd — so building from the
+  // source root both fails and litters the repo whenever ~/.lazy sits on another
+  // volume (a bind-mounted worktree, a separate $HOME volume). Same-directory
+  // cwd + outfile makes the rename intra-filesystem. scripts/build.ts works
+  // around the same bug the same way. Module resolution is unaffected: the entry
+  // point is absolute and bun resolves from the entry file, not from cwd.
   const proc = spawn(
     ['bun', 'build', '--compile', `--target=${target}`, entryPoint, '--outfile', tmpPath],
-    { cwd: sourceRoot, stdout: 'pipe', stderr: 'pipe' }
+    { cwd: binDir, stdout: 'pipe', stderr: 'pipe' }
   );
 
   const outputPromise = new Response(proc.stdout).text();
@@ -574,6 +851,22 @@ export async function ensureAgentBinary(): Promise<string> {
     const lastOutput = stderrLines.slice(-10).join('\n');
     logger.error(`Agent binary build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
     throw new Error(`Agent binary build failed with exit code ${exitCode}`);
+  }
+
+  // Verify BEFORE the rename. `bun build --compile` writes the target runtime
+  // first and appends the bundle last, so an interrupted or partial compile can
+  // leave an output that is a plain Bun runtime — and Bun does not always report
+  // that with a non-zero exit. Renaming it into place would replace a working
+  // binary with one that answers every subcommand `Script not found "<sub>"`.
+  const built = await verifyAgentBinary(tmpPath);
+  if (!built.ok) {
+    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+    throw new Error(
+      `Agent binary build produced an invalid binary (${built.reason}). ` +
+      `The previous binary at ${binaryPath} was left untouched. ` +
+      `Re-run the build; if it keeps happening, clear Bun's cross-compile cache ` +
+      `(~/.bun/install/cache) and rebuild.`,
+    );
   }
 
   // Atomically replace the existing binary
@@ -729,7 +1022,7 @@ export async function runClaude(
   );
 
   if (debug) {
-    console.log('[DEBUG] Running container command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', redactSecrets(args).join(' '));
   }
 
   logger.info('Running Claude Code...');
@@ -781,19 +1074,59 @@ export async function runClaude(
  * caller of this function is housekeeping by construction, so marking here means
  * no caller can forget.
  */
-export async function runClaudeOneshot(
+export interface OneshotOptions {
+  /**
+   * Block the write tools for this run (`lazy ask <conversation>`): the agent
+   * may Read/Grep while forming its answer but cannot touch the repo.
+   */
+  readOnly?: boolean;
+}
+
+/**
+ * Write tools blocked by `readOnly`. Mirrors DISALLOWED_TOOLS_IN_PLAN_MODE in
+ * src/agent/claude-code.ts and DISALLOWED_TOOLS in src/cli/commands/chat.ts —
+ * the same three tools, kept spelled out here so this module stays free of the
+ * agent/runner graph.
+ */
+const ONESHOT_READ_ONLY_DISALLOWED_TOOLS = 'Bash Write Edit';
+
+/**
+ * Compose the argv for a one-shot run. Pure, so the execution-path contract is
+ * assertable without spawning: a one-shot is always `claude -p <marked prompt>`,
+ * and it NEVER carries `--resume`/`--continue`. Those two flags are what would
+ * make housekeeping run inside somebody's existing session instead of its own.
+ */
+export function buildOneshotArgs(
   prompt: string,
   model?: string,
-): Promise<AgentResponse> {
-  // Validate auth up front so the failure mode is a clean error, not a cryptic
-  // Claude CLI exit. Throws if no token / API key is available.
-  _agent.getAuthEnvVars();
-
+  opts: OneshotOptions = {},
+): string[] {
   const marked = markMachineOneshotPrompt(prompt);
   const args = ['claude', '-p', safeArgvPrompt(marked, 'prompt'), '--output-format', 'json'];
   if (model) {
     args.push('--model', model);
   }
+  if (opts.readOnly) {
+    // Same lockdown the supervisor's ask turns use, and for the same reason:
+    // `--permission-mode plan` triggers an interactive ExitPlanMode prompt that
+    // `claude -p` has no human to answer, so writes are blocked with
+    // --disallowedTools instead. Read-only tools stay available so the answer
+    // can be checked against the code.
+    args.push('--disallowedTools', ONESHOT_READ_ONLY_DISALLOWED_TOOLS);
+  }
+  return args;
+}
+
+export async function runClaudeOneshot(
+  prompt: string,
+  model?: string,
+  opts: OneshotOptions = {},
+): Promise<AgentResponse> {
+  // Validate auth up front so the failure mode is a clean error, not a cryptic
+  // Claude CLI exit. Throws if no token / API key is available.
+  _agent.getAuthEnvVars();
+
+  const args = buildOneshotArgs(prompt, model, opts);
   // No progress log here — callers fire N+ of these and own the messaging
   // (see e.g. `lazy report`'s map-reduce, which logs per-unit progress).
 
@@ -821,12 +1154,12 @@ export async function runClaudeOneshot(
  * Extract TokenUsage from an AgentResponse
  */
 export function extractTokenUsage(response: AgentResponse): TokenUsage {
-  return {
-    inputTokens: response.usage.input_tokens ?? 0,
-    outputTokens: response.usage.output_tokens ?? 0,
-    cacheCreationTokens: response.usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-  };
+  // A backend that reports no usage at all is a real possibility (the agent
+  // interface does not require one), and this used to dereference
+  // `response.usage.*` straight through — a TypeError that took the whole ask
+  // down over bookkeeping. Validate, warn, and report zeros instead.
+  return toTurnUsage(response.usage, 'token usage')
+    ?? { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
 }
 
 /**
@@ -1179,7 +1512,7 @@ export async function launchSupervisorAsync(
   });
 
   if (debug) {
-    console.log('[DEBUG] Running container command:', args.join(' '));
+    console.log('[DEBUG] Running container command:', redactSecrets(args).join(' '));
   }
 
   logger.info('Launching supervisor container...');

@@ -1,6 +1,7 @@
 import { isAbsolute, resolve, relative } from 'path';
 import type { MountConfigEntry } from '../config/types';
 import { getDaemonBaseDir } from '../daemon/paths';
+import { getScratchBaseDir } from '../builder/scratch';
 
 /**
  * Custom mounts ([[mounts]]) injected into task agent containers.
@@ -87,6 +88,44 @@ function assertSourceOutsideDaemonState(source: string, where: string): void {
 }
 
 /**
+ * INVARIANT: no task agent container may see the builder scratch dir
+ * (`~/.lazy/scratch/`, or wherever `LAZY_SCRATCH_BASE_DIR` points).
+ *
+ * The scratch dir is the builder's writable exchange area with the HUMAN, and
+ * deliberately NOT a channel to agents (see src/builder/scratch.ts): if the
+ * builder had a writable place agents could read, it would start writing code
+ * there and telling agents to copy it in, dissolving the builder/agent
+ * separation. Lazy's own agent launch paths never mount it (asserted by
+ * test/unit/builder-scratch-mount.test.ts); `[[mounts]]` is the one remaining
+ * way it could reach an agent container, so it is refused here too.
+ *
+ * The BASE dir is the boundary, not this project's subdir — another project's
+ * scratch is someone else's builder/agent boundary, which is no better. Derived
+ * from src/builder/scratch.ts, never hardcoded, so it follows the env override.
+ */
+function assertSourceOutsideBuilderScratch(source: string, where: string): void {
+  const scratchBaseDir = getScratchBaseDir();
+  const why =
+    `That directory is the builder's scratchpad for exchanging documents with you, and is ` +
+    `deliberately not readable by agents — a builder that can hand code to an agent through a ` +
+    `shared directory stops delegating and starts implementing. Mount a specific directory ` +
+    `that does not contain it.`;
+
+  if (isWithin(scratchBaseDir, source)) {
+    throw new Error(
+      `${where}: refusing source "${source}" — it is inside lazy's builder scratch directory ` +
+      `(${scratchBaseDir}). ${why}`,
+    );
+  }
+  if (isWithin(source, scratchBaseDir)) {
+    throw new Error(
+      `${where}: refusing source "${source}" — it CONTAINS lazy's builder scratch directory ` +
+      `(${scratchBaseDir}), so the agent container would see it. ${why}`,
+    );
+  }
+}
+
+/**
  * Validate a single [[mounts]] entry's structure. Throws an actionable error
  * naming the offending entry on any problem. Does NOT expand placeholders —
  * structural validation runs at config-load time, before paths are known.
@@ -129,13 +168,14 @@ export function validateMount(entry: MountConfigEntry, index: number): void {
         `Remove "name" or set type = "volume".`,
       );
     }
-    // A daemon-state mount is refused at LOAD time when the source is already a
-    // plain absolute path — the user hears about it from any lazy command, not
-    // only at launch. Placeholder and relative sources are only knowable once
-    // the worktree/repo paths exist; buildMountArgs checks those (and re-checks
-    // these) after expansion.
+    // A daemon-state or builder-scratch mount is refused at LOAD time when the
+    // source is already a plain absolute path — the user hears about it from any
+    // lazy command, not only at launch. Placeholder and relative sources are only
+    // knowable once the worktree/repo paths exist; buildMountArgs checks those
+    // (and re-checks these) after expansion.
     if (isAbsolute(entry.source as string) && !(entry.source as string).includes('{')) {
       assertSourceOutsideDaemonState(entry.source as string, where);
+      assertSourceOutsideBuilderScratch(entry.source as string, where);
     }
   } else {
     // type === 'volume'
@@ -202,6 +242,7 @@ export function buildMountArgs(mounts: MountConfigEntry[], paths: MountPaths): s
       // that lands in the daemon dir is caught here even though load-time
       // validation could not see it.
       assertSourceOutsideDaemonState(source, entryLabel(index));
+      assertSourceOutsideBuilderScratch(source, entryLabel(index));
       args.push('-v', `${source}:${target}${ro}`);
     }
   });

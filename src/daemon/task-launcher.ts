@@ -31,7 +31,7 @@ import { stampSessionRunner } from '../runner/session-launch';
 import { createDriver } from '../remote';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
-import { mintMcpToken, type McpIdentity } from './mcp-tokens';
+import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-tokens';
 import { getMcpConfigDir } from './paths';
 import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
@@ -182,14 +182,26 @@ async function buildLinkedTaskPreamble(worktreePath: string, branchName: string,
  * daemon derives the caller's identity from it and refuses a request whose
  * claimed `:taskId` disagrees, so a stolen or copied config cannot be used to
  * act as another task.
+ *
+ * CONTAINER REUSE: the path is stable per container and this write truncates in
+ * place, so a container that ALREADY has this file bind-mounted (the mount pins
+ * the inode) picks the new contents up without a relaunch — which is what lets
+ * the reuse branches in task-lifecycle.ts skip re-mounting. The one thing that
+ * cannot be repaired that way is a container whose FIRST launch received no
+ * config: LAZY_DAEMON_CONFIG comes from the launch argv, so it stays unset for
+ * that container's entire life and every turn in it would have no lazy_* tools.
+ * That failure used to be swallowed (one warn line in a container log, days to
+ * diagnose); prepareTurnMcp now fails the turn instead, so the condition is
+ * self-reporting and the next relaunch supplies the config.
  */
 export async function writeDaemonMcpConfig(
   projectRoot: string,
   containerName: string,
   identity: McpIdentity,
+  options: MintMcpTokenOptions = {},
 ): Promise<string> {
   const { webPort } = getDaemonContext();
-  const token = await mintMcpToken(projectRoot, identity, containerName);
+  const token = await mintMcpToken(projectRoot, identity, containerName, options);
 
   const configDir = daemonMcpConfigDir(projectRoot);
   await mkdir(configDir, { recursive: true });
@@ -247,9 +259,10 @@ export interface McpConfigRefreshResult {
  * container (`-v <path>:<path>:ro`). If the daemon later restarts onto a
  * different port — which happens whenever another project's daemon has taken
  * the port in the shared 26024+ window — every running container keeps calling
- * the old port, where a FOREIGN daemon answers and rejects our token with a
- * permanent 401 on every tool, read-only ones included. The token is right; the
- * daemon is wrong, so only the ADDRESS needs correcting.
+ * the old port. If a FOREIGN daemon has taken it, it answers and rejects our
+ * token with a permanent 401 on every tool, read-only ones included; if nothing
+ * has, the calls fail at the transport layer with ECONNREFUSED. Either way the
+ * token is right and the daemon is wrong, so only the ADDRESS needs correcting.
  *
  * The token is deliberately preserved, never rewritten: it is bound to one
  * identity in the token registry (src/daemon/mcp-tokens.ts), which survives
@@ -258,8 +271,9 @@ export interface McpConfigRefreshResult {
  *
  * A single-file bind mount pins the inode, so rewriting the file IN PLACE
  * (open + truncate, never rename) is visible inside the running container. The
- * container-side proxy re-reads it on 401 and retries once, so a live session
- * heals itself instead of losing every lazy tool until relaunch.
+ * container-side proxy re-reads it whenever a call fails to reach the daemon —
+ * on a 401 and on a connection that never established — and retries once, so a
+ * live session heals itself instead of losing every lazy tool until relaunch.
  *
  * Never fails the caller: a daemon must start even if this housekeeping can't.
  */
@@ -313,10 +327,30 @@ export async function refreshDaemonMcpConfigs(
   if (result.updated > 0) {
     log.info(
       `Refreshed ${result.updated} daemon MCP config${result.updated === 1 ? '' : 's'} ` +
-      `to ${target} — running containers pick this up on their next 401`,
+      `to ${target} — running containers pick this up on their next failed tool call`,
     );
   }
   return result;
+}
+
+/**
+ * Failure message for a top-level task whose stored branch target cannot be
+ * resolved (branch deleted, renamed, or never pushed).
+ *
+ * Silently falling back to the repo default here would discard the user's
+ * explicit `--parent` choice and base the task on the wrong branch — the exact
+ * silent-wrongness this message exists to prevent. Name the branch and give the
+ * two real ways out.
+ */
+function unresolvableTargetMessage(branch: string, task: Task, detail?: string): string {
+  const cause = detail ? `: ${detail}` : '';
+  return (
+    `Failed to resolve target branch '${branch}' for task ${displayId(task)}${cause}. ` +
+    `This task was created with --parent ${branch}, so lazy will not silently start it ` +
+    `from the repository default instead. Either make '${branch}' resolvable ` +
+    `(fetch/restore it, or pass --force-local to start from its local ref), ` +
+    `or retarget the task with: lazy reparent ${displayId(task)} <parent>`
+  );
 }
 
 // --- Pre-flight validation ---
@@ -537,6 +571,13 @@ export async function launchTask(
 
   // --- Determine parent branch and start SHA ---
   const tParentId = parentTaskIdOf(t);
+  // Explicit branch target stored at create time (`lazy create --parent release-x`).
+  // '' and a stale 'lazy/…' ref are "needs runtime resolution" sentinels, not real
+  // targets (see src/task-target.ts) — treat both as absent.
+  const storedRawTarget = t.target.kind === 'branch' ? t.target.branch : '';
+  const storedBranchTarget = storedRawTarget && !storedRawTarget.startsWith('lazy/')
+    ? storedRawTarget
+    : undefined;
   let startSha: string;
   let parentBranch: string | null = null;
 
@@ -572,12 +613,31 @@ export async function launchTask(
     await storage.updateTaskBranchedFromSha(t.id, startSha);
     t.branched_from_sha = startSha;
   } else {
-    // Top-level task with no stored target. Default to the repo's configured
-    // integration branch (origin/HEAD → main fallback), NOT the user's currently
-    // checked-out branch. Adopting whatever the user happens to be on at start
-    // time produced bad PRs targeting dead release branches. Explicit override:
-    // pass --parent at create-time (or use lazy reparent post-creation).
-    parentBranch = await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+    // Top-level task. An explicitly stored branch target (`lazy create --parent
+    // release-x`) is the user's instruction and MUST be honoured — branching from
+    // the repo default instead would silently discard it (principle of least
+    // surprise). Only with no stored target do we default to the repo's
+    // configured integration branch (origin/HEAD → main fallback), NOT the user's
+    // currently checked-out branch: adopting whatever the user happens to be on
+    // at start time produced bad PRs targeting dead release branches.
+    parentBranch = storedBranchTarget
+      ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+
+    // With a stored target, --force-local means "the branch's LOCAL ref" — never
+    // the repo's current HEAD, which is a different branch and would resurrect
+    // the silent-discard bug through the fallback path. If that local ref does
+    // not resolve either, fail loudly with the branch named.
+    const localStartSha = async (): Promise<string> => {
+      if (!storedBranchTarget) return await getCurrentSha(projectRoot);
+      const local = await runGit(
+        ['rev-parse', '--verify', '--quiet', `${storedBranchTarget}^{commit}`],
+        { cwd: projectRoot },
+      );
+      if (local.exitCode !== 0) {
+        throw new RpcError(500, unresolvableTargetMessage(storedBranchTarget, t));
+      }
+      return local.stdout;
+    };
 
     try {
       const parentRef = await driver.resolveUpstreamRef(parentBranch, projectRoot);
@@ -585,18 +645,63 @@ export async function launchTask(
       if (resolveResult.exitCode === 0) {
         startSha = resolveResult.stdout;
       } else if (params.forceLocal) {
-        warnings.push('Using local HEAD (remote ref resolution failed)');
-        startSha = await getCurrentSha(projectRoot);
+        warnings.push(storedBranchTarget
+          ? `Using local ${storedBranchTarget} (remote ref resolution failed)`
+          : 'Using local HEAD (remote ref resolution failed)');
+        startSha = await localStartSha();
+      } else if (storedBranchTarget) {
+        throw new RpcError(500, unresolvableTargetMessage(storedBranchTarget, t));
       } else {
         throw new RpcError(500, `Failed to resolve upstream ref. Use --force-local to start from local HEAD.`);
       }
     } catch (err) {
       if (err instanceof RpcError) throw err;
       if (params.forceLocal) {
-        warnings.push(`Failed to fetch ${parentBranch} (using local HEAD): ${err instanceof Error ? err.message : err}`);
-        startSha = await getCurrentSha(projectRoot);
+        warnings.push(`Failed to fetch ${parentBranch} (using local ref): ${err instanceof Error ? err.message : err}`);
+        startSha = await localStartSha();
+      } else if (storedBranchTarget) {
+        throw new RpcError(500, unresolvableTargetMessage(
+          storedBranchTarget,
+          t,
+          err instanceof Error ? err.message : String(err),
+        ));
       } else {
         throw new RpcError(500, `Failed to fetch ${parentBranch}: ${err instanceof Error ? err.message : err}. Use --force-local to start from local HEAD.`);
+      }
+    }
+  }
+
+  // --- Git LFS environment preflight ---
+  // INVARIANT: never launch an agent into an environment where a commit would
+  // silently store raw file content on an LFS-tracked path. Git only errors on
+  // a broken LFS filter when `filter.lfs.required` is true; with it false the
+  // clean filter is skipped and `git add` exits 0 having committed the whole
+  // file (see src/git/lfs.ts for the incident this comes from).
+  //
+  // Runs BEFORE the worktree is created so a refusal leaves nothing behind, and
+  // against `projectRoot` at `startSha` — worktrees share the repository's git
+  // config, and `lazy_commit` stages host-side in the task worktree, so this is
+  // the config that will decide what lands. `git-lfs` is never required to
+  // ANSWER the question; only to pass it.
+  //
+  // The message is deliberately one line plus a doctor referral: `lazy doctor`
+  // is the single diagnosis surface and carries the full remedy.
+  if (config.git.lfs_check !== 'off') {
+    const { inspectLfsEnvironment } = await import('../git/lfs');
+    const lfs = await inspectLfsEnvironment(projectRoot, startSha);
+    if (lfs.problems.length > 0) {
+      const summary =
+        `This repository uses git LFS, but ${lfs.problems.map((p) => p.message).join('; and ')}. ` +
+        `Commits made here would silently store raw file content instead of LFS pointers, ` +
+        `producing a branch that cannot be pushed.`;
+      if (config.git.lfs_check === 'warn') {
+        warnings.push(`${summary} Run \`lazy doctor\` for details.`);
+      } else {
+        throw new RpcError(
+          400,
+          `Refusing to start task ${displayId(t)}: ${summary}\n\n` +
+          `Run \`lazy doctor\` for details.`,
+        );
       }
     }
   }
@@ -683,15 +788,27 @@ export async function launchTask(
     const existingComments = await storage.getTaskComments(t.id);
     const notesCtx = existingComments.length > 0 ? buildNotesContext(existingComments) : undefined;
 
-    let turnPrompt = t.prompt;
+    // Re-read the task immediately before composing turn 1. `t` was captured by
+    // validateTask() at the top of launchTask, and everything since — runner
+    // pre-flight, image build, worktree creation, branch publish — can take many
+    // seconds. A `lazy edit --prompt` accepted during that window is durably
+    // stored (edits are allowed until the task has turns), so launching from the
+    // stale snapshot would hand the agent a prompt the human already replaced.
+    // INVARIANT (CLAUDE.md, "Never Lose Human Feedback"): the task prompt is
+    // human input — the agent must receive the LATEST accepted version.
+    const fresh = await storage.getTask(t.id);
+    const taskPrompt = fresh?.prompt ?? t.prompt;
+    const taskGoal = fresh?.goal ?? t.goal;
+
+    let turnPrompt = taskPrompt;
     if (isLinkedTask) {
       const linkedParentBranch = t.metadata?.parent_branch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
       const preamble = await buildLinkedTaskPreamble(worktreePath, branchName, linkedParentBranch);
-      turnPrompt = preamble + '\n---\n\n' + t.prompt;
+      turnPrompt = preamble + '\n---\n\n' + taskPrompt;
     }
 
     const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }));
-    const fullPrompt = buildPromptWithInstructions(turnPrompt, t.goal, true, projectRoot, notesCtx);
+    const fullPrompt = buildPromptWithInstructions(turnPrompt, taskGoal, true, projectRoot, notesCtx);
 
     // --- Persist state BEFORE launch (crash-safe) ---
     let sess;
@@ -712,6 +829,7 @@ export async function launchTask(
       role: 'human',
       content: turnPrompt,
       model: modelName,
+      effort: effortValue,
       prompt: fullPrompt,
       // Channel actor: MCP-originated starts are 'builder', CLI 'human'.
       // Falls back to getActor() for CLI (env-var / 'human').
@@ -737,7 +855,9 @@ export async function launchTask(
       // task's target is its parent (kind: 'task') and must not be clobbered —
       // its mergeTarget here is the parent's lazy/ branch, used only to base the
       // published branch, never as the canonical integration target.
-      if (!tParentId) {
+      // A stored branch target is the user's explicit `--parent` choice: write
+      // only when the slot is empty (or holds a sentinel), never overwrite.
+      if (!tParentId && !storedBranchTarget) {
         await storage.updateTaskTarget(t.id, branchTarget(mergeTarget));
       }
 

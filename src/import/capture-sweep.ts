@@ -49,7 +49,7 @@ import {
   type ReimportOptions,
 } from './reimport-conversations';
 import { parseConversation, extractSummary, conversationStats } from './claude-code-logs';
-import { toStoredConversation } from './conversation-storage';
+import { toStoredConversation, saveConversationWithoutRegression } from './conversation-storage';
 import type { Storage } from '../storage/interface';
 
 /** Size/mtime of a session file the last time the sweep looked at it. */
@@ -77,6 +77,12 @@ export interface SweepResult {
   /** Sessions skipped because the JSONL held no parseable messages yet. */
   skippedEmpty: string[];
   /**
+   * Sessions whose on-disk copy was a strict PREFIX of what is already stored —
+   * an older snapshot of the same session (a stale copy in another projects dir).
+   * Refused rather than written, so capture can never shorten a conversation.
+   */
+  skippedRegressions: string[];
+  /**
    * Machine-generated lazy one-shots skipped by design (fidelity summaries,
    * `lazy report`, LLM memory compaction). Counted so the daemon can say what it
    * ignored instead of pretending it never saw them.
@@ -102,6 +108,7 @@ export async function sweepConversations(
     scanned: candidates.length,
     captured: [],
     skippedEmpty: [],
+    skippedRegressions: [],
     skippedMachineOneshots: machineOneshots.length,
     errors: [],
   };
@@ -134,10 +141,21 @@ export async function sweepConversations(
 
       const summary = extractSummary(conversation);
       const stats = conversationStats(conversation);
-      await storage.saveConversation(toStoredConversation(conversation, summary, stats));
+      // The sweep runs INSIDE the daemon, so it does not pass through the RPC
+      // storage handler that enforces the no-regression rule — apply it directly.
+      // This is the exact path that overwrote a 3555-message conversation with a
+      // 2989-message prefix: a stale copy's mtime was bumped by nothing more than
+      // being mounted, the cursor saw "changed", and the re-parse blind-wrote it.
+      const outcome = await saveConversationWithoutRegression(
+        storage,
+        toStoredConversation(conversation, summary, stats),
+      );
 
+      // Record the stat either way: a refused prefix is not a failure to retry, and
+      // re-parsing it on every tick would burn CPU to reach the same verdict.
       cursor.set(c.sessionId, stat);
-      result.captured.push(c.sessionId);
+      if (outcome === 'saved') result.captured.push(c.sessionId);
+      else result.skippedRegressions.push(c.sessionId);
     } catch (err) {
       // Leave the cursor unset for this session so a transient failure is
       // retried on the next tick rather than silently marked as handled.

@@ -5,4 +5,4 @@ You **cannot and must not**:
 - Use `Bash`, `Write`, or `Edit` — those are disallowed in this mode and will fail.
 - Try to "finalize" or "wrap up" with any tool — the answer IS the message you write.
 
-You CAN use read-only tools (`Read`, `Grep`, `LS`, `lazy_search`, `lazy_show`, `lazy_diff`, `lazy_status`, `lazy_list`, `lazy_blocked`, `lazy_active`, `lazy_conversations`, `lazy_conversation_search`, `lazy_conversation_read`) to look up code or task history while forming your answer. But the answer goes in your final text reply, nothing else.
+You CAN use read-only tools (`Read`, `Grep`, `LS`, `lazy_search`, `lazy_show`, `lazy_diff`, `lazy_status`, `lazy_list`, `lazy_blocked`, `lazy_active`, `lazy_conversations`, `lazy_conversation_search`, `lazy_conversation_read`, `lazy_memory_recall`) to look up code or task history while forming your answer. But the answer goes in your final text reply, nothing else.

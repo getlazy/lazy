@@ -72,4 +72,46 @@ describe('lazy wait', () => {
     expectFailure(result);
     expectError(result, '--follow is only supported when waiting for a single task');
   });
+
+  // --follow streams raw container output, which would corrupt a JSON document.
+  test('rejects --follow with --json', async () => {
+    const taskId = await createTask(ctx, 'Task one');
+    const result = await ctx.lazy(['wait', taskId, '--follow', '--json']);
+    expectFailure(result);
+    expectError(result, 'cannot be combined with --json');
+  });
+
+  test('accepts multiple task IDs and announces the race', async () => {
+    const taskId1 = await createTask(ctx, 'Task one');
+    const taskId2 = await createTask(ctx, 'Task two');
+    const result = await ctx.lazy(['wait', taskId1, taskId2]);
+    // Neither task was started, so the race reports the missing session rather
+    // than blocking — but the arguments parsed and both were resolved.
+    expectFailure(result);
+    expectOutput(result, 'Waiting for the first of 2 tasks to finish');
+    expectError(result, 'has no session');
+  });
+
+  // INVARIANT: one bad reference fails the WHOLE call, naming it. Silently
+  // racing the valid subset would leave the caller waiting on fewer tasks than
+  // it asked for, with no way to tell.
+  test('an unknown task ID in the set fails the whole call and names it', async () => {
+    const taskId = await createTask(ctx, 'Task one');
+    const result = await ctx.lazy(['wait', taskId, 'nosuchtask']);
+    expectFailure(result);
+    expectError(result, 'Task not found: nosuchtask');
+  });
+
+  test('--json reports the error as JSON', async () => {
+    const result = await ctx.lazy(['wait', 'nosuchtask', '--json']);
+    expectFailure(result);
+    expectOutput(result, '"error"');
+    expectOutput(result, 'nosuchtask');
+  });
+
+  test('--next --json emits an empty set when nothing is working', async () => {
+    const result = await ctx.lazy(['wait', '--next', '--json']);
+    expectSuccess(result);
+    expectOutput(result, '"tasks": []');
+  });
 });

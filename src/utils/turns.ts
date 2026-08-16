@@ -13,7 +13,33 @@
  *     (the last agent turn that re-detected violations — the push-back turn).
  */
 
-import type { Turn } from '../types';
+import type { Turn, FileViolation } from '../types';
+
+/**
+ * The launch settings a supervisor response carries, in `CreateTurnOptions`
+ * shape (`model` / `modelId` / `effort`).
+ *
+ * Apply to AGENT turns only — a supervisor-authored announcement (sync merge
+ * note, nudge prompt) ran no model, so stamping one there would claim a model
+ * produced text it never saw.
+ *
+ * Every field is omitted when the response didn't carry it. That is what keeps
+ * an older supervisor (built before these fields existed) honest: its responses
+ * yield turns with no labels rather than turns labelled with a guess.
+ */
+export function launchSettingsFromResponse(
+  resp: { model?: string; model_id?: string; effort?: string; mcp_tools?: string },
+): { model?: string; modelId?: string; effort?: string; mcpTools?: string } {
+  return {
+    ...(resp.model ? { model: resp.model } : {}),
+    ...(resp.model_id ? { modelId: resp.model_id } : {}),
+    ...(resp.effort ? { effort: resp.effort } : {}),
+    // Not a launch setting in the strict sense — it is an OBSERVATION of what
+    // the agent loaded — but it rides the same per-response path and has the
+    // same "omitted means unrecorded, not zero" rule.
+    ...(resp.mcp_tools ? { mcpTools: resp.mcp_tools } : {}),
+  };
+}
 
 /** A turn whose category advances the task narrative (work, or legacy/missing). */
 function isWorkAgentTurn(turn: Turn): boolean {
@@ -53,6 +79,45 @@ export function latestViolationTurn(turns: Turn[]): Turn | undefined {
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
     if (t.role === 'agent' && t.violations && t.violations.length > 0) return t;
+  }
+  return undefined;
+}
+
+/**
+ * The violations a reviewer still has to decide on: the `pending` entries of
+ * `latestViolationTurn`.
+ *
+ * INVARIANT (violations-come-from-the-violation-turn): every surface that GATES
+ * on "does this task have unresolved violations?" must read them through here,
+ * never through `turns.filter(t => t.role === 'agent').pop()`. A supervised
+ * push-back or maintained-files nudge adds a further agent turn that carries no
+ * violations, so the naive `pop()` lands on the nudge reply, sees none, and lets
+ * the caller through with no decision recorded — after which the daemon (which
+ * DOES use `latestViolationTurn`) finds them and reverts every unapproved file.
+ * That is the silent-revert bug fix-violation-turn-detection fixed: the guard
+ * and the enforcement must look at the same turn.
+ */
+export function pendingViolations(turns: Turn[]): FileViolation[] {
+  const turn = latestViolationTurn(turns);
+  return turn?.violations?.filter(v => v.status === 'pending') ?? [];
+}
+
+/**
+ * The model a launch inherits when the caller gave no explicit override
+ * ("sticky model"): the most recent REQUEST-side turn's model.
+ *
+ * INVARIANT (sticky-model-is-request-side): agent turns are skipped. They carry
+ * a `model` too — that is the whole point of per-turn labelling — but theirs is
+ * a record of what ran, and `model_id` alongside it can be a dated snapshot. If
+ * this scan read agent turns, an alias would harden into whatever concrete
+ * model answered last and every later turn would be pinned to it. Sticky must
+ * propagate the human/builder's REQUEST, so only their turns count.
+ */
+export function findStickyModel(turns: Turn[]): string | undefined {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    if (t.role === 'agent') continue;
+    if (t.model) return t.model;
   }
   return undefined;
 }

@@ -22,6 +22,7 @@
 
 import { spawn } from '../../src/utils/spawn';
 import { resolve } from 'path';
+import { MCP_SERVER_ENV_PINS } from './mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 
@@ -40,7 +41,13 @@ export interface JsonRpcResponse {
 export interface McpMessage {
   method: string;
   id: number;
-  params?: Record<string, unknown>;
+  /**
+   * Request params. A FUNCTION is evaluated just before the message is sent and
+   * receives every response received so far — for calls whose arguments are only
+   * knowable from an earlier reply (the confirm-protocol's per-process
+   * confirmation code, for instance, which a second session would reject).
+   */
+  params?: Record<string, unknown> | ((prior: JsonRpcResponse[]) => Record<string, unknown>);
 }
 
 export interface McpSessionOptions {
@@ -68,7 +75,7 @@ export async function runMcpSession(
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, ...options?.env },
+    env: { ...process.env, ...options?.env, ...MCP_SERVER_ENV_PINS },
   });
 
   const responses: JsonRpcResponse[] = [];
@@ -127,7 +134,8 @@ export async function runMcpSession(
 
   try {
     for (const msg of messages) {
-      stdin.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
+      const params = typeof msg.params === 'function' ? msg.params(responses) : msg.params;
+      stdin.write(JSON.stringify({ jsonrpc: '2.0', ...msg, params }) + '\n');
       stdin.flush();
       await waitFor(msg.id);
     }
