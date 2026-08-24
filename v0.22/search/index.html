@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Searching tasks — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="searching-tasks"><a class="anchor" href="#searching-tasks" aria-hidden="true">#</a>Searching tasks</h1>
+<p><code>lazy search</code> looks across tasks, prompts, turns, commits, notes, follow-ups,
+captured conversations, and shared memory records. The builder and task agents
+reach the same engine through the <code>lazy_search</code> MCP tool — <strong>both surfaces share
+one parser, one evaluator, and one fuzzy content loader</strong>, so a query that works
+in one works in the other, and all three matching modes see the same content.</p>
+<p><code>lazy search --help</code> is the authoritative reference for flags; this page explains
+the query language and the behavior that isn&#39;t obvious from a flag list.</p>
+<h2 id="three-matching-modes"><a class="anchor" href="#three-matching-modes" aria-hidden="true">#</a>Three matching modes</h2>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>When it is used</th>
+<th>What it matches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Structured</strong></td>
+<td>The query contains a boolean operator, a <code>field:</code> term, or a bare <code>#tag</code></td>
+<td>Parsed query, evaluated per field</td>
+</tr>
+<tr>
+<td><strong>Regex</strong></td>
+<td>Plain text with none of the above</td>
+<td>Case-insensitive regex over content</td>
+</tr>
+<tr>
+<td><strong>Fuzzy</strong></td>
+<td><code>--fuzzy</code> / <code>fuzzy=true</code></td>
+<td>Typo-tolerant match; never parses <code>field:</code> syntax</td>
+</tr>
+</tbody></table>
+<p>Mode selection is automatic — there is no flag to force structured search. Note
+that <code>--fuzzy</code> <strong>bypasses</strong> the query language: <code>lazy search &#39;tag:launch&#39; --fuzzy</code>
+looks for the literal text <code>tag:launch</code>, not for tasks tagged <code>launch</code>.</p>
+<h2 id="quote-the-whole-query"><a class="anchor" href="#quote-the-whole-query" aria-hidden="true">#</a>Quote the whole query</h2>
+<p>Always wrap the query in single quotes:</p>
+<pre><code class="language-bash">lazy search &#39;tag:launch AND status:blocked&#39;
+</code></pre>
+<p>Two shell behaviors bite otherwise. <code>#</code> starts a comment in most shells, so an
+unquoted <code>#onboarding</code> never reaches lazy. And an unquoted multi-word value is
+split into separate argv entries before lazy sees it.</p>
+<h2 id="query-language"><a class="anchor" href="#query-language" aria-hidden="true">#</a>Query language</h2>
+<p>Boolean operators are <strong>case-sensitive</strong> (<code>AND</code>, not <code>and</code>). <code>AND</code> binds tighter
+than <code>OR</code>. Two adjacent terms with no operator are an implicit <code>AND</code>.</p>
+<pre><code>AND                Both conditions must match
+OR                 Either condition matches
+NOT                Negation
+(A OR B) AND C     Parentheses group
+</code></pre>
+<p>Field filters:</p>
+<pre><code>status:&lt;value&gt;          Task status (working, blocked, backlog, complete, ...)
+goal:&lt;text&gt;             Match against the task goal
+code:&lt;value&gt;            Match the task code
+tag:&lt;value&gt;             Tasks carrying this tag
+#&lt;value&gt;                Shorthand for tag:&lt;value&gt; (see Tags below)
+in:turns &lt;text&gt;         Within turn content
+in:commits &lt;text&gt;       Within commit messages
+in:comments &lt;text&gt;      Within comments
+in:followups &lt;text&gt;     Within follow-ups
+in:conversations &lt;text&gt; Within captured builder conversations
+in:memories &lt;text&gt;      Within shared memory records
+has:commits             Task has commits
+has:turns               Task has turns
+has:comments            Task has comments
+has:followups           Task has follow-ups
+created:&gt;YYYY-MM-DD     Created after / before (also created:&lt;)
+updated:&gt;YYYY-MM-DD     Last updated after / before (also updated:&lt;)
+</code></pre>
+<h2 id="tags"><a class="anchor" href="#tags" aria-hidden="true">#</a>Tags</h2>
+<p>Tags are normalized <strong>on write and on query</strong>, identically: lowercased, with
+every run of non-alphanumeric characters collapsed to a single hyphen and
+leading/trailing hyphens stripped. All four of these find the task tagged
+<code>my-feature</code>:</p>
+<pre><code class="language-bash">lazy search &#39;tag:my-feature&#39;
+lazy search &#39;tag:MY-FEATURE&#39;
+lazy search &#39;tag:My_Feature!&#39;     # punctuation collapses to a hyphen
+lazy search &#39;tag:#my-feature&#39;     # a leading &#39;#&#39; is stripped
+</code></pre>
+<p>Normalization applies to <strong>one token</strong>. It does not join words across a space —
+see the multi-word caveat below.</p>
+<p>A tag value that normalizes to nothing (<code>tag:&quot;!!!&quot;</code>) is a <strong>parse error</strong>, not a
+silent zero-result — the write side rejects the same input, so the query side
+does too.</p>
+<h3 id="name-is-the-spelling-lazy-prints"><a class="anchor" href="#name-is-the-spelling-lazy-prints" aria-hidden="true">#</a><code>#name</code> is the spelling lazy prints</h3>
+<p><code>lazy tag</code> and <code>lazy show</code> print tags with a leading <code>#</code> (&quot;Tags: <code>#launch</code>&quot;), so
+that spelling has to work when pasted back into a search. A bare <code>#launch</code> term
+is a <strong>superset</strong>, not a redirect — it matches <code>tag:launch</code> <em>or</em> the literal text
+<code>#launch</code>. That keeps <code>#1234</code> issue references in commit messages findable.</p>
+<pre><code class="language-bash">lazy search &#39;#launch&#39;    # tag &#39;launch&#39;, OR the text &#39;#launch&#39; anywhere
+</code></pre>
+<h3 id="quote-a-multi-word-tag"><a class="anchor" href="#quote-a-multi-word-tag" aria-hidden="true">#</a>Quote a multi-word tag</h3>
+<p>This is the one real trap. <code>tag:</code> consumes a single token, and adjacent tokens
+are an implicit <code>AND</code>:</p>
+<pre><code class="language-bash">lazy search &#39;tag:&quot;My Feature Work&quot;&#39;   # matches the tag &#39;my-feature-work&#39;
+lazy search &#39;tag:My Feature Work&#39;     # tag:my AND text &quot;Feature&quot; AND text &quot;Work&quot;
+</code></pre>
+<p>The second form is valid syntax that usually matches nothing. Lazy does not
+guess between the two — <code>tag:x some text</code> is a legitimate query — so instead it
+explains the empty result (below).</p>
+<h2 id="empty-tag-results-explain-themselves"><a class="anchor" href="#empty-tag-results-explain-themselves" aria-hidden="true">#</a>Empty tag results explain themselves</h2>
+<p>A structured, non-fuzzy tag query that returns nothing prints a hint naming what
+is actually missing, rather than a bare &quot;No matches found&quot;:</p>
+<pre><code>$ lazy search &#39;tag:onbording&#39;
+No matches found.
+
+No task is tagged #onbording — did you mean #onboarding?
+Known tags: #infra #launch #onboarding
+Tags are normalized to lowercase alphanumerics and hyphens. Quote a multi-word tag: tag:&quot;My Feature Work&quot;
+</code></pre>
+<p>Details worth knowing:</p>
+<ul>
+<li>Suggestions come from tags that actually exist, ranked by prefix/substring
+relation first and edit distance second — the ranking that surfaces
+<code>my-feature-work</code> when an unquoted multi-word tag queried only <code>my</code>.</li>
+<li>If <strong>every</strong> queried tag exists, there is no hint: the empty result came from
+the rest of the query (a status, a date range, a text term), not the tag.</li>
+<li><code>NOT tag:x</code> never triggers a hint — it says nothing about whether <code>x</code> exists.</li>
+<li>With <code>--json</code>, the hint appears as a top-level <code>hint</code> field. The MCP
+<code>lazy_search</code> tool returns the same field.</li>
+</ul>
+<h2 id="from-a-hit-to-the-thing-it-hit"><a class="anchor" href="#from-a-hit-to-the-thing-it-hit" aria-hidden="true">#</a>From a hit to the thing it hit</h2>
+<p>Result excerpts are truncated (~500 chars over MCP) on purpose: search <em>locates</em>,
+<code>show</code> <em>reads</em>. So a hit that lives inside a task&#39;s own list — a turn, commit,
+comment or follow-up — carries a locator you can hand straight to <code>show</code>.</p>
+<ul>
+<li><p><strong>CLI.</strong> Turn hits print as <code>turn #12</code> in the TYPE column, so <code>lazy show &lt;task&gt;</code> tells you which turn to look at without counting. With <code>--json</code>, each
+hit&#39;s <code>context</code> carries <code>turn_seq</code> (the turn number) and <code>index</code> (its 0-based
+position).</p>
+</li>
+<li><p><strong>MCP.</strong> Each such hit carries <code>index</code>, and turn hits also carry
+<code>turnSequence</code>. For turn, commit and comment hits <code>index</code> is the entity&#39;s
+position in the very list <code>lazy_show</code> pages over, so it works as an <code>offset</code>
+against that one section:</p>
+<pre><code>lazy_search(query=&quot;reconciler&quot;)        -&gt; {type: &quot;turn&quot;, index: 7, turnSequence: 8, ...}
+lazy_show(task_id, sections=[&quot;turns&quot;], offset=7, limit=1)   # that exact turn, in full
+</code></pre>
+<p><code>sections=[&quot;commits&quot;]</code> and <code>sections=[&quot;comments&quot;]</code> work the same way.</p>
+</li>
+</ul>
+<p><code>index</code> and <code>turnSequence</code> are deliberately separate. <code>index</code> is a pagination
+offset; <code>turnSequence</code> is the turn&#39;s identity in rendered output. They coincide
+only when a session&#39;s sequences start at 0 and skip nothing.</p>
+<p>Follow-up hits are the exception: there is no <code>follow_ups</code> value in <code>lazy_show</code>&#39;s
+<code>sections</code>, and none is needed — <code>lazy_show</code> always returns every follow-up in
+full as <code>follow_ups</code>, unpaged, because a task&#39;s follow-ups are its triage queue
+at review. So a follow-up hit&#39;s <code>index</code> is a position to read off in that array,
+not an offset to page to. Asking for <code>sections=[&quot;follow_ups&quot;]</code> is a schema error,
+by design.</p>
+<p>Hits with no position in a per-task list — task, prompt, conversation, memory —
+carry neither field, rather than a misleading <code>index: 0</code>.</p>
+<h2 id="examples"><a class="anchor" href="#examples" aria-hidden="true">#</a>Examples</h2>
+<pre><code class="language-bash">lazy search &#39;auth&#39;                                      # regex, everywhere
+lazy search &#39;catchup&#39; --fuzzy                           # typo-tolerant
+lazy search &#39;status:blocked AND in:turns &quot;reconciler&quot;&#39;
+lazy search &#39;has:commits AND NOT in:commits &quot;wip&quot;&#39;
+lazy search &#39;created:&gt;2026-02-15 AND status:working&#39;
+lazy search &#39;tag:onboarding&#39;
+lazy search &#39;#onboarding&#39;                               # the printed spelling
+lazy search &#39;tag:&quot;My Feature Work&quot;&#39;
+lazy search &#39;tag:launch AND status:blocked&#39;
+lazy search &#39;in:memories &quot;credentials&quot;&#39;
+lazy search &#39;auth&#39; --json                               # structured output
+</code></pre>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><a href="../memory/">Shared memory</a> — memory records and <code>in:memories</code></li>
+<li><a href="../lazy-agent-design/">lazy-agent design</a> — how agents reach search
+over MCP rather than by shelling out</li>
+</ul>
+
+</main>
+</body>
+</html>

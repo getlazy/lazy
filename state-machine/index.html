@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task State Machine and Crash Recovery — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="task-state-machine-and-crash-recovery"><a class="anchor" href="#task-state-machine-and-crash-recovery" aria-hidden="true">#</a>Task State Machine and Crash Recovery</h1>
+<p>This document describes the task status state machine and the crash/resume lifecycle in Lazy.</p>
+<h2 id="task-status-state-machine"><a class="anchor" href="#task-status-state-machine" aria-hidden="true">#</a>Task Status State Machine</h2>
+<h3 id="status-definitions"><a class="anchor" href="#status-definitions" aria-hidden="true">#</a>Status Definitions</h3>
+<p>Lazy tasks can be in one of the following statuses:</p>
+<ul>
+<li><p><strong><code>backlog</code></strong> — Task created but not yet started. No session exists.</p>
+</li>
+<li><p><strong><code>working</code></strong> — Agent is actively working. Container/process is running.</p>
+</li>
+<li><p><strong><code>blocked</code></strong> — Agent completed a turn and is waiting for human review/feedback.</p>
+</li>
+<li><p><strong><code>conflict</code></strong> — Agent completed a turn but file permission violations were detected. Semantically &quot;blocked with violations&quot; — the task cannot be accepted until violations are resolved. Leaving <code>conflict</code> requires an explicit approve/revert decision on every <em>pending</em> violated file; neither <code>lazy unblock</code> nor <code>lazy accept</code> infers one. A decision already made is sticky: a later unblock decides only what is still pending, so silence never re-reverts an approved file, and re-naming one is always accepted. See <a href="../lazy-toml/#resolving-a-conflict-task">Resolving a conflict task</a>.</p>
+<p><strong><code>conflict</code> is DERIVED, never asserted.</strong> The pending violation set is the source of truth; <code>conflict</code> is the label a paused task wears while that set is non-empty. Every path that parks a task as paused — reconciler turn completion, sync completion, a fatal-failure park, stranded recovery, pairing teardown, auto-deliver rollback, <code>lazy stop</code>, <code>lazy doctor &lt;task&gt;</code> — goes through <code>parkTaskPaused</code> in <code>src/utils/paused-status.ts</code> and re-derives the label from the set rather than writing <code>blocked</code> directly. Correspondingly, every reviewer-facing guard (the CLI and MCP unblock guards, the daemon&#39;s revert) reads violation records, not the status — the PENDING set for what must be decided, and the full record set for whether <code>approved_files</code> may be passed at all. Before this was true, a read-only <code>lazy_ask</code> could leave a task reading <code>blocked</code> with a violation still pending, which made the correct call unexpressible: passing <code>approved_files</code> was refused (&quot;no violations&quot;) while omitting it silently reverted the agent&#39;s committed work.</p>
+</li>
+<li><p><strong><code>pairing</code></strong> — Human is working interactively with Claude Code in the task worktree.</p>
+</li>
+<li><p><strong><code>interrupted</code></strong> — Agent crashed or was killed unexpectedly.</p>
+</li>
+<li><p><strong><code>merging</code></strong> — A merge is in flight. Two shapes, distinguished by the <code>accept_in_flight_from</code> task metadata key: without it, the merge lives on the forge (PR/MR submitted, waiting for CI and merge) and a later accept re-enters to ask the forge what happened; with it, a LOCAL merge phase is running right now inside an accept, and the marker records the status to restore if that phase aborts or dies. <code>merging</code> is stamped at the START of the merge phase, so a task reads <code>merging</code> for the whole time it is being merged — not for the last instant of it.</p>
+</li>
+<li><p><strong><code>zombie</code></strong> — System-only recovery state for tasks whose branch was merged but status wasn&#39;t updated (e.g., <code>lazy accept</code> crashed after merge but before status update). Reconciler detects this and transitions through zombie → complete.</p>
+</li>
+<li><p><strong><code>complete</code></strong> — Task accepted and merged successfully.</p>
+</li>
+<li><p><strong><code>abandoned</code></strong> — Task rejected (<code>lazy reject</code>) or closed (<code>lazy close</code>, e.g. &quot;won&#39;t do&quot;, duplicate) by a human. Both commands resolve to this single terminal status; there is no distinct <code>closed</code> status.</p>
+</li>
+</ul>
+<h3 id="status-categories"><a class="anchor" href="#status-categories" aria-hidden="true">#</a>Status Categories</h3>
+<p><strong>Terminal statuses</strong> (task is finished, core fields frozen):</p>
+<ul>
+<li><code>complete</code>, <code>abandoned</code></li>
+</ul>
+<p><strong>Blocked statuses</strong> (waiting for human action):</p>
+<ul>
+<li><code>blocked</code>, <code>conflict</code></li>
+</ul>
+<p><strong>Active statuses</strong> (has active worktree that should not be merged into):</p>
+<ul>
+<li><code>working</code>, <code>interrupted</code>, <code>pairing</code>, <code>merging</code></li>
+</ul>
+<h3 id="valid-state-transitions"><a class="anchor" href="#valid-state-transitions" aria-hidden="true">#</a>Valid State Transitions</h3>
+<pre><code>backlog
+  → working       lazy start (creates session, launches agent)
+  → abandoned     lazy close (task canceled before starting)
+
+working
+  → blocked       reconciler (agent turn completes, response.json processed)
+                  | reconciler (supervisor reported an unrecoverable agent failure —
+                    see &quot;Agent Failure Classification&quot; below; NOT auto-resumed)
+  → conflict      reconciler (agent turn completes with file permission violations)
+                  | lazy accept (pre-accept turn ends, task restored to its pre-accept status)
+  → submitted     lazy accept (same restore, for a task that was submitted)
+  → interrupted   reconciler (container dies without response.json)
+  NOTE: working cannot transition to pairing or abandoned — the agent is running.
+  NOTE: accept moves the task through `working` for the pre-accept turn and
+        restores the status it ACTUALLY had — see the merging note below.
+
+blocked
+  → working       lazy unblock (human gives feedback)
+  → conflict      any park that re-derives the label and finds a pending
+                  violation set (see &quot;conflict is DERIVED&quot; above)
+  → pairing       lazy pair (human wants to work interactively)
+  → merging       lazy accept (begins merge process)
+  → abandoned     lazy reject (rejects the work) | lazy close (canceled without accept/reject)
+  → backlog       reconciler migration (blocked task with no session → backlog)
+  NOTE: blocked cannot go directly to complete — must go through merging first.
+
+conflict
+  → working       lazy unblock (human gives feedback to fix violations)
+  → blocked       any park that re-derives the label after every violation was
+                  resolved (approved or rejected)
+  → pairing       lazy pair (human wants to work interactively on violations)
+  → abandoned     lazy reject | lazy close
+
+interrupted
+  → working       auto-resume (reconciler, circuit breaker allows) | lazy resume
+                  | reconciler stale-completed-response sweep (recovers a response
+                    written after the task was marked interrupted; routes through
+                    working, then working → blocked)
+  → pairing       lazy pair (human investigates interactively)
+  → abandoned     lazy reject | lazy close
+  NOTE: interrupted cannot go to merging or complete — must unblock/review first.
+
+pairing
+  → blocked       pairing ends (Claude Code exits) | reconciler stale pairing sweep
+  → conflict      same two paths, when the task still owes a decision on
+                  file-permission violations
+
+merging
+  → complete      lazy accept (checks pass, merge succeeds) | reconciler (merge completed)
+  → blocked       lazy accept (checks fail) | reconciler (PR/MR closed externally)
+  → conflict      lazy accept (merge phase aborts on a task that was in conflict)
+  → submitted     lazy accept (merge phase aborts on a task that was submitted)
+  NOTE: merging cannot go to abandoned — merge either succeeds or fails back to
+        the status the task held before the accept. A task in `conflict`
+        (unresolved violations) or `submitted` (open PR awaiting review) is not
+        `blocked`; rewriting it to `blocked` on an aborted accept would destroy
+        that signal, so every abort restores the TRUE prior status.
+  NOTE: an accept that DIES mid-merge (daemon restart, crash, kill) leaves the
+        task in `merging` with no owner. That is recovered, not transitioned
+        away: `lazy reject`, `close`, `submit` and `unblock` return the task to a
+        resting status first and then do their job, and the reconciler sweeps
+        such tasks on every tick — so a stranded merge escapes without anyone
+        needing to know an incantation. A merge that is genuinely in flight (an
+        accept holding the task&#39;s lifecycle lock) is refused instead, and a
+        forge-pending merge is left for remote-sync. See
+        `src/daemon/stranded-merge.ts`; `lazy doctor` reports anything sitting
+        in `merging`.
+
+zombie (system-only)
+  → complete      reconciler (merged branch sweep completes the task)
+  NOTE: any non-terminal → zombie (system actor only). Terminal statuses cannot go to zombie.
+
+complete
+  → blocked       lazy reopen --reason &quot;...&quot; (reopen accepted task)
+  → backlog       lazy reopen (reopen accepted task with no session)
+
+abandoned
+  → backlog       lazy reopen (reopen rejected/closed task with no agent work)
+  → blocked       lazy reopen (reopen rejected/closed task with agent work)
+</code></pre>
+<h3 id="actors-turn--transition-provenance"><a class="anchor" href="#actors-turn--transition-provenance" aria-hidden="true">#</a>Actors (turn &amp; transition provenance)</h3>
+<p>Every turn and status transition records an <strong>actor</strong> — who caused it. This is
+provenance metadata: it never gates behavior (a save is a save regardless of
+actor), it only records who did the thing.</p>
+<p>There are five actors (<code>Actor</code> in <code>src/types</code>):</p>
+<ul>
+<li><strong><code>human</code></strong> — a real person acting through the <strong>CLI</strong> boundary.</li>
+<li><strong><code>builder</code></strong> — the AI builder that drives Lazy through the <strong>MCP</strong> boundary
+(the orchestrator that calls <code>lazy_start</code>, <code>lazy_unblock</code>, etc.).</li>
+<li><strong><code>agent</code></strong> — a task agent driving its OWN subtree through the same MCP
+boundary (creating, starting, unblocking, and accepting its own subtasks).
+Same channel as <code>builder</code>, told apart by scope: the tool context carries a
+task id. Without it, an agent-driven subtask accept would read back as the
+builder&#39;s — or a human&#39;s — decision.</li>
+<li><strong><code>system</code></strong> — the daemon acting on its own (reconciler transitions,
+crash auto-resume). Not attributed to whoever happened to trigger the tick.</li>
+<li><strong><code>supervisor</code></strong> — the per-task supervisor authoring push-back/maintain
+prompts as human-role turns.</li>
+</ul>
+<p><strong>The discriminator is the channel, not the content source.</strong> A command that
+arrives over MCP is <code>builder</code>; the same command over the CLI is <code>human</code>. This is
+deliberate: when the builder relays a human&#39;s feedback via <code>lazy_unblock</code>, the
+turn is still <code>builder</code> — the actor records <em>who submitted</em> (pressed the
+button), not who authored the words. The human&#39;s content is persisted as
+written either way (modulo control-character escaping, below); the tag is
+orthogonal to it.</p>
+<p>Mechanically: CLI commands default to <code>getActor()</code> (env-var / <code>human</code>). MCP tool
+handlers set the actor at origination — <code>MCP_ACTOR</code> (<code>builder</code>) for the builder,
+<code>AGENT_ACTOR</code> (<code>agent</code>) when the tool context carries a task id — and thread it
+through the RPC layer, because lifecycle ops persist their records in the
+<strong>daemon</strong> — a shared process that can&#39;t see the caller&#39;s channel from its own
+environment, and whose <code>getActor()</code> therefore reports <code>human</code> for every caller.
+Everything an operation writes carries that one threaded actor: the turn, every
+status transition it makes, and any comment it leaves. That covers the
+turn-creating ops (start, unblock, ask, resume, stop, sync) <em>and</em> the ones that
+never launch an agent (reject, close, submit, reparent), plus task creation —
+whose channel lands on the initial <code>backlog</code> status-changelog entry — and
+journal entries. Read surfaces
+(<code>lazy show</code>, the web dashboard, the MCP <code>lazy_show</code> turns section, fidelity /
+report digests) label a human-role turn by its authoring actor so <code>builder</code> and
+<code>supervisor</code> turns are distinguishable from what a person typed.</p>
+<p><strong>An absent actor is not a bug — it means one of two things.</strong> On a
+<strong><code>role: &#39;agent&#39;</code></strong> turn, an actor is never written: the field records who
+submitted a <em>command</em>, and an agent&#39;s own reply is not one (<code>lazy show</code> labels
+those by role). On a <strong>human-role</strong> turn or a status change, absent means the
+default channel — a CLI/human action, or a record written before the actor was
+populated. Only the non-default channels (<code>builder</code>, <code>agent</code>, <code>system</code>,
+<code>supervisor</code>) are stamped, so legacy records and new CLI records read the same
+way. Turn-creating commands are the exception: they always write an explicit
+actor on the human-role turn, <code>human</code> included.</p>
+<h3 id="text-intake-is-sanitized-at-the-boundary"><a class="anchor" href="#text-intake-is-sanitized-at-the-boundary" aria-hidden="true">#</a>Text intake is sanitized at the boundary</h3>
+<p>Every prompt lazy sends an agent is passed as an <strong>argv element</strong>
+(<code>claude -p &lt;prompt&gt;</code>). A raw NUL byte in argv is illegal, so a single NUL in
+feedback used to kill the spawn instantly, trip crash-loop detection, and — via
+an auto-resume that restarts on a generic prompt — silently drop the feedback.</p>
+<p>Every text intake (CLI <code>unblock</code>/<code>comment</code>/<code>create</code>, the <code>$EDITOR</code> and piped-stdin
+paths, every MCP tool argument, the daemon&#39;s unblock/ask RPCs, and auto-delivered
+comment/CI text) therefore runs through <code>sanitizeUserText()</code>
+(<code>src/utils/sanitize-text.ts</code>) <strong>before persistence</strong>. Non-printable control
+characters — C0 except tab/LF/CR, DEL, and C1 — are replaced with their printable
+escapes (a NUL becomes the six characters <code>\u0000</code>).</p>
+<p>For free-text arguments that become prose in a prompt (<code>feedback</code>, <code>message</code>,
+<code>prompt</code>, <code>note</code>, <code>reason</code>, <code>question</code>, <code>goal_context</code>), a short note is appended
+disclosing the substitution, so it is visible rather than a silent rewrite.
+Strings that are <em>not</em> prose are escaped <strong>without</strong> that note: short single-line
+fields like a task goal, and strings nested inside array arguments — <code>files</code>,
+<code>approved_files</code> — whose elements become git argv. Appending an explanatory
+paragraph to a file path would corrupt the path.</p>
+<p>The policy is <strong>sanitize and deliver, never reject</strong>: rejecting would discard
+feedback at exactly the moment the human finished typing it, which the
+never-lose-human-feedback invariant forbids. Nothing is dropped — only re-encoded.
+Ordinary text is passed through byte-for-byte.</p>
+<p>The delivery side is guarded too, as defense in depth: the argv builders escape
+(and log loudly) rather than fail, and the <code>src/utils/spawn.ts</code> wrappers refuse a
+NUL-bearing argv with an actionable error instead of the opaque
+<code>args[N] must be a string without null bytes</code>.</p>
+<h3 id="transition-triggers"><a class="anchor" href="#transition-triggers" aria-hidden="true">#</a>Transition Triggers</h3>
+<p>The CLI commands below are the <code>human</code>-channel triggers; each has an MCP
+equivalent (<code>lazy_start</code>, <code>lazy_unblock</code>, …) that drives the same transition but
+records the actor as <code>builder</code> (or <code>agent</code>, when the caller is a task agent
+acting inside its own subtree).</p>
+<h4 id="human-actions-cli-commands"><a class="anchor" href="#human-actions-cli-commands" aria-hidden="true">#</a>Human Actions (CLI commands)</h4>
+<ul>
+<li><p><strong><code>lazy start &lt;task&gt;</code></strong> — backlog → working</p>
+<ul>
+<li>Creates session, creates worktree, launches supervisor container</li>
+<li>Records human turn, transitions to working, launches agent</li>
+</ul>
+</li>
+<li><p><strong><code>lazy unblock &lt;task&gt;</code></strong> — blocked|interrupted → working</p>
+<ul>
+<li>Opens $EDITOR for human feedback (or reads from --message/stdin)</li>
+<li>Merges upstream before agent resumes (INVARIANT: every unblock merges upstream)</li>
+<li>Records human turn, transitions to working, launches agent</li>
+</ul>
+</li>
+<li><p><strong><code>lazy resume &lt;task&gt;</code></strong> — interrupted → working</p>
+<ul>
+<li>Manual recovery after auto-resume circuit breaker fires</li>
+<li>Same mechanics as unblock but without requiring feedback</li>
+<li>Refuses while file-permission violations are pending: resume has no channel
+to express an approve/revert decision, and starting a turn without one piles
+more work onto files the eventual unblock may revert. Use <code>lazy unblock</code> with
+<code>--approve-file</code> / <code>--no-approve-files</code> (or <code>approved_files</code> over MCP).
+Auto-resume (reconciler and the auto-resume queue) skips such tasks for the
+same reason</li>
+</ul>
+</li>
+<li><p><strong><code>lazy pair &lt;task&gt;</code></strong> — blocked|conflict|interrupted → pairing</p>
+<ul>
+<li>Acquires pairing lock, transitions to pairing</li>
+<li>Launches Claude Code with --resume (if session exists)</li>
+<li>On exit, synthesizes summary turn, transitions back to blocked (or <code>conflict</code>,
+if violations are still pending)</li>
+</ul>
+</li>
+<li><p><strong><code>lazy ask &lt;task&gt;</code></strong> — blocked|conflict → working → blocked|conflict (status-neutral)</p>
+<ul>
+<li>Read-only and reflective: resumes the agent session (Claude Code plan mode plus
+hard tool denials) to answer one question</li>
+<li>Opens $EDITOR for the question (or reads from --message/stdin)</li>
+<li>Records the question as a human turn before launching, the answer as an agent turn</li>
+<li>Restores the <strong>pre-ask</strong> status when the turn ends — on success, on an agent
+error, and on any other throw — so an ask never mutates task state. The
+transient <code>working</code> window exists only so the reconciler and concurrent
+callers see the task as busy while the agent runs</li>
+<li>The one exception is a timeout: the task deliberately stays <code>working</code> so the
+reconciler can still finalize an answer the supervisor may yet write. The
+reconciler&#39;s park re-derives <code>blocked</code> vs <code>conflict</code>, so the label survives</li>
+<li>If the agent crashes mid-ask the task lands in <code>interrupted</code> like any other turn</li>
+</ul>
+</li>
+<li><p><strong><code>lazy chat &lt;task&gt;</code></strong> — no transition at all (status-neutral)</p>
+<ul>
+<li>On a <code>blocked</code>/<code>conflict</code> task: resumes the live agent session interactively in the
+worktree, read-only and reflective (same denials as ask). No status change, no turn,
+no commits — the only durable effect is the session log captured to storage on exit</li>
+<li>Holds the worktree lock (<code>.lazy-lock</code>, command <code>lazy chat</code>) for the chat&#39;s duration,
+so start/unblock/sync/resume refuse while a chat is open rather than starting a turn
+underneath it</li>
+<li>On a terminal task: rehydrates the captured session JSONL and resumes it in the
+project root (no worktree exists)</li>
+</ul>
+</li>
+<li><p><strong><code>lazy accept &lt;task&gt;</code></strong> — blocked|merging → merging → complete</p>
+<ul>
+<li>Refuses if uncommitted changes exist</li>
+<li>For remote tasks: creates/updates PR/MR, waits for checks<ul>
+<li>If merge succeeds immediately → merging → complete</li>
+<li>If checks pending or approval needed → merging</li>
+</ul>
+</li>
+<li>For local tasks: transitions to merging, squash-merges into parent/main → complete</li>
+<li>Ends session, cleans up container/worktree/branch</li>
+<li>Narrates itself phase by phase — see <a href="#accept-observability">Accept observability</a></li>
+<li>Status tracks the phase in flight: <code>working</code> (with the <code>agent:pre-accept</code>
+substate) for the pre-accept turn, <code>merging</code> for the whole merge phase.
+Every abort restores the status the task actually had before the accept</li>
+<li>Concurrency: the whole accept orchestration runs under a process-level
+per-task lifecycle lock (<code>src/daemon/task-lifecycle-lock.ts</code>). The daemon
+serves RPCs concurrently, so without this a human accept and a builder
+accept on the same task could both clear preflight and both run the merge —
+leaving the task <code>blocked</code> while the merge was already applied. With the
+lock the second accept waits, re-runs preflight, sees the accepted session
+outcome, and returns &quot;already accepted&quot;; the merge runs exactly once.</li>
+<li>Parent must not be active (working/pairing/merging/interrupted) — merging
+into a live worktree would corrupt whatever is running in it. ONE exemption:
+a caller whose own task IS the merge destination, accepting one of its
+subtasks over MCP. The exemption is an identity match on that destination
+(<code>callerTaskId === parent.id</code>, set only at the MCP boundary from the tool
+context, never from client input — so CLI callers can never reach it).
+That &quot;never from client input&quot; is now literally true: the caller&#39;s task id
+is derived from the per-session bearer token the daemon minted, and a
+request whose URL claims a different task is refused outright. Until then
+the id came from the URL path, which the caller wrote — so an agent could
+name its own parent and take this exemption on a worktree it had no claim
+to. See <a href="../lazy-agent-design/#identity-comes-from-the-token-not-the-url">Identity comes from the token, not the
+URL</a>.
+It covers two parent statuses, both of which mean &quot;exactly one actor is in
+that worktree, and it is the one blocked inside this very call&quot;:<ul>
+<li><code>working</code> — the parent&#39;s own agent is the caller.</li>
+<li><code>pairing</code> — a human is driving that session interactively and is the
+sole actor in the worktree, so an accept issued from it is that human&#39;s
+decision.
+<code>merging</code> and <code>interrupted</code> still refuse for everyone. Note that pairing
+sessions are launched as builder-role Claude (<code>lazy pair</code> passes no
+<code>--task-id</code>), so in practice a pairing session usually reaches MCP as the
+builder with no <code>callerTaskId</code> and still gets the refusal; the exemption
+fires only when the session really is task-scoped.</li>
+</ul>
+</li>
+<li>A dirty destination worktree does not block the merge and is never lost:
+the accept stashes the uncommitted work, merges, and pops it back. If the
+stash cannot be reapplied the merge still stands and a
+<code>DestinationRestoreConflict</code> surfaces with the retained stash SHA and
+recovery steps. This is status-agnostic, so it covers the <code>pairing</code> parent —
+the human&#39;s in-progress edits survive the accept. (<code>pairing</code>, like <code>working</code>,
+is not in <code>UNBLOCKABLE_STATUSES</code>, so the conflict is surfaced to the human
+as a warning rather than handed to an agent via unblock.)</li>
+<li>Actor attribution follows the channel: CLI → <code>human</code>, builder MCP →
+<code>builder</code>, task-agent MCP → <code>agent</code>. An agent accepting its own subtask must
+not read back later as a human&#39;s decision.</li>
+<li>Over MCP, a task agent may accept a DIRECT SUBTASK ONLY, never its own task
+(<code>assertAgentMayTargetChildOnly</code> in <code>src/mcp/tools.ts</code>). Self-accept makes no
+sense at any level of the hierarchy: accepting means &quot;merge upward and mark
+complete&quot;, so accepting yourself skips the review the task exists to be
+subject to. Accepting a child merges into the agent&#39;s OWN branch, which a
+human still reviews when the agent&#39;s task is accepted. Every other
+task-targeting agent tool keeps the looser own-task-or-direct-child gate —
+they merge and complete nothing, which keeps <code>lazy_unblock</code> reachable and the
+create → start → wait → review → unblock → accept loop coherent. The builder
+surface is unrestricted, so a builder-mode MCP session can still accept a
+task directly.</li>
+</ul>
+</li>
+<li><p><strong><code>lazy reject &lt;task&gt;</code></strong> — blocked|interrupted → abandoned</p>
+<ul>
+<li>Opens $EDITOR for rejection reason</li>
+<li>Ends session, cleans up container/worktree/branch</li>
+</ul>
+</li>
+<li><p><strong><code>lazy close &lt;task&gt;</code></strong> — blocked|interrupted → abandoned</p>
+<ul>
+<li>Opens $EDITOR for close reason</li>
+<li>Ends session, cleans up container/worktree/branch</li>
+<li>Resolves to the same <code>abandoned</code> terminal status as <code>lazy reject</code>; the two differ only in intent/reason, not status</li>
+</ul>
+</li>
+<li><p><strong><code>lazy reopen &lt;task&gt;</code></strong> — complete|abandoned → blocked|backlog</p>
+<ul>
+<li>For complete tasks: requires --reason, resets session, transitions to blocked</li>
+<li>For abandoned tasks: resets session if it exists, transitions to blocked or backlog</li>
+</ul>
+</li>
+</ul>
+<h4 id="agent-actions"><a class="anchor" href="#agent-actions" aria-hidden="true">#</a>Agent Actions</h4>
+<ul>
+<li><p><strong>Agent turn completes</strong> — working → blocked | conflict</p>
+<ul>
+<li>Supervisor writes response.json with agent output</li>
+<li>Reconciler reads response.json, records agent turn</li>
+<li>If the response has file permission violations, or the session still carries
+an unresolved pending set from an earlier turn → transitions to conflict</li>
+<li>Otherwise → transitions to blocked</li>
+<li>A turn that ran no permission check (an ask, a sync) reports nothing, and
+&quot;reported nothing&quot; never clears a pending set</li>
+</ul>
+</li>
+<li><p><strong>Agent crashes</strong> — working → interrupted</p>
+<ul>
+<li>Container exits without writing response.json</li>
+<li>Reconciler detects missing container, transitions to interrupted</li>
+<li>Auto-resume may kick in (see Crash/Resume Lifecycle below)</li>
+</ul>
+</li>
+</ul>
+<h4 id="system-actions-reconciler"><a class="anchor" href="#system-actions-reconciler" aria-hidden="true">#</a>System Actions (reconciler)</h4>
+<p>The reconciler runs automatically before <code>lazy list</code>, <code>lazy blocked</code>, <code>lazy active</code> commands. It performs several sweeps:</p>
+<ol>
+<li><p><strong>Working task sweep</strong> — Process tasks in &#39;working&#39; status:</p>
+<ul>
+<li>If response.json exists → record turn, transition to blocked</li>
+<li>If container running and no response → leave as working</li>
+<li>If container stopped without response → transition to interrupted, maybe auto-resume</li>
+<li>If no container and no response → transition to interrupted, maybe auto-resume</li>
+</ul>
+</li>
+<li><p><strong>Interrupted response sweep</strong> — Process stale responses for interrupted tasks:</p>
+<ul>
+<li>Race condition fix: supervisor may write response.json after reconciler marks task interrupted</li>
+<li>If interrupted task has response.json → process it, transition to blocked</li>
+</ul>
+</li>
+<li><p><strong>Terminal container sweep</strong> — Clean up orphaned containers:</p>
+<ul>
+<li>Tasks in complete/abandoned may have lingering containers if cleanup failed</li>
+<li>Remove container, clear container_name from session</li>
+</ul>
+</li>
+<li><p><strong>Merged branch sweep</strong> — Detect zombie tasks (branch merged but status not updated):</p>
+<ul>
+<li>For non-terminal tasks with sessions: check if branch merged into target</li>
+<li>If merged → set outcome=&#39;accepted&#39;, transition to zombie (system only) → complete</li>
+<li>Uses the <code>zombie</code> status as an intermediate state to maintain transition table integrity</li>
+<li>Prevents orphaned state where <code>lazy accept</code> succeeded but crashed before updating task</li>
+</ul>
+</li>
+<li><p><strong>Stale pairing sweep</strong> — Recover tasks stuck in &#39;pairing&#39;:</p>
+<ul>
+<li>If pairing PID no longer exists → transition to blocked</li>
+<li>Cleans up pairing lock file</li>
+</ul>
+</li>
+<li><p><strong>Blocked-to-backlog migration</strong> — One-time migration:</p>
+<ul>
+<li>If blocked task has no session → transition to backlog</li>
+<li>Separates &quot;unstarted&quot; (backlog) from &quot;waiting for review&quot; (blocked)</li>
+</ul>
+</li>
+</ol>
+<h2 id="accept-observability"><a class="anchor" href="#accept-observability" aria-hidden="true">#</a>Accept observability</h2>
+<p>An accept can run for minutes — a pre-accept agent turn, remote pushes, an
+LLM-written merge description, the merge itself. It used to print nothing for
+that whole window, which is indistinguishable from a hang. It now narrates.</p>
+<p><strong>The phase table is the single source of truth.</strong> <code>src/daemon/progress.ts</code>
+declares every accept phase (id + label + whether it is optional) and the two
+plans built from it: the fresh-accept plan (<code>acceptPhasePlan</code>, which includes the
+pre-accept turn only when that step is enabled) and the remote-merge re-entry
+plan (<code>acceptReentryPhasePlan</code>: check remote state → finalize → clean up). The
+accept path executes phases from that same table, so the announced plan cannot
+drift from what actually runs.</p>
+<p><strong>How narration travels.</strong> The daemon&#39;s <code>PhaseReporter</code> emits <code>ProgressEvent</code>s
+into the heartbeat envelope described in <code>src/daemon/heartbeat.ts</code> — the same
+NDJSON framing that already carried liveness, extended with a <code>{&quot;progress&quot;: …}</code>
+line rather than forked:</p>
+<table>
+<thead>
+<tr>
+<th>Line</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>{&quot;lazyEnvelope&quot;:1}</code></td>
+<td>preamble; the response is framed</td>
+</tr>
+<tr>
+<td><code>{&quot;heartbeat&quot;:&lt;ms&gt;,&quot;phase&quot;:&quot;Merge&quot;}</code></td>
+<td>still alive, currently in this phase</td>
+</tr>
+<tr>
+<td><code>{&quot;progress&quot;:{…}}</code></td>
+<td>a plan announcement, or a phase start/done/skipped/failed</td>
+</tr>
+<tr>
+<td><code>{&quot;status&quot;:…,&quot;body&quot;:…}</code></td>
+<td>the result</td>
+</tr>
+</tbody></table>
+<p>A progress line also feeds the client&#39;s liveness callback: the daemon wrote it
+because its handler is running <em>now</em>, so a phase change resets any client
+deadline just as a heartbeat does.</p>
+<p>Both client surfaces consume the same events:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Rendering</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy accept</code></td>
+<td><code>src/cli/phase-display.ts</code> — plan header, then one line per phase; on a TTY the open phase repaints with a live elapsed counter, off a TTY it is append-only</td>
+</tr>
+<tr>
+<td>MCP <code>lazy_accept</code></td>
+<td><code>src/daemon/mcp-proxy.ts</code> relays each event as <code>notifications/progress</code></td>
+</tr>
+</tbody></table>
+<p>Narration is strictly observational: a throwing or absent emitter cannot change
+the outcome of an accept, and an accept with nobody listening runs identically.</p>
+<p><strong>Pre-flight is a prelude, not a plan entry.</strong> It runs before the plan is known
+(it is what decides which plan applies), so it is narrated with no <code>[n/m]</code>
+position and the plan is announced immediately after it.</p>
+<p><strong>Status during an accept.</strong> The narration answers &quot;what is it doing&quot; for the
+caller who is watching; the task&#39;s own status answers it for everyone else
+(<code>lazy list</code>, <code>lazy show</code>, MCP):</p>
+<table>
+<thead>
+<tr>
+<th>Accept phase</th>
+<th>Status</th>
+<th>Substate</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Pre-accept validation turn</td>
+<td><code>working</code></td>
+<td><code>agent:pre-accept</code></td>
+</tr>
+<tr>
+<td>Merge phase (description, merge, finalize)</td>
+<td><code>merging</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td>Aborted at any point</td>
+<td>the status held before the accept</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p><code>agent:pre-accept</code> (<code>src/utils/working-substate.ts</code>, derived from the
+supervisor&#39;s <code>command_type</code>) exists because a bare <code>working</code> during an accept is
+indistinguishable from a human having unblocked the task by hand.</p>
+<h2 id="waiting-on-subtasks"><a class="anchor" href="#waiting-on-subtasks" aria-hidden="true">#</a>Waiting on subtasks</h2>
+<p>An agent that decomposes its work into subtasks drives them with blocking lazy
+tools — <code>lazy_wait</code> (long-poll until a subtask finishes its turn) and <code>lazy_ask</code>
+(resume a subtask&#39;s agent and wait for its answer). For that whole stretch the
+parent agent is doing nothing, yet every read surface showed it as
+<code>working(agent)</code>: indistinguishable from an agent thinking hard for twenty
+minutes.</p>
+<p><strong>The signal is the call itself, not the agent&#39;s output.</strong> Every agent tool call
+— container runner and host-process runner alike — is forwarded by
+<code>src/daemon/mcp-proxy.ts</code> to the daemon&#39;s <code>POST /mcp/:taskId/:toolName</code> route and
+authenticates with a per-session MCP token. So <code>handleMcpToolCall</code> already knows
+which task is blocked, on what, and since when. Nothing here parses agent stdout.</p>
+<table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Which tools park the caller</td>
+<td><code>BLOCKING_WAIT_TOOLS</code> in <code>src/daemon/wait-registry.ts</code> (<code>lazy_wait</code>, <code>lazy_ask</code>)</td>
+</tr>
+<tr>
+<td>Wrapping a blocking call</td>
+<td><code>trackWait()</code>, called from <code>handleMcpToolCall</code></td>
+</tr>
+<tr>
+<td>Live marker readers see</td>
+<td><code>waiting.json</code> in the task&#39;s protocol dir (<code>src/protocol/waiting.ts</code>)</td>
+</tr>
+<tr>
+<td>Substate derivation + label</td>
+<td><code>src/utils/working-substate.ts</code> (<code>{ kind: &#39;waiting&#39; }</code>)</td>
+</tr>
+<tr>
+<td>Durable intervals</td>
+<td><code>Storage.recordWaitStart/recordWaitEnd/readWaitIntervals</code></td>
+</tr>
+</tbody></table>
+<p><strong>Rendering.</strong> <code>working(waiting on fix-foo (2m10s))</code> across <code>lazy list</code>,
+<code>lazy active</code>, <code>lazy status</code>, <code>lazy show</code>, <code>lazy watch</code>, and the MCP <code>substate</code>
+field — all of them go through the shared derivation, so they cannot drift. Two
+concurrent waits list both labels; a larger fan-out summarizes
+(<code>waiting on a, b +2</code>).</p>
+<p><strong>Precedence.</strong> Within an agent phase, <code>waiting</code> outranks <code>agent:answering</code> and
+<code>agent:pre-accept</code>: those say what the turn <em>is</em>, <code>waiting</code> says what it is doing
+this second. A harness phase outranks <code>waiting</code> — there the supervisor, not the
+agent, is the active thing. A dead run still reads <code>not-alive</code>; a wait marker
+never resurrects a stranded task.</p>
+<p><strong>Clearing is on settle, not on response delivery.</strong> <code>trackWait</code> clears from a
+<code>finally</code>, so a call whose MCP client already disconnected — which the daemon
+finishes anyway (complete-anyway semantics) — still clears. The marker also
+carries the writing daemon&#39;s pid: a reader that finds that pid dead treats the
+whole file as stale and reports no waits, so a SIGKILLed daemon degrades to the
+pre-existing <code>working(agent)</code> rather than to a lie. <code>cleanProtocol</code> removes the
+file at turn teardown, and a clean daemon stop clears every marker it owns.</p>
+<h3 id="persisted-wait-intervals"><a class="anchor" href="#persisted-wait-intervals" aria-hidden="true">#</a>Persisted wait intervals</h3>
+<p>The same bookkeeping writes a durable record, because waited time is not the
+agent&#39;s time: a turn that spent two hours blocked on a subtask must not bill
+those two hours to the agent in duration or economics reports.</p>
+<p>Intervals live in <code>&lt;storagePath&gt;/waits/intervals.jsonl</code> — shared JSONL used by
+every backend (the same reasoning as trace spans: telemetry-shaped, append-only
+data earns no table and no migration, and the cross-backend row shape is
+byte-identical by construction).</p>
+<p>The file is <strong>event-structured</strong>: a wait writes one <code>start</code> line when it begins
+and one <code>end</code> line when it settles, folded on read. That is what makes a crash
+readable — an interval whose <code>end</code> never arrived reads back with
+<code>ended_at: null</code> and <code>outcome: null</code>, the documented &quot;died mid-wait&quot; shape,
+rather than vanishing. Consumers should treat such an interval as open, bounded
+above by the turn&#39;s end.</p>
+<p><code>turn_sequence</code> is <strong>best-effort by construction</strong>: agent turns are only written
+when the turn ends, so at wait time the only thing available is the next unused
+sequence. A consumer that needs certainty should attribute by time overlap with
+the turn&#39;s own window and use the field as a hint.</p>
+<p>Every write is wrapped in a catch: a wait that cannot be recorded still waits.
+An agent must never lose <code>lazy_wait</code> because an observability write failed.</p>
+<h2 id="agent-reported-progress"><a class="anchor" href="#agent-reported-progress" aria-hidden="true">#</a>Agent-reported progress</h2>
+<p>The working substate answers <em>who is active</em> — agent, harness, a wait, nothing.
+It cannot answer <em>doing what</em>: <code>working(agent)</code> looks identical for an agent
+reproducing a bug, running a migration, and re-reading the same file for the
+ninth time. <code>lazy_update_progress</code> is the complementary channel — the agent
+posts a short human-readable line and every surface that already renders the
+substate folds it in.</p>
+<p><strong>Ephemeral, latest-wins, never history.</strong> A progress line is worthless five
+minutes after it was written, so it never reaches Storage: permanent storage of a
+self-reported status blurb would be a second, worse turn log. Each call replaces
+the previous message; there is no history and there must not be one. What <em>is</em>
+durable about a turn (rationale, decisions, deferrals) belongs in the journal.</p>
+<table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>The tool</td>
+<td><code>lazy_update_progress</code> (<code>src/mcp/tools.ts</code>) — agent-only, requires a task context</td>
+</tr>
+<tr>
+<td>Daemon-side writer</td>
+<td><code>recordProgress()</code> in <code>src/daemon/progress-registry.ts</code></td>
+</tr>
+<tr>
+<td>Live marker readers see</td>
+<td><code>progress.json</code> in the task&#39;s protocol dir (<code>src/protocol/progress.ts</code>)</td>
+</tr>
+<tr>
+<td>Substate decoration + label</td>
+<td><code>src/utils/working-substate.ts</code> (<code>WorkingSubstate.progress</code>)</td>
+</tr>
+</tbody></table>
+<p><strong>Who writes it.</strong> The daemon, for the same reason it writes <code>waiting.json</code>:
+every agent tool call authenticates with a per-session MCP token, so
+<code>handleMcpToolCall</code> already knows which task is reporting. Nothing parses agent
+stdout, and no client writes the marker directly.</p>
+<p><strong>Rendering.</strong> <code>working(agent: running migration 3/7)</code> across <code>lazy list</code>,
+<code>lazy active</code>, <code>lazy status</code>, <code>lazy show</code>, <code>lazy watch</code>, and the MCP <code>substate</code>
+field — one shared derivation, so the surfaces cannot drift. The line is
+whitespace-collapsed and capped at 120 characters at the write boundary (and
+again on read, so a foreign file cannot break a table cell). Over-length messages
+are <strong>truncated, never rejected</strong>, and the truncation is echoed back to the agent
+rather than being silent.</p>
+<p><strong>Precedence.</strong> The progress line decorates only the kinds where the <em>agent</em> is
+the active thing: <code>agent</code>, <code>agent:answering</code>, <code>agent:pre-accept</code>, and
+<code>waiting on …</code>. It is deliberately absent from <code>harness:&lt;phase&gt;</code> — that phase is
+the supervisor&#39;s work, and showing the agent&#39;s last line there would report a
+claim about a turn phase that has already ended — and from <code>not-alive</code>.</p>
+<p><strong>Clearing is structural, not remembered.</strong> <code>writeCommand</code> deletes
+<code>progress.json</code>, and every turn begins with a command, so a new turn always begins
+with no progress: a message from a finished turn cannot linger. Belt and braces
+around that: the substate only renders while a live <code>status.json</code> exists,
+<code>cleanProtocol</code> removes the file at turn teardown, a clean daemon stop clears
+every marker it owns, and the marker carries the writing process&#39;s pid so a
+reader that finds it dead disbelieves the file and reports no progress.</p>
+<p><strong>Bookkeeping never breaks the call it observes.</strong> Every write in the registry is
+wrapped in a catch. A progress post that cannot be recorded is a lost status
+line; losing a status line must never cost an agent its tool call, let alone its
+turn.</p>
+<h2 id="agent-failure-classification"><a class="anchor" href="#agent-failure-classification" aria-hidden="true">#</a>Agent Failure Classification</h2>
+<p>Not every agent failure deserves the same response. A rate limit clears on its own;
+a revoked credential never does. The supervisor therefore never inspects error text
+itself — it asks the <strong>agent</strong> what went wrong and acts on the class it gets back.</p>
+<p>This is the <em>runtime</em> half of credential handling. The <em>start-time</em> half is the
+daemon credential gate (<code>src/daemon/credential-gate.ts</code>): a daemon with no
+credential at all never comes up in the first place, on any start path, so the
+<code>fatal_auth</code> class below is about credentials that were present at start and
+stopped working — not about a daemon that never had one.</p>
+<h3 id="the-taxonomy"><a class="anchor" href="#the-taxonomy" aria-hidden="true">#</a>The taxonomy</h3>
+<p>Each agent implements <code>classifyFailure()</code> (<code>src/agent/interface.ts</code>) and maps its own
+raw stderr / stdout error / exit code onto the shared vocabulary in
+<code>src/agent/failure-taxonomy.ts</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Examples</th>
+<th>Supervisor behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>fatal_auth</code></td>
+<td>401/403, invalid API key, missing credential, credit balance exhausted</td>
+<td>Stop on the first failure</td>
+</tr>
+<tr>
+<td><code>fatal_config</code></td>
+<td>unknown flag, invalid model, agent binary missing (exit 127)</td>
+<td>Stop on the first failure</td>
+</tr>
+<tr>
+<td><code>transient_overload</code></td>
+<td>429, 529, 503, &quot;overloaded&quot;</td>
+<td>Retry forever, 5s→60s</td>
+</tr>
+<tr>
+<td><code>transient_network</code></td>
+<td>ECONNRESET, ETIMEDOUT, socket hang up, <code>fetch failed</code></td>
+<td>Retry forever, 5s→60s</td>
+</tr>
+<tr>
+<td><code>transient_unreachable</code></td>
+<td>ECONNREFUSED, ENOTFOUND</td>
+<td>Retry 5s→60s, <strong>bounded</strong> at 12 attempts (~9 min), then treated as unrecoverable</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>anything unrecognized</td>
+<td>Retry 15s→60s; the crash-loop detector still applies</td>
+</tr>
+</tbody></table>
+<p>A classifier that does not recognize a failure returns <code>unknown</code> rather than guessing.
+A wrong <code>fatal_*</code> blocks a task that would have recovered — the more expensive mistake.</p>
+<p>Agent-specific dialects (Claude Code&#39;s &quot;Invalid API key · Please run /login&quot;, Cursor&#39;s
+&quot;not logged in&quot;) are matched in that agent&#39;s implementation; shared HTTP/socket signals
+live in <code>classifyCommonFailureSignals()</code>.</p>
+<h3 id="retry-pacing"><a class="anchor" href="#retry-pacing" aria-hidden="true">#</a>Retry pacing</h3>
+<p><code>src/supervisor/retry-policy.ts</code> is a pure function of <code>(class, attempt)</code> and is the only
+place cadence is decided. Transients use 5s → 10s → 20s → 40s → 60s (capped) — roughly 60
+retries an hour. The previous uniform ladder (30s → 300s) managed about 12, which in a live
+incident meant two attempts in five minutes on a condition that could never recover.</p>
+<p>The fast-fail crash-loop detector (3 failures under 10s each) is <strong>disabled</strong> for transient
+classes: a 429 comes back in milliseconds, so three in a row would abort a turn that was
+about to succeed. It remains the bound for <code>unknown</code>.</p>
+<p><code>transient_unreachable</code> is the deliberate middle ground for the ConnectionRefused case:
+a refused connection to a local proxy can heal if the proxy restarts, so it is retried
+generously, but a proxy that never returns must not spin forever. After the attempt cap it
+escalates to a stop.</p>
+<h3 id="what-stop-means"><a class="anchor" href="#what-stop-means" aria-hidden="true">#</a>What &quot;stop&quot; means</h3>
+<p>When the policy says stop, the supervisor throws <code>FatalAgentError</code> and writes the class,
+reason, and attempt count into <code>response.json</code> (<code>failure_class</code>, <code>failure_reason</code>,
+<code>failure_attempts</code>). The reconciler treats a set, non-<code>unknown</code> <code>failure_class</code> as the signal
+to move the task to <strong><code>blocked</code></strong> — not <code>interrupted</code> — and records the classified reason as
+an interrupt. This matters because <code>maybeAutoResume</code> only ever fires on <code>interrupted</code> tasks;
+<code>blocked</code> is what actually stops the reconciler from relaunching into a dead condition, and
+puts the task in front of a human with the reason attached.</p>
+<h3 id="the-crash-loop-backstop-reports-it-does-not-judge"><a class="anchor" href="#the-crash-loop-backstop-reports-it-does-not-judge" aria-hidden="true">#</a>The crash-loop backstop reports, it does not judge</h3>
+<p>The fast-crash-loop detector (3 failures under 10s) throws <code>CrashLoopError</code>, which writes the
+same three fields. Its class is always <code>unknown</code> — the detector runs for no other class (see
+<code>appliesFastFailDetection</code>) — and <code>unknown</code> on the wire is <strong>diagnosis only</strong>: the task still
+goes to <code>interrupted</code> with auto-resume, because many crash-loop causes are transient. Before
+this, the backstop threw a bare <code>Error</code> and the whole classification was dropped, so the
+recorded turn said only <code>Crash loop detected: …</code> with no class or attempt count.</p>
+<p>Agent classifiers must therefore keep unrecoverable conditions <em>out</em> of <code>unknown</code>. Cursor&#39;s
+<code>ActionRequiredError</code> (plan quota spent, spend limit needed) is <code>fatal_auth</code> for exactly this
+reason; Claude&#39;s <code>usage limit reached</code> is a self-healing 5-hour window and stays
+<code>transient_overload</code>. Both live in each agent&#39;s own classifier, never in the shared signals.</p>
+<p>The Cursor verdict is narrower than the wording alone: quota phrasing is fatal only when
+nothing in the message says the wall clears by itself. A rate-limit marker, or a reset horizon
+stated as a short duration (&quot;resets in 20 minutes&quot;), falls through to the shared signals and
+stays <code>transient_overload</code> — a horizon stated as a <em>date</em> (&quot;when your monthly cycle ends on
+9/19/2026&quot;) does not, because no retry ladder outlives it. Ambiguity resolves toward retrying:
+a wrong <code>fatal_*</code> blocks work that would have finished.</p>
+<p>Live retry state (class, reason, next delay) is also projected into <code>status.json</code>
+(<code>retry_failure_class</code>, <code>retry_failure_reason</code>, <code>retry_next_delay_ms</code>) for presentation
+surfaces to render.</p>
+<h3 id="rendering-what-is-being-retried"><a class="anchor" href="#rendering-what-is-being-retried" aria-hidden="true">#</a>Rendering &quot;what is being retried&quot;</h3>
+<p><code>phase=retrying</code> on its own tells a human nothing — the question in a live stall is always
+<em>retrying what, and why</em>. <code>src/utils/retry-summary.ts</code> is the single formatting seam:
+<code>formatRetrySummary()</code> turns the <code>status.json</code> retry projection into one line
+(<code>attempt 7 (transient_overload): API Error: 529 overloaded</code>), truncating the error
+snippet to a bounded length. Every surface renders through it, so they cannot drift:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy watch</code> / <code>lazy status</code> header</td>
+<td><code>src/cli/status-header.ts</code></td>
+</tr>
+<tr>
+<td><code>lazy list</code> / <code>lazy active</code> substate</td>
+<td><code>src/utils/working-substate.ts</code> (harness variant carries <code>retry</code>)</td>
+</tr>
+<tr>
+<td><code>lazy show</code> &quot;Retry State&quot; block</td>
+<td><code>src/cli/commands/show.ts</code></td>
+</tr>
+<tr>
+<td>Supervisor log (<code>Phase: retrying …</code>)</td>
+<td><code>src/supervisor/retry-status.ts</code></td>
+</tr>
+<tr>
+<td>MCP <code>lazy_show</code> → <code>retry_status</code></td>
+<td><code>src/mcp/tools.ts</code> (<code>buildRetryStatus</code>)</td>
+</tr>
+</tbody></table>
+<p>The MCP field exists because a builder driving tasks over MCP has no host CLI: without it,
+a task stuck in the retry loop is indistinguishable from a healthy <code>working</code> one.</p>
+<p>Surfaces that render both a header and a substate suffix (watch) or a status word and a
+detail block (show) strip <code>retry</code> from the secondary copy — the detail is printed once per
+line, not two or three times.</p>
+<h3 id="watchdog-kills-are-outside-the-taxonomy"><a class="anchor" href="#watchdog-kills-are-outside-the-taxonomy" aria-hidden="true">#</a>Watchdog kills are outside the taxonomy</h3>
+<p>A no-progress watchdog kill has no error text to classify — lazy killed the process itself,
+after <code>[agent] watchdog_output_timeout_ms</code> (default <strong>30 minutes</strong>, and the timer resets on
+every completed step) passed with no forward progress. So it is not routed through
+<code>classifyFailure()</code>; it is decided by one question, in <code>decideWatchdogRetry()</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Did the turn capture anything?</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Yes</strong> — a final result was on the wire, or the turn added commits</td>
+<td>Not retried. The work is already on disk, so relaunching would repeat it or wedge the same way; the turn ends and a human reads what was captured</td>
+</tr>
+<tr>
+<td><strong>No</strong> — no result, no new commits</td>
+<td>Relaunched in-turn with transient-style backoff (5s → 10s), bounded at 3 attempts. Each attempt costs a full no-progress window, so the bound is far tighter than <code>UNREACHABLE_MAX_ATTEMPTS</code></td>
+</tr>
+</tbody></table>
+<p>The zero-work branch exists because the &quot;work is already on disk&quot; rationale is false in the
+case that hurts most: during a provider incident a task sat 45 minutes in <code>working</code> with its
+<em>first</em> model call hung — nothing captured, nothing to repeat — and a relaunch is exactly
+what heals it. If the commit probe cannot read git, the kill is treated as zero-work
+(fail toward retrying).</p>
+<p>A watchdog kill carries no <code>failure_class</code>, so when it does end the turn the reconciler
+routes it to <strong><code>interrupted</code></strong> with bounded auto-resume, not <code>blocked</code>. The recorded turn and
+the session&#39;s <code>interrupt_reason</code> are rendered by <code>src/utils/watchdog-turn.ts</code> — one place, shared
+by work turns and the ask path — and say which guard fired, what its limit was, that
+keep-alives are not progress, and whether lazy already relaunched.</p>
+<h2 id="crashresume-lifecycle"><a class="anchor" href="#crashresume-lifecycle" aria-hidden="true">#</a>Crash/Resume Lifecycle</h2>
+<p>When an agent crashes mid-turn, Lazy automatically detects the failure and attempts to resume the task. This section describes the full lifecycle.</p>
+<h3 id="1-detection"><a class="anchor" href="#1-detection" aria-hidden="true">#</a>1. Detection</h3>
+<p>The reconciler runs on every <code>lazy list</code>, <code>lazy blocked</code>, <code>lazy active</code> invocation. It scans tasks in &#39;working&#39; status and checks:</p>
+<ul>
+<li>Does the supervisor container/process still exist?</li>
+<li>Has it written a response.json file?</li>
+<li>How long has it been since the task transitioned to &#39;working&#39;?</li>
+</ul>
+<p><strong>Grace period</strong>: Newly-working tasks (last_interaction_at within 30 seconds) are skipped to give the container time to start. This prevents a race where reconciliation runs before the container finishes launching.</p>
+<p>If a working task has:</p>
+<ul>
+<li>No response.json</li>
+<li>No running container</li>
+<li>Grace period expired</li>
+</ul>
+<p>Then the task is marked as interrupted.</p>
+<h3 id="2-classification-clean-vs-dirty-worktree"><a class="anchor" href="#2-classification-clean-vs-dirty-worktree" aria-hidden="true">#</a>2. Classification: Clean vs Dirty Worktree</h3>
+<p>Once a crash is detected, the reconciler checks <code>hasUncommittedChanges(worktreePath)</code> to classify the crash:</p>
+<ul>
+<li><strong>Clean worktree</strong>: Agent crashed before making edits, or successfully committed all changes before crashing</li>
+<li><strong>Dirty worktree</strong>: Agent was mid-edit when it crashed, leaving uncommitted changes</li>
+</ul>
+<p>This classification determines the auto-resume strategy.</p>
+<h3 id="3-recording-the-interrupt"><a class="anchor" href="#3-recording-the-interrupt" aria-hidden="true">#</a>3. Recording the Interrupt</h3>
+<p>The reconciler transitions the task to &#39;interrupted&#39; and records diagnostics:</p>
+<pre><code class="language-typescript">await storage.updateTaskStatus(taskId, &#39;interrupted&#39;, &#39;system&#39;);
+await storage.recordInterrupt(session.id, {
+  reason: exitCodeToReason(exitCode),  // e.g., &quot;OOM killed or SIGKILL (exit code 137)&quot;
+  exit_code: exitCode,
+  logs: runner.getRunLogs(containerName, 50),  // Last 50 lines
+});
+</code></pre>
+<p>The <code>recordInterrupt</code> call increments the <code>consecutive_interruptions</code> counter, which is used by the circuit breaker.</p>
+<h3 id="4-circuit-breaker-check"><a class="anchor" href="#4-circuit-breaker-check" aria-hidden="true">#</a>4. Circuit Breaker Check</h3>
+<p>Before attempting auto-resume, the reconciler checks:</p>
+<pre><code class="language-typescript">if (session.consecutive_interruptions &gt;= MAX_CONSECUTIVE_INTERRUPTIONS) {
+  // MAX_CONSECUTIVE_INTERRUPTIONS = 3
+  logger.warn(&#39;Circuit breaker triggered, not auto-resuming&#39;);
+  return;
+}
+</code></pre>
+<p>If the circuit breaker fires, the task stays in &#39;interrupted&#39; state until a human manually intervenes with <code>lazy resume</code> or <code>lazy unblock</code>.</p>
+<p><strong>Rationale</strong>: Prevents infinite crash loops. If an agent crashes 3 times in a row without completing a turn, something is fundamentally wrong (OOM, broken dependencies, infinite loop, etc.). A human needs to investigate.</p>
+<h3 id="5-auto-resume-clean-worktree-path"><a class="anchor" href="#5-auto-resume-clean-worktree-path" aria-hidden="true">#</a>5. Auto-Resume: Clean Worktree Path</h3>
+<p>If the worktree is clean (no uncommitted changes), the auto-resume flow is:</p>
+<ol>
+<li><p><strong>Resolve parent branch</strong> (same logic as normal unblock):</p>
+<ul>
+<li>For child tasks: parent&#39;s branch (<code>lazy/&lt;parent-ref&gt;</code>)</li>
+<li>For root tasks: <code>task.metadata.remote_target_branch</code> or &#39;main&#39;</li>
+</ul>
+</li>
+<li><p><strong>Merge upstream</strong> (INVARIANT: every unblock merges upstream):</p>
+<ul>
+<li>Set <code>sync_before_work: true</code> in the UnblockCommand</li>
+<li>Supervisor merges parent/main into task branch before agent resumes</li>
+<li>Prevents branch drift (see CLAUDE.md architectural invariants)</li>
+</ul>
+</li>
+<li><p><strong>Build crash context prompt</strong>:</p>
+<pre><code>You are being resumed after a crash. Upstream has been merged into your branch
+since your last turn. Don&#39;t assume your previous state is intact — verify before
+continuing.
+</code></pre>
+</li>
+<li><p><strong>Write UnblockCommand</strong> to protocol directory with:</p>
+<ul>
+<li><code>parent_branch</code> set (for upstream merge)</li>
+<li><code>sync_before_work: true</code></li>
+<li>Crash context prepended to the resume prompt</li>
+</ul>
+</li>
+<li><p><strong>Record synthetic human turn</strong>:</p>
+<pre><code class="language-typescript">await storage.createTurn({
+  sessionId: session.id,
+  sequence: nextSeq,
+  role: &#39;human&#39;,
+  content: &#39;[system] Session interrupted and auto-resumed&#39;,
+  actor: &#39;system&#39;,
+});
+</code></pre>
+</li>
+<li><p><strong>Transition to working</strong>:</p>
+<pre><code class="language-typescript">await storage.setAutoResumed(session.id, true);
+await storage.updateTaskStatus(task.id, &#39;working&#39;, &#39;system&#39;);
+</code></pre>
+</li>
+<li><p><strong>Launch supervisor</strong> (or write command if already running):</p>
+<ul>
+<li>If container exists: just write UnblockCommand, supervisor picks it up</li>
+<li>If container gone: launch new supervisor container</li>
+</ul>
+</li>
+</ol>
+<p>The agent resumes with full Claude Code <code>/resume</code> context (conversation history), but filesystem state reflects the crash — it must verify assumptions before continuing.</p>
+<h3 id="6-auto-resume-dirty-worktree-path"><a class="anchor" href="#6-auto-resume-dirty-worktree-path" aria-hidden="true">#</a>6. Auto-Resume: Dirty Worktree Path</h3>
+<p>If the worktree has uncommitted changes, the auto-resume flow is:</p>
+<ol>
+<li><p><strong>Skip upstream merge</strong>:</p>
+<ul>
+<li>Set <code>sync_before_work: false</code></li>
+<li>Merging upstream on a dirty worktree would fail (<code>git merge</code> refuses) or create confusing state (stashed changes, lost edits)</li>
+</ul>
+</li>
+<li><p><strong>Build crash context prompt</strong>:</p>
+<pre><code>You are being resumed after a crash. There are uncommitted changes in your worktree
+from your interrupted turn. Review them, decide what to keep, commit or discard,
+then continue your work.
+</code></pre>
+</li>
+<li><p><strong>Write UnblockCommand</strong> with:</p>
+<ul>
+<li>No <code>parent_branch</code> (skip merge)</li>
+<li><code>sync_before_work: false</code></li>
+<li>Crash context prepended to resume prompt</li>
+</ul>
+</li>
+<li><p><strong>Record synthetic human turn</strong>, transition to working, launch supervisor** (same as clean path)</p>
+</li>
+</ol>
+<p>The agent resumes and sees uncommitted changes. It must decide what to do with them (commit, discard, edit further) before making progress.</p>
+<h3 id="7-session-resume-and-conversation-context"><a class="anchor" href="#7-session-resume-and-conversation-context" aria-hidden="true">#</a>7. Session Resume and Conversation Context</h3>
+<p>When the supervisor launches, it:</p>
+<ol>
+<li>Looks for the Claude session ID in the sandbox&#39;s <code>.claude/projects/</code> directory</li>
+<li>Passes <code>agent_session_id</code> to the capture layer</li>
+<li>Claude Code&#39;s <code>/resume</code> functionality restores the full conversation history</li>
+</ol>
+<p><strong>Filesystem state depends on crash timing</strong>:</p>
+<ul>
+<li><strong>Crash before any edits</strong>: Worktree clean, no conversation context lost</li>
+<li><strong>Crash mid-edit</strong>: Worktree dirty, conversation context intact, but file edits partially complete</li>
+<li><strong>Crash after commit but before response.json</strong>: Worktree clean (changes committed), conversation context intact, agent picks up from last commit</li>
+</ul>
+<p>The conversation transcript is preserved, but the agent must verify filesystem state — the crash may have interrupted file writes, git operations, or tool calls.</p>
+<h3 id="7b-feedback-redelivery-never-lose-human-feedback"><a class="anchor" href="#7b-feedback-redelivery-never-lose-human-feedback" aria-hidden="true">#</a>7b. Feedback Redelivery (never lose human feedback)</h3>
+<p><strong>INVARIANT (CLAUDE.md)</strong>: a turn whose feedback was recorded but never consumed is
+re-delivered <strong>verbatim</strong> when the task resumes — for <strong>any</strong> crash cause.</p>
+<p>The gap this closes: feedback is persisted <em>before</em> the container launches (save first,
+act second). If the work phase then crashes, the feedback exists in the store but the
+agent never read it. Resuming with the generic &quot;your previous session was interrupted,
+carry on&quot; prompt leaves that feedback available only <em>implicitly</em> via turn-history
+injection — and in practice the agent does not act on it.</p>
+<p><strong>Tracking.</strong> Delivery state lives explicitly on the turn (<code>Turn.feedback_delivery</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>absent</td>
+<td>The turn carries no redeliverable feedback (system resume notices, supervisor <code>sync</code>/<code>nudge</code> turns, stop reasons). Never triggers redelivery.</td>
+</tr>
+<tr>
+<td><code>pending</code></td>
+<td>Feedback is persisted but no agent response has consumed it.</td>
+</tr>
+<tr>
+<td><code>consumed</code></td>
+<td>An agent response completed after this feedback was delivered.</td>
+</tr>
+</tbody></table>
+<p>Turns created with <code>carriesFeedback: true</code> start as <code>pending</code>: the initial task prompt
+(<code>task-launcher</code>), <code>lazy unblock</code>, <code>lazy ask</code>, and auto-delivered comments/CI output
+(<code>auto-deliver</code> — actor <code>system</code>, but the <em>content</em> is human).</p>
+<p><strong>Why an explicit marker and not &quot;is there an agent turn after it?&quot;</strong> Because a crash
+records an agent <em>error</em> turn. That turn consumed nothing, so the positional proxy would
+mask exactly the case redelivery exists for.</p>
+<p><strong>Marking consumed.</strong> <code>storage.markFeedbackConsumed(sessionId)</code> flips every <code>pending</code>
+turn in the session to <code>consumed</code>. It is called wherever an agent response completes
+normally — <code>handleCompletedResponse</code>, the stranded-session recovery, and the ask
+recorder — and deliberately <strong>not</strong> in the error paths. Clearing the whole backlog at
+once is what makes redelivery idempotent: a turn that <em>did</em> consume its feedback can
+never be re-delivered into.</p>
+<p><strong>Redelivering.</strong> Both resume paths (<code>autoResumeTask</code> and <code>lazy resume</code>) call
+<code>findPendingFeedback()</code>; when it returns a turn, the redelivery block <strong>replaces</strong> the
+generic resume context in the prompt. The newest pending turn is reproduced verbatim
+(never summarized or truncated); if older pending turns exist, the prompt says how many
+so a queue is never silently collapsed. The synthetic resume turn itself does <em>not</em>
+carry feedback, so a crash during the resume re-delivers the same feedback again.</p>
+<p>Rows written before this field existed read as &quot;carries no feedback&quot; — the correct
+reading, since resurrecting them now would be a stale redelivery.</p>
+<h3 id="8-three-crash-scenarios-in-detail"><a class="anchor" href="#8-three-crash-scenarios-in-detail" aria-hidden="true">#</a>8. Three Crash Scenarios in Detail</h3>
+<h4 id="scenario-a-crash-before-any-edits"><a class="anchor" href="#scenario-a-crash-before-any-edits" aria-hidden="true">#</a>Scenario A: Crash Before Any Edits</h4>
+<pre><code>Agent starts turn → reads files → analyzes → CRASH
+</code></pre>
+<p><strong>State</strong>:</p>
+<ul>
+<li>Worktree clean (no edits made)</li>
+<li>No commits made this turn</li>
+<li>Conversation history intact (agent read messages, maybe sent partial response)</li>
+</ul>
+<p><strong>Auto-resume flow</strong>:</p>
+<ul>
+<li>Clean worktree path</li>
+<li>Merge upstream</li>
+<li>Agent resumes: &quot;You crashed before making changes. Upstream was merged. Verify assumptions and continue.&quot;</li>
+</ul>
+<h4 id="scenario-b-crash-mid-edit-with-uncommitted-changes"><a class="anchor" href="#scenario-b-crash-mid-edit-with-uncommitted-changes" aria-hidden="true">#</a>Scenario B: Crash Mid-Edit with Uncommitted Changes</h4>
+<pre><code>Agent starts turn → edits file A → edits file B → CRASH (file B half-written)
+</code></pre>
+<p><strong>State</strong>:</p>
+<ul>
+<li>Worktree dirty (file A fully edited, file B partially edited)</li>
+<li>No commits made</li>
+<li>Conversation history intact (agent may have sent tool calls for edits)</li>
+</ul>
+<p><strong>Auto-resume flow</strong>:</p>
+<ul>
+<li>Dirty worktree path</li>
+<li>Skip upstream merge</li>
+<li>Agent resumes: &quot;You crashed with uncommitted changes. Review them (file A done, file B partial). Commit, fix, or discard.&quot;</li>
+</ul>
+<h4 id="scenario-c-crash-after-commit-but-before-responsejson"><a class="anchor" href="#scenario-c-crash-after-commit-but-before-responsejson" aria-hidden="true">#</a>Scenario C: Crash After Commit But Before response.json</h4>
+<pre><code>Agent starts turn → edits files → commits → CRASH (before writing response.json)
+</code></pre>
+<p><strong>State</strong>:</p>
+<ul>
+<li>Worktree clean (changes committed)</li>
+<li>Commits exist on branch</li>
+<li>Conversation history intact but response may be incomplete</li>
+<li>No response.json written → reconciler doesn&#39;t know about the commit yet</li>
+</ul>
+<p><strong>Auto-resume flow</strong>:</p>
+<ul>
+<li>Clean worktree path</li>
+<li>Merge upstream</li>
+<li>Agent resumes: &quot;You crashed after committing. Upstream was merged. Your commit is on the branch. Verify and continue.&quot;</li>
+</ul>
+<p><strong>Reconciler behavior</strong>: On next successful turn, the reconciler will detect the &quot;new&quot; commit (it compares session.git_start_sha with current HEAD) and record it.</p>
+<h3 id="9-special-cases-and-edge-cases"><a class="anchor" href="#9-special-cases-and-edge-cases" aria-hidden="true">#</a>9. Special Cases and Edge Cases</h3>
+<h4 id="merge-and-fix-failures"><a class="anchor" href="#merge-and-fix-failures" aria-hidden="true">#</a>Merge-and-Fix Failures</h4>
+<p>If the supervisor crashes during the <code>merge_and_fix</code> phase (upstream merge failed with conflicts), auto-resume is <strong>disabled</strong>:</p>
+<pre><code class="language-typescript">if (response.phase === &#39;merge_and_fix&#39;) {
+  logger.warn(&#39;merge-and-fix failed, not auto-resuming (task needs human investigation)&#39;);
+  // Task stays interrupted
+}
+</code></pre>
+<p><strong>Rationale</strong>: The task cannot make progress without a successful upstream merge. Auto-resuming would start a new turn on a stale branch, diverging further from upstream. A human must investigate the merge conflict.</p>
+<h4 id="error-responses"><a class="anchor" href="#error-responses" aria-hidden="true">#</a>Error Responses</h4>
+<p>The supervisor can write an error response.json (instead of a completed response):</p>
+<pre><code class="language-json">{
+  &quot;status&quot;: &quot;error&quot;,
+  &quot;phase&quot;: &quot;capture&quot; | &quot;merge_and_fix&quot; | &quot;supervisor&quot;,
+  &quot;error&quot;: &quot;...&quot;,
+  &quot;exit_code&quot;: 137,
+  &quot;stderr&quot;: &quot;...&quot;
+}
+</code></pre>
+<p>When the reconciler sees an error response:</p>
+<ol>
+<li>Record agent error turn (visible in <code>lazy show</code>)</li>
+<li>Transition to interrupted</li>
+<li>Record interrupt diagnostics</li>
+<li>Auto-resume if allowed (unless merge-and-fix failure)</li>
+</ol>
+<p>This gives visibility into crash details while still attempting recovery.</p>
+<h4 id="interrupted-response-sweep-race-condition-fix"><a class="anchor" href="#interrupted-response-sweep-race-condition-fix" aria-hidden="true">#</a>Interrupted Response Sweep (Race Condition Fix)</h4>
+<p><strong>Problem</strong>: The reconciler moves a task to &#39;interrupted&#39; due to a supervisor error, but the supervisor may have already picked up the next command (written by <code>lazy resume</code> or <code>lazy unblock</code>) and completed it. The new response.json sits unconsumed because the reconciler only looked at working tasks.</p>
+<p><strong>Solution</strong>: After the primary working task sweep, the reconciler runs a secondary sweep over interrupted tasks:</p>
+<pre><code class="language-typescript">const interruptedTasks = await storage.listTasksWithOptions({ interruptedOnly: true });
+for (const task of interruptedTasks) {
+  const response = readResponse(protoDir);
+  if (response?.status === &#39;completed&#39;) {
+    // Stale response found — process it, transition to blocked
+    await handleCompletedResponse(...);
+  }
+}
+</code></pre>
+<p>This ensures responses are never lost, even when races occur between reconciler and supervisor.</p>
+<h4 id="consecutive-interruptions-counter-reset"><a class="anchor" href="#consecutive-interruptions-counter-reset" aria-hidden="true">#</a>Consecutive Interruptions Counter Reset</h4>
+<p>The <code>consecutive_interruptions</code> counter is reset to 0 when:</p>
+<ul>
+<li>A turn completes successfully (agent writes response.json, reconciler processes it)</li>
+<li>A human manually runs <code>lazy resume</code> or <code>lazy unblock</code> (considered human intervention)</li>
+</ul>
+<p>This means the circuit breaker is lenient: if the agent succeeds once, the counter resets. Only sustained consecutive crashes trigger the breaker.</p>
+<h3 id="10-manual-recovery"><a class="anchor" href="#10-manual-recovery" aria-hidden="true">#</a>10. Manual Recovery</h3>
+<p>If auto-resume fails or the circuit breaker fires, humans can recover manually:</p>
+<ul>
+<li><strong><code>lazy resume &lt;task&gt;</code></strong> — Same as unblock, but without requiring feedback. Resets the consecutive_interruptions counter.</li>
+<li><strong><code>lazy unblock &lt;task&gt; --message &quot;...&quot;</code></strong> — Give feedback and resume. Resets the counter.</li>
+<li><strong><code>lazy pair &lt;task&gt;</code></strong> — Jump into pairing mode to debug interactively.</li>
+<li><strong><code>lazy show &lt;task&gt;</code></strong> — View interrupt diagnostics (exit code, logs, crash reason).</li>
+</ul>
+<p>Interrupt diagnostics are stored in the session:</p>
+<pre><code class="language-typescript">interface Session {
+  interrupt_reason: string | null;        // &quot;OOM killed or SIGKILL (exit code 137)&quot;
+  interrupt_exit_code: number | null;     // 137
+  interrupt_at: number | null;            // timestamp
+  interrupt_logs: string | null;          // last 50 lines of container logs
+  consecutive_interruptions: number;      // circuit breaker counter
+  auto_resumed: boolean;                  // was this session auto-resumed?
+}
+</code></pre>
+<p>This gives humans full visibility into what went wrong.</p>
+<h2 id="code-references"><a class="anchor" href="#code-references" aria-hidden="true">#</a>Code References</h2>
+<p>Key files implementing the state machine and crash recovery:</p>
+<ul>
+<li><strong><code>src/task-state-machine.ts</code></strong> — Centralized state machine: transition table, validation, status classification</li>
+<li><strong><code>src/types/index.ts</code></strong> — TaskStatus type definition, status classification functions (isTerminalStatus, isActiveStatus, isBlockedStatus)</li>
+<li><strong><code>src/utils/reconcile.ts</code></strong> — Main reconciler loop, state transitions, crash detection</li>
+<li><strong><code>src/utils/auto-resume.ts</code></strong> — Auto-resume logic (shared by reconciler and <code>lazy resume</code>)</li>
+<li><strong><code>src/utils/feedback-redelivery.ts</code></strong> — Selecting and rendering unconsumed feedback for redelivery on resume</li>
+<li><strong><code>src/cli/commands/start.ts</code></strong> — backlog → working transition</li>
+<li><strong><code>src/cli/commands/unblock.ts</code></strong> — blocked|interrupted → working transition</li>
+<li><strong><code>src/cli/commands/pair.ts</code></strong> — blocked|conflict|interrupted → pairing transition</li>
+<li><strong><code>src/cli/commands/accept.ts</code></strong> — blocked|interrupted|merging → complete|merging transitions</li>
+<li><strong><code>src/cli/commands/reject.ts</code></strong> — blocked|interrupted → abandoned transition</li>
+<li><strong><code>src/cli/commands/close.ts</code></strong> — blocked|interrupted → abandoned transition</li>
+<li><strong><code>src/cli/commands/reopen.ts</code></strong> — terminal → blocked|backlog transition</li>
+<li><strong><code>src/daemon/progress.ts</code></strong> — Accept phase table, the two phase plans, and the <code>PhaseReporter</code> that emits them</li>
+<li><strong><code>src/cli/phase-display.ts</code></strong> — Renders phase events in the terminal (TTY and plain)</li>
+<li><strong><code>src/storage/interface.ts</code></strong> — Storage methods for status updates, interrupt recording</li>
+</ul>
+<h2 id="testing"><a class="anchor" href="#testing" aria-hidden="true">#</a>Testing</h2>
+<p>State machine behavior is tested in:</p>
+<ul>
+<li><strong><code>test/unit/task-state-machine.test.ts</code></strong> — Centralized transition table, zombie transitions, status classification, reverse lookups</li>
+<li><strong><code>test/e2e/reconcile.test.ts</code></strong> — Reconciler sweeps, crash detection, auto-resume</li>
+<li><strong><code>test/unit/feedback-redelivery.test.ts</code></strong> — Unconsumed-feedback selection and the resume-prompt seam</li>
+<li><strong><code>test/e2e/auto-resume.test.ts</code></strong> — Crash diagnostics, circuit breaker, and feedback redelivery on auto/manual resume</li>
+<li><strong><code>test/unit/merging-status.test.ts</code></strong> — Merging status transitions</li>
+<li><strong><code>test/e2e/pair.test.ts</code></strong> — Pairing state transitions and stale pairing sweep</li>
+<li><strong><code>test/e2e/agent-binary-seam.test.ts</code></strong> — <code>working → blocked</code> and <code>working → interrupted</code> driven by a REAL supervisor: watchdog kills (wind-down keeps the summary and blocks; no-progress interrupts), SIGTERM→SIGKILL escalation, in-turn crash retry, and session resume. Uses the fake-<code>claude</code>-binary seam (<code>setupTestLazy({ fakeClaude: true })</code>) so nothing in <code>src/</code> is mocked — the other e2e suites reach these transitions through a module mock that replaces the supervisor entirely. Also covers the sandbox permission posture (<code>hostPermissionMode: &#39;sandbox&#39;</code>), which needs <code>bwrap</code> and <code>socat</code> on Linux</li>
+<li><strong><code>test/e2e/auto-resume-binary-seam.test.ts</code></strong> — <code>interrupted → working → blocked</code> closed autonomously after a REAL watchdog kill: the reconciler resumes a genuinely crashed turn, the resumed agent receives the crash-context prefix, and unconsumed feedback is re-delivered verbatim. Assertions are on the argv the fake agent actually received, so they cover the prompt as <em>delivered</em>, not as composed — the one step <code>auto-resume.test.ts</code> cannot reach, because it fabricates its crash and stops at <code>command.json</code></li>
+</ul>
+<p>When modifying state transitions, ensure tests cover:</p>
+<ul>
+<li>Valid transitions (should succeed)</li>
+<li>Invalid transitions (should fail or be prevented)</li>
+<li>Reconciler sweeps (should detect and fix inconsistent states)</li>
+<li>Auto-resume circuit breaker (should stop after 3 consecutive crashes)</li>
+<li>Manual recovery paths (should reset circuit breaker)</li>
+</ul>
+
+</main>
+</body>
+</html>

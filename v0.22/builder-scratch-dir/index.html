@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Builder scratch dir — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="builder-scratch-dir"><a class="anchor" href="#builder-scratch-dir" aria-hidden="true">#</a>Builder scratch dir</h1>
+<p>A writable, host-accessible directory the builder can use for artifacts it wants
+to hand to you — and nothing else.</p>
+<pre><code>~/.lazy/scratch/&lt;project-slug&gt;/
+</code></pre>
+<p>The builder sees the path in <code>$LAZY_SCRATCH_DIR</code>. You see it at the <strong>same
+absolute path</strong> on the host.</p>
+<h2 id="why-it-exists"><a class="anchor" href="#why-it-exists" aria-hidden="true">#</a>Why it exists</h2>
+<p>The repository is bind-mounted <strong>read-only</strong> into builder containers, and the
+host builder runs under an OS sandbox confined to the worktree. That is
+deliberate: the builder&#39;s job is prompts and review, not implementation, so it
+must not be able to do work in the git tree.</p>
+<p>The side effect was that the builder had nowhere to put anything. Yet artifacts
+are genuinely useful:</p>
+<ul>
+<li>a long accept/review message you then pass through:
+<code>lazy accept &lt;task&gt; --message &quot;$(cat ~/.lazy/scratch/&lt;slug&gt;/accept-&lt;task&gt;.md)&quot;</code></li>
+<li>a throwaway analysis script</li>
+<li>a draft document</li>
+<li>a data dump for you to read</li>
+</ul>
+<p>The scratch dir is that place.</p>
+<h2 id="the-boundary-builder--human-never-builder--agent"><a class="anchor" href="#the-boundary-builder--human-never-builder--agent" aria-hidden="true">#</a>The boundary: builder ↔ human, never builder ↔ agent</h2>
+<p><strong>This directory is a scratchpad for the builder and for data exchange with
+you. It is not a channel to agents.</strong> If the builder had a writable place task
+agents could also see, the builder would start writing code there and telling
+agents to copy it in — dissolving the builder/agent separation the whole system
+depends on. An agent-visible scratch dir is worse than no scratch dir.</p>
+<p>There is no builder→agent handoff area, and none is planned.</p>
+<p>Two properties enforce this, structurally rather than by convention:</p>
+<ol>
+<li><strong>It can never be committed.</strong> It is not inside any git tree — not
+<code>.lazy/</code>, not the worktree, not the repo at all. There is no <code>.gitignore</code>
+entry to forget, edit, or override with <code>git add -f</code>.</li>
+<li><strong>No agent can read it.</strong><ul>
+<li><p><strong>Container agents:</strong> no agent launch path mounts it, and nothing is
+reachable in a container that is not mounted. A custom <code>[[mounts]]</code> entry
+in lazy.toml whose <code>source</code> is (or contains) the scratch base dir is
+refused with an error naming the entry — the same treatment lazy&#39;s daemon
+state directory gets, and for the same kind of reason.</p>
+</li>
+<li><p><strong>Host-process agents:</strong> these share one filesystem with the builder, so
+the entire scratch <strong>base</strong> dir (<code>~/.lazy/scratch</code>, every project&#39;s) is
+added to the agent&#39;s <code>denyRead</code>/<code>denyWrite</code> lists — both the OS sandbox
+(which governs Bash) and <code>permissions.deny</code> (which governs the Read, Write
+and Edit tools).</p>
+<p>Caveat, stated plainly: this holds under <code>permission_mode = &quot;sandbox&quot;</code>, the
+default. Under <code>permission_mode = &quot;bypass&quot;</code> the host runner has no
+filesystem boundary of any kind — that is what the mode means, and the
+builder warns about it at launch.</p>
+</li>
+</ul>
+</li>
+</ol>
+<p>Both properties are pinned by tests. <code>test/unit/builder-scratch-mount.test.ts</code>
+asserts that every agent container argv is free of the scratch dir and that the
+deny lists carry it; <code>test/e2e/builder-scratch.test.ts</code> asserts that git cannot
+see it and that no agent worktree path is below it. Making the scratch dir
+reachable by agents is a design reversal, not a test edit.</p>
+<h2 id="both-builder-runners-same-contract"><a class="anchor" href="#both-builder-runners-same-contract" aria-hidden="true">#</a>Both builder runners, same contract</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>container runner (<code>docker</code> / <code>podman</code>)</th>
+<th>host-process runner</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Availability</td>
+<td>bind-mounted read-write at the identical host path</td>
+<td>already on the same filesystem; passed as a workspace dir via <code>--add-dir</code></td>
+</tr>
+<tr>
+<td>Path</td>
+<td><code>$LAZY_SCRATCH_DIR</code></td>
+<td><code>$LAZY_SCRATCH_DIR</code></td>
+</tr>
+<tr>
+<td>Writable under the sandbox</td>
+<td>n/a</td>
+<td>yes, in both <code>sandbox</code> and <code>bypass</code> modes</td>
+</tr>
+</tbody></table>
+<p>The path is derived from the project root alone — no config key, no lazy.toml
+setting — so both runners compute the identical path and cannot drift apart. A
+capability that exists only under one runner is worse than no capability,
+because the builder cannot tell which one it has.</p>
+<p>The directory is created mode <code>0777</code> before every builder launch. A builder
+<em>container</em> writes as the image&#39;s <code>user</code> account, whose uid need not match
+yours; the bind mount carries host ownership through, so a <code>0700</code> dir would be
+silently unwritable inside the container on any host where the uids differ.
+Repair only ever widens the bits — if you set the sticky bit (<code>chmod 1777</code>) by
+hand on a multi-user machine, lazy leaves it alone.</p>
+<h2 id="finding-it"><a class="anchor" href="#finding-it" aria-hidden="true">#</a>Finding it</h2>
+<pre><code>lazy system status     # names the path
+lazy doctor            # names the path, item count and total size
+</code></pre>
+<p>The builder also prints the path at launch, and its system prompt tells it to
+give you the full path whenever it leaves something there.</p>
+<h2 id="lifecycle"><a class="anchor" href="#lifecycle" aria-hidden="true">#</a>Lifecycle</h2>
+<p><strong>Persistent, never auto-wiped.</strong> You may read an artifact hours or days after
+the builder session that wrote it has ended, so nothing in lazy prunes this
+directory — not <code>lazy doctor</code>, not <code>lazy system status</code>, not a new builder
+session.</p>
+<p>Cleanup is yours:</p>
+<pre><code>rm -rf ~/.lazy/scratch/&lt;project-slug&gt;/*
+</code></pre>
+<p><code>lazy doctor</code> reports the size on every run and adds that hint once the
+directory passes 100 MB.</p>
+<h2 id="overriding-the-location"><a class="anchor" href="#overriding-the-location" aria-hidden="true">#</a>Overriding the location</h2>
+<p><code>LAZY_SCRATCH_BASE_DIR</code> relocates the base directory for every project at once
+— the same seam, and for the same reason, as <code>LAZY_DAEMON_BASE_DIR</code> for daemon
+state. The test harness sets it so a test run never touches your real scratch
+dirs. There is no lazy.toml key: see &quot;Both builder runners&quot; above for why the
+path must stay a pure function of the project root.</p>
+
+</main>
+</body>
+</html>

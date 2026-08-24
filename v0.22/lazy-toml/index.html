@@ -1,0 +1,1626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lazy.toml Configuration Reference — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="lazytoml-configuration-reference"><a class="anchor" href="#lazytoml-configuration-reference" aria-hidden="true">#</a>lazy.toml Configuration Reference</h1>
+<p><code>lazy.toml</code> is the project-level configuration file for Lazy. It lives at the root of your git repository and is created by <code>lazy init</code>.</p>
+<p>You can override the config filename with the <code>LAZY_CONFIG</code> environment variable (e.g., <code>LAZY_CONFIG=lazy.lima.toml lazy list</code>). If <code>LAZY_CONFIG</code> is an absolute path, it is used directly; otherwise lazy walks up from the current directory looking for the file. Worktrees can carry their own <code>lazy.toml</code> this way.</p>
+<p>If <code>LAZY_CONFIG</code> is set but points to a file that doesn&#39;t exist, lazy fails hard rather than silently falling back to defaults.</p>
+<h2 id="if-lazytoml-doesnt-parse"><a class="anchor" href="#if-lazytoml-doesnt-parse" aria-hidden="true">#</a>If lazy.toml doesn&#39;t parse</h2>
+<p>A missing <code>lazy.toml</code> is a normal condition — lazy uses its defaults. A <code>lazy.toml</code> that <strong>exists but doesn&#39;t parse</strong> is not: lazy fails hard with the offending line and stops, rather than falling back to defaults. Falling back would discard every setting in the file at once and leave lazy running on defaults that look deliberate — a duplicate <code>[runner]</code> table would mean agents ran in Docker while the file plainly said host-process.</p>
+<p>The most common cause is a <strong>duplicate table</strong>. <code>lazy init</code> already writes <code>[runner]</code>, <code>[server]</code>, <code>[storage]</code>, <code>[remote]</code>, <code>[docker]</code> and others, so appending a second copy of one is a TOML redefinition error. Edit the table that is already there instead of adding another one.</p>
+<p><strong>The daemon refuses to start on such a config</strong>, whether it failed to parse or was rejected for an invalid value — it fails before the dashboard port is bound, with an error naming the file and the cause, and tears down what it had already opened — the control socket, the lock — so a refused start leaves nothing listening and nothing to clean up by hand. It reads the dashboard port, the bind interface, and the runner from this file and hands the last of those to every task it launches, so starting on guessed values would serve a dashboard on a port you did not configure with a runner you may not have. This joins the daemon&#39;s other hard startup preconditions — the credential gate and the <a href="#proxy">proxy bind</a>.</p>
+<p><code>lazy doctor</code> is the exception that keeps working: it reports the parse failure as a failed <code>lazy.toml parses</code> check and skips every config-dependent check rather than reporting defaults as if you had chosen them. It keeps working <em>without a daemon</em>, too — every other command auto-starts one and fails when that start fails, but doctor prints why the daemon isn&#39;t there and runs its remaining checks anyway. It is the command you reach for when nothing else runs, so it must not die of the thing it is meant to diagnose.</p>
+<hr>
+<h2 id="models"><a class="anchor" href="#models" aria-hidden="true">#</a><code>[models]</code></h2>
+<p>Controls which AI model agents use by default.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>default</code></td>
+<td><code>string</code></td>
+<td><code>&quot;claude-sonnet-4-5-20250929&quot;</code></td>
+<td>Default model for sessions.</td>
+</tr>
+</tbody></table>
+<p>Values are raw model IDs — examples: <code>&quot;claude-sonnet-4-5-20250929&quot;</code>, <code>&quot;claude-opus-4-7&quot;</code>, <code>&quot;qwen3.5:35b-a3b-coding-nvfp4&quot;</code>.</p>
+<pre><code class="language-toml">[models]
+default = &quot;claude-opus-4-7&quot;
+</code></pre>
+<p><strong><code>default</code> is an Anthropic model name, so it applies only to agents that speak
+Anthropic model names.</strong> An agent may declare its own default instead: a Cursor
+task with no explicit model runs Cursor&#39;s <code>auto</code> (Cursor picks the model), not
+<code>models.default</code> — lazy&#39;s default is chosen for Claude Code and means nothing to
+Cursor&#39;s registry. An explicit per-task model (<code>lazy start --model</code>, the task&#39;s
+<code>model</code>, the previous turn&#39;s sticky model) still wins over the agent&#39;s default,
+and so does a pinned <code>ollama</code>/<code>proxy</code> model. Full precedence:</p>
+<ol>
+<li><code>--model</code> on the command</li>
+<li>The task&#39;s model / previous turn&#39;s sticky model, or a pinned <code>ollama</code>/<code>proxy</code> model</li>
+<li>The agent&#39;s own default (Cursor: <code>auto</code>; Claude Code declares none)</li>
+<li><code>models.default</code></li>
+</ol>
+<h3 id="modelsroles--per-role-model-targets"><a class="anchor" href="#modelsroles--per-role-model-targets" aria-hidden="true">#</a><code>[models.roles.*]</code> — per-role model targets</h3>
+<p>Lazy distinguishes two model <strong>roles</strong>: the interactive <strong>builder</strong> (<code>lazy builder</code>, <code>lazy pair</code>, <code>lazy chat</code>) and the <strong>agent</strong> that runs tasks (the task supervisor and all auto-triggered turns). The <code>[models.roles.builder]</code> and <code>[models.roles.agent]</code> tables let each role run against a different <strong>backend</strong>, so you can — for example — keep the builder on real Anthropic while task agents run on a local Ollama model.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>backend</code></td>
+<td><code>string</code></td>
+<td><code>&quot;anthropic&quot;</code></td>
+<td>One of <code>&quot;anthropic&quot;</code>, <code>&quot;ollama&quot;</code>, or <code>&quot;proxy&quot;</code>. All three are Anthropic-native targets — lazy never translates between API shapes.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Model passed to the agent via <code>--model</code>. <strong>Required</strong> for <code>ollama</code>/<code>proxy</code>. For <code>anthropic</code>, an empty value means &quot;use the normal model chain / <code>models.default</code>&quot;.</td>
+</tr>
+<tr>
+<td><code>endpoint</code></td>
+<td><code>string</code></td>
+<td>see below</td>
+<td>The upstream <strong>lazy&#39;s proxy forwards this role to</strong> — never an address the agent dials. For <code>ollama</code> it defaults to <code>http://localhost:11434</code>. Optional for <code>proxy</code> (empty = the proxy&#39;s primary upstream). Ignored for <code>anthropic</code>.</td>
+</tr>
+</tbody></table>
+<p><strong>Backends:</strong></p>
+<ul>
+<li><code>anthropic</code> — the real Anthropic API (whatever <code>CLAUDE_CODE_OAUTH_TOKEN</code> / <code>ANTHROPIC_API_KEY</code> point at). This is the default for any role you don&#39;t configure.</li>
+<li><code>ollama</code> — a local Ollama instance serving the Anthropic Messages API. The proxy forwards this role&#39;s traffic to it and presents <strong>no credential</strong> (Ollama ignores auth, and shipping your Anthropic token to a local process would leak it); the configured <code>model</code> is authoritative.</li>
+<li><code>proxy</code> — another Anthropic-compatible endpoint, which the proxy forwards this role&#39;s traffic to with your real Anthropic credential. Leave <code>endpoint</code> empty and it behaves exactly like <code>anthropic</code>.</li>
+</ul>
+<p><strong>The backend chooses the upstream, never whether the role is proxied.</strong> Every role&#39;s traffic goes through lazy&#39;s audit/policy proxy — including <code>ollama</code> roles and roles pinned at an explicit <code>endpoint</code>. The agent is always handed the proxy&#39;s address; where the request goes next is the proxy&#39;s routing decision, made from the authenticated per-launch credential it was presented with. See <a href="#proxy"><code>[proxy]</code></a>.</p>
+<p><strong>How a role resolves to a backend</strong> (precedence, highest first):</p>
+<ol>
+<li>An explicit <code>[models.roles.&lt;role&gt;]</code> table.</li>
+<li>The legacy <code>[ollama]</code> block (see <a href="#ollama"><code>[ollama]</code></a>), which maps to <strong>all roles → ollama</strong> when enabled.</li>
+<li>The <code>anthropic</code> default — i.e. <code>models.default</code> / the normal model chain.</li>
+</ol>
+<p>For the <code>anthropic</code> backend, an explicit <code>--model</code> flag, the previous turn&#39;s sticky model, or the task&#39;s model still take precedence over <code>models.default</code> as before. For <code>ollama</code>/<code>proxy</code> the configured <code>model</code> is <strong>authoritative and never silently substituted</strong> — a logical alias like <code>&quot;claude-opus-4-8&quot;</code> does not exist in those registries, so it is intentionally ignored. (Local backends only work through the Claude Code agent; any other agent forces the <code>anthropic</code> path regardless of config.)</p>
+<p><strong>Guardrails (fail hard, no silent fallback):</strong></p>
+<ul>
+<li>Invalid <code>backend</code>, or an <code>ollama</code>/<code>proxy</code> role missing its <code>model</code>, is rejected at config load with an actionable error.</li>
+<li>Before every launch lazy <strong>preflights</strong> the role&#39;s backend for reachability. If a local backend is unreachable, the launch fails with an actionable error — lazy <strong>never</strong> silently falls back to a different backend.</li>
+<li>Unresolvable model names surface loudly (e.g. Ollama&#39;s <code>404 model not found</code>) rather than being quietly swapped.</li>
+</ul>
+<p><strong><code>endpoint</code> is host-perspective.</strong> The proxy runs inside the daemon, which is a host process, so it makes the upstream call from the host. Write <code>endpoint</code> the way the host reaches the service: <code>http://localhost:11434</code>, a LAN IP, a real DNS name.</p>
+<blockquote>
+<p><strong>Migration note.</strong> <code>endpoint</code> used to be an address the <em>agent</em> dialed, so it was normally written from the container&#39;s point of view — <code>http://host.docker.internal:11434</code>. That alias resolves only inside a container, and the caller is the proxy now, so lazy reads any <code>host.docker.internal</code> endpoint as <code>localhost</code> (the same service, from the host) and <strong>warns</strong> when it does, naming the value it read. Update the endpoint to its host-side spelling to clear the warning. Other hostnames are used exactly as written.</p>
+</blockquote>
+<p>Because there is now only one perspective, there is nothing to translate per launch: container and host launches alike get the proxy&#39;s own address in <code>ANTHROPIC_BASE_URL</code>, and only <em>that</em> address differs between them.</p>
+<pre><code class="language-toml">[models]
+default = &quot;claude-opus-4-7&quot;
+
+# Builder talks to real Anthropic; task agents run on a local Ollama model.
+[models.roles.builder]
+backend = &quot;anthropic&quot;
+model = &quot;claude-opus-4-8&quot;
+
+[models.roles.agent]
+backend = &quot;ollama&quot;
+model = &quot;qwen3.5:35b-a3b-coding-nvfp4&quot;
+endpoint = &quot;http://localhost:11434&quot;
+</code></pre>
+<hr>
+<h2 id="session"><a class="anchor" href="#session" aria-hidden="true">#</a><code>[session]</code></h2>
+<p>Controls session-level behavior and logging.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>verbose</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Show Docker output in real-time during session execution.</td>
+</tr>
+<tr>
+<td><code>debug</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Extra logging for troubleshooting.</td>
+</tr>
+<tr>
+<td><code>auto_commit_instructions</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Include commit guidelines in prompts sent to the agent.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[session]
+verbose = true
+debug = false
+auto_commit_instructions = true
+</code></pre>
+<hr>
+<h2 id="data"><a class="anchor" href="#data" aria-hidden="true">#</a><code>[data]</code></h2>
+<p>Controls where the <code>.lazy</code> directory lives.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>path</code></td>
+<td><code>string</code></td>
+<td><code>&quot;.lazy&quot;</code></td>
+<td>Location of the <code>.lazy</code> directory.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="storage"><a class="anchor" href="#storage" aria-hidden="true">#</a><code>[storage]</code></h2>
+<p>Controls where Lazy persists task state (tasks, sessions, turns, commits, comments).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>backend</code></td>
+<td><code>string</code></td>
+<td><code>&quot;external&quot;</code></td>
+<td>Storage backend: <code>&quot;external&quot;</code> or <code>&quot;postgres&quot;</code>.</td>
+</tr>
+<tr>
+<td><code>external_path</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Path for external storage. Defaults to <code>~/.lazy/&lt;project-name&gt;</code> if empty. Leading <code>~/</code> is expanded at load time.</td>
+</tr>
+<tr>
+<td><code>postgres_ssl</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Enable SSL/TLS for PostgreSQL connections (required for cloud databases like Neon, Supabase).</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[storage]
+backend = &quot;external&quot;
+external_path = &quot;~/.lazy/my-project&quot;
+</code></pre>
+<p>For PostgreSQL, configure the connection via <code>LAZY_POSTGRES_URL</code> or standard <code>PG*</code> environment variables (<code>PGHOST</code>, <code>PGDATABASE</code>, etc.).</p>
+<p>The legacy <code>&quot;in-repo&quot;</code> and <code>&quot;orphan-branch&quot;</code> backends have been removed; lazy fails hard if it sees them and prints migration guidance.</p>
+<hr>
+<h2 id="git"><a class="anchor" href="#git" aria-hidden="true">#</a><code>[git]</code></h2>
+<p>Git-related configuration.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>default_branch_prefix</code></td>
+<td><code>string</code></td>
+<td><code>&quot;lazy&quot;</code></td>
+<td>Prefix for task branches (e.g., <code>lazy/fix-bug</code>).</td>
+</tr>
+<tr>
+<td><code>lfs_check</code></td>
+<td><code>string</code></td>
+<td><code>&quot;refuse&quot;</code></td>
+<td>Start-time git LFS check on repos that use LFS: <code>&quot;refuse&quot;</code> blocks the start when the LFS filter would not run, <code>&quot;warn&quot;</code> starts anyway and records a warning, <code>&quot;off&quot;</code> disables it. Does not affect the accept-time guard, which always runs — see <a href="../lfs-guard/">LFS guard</a>.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="output"><a class="anchor" href="#output" aria-hidden="true">#</a><code>[output]</code></h2>
+<p>Controls CLI output formatting.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>shortid_length</code></td>
+<td><code>number</code></td>
+<td><code>8</code></td>
+<td>Length of shortened IDs displayed in output.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="agent"><a class="anchor" href="#agent" aria-hidden="true">#</a><code>[agent]</code></h2>
+<p>Agent configuration for task execution.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agent_id</code></td>
+<td><code>string</code></td>
+<td><code>&quot;claude-code&quot;</code></td>
+<td>Default agent for task execution. Available: <code>&quot;claude-code&quot;</code>, <code>&quot;cursor&quot;</code> (Cursor CLI). Validated against the agent registry at load time; unknown values are rejected. Switch with <code>lazy system agent set &lt;id&gt;</code> (comment-preserving; takes effect on the next launch, no daemon restart); per-task override via <code>lazy create</code>/<code>start</code>/<code>edit</code>/<code>unblock --agent &lt;id&gt;</code>. This value is the default only for a task created from scratch: a subtask, clone, redo or rework inherits the agent of the task it came from, so a Cursor task&#39;s derivatives stay on Cursor. Switching agents mid-task (via <code>edit</code> or <code>unblock</code>) starts a new session on the new agent; sessions are not migrated between agents. The next prompt includes a distilled copy of the task&#39;s turn history plus a short branch orientation (commits and changed files). Cursor authenticates via <code>lazy system agent set-key cursor</code> (per-project, stored 0600 in <code>~/.lazy/daemon/&lt;slug&gt;/agent-credentials.json</code> — outside the repo, which every task container mounts read-only; read from a masked prompt or piped stdin, never an argument; <code>CURSOR_API_KEY</code> overrides) or <code>cursor-agent login</code> on the host — containers need a key. <code>lazy pair</code> is claude-code only: it refuses on a Cursor task, because a container task&#39;s chat lives inside the sandbox and lazy will not copy agent-written history onto your host — see <a href="../troubleshooting/#lazy-pair-refuses-on-a-cursor-task">troubleshooting</a>.</td>
+</tr>
+<tr>
+<td><code>watchdog_output_timeout_ms</code></td>
+<td><code>number</code></td>
+<td><code>1800000</code></td>
+<td>Hang backstop: kill the agent process after this many ms <strong>without forward progress</strong>. Resets on every completed step, so it bounds a single step, not the turn. A kill that captured nothing (no result, no new commits) is relaunched automatically with backoff; a kill after the agent had captured work stops for a human. <code>0</code> = use agent default (disabled for Claude Code). Default is 30 minutes.</td>
+</tr>
+<tr>
+<td><code>wind_down_timeout_ms</code></td>
+<td><code>number</code></td>
+<td><code>60000</code></td>
+<td>How long to wait for the agent process to exit <em>after</em> it has emitted its final result, before killing it. <code>0</code> = wait indefinitely. Default is 60s.</td>
+</tr>
+<tr>
+<td><code>effort</code></td>
+<td><code>string</code></td>
+<td><code>&quot;medium&quot;</code></td>
+<td>Reasoning effort level passed to Claude Code via <code>--effort</code> for task agents. Valid: <code>&quot;low&quot;</code>, <code>&quot;medium&quot;</code>, <code>&quot;high&quot;</code>, <code>&quot;xhigh&quot;</code>, <code>&quot;max&quot;</code>. Higher levels spend more tokens thinking before responding.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[agent]
+agent_id = &quot;claude-code&quot;
+watchdog_output_timeout_ms = 3600000  # 1 hour without forward progress
+wind_down_timeout_ms = 60000          # 60s to exit after the summary lands
+effort = &quot;medium&quot;
+</code></pre>
+<p><code>lazy start --effort &lt;level&gt;</code> overrides this for a task, and the level then
+<strong>persists on the task</strong> — every later turn uses it. To dial a running task back
+down (or up) between turns, use <code>lazy edit &lt;task&gt; --effort &lt;level&gt;</code> (or the
+<code>effort</code> field of the <code>lazy_edit</code> MCP tool); like <code>--model</code>, it is one of the
+few edits allowed on a task an agent has already worked on, and it takes effect
+on the next turn.</p>
+<h3 id="how-a-turn-is-guarded"><a class="anchor" href="#how-a-turn-is-guarded" aria-hidden="true">#</a>How a turn is guarded</h3>
+<p>The two timeouts above are deliberately different guards, and only one of them
+is ever armed at a time:</p>
+<ul>
+<li><strong>While the agent is working</strong>, <code>watchdog_output_timeout_ms</code> applies. It is a
+hang backstop, not a turn deadline — there is no time limit measured from
+launch, from a commit, or from any other event. For Claude Code the supervisor
+reads the agent&#39;s output stream and resets the timer on every step the agent
+<em>completes</em>, so a turn made of many long steps runs as long as it needs. What
+the value actually bounds is a <strong>single step</strong>: a tool call that runs longer
+than the timeout without finishing is killed. Keep-alive heartbeats emitted
+by a stuck tool call deliberately do <strong>not</strong> reset the timer — a wedged MCP
+call emits one every 30s forever, so counting them as progress would make it
+immortal. Agents that do not stream (Cursor) fall back to &quot;any output counts&quot;.</li>
+<li><strong>After the agent emits its final result</strong>, the work is safe on disk and the
+summary is in hand, so <code>wind_down_timeout_ms</code> gives the CLI a short window to
+exit and then kills it (SIGTERM, then SIGKILL after 5s). A kill here is
+recorded as a <em>successful</em> turn — the summary is preserved.</li>
+</ul>
+<p>Both guards cover merge-conflict resolution turns too: when a sync hits
+conflicts an agent resolves them, and that is an ordinary agent turn.</p>
+<p><code>graceful_exit_timeout_ms</code> is the old name for <code>wind_down_timeout_ms</code> and is
+still read, so existing configs keep working.</p>
+<hr>
+<h2 id="builder"><a class="anchor" href="#builder" aria-hidden="true">#</a><code>[builder]</code></h2>
+<p>Builder session configuration. Builder sessions handle orchestration and planning across tasks.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>effort</code></td>
+<td><code>string</code></td>
+<td><code>&quot;high&quot;</code></td>
+<td>Reasoning effort level passed to Claude Code via <code>--effort</code> for builder sessions. Valid: <code>&quot;low&quot;</code>, <code>&quot;medium&quot;</code>, <code>&quot;high&quot;</code>, <code>&quot;xhigh&quot;</code>, <code>&quot;max&quot;</code>.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[builder]
+effort = &quot;high&quot;
+</code></pre>
+<hr>
+<h2 id="chattiness"><a class="anchor" href="#chattiness" aria-hidden="true">#</a><code>[chattiness]</code></h2>
+<p>Baseline conversational verbosity for the builder and agents — how much they narrate, explain, and elaborate in their replies. This controls <em>communication style only</em>, not how hard the model thinks (that is <code>effort</code>).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>default</code></td>
+<td><code>string</code></td>
+<td>unset</td>
+<td>Shared baseline applied to both the builder and agents. Valid: <code>&quot;terse&quot;</code>, <code>&quot;normal&quot;</code>, <code>&quot;chatty&quot;</code>.</td>
+</tr>
+<tr>
+<td><code>builder</code></td>
+<td><code>string</code></td>
+<td>unset</td>
+<td>Per-role override for builder sessions. Falls back to <code>default</code> when omitted.</td>
+</tr>
+<tr>
+<td><code>agent</code></td>
+<td><code>string</code></td>
+<td>unset</td>
+<td>Per-role override for task agents. Falls back to <code>default</code> when omitted.</td>
+</tr>
+</tbody></table>
+<p>When a role&#39;s effective level is unset (no <code>default</code> and no per-role value), <strong>no verbosity guidance is injected</strong> and behavior is unchanged from before this setting existed.</p>
+<p>The injected guidance is <strong>elastic, not binary</strong>: the configured level is the baseline, and when you ask for more detail the model steps up <em>one notch</em> from that baseline for that reply — not straight to maximum verbosity. At a <code>terse</code> baseline, &quot;tell me more&quot; yields a normal-length explanation, not an exhaustive essay. The guidance is placed near the top of the system prompt so it gets the model&#39;s attention.</p>
+<p>Invalid levels are rejected at config-load time, listing the valid levels.</p>
+<pre><code class="language-toml">[chattiness]
+# Shared baseline for both roles
+default = &quot;normal&quot;
+# Optional per-role overrides
+builder = &quot;chatty&quot;
+agent = &quot;terse&quot;
+</code></pre>
+<hr>
+<h2 id="server"><a class="anchor" href="#server" aria-hidden="true">#</a><code>[server]</code></h2>
+<p>Web dashboard server settings.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>port</code></td>
+<td><code>number</code></td>
+<td><code>26024</code></td>
+<td>Starting port for the web dashboard server. If busy, the daemon tries the next few ports (a bounded window of 20) so several projects can run on one host. If the whole window is occupied — almost always stray daemons squatting the range — startup fails with an actionable error pointing at <code>lazy daemon kill-stray</code> rather than silently binding a far-off port.</td>
+</tr>
+<tr>
+<td><code>bind</code></td>
+<td><code>string</code></td>
+<td><code>&quot;127.0.0.1&quot;</code></td>
+<td>Network interface the daemon&#39;s TCP server binds to. Loopback by default so the unauthenticated dashboard and the <code>/mcp</code> + <code>/rpc</code> endpoints are not reachable from other machines. Set to <code>&quot;0.0.0.0&quot;</code> to expose on all interfaces (opt-in to LAN access — the dashboard is unauthenticated, so the daemon logs a warning). The dashboard URL printed by <code>lazy daemon status</code>/<code>lazy daemon dashboard-url</code> reflects this value; a <code>0.0.0.0</code> bind is shown as <code>127.0.0.1</code> for local convenience.</td>
+</tr>
+<tr>
+<td><code>sync_interval</code></td>
+<td><code>number</code></td>
+<td><code>60</code></td>
+<td>Interval in seconds for the daemon&#39;s background sync. Set to <code>0</code> to disable.</td>
+</tr>
+</tbody></table>
+<p><strong>Native Linux Docker note:</strong> When <code>bind</code> is left at the loopback default and a container runner (<code>docker</code>/<code>podman</code>) is configured, on Linux the daemon <em>additionally</em> binds the detected docker/podman bridge gateway (<code>docker0</code>, typically <code>172.17.0.1</code>) on the same port. This is required because containers reach the host via <code>host.docker.internal</code> → the bridge gateway (a non-loopback interface), which a loopback-only daemon would refuse. The bridge interface is host-local and reachable only from the container network — <strong>not</strong> routable from the LAN — so it does not widen LAN exposure. macOS/Windows Docker Desktop need nothing extra (<code>host.docker.internal</code> is proxied to the host&#39;s loopback). If you set <code>bind</code> explicitly, that value is used as-is with no extra interfaces; if the bridge can&#39;t be detected on Linux the daemon logs an actionable warning rather than letting agents fail to reach it.</p>
+<hr>
+<h2 id="runner"><a class="anchor" href="#runner" aria-hidden="true">#</a><code>[runner]</code></h2>
+<p>Controls how agent containers are executed.</p>
+<p>Can also be specified as a top-level string for backward compatibility (e.g., <code>runner = &quot;docker&quot;</code>), which lazy translates into <code>[runner] type = &quot;...&quot;</code> at load time and warns about.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>type</code></td>
+<td><code>string</code></td>
+<td><code>&quot;docker&quot;</code></td>
+<td>Runner type: <code>&quot;docker&quot;</code>, <code>&quot;podman&quot;</code>, or <code>&quot;dangerously-host-process-without-any-isolation&quot;</code>.</td>
+</tr>
+</tbody></table>
+<p>Docker and Podman modes run agents in isolated containers. Host-process mode runs agents directly on the host so they can use your local toolchain (language servers, project scripts). It is no longer &quot;no isolation&quot; by default — see the host permission posture below.</p>
+<pre><code class="language-toml">[runner]
+type = &quot;docker&quot;
+</code></pre>
+<h3 id="host-permission-posture"><a class="anchor" href="#host-permission-posture" aria-hidden="true">#</a>Host permission posture</h3>
+<p>These keys apply <strong>only</strong> to the host-process runner (<code>type = &quot;dangerously-host-process-without-any-isolation&quot;</code>) and are ignored for Docker/Podman, where the container is the boundary.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>permission_mode</code></td>
+<td><code>string</code></td>
+<td><code>&quot;sandbox&quot;</code></td>
+<td><code>&quot;sandbox&quot;</code> runs host agents/builder under Claude Code&#39;s OS sandbox (Seatbelt on macOS, bubblewrap on Linux/WSL2). <code>&quot;bypass&quot;</code> is the old <code>--dangerously-skip-permissions</code> behavior with <strong>no</strong> sandbox — an explicit opt-in.</td>
+</tr>
+<tr>
+<td><code>sandbox_allowed_domains</code></td>
+<td><code>string[]</code></td>
+<td><code>[&quot;*.anthropic.com&quot;]</code></td>
+<td>Network domains Bash may reach without prompting. See the security note below — this is <strong>not</strong> a hard network wall.</td>
+</tr>
+<tr>
+<td><code>sandbox_deny_read</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Extra paths to deny the Read tool, <strong>merged with</strong> the built-in sensitive defaults (<code>~/.ssh</code>, <code>~/.aws</code>, <code>~/.gnupg</code>, <code>~/.config/gh</code>, shell rc files, <code>~/.claude*</code>, …) — never replacing them.</td>
+</tr>
+<tr>
+<td><code>sandbox_deny_write</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Extra paths to deny the Write/Edit tools, merged with the same sensitive defaults.</td>
+</tr>
+<tr>
+<td><code>sandbox_allow_weaker_nested</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Allow Claude Code&#39;s weaker nested sandbox so bubblewrap can run inside an unprivileged container (no user namespaces). <strong>Considerably weakens isolation</strong> — only enable when an outer container already provides the boundary. No effect on macOS.</td>
+</tr>
+</tbody></table>
+<p>In <code>&quot;sandbox&quot;</code> mode, lazy confines host execution with two OS-enforced boundaries carried in Claude Code&#39;s <code>--settings</code>:</p>
+<ul>
+<li><strong>Headless agents</strong> run sandbox + <code>--dangerously-skip-permissions</code>, so a <code>-p</code> session never hangs on a permission prompt; the OS sandbox is the sole hard boundary for Bash (a write outside the worktree or a connection to a non-allowlisted domain is a tool error, not a prompt), and the <code>dangerouslyDisableSandbox</code> escape hatch is disabled.</li>
+<li><strong>The interactive builder</strong> runs the headless posture by default, because <code>lazy builder</code> is autonomous by default; <code>--no-autonomous</code> opts it back into sandbox + the normal prompt mode, where a human at the terminal can answer a sandbox-escape prompt.</li>
+<li>The <strong>Read/Edit/Write file tools bypass the OS sandbox</strong> (it governs Bash only), so lazy additionally confines them with <code>permissions.deny</code> rules built from the sensitive defaults + your <code>sandbox_deny_read</code>/<code>sandbox_deny_write</code>.</li>
+</ul>
+<blockquote>
+<p><strong>Security note — <code>sandbox_allowed_domains</code> is not a hard network wall.</strong> Under <code>sandbox</code> + bypass it only <em>pre-approves</em> domains so Bash doesn&#39;t prompt; a non-allowlisted domain is still reachable (bypass auto-approves the prompt it would otherwise raise). Treat it as prompt-reduction, not network confinement. Real network confinement needs Claude Code managed settings, which lazy does not currently emit.</p>
+</blockquote>
+<p>On Linux, <code>sandbox</code> mode requires <code>bubblewrap</code> and <code>socat</code>; if they&#39;re missing, host execution fails hard with an actionable install message (no silent fallback to unsandboxed). <code>lazy doctor</code> reports the active posture and, on Linux, checks these dependencies.</p>
+<p>The posture above is verified against real headless sessions by <code>scripts/host-sandbox-probe.sh</code>, which ships with lazy. Run it to check the posture on your own machine.</p>
+<pre><code class="language-toml">[runner]
+type = &quot;dangerously-host-process-without-any-isolation&quot;
+# permission_mode = &quot;sandbox&quot;                      # default; &quot;bypass&quot; = no sandbox
+# sandbox_allowed_domains = [&quot;*.anthropic.com&quot;]    # add registries/git hosts your project needs
+# sandbox_deny_read = []                            # extra Read-tool denials (merged with defaults)
+# sandbox_deny_write = []                           # extra Write/Edit denials (merged with defaults)
+# sandbox_allow_weaker_nested = false               # opt-in for unprivileged containers
+</code></pre>
+<hr>
+<h2 id="remote"><a class="anchor" href="#remote" aria-hidden="true">#</a><code>[remote]</code></h2>
+<p>Remote integration for push, PR/MR creation, and comment syncing.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>driver</code></td>
+<td><code>string</code></td>
+<td><code>&quot;local&quot;</code></td>
+<td>Remote driver: <code>&quot;local&quot;</code>, <code>&quot;github&quot;</code>, or <code>&quot;gitlab&quot;</code>.</td>
+</tr>
+<tr>
+<td><code>git_remote</code></td>
+<td><code>string</code></td>
+<td><code>&quot;origin&quot;</code></td>
+<td>Git remote name. Change if your remote is named differently.</td>
+</tr>
+<tr>
+<td><code>auto_approve</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>If <code>true</code>, <code>lazy accept</code> on a protected target branch submits an approving review before merging. See behavior notes below.</td>
+</tr>
+<tr>
+<td><code>offline</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Permanent offline mode. If <code>true</code>, all remote operations (push, fetch, sync, PR creation) are skipped <strong>indefinitely</strong>. See offline modes below.</td>
+</tr>
+</tbody></table>
+<h3 id="offline-modes"><a class="anchor" href="#offline-modes" aria-hidden="true">#</a>Offline modes</h3>
+<p>There are two ways to be offline, with deliberately different lifetimes:</p>
+<ul>
+<li><p><strong>Temporary — <code>lazy system offline</code></strong> (the command). Records an expiry at the <strong>next local midnight</strong> and auto-recovers: once that instant passes, lazy is online again and the daemon resumes remote ops, with no manual <code>lazy system online</code>. This prevents the common failure of forgetting to come back online and silently staying stranded. The expiry/countdown is always shown by the command, <code>lazy system status</code>, <code>lazy doctor</code>, and <code>lazy config get offline</code> (e.g. <code>OFFLINE — auto-resumes in 6h (00:00 local)</code>). Run <code>lazy system online</code> to restore remote ops sooner.</p>
+</li>
+<li><p><strong>Permanent — <code>offline = true</code></strong> (this config flag). For projects that genuinely want to stay offline (air-gapped, Ollama-only, etc.). It is <strong>not</strong> subject to the midnight auto-expiry — it stays in effect until you remove the flag. <code>lazy system online</code> will <strong>not</strong> clear it (it never rewrites your <code>lazy.toml</code>); remove <code>offline = true</code> from <code>[remote]</code> to go back online.</p>
+</li>
+</ul>
+<p>Under either mode, <code>lazy start</code> branches a task from the <strong>local</strong> parent/integration branch — it skips the remote fetch entirely (mirroring <code>lazy sync</code>), so starting a task whose parent branch only exists locally (e.g. created earlier while offline and never pushed) works without error. When you are <strong>online</strong> and a parent ref genuinely isn&#39;t on the remote, <code>lazy start --force-local</code> (CLI) or the <code>force_local</code> param on the <code>lazy_start</code> MCP tool starts from the parent&#39;s local HEAD instead of failing.</p>
+<p>For a <strong>top-level task created with <code>--parent &lt;branch&gt;</code></strong>, <code>--force-local</code> means <em>that branch&#39;s</em> local ref — never whatever the repository currently has checked out. If the stored target branch cannot be resolved at all (deleted, renamed, or never created locally), <code>lazy start</code> fails and names the branch rather than silently basing the task on the repository default; fetch or restore the branch, or retarget the task with <code>lazy reparent &lt;task&gt; &lt;parent&gt;</code>.</p>
+<h3 id="auto_approve-on-protected-branches"><a class="anchor" href="#auto_approve-on-protected-branches" aria-hidden="true">#</a><code>auto_approve</code> on protected branches</h3>
+<p>When the target branch (usually <code>main</code>) has protection rules requiring approval, the accept path has two modes:</p>
+<ul>
+<li><strong><code>auto_approve = false</code> (default)</strong>: lazy requires an <em>external</em> approval to exist on the PR/MR before merging. Without one, <code>lazy accept</code> fails with a <code>409</code> and tells you to run <code>lazy submit</code> and wait for review.</li>
+<li><strong><code>auto_approve = true</code></strong>: lazy submits its own approving review immediately before evaluating the merge gates, and skips the <code>reviews</code> gate when computing whether the accept is blocked (because the approval may not have propagated through the forge API yet). This is aimed at sole developers who don&#39;t want to manually approve their own MRs. It does <strong>not</strong> bypass other gates (CI checks, unresolved threads, merge conflicts) — those still block the accept.</li>
+</ul>
+<p>Use <code>auto_approve = true</code> only when self-approval is acceptable by your team and forge policy.</p>
+<h3 id="github-specific-options"><a class="anchor" href="#github-specific-options" aria-hidden="true">#</a>GitHub-specific options</h3>
+<p>Available when <code>driver = &quot;github&quot;</code>. Authentication is handled by <code>gh</code> CLI (<code>gh auth login</code>).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>github_auto_push</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Automatically push after each agent turn.</td>
+</tr>
+<tr>
+<td><code>github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Sync PR comments in public repos. <strong>Security risk</strong> — enables prompt injection via public comments.</td>
+</tr>
+</tbody></table>
+<h4 id="github-enterprise-server"><a class="anchor" href="#github-enterprise-server" aria-hidden="true">#</a>GitHub Enterprise Server</h4>
+<p><code>driver = &quot;github&quot;</code> also works against a GitHub Enterprise Server install — the
+remote&#39;s hostname is read from the git remote, so <code>git@github.mycorp.com:team/app.git</code>
+and <code>https://github.internal.example/team/app.git</code> resolve to <code>team/app</code> on that
+host. Authenticate <code>gh</code> against the install first:</p>
+<pre><code class="language-bash">gh auth login --hostname github.mycorp.com
+</code></pre>
+<p>Nothing in <code>lazy.toml</code> needs to name the host. <code>lazy doctor</code> verifies that <code>gh</code>
+is logged into <em>that</em> host specifically — <code>gh auth status</code> on its own exits 0
+whenever gh is logged into any host, which on an Enterprise remote is usually
+github.com — and fails the check by name if it is not:</p>
+<pre><code>✗ GitHub authentication (github.mycorp.com)
+  gh is not authenticated to github.mycorp.com, the host of remote &#39;origin&#39;. Run: gh auth login --hostname github.mycorp.com
+</code></pre>
+<p>Note that <code>gh</code> resolves a bare <code>owner/repo</code> and all <code>gh api</code> requests against
+<em>its</em> default host, so if you are logged into both github.com and an Enterprise
+install, lazy pins the Enterprise host explicitly on every call it makes, but
+ad-hoc <code>gh</code> commands you run yourself will not be.</p>
+<h3 id="gitlab-specific-options"><a class="anchor" href="#gitlab-specific-options" aria-hidden="true">#</a>GitLab-specific options</h3>
+<p>Available when <code>driver = &quot;gitlab&quot;</code>. Authentication is handled by <code>glab</code> CLI (<code>glab auth login</code>).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>gitlab_auto_push</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Automatically push after each agent turn.</td>
+</tr>
+<tr>
+<td><code>gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Sync MR comments in public repos. <strong>Security risk</strong> — enables prompt injection via public comments.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[remote]
+driver = &quot;github&quot;
+git_remote = &quot;origin&quot;
+auto_approve = false
+# offline = true   # stay offline permanently (no midnight auto-expiry)
+github_auto_push = true
+</code></pre>
+<p>The driver-specific keys (<code>github_*</code>, <code>gitlab_*</code>) are always valid at the schema level — lazy won&#39;t warn about GitHub keys while you&#39;re temporarily using the <code>local</code> driver.</p>
+<p>The legacy <code>[remote_github]</code> section is no longer supported; lazy fails hard if it sees one and tells you to move the keys under <code>[remote]</code> with a <code>github_</code> prefix.</p>
+<hr>
+<h2 id="docker"><a class="anchor" href="#docker" aria-hidden="true">#</a><code>[docker]</code></h2>
+<p>Docker image configuration for agent containers.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>dockerfile</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Path to a custom Dockerfile, relative to the project root. If empty, lazy uses the base image (Ubuntu with Claude Code + passwordless sudo). Agents install what they need via <code>apt-get</code>.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[docker]
+dockerfile = &quot;Dockerfile.lazy&quot;
+</code></pre>
+<p>The path always resolves against the <strong>project root</strong> — a task worktree&#39;s copy of the Dockerfile never governs the image (task branches are agent-writable, and an image derived from one would let an agent&#39;s Dockerfile edits execute as build steps on the host).</p>
+<p>To build from a different file — typically a source branch&#39;s <code>Dockerfile.lazy</code> you want to test before it merges, or an e2e fixture — export <strong><code>LAZY_DOCKERFILE_LAZY</code></strong> (same family as <code>LAZY_CONFIG</code>): an absolute path is used verbatim, a relative one resolves against the project root. It overrides <code>dockerfile</code> for every command uniformly, forces custom-image mode even when <code>dockerfile</code> is empty, and reaches the daemon by ordinary environment inheritance — so export it, run <code>lazy upgrade</code>, and the build and every subsequent container launch agree on the file. A daemon started <em>without</em> the variable keeps ignoring it until restarted (<code>lazy upgrade</code> restarts it for you). <code>lazy upgrade</code> prints the exact <code>Config:</code> and <code>Dockerfile:</code> paths it reads, marking the override, so the source is always visible; a set-but-missing path is a hard error naming the variable. When you run <code>lazy upgrade</code> interactively from a task worktree whose <code>Dockerfile.lazy</code> differs from the root&#39;s, lazy asks whether to set the override for that run (skipped without a TTY).</p>
+<hr>
+<h2 id="ollama"><a class="anchor" href="#ollama" aria-hidden="true">#</a><code>[ollama]</code></h2>
+<p>Use a local Ollama instance for model inference instead of Anthropic&#39;s API. Requires Ollama v0.14+ running on the host with the Anthropic Messages API enabled.</p>
+<blockquote>
+<p><strong>Legacy / backward compatibility.</strong> When <code>enabled = true</code>, this block maps to <strong>all roles → ollama</strong> (both the builder and task agents). It is kept so existing configs keep working. For finer-grained control — e.g. the builder on Anthropic and agents on Ollama, or a <code>proxy</code> backend — prefer the per-role <a href="#modelsroles--per-role-model-targets"><code>[models.roles.*]</code></a> tables, which override this block for any role they set.</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Route agent inference through Ollama.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Model name passed to the agent via <code>--model</code> (e.g., <code>&quot;qwen3.5:35b-a3b-coding-nvfp4&quot;</code>). Required when <code>enabled = true</code> — lazy rejects the config at load time if it&#39;s empty.</td>
+</tr>
+<tr>
+<td><code>endpoint</code></td>
+<td><code>string</code></td>
+<td><code>&quot;http://localhost:11434&quot;</code></td>
+<td>Ollama API endpoint, as <strong>lazy&#39;s proxy</strong> reaches it from the host — the agent never dials it. A container-perspective <code>host.docker.internal</code> spelling is read as <code>localhost</code> with a warning; see the migration note under <a href="#modelsroles--per-role-model-targets"><code>[models.roles.*]</code></a>.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[ollama]
+enabled = true
+model = &quot;qwen3.5:35b-a3b-coding-nvfp4&quot;
+endpoint = &quot;http://localhost:11434&quot;
+</code></pre>
+<p><strong>Interaction with the daemon credential gate.</strong> The daemon refuses to start without a model credential (<code>CLAUDE_CODE_OAUTH_TOKEN</code> or <code>ANTHROPIC_API_KEY</code>) on every start path — explicit start, restart, upgrade, and the auto-start that fires on any <code>lazy</code> command — because it launches task containers that inherit its credential. <code>enabled = true</code> here is the documented escape hatch: Ollama-backed setups use local dummy credentials, so the gate is skipped entirely, matching <code>runner.checkAvailability()</code>. Note the gate reads <strong>this block only</strong> — a per-role <code>[models.roles.*]</code> table with <code>backend = &quot;ollama&quot;</code> and no <code>[ollama] enabled = true</code> still requires a credential in the daemon&#39;s environment. The check is presence-only and never calls the API (a blank value counts as absent); see <code>src/daemon/credential-gate.ts</code> for the rationale. Because it never calls the API, a credential that is present but <em>expired</em> passes the gate — the daemon starts and then every request 401s. <code>lazy doctor</code> covers that half: it reads the proxy&#39;s audit trail and reports a 401/403 that nothing has succeeded after, with the steps to re-mint. Both halves report on the <strong>daemon&#39;s</strong> environment, not the shell you happen to run <code>lazy doctor</code> in: the presence check asks the daemon over RPC (which returns presence and the variable <em>name</em>, never the credential itself) and labels the source it used — <code>daemon env: …</code>, or <code>shell env: …</code> plus a caveat when the daemon could not be asked.</p>
+<hr>
+<h2 id="proxy"><a class="anchor" href="#proxy" aria-hidden="true">#</a><code>[proxy]</code></h2>
+<p><strong>The proxy is ALWAYS ON.</strong> It is how lazy runs, the same way the daemon is: with <strong>no <code>[proxy]</code> section at all</strong>, the daemon starts the built-in Anthropic-native passthrough proxy on an OS-assigned port and routes <strong>all agent model traffic through it</strong>. You do not have to configure anything, and there is no <code>backend = &quot;proxy&quot;</code> to set — an ordinary <code>anthropic</code> role is proxied automatically. This whole section is optional tuning, never an on/off switch.</p>
+<p>What you get by default: SSE responses streamed through untouched, one asynchronously-logged <code>ProxyAuditRecord</code> per request (model, request shape, extracted <code>tool_use</code> blocks — Read/Write paths, Bash commands, WebFetch URLs, inherited <code>mcp__claude_ai_*</code> connectors — and <code>tool_result</code> previews, attributed to the role and task that made the call), plus the mechanistic policy plane over every tool call, with inherited claude.ai connectors denied by default — see <a href="#proxypolicy--mechanistic-enforcement-63-layer-1"><code>[proxy.policy]</code></a>.</p>
+<p><strong>The proxy holds the credential — the agent does not.</strong> Your real API key or OAuth token never leaves the daemon. At launch, lazy mints a per-task <strong>placeholder</strong> credential and puts <em>that</em> in the agent&#39;s environment (and in the container&#39;s <code>docker run</code> argv); the proxy recognises the placeholder, identifies which task and role presented it, and swaps in the real credential just before forwarding upstream. Nothing else about authentication changes — the same account is billed, in the same wire form your client would have used. See <a href="../proxy-jit-credentials/">Just-in-time credential injection</a> for the full design, including what happens on a fallback reroute and how the placeholder is revoked.</p>
+<p>Find the live address with <code>lazy daemon status</code> (it&#39;s also printed at daemon start). The port is OS-assigned because a hardcoded one conflicts across per-project daemons; set <code>port</code> only to pin it.</p>
+<p><strong>Cursor traffic rides the same proxy.</strong> A <code>cursor</code> task&#39;s API calls are routed through the daemon&#39;s proxy too, on the same port, under the path prefix <code>/_lazy/cursor/&lt;placeholder&gt;</code> — the same per-task placeholder credential lazy puts in <code>CURSOR_API_KEY</code>, which is what identifies the caller. Lazy sets <code>CURSOR_API_ENDPOINT</code> (and pins <code>--agent-endpoint</code>) at launch for both container and host launches, so you configure nothing. The route is deliberately <strong>coarse and opaque</strong>: requests are forwarded verbatim — method, path, headers, streamed body — with only the placeholder credential swapped for the real one, and audited by role, task, method, path, status and duration only. The Anthropic-shaped request extractor, the policy plane, and the failover chain do <strong>not</strong> apply to cursor traffic; the audit record carries no model or token usage. Attribution rides in the URL prefix rather than headers because <code>cursor-agent</code>&#39;s <code>-H</code> flag does not cover every request it makes — and because a placeholder in the path is <em>authenticated</em> attribution, unlike a header the agent could set to any value it likes. As with Anthropic traffic, a cursor launch that cannot resolve the live proxy address <strong>fails</strong> rather than calling Cursor&#39;s servers unaudited.</p>
+<p>Cursor&#39;s agent stream is forced onto HTTP/1.1 for this: lazy sets <code>network.useHttp1ForAgent</code> in the container&#39;s <code>~/.cursor/cli-config.json</code> before each turn, and says so in the supervisor log. Two reasons — lazy&#39;s proxy speaks HTTP/1.1 only, and on cursor&#39;s HTTP/2 path the CLI takes its agent URL from a <em>server-supplied</em> redirect, which would route around the proxy silently. Your real <code>CURSOR_API_KEY</code> stays on the host: the container gets a placeholder and the proxy substitutes the real key — in the header or in the request body, wherever the CLI put it — on the way out. A host <code>cursor-agent</code> session logged in <em>without</em> an API key has no key to swap, so its traffic is forwarded exactly as it arrives and recorded unattributed.</p>
+<p><strong>Everything is proxied — <code>endpoint</code> chooses where the proxy forwards.</strong> There is no role configuration that opts out. An <code>ollama</code> role and a role with an explicit <code>endpoint</code> are routed by the proxy to that upstream, per-caller: the per-launch credential the agent presents is what identifies its role, so the proxy resolves role → upstream at request time from evidence, not from a header the agent could set. Traffic with no such credential (a host login session) goes to the primary upstream as before. Each role upstream gets its own credential — <code>anthropic</code> for an Anthropic-native endpoint, <strong>none</strong> for <code>ollama</code> — and the audit record names the upstream that was actually called.</p>
+<h3 id="there-is-no-off-switch"><a class="anchor" href="#there-is-no-off-switch" aria-hidden="true">#</a>There is no off switch</h3>
+<p><code>[proxy] enabled</code> <strong>was removed.</strong> A lazy.toml that still carries it is never silently ignored — what happens depends on the value. <code>enabled = false</code> asks for something lazy no longer does, so it is <strong>rejected at load</strong> with an error naming the removed option; ignoring it would leave you believing traffic was unproxied when it is not. <code>enabled = true</code> asks for exactly what lazy already does, so the line is merely dead: you get a <strong>warning</strong> telling you to delete it, and the command carries on.</p>
+<pre><code class="language-toml">[proxy]
+enabled = false   # ERROR: `enabled` has been removed — delete this line
+enabled = true    # WARNING: dead line, the proxy is always on — delete it
+</code></pre>
+<p>This is what makes just-in-time credential injection possible: containers hold placeholder credentials and only the proxy holds the real one, so a proxy-less launch could not authenticate at all — &quot;proxy off&quot; is not a coherent state. To send a role somewhere else entirely, point it at an explicit <code>endpoint</code> under <code>[models.roles.*]</code> — that changes where the <strong>proxy</strong> forwards it, not whether it is proxied.</p>
+<p><strong>If the proxy cannot start, the daemon fails to start</strong> — it never falls through to a direct connection. A silent fallback would send agent traffic straight to Anthropic while the audit trail recorded nothing, so the trail would lie by omission and the connector deny-rules would silently not apply. The startup error says why the proxy did not bind.</p>
+<p><strong>And if a launch cannot reach the running proxy, the launch fails too.</strong> Every launch path (task agents, the builder, <code>lazy pair</code>, <code>lazy chat</code>) resolves the proxy&#39;s live address at launch time — from the daemon directly when it launches the agent itself, over the daemon&#39;s RPC socket when the launch happens in a CLI client. If that resolution fails — daemon down, RPC blip, proxy not bound yet — lazy <strong>refuses to launch</strong> rather than connect direct:</p>
+<pre><code>lazy could not resolve the live proxy address.
+Reason: Daemon is not running.
+...
+What to do:
+  - Check the daemon:    lazy daemon status
+  - Start / restart it:  lazy daemon start   (or: lazy daemon restart)
+  - Still failing? Its startup log says why the proxy did not bind: lazy daemon logs
+</code></pre>
+<p>The reasoning is the same as for daemon startup: a transient daemon failure must not be able to drop you out of the audit plane — silently, on a single launch, with no trace afterward that the traffic went unaudited. This applies to every role, <code>ollama</code> and explicitly-pinned endpoints included: they need the proxy&#39;s address too, because the proxy is what reaches their upstream.</p>
+<p><strong>A resolved address is only good for the daemon that gave it out.</strong> With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for <code>lazy upgrade</code>, which restarts the daemon <em>and</em> relaunches your builder session: the relaunched builder re-resolves the address against the daemon that came back, rather than reusing the one it started with. If that re-resolve fails, the builder is <strong>not</strong> relaunched — you get the error above and a <code>lazy builder --resume &lt;id&gt;</code> to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.</p>
+<blockquote>
+<p><strong>Proven architecture.</strong> The passthrough proxy has been validated against real Claude Code ↔ Anthropic traffic, including <code>tool_result</code> file contents, streaming SSE, and the two-stage permission-classifier flow.</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>port</code></td>
+<td><code>int</code></td>
+<td>OS-assigned free port</td>
+<td>TCP port the proxy listens on. <strong>Optional</strong> — omit it to let the OS pick a free port (avoids conflicts across per-project daemons); the actual port is shown by <code>lazy daemon status</code> and at daemon start. Set it only to pin a specific port.</td>
+</tr>
+<tr>
+<td><code>bind</code></td>
+<td><code>string</code></td>
+<td><code>&quot;127.0.0.1&quot;</code></td>
+<td>Bind address. Keep the default (loopback only) unless you deliberately expose the proxy to other machines.</td>
+</tr>
+<tr>
+<td><code>upstream</code></td>
+<td><code>string</code></td>
+<td><code>&quot;https://api.anthropic.com&quot;</code></td>
+<td>Anthropic-compatible upstream the proxy forwards to (real Anthropic, Ollama, or another proxy). Anthropic-native targets only — the proxy never translates between API shapes.</td>
+</tr>
+<tr>
+<td><code>cursor_upstream</code></td>
+<td><code>string</code></td>
+<td><code>&quot;https://api2.cursor.sh&quot;</code></td>
+<td>Cursor API base URL the cursor passthrough route forwards to. Change it only to point cursor traffic at a different Cursor deployment or a local stand-in.</td>
+</tr>
+<tr>
+<td><code>retry_after_threshold</code></td>
+<td><code>int</code></td>
+<td><code>5</code></td>
+<td>On a <strong>primary</strong> 429 whose <code>Retry-After</code> is ≤ this many seconds, the proxy waits that long and retries the primary <strong>once</strong> before failing over. A larger <code>Retry-After</code> fails over immediately. Only applies when a fallback chain is configured.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml"># The default. No [proxy] section needed at all — the daemon starts the proxy on
+# an OS-assigned port and routes agent traffic through it.
+</code></pre>
+<p>To pin a specific port and endpoint instead (both are overrides):</p>
+<pre><code class="language-toml">[proxy]
+port = 8766
+bind = &quot;127.0.0.1&quot;
+upstream = &quot;https://api.anthropic.com&quot;
+
+[models.roles.agent]
+backend = &quot;proxy&quot;
+model = &quot;claude-sonnet-4-6&quot;
+endpoint = &quot;http://127.0.0.1:8766&quot;
+</code></pre>
+<p>Audit records are written to <code>.lazy/logs/proxy-audit.jsonl</code> (append-only JSONL, one record per line) in the project-local data dir — <strong>not</strong> into your task store. The audit trail is disposable telemetry, not durable state: it is gitignored, safe to delete at any time, and never travels with the store. Writes are serialised — no interleaving even under concurrent requests — and happen asynchronously so the proxy hot path is never blocked by disk I/O.</p>
+<p>The file is <strong>bounded</strong>: it rotates to <code>proxy-audit.jsonl.1</code> at 4 MiB and only that one older segment is kept, so the audit trail can never exceed 8 MiB total. Retention is deliberately shallow — the only reader is the recent-history &quot;is lazy&#39;s credential actually accepted?&quot; verdict in <code>lazy doctor</code>. Anything wanting statistics should tap the stream as it flows rather than mine the file.</p>
+<blockquote>
+<p><strong>Upgrading from an earlier version:</strong> the audit stream used to be appended, uncapped, into the task store itself (<code>&lt;store&gt;/proxy-audit.jsonl</code>) — where one real store grew it to 677 MiB and broke a push. The daemon deletes that leftover file on startup and says so in its log — since it is cleanup of a file an older version wrote and has nothing to do with the proxy&#39;s current state. <code>lazy doctor</code> reports it if it is still there. If your store is a git repo, the oversized blob is also in its <strong>history</strong>, which lazy will not rewrite for you — use <code>git filter-repo</code> in the store repo to purge it.</p>
+</blockquote>
+<p>Each record is <strong>attributed to the role and task that made the request.</strong> lazy sets <code>ANTHROPIC_CUSTOM_HEADERS</code> on every agent it launches through the proxy, so Claude Code sends <code>x-lazy-role</code> (<code>agent</code> or <code>builder</code>) and — for task agents — <code>x-lazy-task-id</code> on each request; the proxy reads them into the audit record&#39;s <code>role</code>/<code>taskId</code>, then strips them before forwarding upstream (real Anthropic never sees lazy-internal headers). This is what lets the audit trail (and every <code>DENY</code> log line) say <em>which</em> agent and task tried a given <code>tool_use</code>, not just that one did.</p>
+<h3 id="token-accounting--lazy-stats-tokens"><a class="anchor" href="#token-accounting--lazy-stats-tokens" aria-hidden="true">#</a>Token accounting — <code>lazy stats tokens</code></h3>
+<p>Every audit record also carries the <strong>token usage</strong> the upstream reported for that request, in the <code>usage</code> field: <code>inputTokens</code>, <code>outputTokens</code>, <code>cacheCreationInputTokens</code>, <code>cacheReadInputTokens</code>. Combined with the role/task attribution above, that gives per-role, per-task and per-model token accounting with no extra instrumentation.</p>
+<p>Usage is captured on both response paths:</p>
+<ul>
+<li><strong>Non-streaming / enforcement path</strong> — the body is already buffered, so <code>usage</code> is read straight out of the JSON. On an enforced (denied) request the counts come from the <em>original</em> upstream body, not the rewritten one: a denial changes content, never the tokens the upstream billed.</li>
+<li><strong>Streaming path</strong> — the response body is passed through a tee that forwards each chunk to the client <em>before</em> inspecting it, watching the SSE stream for <code>message_start</code> (input/cache counts) and the final <code>message_delta</code> (cumulative <code>output_tokens</code>). Nothing is buffered and the client never waits on the scanner, so the streaming hot path keeps its zero-added-latency guarantee. The audit record is enqueued when the stream ends — including when the client cancels mid-stream, so a walked-away client never vanishes from the trail.</li>
+</ul>
+<p>Requests that failed before any response (an unreachable upstream, a terminal error) legitimately have no usage and keep <code>usage: null</code>. They still appear in the trail, and <code>lazy stats tokens</code> counts them under &quot;requests&quot; but not under &quot;with usage&quot; — so a failure is visible rather than silently inflating or deflating the totals.</p>
+<p>Read the trail with <code>lazy stats tokens</code>. It lives under <code>lazy stats</code>, the multiplexer for read-only analytics over what lazy recorded (alongside <code>lazy stats timings</code>, the request-trace readout) — top-level verbs are reserved for task-lifecycle operations:</p>
+<pre><code class="language-bash">lazy stats tokens                        # totals + by-role / by-task / by-model breakdowns
+lazy stats tokens --since 24h            # only the last day
+lazy stats tokens --role agent --top 20  # agent traffic only, 20 rows per breakdown
+lazy stats tokens --task add-proxy       # one task&#39;s spend (short-id prefix match)
+lazy stats tokens --json                 # machine-readable rollup
+</code></pre>
+<p>Two scope caveats, both printed in the readout:</p>
+<ul>
+<li><strong>Every launch lazy makes is proxied</strong>, whatever the role&#39;s backend, so all of it appears here. A process lazy did not launch does not.</li>
+<li><strong>Traffic with no <code>x-lazy-role</code>/<code>x-lazy-task-id</code> header is grouped under <code>(unattributed)</code>, not dropped.</strong> It cost real tokens; hiding it would make the rollup under-report.</li>
+</ul>
+<h3 id="reading-the-trail-record-by-record--lazy-stats-audit"><a class="anchor" href="#reading-the-trail-record-by-record--lazy-stats-audit" aria-hidden="true">#</a>Reading the trail record by record — <code>lazy stats audit</code></h3>
+<p><code>lazy stats tokens</code> rolls the trail up. <code>lazy stats audit</code> is the other half: <strong>one row per proxied request</strong>, so you can answer &quot;what did the policy engine deny on that turn?&quot; or &quot;which requests failed over to the fallback?&quot; without hand-reading <code>proxy-audit.jsonl</code>.</p>
+<pre><code class="language-bash">lazy stats audit                          # the newest 20 proxied requests, one row each
+lazy stats audit --denied                 # every policy denial recorded
+lazy stats audit --task add-audit --last 2h
+lazy stats audit --errors --limit 50      # recent failures — e.g. the 401s that mean an expired credential
+lazy stats audit --reroutes --json        # failovers, machine-readable
+lazy stats audit 3f9a1c2b                 # full detail for one record
+</code></pre>
+<p>The listing shows time, record id, role, task, model, tool_use/tool_result counts, total tokens and duration, plus a <code>NOTES</code> column that flags the rows worth opening: <code>DENY(n)</code>, <code>REROUTE</code>, and <code>FAIL(&lt;status&gt;)</code> (or <code>FAIL(no-response)</code> when the request never got one). Filters — <code>--task</code> (short-id prefix), <code>--role</code>, <code>--model</code> (substring), <code>--since</code>/<code>--last</code>, <code>--denied</code>, <code>--reroutes</code>, <code>--errors</code> — all combine.</p>
+<p>Passing a record id (the short form from the <code>ID</code> column is enough) opens the <strong>detail view</strong> for that request: routing and upstream, request shape and declared tools, token usage, the <code>tool_use</code> blocks the agent intended with their paths/commands, <code>tool_result</code> previews, the reroute&#39;s source and target, and each denial with the rule that fired and the reason given back to the agent. <code>--json</code> emits the row list, or — with a record id — the raw record.</p>
+<p>Two deliberate behaviors worth knowing:</p>
+<ul>
+<li><strong><code>--limit</code> keeps the newest records, not the oldest.</strong> The trail reads like a log; when the listing is capped the tail is what you want, and the footer says how many older records were hidden.</li>
+<li><strong>An ambiguous record-id prefix is an error, not a best guess.</strong> Showing the wrong request&#39;s denials would be worse than failing.</li>
+</ul>
+<p>Like <code>lazy stats tokens</code>, this is read-only and covers proxied traffic — which, since every launch lazy makes is proxied, is all of it.</p>
+<p>The audit plane is implemented by <code>FileStorage</code> only. <code>PostgresStorage</code> <strong>fails loudly</strong> on both <code>appendAuditRecord</code> and <code>listAuditRecords</code> rather than accepting writes into a void or returning an empty list — an empty list would render as &quot;no traffic yet&quot;, an answer indistinguishable from the truth and wrong in the worst direction.</p>
+<h3 id="smart-routing--proxyfallback-failover-chain"><a class="anchor" href="#smart-routing--proxyfallback-failover-chain" aria-hidden="true">#</a>Smart routing — <code>[[proxy.fallback]]</code> failover chain</h3>
+<p>By default, when the upstream returns <strong>429</strong> (rate limited) / <strong>529</strong> (overloaded) or is unreachable, the proxy fails the request and the agent&#39;s turn fails with it. A <code>[[proxy.fallback]]</code> chain lets the proxy instead <strong>reroute</strong> the request to an alternate Anthropic-native target — a different model tier, a different endpoint (e.g. a locally-served Ollama model), or a different account. Each entry is tried in order until one responds.</p>
+<p>Failover is <strong>explicit and opt-in.</strong> With no <code>[[proxy.fallback]]</code> entries the proxy fails hard exactly as before — it never invents a fallback or silently retries (per lazy&#39;s no-silent-fallback rule). Every reroute is <strong>logged</strong> (<code>logger.warn</code>) <strong>and recorded</strong> in the audit trail: each <code>ProxyAuditRecord</code> carries a <code>reroute</code> field with the original upstream/model, the fallback upstream/model actually used, the trigger (<code>&quot;429&quot;</code>, <code>&quot;529&quot;</code>, or <code>&quot;unreachable&quot;</code>), and the number of targets attempted. So you can always see afterward which turns ran on a fallback model.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>upstream</code></td>
+<td><code>string</code></td>
+<td>— (required)</td>
+<td>Anthropic-native base URL to reroute to. Anthropic-native only — no translation layer.</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td><code>string</code></td>
+<td>(keep original)</td>
+<td>Optional. When set, the request body&#39;s <code>model</code> is rewritten to this before re-sending — use it to fail over to a different tier or to name the model a different backend expects. Omit it to keep the original model (e.g. a hot spare on the same model).</td>
+</tr>
+<tr>
+<td><code>credential</code></td>
+<td><code>string</code></td>
+<td><code>&quot;none&quot;</code></td>
+<td>Which credential the proxy presents to this target: <code>&quot;anthropic&quot;</code> (the same real credential it uses for the primary) or <code>&quot;none&quot;</code> (send no credential at all). The default is <code>&quot;none&quot;</code> because a fallback is a <em>different</em> server — a local Ollama, someone else&#39;s endpoint — and forwarding your Anthropic credential there by default would leak it. Set <code>&quot;anthropic&quot;</code> for a fallback that is genuinely Anthropic (a hot spare, a cheaper tier). Any other value is rejected at load.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[proxy]
+port = 8766
+upstream = &quot;https://api.anthropic.com&quot;
+retry_after_threshold = 5
+
+# First fallback: a local Ollama model (free). No API spend.
+[[proxy.fallback]]
+upstream = &quot;http://localhost:11434&quot;
+model = &quot;qwen3.5:35b-a3b-coding-nvfp4&quot;
+
+# Second fallback: a cheaper Anthropic tier, only if the local one is also down.
+# It is really Anthropic, so it gets the real credential.
+[[proxy.fallback]]
+upstream = &quot;https://api.anthropic.com&quot;
+model = &quot;claude-haiku-4-5-20251001&quot;
+credential = &quot;anthropic&quot;
+</code></pre>
+<p><strong>Guarantees and constraints:</strong></p>
+<ul>
+<li><strong>Streaming is never interrupted.</strong> Failover keys only on the upstream&#39;s <em>status line</em>. Once a <code>200</code> response has started streaming back to the client, it is never rerouted mid-stream — an error partway through a successful turn surfaces to the client as-is.</li>
+<li><strong>Respect <code>Retry-After</code>.</strong> On a primary 429 with a short <code>Retry-After</code> (≤ <code>retry_after_threshold</code>, default 5s), the proxy waits it out and retries the primary once before failing over — a brief rate-limit blip is cheaper to wait than to reroute. A longer <code>Retry-After</code>, or a 529, fails over immediately.</li>
+<li><strong>Paid-API guard.</strong> A fallback chain is itself explicit config, but mind the <em>ordering</em>: putting a paid Anthropic target as the fallback for a local/free primary means an overloaded local model silently escalates to billed API usage. That is allowed (you configured it) but should be intentional — order free/cheap targets first if that is what you want.</li>
+<li><strong>A fallback that shares an origin with a credentialed target is rejected at startup.</strong> The credential map is keyed by <em>origin</em> (scheme + host + port), so a fallback at <code>https://api.anthropic.com/v2</code> cannot receive &quot;no credential&quot; while <code>https://api.anthropic.com/v1</code> receives one — it would inherit it, and the startup log would print <code>→ none</code> while the opposite happened. Rather than let the config lie, lazy refuses to start: give the fallback a distinct host or port, or declare <code>credential = &quot;anthropic&quot;</code> and mean it.</li>
+<li><strong>Each target gets its own credential, or none.</strong> The proxy does not forward whatever the client presented — it looks up the credential for the target it is actually calling. A fallback with no <code>credential</code> receives <strong>no</strong> credential, so the placeholder never escapes to a third-party endpoint and your real key is not handed to a server you only listed as a spare.</li>
+<li><strong>Anthropic-native only.</strong> Fallback targets speak <code>/v1/messages</code> natively; the proxy never translates between API shapes.</li>
+</ul>
+<h3 id="proxypolicy--mechanistic-enforcement"><a class="anchor" href="#proxypolicy--mechanistic-enforcement" aria-hidden="true">#</a><code>[proxy.policy]</code> — mechanistic enforcement</h3>
+<p>Beyond passive audit, the proxy runs a <strong>deterministic, injection-proof rule engine</strong> that inspects every <code>tool_use</code> an agent proposes <em>before it executes</em>. On a policy violation it <strong>rewrites the response</strong> so the call never runs and injects an explanatory assistant text block, so the agent learns why and course-corrects. Rules are model- and backend-independent — a prompt-injected agent cannot argue its way past a static rule.</p>
+<p><strong>Enforcement is ON by default whenever <code>[proxy]</code> is set</strong>, with a closed posture. The load-bearing rule: inherited <strong>claude.ai account connectors (<code>mcp__claude_ai_*</code>) are denied by default, allowlist-only</strong> — these Gmail/Drive/Calendar/Spotify tools are injected server-side from the authenticated account and are invisible to the OS sandbox and Claude Code&#39;s own permission model, so the proxy is the only <code>lazy</code>-controlled place that can stop them. Reads of secret/credential paths are also denied by default.</p>
+<p>Only a <code>/v1/messages</code> response to a request that <em>declared tools</em> is buffered for possible rewriting; every other response streams through untouched, and when nothing is denied the original bytes are forwarded verbatim.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enforce</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Master switch. <code>false</code> = pure passthrough/audit, no enforcement.</td>
+</tr>
+<tr>
+<td><code>connector_allowlist</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Exact <code>mcp__claude_ai_*</code> tool names to re-allow despite the default-deny posture. Exact match, not prefix.</td>
+</tr>
+<tr>
+<td><code>deny_secret_path_reads</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Deny reads of <code>~/.ssh</code>, <code>.env</code>, <code>.aws/credentials</code>, private keys, <code>.npmrc</code>, kubeconfig, etc.</td>
+</tr>
+<tr>
+<td><code>deny_path_globs</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Extra absolute-path globs (<code>*</code>/<code>**</code>) to deny for read/write tools.</td>
+</tr>
+<tr>
+<td><code>egress_allowlist</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Hosts <code>WebFetch</code> may reach. Empty/unset = egress unrestricted; a non-empty list denies any other host.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[proxy]
+port = 8766
+
+[proxy.policy]
+enforce = true
+connector_allowlist = [&quot;mcp__claude_ai_gmail_search_threads&quot;]  # re-allow only what you intend
+deny_secret_path_reads = true
+# deny_path_globs = [&quot;/etc/**&quot;, &quot;**/*.key&quot;]
+# egress_allowlist = [&quot;api.github.com&quot;]
+</code></pre>
+<p>Denials are recorded on the request&#39;s <code>ProxyAuditRecord</code> (<code>enforcement</code> field: which tool, which rule, why). This is the <strong>mechanistic floor</strong>: deterministic rules, evaluated on every request.</p>
+<hr>
+<h2 id="documents"><a class="anchor" href="#documents" aria-hidden="true">#</a><code>[documents]</code></h2>
+<p>Mount additional documents into agent containers.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>path</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Path to a directory of documents to mount into the agent container.</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="docs"><a class="anchor" href="#docs" aria-hidden="true">#</a><code>[docs]</code></h2>
+<p>Where the <code>Check documentation at &lt;url&gt;</code> pointers in error messages, warnings and command help point.</p>
+<p>Not to be confused with <code>[documents]</code> above — that mounts a directory of reference material into agent containers. <code>[docs]</code> is only the documentation link domain.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>url</code></td>
+<td><code>string | false</code></td>
+<td><code>&quot;https://docs.getlazy.dev/v&lt;major.minor&gt;&quot;</code></td>
+<td>Base URL for documentation links. <code>&quot;&quot;</code> or <code>false</code> turns pointers off.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[docs]
+# Point at your own mirror (a fork, or an internal copy of the docs)
+url = &quot;https://docs.internal.example.com/lazy&quot;
+
+# ...or turn documentation pointers off entirely
+# url = &quot;&quot;
+</code></pre>
+<p>Links are composed as <code>&lt;url&gt;/&lt;page&gt;</code> — the <code>protected-branches</code> page renders as <code>&lt;url&gt;/protected-branches</code>. Set <code>url</code> to the root of whatever serves the documentation; a trailing slash is ignored.</p>
+<p><strong>The default is version-pinned; a configured value is not.</strong> With no <code>url</code> set, lazy points at <code>https://docs.getlazy.dev/v&lt;major.minor&gt;</code> — the snapshot of the docs published alongside the build you are running. The docs site keeps one directory per minor release and never rewrites an old one, so a pointer printed by any build that ever shipped keeps resolving.</p>
+<p>A <code>url</code> you configure is used <strong>exactly as written</strong>: lazy appends the page path and nothing else, and never adds a version segment. Appending our layout to someone else&#39;s site would produce 404s they could not fix from their side, so a mirror owns its own paths. If you want your mirror version-pinned too, put the version in the URL yourself.</p>
+<p>Pointers are always a <strong>supplement</strong>. Every message that carries one is fully actionable with the pointer removed, so disabling them costs you a link and nothing else.</p>
+<p>A value that is neither an <code>http(s)</code> URL nor the empty string fails the config load with a message naming the section — an unusable URL is reported at load time rather than silently degrading into &quot;links never appear&quot;.</p>
+<hr>
+<h2 id="mounts"><a class="anchor" href="#mounts" aria-hidden="true">#</a><code>[[mounts]]</code></h2>
+<p>Custom mounts injected into <strong>task agent containers</strong> (the worktree containers where agents run; the builder container is not affected). Array of tables — each entry is either a host <strong>bind</strong> mount or a container-local <strong>volume</strong>. Opt-in: none by default, and with no <code>[[mounts]]</code> configured container launch is exactly as before.</p>
+<p>The motivating case: the worktree (including its <code>node_modules</code>) is bind-mounted into the container, so container-installed Linux binaries fight the host&#39;s macOS ones. Shadowing <code>{worktree}/node_modules</code> with a volume gives the container its own <code>node_modules</code> that never clobbers the host&#39;s (Docker resolves overlapping mounts by longest container-path match, so the inner volume wins regardless of declaration order).</p>
+<p>Each entry&#39;s keys:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>type</code></td>
+<td><code>string</code></td>
+<td><code>&quot;bind&quot;</code></td>
+<td><code>&quot;bind&quot;</code> mounts a host path; <code>&quot;volume&quot;</code> uses a container-local Docker volume.</td>
+</tr>
+<tr>
+<td><code>source</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Host path for bind mounts. Absolute, or project-relative (resolved against the repo root). Required for bind; invalid for volume.</td>
+</tr>
+<tr>
+<td><code>name</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Volume name for a <strong>named</strong> volume (persists/reused across runs). Omit for an <strong>anonymous</strong> volume. Only valid for <code>type = &quot;volume&quot;</code>.</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td><code>string</code></td>
+<td>—</td>
+<td>Absolute container path to mount at. Required.</td>
+</tr>
+<tr>
+<td><code>readonly</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>Mount read-only.</td>
+</tr>
+</tbody></table>
+<p><strong>Placeholders</strong> (expanded at launch time) are supported in <code>source</code> and <code>target</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Expands to</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>{worktree}</code></td>
+<td>The task&#39;s worktree path.</td>
+</tr>
+<tr>
+<td><code>{repo}</code></td>
+<td>The repo root.</td>
+</tr>
+</tbody></table>
+<p>Invalid entries fail loudly at config-load time with a message naming the offending entry (missing <code>target</code>, unknown <code>type</code>, a bind with no <code>source</code>, a volume that sets <code>source</code>, etc.) — they are never silently skipped.</p>
+<p><strong>One host path is refused outright: lazy&#39;s daemon state directory</strong> (<code>~/.lazy/daemon/</code>, or wherever <code>LAZY_DAEMON_BASE_DIR</code> points). A bind <code>source</code> inside it — or one that <em>contains</em> it, such as <code>~/.lazy</code> or <code>$HOME</code> — fails with an error naming the entry and the reason. That directory holds the shared daemon token (which authenticates every <code>/rpc</code> call) and the per-task MCP token registry; a container that could read it could act as any other task, or as the builder, defeating per-task agent identity entirely. Absolute sources are refused at config-load time; a project-relative or placeholder source that <em>resolves</em> into that directory is refused at launch. Lazy&#39;s own read-only mount of a container&#39;s single MCP config file is added by the launch path itself and is unaffected.</p>
+<p><strong>A second host path is refused the same way: the builder scratch directory</strong> (<code>~/.lazy/scratch/</code>, or wherever <code>LAZY_SCRATCH_BASE_DIR</code> points). That directory is the builder&#39;s scratchpad for handing documents to <em>you</em>, and is deliberately unreadable by agents — a builder that can pass code to an agent through a shared directory stops delegating and starts implementing. A bind <code>source</code> inside it, or one that contains it, fails with an error naming the entry. See <a href="../builder-scratch-dir/">builder-scratch-dir.md</a>.</p>
+<pre><code class="language-toml"># Bind a host path into the container
+[[mounts]]
+source = &quot;/abs/or/project-relative/host/path&quot;
+target = &quot;/absolute/container/path&quot;
+readonly = false
+
+# Shadow a worktree path with a container-local named volume (the node_modules case)
+[[mounts]]
+type = &quot;volume&quot;
+name = &quot;myproj-node-modules&quot;   # omit for an anonymous volume
+target = &quot;{worktree}/node_modules&quot;
+</code></pre>
+<hr>
+<h2 id="features"><a class="anchor" href="#features" aria-hidden="true">#</a><code>[features]</code></h2>
+<p>Feature flags for experimental functionality. Accepts arbitrary key-value pairs — lazy does not warn about unknown keys here.</p>
+<p>Set individual flags to <code>true</code>/<code>false</code>, or use <code>all = true</code> to enable everything. Use <code>LAZY_VANILLA=1</code> env var to disable all flags temporarily.</p>
+<pre><code class="language-toml">[features]
+auto_sync_after_turn = true
+# all = true
+</code></pre>
+<hr>
+<h2 id="worktree"><a class="anchor" href="#worktree" aria-hidden="true">#</a><code>[worktree]</code></h2>
+<p>Controls what untracked files are copied into new task worktrees.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>include</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Glob patterns for untracked files to copy into new task worktrees.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[worktree]
+include = [&quot;.env&quot;, &quot;.env.local&quot;, &quot;config/local.yml&quot;]
+</code></pre>
+<hr>
+<h2 id="permissions"><a class="anchor" href="#permissions" aria-hidden="true">#</a><code>[permissions]</code></h2>
+<p>File protection — prevents agents from modifying or deleting certain files.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>protected</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Glob patterns for files agents should not modify or delete. Agents can still <em>add</em> new files matching these patterns — only modifications and deletions are flagged as violations for human review. User patterns are merged additively with the built-in defaults.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[permissions]
+protected = [&quot;README.md&quot;, &quot;test/**/*.ts&quot;, &quot;*.spec.*&quot;]
+</code></pre>
+<h3 id="resolving-a-conflict-task"><a class="anchor" href="#resolving-a-conflict-task" aria-hidden="true">#</a>Resolving a conflict task</h3>
+<p>A turn that violates these patterns leaves the task in <code>conflict</code>. Protected
+files are protected <strong>by default</strong>: on unblock, every <strong>pending</strong> violated file
+the reviewer does not approve is reverted to its base commit and committed.
+Because that is destructive, no decision is inferred — omitting the
+flag/parameter while something is pending is an error on both surfaces, not
+&quot;revert all&quot;.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>lazy unblock</code></th>
+<th><code>lazy accept</code></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>CLI</td>
+<td><code>--approve-file &lt;file&gt;</code> (repeatable) or <code>--no-approve-files</code></td>
+<td><code>--approve-file &lt;file&gt;</code> (repeatable)</td>
+</tr>
+<tr>
+<td>MCP</td>
+<td><code>approved_files: [...]</code>, <code>[]</code> = revert all pending</td>
+<td><code>approved_files: [...]</code></td>
+</tr>
+<tr>
+<td>Required?</td>
+<td>Yes, while a violation is pending — no default</td>
+<td>Yes, while a violation is pending</td>
+</tr>
+<tr>
+<td>A pending file left out</td>
+<td>is <strong>reverted</strong> to its base commit</td>
+<td>makes accept <strong>refuse</strong>; nothing is reverted</td>
+</tr>
+</tbody></table>
+<p><strong>Approval is sticky.</strong> Each call decides the violations that are still
+<code>pending</code>; a file already approved stays approved, and a later unblock that says
+nothing about it changes nothing. Naming an already-approved file again is
+always accepted — a harmless re-assert — so there is no state in which the
+surfaces refuse <code>approved_files</code> and then revert on the same records. Only a
+turn that touches the file again raises a fresh pending violation to decide.</p>
+<p>Reversing an approval is therefore not an unblock flag. Un-approve the file on
+the web review page — <code>setViolationDecision</code> puts that record back to
+<code>pending</code> rather than straight to <code>rejected</code>, so the next unblock decides it
+like any other pending violation and the revert stays an explicit reviewer act —
+or ask the agent to revert it in the feedback text. The absence of a CLI/MCP
+un-approve is deliberate; see
+<a href="../surface-asymmetries/">public-docs/surface-asymmetries.md</a>.</p>
+<p>The two are easy to confuse and behave oppositely on the omitted file, so they
+are spelled out separately in <code>lazy unblock --help</code> and <code>lazy accept --help</code>.
+Approving files in the feedback <em>text</em> has no effect on either — the flag and
+the parameter are the only channels that are read.</p>
+<p>Which violations count is a per-turn question with a subtlety: a turn that
+violates protections is followed by supervised push-back and maintained-files
+nudges, each producing a further agent turn. Only the last agent turn that
+<em>re-detected</em> violations carries the set the reviewer must resolve — reading
+&quot;the last agent turn&quot; instead lands on a nudge reply that carries none. Every
+surface reads it through the helpers in <code>src/utils/turns.ts</code> —
+<code>pendingViolations</code> for what still needs deciding, <code>violationRecords</code> for every
+record whatever its status — so the guard and the enforcement cannot drift apart.</p>
+<p>When a file is reverted, the agent&#39;s next prompt names it and says the revert
+stands. If the reverted state does not compile or breaks tests, the agent is
+told to report that and hand the task back rather than re-apply — re-applying
+unilaterally would just start a revert ping-pong. Re-approval is the reviewer&#39;s
+move: unblock again with those files approved.</p>
+<hr>
+<h2 id="protection"><a class="anchor" href="#protection" aria-hidden="true">#</a><code>[protection]</code></h2>
+<p>Protected branches — accepting a task into a protected branch requires a one-time human approval, recorded with <code>lazy approve &lt;task&gt;</code>. This is friction against an over-eager builder, not a security boundary; the full story is in <a href="../protected-branches/">Protected branches</a>. Not to be confused with <code>[permissions].protected</code>, which guards <em>files</em> from agent edits.</p>
+<p><strong>Opt-in — off by default.</strong> A project with no <code>[protection]</code> section has no protection at all: accepts behave exactly as if the feature didn&#39;t exist. <code>enabled</code> is the single master switch, and while it is off every other key in this section has no effect. The one command that turns it on is <code>lazy protect main on</code>, which lists the branch <strong>and</strong> sets <code>enabled = true</code>; <code>lazy protect &lt;target&gt; off</code> never touches the switch, so toggling never loses a list. Because the feature is invisible while off, a successful <code>lazy accept</code> into the repo&#39;s default branch prints a one-line tip pointing at <code>lazy protect</code> — suppressed as soon as <code>enabled</code> appears in this section with either value. <code>lazy doctor</code> warns when other <code>[protection]</code> keys are configured while the switch is off, since they are inert.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>Master switch. Off by default; set <code>true</code> (or run <code>lazy protect &lt;branch&gt; on</code>) to engage protection — that alone protects the repo&#39;s default branch (e.g. <code>main</code>). While false, nothing else in this section has any effect.</td>
+</tr>
+<tr>
+<td><code>gate_default_branch</code></td>
+<td><code>boolean</code></td>
+<td><code>true</code></td>
+<td>When protection is enabled, protect the repo&#39;s default branch. On by default; set <code>false</code> to protect only the branches listed in <code>protected_branches</code>.</td>
+</tr>
+<tr>
+<td><code>protected_branches</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Additional protected branches, for projects with more than one sensitive branch. Merges <strong>into</strong> them need approval. Exact branch names, no globs.</td>
+</tr>
+<tr>
+<td><code>protected_tasks</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Protected tasks, by task code or short id. Merging that task&#39;s work <strong>out</strong> — upward into any target — needs approval. The branch is resolved from the task at decision time.</td>
+</tr>
+</tbody></table>
+<p><strong>The approval passphrase is not configured here.</strong> It lives nowhere in the repository: enroll it once per <em>machine</em> with <code>lazy system passphrase set</code>, which stores a hash (never the passphrase) at <code>~/.lazy/passphrase.json</code>, mode <code>0600</code>. Before v0.23 a <code>passphrase_file</code> key pointed at a plaintext file inside the repo — that key is <strong>removed</strong>, and a config still carrying it gets a one-line warning at load naming the new command, plus the full remedy in <code>lazy doctor</code>. Both halves of the old design were bugs: every agent could read the secret out of the tree, and a repo-controlled path let one point the key at a file it had just written. See <a href="../protected-branches/#enrolling-the-passphrase-lazy-system-passphrase">protected-branches.md</a>.</p>
+<p>Both lists are managed by <strong><code>lazy protect &lt;branch|task&gt; on|off</code></strong>, which edits this section in place and preserves its comments; <code>lazy protect</code> with no arguments prints the current state. Hand-editing works too — this section is the one and only store.</p>
+<p>When enabled, protection applies on <strong>all</strong> remote drivers, including <code>local</code>, and regardless of who calls accept (CLI <code>--yes</code>, the builder over MCP, automation). Subtask merges into intermediate <code>lazy/*</code> parent branches are never protected — no friction in the inner loop — with one deliberate exception: a task listed in <code>protected_tasks</code> gates its own outgoing merge even into a <code>lazy/*</code> parent. One approval unlocks exactly one accept of the approved task.</p>
+<p><code>gate_default_branch</code> protects a branch that appears in no list: the default branch is resolved from <code>refs/remotes/&lt;remote&gt;/HEAD</code> at decision time, so it stays correct if the repo&#39;s default branch changes. <code>lazy protect</code> shows it under Protected branches marked as implicit, and <code>lazy doctor</code> warns when that remote ref is missing (resolution then falls back to the literal <code>main</code>, which would gate nothing on a <code>master</code> repo).</p>
+<p>Once anything here is protected, the gates are <strong>visible before they bite</strong>: <code>lazy show</code> and <code>lazy status</code> print a <code>Protected:</code> line, <code>lazy list</code> and the dashboard mark the task <code>[P]</code> (<code>[P][A]</code> when an approval is recorded and pending), <code>lazy review</code> shows it in the header, and MCP <code>lazy_show</code> returns a read-only <code>protection</code> object. A project that protects nothing sees no change at all. See <a href="../protected-branches/#seeing-a-gate-before-it-bites">protected-branches.md</a>.</p>
+<p>On GitHub and GitLab projects, <strong>approving the task&#39;s PR/MR satisfies this same gate</strong> — it is a satisfier resolved inside the gate, not a parallel mechanism, so a <code>local</code> project and a forge project reach the identical decision. The forge is checked before any pending <code>lazy approve</code> record (so an approved PR does not burn it) and fails closed if the forge is unreachable. See <a href="../protected-branches/">protected-branches.md</a>.</p>
+<pre><code class="language-toml">[protection]
+# opt-in: off until this is true (or until `lazy protect main on` sets it)
+# enabled = true                # protects the repo&#39;s default branch
+
+# advanced: additional protected branches (merges IN need approval)
+# protected_branches = [&quot;release&quot;]
+# advanced: protected tasks (merges OUT need approval)
+# protected_tasks = [&quot;add-auth&quot;]
+</code></pre>
+<hr>
+<h2 id="automation"><a class="anchor" href="#automation" aria-hidden="true">#</a><code>[automation]</code></h2>
+<p>Maintained files — the inverse of <code>[permissions].protected</code>. Patterns agents are <em>expected</em> to keep up to date as they work (docs, CHANGELOG, architecture diagrams). Agents <em>may</em> skip them, but when a turn touches none of an entry&#39;s files, the supervisor prompts the agent once to either make the update or record why it skipped — turning a silent omission into a deliberate, reviewable decision. It is a nudge, not a gate: the task still blocks normally (it does not become a <code>conflict</code>).</p>
+<p><code>maintain</code> is an array of tables (<code>[[automation.maintain]]</code>), each with:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>title</code></td>
+<td><code>string</code></td>
+<td>Short label for the group (shown to the agent and in review).</td>
+</tr>
+<tr>
+<td><code>pattern</code></td>
+<td><code>string</code></td>
+<td>Glob matched against the turn&#39;s changed files.</td>
+</tr>
+<tr>
+<td><code>instructions</code></td>
+<td><code>string</code></td>
+<td>What/why to maintain — shown to the agent verbatim, up front and in the follow-up.</td>
+</tr>
+</tbody></table>
+<p>Opt-in: empty by default. The follow-up fires at most once per turn, and is skipped entirely only on a no-op turn (no code changes).</p>
+<p>When the same turn also has protected-file violations, the maintain nudge runs <strong>after</strong> the push-back exchange and is <strong>independent of its outcome</strong> — it fires whether the agent resolved the violations or kept them. (Earlier versions suppressed it whenever any violation remained; because <code>lazy.toml</code> is itself a protected file, every turn that edited it skipped the nudge, making the feature look inert.) Ordering within such a turn is: work → push-back → agent reply → maintain nudge → agent reply. The push-back never re-runs because of the maintain step (it is single-shot), and only the push-back turn carries the final violation set, so a still-violating turn still becomes a <code>conflict</code> even though it also got nudged.</p>
+<p>The follow-up is recorded as its own discrete turn pair — a <code>supervisor</code>-authored prompt turn (under a &quot;Maintained Files Review&quot; heading) followed by the agent&#39;s reply turn — so the turn history reads cleanly: work turn → supervisor nudge → agent reply. The nudge text is <strong>not</strong> appended to the work turn&#39;s response. The reply turn carries its own token usage (including cache tokens) and any commits the follow-up made are attributed to it, not the work turn. The protected-file push-back behaves the same way (&quot;Permission Violation Review&quot;). In <code>lazy show</code> and the dashboard these prompt turns are labelled <code>supervisor</code> (not <code>human</code>), so you can tell &quot;the human said&quot; from &quot;the supervisor pushed back&quot;.</p>
+<pre><code class="language-toml">[[automation.maintain]]
+title = &quot;docs&quot;
+pattern = &quot;docs/**/*&quot;
+instructions = &quot;Search for docs and update any that have gone out of date due to your work, OR create new docs if needed.&quot;
+
+[[automation.maintain]]
+title = &quot;changelog&quot;
+pattern = &quot;CHANGELOG.md&quot;
+instructions = &quot;Add ONE line to the next release section under Added/Changed/Fixed: bold feature/command name, one sentence of the user-visible effect (not the implementation, no internal type/function names), and your task code in parens as the depth pointer. Max ~25 words. Skip if your work is intra-release; update your existing line instead of adding a second.&quot;
+</code></pre>
+<h3 id="automationpre_accept"><a class="anchor" href="#automationpre_accept" aria-hidden="true">#</a><code>[automation.pre_accept]</code></h3>
+<p><strong>Opt-in — <code>enabled</code> defaults to <code>false</code>.</strong> The step costs a full agent turn on <em>every</em> accept (session resume, gate commands, maintained-files review, post-mortem) and <code>lazy accept</code> blocks on it, including agent-driven subtask accepts. Accept is fast by default; set <code>enabled = true</code> to turn the step on.</p>
+<p>When enabled, a single agent turn runs as a task is being <strong>accepted</strong>, BEFORE the merge. It is the home for expensive one-time validation (full test suite, build) and for maintained-files completeness — any configured <code>[[automation.maintain]]</code> groups (a CHANGELOG, for example) brought up to date once against the <em>final</em> diff rather than re-litigated on every turn. Per-turn checks (<code>[checks].post_turn</code>) stay lightweight; accept-time is where completeness is enforced.</p>
+<p>The turn&#39;s only built-in behavior is the post-mortem below. Everything else comes from configuration: the acceptance-checks step appears only when <code>commands</code> are set, and the maintained-files step only when <code>[[automation.maintain]]</code> groups exist. With neither configured, the turn is the post-mortem alone.</p>
+<p>On accept the agent runs the configured commands, fixes what they surface, brings maintained files up to date, commits, and records a short post-mortem. The supervisor then <strong>re-runs <code>commands</code> itself</strong> as the authoritative merge gate — the agent cannot self-certify. Only if that independent run passes does the merge proceed.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>enabled</code></td>
+<td><code>boolean</code></td>
+<td><code>false</code></td>
+<td>Run the pre-accept turn at all. Default <code>false</code>: accept merges directly with no pre-accept turn (and no post-mortem). Set <code>true</code> to opt in.</td>
+</tr>
+<tr>
+<td><code>commands</code></td>
+<td><code>string[]</code></td>
+<td><code>[]</code></td>
+<td>Gate commands, run in order after the agent&#39;s turn. The first non-zero exit <strong>aborts the accept</strong> and returns the task to the status it held before the accept with the failure surfaced as a comment — never a silent merge. Empty means the turn is the post-mortem (plus any configured maintained-files work) only — the gate passes trivially.</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td><code>number</code></td>
+<td><code>600</code></td>
+<td>Timeout in seconds for <strong>each</strong> gate command. A timed-out command counts as a failure and aborts the accept.</td>
+</tr>
+</tbody></table>
+<p><strong>Built-in post-mortem (not a config knob).</strong> Every pre-accept turn — even with no <code>commands</code> and no maintained files — asks the agent to append a short retrospective (what was hard, what it would do differently, what surprised it) to the task <strong>journal</strong>. The journal is chosen deliberately: it is append-only and prompt-immune (never re-injected into a later agent turn), so the retrospective is preserved as memory for future work without polluting any prompt. The post-mortem is valuable on its own, but it is not free — it rides along with the turn, so you get it by opting the step in.</p>
+<p><strong>Failure semantics.</strong> If the agent&#39;s turn crashes, the gate times out, or a gate command exits non-zero, the task is returned to the status it held before the accept — <code>blocked</code>, <code>conflict</code>, or <code>submitted</code>, whichever it actually was — with the reason recorded as a comment, and the accept is aborted. Fix the issue and re-run <code>lazy accept</code>. <code>enabled = false</code> (the default) opts a project out of the whole step.</p>
+<p><strong>How long the daemon waits.</strong> The daemon&#39;s own backstop for the whole pre-accept turn is derived from <code>[agent].watchdog_output_timeout_ms</code> plus a 5-minute margin, so it always fires <em>after</em> the agent&#39;s no-progress watchdog. That ordering is deliberate: the watchdog is the clock that can say something useful (&quot;the agent stopped producing output&quot;), so it should be the one that fires first; this wait exists for the case where the watchdog itself is wedged, and the message names which deadline fired. Raising the watchdog raises this wait with it — there is no separate knob to keep in sync.</p>
+<pre><code class="language-toml">[automation.pre_accept]
+enabled = true
+commands = [&quot;bun test&quot;, &quot;bun run build&quot;]
+timeout = 600
+</code></pre>
+<hr>
+<h2 id="checks"><a class="anchor" href="#checks" aria-hidden="true">#</a><code>[checks]</code></h2>
+<p>Post-turn checks run after each agent turn to capture test results or other signals.</p>
+<p>This is where a full test suite or build belongs. Agents are instructed to verify with the tests covering what they changed and <em>not</em> to run the whole suite as routine verification — it would cost minutes on every turn. Configure <code>post_turn</code> and the sweep happens once, after the turn, without the agent paying for it.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>post_turn</code></td>
+<td><code>string</code></td>
+<td><code>&quot;&quot;</code></td>
+<td>Command to run after each agent turn. Output is captured and attached to the turn for reviewers. Does NOT block the agent or trigger retries.</td>
+</tr>
+<tr>
+<td><code>post_turn_timeout</code></td>
+<td><code>number</code></td>
+<td><code>300</code></td>
+<td>Timeout in seconds for the <code>post_turn</code> command (default: 5 minutes).</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[checks]
+post_turn = &quot;bun test --bail&quot;
+post_turn_timeout = 300
+</code></pre>
+<hr>
+<h2 id="memory"><a class="anchor" href="#memory" aria-hidden="true">#</a><code>[memory]</code></h2>
+<p>Advisory size budget for the shared-memory context injected into every builder and agent launch (see <a href="../memory/">memory.md</a>).</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>warn_bytes</code></td>
+<td><code>number</code></td>
+<td><code>4096</code></td>
+<td>When the assembled memory context exceeds this many bytes, every launch logs one generic line pointing at <code>lazy doctor</code> (and the builder&#39;s section carries a short in-prompt pointer to it). <code>lazy doctor</code> reports the actual size, this threshold, the compact&#39;s staleness, and the remedy.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[memory]
+warn_bytes = 4096
+</code></pre>
+<p><strong>Advisory, never enforced.</strong> Memory past the threshold is still knowledge, so lazy never truncates it and never blocks a launch over it — the only effect is the warning. The full diagnosis lives in <code>lazy doctor</code> (the single &quot;check engine light&quot; surface), which recommends <code>lazy memory compact</code> only when the compact is actually behind the records; if it is already current, it points at curating records or raising this key instead. <code>lazy memory compact</code> regenerates the derived compact used for injection; it never modifies the records, and it refuses to write a compact that would make the injected context <em>larger</em> than it already is (see <a href="../memory/#compaction">Compaction</a>) — so on a small or already-dense store, curating records or raising this key is the only thing that helps.</p>
+<hr>
+<h2 id="limits"><a class="anchor" href="#limits" aria-hidden="true">#</a><code>[limits]</code></h2>
+<p>Concurrency caps for containers. When many tasks launch at once Docker struggles (slow launches, probe timeouts — see the write-probe flips under load that motivated this), so lazy caps how many run concurrently.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>max_concurrent_agents</code></td>
+<td><code>number</code></td>
+<td><code>8</code></td>
+<td>Max <strong>live</strong> agent task containers. New <code>lazy start</code>s beyond this <strong>queue</strong> — the task enters <code>queued</code> status and the daemon launches it automatically as slots free up.</td>
+</tr>
+<tr>
+<td><code>max_concurrent_builders</code></td>
+<td><code>number</code></td>
+<td><code>8</code></td>
+<td>Max concurrent interactive builder containers. New <code>lazy builder</code>s beyond this <strong>fail fast</strong> with an actionable message — an interactive session a human is waiting on is never queued.</td>
+</tr>
+<tr>
+<td><code>idle_grace_minutes</code></td>
+<td><code>number</code></td>
+<td><code>10</code></td>
+<td>How long an idle <strong>blocked</strong> container may linger (kept warm for a likely next turn) before the reaper frees its slot. Same-or-higher-priority queued work overrides this grace immediately. <code>0</code> = reap as soon as idle.</td>
+</tr>
+<tr>
+<td><code>max_turns_without_human</code></td>
+<td><code>number</code></td>
+<td><code>10</code></td>
+<td>Max <em>consecutive</em> work turns a task may run without a human in the loop. Only builder (MCP) and agent-driven turns count — system/supervisor turns (auto-resume, watchdog restarts, sync turns, auto-react) are not double-gated here, since they have their own budgets. <code>0</code> = unlimited.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[limits]
+max_concurrent_agents = 8
+max_concurrent_builders = 8
+idle_grace_minutes = 10
+max_turns_without_human = 10
+</code></pre>
+<p><strong>What counts as a live agent container.</strong> A supervisor container is <em>not</em> torn down when a turn finishes — a <code>blocked</code> task awaiting review keeps its container alive (idle-polling), until it is reviewed, its next unblock reuses it, or the <strong>idle reaper</strong> (below) frees it. Since the cap exists to bound Docker load, those lingering containers count toward <code>max_concurrent_agents</code> too — the cap tracks any non-terminal task holding a live container, not just those actively running a turn.</p>
+<p><strong>Idle reaper.</strong> So blocked-but-alive containers don&#39;t permanently eat slots, the daemon reaps them:</p>
+<ul>
+<li><strong>Base reap</strong> (RAM bound): an idle container older than <code>idle_grace_minutes</code> is reaped unconditionally.</li>
+<li><strong>Demand-driven reap</strong> (queued work waiting, no free slot): grace only keeps a container warm for a <em>likely next turn</em> — it never starves equal work. A blocked task&#39;s grace protects it only against strictly <em>lower</em>-priority queued demand; same-or-higher-priority queued demand reaps it immediately (lowest-priority / oldest-idle first). Heuristic exception: if a strictly-lower-priority task is currently <em>working</em>, its slot will free and drain to the queued task first, so the blocked task keeps its grace.</li>
+</ul>
+<p>Reaping is safe and cheap: all durable state is in the store + the on-disk Claude session, and the next unblock relaunches the container anyway — so reaping costs only a container cold-start on the next turn.</p>
+<p><strong>Per-runner semantics.</strong> Both the cap and demand-driven reaping are <strong>runner-agnostic</strong> — docker, podman, and the host-process runner all set a run name and count against <code>max_concurrent_agents</code>, and any of them may be demand-reaped to free a slot for higher-priority queued work. The <strong>base (grace) reap</strong> applies only to container runners (docker/podman), where an idle run holds a full resident container; an idle <strong>host-process</strong> supervisor is a cheap Bun process, so it is exempt from grace-based reaping (never reaped just for sitting idle). This difference is driven by the runner&#39;s <code>reapsIdleRuns</code> capability, not an <code>if docker</code> check.</p>
+<p>Both are <strong>positive integers</strong> (a cap <code>&lt; 1</code> is rejected at load time). At the agent cap, <code>lazy start</code> reports <code>queued (N/N running)</code>; queued tasks surface in <code>lazy active</code> / <code>lazy list</code> with a <code>queued</code> status and their drain position (<code>queued #2 of 3</code>). Only the autonomous launch paths are gated (start-queue, crash auto-resume, and CI/comment auto-unblock); a deliberate human <code>lazy unblock</code>/<code>lazy resume</code> is never blocked or delayed.</p>
+<p><strong>Queue priority.</strong> Set a task&#39;s priority with <code>lazy create --priority &lt;low|normal|high|urgent&gt;</code>, <code>lazy prioritize &lt;task&gt; &lt;level&gt;</code>, or the <code>lazy_prioritize</code> MCP tool (default <code>normal</code>). When a slot frees, the daemon drains the <strong>highest-priority</strong> queued task first; ties break <strong>FIFO</strong> (oldest queued first). Priority is a durable task edit, shown wherever queued state is (<code>lazy active</code>/<code>list</code>, <code>lazy_active</code>/<code>lazy_list</code>). This is operational backpressure ordering, not a scheduler.</p>
+<p>These are the <strong>permanent</strong> caps. To steer them at runtime without editing <code>lazy.toml</code>, use <code>lazy daemon config</code>:</p>
+<ul>
+<li><code>lazy daemon config get</code> — both caps: configured value, ephemeral override, effective limit, and current running count.</li>
+<li><code>lazy daemon config set &lt;key&gt; &lt;value&gt;</code> — set an <strong>ephemeral</strong> override for the current daemon session (e.g. <code>set max_concurrent_agents 12</code>, or the aliases <code>agents</code> / <code>builders</code>). This does <strong>not</strong> change <code>lazy.toml</code> and resets on daemon restart.</li>
+<li><code>lazy daemon config reset [key]</code> — clear the override(s), reverting to <code>lazy.toml</code>.</li>
+</ul>
+<p><strong>Turn cap (<code>max_turns_without_human</code>).</strong> The counter is per-task and increments on every builder- or agent-initiated <code>lazy unblock</code>/<code>lazy resume</code>/<code>lazy start</code>; a <strong>human</strong>-initiated one always resets it to 0. At the cap, the daemon refuses a builder/agent-initiated unblock/resume/start with a <code>409</code> naming the task, the count, and the config key — the task stays <code>blocked</code> awaiting a human. A human action is never blocked by this cap.</p>
+<h2 id="daemon"><a class="anchor" href="#daemon" aria-hidden="true">#</a><code>[daemon]</code></h2>
+<p>Controls the daemon&#39;s auto-react behavior — automatically unblocking tasks in response to CI failures, PR/MR comments, and other triggers.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auto_react_ci</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>React to CI failures (auto-unblock blocked tasks when CI fails).</td>
+</tr>
+<tr>
+<td><code>auto_react_comments</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>React to PR/MR comments (auto-unblock blocked tasks when humans comment).</td>
+</tr>
+<tr>
+<td><code>auto_react_max_retries</code></td>
+<td><code>number</code></td>
+<td><code>3</code></td>
+<td>Max auto-unblocks per task <em>per trigger type</em> before the task is paused for human review.</td>
+</tr>
+<tr>
+<td><code>auto_react_backoff</code></td>
+<td><code>string</code></td>
+<td><code>&quot;exponential&quot;</code></td>
+<td>Backoff strategy between repeated auto-unblocks of the same trigger: <code>&quot;none&quot;</code>, <code>&quot;linear&quot;</code>, or <code>&quot;exponential&quot;</code>.</td>
+</tr>
+<tr>
+<td><code>auto_react_daily_budget</code></td>
+<td><code>number</code></td>
+<td><code>50</code></td>
+<td>Max auto-triggered turns per day across all tasks in the project. Resets at <strong>local midnight</strong> (machine timezone).</td>
+</tr>
+<tr>
+<td><code>max_auto_turns</code></td>
+<td><code>number</code></td>
+<td><code>3</code></td>
+<td>Max <em>consecutive</em> auto-triggered turns per task before the task is paused for human review. The counter resets whenever a human manually unblocks the task or the task reaches a terminal state.</td>
+</tr>
+<tr>
+<td><code>auto_resume</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Master switch for auto-resuming interrupted tasks (both the fast lane and the slow lane below). <code>false</code> disables both — a crashed task then waits for a manual <code>lazy resume</code>.</td>
+</tr>
+<tr>
+<td><code>auto_resume_interval_minutes</code></td>
+<td><code>number</code></td>
+<td><code>30</code></td>
+<td>Once a task&#39;s fast-lane retries are spent (its circuit breaker tripped), how often it is retried on the slow lane.</td>
+</tr>
+<tr>
+<td><code>auto_resume_gap_minutes</code></td>
+<td><code>number</code></td>
+<td><code>5</code></td>
+<td>Minimum spacing between ANY two auto-resumes project-wide, fast lane or slow lane — a fairness floor so a burst of simultaneous crashes can&#39;t relaunch every task at once.</td>
+</tr>
+<tr>
+<td><code>auto_resume_max_attempts</code></td>
+<td><code>number</code></td>
+<td><code>24</code></td>
+<td>Slow-lane attempts before a task gives up for good (default: 24 × 30 min ≈ 12 hours). If a task hasn&#39;t recovered by then it needs a human — resume it manually with <code>lazy resume</code>.</td>
+</tr>
+</tbody></table>
+<pre><code class="language-toml">[daemon]
+auto_react_ci = true
+auto_react_comments = true
+auto_react_max_retries = 5
+auto_react_backoff = &quot;exponential&quot;
+auto_react_daily_budget = 100
+max_auto_turns = 3
+auto_resume = true
+auto_resume_interval_minutes = 30
+auto_resume_gap_minutes = 5
+auto_resume_max_attempts = 24
+</code></pre>
+<h3 id="auto-resume-fast-lane-and-slow-lane"><a class="anchor" href="#auto-resume-fast-lane-and-slow-lane" aria-hidden="true">#</a>Auto-resume: fast lane and slow lane</h3>
+<p>A crashed or interrupted task first tries the <strong>fast lane</strong>: an immediate resume, up to 3 consecutive interruptions. If it keeps crashing, that circuit breaker trips and the task falls to the <strong>slow lane</strong> — a round-robin retry queue, each task retried on its own <code>auto_resume_interval_minutes</code> cadence (counted from when it entered the queue, not from whenever it&#39;s next inspected), up to <code>auto_resume_max_attempts</code> before it stops for good. <code>auto_resume_gap_minutes</code> is a single project-wide throttle shared by BOTH lanes — at most one auto-resume, fast or slow, happens per gap window — so a burst of simultaneous crashes can&#39;t relaunch every task at once on the fast lane before any of them even reaches the slow lane. Any healthy turn — a successful resume, a completed sync, daemon-restart recovery — clears a task out of both the fast-lane counter and the slow-lane queue.</p>
+<p>Inspect the current slow-lane queue with:</p>
+<pre><code>lazy daemon resume-queue
+</code></pre>
+<p>which lists each queued task&#39;s attempts used/max, last attempt time, next eligible time, and whether the project-wide gap or its own retry interval is what&#39;s currently holding it back. <code>lazy show</code>/<code>lazy list</code> also surface a queued task&#39;s next auto-resume window inline.</p>
+<p><code>auto_react_daily_budget</code> is the <strong>permanent</strong> cap. To steer the budget at runtime
+without editing <code>lazy.toml</code>, use <code>lazy daemon auto-budget</code>:</p>
+<ul>
+<li><code>lazy daemon auto-budget list</code> — today&#39;s used/limit, reset countdown, pause state,
+and a log of what consumed budget today (timestamp, task, trigger).</li>
+<li><code>lazy daemon auto-budget update &lt;+N|-N|=N&gt;</code> — adjust <strong>today&#39;s</strong> effective cap only
+(e.g. <code>+50</code>, <code>-20</code>, <code>=100</code>). This is ephemeral and resets at local midnight; it does
+<strong>not</strong> change <code>lazy.toml</code>.</li>
+<li><code>lazy daemon auto-budget pause</code> — pause all auto-react until local midnight (then
+auto-resumes); <code>resume</code> clears it early.</li>
+</ul>
+<p>&quot;Today&quot; rolls over at local midnight, and every reset/pause expiry is shown with a
+countdown anchored to <code>00:00 local</code>.</p>
+<h3 id="inspecting-and-reaping-daemons-across-projects"><a class="anchor" href="#inspecting-and-reaping-daemons-across-projects" aria-hidden="true">#</a>Inspecting and reaping daemons across projects</h3>
+<p><code>lazy daemon status</code> reports the daemon for the current project. To see and clean up
+daemons across <strong>all</strong> projects on the host:</p>
+<ul>
+<li><code>lazy daemon list</code> — every running daemon (pid, web port, version, age, project
+root). A daemon whose project root has been deleted is marked <code>(stray)</code>, and state
+dirs with no daemon behind them are reported as orphans.</li>
+<li><code>lazy daemon kill-stray</code> — reap only stray daemons (those whose project root no longer
+exists). A daemon whose root still exists is <strong>never</strong> touched. Requires confirmation;
+pass <code>--yes</code> for non-interactive callers and <code>--prune-dirs</code> to also remove orphaned
+state dirs.</li>
+</ul>
+<p>A state dir counts as <em>running</em> only if the process behind its recorded PID is verified
+to be that daemon — by answering on its socket, by holding the dir&#39;s daemon lock, or by
+its command line. A PID alone proves nothing: the OS reuses PIDs, so a dir left behind
+months ago will eventually record a PID that belongs to some unrelated process. Such a
+dir is reported as an orphan (and is removable with <code>--prune-dirs</code>), and its recycled
+PID is never signalled. When two dirs record the same PID, only the one that verifies is
+listed. If none of those signals can be evaluated at all, the daemon is assumed alive —
+the safe direction, since a wrong &quot;dead&quot; verdict would let <code>--prune-dirs</code> delete a live
+daemon&#39;s socket and token.</p>
+<p>Daemon state lives under <code>~/.lazy/daemon/&lt;slug&gt;/</code> by default. Set the
+<code>LAZY_DAEMON_BASE_DIR</code> environment variable to relocate it — useful for isolated test
+runs or custom operator setups. It is honored by every daemon path, including the
+<code>list</code>/<code>kill-stray</code> scan, so all daemons agree on a single location.</p>
+<h3 id="surviving-a-daemon-restart-running-agents-and-builders"><a class="anchor" href="#surviving-a-daemon-restart-running-agents-and-builders" aria-hidden="true">#</a>Surviving a daemon restart (running agents and builders)</h3>
+<p>A running agent or builder talks to the daemon through a small config file minted at
+launch and bind-mounted into its container: its own MCP token (minted per task
+session and per builder session, so an agent can only ever act as itself) plus a target of
+<code>http://host.docker.internal:&lt;web port&gt;</code>. Restart the daemon (an upgrade, a crash, <code>lazy daemon restart</code>) and that file can go stale, which used to leave <strong>every</strong> <code>lazy_*</code> tool
+in the live session returning a bare <code>Unauthorized</code> — read-only ones included — until the
+session was relaunched.</p>
+<p>Three things keep a live session working across a restart:</p>
+<ol>
+<li><strong>MCP tokens are persisted</strong> (<code>~/.lazy/daemon/&lt;slug&gt;/mcp-tokens.json</code>) rather than
+re-minted, and the daemon <strong>prefers the port it last bound</strong> over the default.</li>
+<li><strong>A starting daemon rewrites the config files it already minted</strong> to its current port
+— never the token, which belongs to one identity and must not be swapped under a live
+container. The rewrite is in place (same inode), because a single-file bind mount pins
+the inode — an atomic write-and-rename would be invisible inside the container.</li>
+<li><strong>Clients re-read that file on a 401 and retry exactly once.</strong> Nothing is retried
+unboundedly, no auth check is skipped, and the only credential source is the same
+trusted local file (or <code>~/.lazy/daemon/&lt;slug&gt;/token</code> for the supervisor&#39;s client).</li>
+</ol>
+<p>Point 1 is best-effort by nature: the <code>26024+</code> window is shared by <em>every</em> project on the
+host, so if another project&#39;s daemon has taken your port while yours was down, yours moves
+and the old port now answers with a foreign daemon that rightly rejects your token. That is
+what points 2 and 3 recover from. If the 401 still stands after the refresh, the error
+names the situation explicitly — the daemon on that port belongs to a different project —
+using <code>/daemon/status</code>, which reports its <code>projectRoot</code> unauthenticated for exactly this
+diagnosis. <code>lazy daemon list</code> shows which project owns which port.</p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,18 @@
+graph TB
+    subgraph Daemon
+        MCP[MCP Proxy]
+        EVT[Event Router]
+        SYNC[Sync Loop]
+        WEB[Web Dashboard]
+        PUSH[Branch Pusher]
+    end
+
+    CLI[CLI] -->|unix socket| MCP
+    Browser[Browser] -->|TCP :26024| WEB
+    AgentA[Agent A] -->|SSE| EVT
+    AgentB[Agent B] -->|HTTP proxy| MCP
+    Git[Git Remote] <-->|push/fetch| SYNC
+    SYNC -->|CI failures| EVT
+    SYNC -->|PR comments| EVT
+    EVT -->|auto-unblock| AgentA
+    PUSH -->|auto-push| Git

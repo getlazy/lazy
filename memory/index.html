@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared memory — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="shared-memory"><a class="anchor" href="#shared-memory" aria-hidden="true">#</a>Shared memory</h1>
+<p>Lazy owns a shared memory store: many small, named records of <strong>curated,
+cross-task knowledge</strong> — who the engineer is, guidance they gave and why,
+project constraints that aren&#39;t derivable from the code, and pointers to
+external resources.</p>
+<p>A compact index of every record (one line each: name, type, description) is
+auto-injected into <strong>builder and agent launches</strong>. Bodies are read on demand.
+Once the store grows, <code>lazy memory compact</code> replaces that index with a smaller
+<em>derived</em> summary — see <a href="#compaction">Compaction</a>.</p>
+<pre><code class="language-bash">lazy memory list                     # the index
+lazy memory show vm-credentials-idea # one record in full
+lazy memory save &lt;name&gt; -t project -d &quot;one line&quot;   # create or update
+lazy memory rm &lt;name&gt;                # tombstone (history preserved)
+lazy memory history [&lt;name&gt;]         # who wrote what, when
+lazy memory compact                  # regenerate the injected summary
+lazy search &#39;in:memories &quot;credentials&quot;&#39;            # search bodies
+</code></pre>
+<h2 id="why-lazy-owns-this"><a class="anchor" href="#why-lazy-owns-this" aria-hidden="true">#</a>Why lazy owns this</h2>
+<p>Claude Code has its own memory feature that writes markdown files into the
+harness&#39;s memory directory. In lazy, that directory lives <strong>inside each
+builder&#39;s per-builder projects overlay</strong> (<code>&lt;data&gt;/builder-projects/&lt;id&gt;/…</code>).
+Consequences, all verified in practice:</p>
+<ul>
+<li>never shared between builders (seeding copies only session JSONLs),</li>
+<li>garbage-collected by the overlay prune,</li>
+<li>invisible to agents and to other machines,</li>
+<li>outside lazy state entirely (not in storage, not searchable, not backed up).</li>
+</ul>
+<p>Months of builder sessions accumulated zero shared memory. Lazy memory replaces
+it: storage-backed, actor-attributed, searchable, and injected where it&#39;s
+actually needed. Builder and agent prompts explicitly redirect from the harness
+feature to <code>lazy_memory_*</code> — the harness feature cannot be disabled, so the
+prompts tell the model not to use it.</p>
+<h3 id="when-the-index-cant-be-read"><a class="anchor" href="#when-the-index-cant-be-read" aria-hidden="true">#</a>When the index can&#39;t be read</h3>
+<p>A storage failure while building the index <strong>never blocks a launch</strong>. Instead the
+memory section is replaced with an explicit marker — <code>MEMORY INDEX UNAVAILABLE (&lt;error&gt;)</code> — that tells the model records may exist and to retry on demand with
+<code>lazy_memory_recall</code> / <code>lazy_search</code>, and the underlying error is logged loudly.
+This is deliberately <em>not</em> the same as the empty-section case: rendering nothing
+would say &quot;this project has no recorded knowledge&quot;, turning an unreadable store
+into apparent absence of knowledge. All five agent launch paths and the builder
+share the same renderer, so they behave identically.</p>
+<h2 id="compaction"><a class="anchor" href="#compaction" aria-hidden="true">#</a>Compaction</h2>
+<p>Every record&#39;s index line is injected into every launch, so the injected context
+grows with the store. <code>lazy memory compact</code> bounds it <strong>without touching the
+records</strong>:</p>
+<pre><code class="language-bash">lazy memory compact               # auto: LLM summary, mechanical fallback
+lazy memory compact --mechanical  # code-only; no model needed
+lazy memory compact --llm         # require the model path (fails if unavailable)
+lazy memory compact --show        # print the current compact and what it covers
+lazy memory compact --clear       # drop it; injection returns to the full index
+lazy doctor                       # injected size vs the budget, staleness, remedy
+</code></pre>
+<p>A run prints what it is about to do <em>before</em> the model call — the record count,
+when the last compact was generated, which generator and model it will use —
+because an LLM round-trip is otherwise several silent seconds.</p>
+<p>Five rules define the feature:</p>
+<ol>
+<li><p><strong>The compact is derived; records are never modified.</strong> Compaction reads the
+records and writes one separate, overwritable artifact. No description
+rewrites, no truncation, no deletions — curation-by-mutilation is exactly what
+this avoids. <code>lazy memory show</code> is byte-identical before and after, and
+compaction records no write history because it is not a write to the records.</p>
+</li>
+<li><p><strong>Injection is the compact <em>plus</em> everything newer.</strong> A record created or
+updated after the compact was generated is injected as its <strong>live index
+line</strong>, and that line supersedes whatever the compact says about it. The
+watermark is the set of <code>name</code> + <code>revision</code> pairs the compact covered — a
+revision, not a timestamp, so it is immune to clock skew and a
+delete→revive cycle correctly reads as &quot;new&quot;. A record <em>removed</em> since
+compaction is called out too (&quot;Removed since that summary&quot;), so a session
+never reads a stale summary claim as current.</p>
+</li>
+<li><p><strong>Recompaction always regenerates from the records</strong>, never from the previous
+compact. There is no compounding lossy compression: every generation is one
+summarization step away from the source of truth.</p>
+</li>
+<li><p><strong>Size is a warning, never an error — and the diagnosis lives in
+<code>lazy doctor</code>.</strong> Whenever the memory context is assembled (builder launch,
+agent launch), a context over <code>[memory] warn_bytes</code> (default 4096) logs one
+generic line — <em>&quot;Injected memory context is over the advisory size threshold.
+Run <code>lazy doctor</code> for details.&quot;</em> — and nothing more. Doctor is the single
+&quot;check engine light&quot; surface, so it owns the whole diagnosis: the actual size
+against the threshold, whether a compact exists and how stale it is (records
+written/removed since its watermark), and the remedy. The remedy is
+conditional: <code>lazy memory compact</code> when the compact is <em>behind</em> the records,
+otherwise curate the records or raise <code>warn_bytes</code> — recommending a recompact
+of an already-current compact would send you in a circle. The builder&#39;s
+section also carries a short in-prompt pointer to <code>lazy doctor</code> (the builder
+can act on it; agents are read-only, so telling them would be noise); it
+carries no sizes or remedy of its own. Nothing is ever truncated and no launch
+is ever blocked.</p>
+<p>The size that is reported is measured on the section <em>without</em> that in-prompt
+note, so the number deciding &quot;over threshold&quot; is the same number doctor and
+<code>lazy memory compact</code> quote.</p>
+</li>
+<li><p><strong>Compaction must never grow the injected context.</strong> Shrinking injection is
+the only thing compaction exists to do, so a candidate that would make it
+bigger is rejected: nothing is written, any existing compact stays in place
+and stays injected, and the command exits non-zero after printing both sizes
+and what actually helps. The comparison is made on the <strong>assembled body</strong> —
+the summary plus the compact&#39;s own explanatory preamble plus any newer
+records injected alongside it — versus that same body with no compact, since
+that is what a prompt really pays for. (Comparing the raw summary text to the
+raw index is how a 6.0KB → 6.4KB run once reported success.) A consequence
+worth knowing: the preamble is a fixed cost, and one-line descriptions are
+already dense, so a small or already-tight store <em>cannot</em> be compacted below
+its plain index — mechanical compaction only starts paying for itself at
+roughly fifty-plus records. There the honest answer is rejection plus
+&quot;curate the records, or raise <code>warn_bytes</code>&quot;, not a compact that costs more
+than it saves.</p>
+</li>
+</ol>
+<p>Names stay referenceable: <code>lazy_memory_recall(name=…)</code> reads bodies on demand,
+so a summary that failed to mention a record would <strong>orphan</strong> it. Any name the
+LLM omits is appended verbatim as an index line and reported — repair, not
+rejection.</p>
+<h3 id="why-llm-first-with-a-mechanical-fallback"><a class="anchor" href="#why-llm-first-with-a-mechanical-fallback" aria-hidden="true">#</a>Why LLM-first with a mechanical fallback</h3>
+<p>The index is already one line per record, so mechanical tightening can only
+recover the repeated <code>(type)</code> token — real compression requires a reader that can
+merge overlapping knowledge into themes. So the default (<code>auto</code>) asks a model,
+and falls back to the mechanical generator — grouping by type, every name and
+description verbatim, lossless — on <strong>any</strong> failure: no credential, offline mode,
+a non-zero exit, empty output. Compaction is optional infrastructure; it must
+never be the reason a project cannot compact its memory. The fallback reason is
+always printed, never silent. Two extra guards: an LLM summary that would not
+shrink the injected context is discarded in favor of the mechanical result, and
+<code>--llm</code> (an explicit demand) fails loudly rather than quietly doing something
+else — including here, where a non-shrinking LLM summary is rejected outright
+instead of being silently replaced by a mechanical compact nobody asked for.</p>
+<h3 id="seeing-what-is-injected"><a class="anchor" href="#seeing-what-is-injected" aria-hidden="true">#</a>Seeing what is injected</h3>
+<p><code>lazy memory compact --show</code> prints the artifact <em>and its coverage</em>: when it was
+generated, by whom, which generator and model, how many records it covers, the
+injected size both with it and without it, the summary text itself, and then the
+catch-up picture — every record written or updated since the watermark (injected
+as its live index line, superseding the summary) and every name removed since.
+When nothing is outstanding it says so explicitly, so &quot;is my newest memory
+actually reaching sessions?&quot; is answerable without launching anything.</p>
+<h2 id="memory-vs-journal-vs-claudemd"><a class="anchor" href="#memory-vs-journal-vs-claudemd" aria-hidden="true">#</a>Memory vs journal vs CLAUDE.md</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>scope</th>
+<th>injected into prompts?</th>
+<th>who writes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>CLAUDE.md</strong></td>
+<td>how to work in this repo</td>
+<td>read by Claude Code automatically</td>
+<td>humans, in git</td>
+</tr>
+<tr>
+<td><strong>Journal</strong> (<code>lazy journal</code>)</td>
+<td>one task</td>
+<td><strong>never</strong> — prompt-immune by design</td>
+<td>humans, builder, agents</td>
+</tr>
+<tr>
+<td><strong>Memory</strong> (<code>lazy memory</code>)</td>
+<td>the project, across tasks</td>
+<td>yes — the index, on every launch</td>
+<td>humans, builder</td>
+</tr>
+</tbody></table>
+<p>The journal is the <em>raw per-task record</em> (&quot;chose K=3 because…&quot;, &quot;stubbed retry&quot;).
+Memory is <em>curated cross-task knowledge</em> that future sessions should start with.
+A journal entry that turns out to matter beyond its task is a candidate for a
+memory record — promoting it is a deliberate act, not automatic.</p>
+<h2 id="record-shape"><a class="anchor" href="#record-shape" aria-hidden="true">#</a>Record shape</h2>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>kebab-case slug; the record&#39;s identity. Saving an existing name <strong>supersedes</strong> it</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>one line — this is what the injected index shows (max 200 chars <strong>when you author it</strong>; see below)</td>
+</tr>
+<tr>
+<td><code>type</code></td>
+<td><code>user</code> · <code>feedback</code> · <code>project</code> · <code>reference</code></td>
+</tr>
+<tr>
+<td><code>body</code></td>
+<td>the actual knowledge (markdown)</td>
+</tr>
+</tbody></table>
+<p>Types mirror the harness categories so imported records keep their meaning:</p>
+<ul>
+<li><code>user</code> — who the engineer is (role, expertise, preferences)</li>
+<li><code>feedback</code> — guidance they&#39;ve given about how to work, <strong>with the why</strong></li>
+<li><code>project</code> — goals and constraints not derivable from code or git history</li>
+<li><code>reference</code> — pointers to external resources (dashboards, tickets, docs)</li>
+</ul>
+<h3 id="the-200-character-description-limit-is-an-authoring-rule"><a class="anchor" href="#the-200-character-description-limit-is-an-authoring-rule" aria-hidden="true">#</a>The 200-character description limit is an <em>authoring</em> rule</h3>
+<p><code>lazy memory save</code> and <code>lazy_memory_save</code> reject a description longer than 200
+characters: when you&#39;re writing a record, keeping the injected line short is
+free — put the detail in the body.</p>
+<p>The <strong>import path does not enforce it</strong>. Harness records were written by another
+tool under another contract, so they are stored <em>verbatim</em>, however long their
+description is — never rejected, never truncated. Rejecting would discard the
+curated knowledge the import exists to rescue; truncating would mangle it.
+After an import, lazy prints a hint naming any records over the limit so you can
+tighten them at your leisure — curation is a separate act from intake.</p>
+<p>Rendering adapts to the data rather than the data to the renderer: the index is
+one line per record, so a stored description&#39;s whitespace is collapsed <em>at
+render time</em> and long lines render in full.</p>
+<p>The one exception is the <code>lazy memory list</code> <strong>table</strong>, where a long description
+would wrap across terminal lines and make the table unscannable. There the
+description column is elided with a trailing <code>…</code> to whatever width the terminal
+leaves (piped output assumes 120 columns), and the footer says so when anything
+was shortened. This is display only — nothing stored changes, nothing that feeds
+injection is affected (the index renders descriptions in full, and a compact is
+derived from the records, never from this table), and <code>lazy memory show &lt;name&gt;</code>
+always prints the description verbatim.</p>
+<p>Every write is attributed (<code>human</code> from the CLI, <code>builder</code> over MCP, <code>system</code>
+for the import) and appended to an immutable history. <code>lazy memory rm</code> is a
+<strong>tombstone</strong>: the record leaves the index, but its history survives, and a
+later save under the same name revives it as a new revision.</p>
+<h2 id="who-can-write-agents-are-read-only"><a class="anchor" href="#who-can-write-agents-are-read-only" aria-hidden="true">#</a>Who can write: agents are read-only</h2>
+<p><strong>Task agents cannot write memory.</strong> <code>lazy_memory_save</code> is rejected
+server-side when the caller has a task id — the same ownership-gate mechanism
+that confines agents to their own subtree, not prompt guidance.</p>
+<p>The reason is a security boundary: memory records are injected into <em>every</em>
+future builder and agent session. An agent-writable shared store would be a
+prompt-injection channel into every session that follows — one compromised or
+confused agent could plant instructions that every later run reads as trusted
+project knowledge.</p>
+<p>Agents still <strong>read</strong> freely:</p>
+<ul>
+<li><code>lazy_memory_recall()</code> — the index; <code>lazy_memory_recall(name=…)</code> — one record</li>
+<li><code>lazy_search(query=&quot;in:memories &lt;text&gt;&quot;)</code> — search bodies</li>
+</ul>
+<p>If an agent learns something memory-worthy, it says so in its final summary and
+the human or builder decides.</p>
+<h2 id="mcp-tools"><a class="anchor" href="#mcp-tools" aria-hidden="true">#</a>MCP tools</h2>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>builder</th>
+<th>agent</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_memory_save</code></td>
+<td>✅</td>
+<td>❌ rejected server-side</td>
+</tr>
+<tr>
+<td><code>lazy_memory_recall</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>lazy_search</code> <code>in:memories</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+</tbody></table>
+<h2 id="importing-existing-harness-memory"><a class="anchor" href="#importing-existing-harness-memory" aria-hidden="true">#</a>Importing existing harness memory</h2>
+<p>One-time migration from the Claude Code harness memory files:</p>
+<pre><code class="language-bash">lazy doctor --import-memory        # previews, confirms, then imports
+lazy doctor --import-memory --yes  # non-interactive
+</code></pre>
+<p>It scans the shared <code>~/.claude/projects/&lt;encoded-cwd&gt;/memory/</code> directory <strong>and
+every per-builder overlay</strong> under <code>&lt;data&gt;/builder-projects/*/</code>, dedupes by
+record name (newest copy wins), and imports what lazy doesn&#39;t already have.
+Imported records are attributed to <code>system</code> — lazy performed the write, and the
+harness format doesn&#39;t record who authored the file.</p>
+<p>It is <strong>mechanistic</strong>: records come in as they were written. No authoring-side
+validation is applied at intake — in particular the 200-character description
+limit is not enforced and nothing is ever truncated (see above).</p>
+<p>It is idempotent: records already present are skipped, so later human edits are
+never clobbered by a re-run. <code>lazy doctor</code> reports when on-disk harness memory
+has no lazy counterpart and points at the command; it never writes silently.</p>
+<p><code>lazy init</code> also offers this import during onboarding, alongside the
+conversation-import offer, so adopting lazy on an existing repo inherits its
+memory in one step — see
+<a href="../conversation-import/#onboarding-lazy-init-offers-to-inherit-history">conversation-import.md</a>.
+That offer is a prompt too: skipped under <code>--non-interactive</code>, never silent, and
+declining just prints the <code>lazy doctor --import-memory</code> hint.</p>
+<h2 id="storage"><a class="anchor" href="#storage" aria-hidden="true">#</a>Storage</h2>
+<p>Memory lives behind the Storage interface like every other entity — records
+plus an append-only write history — and is implemented in all three backends
+(file, Postgres, daemon-remote). With file storage that is <code>memories.json</code> and
+<code>memory-history.json</code> under the storage root; never read or write those
+directly.</p>
+<p>The compact is stored separately as a single overwritable slot (<code>memory-compact.json</code>
+with file storage, one row in Postgres) with no history and no lock: it is derived
+state, so overwriting it destroys nothing and last-writer-wins is harmless — both
+writers regenerated from the same records. Deleting it is always safe; injection
+falls back to the full index.</p>
+
+</main>
+</body>
+</html>

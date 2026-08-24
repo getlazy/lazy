@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How lazy upgrade rebuilds the container image — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="how-lazy-upgrade-rebuilds-the-container-image"><a class="anchor" href="#how-lazy-upgrade-rebuilds-the-container-image" aria-hidden="true">#</a>How <code>lazy upgrade</code> rebuilds the container image</h1>
+<p><code>lazy upgrade</code> used to do its work strictly in order: find running containers,
+ask the human what to do about the working ones, wait for them to block, stop
+everything — and only <em>then</em> start a container image rebuild that can take
+several minutes. None of that waiting is an input to the build: the image is
+built from the Dockerfile, not from the state of your tasks. So the build now
+starts first and runs in the background while the rest of the upgrade proceeds.</p>
+<h2 id="the-sequence"><a class="anchor" href="#the-sequence" aria-hidden="true">#</a>The sequence</h2>
+<ol>
+<li><p><strong>Preflight</strong> — credential gate, container runtime availability, discovery of
+this project&#39;s running containers. Nothing has changed yet, and an abort here
+costs nothing.</p>
+</li>
+<li><p><strong>Start the rebuild, in the background, to a staging tag.</strong> The build writes
+<code>&lt;repository&gt;:&lt;tag&gt;-upgrade</code> (e.g. <code>lazy-runner:0.21-upgrade</code>), always
+with <code>--no-cache</code> — the Dockerfile text is unchanged when a new version of
+the configured agent&#39;s CLI ships, so only busting the cache actually
+re-fetches it.</p>
+<p>This happens <strong>unconditionally</strong>: no version comparison, no Dockerfile-hash
+check, no age check. Upgrading lazy rebuilds the image, always. That is what
+makes the image tag safe to keep coarse (<code>major.minor</code>) — the tag is an
+identity, and this is the freshness mechanism.</p>
+</li>
+<li><p><strong>Foreground flow continues</strong>: the stop/wait/cancel prompt, waiting for
+working agents to block, the builder pre-stop warning, stopping containers.</p>
+</li>
+<li><p><strong>Collect and promote.</strong> The upgrade waits for the background build (usually
+already finished), then points the canonical tags — <code>lazy-runner:&lt;major.minor&gt;</code>
+and, for the base repository, <code>lazy-runner:latest</code> — at the staged image and
+drops the staging tag. The agent binary is rebuilt alongside this.</p>
+</li>
+<li><p><strong>Stop the daemon</strong>, then purge any pre-v0.20 MCP configs left in the repo and
+rotate the shared daemon token they leaked — the one window where no
+container and no daemon holds it.</p>
+</li>
+<li><p><strong>Restart the daemon</strong>, which reconciles and auto-resumes interrupted tasks.</p>
+</li>
+</ol>
+<h2 id="why-this-is-safe"><a class="anchor" href="#why-this-is-safe" aria-hidden="true">#</a>Why this is safe</h2>
+<p><strong>Nothing running is disturbed by the build.</strong> A container holds its image by ID
+from the moment it launches, and any container created while the build is in
+flight resolves the <em>canonical</em> tag — which still points at the current image.
+The staging tag is invisible to every launch path.</p>
+<p><strong>The canonical tag only moves after you commit.</strong> Promotion happens in step 4,
+past the point where you chose to proceed. Cancel the upgrade, ctrl-c out of a
+prompt, or hit any failure before that, and <code>lazy-runner:&lt;major.minor&gt;</code> still points
+exactly where it did. The abandoned build&#39;s layers stay in the container
+runtime&#39;s build cache, so the next upgrade starts warm instead of from scratch;
+the staging tag itself is removed.</p>
+<p><strong>A failed build fails the upgrade, loudly.</strong> There is no fallback to &quot;keep the
+old image and carry on&quot; — that would produce an upgrade that upgraded nothing.
+If the build has already failed by the time you answer the prompt, the upgrade
+aborts <em>before</em> stopping anything, so your builders and agents keep running on
+the intact image. If it fails while the upgrade is collecting it, the failure is
+reported with the staging tag that was not promoted.</p>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><code>lazy upgrade --images</code> is the separate <strong>non-disruptive</strong> path: it rebuilds
+only the image, in the foreground, and stops nothing and restarts nothing.
+Only newly-created containers pick the new image up (<code>lazy upgrade --images --dry-run</code> prints the exact boundary).</li>
+<li>Image tags are versioned, never bare <code>:latest</code> — see the rationale in
+<code>src/capture/image-tag.ts</code> and <code>docs/agent-container.md</code>.</li>
+<li>An upgrade is not the only thing that refreshes the image — see &quot;When else the
+image gets rebuilt&quot; below.</li>
+</ul>
+<h2 id="when-else-the-image-gets-rebuilt"><a class="anchor" href="#when-else-the-image-gets-rebuilt" aria-hidden="true">#</a>When else the image gets rebuilt</h2>
+<p>An upgrade is the main path, but not the only one. Three triggers rebuild a
+runner image, on three different axes:</p>
+<table>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>What it catches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy upgrade</code></td>
+<td>Everything. Unconditional, <code>--no-cache</code>, described above</td>
+</tr>
+<tr>
+<td>The image is more than 14 days old</td>
+<td>Unpinned contents drifting on a host nobody upgrades</td>
+</tr>
+<tr>
+<td>The Dockerfile&#39;s content hash changed</td>
+<td>You edited the Dockerfile</td>
+</tr>
+</tbody></table>
+<p><code>lazy system build lazy-runner --no-cache</code> forces one at any time.</p>
+<p>The age backstop exists because a Dockerfile&#39;s <em>text</em> is not what goes stale.
+What it installs is unpinned — apt packages, the agent CLI&#39;s installer, the base
+image — so identical text yields a materially different image weeks later. Only
+wall-clock time sees that, which is why freshness is time-based and the tag
+(lazy&#39;s <code>major.minor</code>) is only an identity.</p>
+<p>None of this can leave you running an old <em>lazy</em>. The image contains no lazy
+code: <code>lazy-agent</code> is bind-mounted into the container at launch, so it is
+current the moment lazy is.</p>
+
+</main>
+</body>
+</html>

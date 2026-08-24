@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The git LFS guard — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="the-git-lfs-guard"><a class="anchor" href="#the-git-lfs-guard" aria-hidden="true">#</a>The git LFS guard</h1>
+<p>Lazy refuses to launch an agent into an environment where git LFS would silently
+store raw file content, and refuses to accept a branch that already contains such
+a commit. This document explains the defect, the two checks, and what to do when
+either fires.</p>
+<h2 id="the-defect"><a class="anchor" href="#the-defect" aria-hidden="true">#</a>The defect</h2>
+<p>A repository tracks large files with git LFS: a checked-in <code>.gitattributes</code>
+carries <code>filter=lfs</code> for some path, and <code>git add</code> is supposed to run the LFS
+<em>clean</em> filter so the commit holds a ~130-byte pointer instead of the file.</p>
+<p>Whether that happens depends on the git config of the clone doing the commit —
+<code>filter.lfs.process</code> / <code>clean</code> / <code>smudge</code>, written by <code>git lfs install</code>. If those
+are missing or empty, git skips the filter. Whether that is an <strong>error</strong> depends
+on one more key:</p>
+<table>
+<thead>
+<tr>
+<th><code>filter.lfs.required</code></th>
+<th>broken filter behaves as</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>true</code></td>
+<td><code>fatal: &lt;path&gt;: clean filter &#39;lfs&#39; failed</code> — the add fails</td>
+</tr>
+<tr>
+<td><code>false</code> (or unset)</td>
+<td>the raw file is committed, exit 0, no output</td>
+</tr>
+</tbody></table>
+<p>The second row is the whole problem. Nothing errors, nothing warns, and the
+commit looks normal until a push hits the forge&#39;s blob-size limit.</p>
+<p>This is not hypothetical. In a lazy-managed project in August 2026, a clone had
+<code>filter.lfs.process</code> set but <strong>empty</strong> and <code>required = false</code>. A 335 MB dataset
+file was committed verbatim where a 134-byte pointer belonged. The task branch
+became unpushable, and recovery took manual history surgery on a branch lazy
+owned.</p>
+<h2 id="layer-1-the-start-time-preflight"><a class="anchor" href="#layer-1-the-start-time-preflight" aria-hidden="true">#</a>Layer 1: the start-time preflight</h2>
+<p>When a task starts on a repository that uses LFS, lazy inspects the environment
+the agent will commit from — <code>git-lfs</code> on PATH, the three filter hooks non-empty,
+<code>filter.lfs.required</code> true — <strong>before</strong> the worktree is created. If anything is
+wrong the start is refused with one line and a pointer to <code>lazy doctor</code>:</p>
+<pre><code>Refusing to start task t1: This repository uses git LFS, but the LFS clean/smudge
+filter is not configured here (filter.lfs.process unset or empty); and
+`filter.lfs.required` is false, so git commits raw file contents instead of
+failing when the filter is broken. Commits made here would silently store raw
+file content instead of LFS pointers, producing a branch that cannot be pushed.
+
+Run `lazy doctor` for details.
+</code></pre>
+<p><code>lazy doctor</code> carries the full diagnosis and the exact commands — that split is a
+project convention, not an oversight: the point of occurrence gets one generic
+line, doctor is the single place remedies live.</p>
+<p><strong>Lazy never repairs the config for you.</strong> Writing to a user&#39;s git config as a
+side effect of <code>lazy start</code> is exactly the hidden side effect the project
+forbids. Lazy detects and refuses; you fix it deliberately:</p>
+<pre><code class="language-bash">git lfs install --local          # writes filter.lfs.process/clean/smudge + required
+git config filter.lfs.required true
+</code></pre>
+<p>Configure the mode with <code>[git] lfs_check</code> in lazy.toml:</p>
+<ul>
+<li><code>&quot;refuse&quot;</code> (default) — block the start</li>
+<li><code>&quot;warn&quot;</code> — start anyway, record a warning on the task</li>
+<li><code>&quot;off&quot;</code> — skip the check</li>
+</ul>
+<p><code>lfs_check</code> does <strong>not</strong> affect the accept-time guard below, which is always on.</p>
+<h2 id="layer-2-the-accept-time-guard"><a class="anchor" href="#layer-2-the-accept-time-guard" aria-hidden="true">#</a>Layer 2: the accept-time guard</h2>
+<p>Before <code>lazy accept</code> merges anything, lazy scans <code>merge-base..&lt;task branch&gt;</code> for
+files on LFS-tracked paths whose committed blob is not a pointer, and refuses if
+it finds any:</p>
+<pre><code>Accepting task t1 would merge `lazy/add-dataset` into `main` with 1 file stored
+as RAW CONTENT on an LFS-tracked path:
+
+  datasets/train.bin  (335 MB of raw content)
+      committed by 4f2a1c9e &quot;Add training data&quot; (2026-08-09)
+…
+</code></pre>
+<p>The message names each file with its size and the commit that introduced it,
+explains why nothing failed at commit time, and gives the recovery route:</p>
+<ol>
+<li>fix the environment first (<code>git lfs install --local &amp;&amp; git config filter.lfs.required true</code>) — otherwise the re-commit repeats the mistake;</li>
+<li>re-stage the paths through the filter (<code>git rm --cached … &amp;&amp; git add …</code>) and
+commit, confirming with <code>git cat-file -s &lt;branch&gt;:&lt;path&gt;</code> that the blob is now
+pointer-sized;</li>
+<li>if the branch&#39;s <em>history</em> still carries the raw blob the push will still fail
+— redo the work on a fresh branch (<code>lazy redo &lt;task&gt;</code>) rather than rewriting
+shared history in place.</li>
+</ol>
+<p>If a file genuinely belongs in git as-is, approve it explicitly:</p>
+<pre><code class="language-bash">lazy accept t1 --approve-file datasets/train.bin
+</code></pre>
+<p>(or <code>approved_files</code> over MCP). Each file must be approved individually; the
+accept then proceeds and records a warning naming what was approved, so the audit
+trail shows a human made the call. This reuses the same approval channel as the
+<a href="../resurrection-guard/">resurrection guard</a> rather than inventing a second one.</p>
+<p>Lazy does <strong>not</strong> rewrite bad commits for you. Repairing history on a branch is
+the human&#39;s call.</p>
+<h2 id="how-detection-works"><a class="anchor" href="#how-detection-works" aria-hidden="true">#</a>How detection works</h2>
+<p>Both layers read git data only — <strong>no <code>git-lfs</code> binary is required</strong> to detect
+LFS usage or to find raw blobs. The binary is consulted for exactly one question
+(&quot;is it installed?&quot;), so a machine without git-lfs is still fully diagnosable.</p>
+<ul>
+<li><strong>Does this repo use LFS?</strong> <code>git grep -l --fixed-strings &#39;filter=lfs&#39; &lt;ref&gt; -- &#39;*.gitattributes&#39;</code> — one pass over the tree at a ref, no checkout.</li>
+<li><strong>Is path X LFS-tracked at a ref?</strong> git&#39;s own attribute engine, against a
+throwaway index built from that ref:
+<code>GIT_INDEX_FILE=&lt;temp&gt; git read-tree &lt;ref&gt;</code> then <code>git check-attr --cached -z filter</code>. <code>git check-attr --source=&lt;ref&gt;</code> would be the direct spelling but only
+landed in git 2.40, and lazy supports older gits. Nothing is written to the
+repository.</li>
+<li><strong>Is a blob a pointer?</strong> <code>git cat-file -s</code> first; anything over 1 KB cannot be a
+pointer and is reported without being read (the point is not to pull 335 MB
+into memory to learn that it is 335 MB). Otherwise the blob must start with
+<code>version https://git-lfs.github.com/spec/v1</code>.</li>
+</ul>
+<h2 id="scope-and-limits"><a class="anchor" href="#scope-and-limits" aria-hidden="true">#</a>Scope and limits</h2>
+<ul>
+<li><strong>Only checked-in <code>.gitattributes</code>.</strong> A repo that enables LFS purely through
+<code>.git/info/attributes</code> or <code>core.attributesFile</code> is not detected as LFS-using.
+(Once detected, <code>check-attr</code> does honour those.)</li>
+<li><strong>Only <code>merge-base..head</code>.</strong> Raw blobs already on the target branch are
+somebody else&#39;s damage and are deliberately not this accept&#39;s business.</li>
+<li><strong>Wide branches are capped.</strong> Beyond 5000 changed files the scan truncates and
+says so in the accept&#39;s warnings rather than reporting a clean result.</li>
+<li><strong>No repair tooling.</strong> Neither layer rewrites config or history.</li>
+</ul>
+<p>Implementation: <a href="../src/git/lfs.ts"><code>src/git/lfs.ts</code></a> (detection and scanning),
+<a href="../src/protection/lfs-guard.ts"><code>src/protection/lfs-guard.ts</code></a> (accept-time
+enforcement), with the preflight in the daemon&#39;s task launcher so both runners
+are covered.</p>
+
+</main>
+</body>
+</html>

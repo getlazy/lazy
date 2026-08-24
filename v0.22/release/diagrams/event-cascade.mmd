@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant Parent
+    participant Daemon
+    participant Child A
+    participant Child B
+
+    Child A->>Daemon: Turn complete
+    Daemon->>Parent: SSE: task.completed
+    Note over Parent: Reviews child work
+    Parent->>Daemon: lazy accept child-a
+    Daemon->>Daemon: Merge child-a into parent
+    Daemon->>Child B: SSE: upstream.updated
+    Note over Child B: Auto-syncs with parent
+    Daemon->>Daemon: Auto-push parent branch

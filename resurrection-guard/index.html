@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The deleted-file resurrection guard — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="the-deleted-file-resurrection-guard"><a class="anchor" href="#the-deleted-file-resurrection-guard" aria-hidden="true">#</a>The deleted-file resurrection guard</h1>
+<p><code>lazy accept</code> refuses a merge that would silently put back a file the target
+branch deliberately deleted, and names every such file. This document explains
+the defect it prevents, how the detection works, and what to do when it fires.</p>
+<h2 id="the-defect"><a class="anchor" href="#the-defect" aria-hidden="true">#</a>The defect</h2>
+<p>Git&#39;s 3-way merge decides what happened to a path by comparing both branches
+against their <strong>merge base</strong>. If a file is:</p>
+<ul>
+<li><strong>present</strong> on the source branch, and</li>
+<li><strong>absent</strong> on the target branch, and</li>
+<li><strong>absent at the merge base</strong></li>
+</ul>
+<p>then git sees &quot;one side added a file, the other side did nothing&quot; and adds it.
+No conflict, no prompt, nothing in the merge output. If the target branch had
+deleted that file on purpose, the deletion is quietly undone.</p>
+<p>The third condition is the surprising one. A branch that merely <em>predates</em> a
+deletion is safe: the file exists at its merge base, so git sees &quot;the target
+deleted it, the source did nothing&quot; and correctly keeps it deleted. The defect
+needs the file to be missing at the base entirely.</p>
+<h2 id="how-a-base-gets-that-stale"><a class="anchor" href="#how-a-base-gets-that-stale" aria-hidden="true">#</a>How a base gets that stale</h2>
+<p>The shape that produces it in lazy is a <strong>squash-accepted parent with a stacked
+child</strong> — which is exactly how release hubs work:</p>
+<pre><code>main ── … ── &quot;Release v0.11&quot; (squash of the v0.11 hub) ── &quot;delete src/sse.ts&quot;
+        \
+         v0.11 hub ── (adds src/sse.ts) ── v0.12 hub ── … ── Merge origin/main
+</code></pre>
+<p>Accepting the v0.11 hub squashes its work into a single commit on <code>main</code>. That
+commit is <em>not</em> a descendant of the hub&#39;s own commits, so the v0.12 hub — which
+was branched off v0.11 before the squash — still has a merge base with <code>main</code>
+that predates the entire v0.11 window. Every file born in that window has no
+version at the base. When <code>main</code> later deletes one of them, the v0.12 hub&#39;s
+routine <code>Merge origin/main</code> brings it straight back.</p>
+<p>This is not hypothetical. In the v0.12 release it resurrected a dead SSE module
+and five other changes, one of them a live behavioral regression, and none of it
+was noticed for eight releases.</p>
+<h2 id="what-the-guard-checks"><a class="anchor" href="#what-the-guard-checks" aria-hidden="true">#</a>What the guard checks</h2>
+<p>Before any accept merges, lazy computes:</p>
+<ol>
+<li><code>git diff --diff-filter=A --name-only &lt;target&gt;...&lt;source&gt;</code> — files added
+relative to the <strong>merge base</strong> (three-dot);</li>
+<li><code>git diff --diff-filter=A --name-only &lt;target&gt; &lt;source&gt;</code> — files present on
+the source but not on the target tip (two-dot);</li>
+<li>the intersection of the two — these are exactly the paths the merge would add
+one-sidedly;</li>
+<li>for each, <code>git log --diff-filter=D &lt;target&gt; -- &lt;path&gt;</code> — did the target branch
+ever delete it? The newest such commit is reported.</li>
+</ol>
+<p>Anything that survives step 4 is a resurrection. Paths the target never had, or
+that it deleted and later re-added itself, are not flagged.</p>
+<h3 id="why-not-git-diff---diff-filterd-mainhub"><a class="anchor" href="#why-not-git-diff---diff-filterd-mainhub" aria-hidden="true">#</a>Why not <code>git diff --diff-filter=D main...hub</code></h3>
+<p>That command is the intuitive one and it does <strong>not</strong> work. A three-dot diff is
+taken from the merge base, and in this topology the resurrected file has no
+version at the merge base — so it appears in neither side of that diff. Run
+against a reproduction of the v0.12 topology it returns nothing at all.</p>
+<p>The related idea of checking that <code>merge-base(hub, main)</code> is recent enough also
+fails, for a different reason: by accept time the hub has already merged <code>main</code>,
+so its merge base <em>is</em> <code>main</code>&#39;s tip. The staleness signal is gone precisely when
+you would want to read it. The guard therefore asks the direct question — &quot;would
+this merge un-delete anything?&quot; — instead of a proxy for it.</p>
+<h2 id="when-it-fires"><a class="anchor" href="#when-it-fires" aria-hidden="true">#</a>When it fires</h2>
+<p>The accept is refused, nothing is merged, and the message names each file, the
+commit that deleted it, and the command that resolves it:</p>
+<pre><code>Accepting task t1 would merge `lazy/release-v012` into `main` and RE-ADD 1 file
+that `main` deliberately deleted:
+
+  src/sse.ts
+      deleted by 4f2a1c9e &quot;Remove dead SSE module&quot; (2026-04-12)
+
+`lazy/release-v012` has no version of this file at its merge base with `main`, so
+git sees the deletion as nothing to merge and takes the branch&#39;s copy wholesale —
+no conflict, nothing to review. …
+
+If it is dead on `main`, delete it on `lazy/release-v012` and re-run the accept.
+
+If bringing it back is intentional, approve it explicitly:
+
+  lazy accept t1 --approve-file src/sse.ts
+</code></pre>
+<p>Two ways forward:</p>
+<ul>
+<li><strong>The deletion was right</strong> (the usual case): delete the files on the task
+branch too, commit, and accept again.</li>
+<li><strong>The re-addition is deliberate</strong>: pass <code>--approve-file &lt;path&gt;</code> for each one
+(or <code>approved_files</code> over MCP). The accept proceeds and records a warning
+naming what was approved, so the audit trail shows a human made the call.</li>
+</ul>
+<p>Every file must be approved individually — a partial approval still refuses, and
+lists only what is still unapproved.</p>
+<h2 id="stacked-children-after-an-accept"><a class="anchor" href="#stacked-children-after-an-accept" aria-hidden="true">#</a>Stacked children after an accept</h2>
+<p>When an accept squash-lands a task that has active children, lazy re-parents
+those children automatically, but re-parenting only moves a pointer — it does not
+touch their worktrees. Until each child runs <code>lazy sync</code>, its merge base is
+behind the work that just landed, which is the stale-base condition above. Accept
+says so, and both <code>lazy accept</code>&#39;s pre-flight note and the post-accept warning
+point at <code>lazy sync</code>.</p>
+<p>Lazy does <strong>not</strong> sync those children for you. Merging into somebody else&#39;s
+worktree as a side effect of an accept the human asked for on a different task is
+exactly the hidden side effect CLAUDE.md forbids, and a conflict raised there
+would strand a task nobody is watching. Upstream merge is <code>lazy sync</code>&#39;s job. The
+resurrection guard is the backstop for when the advice is ignored.</p>
+<h2 id="scope-and-limits"><a class="anchor" href="#scope-and-limits" aria-hidden="true">#</a>Scope and limits</h2>
+<ul>
+<li><strong>The guard is always on</strong> and applies to every accept, not just release hubs.
+The hazard is a property of merge topology, not of release semantics — any
+squash-accepted parent with a stacked child can produce it. It adds no config.</li>
+<li><strong>File granularity only.</strong> A file that survives on the target but has <em>hunks</em>
+reverted inside it by the same mechanism is not detected. That defect class is
+real — the v0.12 audit found instances — but hunk-level detection has no clean
+signal to key off and would fire constantly on ordinary merges.</li>
+<li><strong>Deletions made only inside a merge commit</strong> are not attributed to a deleting
+commit; <code>git log --diff-filter=D</code> does not report them by default. No such case
+appeared in the v0.12 audit, and the file-level check itself still catches the
+re-add — only the &quot;deleted by&quot; attribution would be missing.</li>
+<li><strong>A very wide branch is capped.</strong> If a merge adds more than 2000 files the
+guard checks the first 2000 and warns that it truncated, rather than silently
+reporting a clean result.</li>
+</ul>
+<p>Implementation: <a href="../src/protection/resurrection-guard.ts"><code>src/protection/resurrection-guard.ts</code></a>;
+enforcement point in the daemon accept path, alongside the branch-protection edge
+gate, so every driver and every caller (CLI, MCP, automation) is covered.</p>
+
+</main>
+</body>
+</html>

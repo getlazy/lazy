@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protected branches and human approvals — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="protected-branches-and-human-approvals"><a class="anchor" href="#protected-branches-and-human-approvals" aria-hidden="true">#</a>Protected branches and human approvals</h1>
+<p>Branch protection flips the builder&#39;s default on sensitive merges from
+<em>&quot;accept unless told not to&quot;</em> to <em>&quot;cannot accept without a deliberate human
+act.&quot;</em> It is <strong>friction, not security</strong>: the builder is an over-eager
+cooperator, not an adversary. Treat it as a speed bump that makes an
+unreviewed merge require a deliberate act, not as a boundary that would hold
+against one.</p>
+<h2 id="turning-it-on-one-command-zero-branch-listing"><a class="anchor" href="#turning-it-on-one-command-zero-branch-listing" aria-hidden="true">#</a>Turning it on: one command, zero branch listing</h2>
+<p>Protection is <strong>opt-in — OFF by default</strong>. A project with no <code>[protection]</code>
+section (or with <code>enabled = false</code>) has no protection at all: accepts into
+<code>main</code> behave exactly as they always have. That is deliberate — a brand-new
+user&#39;s first <code>lazy accept</code> should merge, not refuse over a gate they have not
+heard of yet.</p>
+<p>One command turns it on:</p>
+<pre><code>lazy protect main on
+</code></pre>
+<p>That both lists <code>main</code> in <code>[protection].protected_branches</code> <strong>and</strong> sets
+<code>enabled = true</code> (it says so when it does). From then on, accepting any task
+into <code>main</code> requires a human <code>lazy approve &lt;task&gt;</code> — or an approval on the
+task&#39;s PR/MR, which satisfies the same gate.</p>
+<p>The equivalent by hand, which needs no branch listing at all because the repo&#39;s
+<strong>default branch</strong> is protected as soon as the switch is on:</p>
+<pre><code class="language-toml">[protection]
+enabled = true   # protects the repo&#39;s default branch; set false (or delete) to turn off
+</code></pre>
+<p>Toggling <code>enabled</code> off and on again loses nothing: the rest of the section is
+kept, it just has no effect while disabled. <code>lazy protect &lt;target&gt; off</code> never
+touches the switch — unprotecting one branch is not the same act as turning
+the feature off.</p>
+<h3 id="how-you-find-out-it-exists"><a class="anchor" href="#how-you-find-out-it-exists" aria-hidden="true">#</a>How you find out it exists</h3>
+<p>Since protection is off by default, <code>lazy accept</code> advertises it: after an
+accept <strong>succeeds</strong> into the repo&#39;s default branch, it prints one line —</p>
+<pre><code>Tip: gate future accepts into `main` behind a human approval — lazy protect main on
+</code></pre>
+<p>The tip is suppressed once you have expressed an opinion: writing <code>enabled</code>
+into <code>[protection]</code> (either value) stops it for good, as does having protection
+on. An explicit <code>enabled = false</code> means you know about the feature and said no,
+so lazy stops mentioning it.</p>
+<h2 id="seeing-a-gate-before-it-bites"><a class="anchor" href="#seeing-a-gate-before-it-bites" aria-hidden="true">#</a>Seeing a gate before it bites</h2>
+<p>Protection is friction, and friction you meet for the first time as a refusal
+is just a surprise. Once a project protects anything, every read surface says
+so — before you try to accept.</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What you see</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy show &lt;task&gt;</code></td>
+<td>a <code>Protected:</code> line — <code>yes (branch gate)</code>, <code>yes (task gate)</code>, or <code>yes (task gate + branch gate)</code> — followed by what each gate is and where the approval stands</td>
+</tr>
+<tr>
+<td><code>lazy status &lt;task&gt;</code></td>
+<td>the same <code>Protected:</code> line, in the same words</td>
+</tr>
+<tr>
+<td><code>lazy list</code> / <code>lazy active</code> / <code>lazy blocked</code></td>
+<td>a compact <code>[P]</code> marker on the goal, <code>[P][A]</code> when an approval is recorded and pending, plus a one-line legend under the table</td>
+</tr>
+<tr>
+<td><code>lazy review &lt;task&gt;</code></td>
+<td>the gate in the header line (and above the hunks under <code>-i</code>), so you learn about it before you press <code>a</code></td>
+</tr>
+<tr>
+<td>MCP <code>lazy_show</code></td>
+<td>a <code>protection</code> object — <code>gated</code>, <code>target_branch</code>, <code>task_gate</code>, <code>branch_gate</code>, <code>approval_pending</code>, <code>markers</code>, <code>summary</code></td>
+</tr>
+<tr>
+<td>Web dashboard</td>
+<td>the same <code>[P]</code> / <code>[P][A]</code> badge on the task list, and a <code>Protected</code> row on the task detail page</td>
+</tr>
+</tbody></table>
+<p>Two properties are deliberate:</p>
+<ul>
+<li><strong>Additive only.</strong> A project that protects nothing sees exactly the output it
+saw before — no marker, no legend, no <code>Protected:</code> line. Markers sit in the
+last column so no fixed-width column shifts, and they are ASCII (<code>[P]</code>, not a
+shield emoji, whose width varies by terminal) so scripts can grep them.</li>
+<li><strong>Read-only.</strong> These surfaces report gates; they never arrange them. There is
+no MCP write surface for <code>lazy protect</code> or <code>lazy approve</code> — see
+<a href="../surface-asymmetries/">surface-asymmetries.md</a>. The builder can plan around
+a gate without being able to open it.</li>
+</ul>
+<p>A task you listed in <code>protected_tasks</code> while <code>enabled = false</code> gets no marker —
+it gates nothing — but <code>lazy show</code> still reports it, as <code>no — listed in [protection].protected_tasks, but protection is disabled</code>. Silence there would
+leave you believing a gate was armed when it was not.</p>
+<p>All surfaces render one shared vocabulary (<code>src/protection/status.ts</code>), which
+also resolves the target branch exactly the way accept resolves it. A new
+surface renders those helpers; it does not re-derive protection from config.</p>
+<h2 id="what-a-protected-accept-looks-like"><a class="anchor" href="#what-a-protected-accept-looks-like" aria-hidden="true">#</a>What a protected accept looks like</h2>
+<p>With protection on, <code>lazy accept</code> of a task targeting a protected branch
+refuses — regardless of who asks (CLI <code>--yes</code>, the builder over MCP, any
+automation) and on <strong>all</strong> remote drivers, including <code>local</code>. The refusal
+says exactly what to do: merging into <code>main</code> requires human approval — run
+<code>lazy approve &lt;task&gt;</code>.</p>
+<pre><code>lazy system passphrase set   # once per MACHINE, at your own terminal
+lazy approve &lt;task&gt;          # prompts for the passphrase
+lazy accept &lt;task&gt;           # consumes it once it completes
+</code></pre>
+<ul>
+<li>The passphrase lives <strong>nowhere in the repository</strong>. It is enrolled once per
+machine with <code>lazy system passphrase set</code>, stored as a <code>Bun.password</code> hash
+(argon2id) at <code>~/.lazy/passphrase.json</code> with mode <code>0600</code>, and covers every
+lazy project on that machine. What makes the approval meaningful is that the
+passphrase is <strong>outside the builder&#39;s context</strong> — never paste it into a
+conversation with the builder. See
+<a href="#enrolling-the-passphrase-lazy-system-passphrase">the enrollment section</a>.</li>
+<li>One approval unlocks <strong>exactly one</strong> accept of that task, and it is spent
+<strong>only when that accept completes</strong>. Passing the gate merely reserves the
+approval; it is consumed at the moment the merge becomes durable (the same
+point that writes the accept tag, or that hands the merge to the forge). An
+accept that fails or aborts at any phase — pre-flight, a pre-merge gate, the
+merge itself — leaves the approval pending and says so in the failure, so
+you fix the cause and re-run <code>lazy accept</code> <strong>without approving again</strong>.
+Consumption happens inside accept&#39;s per-task lock, so two concurrent accepts
+can never both spend one approval.</li>
+<li><code>lazy approve</code> checks enrollment <strong>before</strong> it prompts. With nothing enrolled
+on the machine, it prints the enrollment instructions and exits non-zero
+without asking you to type a secret that could not possibly have matched. The
+interactive prompt is a bare <code>Approval passphrase:</code> — it names no file,
+because there is no file to read it from.</li>
+<li>The prompt is <strong>masked</strong> — each character you type shows as <code>*</code>, so the
+passphrase never reaches the screen, terminal scrollback, or a screen
+share. Masking needs a real terminal: without one, <code>lazy approve</code> refuses
+rather than falling back to an echoing prompt.</li>
+<li><code>lazy approve</code> is CLI-only. There is deliberately <strong>no MCP equivalent</strong>;
+exposing one would let the builder approve its own work.</li>
+<li>The MCP <code>lazy_accept</code> tool refuses protected accepts up front and <strong>never
+issues a confirmation code</strong> for them: the two-step confirmation is
+self-satisfiable by the builder and does not count as authorization for a
+protected merge (it remains in place for unprotected operations).</li>
+</ul>
+<p>Task-to-task merges (a subtask accepted into its parent&#39;s <code>lazy/*</code> branch)
+are never protected by default — no friction in the inner loop. Re-entry of a
+task already in <code>merging</code> status is exempt — a human already approved the merge
+that reached that state (and it was spent when the forge took the merge over);
+re-entry only completes that authorized merge.</p>
+<h3 id="ci-and-scripting"><a class="anchor" href="#ci-and-scripting" aria-hidden="true">#</a>CI and scripting</h3>
+<p>There is deliberately <strong>no <code>--yes</code></strong> for <code>lazy approve</code>, and — since v0.23 —
+<strong>no scripted route to the passphrase at all</strong>: no flag, no env var, no piped
+stdin. It is typed at the masked prompt, at a terminal, or not at all.</p>
+<p>Until v0.23 <code>echo &quot;$SECRET&quot; | lazy approve &lt;task&gt;</code> was supported and
+documented. It is now refused with a message pointing you at a terminal. The
+reason is the same one that moved the passphrase out of the repo: a value a
+script can supply is a value that lives on in shell history, CI logs, process
+listings and agent transcripts, and a gate whose credential can be replayed by
+automation is not proof a human looked at the diff. If a pipeline needs to
+merge without a human, the honest answer is to not protect that branch, or to
+merge it on the forge where the approval is a person clicking Approve.</p>
+<h3 id="approving-the-prmr-counts"><a class="anchor" href="#approving-the-prmr-counts" aria-hidden="true">#</a>Approving the PR/MR counts</h3>
+<p>On a GitHub or GitLab project, <strong>approving the task&#39;s PR/MR satisfies the same
+gate</strong> — no separate <code>lazy approve</code> needed. Clicking &quot;Approve&quot; while reading
+the diff is the same deliberate human act, expressed where you were already
+reviewing; demanding a second local approval on top would be friction with no
+extra judgement behind it.</p>
+<p>The two are one mechanism, not two: the forge approval is resolved <em>inside</em>
+the same gate, so a local-driver project and a forge project reach the
+identical decision. Details that follow from that:</p>
+<ul>
+<li>The forge is checked <strong>first</strong>, so an already-approved PR does not silently
+burn a pending <code>lazy approve</code> record — that record stays for an accept that
+needs it.</li>
+<li>The check <strong>fails closed</strong>: if the forge cannot be reached, the gate stays
+shut and the refusal points you at <code>lazy approve</code>, which works offline.</li>
+<li>A refusal on a forge project names both routes; on a <code>local</code> project it
+names only <code>lazy approve</code>, because there is no PR to approve.</li>
+</ul>
+<h2 id="enrolling-the-passphrase-lazy-system-passphrase"><a class="anchor" href="#enrolling-the-passphrase-lazy-system-passphrase" aria-hidden="true">#</a>Enrolling the passphrase: <code>lazy system passphrase</code></h2>
+<pre><code>lazy system passphrase set      # enroll or rotate (asks twice; rotation asks for the current one)
+lazy system passphrase status   # is this machine enrolled? never prints or hints at the value
+lazy system passphrase delete   # un-enroll (asks for the current passphrase first)
+</code></pre>
+<p><strong>One enrollment per machine, not per project.</strong> Keying the credential to a
+project would need a stable project identity, and the only identity available
+is the path — which changes the moment the repo is cloned, moved, or opened
+from a worktree. A passphrase that silently stops working after <code>git clone</code> is
+worse than one shared across your projects, and the passphrase is <em>friction</em>
+(proof a human is at the keyboard), not a per-repo secret.</p>
+<p><strong>Stored hashed, outside every repository.</strong> <code>~/.lazy/passphrase.json</code> holds a
+<code>Bun.password</code> hash (argon2id) and mode <code>0600</code> — never the passphrase. It sits
+one level <em>above</em> <code>~/.lazy/daemon/</code>, with its own <code>LAZY_PASSPHRASE_BASE_DIR</code>
+seam, so <code>LAZY_DAEMON_BASE_DIR</code> cannot relocate your credential out from under
+you. lazy <strong>refuses</strong> — not warns — to use a store that is group- or
+world-readable, and tells you the <code>chmod</code> to fix it: a hash other accounts can
+read is a hash they can attack offline while you believe the gate is intact.</p>
+<p><strong>There is no recovery — reset instead.</strong> The store holds a hash, so a
+forgotten passphrase cannot be read back, and both rotation (<code>set</code>) and
+<code>delete</code> ask for the current one. The way back is to remove the store yourself
+and enroll again:</p>
+<pre><code class="language-bash">rm ~/.lazy/passphrase.json      # the file `lazy system passphrase status` names
+lazy system passphrase set      # enroll a new one, at your terminal
+</code></pre>
+<p>That is a plain local file only your account can write, and removing it resets
+the passphrase and nothing else — protection settings, tasks and branches are
+untouched. Until you re-enroll, protected merges <strong>fail closed</strong>: <code>lazy approve</code>
+refuses and points back at <code>lazy system passphrase set</code> rather than letting the
+merge through.</p>
+<p>Three deliberate restrictions, each load-bearing:</p>
+<ul>
+<li><strong>TTY only.</strong> No flag, no env var, no piped stdin — same reasoning as
+<a href="#ci-and-scripting">CI and scripting</a> above.</li>
+<li><strong>No daemon, no MCP tool.</strong> Enrollment writes from the CLI process on your
+host; verification stays daemon-side. If enrollment went <em>through</em> the
+daemon, anything that can reach the daemon could enroll a new passphrase and
+then satisfy its own gate.</li>
+<li><strong>Refuses inside a container.</strong> A task agent&#39;s container is not your
+terminal, and the command exists for your terminal.</li>
+</ul>
+<h3 id="migrating-from-lazyapprove-passphrase"><a class="anchor" href="#migrating-from-lazyapprove-passphrase" aria-hidden="true">#</a>Migrating from <code>.lazy/approve-passphrase</code></h3>
+<p>Before v0.23 the passphrase sat in plaintext inside the repo, at
+<code>.lazy/approve-passphrase</code> or wherever <code>[protection].passphrase_file</code> pointed.
+Both are <strong>gone</strong>: the key is removed from the schema (<code>lazy doctor</code> explains
+the migration if it is still in your <code>lazy.toml</code>), and the old file is <strong>never
+consulted</strong> — leaving it in place does not satisfy the gate. Run
+<code>lazy system passphrase set</code>, which offers to delete the stale file for you;
+<code>lazy system passphrase status</code> and <code>lazy doctor</code> flag it until it is gone.</p>
+<h3 id="what-this-does-not-close"><a class="anchor" href="#what-this-does-not-close" aria-hidden="true">#</a>What this does not close</h3>
+<p>If nothing has ever been enrolled on a machine, the <strong>first</strong> enrollment is
+reachable by an agent running under the <strong>host-process</strong> runner — it shares
+your user account, so it could run the command&#39;s code path itself. Rotation is
+not (it requires the current passphrase), and neither is reading the passphrase
+back (only a hash is stored). This residual is accepted rather than papered
+over: the real fix is running agents in containers, which is the default
+runner and where the command refuses outright.</p>
+<h2 id="advanced-protecting-additional-branches"><a class="anchor" href="#advanced-protecting-additional-branches" aria-hidden="true">#</a>Advanced: protecting additional branches</h2>
+<p>For projects with more than one sensitive branch, <code>protected_branches</code> adds
+to the automatic default-branch protection (exact names, no globs):</p>
+<pre><code class="language-toml">[protection]
+protected_branches = [&quot;release&quot;]
+</code></pre>
+<p><code>gate_default_branch = false</code> switches off the automatic default-branch
+protection, leaving only the explicit list. See the <code>[protection]</code> reference
+in <a href="../lazy-toml/">lazy-toml.md</a>.</p>
+<h3 id="the-default-branch-is-an-implicit-entry"><a class="anchor" href="#the-default-branch-is-an-implicit-entry" aria-hidden="true">#</a>The default branch is an implicit entry</h3>
+<p>The default branch is gated <strong>without appearing in <code>protected_branches</code></strong> — it
+is resolved from the remote (<code>refs/remotes/&lt;remote&gt;/HEAD</code>) at decision time, so
+it stays correct if the repo&#39;s default branch ever changes. Because nobody
+typed it into a list, it is surfaced everywhere the list is:</p>
+<ul>
+<li><code>lazy protect</code> shows it under <strong>Protected branches</strong>, marked <code>(implicit — gate_default_branch)</code>.</li>
+<li><code>lazy protect &lt;default-branch&gt; off</code> does not claim it is unprotected — it
+says what actually protects it and that <code>gate_default_branch = false</code> is the
+key that lifts it. (Listing it explicitly is still allowed and is saved: the
+entry outlives a later <code>gate_default_branch = false</code>.)</li>
+<li><code>lazy doctor</code> warns when that remote ref is missing, because resolution then
+falls back to the literal <code>main</code> — on a <code>master</code> repo, a gate you believe is
+armed would protect nothing. The fix it names is
+<code>git remote set-head &lt;remote&gt; --auto</code>.</li>
+</ul>
+<h2 id="protected-tasks-gating-work-on-the-way-out"><a class="anchor" href="#protected-tasks-gating-work-on-the-way-out" aria-hidden="true">#</a>Protected tasks: gating work on the way OUT</h2>
+<p>A protected <strong>branch</strong> gates merges coming <em>in</em>. A protected <strong>task</strong> gates
+one task&#39;s work going <em>out</em>: merging its branch upward requires approval
+<strong>regardless of the target</strong> — including into a <code>lazy/*</code> parent branch, which
+is otherwise never gated.</p>
+<p>Use it when a particular piece of work is the sensitive thing, wherever it
+lands: a risky refactor, a task you want to read yourself before it moves
+anywhere, a long-running task that accumulates subtask work freely but must
+not be promoted without you.</p>
+<p>Tasks are listed by <strong>code or short id</strong>, not by branch — the branch is
+resolved from the task at decision time, so it stays correct:</p>
+<pre><code class="language-toml">[protection]
+protected_tasks = [&quot;add-auth&quot;]
+</code></pre>
+<p>The refusal names the task and, as always, <code>lazy approve &lt;task&gt;</code>.</p>
+<h3 id="stale-entries-fail-open--loudly"><a class="anchor" href="#stale-entries-fail-open--loudly" aria-hidden="true">#</a>Stale entries fail open — loudly</h3>
+<p>A listed task that no longer resolves to a branch — deleted, code changed,
+identifier now ambiguous, or simply never started — <strong>gates nothing</strong>. It
+fails open rather than blocking every accept on a config typo.</p>
+<p>That is the dangerous half of the trade: you believe a gate is armed when it
+is not. So a stale entry is made loud in three places:</p>
+<ul>
+<li>the accept path <strong>warns</strong> on every gated accept</li>
+<li><code>lazy doctor</code> reports it, naming each stale code and its fix
+(<code>lazy protect &lt;code&gt; off</code>) — report-only, never a hard failure</li>
+<li><code>lazy protect</code> shows it as stale in the listing</li>
+</ul>
+<h2 id="the-lazy-protect-command"><a class="anchor" href="#the-lazy-protect-command" aria-hidden="true">#</a>The <code>lazy protect</code> command</h2>
+<p><code>lazy protect</code> is the single CLI for all of the above. It edits the
+<code>[protection]</code> section of <code>lazy.toml</code> in place — there is <strong>one store</strong>, and
+you can always read or hand-edit it.</p>
+<pre><code class="language-bash">lazy protect                       # Show the current protection state
+lazy protect release on            # Protect merges INTO branch &#39;release&#39;
+lazy protect add-auth on           # Protect merges OUT OF task &#39;add-auth&#39;
+lazy protect add-auth off          # Lift that task gate
+lazy protect --branch main off     # Stop protecting the &#39;main&#39; branch
+</code></pre>
+<ul>
+<li>The target resolves as a <strong>task code or short id first</strong>, then as a branch
+name — you think in tasks more often than in branches. When it matches
+both, the command says so and takes the task; <code>--branch</code> / <code>--task</code> settle
+it explicitly.</li>
+<li>Turning a target <strong>on</strong> also sets <code>enabled = true</code> when the switch is off,
+and says so. Protection is opt-in, so a bare list edit would otherwise be
+inert — you would believe you had gated a branch when you had not.</li>
+<li>Turning a target <strong>off</strong> never touches the switch. While protection is
+disabled such an edit is still saved (losing your change would be worse than
+a no-op) but <strong>warns</strong> that it has no effect yet. <code>lazy doctor</code> flags the
+same combination: gate keys configured while the switch is off.</li>
+<li>There is deliberately <strong>no MCP equivalent for writing</strong>: the builder must
+not manage its own gates, for the same reason it cannot run <code>lazy approve</code>.
+Reading the state is harmless.</li>
+</ul>
+<h3 id="what-the-config-editing-does-and-does-not-preserve"><a class="anchor" href="#what-the-config-editing-does-and-does-not-preserve" aria-hidden="true">#</a>What the config editing does and does not preserve</h3>
+<p><code>lazy protect</code> edits <code>lazy.toml</code> as text rather than reparsing and
+re-serializing it, so <strong>comments, blank lines, key order and quoting style
+survive</strong>. Known limitations:</p>
+<ul>
+<li>A replaced <strong>multi-line</strong> array collapses to a single line. Comments
+<em>inside</em> that array&#39;s brackets are lost; comments above and below are not.</li>
+<li>Removing the last entry writes an explicit <code>protected_branches = []</code> rather
+than deleting the key — &quot;nothing is protected&quot; said out loud.</li>
+<li>The dotted form (<code>protection.protected_branches = [...]</code>) and an inline
+table (<code>protection = { ... }</code>) are <strong>rejected with an error</strong> rather than
+edited, since rewriting them safely is not possible at the text level.
+Convert to a <code>[protection]</code> section and re-run.</li>
+</ul>
+<h2 id="mechanics"><a class="anchor" href="#mechanics" aria-hidden="true">#</a>Mechanics</h2>
+<p>Verification goes through a pluggable <code>verifyHumanToken</code> seam
+(<code>src/protection/verify-token.ts</code>). The static passphrase is the first-cut
+mechanism; TOTP can replace it behind the same seam.</p>
+<p>The seam also answers a token-free question — &quot;is anything enrolled?&quot; — which
+is what lets <code>lazy approve</code> refuse before prompting, and which names the
+token&#39;s source in the prompt. A mechanism that cannot know the answer without
+a token (TOTP has no file to inspect) reports that honestly, and <code>lazy approve</code>
+falls back to asking and then verifying. The CLI asks the daemon this over a
+pre-flight RPC rather than reading config itself, so the answer always comes
+from the same project root that will do the verifying.</p>
+<p>A forge PR approval is an <em>additional</em> satisfier of that same check, not a
+parallel mechanism — see <a href="#approving-the-prmr-counts">Approving the PR/MR counts</a>
+above. The accept path hands the gate a probe for it rather than checking the
+forge on its own branch of logic, so adding a future satisfier means adding it
+in one place.</p>
+<h2 id="a-separate-gate-on-the-same-path"><a class="anchor" href="#a-separate-gate-on-the-same-path" aria-hidden="true">#</a>A separate gate on the same path</h2>
+<p>The <a href="../resurrection-guard/">deleted-file resurrection guard</a> sits immediately
+after this one in the accept path and refuses a merge that would silently put
+back a file the target branch deleted. It is unrelated to protection — always
+on, no config, and it asks about the <em>content</em> of the merge rather than about
+who is allowed to make it — but it shares the enforcement point and the
+<code>--approve-file</code> approval channel.</p>
+<h2 id="what-this-does-not-do"><a class="anchor" href="#what-this-does-not-do" aria-hidden="true">#</a>What this does NOT do</h2>
+<p>Deliberate non-goals: no threat model against a hostile builder, no
+push-prevention (an agent on a host runner can <code>git push</code> around the check —
+accepted), no cryptographic hardening or rate limiting. The feature succeeds
+if it changes the <em>default</em> path from auto-accept to human-approved.</p>
+<p>Moving the passphrase out of the repo (v0.23) closed one concrete hole — the
+secret is no longer sitting in plaintext in a tree every agent can read, at a
+path the repo&#39;s own config could redirect. It did not turn friction into
+security: see
+<a href="#what-this-does-not-close">What this does not close</a> for the residual that
+remains under the host-process runner.</p>
+
+</main>
+</body>
+</html>

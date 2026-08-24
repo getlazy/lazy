@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant CI
+    participant Human
+    participant Agent A
+    participant Agent B
+
+    Agent A->>Human: Turn complete (blocked)
+    CI->>Human: Build failed
+    Human->>Human: Read CI logs, copy error
+    Human->>Agent A: lazy unblock "CI failed: ..."
+    Agent A->>Human: Fixed, turn complete (blocked)
+    Agent B->>Human: Needs upstream sync
+    Human->>Human: Remember to merge parent
+    Human->>Agent B: lazy unblock --sync-with-upstream

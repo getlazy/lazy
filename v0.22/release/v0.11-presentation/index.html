@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lazy v0.11 — The Daemon Release — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<hr>
+<p>marp: true
+theme: default
+paginate: true
+title: Lazy v0.11 — The Daemon Release
+style: |
+  section {
+    font-family: -apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, sans-serif;
+  }
+  h1 {
+    color: #1a1a2e;
+  }
+  h2 {
+    color: #16213e;
+  }
+  .columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  .before { color: #e74c3c; }
+  .after { color: #27ae60; }
+  code { font-size: 0.85em; }
+  img {
+    max-width: 100%;
+    max-height: 80%;
+    object-fit: contain;</p>
+<h2 id=""><a class="anchor" href="#" aria-hidden="true">#</a>}</h2>
+<h1 id="lazy-v011--the-daemon-release"><a class="anchor" href="#lazy-v011--the-daemon-release" aria-hidden="true">#</a>Lazy v0.11 — The Daemon Release</h1>
+<p><strong>The daemon becomes the central nervous system.</strong></p>
+<p>Agents, CLI, web dashboard, and git remotes all connect through the daemon.
+Tasks advance themselves in response to real-world signals.</p>
+<p>March 2026</p>
+<hr>
+<h1 id="the-problem-manual-relay"><a class="anchor" href="#the-problem-manual-relay" aria-hidden="true">#</a>The problem: manual relay</h1>
+<p>Before v0.11, humans were the message bus.</p>
+<ul>
+<li><strong>CI fails</strong> — you notice, copy the error, run <code>lazy unblock</code> with context</li>
+<li><strong>PR gets a comment</strong> — you read it, relay it to the agent manually</li>
+<li><strong>Child task finishes</strong> — you remember to unblock the parent</li>
+<li><strong>Branch drifts</strong> — you notice conflicts late, spend time resolving them</li>
+<li><strong>No visibility</strong> — <code>lazy list</code> in terminal is the only window into the system</li>
+</ul>
+<p>Every signal required a human in the loop. Agents sat blocked, waiting.</p>
+<hr>
+<h1 id="before-v011-human-as-message-bus"><a class="anchor" href="#before-v011-human-as-message-bus" aria-hidden="true">#</a>Before v0.11: Human as message bus</h1>
+<p><img src="../diagrams/before-human-relay.svg" alt="w:800 h:400" loading="lazy"></p>
+<p>Every arrow through &quot;Human&quot; is latency and context-switching cost.</p>
+<hr>
+<h1 id="after-v011-daemon-as-nervous-system"><a class="anchor" href="#after-v011-daemon-as-nervous-system" aria-hidden="true">#</a>After v0.11: Daemon as nervous system</h1>
+<p><img src="../diagrams/after-daemon-relay.svg" alt="w:800 h:400" loading="lazy"></p>
+<p>The daemon routes signals. Humans review results.</p>
+<hr>
+<h1 id="architecture"><a class="anchor" href="#architecture" aria-hidden="true">#</a>Architecture</h1>
+<p><img src="../diagrams/architecture.svg" alt="w:800 h:400" loading="lazy"></p>
+<p>One daemon process. Five responsibilities. Zero manual relay.</p>
+<hr>
+<h1 id="web-dashboard"><a class="anchor" href="#web-dashboard" aria-hidden="true">#</a>Web dashboard</h1>
+<p>The daemon serves a web UI at <code>http://localhost:26024</code>.</p>
+<ul>
+<li>Task list with status, agent, and timing</li>
+<li>Task detail with turns, commits, and diffs</li>
+<li>Full-text search across tasks</li>
+<li>Real-time updates</li>
+</ul>
+<p><strong>Dual-bind architecture:</strong></p>
+<ul>
+<li>Unix socket — CLI and agent RPC (token-authenticated)</li>
+<li>TCP port — browser access (localhost only, no auth needed)</li>
+</ul>
+<pre><code class="language-toml">[server]
+port = 26024
+</code></pre>
+<hr>
+<h1 id="mcp-proxy-for-agents"><a class="anchor" href="#mcp-proxy-for-agents" aria-hidden="true">#</a>MCP proxy for agents</h1>
+<p>Containerized agents access lazy tools through the daemon.</p>
+<div class="columns">
+<div><p><strong>Before:</strong>
+Each builder session spun up its own TCP server. Port management, config files, separate auth.</p>
+</div>
+<div><p><strong>After:</strong>
+One daemon endpoint. Agents connect via HTTP tunnel (<code>host.docker.internal:26024</code>). Task-scoped — agents can only access their own worktree.</p>
+</div>
+</div><p>The builder server pattern is subsumed. No per-session servers, no port dance.</p>
+<hr>
+<h1 id="auto-push-branches"><a class="anchor" href="#auto-push-branches" aria-hidden="true">#</a>Auto-push branches</h1>
+<p>Task branches push to remote automatically after state changes.</p>
+<div class="columns">
+<div><p><strong>Before:</strong></p>
+<ul>
+<li>Run <code>lazy accept</code></li>
+<li>Remember to push</li>
+<li>Or wait for periodic sync</li>
+<li>Branch drift accumulates</li>
+</ul>
+</div>
+<div><p><strong>After:</strong></p>
+<ul>
+<li>Run <code>lazy accept</code></li>
+<li>Daemon auto-pushes immediately</li>
+<li>Serialized queue, retry on failure</li>
+<li>Remote always in sync</li>
+</ul>
+</div>
+</div><p>Enabled by default. No configuration needed.</p>
+<hr>
+<h1 id="event-routing"><a class="anchor" href="#event-routing" aria-hidden="true">#</a>Event routing</h1>
+<p>Real-time event flow through the task graph.</p>
+<p><img src="../diagrams/event-cascade.svg" alt="w:800 h:400" loading="lazy"></p>
+<p>Events cascade. Blocked tasks auto-unblock. Working tasks get SSE.</p>
+<hr>
+<h1 id="auto-react-ci-failures"><a class="anchor" href="#auto-react-ci-failures" aria-hidden="true">#</a>Auto-react: CI failures</h1>
+<p><img src="../diagrams/ci-auto-react.svg" alt="w:800 h:400" loading="lazy"></p>
+<p>The agent gets: job name, failure reason, log excerpt, and link to the CI run.
+No human copy-paste. No context lost in translation.</p>
+<hr>
+<h1 id="auto-react-pr-comments"><a class="anchor" href="#auto-react-pr-comments" aria-hidden="true">#</a>Auto-react: PR comments</h1>
+<p>When a human comments on a task&#39;s pull request:</p>
+<ol>
+<li>Daemon detects new comment during sync</li>
+<li>Deduplicates against previously seen comment IDs</li>
+<li>Checks auto-react budget</li>
+<li>Auto-unblocks the task with comment content</li>
+</ol>
+<p>The agent gets another turn to address the feedback — no manual relay needed.</p>
+<p>Works with both GitHub and GitLab.</p>
+<hr>
+<h1 id="safety-circuit-breakers"><a class="anchor" href="#safety-circuit-breakers" aria-hidden="true">#</a>Safety: circuit breakers</h1>
+<p>Auto-reactions are powerful but need guardrails.</p>
+<table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auto_react</code></td>
+<td><code>true</code></td>
+<td>Master switch</td>
+</tr>
+<tr>
+<td><code>auto_react_max_retries</code></td>
+<td><code>3</code></td>
+<td>Per-task limit per trigger type</td>
+</tr>
+<tr>
+<td><code>auto_react_backoff</code></td>
+<td><code>exponential</code></td>
+<td>Delay between retries</td>
+</tr>
+<tr>
+<td><code>auto_react_daily_budget</code></td>
+<td><code>50</code></td>
+<td>Project-wide daily turn limit</td>
+</tr>
+</tbody></table>
+<p><strong>Escalation path:</strong></p>
+<ol>
+<li>First failure → auto-unblock immediately</li>
+<li>Second failure → backoff delay, then auto-unblock</li>
+<li>Third failure → task paused, human notified</li>
+<li>Daily budget hit → all auto-reactions paused project-wide</li>
+</ol>
+<p>Counters reset on manual unblock.</p>
+<hr>
+<h1 id="terminal-lazy-watch"><a class="anchor" href="#terminal-lazy-watch" aria-hidden="true">#</a>Terminal: <code>lazy watch</code></h1>
+<pre><code class="language-bash"># Watch a specific task&#39;s agent session (read-only)
+lazy watch fix-auth
+
+# Watch the only running task
+lazy watch
+</code></pre>
+<ul>
+<li>Attaches to the agent&#39;s tmux session in read-only mode</li>
+<li>See exactly what the agent is doing, without interfering</li>
+<li>Terminal windows auto-named: &quot;lazy builder&quot;, &quot;lazy pair&quot;</li>
+<li>Requires tmux</li>
+</ul>
+<hr>
+<h1 id="default-watchdog-timeout"><a class="anchor" href="#default-watchdog-timeout" aria-hidden="true">#</a>Default watchdog timeout</h1>
+<p>Agents now have a 2-hour watchdog by default.</p>
+<p>If an agent produces no output for 2 hours, it&#39;s killed (SIGTERM, then SIGKILL after 5s grace).</p>
+<p>Previously: watchdog was disabled. Hung agents ran forever.</p>
+<pre><code class="language-toml">[agent]
+watchdog_output_timeout_ms = 7200000  # 2 hours (default)
+watchdog_output_timeout_ms = 0        # Disable (old behavior)
+</code></pre>
+<hr>
+<h1 id="configuration-summary"><a class="anchor" href="#configuration-summary" aria-hidden="true">#</a>Configuration summary</h1>
+<pre><code class="language-toml"># Web dashboard
+[server]
+port = 26024
+
+# Watchdog
+[agent]
+watchdog_output_timeout_ms = 7200000
+
+# Auto-react controls
+[daemon]
+auto_react = true
+auto_react_ci = true
+auto_react_comments = true
+auto_react_max_retries = 3
+auto_react_backoff = &quot;exponential&quot;
+auto_react_daily_budget = 50
+</code></pre>
+<p>All features work out of the box with sensible defaults.</p>
+<hr>
+<h1 id="whats-next"><a class="anchor" href="#whats-next" aria-hidden="true">#</a>What&#39;s next</h1>
+<p>Deferred from v0.11, candidates for v0.12:</p>
+<ul>
+<li><strong>Dockerfile onboarding</strong> — auto-detect project language and generate Dockerfile</li>
+<li><strong><code>lazy log</code></strong> — unified log viewer across tasks and daemon</li>
+<li><strong>Builder MCP migration</strong> — builders use daemon MCP endpoint directly</li>
+<li><strong>Dashboard auth</strong> — token-based auth for remote dashboard access</li>
+<li><strong>Event persistence</strong> — durable event log for audit and replay</li>
+</ul>
+<hr>
+<h1 id="summary"><a class="anchor" href="#summary" aria-hidden="true">#</a>Summary</h1>
+<p>v0.11 makes lazy a <strong>self-advancing system</strong>.</p>
+<table>
+<thead>
+<tr>
+<th>Before</th>
+<th>After</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Human relays CI errors</td>
+<td>Daemon auto-reacts</td>
+</tr>
+<tr>
+<td>Human syncs branches</td>
+<td>Daemon auto-pushes</td>
+</tr>
+<tr>
+<td>Human unblocks on events</td>
+<td>Daemon auto-delivers</td>
+</tr>
+<tr>
+<td>Terminal-only visibility</td>
+<td>Web dashboard</td>
+</tr>
+<tr>
+<td>No agent timeout</td>
+<td>2-hour default watchdog</td>
+</tr>
+</tbody></table>
+<p>The daemon is the central nervous system.
+Agents respond to signals. Humans review results.</p>
+
+</main>
+</body>
+</html>

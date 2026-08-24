@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web review surface — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="web-review-surface"><a class="anchor" href="#web-review-surface" aria-hidden="true">#</a>Web review surface</h1>
+<p>The daemon&#39;s embedded web server hosts a <strong>review loop</strong>: the list of tasks
+awaiting review → a per-line-commentable diff → inline comment threads that
+carry a real back-and-forth with the task&#39;s agent → unblock/accept.</p>
+<p>It is an early implementation: the loop works end to end, but it is <strong>not
+hardened</strong>, and it binds to loopback only for that reason. Read <a href="#known-limits">Known
+limits</a> before exposing it on anything else.</p>
+<h2 id="routes"><a class="anchor" href="#routes" aria-hidden="true">#</a>Routes</h2>
+<p>All served in-process by the daemon (same process, same <code>storage</code> instance —
+never a second writer). The dashboard&#39;s base URL is printed by
+<code>lazy daemon status</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/review</code></td>
+<td>GET</td>
+<td>Review queue — blocked tasks, with comment / pending-ask / queued-comment counts</td>
+</tr>
+<tr>
+<td><code>/review/:task</code></td>
+<td>GET</td>
+<td>Review view — anchored diff + inline threads + queued comments + actions (mirrored top and bottom) + sticky status bar</td>
+</tr>
+<tr>
+<td><code>/review/:task/comment</code></td>
+<td>POST</td>
+<td>Post an inline message (JSON), <code>intent: &#39;ask&#39; | &#39;comment&#39;</code></td>
+</tr>
+<tr>
+<td><code>/review/:task/comment/:id/retry</code></td>
+<td>POST</td>
+<td>Re-send a saved question whose ask failed (form; 303 → <code>/review/:task</code>)</td>
+</tr>
+<tr>
+<td><code>/review/:task/comment/:id/withdraw</code></td>
+<td>POST</td>
+<td>Retract one of your own messages before it reaches the agent (form; 303 → <code>/review/:task</code>)</td>
+</tr>
+<tr>
+<td><code>/review/:task/unblock</code></td>
+<td>POST</td>
+<td>Unblock with feedback, carrying every queued comment (form; 303 → <code>/tasks/:id</code>)</td>
+</tr>
+<tr>
+<td><code>/review/:task/accept</code></td>
+<td>POST</td>
+<td>Accept the task (form; carries the approval passphrase when the gate asks for one)</td>
+</tr>
+<tr>
+<td><code>/review/:task/sync</code></td>
+<td>POST</td>
+<td>Merge the parent branch into the task branch — the in-UI remedy for an out-of-sync or conflicted accept (form)</td>
+</tr>
+<tr>
+<td><code>/api/review/queue</code></td>
+<td>GET</td>
+<td>The queue as JSON</td>
+</tr>
+<tr>
+<td><code>/api/review/:task/threads</code></td>
+<td>GET</td>
+<td><code>{ threads, pending, pendingDelivery, queued, state }</code> — what the island polls</td>
+</tr>
+</tbody></table>
+<p><code>:task</code> accepts a short id, a full id, or a task code — the same resolution the
+CLI uses. Rendered forms always post to the canonical full id.</p>
+<h2 id="the-loop"><a class="anchor" href="#the-loop" aria-hidden="true">#</a>The loop</h2>
+<ol>
+<li><strong>Queue</strong> (<code>/review</code>) lists tasks in <code>blocked</code>, each showing its status,
+whether a live agent session exists, and how many comments are still awaiting
+an answer.</li>
+<li><strong>Diff</strong> (<code>/review/:task</code>) renders the task branch vs. its parent, computed by
+the daemon&#39;s own diff path (<code>handleDiff</code>), never by shelling git in the
+handler.</li>
+<li><strong>Comment</strong> — every diff row is commentable, and every message carries one of
+two reviewer <strong>intents</strong> (see below): <em>ask</em> a question, or leave a <em>comment</em>
+for the agent to act on later.</li>
+<li><strong>Resolve</strong> — unblock with feedback (which also delivers every queued comment)
+or accept. If the accept is refused, the page says what to do about it — see
+<a href="#when-an-accept-is-refused">When an accept is refused</a>.</li>
+</ol>
+<h2 id="when-an-accept-is-refused"><a class="anchor" href="#when-an-accept-is-refused" aria-hidden="true">#</a>When an accept is refused</h2>
+<p>An accept can be refused for many reasons: the protection gate wants an approval
+passphrase, files were touched that the task was not allowed to touch, the branch
+is behind its parent, a merge is half-finished, the task has no commits. A bare
+&quot;accept failed&quot; leaves the reviewer with nowhere to go, so every refusal renders a
+<strong>remedy panel</strong> above the diff:</p>
+<ul>
+<li><strong>what to do next</strong>, in a sentence;</li>
+<li>the <strong>files involved</strong>, when the refusal is about specific paths (the motivating
+case is a task with dozens of protected files — nobody is retyping those);</li>
+<li>an <strong>in-page action</strong> when one exists — the passphrase form for a gated accept,
+or a <em>Sync with parent</em> button for a branch that is behind or conflicted;</li>
+<li>the <strong>exact CLI command</strong>, complete and copy-pasteable, always. It is the
+fallback when there is no in-page action, and the escape hatch when there is.</li>
+</ul>
+<h3 id="the-daemon-owns-the-remedy-the-page-only-renders-it"><a class="anchor" href="#the-daemon-owns-the-remedy-the-page-only-renders-it" aria-hidden="true">#</a>The daemon owns the remedy, the page only renders it</h3>
+<p>The refusal→remedy mapping lives in the daemon, next to the code that refuses.
+<code>AcceptRefusedError</code> (<code>src/daemon/accept-refusal.ts</code>) carries a structured
+<code>AcceptRemedy</code> — <code>{ reason, next, command?, uiAction?, files? }</code> from
+<code>src/types/accept-remedy.ts</code> — which travels in the RPC error body alongside the
+message and is parsed back out client-side. The web layer never pattern-matches
+the prose of an error message to decide what to offer, and it never re-derives a
+command from config. A refusal the daemon has not mapped simply has no remedy
+panel: the daemon&#39;s own message is still shown verbatim, so an unmapped case
+degrades to what the page did before, never to a dead end.</p>
+<h3 id="the-passphrase-is-a-human-surface-deliberately"><a class="anchor" href="#the-passphrase-is-a-human-surface-deliberately" aria-hidden="true">#</a>The passphrase is a human surface, deliberately</h3>
+<p><code>lazy approve</code> has no MCP equivalent on purpose — an agent must not be able to
+satisfy its own gate. That asymmetry is about <em>agents</em>, not about terminals: a
+person at the review page is exactly the human the gate was written for, so the
+page asks for the passphrase and the daemon completes the gated accept, the same
+way <code>lazy approve</code> + <code>lazy accept</code> do at a shell. The passphrase is posted to the
+daemon for verification, is never stored client-side and never logged or echoed
+back into the page, and a wrong one re-renders the form with a clear, retryable
+error. See <a href="../surface-asymmetries/">surface-asymmetries.md</a>.</p>
+<h3 id="a-refused-accept-never-eats-what-you-typed"><a class="anchor" href="#a-refused-accept-never-eats-what-you-typed" aria-hidden="true">#</a>A refused accept never eats what you typed</h3>
+<p>The reviewer may have a half-written accept reason and half-written unblock
+feedback on the page when the accept is refused. Both are carried through the
+refusal and echoed back into their boxes, and both ride along as hidden fields
+inside the passphrase and sync forms — so a second failure preserves them too.
+This is the same never-lose-human-feedback rule the CLI follows with <code>$EDITOR</code>
+content.</p>
+<h2 id="two-intents-ask-vs-comment"><a class="anchor" href="#two-intents-ask-vs-comment" aria-hidden="true">#</a>Two intents: ask vs comment</h2>
+<p>Each inline message is one of:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Ask agent</strong></th>
+<th><strong>Add comment</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Means</td>
+<td>a question</td>
+<td>a change request or note</td>
+</tr>
+<tr>
+<td>Dispatched</td>
+<td>immediately, as a read-only ask turn</td>
+<td>never on its own</td>
+</tr>
+<tr>
+<td>Reaches the agent</td>
+<td>now</td>
+<td>batched into your next unblock work turn</td>
+</tr>
+<tr>
+<td>Can change code</td>
+<td>no</td>
+<td>yes (it rides a normal work turn)</td>
+</tr>
+<tr>
+<td>State on the record</td>
+<td><code>ask_state: pending → answered/failed</code></td>
+<td><code>delivery_state: pending_delivery → delivered</code> (+ <code>delivered_turn</code>)</td>
+</tr>
+</tbody></table>
+<p>The familiar analogue is GitHub&#39;s single comment vs. start-a-review: an ask is a
+question you want answered right now; comments accumulate until you submit.</p>
+<p>Worked example — the reviewer posts C1 (comment), A1 (ask), C2 (comment), A2
+(ask), then unblocks. The agent sees exactly <strong>three</strong> turns: A1&#39;s ask and reply,
+A2&#39;s ask and reply, then a single work turn carrying C1 + C2 with their anchors
+plus the reviewer&#39;s unblock message.</p>
+<p><strong>INVARIANT: a comment must never become a work turn on its own.</strong> That is the
+legacy <code>Comment</code> behaviour (one comment = one agent turn) and it is precisely
+what this model replaces — a reviewer marking up ten lines should produce one
+turn, not ten. This mirrors how lazy already treats forge PR comments: collect,
+then react in batch.</p>
+<p>Both modes stand alone. Comment-only-then-unblock (accumulate, then answer) and
+ask-only (pure conversation, no code change) are equally legitimate, and an
+unblock with nothing queued behaves exactly as it did before: the message alone,
+unwrapped.</p>
+<h3 id="asks"><a class="anchor" href="#asks" aria-hidden="true">#</a>Asks</h3>
+<p>An ask persists the comment, then resumes the agent&#39;s session in <strong>plan mode</strong>
+(same machinery as <code>lazy_ask</code> and <code>lazy review -i</code>&#39;s ask action). The answer is
+persisted as a reply in the same thread, anchored to the same line. The human can
+reply again; the thread accumulates. Ask turns never change code.</p>
+<p>Asks are only possible while the task is <code>blocked</code> or <code>conflict</code>. The rule and
+its wording live in exactly one place — <code>askUnavailableReason()</code> in
+<code>src/server/review-actions.ts</code> — and drive three surfaces: the daemon&#39;s gate, the
+warning shown above the comment box <em>before</em> the reviewer types, and the sticky
+status bar. A question posted at any other time is still saved, marked <code>failed</code>
+with that reason, and the thread offers a <strong>Re-send to agent</strong> button
+(<code>POST /review/:task/comment/:id/retry</code>) so it never has to be typed twice.
+Retry re-checks askability: still unavailable → the current reason is re-recorded
+and the question is untouched; askable → it is dispatched as-is into its original
+thread. Retrying an ask already in flight is a no-op, and retry refuses anything
+that is not one of the reviewer&#39;s own questions (a queued comment is delivered by
+unblock, not by an ask).</p>
+<h3 id="comments"><a class="anchor" href="#comments" aria-hidden="true">#</a>Comments</h3>
+<p>A comment is persisted with <code>delivery_state: &#39;pending_delivery&#39;</code> and nothing else
+happens — no dispatch, and deliberately <strong>no status gate</strong>: a reviewer may mark up
+the diff of a task that is busy or not yet askable, and the notes keep until an
+unblock can carry them. The task page previews everything queued and both the
+page and the queue show the count, so the reviewer never has to remember what
+they wrote.</p>
+<p>On unblock, every undelivered comment is rendered into one prompt
+(<code>src/prompts/review-comments-unblock.md</code>) with its anchor (file, line, side, the
+line&#39;s text) and any ask conversation that already happened on that thread —
+without it, &quot;do what we just agreed&quot; reads as a non-sequitur. The reviewer&#39;s
+overall message follows.</p>
+<p>A comment is marked <code>delivered</code> <strong>only after the unblock turn actually launches</strong>,
+recording the turn number that carried it. A failed launch leaves it pending for
+the next attempt — the persist-first invariant, extended to the batch path.</p>
+<h3 id="withdrawing-retracted-not-deleted"><a class="anchor" href="#withdrawing-retracted-not-deleted" aria-hidden="true">#</a>Withdrawing: retracted, not deleted</h3>
+<p>A reviewer can take back one of their own messages while it is still theirs to
+take back — a queued comment, or a question whose ask failed (which by
+definition never reached the agent, and whose <strong>Re-send to agent</strong> button the
+reviewer may simply not want). <code>POST /review/:task/comment/:id/withdraw</code>, a
+plain form with a redirect for the same reason retry is one.</p>
+<p>It is a <strong>state, not a delete</strong>: <code>withdrawn_at</code> is stamped on the record, which
+keeps its place in its thread (struck through, so the reviewer can see what they
+took back) while dropping out of <code>isPendingDelivery</code> — and therefore out of the
+queued list, the counts, the threads payload the island polls, and every future
+unblock prompt. A hard delete would destroy the only durable copy of something a
+human wrote, and a <code>withdrawn</code> value on <code>delivery_state</code> would give a withdrawn
+<em>ask</em> a delivery state it never had. This is a deliberately narrow, one-way
+widening of &quot;a review comment&#39;s words are immutable&quot;: there is no un-withdraw,
+and a reviewer who changes their mind posts again.</p>
+<p>Withdrawal is refused, in the daemon and stated in place of the button on the
+page, for anything the agent has already seen: a delivered comment, a question
+already in flight (the ask turn is running and the answer will land — saying
+&quot;withdrawn&quot; over a live conversation would be a lie the reviewer then acts on),
+an answered question, and anything the agent wrote. One definition —
+<code>withdrawRefusalReason()</code> in <code>src/server/review-actions.ts</code> — drives the daemon&#39;s
+refusal, the page&#39;s explanation, and the notice after a POST.</p>
+<h3 id="ordering-asks-first"><a class="anchor" href="#ordering-asks-first" aria-hidden="true">#</a>Ordering: asks first</h3>
+<p>Asks and the unblock work turn share one per-task queue in the daemon, so a
+reviewer who asks a question and then unblocks in the same breath gets the answer
+before the work starts. One failed ask does not strand the asks or the unblock
+behind it.</p>
+<h2 id="design-decisions-worth-knowing"><a class="anchor" href="#design-decisions-worth-knowing" aria-hidden="true">#</a>Design decisions worth knowing</h2>
+<h3 id="comments-are-their-own-storage-entity"><a class="anchor" href="#comments-are-their-own-storage-entity" aria-hidden="true">#</a>Comments are their own storage entity</h3>
+<p>Inline comments are <code>ReviewComment</code>s, not <code>Comment</code>s.</p>
+<ul>
+<li><strong>INVARIANT: they must not feed the daemon&#39;s comment auto-react loop.</strong> A
+<code>Comment</code> on a blocked task triggers a <em>work</em> turn — the exact opposite of both
+a read-only ask and a batched change request. Reusing that entity would make
+every review question rewrite the branch, and every marked-up line its own
+turn.</li>
+<li>They carry an anchor (<code>file</code>, <code>line</code>, <code>side</code>) and a <code>thread_id</code>, which
+<code>Comment</code> has no place for.</li>
+</ul>
+<p>They live in <code>review-comments.json</code> per task under FileStorage, in a
+<code>review_comments</code> table under PostgresStorage (migration V13; <code>withdrawn_at</code>
+added in V15), and are proxied
+like everything else by RemoteStorage.</p>
+<h3 id="the-message-is-saved-before-anything-is-attempted"><a class="anchor" href="#the-message-is-saved-before-anything-is-attempted" aria-hidden="true">#</a>The message is saved before anything is attempted</h3>
+<p>CLAUDE.md&#39;s load-bearing invariant. <code>postComment</code> writes the reviewer&#39;s words
+through <code>Storage</code> <em>first</em>, then decides what to do with them — for an ask, that
+means the askability gate is evaluated only after the write.
+Every downstream failure — task not askable, worktree lock contention, runner
+unavailable, agent crash, 10-minute ask timeout — is recorded <strong>on</strong> the comment
+as <code>ask_state: &#39;failed&#39;</code> with an actionable <code>ask_error</code>. A comment is never
+deleted or rolled back because its ask failed. The same holds on the delivery
+side: a comment that could not be delivered stays <code>pending_delivery</code>.</p>
+<p>The reviewer&#39;s overall unblock message has no such durable home before the agent
+turn exists, so it is written to <code>.lazy/recovery/</code> before launch and removed only
+on success. The batched comments need no such backup — they are already durable.</p>
+<h3 id="the-post-returns-before-the-agent-answers"><a class="anchor" href="#the-post-returns-before-the-agent-answers" aria-hidden="true">#</a>The POST returns before the agent answers</h3>
+<p>An ask is synchronous inside the daemon with a 10-minute timeout — far too long
+to hold an HTTP request open. <code>POST /review/:task/comment</code> returns <code>201</code> as soon
+as the comment is durable, with <code>ask_state: &#39;pending&#39;</code>. The ask runs in the
+background; the browser island polls <code>/api/review/:task/threads</code> while
+<code>pending &gt; 0</code> and stops when it reaches zero. A queued comment never triggers
+polling — nothing is happening to it until unblock.</p>
+<p>Asks <em>and</em> the unblock are serialized per task in the daemon: <code>launchAskTask</code>
+takes the worktree lock and 409s on contention, so two quickly-posted questions —
+or a question and the unblock chasing it — would otherwise race.</p>
+<h3 id="the-page-is-read-top-to-bottom-so-it-must-be-actionable-at-the-bottom"><a class="anchor" href="#the-page-is-read-top-to-bottom-so-it-must-be-actionable-at-the-bottom" aria-hidden="true">#</a>The page is read top-to-bottom, so it must be actionable at the bottom</h3>
+<p>The queued-comment list, the unblock box and accept are rendered <strong>twice</strong> —
+above and below the diff — because a reviewer who has just finished reading 400
+lines should not have to scroll back up to act. Both copies are complete,
+independently working forms; with JS off there are simply two of each and either
+one posts. Consequently <code>actionsHtml()</code> contains <strong>no element ids</strong> (they would
+duplicate); the island addresses it through <code>[data-rv-queued]</code>,
+<code>[data-rv-sync=&quot;feedback&quot;]</code>, <code>.rv-accept-form</code> and <code>.rv-accept-open</code>, and keeps
+the two feedback textareas in sync on <code>input</code>.</p>
+<p>Unblock owns the full width — it is the box that gets typed in. Accept is a
+<code>&lt;dialog&gt;</code> that takes the accept reason, opened by an <strong>Accept…</strong> button. The
+server renders accept as a plain inline form regardless; the island moves the
+first one into the dialog, drops the duplicate, and only <em>then</em> un-hides the
+Accept… buttons — so with JS off (or without <code>showModal</code>) the inline forms remain
+and accept still works.</p>
+<p>Queued comments are listed <strong>in full</strong>, never truncated: this list is the
+reviewer&#39;s only record of what they have already written before they commit to
+sending it, and the comment cut off at a preview is exactly the one they would
+want to re-read. Each entry links back to the diff row it was written against
+(<code>#l-&lt;encoded path&gt;-&lt;side&gt;-&lt;line&gt;</code>, <code>anchorDomId()</code>), which is why every
+commentable row carries that id.</p>
+<h3 id="the-sticky-status-bar"><a class="anchor" href="#the-sticky-status-bar" aria-hidden="true">#</a>The sticky status bar</h3>
+<p>A fixed footer always shows the task&#39;s status, turn count, last agent activity,
+how much is queued, how many asks are in flight, and whether the agent can answer
+right now — the <code>lazy ls</code> facts, without scrolling out of the diff.</p>
+<p>It is refreshed by the <strong>same poll</strong> that refreshes the threads, which therefore
+now runs always: every 3s while an ask is pending, every 10s otherwise. That is a
+deliberate stopgap: polling is simple and adequate at this scale, and server
+push is the better answer once the surface justifies it.</p>
+<h3 id="one-diff-renderer-shared-by-both-pages"><a class="anchor" href="#one-diff-renderer-shared-by-both-pages" aria-hidden="true">#</a>One diff renderer, shared by both pages</h3>
+<p><code>src/server/review-diff.ts</code> is the only diff renderer. It is a purpose-built
+light-DOM unified-diff parser/renderer: every commentable line carries
+<code>data-file</code> / <code>data-side</code> / <code>data-line</code>, and every page that shows a diff — the
+review surface and commit detail — goes through it.</p>
+<p>Commit detail used to have a second one (<code>src/server/diff.ts</code>, rendering through
+<code>@pierre/diffs</code>). It put its lines in a <strong>Shadow DOM</strong>, where nothing outside can
+address a line, so per-line comment affordances were structurally impossible
+there — which is why the review surface needed its own renderer in the first
+place. Both are deleted. One renderer means one look, one set of behaviours, and
+a feature built once shows up on both pages.</p>
+<p>Anchors track the old and new numbering spaces independently — a deleted line
+has only a pre-image number, an added line only a post-image number. Collapsing
+them would make anchors ambiguous.</p>
+<h3 id="the-view-toolbar-and-side-by-side"><a class="anchor" href="#the-view-toolbar-and-side-by-side" aria-hidden="true">#</a>The view toolbar, and side-by-side</h3>
+<p>Above every diff sits a toolbar of <strong>view modes</strong>, one group per mode, defined as
+a list in <code>DIFF_VIEW_MODES</code> rather than as hand-written controls. Today that is
+<strong>Layout</strong> (Unified / Split) and <strong>Long lines</strong> (Scroll / Wrap). Each choice is
+one setting for the whole tool, not per file, persisted in <code>localStorage</code>
+(<code>lazy:difflayout</code>, <code>lazy:diffwrap</code>) in a try/catch — a private-mode browser
+loses the preference and nothing else. The controls ship <code>hidden</code> and JS unhides
+them, so a diff still renders fully without JS.</p>
+<p>The list shape is the point. The review surface is heading towards <em>presenting</em> a
+change (rendered markdown, diagrams, images) rather than printing its lines, and
+every such mode needs an escape hatch back to the raw lines sitting right beside
+it. Adding one is a row in <code>DIFF_VIEW_MODES</code> plus an applier in
+<code>diffViewScript</code> — not a second kind of control invented elsewhere on the page.</p>
+<p><strong>Split is a DOM regrouping, not a stylesheet.</strong> Pairing a deletion with the
+addition that replaced it merges two <code>&lt;tr&gt;</code>s into one, and no CSS can change how
+many rows a table has. The server does the fallible half: <code>pairSplitRows()</code>
+groups each hunk&#39;s lines into rows (a change block&#39;s deletions zipped index-wise
+against its additions, blank filler on whichever side runs out, context lines
+occupying both panes) and stamps every line with <code>data-rv-pair</code> / <code>data-rv-pane</code>.
+The browser only regroups rows it is told about, <strong>moving</strong> existing cells rather
+than re-rendering text — so nothing client-side can mis-escape a line of code,
+and the part that can actually be wrong is unit-tested TypeScript.</p>
+<p>Two consequences worth knowing:</p>
+<ul>
+<li><strong>The anchor moves one level down the tree, and only that.</strong> A split row holds
+two lines, so it cannot carry one anchor: <code>data-file</code>/<code>data-side</code>/<code>data-line</code>
+and the <code>anchorDomId()</code> id land on the <strong>code cell of the side they belong
+to</strong>. Same values, same key, same fragment link — so a comment placed in split
+resolves identically in unified and survives a reload. The review island
+addresses anchors through <code>ANCHOR_SEL</code> / <code>anchorElement()</code> and never assumes a
+row.</li>
+<li><strong>The unified <code>&lt;tbody&gt;</code> is detached, not hidden</strong>, while split is showing
+(stashed on the table element). Two copies in one document would mean two
+elements carrying each anchor&#39;s id, and the queued-comment list is built
+entirely out of fragment links.</li>
+</ul>
+<p>Wrap and split are <strong>independent and freely combined</strong>: a paired row is as tall
+as its taller pane, so wrapping cannot drift the two sides apart — split is if
+anything more robust under Wrap than unified was. Below <code>900px</code> the layout
+<strong>falls back to unified</strong> and the Split button is disabled rather than scrolling
+horizontally into uselessness; the stored preference is untouched, so widening
+the window restores it. Switching layout swaps the whole <code>&lt;tbody&gt;</code>, so the review
+island re-renders threads on an <code>rv:layout</code> event instead of waiting for the next
+poll.</p>
+<p>Commit detail gets all of this with no comment affordances — the toolbar and the
+split layout are renderer-level, the comment UI is passed in per page.</p>
+<h3 id="the-web-layer-does-not-import-the-daemon"><a class="anchor" href="#the-web-layer-does-not-import-the-daemon" aria-hidden="true">#</a>The web layer does not import the daemon</h3>
+<p><code>src/daemon/server.ts</code> already imports <code>src/server/</code>, so the reverse edge would
+be a cycle. <code>src/server/review-actions.ts</code> declares a narrow <code>ReviewActions</code>
+port; <code>src/daemon/review-service.ts</code> implements it and the daemon injects it at
+bind time. With no actions injected, the review routes return <code>503</code> rather than
+a half-working page. This also structurally enforces &quot;all mutations go through
+the daemon&quot; — the handler never touches git, locks, or storage writes itself.</p>
+<h3 id="threads-survive-a-re-diff-even-when-their-line-moves"><a class="anchor" href="#threads-survive-a-re-diff-even-when-their-line-moves" aria-hidden="true">#</a>Threads survive a re-diff, even when their line moves</h3>
+<p>Threads whose anchor no longer appears in the current diff (the agent edited the
+file, the hunk moved) are not dropped — they render in an <strong>orphan threads</strong>
+section below the diff, with their original anchor. There is no re-anchoring
+model yet; see <a href="#known-limits">Known limits</a>.</p>
+<h2 id="security-posture"><a class="anchor" href="#security-posture" aria-hidden="true">#</a>Security posture</h2>
+<p>This surface <strong>binds to loopback only</strong>, and that is load-bearing rather than a
+default nobody revisited. The mutating routes — posting a comment, unblocking,
+accepting — have no CSRF protection and no write authentication in front of
+them. Loopback binding is what stands in for both.</p>
+<p>Do not expose it on another interface, a tunnel, or a reverse proxy. Treat
+that as a hard constraint of the current implementation, not a configuration
+choice.</p>
+<p>Comment threads use exact <code>(file, line, side)</code> anchors. When a later turn moves
+the lines a thread was anchored to, the thread is not re-anchored: it is listed
+separately as an orphan thread, keeping its original anchor, rather than being
+silently attached to the wrong line.</p>
+<h2 id="working-on-the-ui-the-dev-web-server"><a class="anchor" href="#working-on-the-ui-the-dev-web-server" aria-hidden="true">#</a>Working on the UI: the dev web server</h2>
+<p>Editing a template and then rebuilding and restarting the daemon to look at it is
+a slow loop. The dev web server renders the same handler
+(<code>createWebRequestHandler</code>) in a throwaway process while the daemon keeps
+serving:</p>
+<pre><code class="language-bash">bun run dev:server                             # this project
+bun run dev:server -- --project ~/code/foo     # someone else&#39;s project
+bun run dev:server -- --port 41234
+</code></pre>
+<p>It binds <code>127.0.0.1:26124</code> by default, outside the daemon&#39;s own port window so a
+dev tab is never mistaken for the real dashboard. A busy port is an error rather
+than a silent move to the next one — the URL has to stay stable across restarts.</p>
+<h3 id="it-is-a-client-of-the-daemon-not-a-second-writer"><a class="anchor" href="#it-is-a-client-of-the-daemon-not-a-second-writer" aria-hidden="true">#</a>It is a client of the daemon, not a second writer</h3>
+<p>Everything goes through the running daemon. Reads use <code>RemoteStorage</code> over the
+<code>storage</code> RPC, exactly as the CLI does; writes use the review RPC commands
+(<code>reviewQueue</code>, <code>reviewDiff</code>, <code>reviewComments</code>, <code>reviewPostComment</code>,
+<code>reviewRetryAsk</code>, <code>reviewWithdrawComment</code>, <code>reviewUnblock</code>, <code>reviewAccept</code>, <code>reviewViolationDecision</code>) and land in
+<code>src/daemon/review-service.ts</code> — the same implementation the daemon injects into
+its own dashboard. So reviewing, commenting, asking, unblocking and accepting all
+work here and take effect in the real store; there is no read-only mode, no
+banner, and no refused route.</p>
+<p>Those RPC commands are a general daemon capability, not a dev-server feature. The
+review port used to be reachable only in-process, which meant no other client —
+a UI served from source, a client talking to a daemon on another host — could
+review at all. The dev server is simply the first client of the transport.</p>
+<p>With no daemon running it <strong>refuses to start</strong> and names the fix
+(<code>lazy daemon start</code>). That is deliberate: a fallback to opening the store
+directly would make the same click mutate a real store on one machine and no-op
+on another, and could not work at all against a remote daemon, where there is no
+store on the local filesystem to open.</p>
+<h3 id="the-cli-surface-is-unchanged"><a class="anchor" href="#the-cli-surface-is-unchanged" aria-hidden="true">#</a>The CLI surface is unchanged</h3>
+<p>There is no <code>lazy</code> command for this and no hidden flag. The entry point is
+<code>src/dev/web-server.ts</code>, which is not registered in the dispatcher, not listed in
+<code>src/cli/commands/</code>, and not completable — it is reached only through the
+<code>dev:server</code> package script.</p>
+<h3 id="what-needs-a-restart-and-what-does-not"><a class="anchor" href="#what-needs-a-restart-and-what-does-not" aria-hidden="true">#</a>What needs a restart, and what does not</h3>
+<ul>
+<li><strong>Stylesheets: nothing.</strong> The CSS lives in <code>src/server/styles/*.css</code> and is
+served at <code>/assets/app.css</code> by a route that re-reads those files per request
+(with <code>Cache-Control: no-store</code>), so an edit is visible on a plain reload. In
+the shipped binary the same parts are compiled in via text imports and composed
+in the same order, so dev and release can never cascade differently.</li>
+<li><strong>Templates and routes: this process only.</strong> <code>bun --watch</code> restarts it; the
+daemon is untouched.</li>
+<li><strong>The daemon: only when daemon code changes.</strong></li>
+</ul>
+<p><strong>Use <code>bun --watch</code>, not <code>bun --hot</code>.</strong> Measured: under <code>--hot</code> the process stays
+up but keeps serving the pre-edit HTML; under <code>--watch</code> it restarts and the next
+request renders the edit. Nothing is held in memory here, so a restart is free.
+One caveat — an editor that saves by writing a temp file and renaming it over the
+original can leave Bun&#39;s watcher on the stale inode (a bare <code>sed -i</code> does this);
+ordinary in-place saves are picked up.</p>
+<h2 id="known-limits"><a class="anchor" href="#known-limits" aria-hidden="true">#</a>Known limits</h2>
+<ul>
+<li>No write gate: no CSRF, no same-origin check, no auth on the mutating routes.
+Loopback only.</li>
+<li>No re-anchoring: a thread whose line moved falls into the orphan list.</li>
+<li>No live updates; the island polls — 3s while an ask is pending, 10s
+otherwise — to keep the threads and the status bar current.</li>
+<li>Single reviewer assumed — comments record <code>actor: &#39;human&#39;</code> with no identity.</li>
+<li>The queue lists <code>blocked</code> only; <code>conflict</code> tasks are askable but not listed.</li>
+<li>A queued comment cannot be <em>edited</em> before delivery — withdraw it and write it
+again. Withdrawal itself is one-way; there is no un-withdraw.</li>
+<li>No syntax highlighting, and no word-level intra-line diffing — the diff is
+plain text in both layouts.</li>
+<li>The sync remedy starts a sync and reports it; the page does not follow the
+task through it — re-open the review page to see where it landed.</li>
+<li>Split shares one horizontal scroller across both panes, and an open comment
+form is dropped when the layout is toggled (a cloned <code>&lt;textarea&gt;</code> would lose
+what was typed).</li>
+</ul>
+<h2 id="testing"><a class="anchor" href="#testing" aria-hidden="true">#</a>Testing</h2>
+<ul>
+<li><code>test/unit/review-diff.test.ts</code> — parser, anchors, light-DOM rendering,
+escaping, thread grouping, queue rendering (both counts), the split-row
+pairing and the markup the side-by-side layout is built from, plus the page
+itself: mirrored action blocks, untruncated queued comments linked to their
+line, the retry affordance on a failed ask, and the sticky status bar.</li>
+<li><code>test/unit/server-diff.test.ts</code> — commit detail goes through the shared
+renderer: light-DOM rows, the view toolbar, split without any comment UI.</li>
+<li><code>test/unit/review-comments-storage.test.ts</code> — the storage entity, including
+the &quot;a failed ask never destroys the comment&quot; invariant and the
+<code>pending_delivery → delivered</code> transition, plus withdrawal recorded on a
+comment that survives intact.</li>
+<li><code>test/unit/review-service.test.ts</code> — the persist-before-ask invariant, the
+&quot;a comment is never dispatched&quot; invariant, the bundled unblock prompt, and
+withdrawal: allowed for a queued comment and a failed ask, refused for a
+delivered comment, an in-flight or answered ask, an agent reply, and an id
+that is not on this task.</li>
+<li><code>test/e2e/server-review.test.ts</code> — the full loop against a real daemon: the
+comment → ask → threaded agent reply round-trip, N queued comments delivered in
+ONE work turn, ask-before-unblock ordering, a bare unblock still behaving as it
+always did, and the retry path — a question posted while the agent cannot
+answer is saved, survives a retry that still cannot go, and reaches the agent
+once the task is blocked.</li>
+<li><code>test/unit/accept-remedy.test.ts</code> — the shared remedy contract: boundary
+parsing (an unknown reason or a blank <code>next</code> degrades to no remedy rather than
+a half-rendered panel) and the composed <code>--approve-file</code> command, shell-quoted.</li>
+<li><code>test/unit/review-remedy-render.test.ts</code> — the three panel shapes (passphrase,
+sync, command-only with files), typed drafts surviving into the re-rendered
+forms, and no panel at all when there is no remedy.</li>
+<li><code>test/e2e/server-review-remedy.test.ts</code> — the gated accept end-to-end against a
+real daemon: refusal renders the passphrase form and does not merge, a wrong
+passphrase is a retryable error that keeps the typed text and never echoes the
+attempt, and the right passphrase completes the merge.</li>
+<li><code>test/e2e/dev-web-server.test.ts</code> — the dev web server as a daemon client: a
+review comment posted on its page is read back through the daemon&#39;s own
+dashboard, the stylesheet is served from disk and an edit to it is served
+without restarting anything, and with no daemon it refuses to start.</li>
+</ul>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v0.11 PR Walkthrough — The Daemon Release — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="v011-pr-walkthrough--the-daemon-release"><a class="anchor" href="#v011-pr-walkthrough--the-daemon-release" aria-hidden="true">#</a>v0.11 PR Walkthrough — The Daemon Release</h1>
+<p><strong>6,388 lines added, 180 deleted across 71 files.</strong></p>
+<p>This is the narrative walkthrough for the v0.11 PR. It&#39;s organized by concept,
+not by file. Start at the top and read sequentially — each section builds on
+the previous one.</p>
+<hr>
+<h2 id="where-to-start-the-reconcile-loop"><a class="anchor" href="#where-to-start-the-reconcile-loop" aria-hidden="true">#</a>Where to start: the reconcile loop</h2>
+<p>The entire release orbits one function: the daemon&#39;s reconcile loop in
+<code>src/daemon/server.ts</code>. Before v0.11, the daemon was a simple RPC proxy — CLI
+commands routed through it for performance, but it didn&#39;t <em>do</em> anything on its
+own. Now it does. Every 5 seconds, the daemon:</p>
+<ol>
+<li>Snapshots all working tasks (status, branch tip, parent branch tip)</li>
+<li>Runs <code>reconcileTasks()</code> (existing — detects turn completions, crashes)</li>
+<li>Compares the snapshot to the new state</li>
+<li>Routes events based on what changed</li>
+<li>Auto-reacts to external signals (CI failures, PR comments)</li>
+<li>Pushes branches that changed</li>
+</ol>
+<p>This is the heartbeat. Everything else in this PR is either feeding data into
+this loop or consuming signals that come out of it.</p>
+<p><strong>Read first:</strong> <code>src/daemon/server.ts</code>, starting from <code>startDaemonServer()</code>.
+Follow the reconcile loop body — it&#39;s the skeleton that the rest of the PR
+hangs from.</p>
+<hr>
+<h2 id="layer-1-dual-bind-server-and-web-dashboard"><a class="anchor" href="#layer-1-dual-bind-server-and-web-dashboard" aria-hidden="true">#</a>Layer 1: Dual-bind server and web dashboard</h2>
+<p>The daemon server was a unix-socket-only process. Now it dual-binds:</p>
+<ul>
+<li><strong>Unix socket</strong> — CLI and agent RPC, bearer token auth (unchanged)</li>
+<li><strong>TCP port 26024</strong> — web dashboard for browsers, no auth (localhost only)</li>
+</ul>
+<p>The TCP side reuses <code>src/server/index.ts</code> (the existing <code>lazy server</code> web UI)
+via <code>createWebRequestHandler()</code>. The key change in <code>server.ts</code> is
+<code>tryBindTcpPort()</code> — it tries the configured port, auto-increments on conflict,
+and logs the bound port. The web server is a separate <code>Bun.serve()</code> instance
+that shares storage with the daemon.</p>
+<p>This is mostly plumbing. The interesting part is that <code>lazy server</code> (the
+standalone web command) and the daemon now share the same request handler code,
+which means features added to one appear in both. <code>src/server/index.ts</code> was
+refactored to export <code>createWebRequestHandler()</code> as a reusable function.</p>
+<p><strong>Mechanical changes:</strong> <code>src/cli/commands/server.ts</code> and <code>src/cli/commands/daemon.ts</code>
+updated to wire the new options through. Config type additions in
+<code>src/config/types.ts</code> (<code>port</code> field moved from 26024 to 26024 in
+<code>lazy.toml.example</code>).</p>
+<hr>
+<h2 id="layer-2-event-routing-via-sse"><a class="anchor" href="#layer-2-event-routing-via-sse" aria-hidden="true">#</a>Layer 2: Event routing via SSE</h2>
+<p><code>src/daemon/events.ts</code> (430 lines, entirely new) is the nervous system&#39;s wiring.</p>
+<p><strong>The model:</strong> Events are transient signals, not durable messages. There&#39;s no
+event log, no replay, no persistence. The daemon maintains an in-memory routing
+table: <code>Map&lt;taskId, ReadableStreamDefaultController&gt;</code>. When a supervisor
+connects via <code>GET /events/stream?task_id=&lt;id&gt;</code>, it gets an SSE stream. When an
+event targets that task, the daemon writes it to the stream.</p>
+<p><strong>Event types:</strong></p>
+<ul>
+<li><code>upstream.updated</code> — parent branch has new commits (flows down to children)</li>
+<li><code>task.completed</code> — child turn finished (flows up to parent)</li>
+<li><code>task.accepted</code> — child merged (flows to parent + siblings)</li>
+<li><code>task.failed</code> — child crashed (flows up to parent)</li>
+</ul>
+<p><strong>Routing logic lives in <code>routeStateChangeEvents()</code>:</strong> Given a list of state
+changes (tasks that transitioned during reconciliation), it walks the task graph
+and sends events to connected supervisors. The graph walk is simple — one level
+up (parent) and one level across (siblings) — not recursive.</p>
+<p><strong>Catchup on reconnect:</strong> When a supervisor connects, <code>sendCatchupEvents()</code>
+re-derives the current state by checking git (merge-base for upstream drift,
+child task statuses for completions). This means a supervisor that disconnects
+and reconnects doesn&#39;t miss signals — it gets the <em>current</em> situation, not a
+replay of history.</p>
+<p><strong>The SSE connection lifecycle</strong> uses a heartbeat comment (<code>: heartbeat\n\n</code>)
+every 30 seconds. If the write fails, the connection is removed. The
+<code>stopAllConnections()</code> function is called during daemon shutdown.</p>
+<p><strong>On the supervisor side:</strong> <code>src/supervisor/event-client.ts</code> (238 lines, new)
+is the SSE consumer. It connects to the daemon, parses SSE frames, queues
+events, and exposes <code>drainEvents()</code> for the supervisor to call at turn
+boundaries. Events are never delivered mid-turn — the agent finishes its
+current work, then gets the event context in the next prompt.</p>
+<p><strong>Design decision worth noting:</strong> Events are <em>transient</em> by design. The system
+doesn&#39;t need event replay because the reconcile loop re-derives state every 5
+seconds. If an event is missed (connection dropped), the next reconnect catches
+up from current state. This avoids the complexity of event storage, ordering,
+and delivery guarantees.</p>
+<hr>
+<h2 id="layer-3-auto-deliver--bridging-events-to-blocked-tasks"><a class="anchor" href="#layer-3-auto-deliver--bridging-events-to-blocked-tasks" aria-hidden="true">#</a>Layer 3: Auto-deliver — bridging events to blocked tasks</h2>
+<p><code>src/daemon/auto-deliver.ts</code> (621 lines, the largest new file) answers: &quot;What
+happens when an event targets a task that has no SSE connection?&quot;</p>
+<p>Working tasks have supervisors connected via SSE — events flow in real-time.
+But blocked tasks are dormant. No supervisor, no SSE. When a blocked task needs
+to react to an event, the daemon auto-unblocks it.</p>
+<p><strong>The core function is <code>detectAndDeliverEvents()</code></strong>, called after each
+reconcile tick. It:</p>
+<ol>
+<li>Detects newly-accepted tasks (status changed to <code>complete</code> since last tick)</li>
+<li>Routes <code>task.accepted</code> → parent gets notified, siblings get <code>upstream.updated</code></li>
+<li>Detects parent branch changes (tip moved since last tick)</li>
+<li>Routes <code>upstream.updated</code> → all non-terminal children</li>
+<li>Detects newly-completed/failed tasks</li>
+<li>Routes <code>task.completed</code>/<code>task.failed</code> → parent</li>
+</ol>
+<p>For each event targeting a blocked task without an SSE connection:
+<code>deliverToBlockedTask()</code> auto-unblocks it. This is the most complex part of
+the file — it sets up the worktree, acquires a lock, writes an <code>UnblockCommand</code>
+to the protocol directory, and spawns a supervisor. It&#39;s essentially the same
+flow as <code>lazy unblock</code>, but triggered automatically.</p>
+<p><strong>Parent branch tracking:</strong> The function maintains <code>previousParentTips</code> — a
+<code>Map&lt;taskId, commitSha&gt;</code> that snapshots parent branch HEADs. On each tick, it
+compares current tips to previous tips. If a parent branch moved, all blocked
+children get <code>upstream.updated</code> with <code>--sync-with-upstream</code> context.</p>
+<p><strong>The <code>rejected</code> → <code>abandoned</code> fix</strong> (the TypeScript error fixed in this
+release) was in this file — two comparisons filtering terminal tasks used
+<code>&quot;rejected&quot;</code> which isn&#39;t a valid <code>TaskStatus</code>. The correct status for rejected
+tasks is <code>&quot;abandoned&quot;</code>.</p>
+<hr>
+<h2 id="layer-4-auto-react--ci-failures-and-pr-comments"><a class="anchor" href="#layer-4-auto-react--ci-failures-and-pr-comments" aria-hidden="true">#</a>Layer 4: Auto-react — CI failures and PR comments</h2>
+<p><code>src/daemon/auto-react.ts</code> (504 lines, new) is the external signal handler.
+While auto-deliver routes <em>internal</em> events (task graph changes), auto-react
+handles <em>external</em> signals from CI and code review.</p>
+<p><strong><code>runAutoReact()</code></strong> is called from the reconcile loop for each project. It
+iterates blocked tasks that have a remote branch, then:</p>
+<ol>
+<li><p><strong>CI failures:</strong> Calls the remote driver to get check/pipeline results.
+Builds a &quot;signature&quot; (sorted job names + exit codes) for deduplication.
+If signature differs from the last-reacted one (stored in task metadata),
+formats structured feedback with job name, failure reason, truncated logs
+(last 3000 chars), and run URL. Spawns <code>lazy unblock</code> with this feedback.</p>
+</li>
+<li><p><strong>PR comments:</strong> Gets comments from the remote driver. Finds comments newer
+than the last-reacted comment ID (stored in task metadata). Formats feedback
+with author, file/line (if review comment), and body text. Spawns <code>lazy unblock</code>.</p>
+</li>
+</ol>
+<p><strong>Fire-and-forget pattern:</strong> Auto-react spawns <code>lazy unblock</code> as a subprocess
+with <code>LAZY_IS_DAEMON=1</code> to avoid routing back through the daemon (infinite
+loop). It doesn&#39;t wait for completion — it logs the PID and moves on. If the
+unblock fails (lock contention, worktree issue), the task stays blocked and
+the next reconcile tick won&#39;t re-trigger (dedup prevents it).</p>
+<p><strong>One trigger per tick per task:</strong> CI is checked first. If CI triggers an
+unblock, PR comments are skipped for that tick. This prevents double-unblocking
+a task in a single reconcile cycle.</p>
+<hr>
+<h2 id="layer-5-budget-controls--the-circuit-breaker"><a class="anchor" href="#layer-5-budget-controls--the-circuit-breaker" aria-hidden="true">#</a>Layer 5: Budget controls — the circuit breaker</h2>
+<p><code>src/daemon/auto-react-budget.ts</code> (336 lines, new) prevents auto-react from
+burning through API credits.</p>
+<p><strong>Four gates, checked in order:</strong></p>
+<ol>
+<li><strong>Task not paused</strong> — a previously-exhausted task stays paused until human
+manually unblocks</li>
+<li><strong>Daily budget</strong> — project-wide cap (default 50 auto-triggered turns per
+day), stored in <code>.lazy/auto-react-budget.json</code></li>
+<li><strong>Per-task per-trigger count</strong> — e.g., max 3 CI failure reactions before
+pausing (default <code>auto_react_max_retries = 3</code>)</li>
+<li><strong>Backoff delay</strong> — exponential by default: 0s, 60s, 300s (capped at 5 min)</li>
+</ol>
+<p><strong>Counter storage:</strong> Per-task counters are stored in task metadata
+(<code>auto_react_count_ci_failure</code>, <code>auto_react_last_ci_failure</code>, etc.). Daily
+budget is a file with <code>{ date: &quot;YYYY-MM-DD&quot;, used: N }</code> — resets automatically
+at midnight.</p>
+<p><strong>Reset triggers:</strong> Counters reset only when a human manually unblocks or
+resumes the task — this is the signal that a human reviewed the situation and
+it&#39;s safe to reset. Budget counters are NOT reset on successful turn completion,
+because doing so would defeat the budget gate (counter resets to 0 after every
+turn, allowing unlimited auto-triggers).</p>
+<p><strong>Integration with reconcile:</strong> <code>maybeAutoResume()</code> in <code>reconcile.ts</code> (existing
+function for auto-restarting crashed tasks) now checks the budget before
+restarting. This means even crash recovery respects the circuit breaker — a
+task that crashes 3 times in a row gets paused instead of looping.</p>
+<hr>
+<h2 id="layer-6-branch-push-queue"><a class="anchor" href="#layer-6-branch-push-queue" aria-hidden="true">#</a>Layer 6: Branch push queue</h2>
+<p><code>src/daemon/push.ts</code> (143 lines, new) is the simplest new module.</p>
+<p>After the reconcile loop detects state changes (turn completion, acceptance),
+it calls <code>pushBranchAfterStateChange(branchName, projectRoot)</code>. The push module
+maintains a <code>Set&lt;string&gt;</code> per project — branches waiting to be pushed. Pushes
+are serialized per-project to avoid concurrent git conflicts. Failed pushes stay
+in the set and retry on the next tick.</p>
+<p>The push uses the remote driver (<code>createDriver()</code> from config), which handles
+GitHub/GitLab API differences. If no remote is configured, push is a no-op.</p>
+<hr>
+<h2 id="layer-7-mcp-proxy-for-containers"><a class="anchor" href="#layer-7-mcp-proxy-for-containers" aria-hidden="true">#</a>Layer 7: MCP proxy for containers</h2>
+<p>Two files: <code>src/daemon/mcp-proxy.ts</code> (132 lines) and <code>src/daemon/mcp-routes.ts</code>
+(79 lines).</p>
+<p><strong>The problem:</strong> Agents running in Docker containers need to call MCP tools
+(lazy_search, lazy_show, lazy_commit, etc.). Before v0.11, each builder session
+spun up its own TCP server inside the container. This was per-session overhead
+with port management and config file dance.</p>
+<p><strong>The solution:</strong> The daemon is already running. Agents proxy MCP calls through
+it.</p>
+<p><strong><code>mcp-routes.ts</code></strong> (daemon side): Handles <code>POST /mcp/:taskId/:toolName</code>.
+Creates a <code>McpToolContext</code> scoped to the task&#39;s worktree and executes the
+requested tool. The task ID is resolved from storage — if the task doesn&#39;t
+exist, it&#39;s a 404.</p>
+<p><strong><code>mcp-proxy.ts</code></strong> (agent side): Creates HTTP proxy handlers that forward tool
+calls to the daemon. Supports two transport modes: unix socket (host process)
+or TCP via <code>host.docker.internal:26024</code> (container). The proxy reads a config
+file written by the host before container launch.</p>
+<p><strong>Docker runner integration:</strong> <code>src/runner/docker-runner.ts</code> was updated to:</p>
+<ol>
+<li>Detect if daemon config is available (<code>LAZY_DAEMON_CONFIG</code> env)</li>
+<li>Create a task-specific config file with the task ID baked in</li>
+<li>Mount the config into the container</li>
+<li>Pass <code>--daemon-config</code> to the agent entry point</li>
+</ol>
+<p>This replaces the builder server pattern. The old pattern still works as
+fallback if daemon config isn&#39;t available.</p>
+<hr>
+<h2 id="layer-8-terminal-driver-and-lazy-watch"><a class="anchor" href="#layer-8-terminal-driver-and-lazy-watch" aria-hidden="true">#</a>Layer 8: Terminal driver and <code>lazy watch</code></h2>
+<p><code>src/terminal/</code> (4 new files, ~270 lines total) adds a terminal abstraction.</p>
+<p><strong><code>interface.ts</code></strong> defines the <code>TerminalDriver</code> interface with two methods:
+<code>setWindowTitle(title)</code> and <code>createWatchSession(taskId, command)</code>.</p>
+<p><strong><code>tmux.ts</code></strong> implements <code>TmuxDriver</code>: creates detached tmux sessions for agent
+observation, kills sessions on cleanup, auto-names windows.</p>
+<p><strong><code>vanilla.ts</code></strong> implements <code>VanillaTerminalDriver</code>: no-op for most operations,
+opens a new terminal window on macOS/Linux for watch.</p>
+<p><strong><code>index.ts</code></strong> exports the factory <code>createTerminal()</code> and helpers like
+<code>tmuxSessionName()</code> and <code>killTmuxWatchSession()</code>.</p>
+<p><strong><code>src/cli/commands/watch.ts</code></strong> (103 lines): The <code>lazy watch</code> command.
+Finds the task, validates it&#39;s working, attaches to its tmux session in
+read-only mode (<code>tmux attach-session -t &lt;name&gt; -r</code>).</p>
+<p><strong>Reconcile integration:</strong> <code>src/utils/reconcile.ts</code> now calls
+<code>killTmuxWatchSession()</code> when a task&#39;s agent process exits (interrupted or
+completed). This cleans up the tmux session so <code>lazy watch</code> doesn&#39;t attach
+to a stale session.</p>
+<hr>
+<h2 id="layer-9-watchdog-default"><a class="anchor" href="#layer-9-watchdog-default" aria-hidden="true">#</a>Layer 9: Watchdog default</h2>
+<p>The smallest change in the release: <code>src/supervisor/watchdog.ts</code> now defaults
+to 2 hours (7,200,000ms) instead of disabled. <code>lazy.toml.example</code> updated to
+document the new default. That&#39;s it.</p>
+<p>But this is a meaningful change — without it, a hung agent runs forever. With
+it, the worst case is a 2-hour burn before automatic cleanup.</p>
+<hr>
+<h2 id="the-test-suite"><a class="anchor" href="#the-test-suite" aria-hidden="true">#</a>The test suite</h2>
+<p><strong>2,024 lines of new test code</strong> across 7 files:</p>
+<ul>
+<li><code>test/e2e/daemon-events.test.ts</code> (625 lines) — SSE connection, event
+routing, heartbeat, catchup on reconnect</li>
+<li><code>test/e2e/auto-deliver.test.ts</code> (475 lines) — event delivery to blocked
+tasks, parent branch detection, task graph cascades</li>
+<li><code>test/e2e/daemon-auto-react.test.ts</code> (359 lines) — CI failure detection,
+PR comment reactions, deduplication</li>
+<li><code>test/e2e/auto-react-budget.test.ts</code> (316 lines) — budget gates, backoff,
+daily limits, counter reset</li>
+<li><code>test/unit/terminal.test.ts</code> (108 lines) — tmux session naming, driver
+factory, window title</li>
+<li><code>test/e2e/daemon-push.test.ts</code> (58 lines) — push queue, serialization</li>
+<li><code>test/e2e/watch.test.ts</code> (41 lines) — command validation, task resolution</li>
+</ul>
+<p>Several existing unit test files got 8-line additions — these are
+<code>beforeAll</code>/<code>afterAll</code> hooks calling <code>killTmuxWatchSession()</code> to clean up tmux
+sessions that tests might create. Mechanical but necessary.</p>
+<hr>
+<h2 id="what-to-scrutinize-in-review"><a class="anchor" href="#what-to-scrutinize-in-review" aria-hidden="true">#</a>What to scrutinize in review</h2>
+<h3 id="1-auto-deliver-worktree-setup-auto-deliverts380-520"><a class="anchor" href="#1-auto-deliver-worktree-setup-auto-deliverts380-520" aria-hidden="true">#</a>1. Auto-deliver worktree setup (<code>auto-deliver.ts:380-520</code>)</h3>
+<p>This is the riskiest code in the PR. When the daemon auto-unblocks a blocked
+task, it needs to set up the worktree, create a sandbox, configure the runner,
+and spawn a supervisor — all from the daemon process. This duplicates logic
+from <code>lazy unblock</code> (the CLI command) but runs in a long-lived process where
+failures can&#39;t just exit.</p>
+<p><strong>Concerns:</strong></p>
+<ul>
+<li>Lock acquisition: if a worktree lock is held by a dead process, auto-deliver
+skips the task. This is safe but means the task stays blocked until the lock
+times out or is manually cleaned.</li>
+<li>Sandbox setup: copies <code>.gitconfig</code>, creates protocol directory, writes
+command file — same sequence as CLI but in daemon context. If any step fails,
+the task stays blocked with a logged warning.</li>
+<li>Runner creation: <code>createRunner()</code> could fail (Docker not available, config
+invalid). Failure is caught and logged.</li>
+</ul>
+<p>The fundamental question: <strong>should the daemon be spawning supervisors?</strong> It&#39;s
+the same work the CLI does, but the daemon is long-lived and handles many tasks.
+If a supervisor spawn hangs or leaks resources, it affects all tasks. The
+current code is cautious (pre-flight checks, lock-based exclusion, error
+boundaries) but it&#39;s the most complex new codepath.</p>
+<h3 id="2-fire-and-forget-lazy-unblock-in-auto-react-auto-reactts364-429"><a class="anchor" href="#2-fire-and-forget-lazy-unblock-in-auto-react-auto-reactts364-429" aria-hidden="true">#</a>2. Fire-and-forget <code>lazy unblock</code> in auto-react (<code>auto-react.ts:364-429</code>)</h3>
+<p>Auto-react spawns <code>lazy unblock</code> as a subprocess and doesn&#39;t wait for it. This
+is pragmatic — the daemon can&#39;t block its reconcile loop waiting for unblock to
+finish — but means failures are invisible unless you check logs.</p>
+<p><strong>What could go wrong:</strong></p>
+<ul>
+<li>Lock contention: unblock needs the worktree lock, which another process might hold</li>
+<li>Storage lock: unblock needs storage access, which the daemon also uses</li>
+<li>Stale dedup: if unblock fails but the dedup signature was already updated,
+the signal won&#39;t re-trigger</li>
+</ul>
+<p>The dedup signature is updated <em>before</em> spawning the unblock subprocess (in
+task metadata). If the subprocess fails, the daemon won&#39;t retry because it
+thinks it already reacted. This is a deliberate trade-off — better to miss one
+reaction than to spam-unblock — but reviewers should understand it.</p>
+<h3 id="3-daily-budget-file-race-auto-react-budgetts"><a class="anchor" href="#3-daily-budget-file-race-auto-react-budgetts" aria-hidden="true">#</a>3. Daily budget file race (<code>auto-react-budget.ts</code>)</h3>
+<p>The daily budget is stored in <code>.lazy/auto-react-budget.json</code>. If two daemon
+instances (shouldn&#39;t happen, but could in edge cases) write simultaneously,
+one write could be lost. The invariant &quot;one daemon per project&quot; prevents this,
+but there&#39;s no file locking — just read-modify-write.</p>
+<h3 id="4-config-and-storage-opened-per-mcp-request-mcp-routests"><a class="anchor" href="#4-config-and-storage-opened-per-mcp-request-mcp-routests" aria-hidden="true">#</a>4. Config and storage opened per MCP request (<code>mcp-routes.ts</code>)</h3>
+<p>Every MCP tool call from an agent opens storage and loads config. For a
+long-lived daemon handling many agents, this is wasteful. It works correctly
+but creates unnecessary I/O. A connection pool or config cache would help,
+but this is a performance concern, not a correctness concern.</p>
+<h3 id="5-event-client-reconnect-backoff-event-clientts"><a class="anchor" href="#5-event-client-reconnect-backoff-event-clientts" aria-hidden="true">#</a>5. Event client reconnect backoff (<code>event-client.ts</code>)</h3>
+<p>The supervisor&#39;s SSE client uses exponential backoff on reconnect (1s → 30s).
+If the daemon is flapping (rapid restart), the supervisor could be offline for
+up to 30 seconds between attempts. During that window, events are not delivered
+via SSE. This is mitigated by catchup-on-reconnect, but there&#39;s a latency
+gap.</p>
+<hr>
+<h2 id="mechanical-changes-safe-to-skim"><a class="anchor" href="#mechanical-changes-safe-to-skim" aria-hidden="true">#</a>Mechanical changes (safe to skim)</h2>
+<ul>
+<li><strong>Config type additions</strong> (<code>src/config/types.ts</code>): New fields for daemon
+auto-react settings (<code>auto_react</code>, <code>auto_react_ci</code>, <code>auto_react_comments</code>,
+<code>auto_react_max_retries</code>, <code>auto_react_backoff</code>, <code>auto_react_daily_budget</code>).
+All have defaults.</li>
+<li><strong>CLI command registrations</strong> (<code>src/cli/commands/index.ts</code>, <code>shared.ts</code>):
+Adding <code>watch</code> to the command list, adding <code>--daemon-config</code> flags.</li>
+<li><strong><code>lazy.toml.example</code></strong>: Port changed from 26024 to 26024, watchdog default
+documented.</li>
+<li><strong><code>src/daemon/index.ts</code></strong>: Re-exports new modules.</li>
+<li><strong><code>src/daemon/lifecycle.ts</code></strong>: Minor — added web port to status output.</li>
+<li><strong>Unit test boilerplate</strong>: 6 existing test files got identical 8-line
+<code>beforeAll</code>/<code>afterAll</code> blocks for tmux cleanup.</li>
+<li><strong><code>src/cli/commands/list.ts</code>, <code>loop.ts</code>, <code>pair.ts</code>, <code>show.ts</code>, <code>start.ts</code>,
+<code>unblock.ts</code>, <code>upgrade.ts</code>, <code>wait.ts</code></strong>: Small additions to pass daemon
+config or terminal driver through existing command flows.</li>
+<li><strong>Release artifacts</strong>: <code>CHANGELOG.md</code>, <code>docs/release/v0.11-presentation.md</code>,
+and SVG diagrams are documentation — no code review needed.</li>
+</ul>
+<hr>
+<h2 id="suggested-reading-order"><a class="anchor" href="#suggested-reading-order" aria-hidden="true">#</a>Suggested reading order</h2>
+<p>For a reviewer working through this PR:</p>
+<ol>
+<li><strong><code>src/daemon/server.ts</code></strong> — the reconcile loop body. Understand the
+sequence: snapshot → reconcile → detect changes → route events →
+auto-deliver → auto-react → push.</li>
+<li><strong><code>src/daemon/events.ts</code></strong> — the SSE routing table and event model.
+Understand transient-not-durable design.</li>
+<li><strong><code>src/daemon/auto-deliver.ts</code></strong> — how events reach blocked tasks.
+Focus on <code>deliverToBlockedTask()</code> and the worktree setup.</li>
+<li><strong><code>src/daemon/auto-react.ts</code></strong> — CI and comment detection. Focus on
+dedup signatures and the fire-and-forget pattern.</li>
+<li><strong><code>src/daemon/auto-react-budget.ts</code></strong> — the four budget gates. Read
+<code>shouldAutoReact()</code> top to bottom.</li>
+<li><strong><code>src/utils/reconcile.ts</code> diff</strong> — integration points: budget check
+in <code>maybeAutoResume()</code>, counter reset in <code>handleCompletedResponse()</code>,
+tmux cleanup on task exit.</li>
+<li><strong><code>src/supervisor/event-client.ts</code></strong> — the other end of SSE. Understand
+queue-and-drain pattern.</li>
+<li><strong><code>src/daemon/mcp-proxy.ts</code> + <code>mcp-routes.ts</code></strong> — MCP proxy. Simple
+and self-contained.</li>
+<li><strong><code>src/daemon/push.ts</code></strong> — push queue. Straightforward.</li>
+<li><strong><code>src/terminal/</code></strong> — terminal abstraction. Quick read.</li>
+<li><strong>Tests</strong> — skim for coverage gaps, not correctness (they&#39;re extensive).</li>
+</ol>
+<hr>
+<h2 id="what-was-reworked-during-the-release"><a class="anchor" href="#what-was-reworked-during-the-release" aria-hidden="true">#</a>What was reworked during the release</h2>
+<ul>
+<li><p><strong><code>rejected</code> → <code>abandoned</code></strong> in <code>auto-deliver.ts</code>: Two comparisons
+filtered terminal tasks using <code>&quot;rejected&quot;</code>, which isn&#39;t a valid <code>TaskStatus</code>.
+TypeScript caught this — the correct status is <code>&quot;abandoned&quot;</code> (what
+<code>lazy reject</code> transitions to). Fixed as the first commit of the release
+process.</p>
+</li>
+<li><p><strong>Web dashboard port</strong>: Changed from 26024 (which was a placeholder) to 26024
+in <code>lazy.toml.example</code>. This is the &quot;lazy&quot; port (L=1, A=3, Z=2, Y=1 → 26024
+by some creative mapping... or just a nice number).</p>
+</li>
+<li><p><strong>Watchdog default</strong>: Changed from &quot;disabled by default&quot; to &quot;2 hours by
+default&quot;. The <code>lazy.toml.example</code> comment was updated to reflect this.
+The code change in <code>watchdog.ts</code> is one line, but the <em>behavior</em> change is
+significant — every agent now has a timeout unless explicitly disabled.</p>
+</li>
+</ul>
+
+</main>
+</body>
+</html>

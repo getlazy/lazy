@@ -1,0 +1,9 @@
+graph LR
+    CI[CI Pipeline] -->|failure| SYNC[Daemon Sync]
+    SYNC -->|new failure?| DEDUP{Deduplicate}
+    DEDUP -->|seen| DROP[Skip]
+    DEDUP -->|new| BUDGET{Budget Check}
+    BUDGET -->|over limit| PAUSE[Pause task]
+    BUDGET -->|OK| UNBLOCK[Auto-unblock]
+    UNBLOCK -->|structured context| AGENT[Agent]
+    AGENT -->|fix + push| CI

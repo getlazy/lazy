@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lazy activity report — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="lazy-activity-report"><a class="anchor" href="#lazy-activity-report" aria-hidden="true">#</a>Lazy activity report</h1>
+<p><strong>Window:</strong> 2026-05-22T15:13:09.025Z → 2026-05-23T15:13:09.025Z</p>
+<h2 id="brief"><a class="anchor" href="#brief" aria-hidden="true">#</a>Brief</h2>
+<p>Window centered on the v0.14 release hub absorbing a second wave of child merges and finalizing the CHANGELOG, plus the landing of <code>unify-stop-and-harden-ask</code> which fixed the ask-mode hang and unified stop semantics. Two smaller tasks supported the release: builder-prompt documentation for <code>lazy_ask</code>/<code>lazy_stop</code>, and a stop-semantics test fixture that didn&#39;t actually exercise the stop path.</p>
+<ul>
+<li>v0.14 scope expanded from 2 to ~10 child merges; CHANGELOG retitled to &quot;New commands, safer accept, restored close/reject&quot; and finalized as <code>d21d9c4</code>.</li>
+<li><code>unify-stop-and-harden-ask</code> accepted in one pass: unified stop → <code>blocked</code>, fixed 10-minute ask hang via <code>ErrorResponse</code> write, replaced plan-mode with explicit tool denials.</li>
+<li>Builder prompt and MCP tool descriptions now document <code>lazy_ask</code>/<code>lazy_stop</code> usage (awaiting review).</li>
+<li>Stop-semantics test fixture ran too fast to exercise the new stop path; left as an unconsumed fixture in <code>blocked</code>.</li>
+<li>Release announcement headline settled on five user-visible items; tag push remains out-of-window pending MR #428 merge.</li>
+</ul>
+<h2 id="for-the-engineering-manager"><a class="anchor" href="#for-the-engineering-manager" aria-hidden="true">#</a>For the engineering manager</h2>
+<p><strong>Release</strong></p>
+<ul>
+<li>v0.14 release hub (<code>release-v014</code>) accepted ~10 child merges this window and is queued for ship via MR #428; the tag is pushed after the merge.</li>
+<li>Patch number derives from <code>git rev-list --count HEAD</code> (<code>0.14.1064</code>) — no manual version bumps needed.</li>
+<li>Announcement headline: <code>lazy stop</code>/<code>lazy_stop</code>, <code>lazy report</code>, <code>lazy_ask</code>, restored <code>lazy close</code>/<code>lazy reject</code>, unified <code>lazy watch</code>. Honorable mentions: safer accept, audible offline mode.</li>
+</ul>
+<p><strong>Direction / decisions</strong></p>
+<ul>
+<li>Stop semantics consolidated: <code>lazy stop</code> now lands tasks in <code>blocked</code> (not a separate state); <code>lazy resume</code> demoted to deprecated alias.</li>
+<li>Ask-mode permission model shifted from Claude&#39;s <code>--permission-mode plan</code> to explicit <code>--disallowedTools</code> denials — denial is now the source of truth, defense-in-depth via system prompt.</li>
+<li>README ownership stays with the human; agent delivered a structured recommendation list (not edits) on request.</li>
+</ul>
+<p><strong>Risk / follow-ups</strong></p>
+<ul>
+<li>Stop-semantics behavior shipped without an end-to-end validation pass — the <code>test-stop-semantics</code> fixture finished before stop could land. Worth flagging for manual smoke before tag push.</li>
+<li>Builder-prompt doc placement (under &quot;Reviewing workflow&quot; vs. &quot;Lazy tools&quot; catalog) is a judgment call awaiting review on <code>document-ask-and-stop-usage</code>.</li>
+</ul>
+<h2 id="for-the-engineering-lead"><a class="anchor" href="#for-the-engineering-lead" aria-hidden="true">#</a>For the engineering lead</h2>
+<h3 id="v014-release-hub"><a class="anchor" href="#v014-release-hub" aria-hidden="true">#</a>v0.14 release hub</h3>
+<ul>
+<li><code>release-v014</code> (<code>8d689a8e</code>) absorbed the second wave: 7 direct child merges (<code>fix-safe-branch-delete</code>, <code>fix-ask-protocol-version</code>, <code>add-graceful-exit-timeout</code>, <code>add-stop-command-redo-1</code>, <code>unify-task-watch-redo-1</code>, <code>fix-accept-confirmation-ux</code>, <code>drop-tmux-window-title</code>), a <code>recover-v014-branches</code> squash carrying 6 earlier children, and an <code>origin/main</code> merge pulling <code>lazy report</code> in.</li>
+<li>CHANGELOG header rewritten from <code>[0.14.1041] - Offline awareness and subagent discovery</code> to <code>[0.14.1064] - New commands, safer accept, restored close/reject</code>; finalize commit <code>d21d9c4</code>.</li>
+<li>Same-window merge of <code>lazy/unify-stop-and-harden-ask</code> (<code>e644b2f</code> / <code>4b14a09</code>) folded the ask/stop fix into the hub — this had been flagged in the opening turn as previously stuck behind a plan-mode bug.</li>
+<li>README recommendations returned as a proposal only (per human&#39;s &quot;don&#39;t write&quot; boundary): drop <code>lazy resume</code> from troubleshooting in favor of <code>lazy unblock</code>; sharpen task-status taxonomy; add <code>lazy close</code> next to <code>lazy reject</code> in Quick Start; three new Advanced-Features subsections (<code>lazy report</code>, <code>lazy stop</code>+<code>lazy_ask</code> paired workflow, <code>lazy watch</code> unified timeline); optional &quot;New in v0.14&quot; header callout. Explicitly excluded: subagent MCP internals, builder-prompt polish, ask-mode hardening internals.</li>
+<li>Out of scope: tag push (deferred to post-MR-merge). Smoke test (<code>bun test test/e2e/</code> + per-command host checks) documented but not run in-window.</li>
+</ul>
+<h3 id="stop--ask-hardening"><a class="anchor" href="#stop--ask-hardening" aria-hidden="true">#</a>Stop + ask hardening</h3>
+<ul>
+<li><code>unify-stop-and-harden-ask</code> (<code>2273b54c</code>) accepted in one pass, no iteration:<ul>
+<li><code>lazy stop</code> transitions to <code>blocked</code> with <code>user_stopped=true</code>; <code>lazy resume</code> is now a deprecated alias.</li>
+<li>Post-kill, <code>lazy stop</code> writes an <code>ErrorResponse</code> to <code>response.json</code> so the daemon&#39;s ask RPC unblocks in ≤500ms instead of waiting out the 10-minute timeout — real latency cliff for anyone interrupting an ask.</li>
+<li>Ask permission model: dropped <code>--permission-mode plan</code>, switched to <code>--disallowedTools &quot;Bash Write Edit&quot;</code>.</li>
+<li><code>LAZY_MCP_READ_ONLY=1</code> propagates supervisor → claude → MCP through the Docker config-spawn chain; three write-tool handlers gained actionable read-only guards.</li>
+<li>Ask system prompt tightened to reinforce read-only on the model side as well.</li>
+</ul>
+</li>
+<li><code>test-stop-semantics</code> (<code>7a87e94c</code>) was meant to exercise the new behavior via a deliberately slow read-and-summarize job (10 files, paced for mid-flight stop) writing to <code>notes/stop-test-exploration.md</code>.<ul>
+<li>Stop never landed in time: agent finished all 10 summaries and committed (<code>8fc33892</code>) before the human could trigger it — the stop path was not actually validated.</li>
+<li>Human merged <code>origin/lazy/release-v014 @ d21d9c46</code> into the task branch (clean, HEAD <code>8fc33892 → 2e8a3bbe</code>) to pull in the v0.14 CHANGELOG.</li>
+<li>Task ends <code>blocked</code> post-second-system-block as an unconsumed fixture.</li>
+</ul>
+</li>
+</ul>
+<h3 id="documentation"><a class="anchor" href="#documentation" aria-hidden="true">#</a>Documentation</h3>
+<ul>
+<li><code>document-ask-and-stop-usage</code> (<code>914689b1</code>, blocked awaiting review):<ul>
+<li>Builder system prompt (<code>src/prompts/builder-system-prompt.md</code>) gained two H3 sections under &quot;Reviewing workflow&quot; — &quot;Asking the agent for clarification&quot; (<code>lazy_ask</code>) and &quot;Halting an agent on the wrong path&quot; (<code>lazy_stop</code>) — with Good uses / Don&#39;t structure and post-stop options list.</li>
+<li>Placement is a judgment call: sections went under &quot;Reviewing workflow&quot; next to &quot;Feedback first, reject last&quot; rather than under the &quot;Lazy tools&quot; reference catalog. Flag for reviewer sanity check.</li>
+<li><code>lazy_ask</code> and <code>lazy_stop</code> MCP tool descriptions in <code>src/mcp/tools.ts</code> each picked up a one-line usage hint.</li>
+<li><code>lazy_resume</code> deprecation notice confirmed already in place from prior <code>unify-stop-and-harden-ask</code> work.</li>
+<li>Docs-only, no new tests; <code>bun run typecheck</code> clean modulo four pre-existing <code>version</code> module errors on the parent branch. Shipped as single commit <code>a9d44f4</code>.</li>
+</ul>
+</li>
+</ul>
+<h3 id="other-notable-activity"><a class="anchor" href="#other-notable-activity" aria-hidden="true">#</a>Other notable activity</h3>
+<ul>
+<li>Nothing else in this window beyond the four tracked tasks above; no untracked builder/engineer conversations.</li>
+</ul>
+
+</main>
+</body>
+</html>

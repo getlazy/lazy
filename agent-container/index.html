@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The lazy agent container image — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.22</span></div></header>
+<main class="wrap">
+<h1 id="the-lazy-agent-container-image"><a class="anchor" href="#the-lazy-agent-container-image" aria-hidden="true">#</a>The lazy agent container image</h1>
+<p>Agents working on the lazy codebase run inside the image built from
+<code>Dockerfile.lazy</code> (wired up by <code>[docker] dockerfile = &quot;Dockerfile.lazy&quot;</code> in
+<code>lazy.toml</code>). This document records what that image carries beyond a plain
+Debian box, and why.</p>
+<p>It is <em>not</em> the image other projects get. Projects with no <code>[docker] dockerfile</code>
+build from the embedded default (<code>src/docker/base.Dockerfile</code>, exported by
+<code>lazy system export-dockerfile</code>), which stays deliberately minimal — everything
+below is here because lazy&#39;s own test suite needs it.</p>
+<h2 id="whats-preinstalled"><a class="anchor" href="#whats-preinstalled" aria-hidden="true">#</a>What&#39;s preinstalled</h2>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>git</code>, <code>curl</code>, <code>jq</code>, <code>wget</code>, <code>unzip</code>, <code>less</code>, <code>openssh-client</code>, <code>gnupg</code>, <code>sudo</code></td>
+<td>Base dev utilities</td>
+</tr>
+<tr>
+<td><code>bun</code> (system-wide, plus <code>bunx</code>)</td>
+<td>Lazy is a bun/TypeScript project — tests, typecheck, and lazy itself</td>
+</tr>
+<tr>
+<td>Playwright + Chromium (<code>/ms-playwright</code>)</td>
+<td>Screenshots for visual verification of UI work</td>
+</tr>
+<tr>
+<td>Claude Code (<code>/home/user/.local/bin/claude</code>)</td>
+<td>The agent binary</td>
+</tr>
+<tr>
+<td><strong><code>bubblewrap</code>, <code>socat</code></strong></td>
+<td>Claude Code&#39;s Linux OS-sandbox backend</td>
+</tr>
+<tr>
+<td><strong>PostgreSQL 15 (server + client)</strong></td>
+<td><code>PostgresStorage</code> integration coverage</td>
+</tr>
+</tbody></table>
+<p>The bolded rows are the e2e dependencies. Before they shipped in the image,
+agents verifying their work re-installed them by hand, once per container, over
+and over — minutes each time, invisible to whoever was waiting.</p>
+<h3 id="there-is-no-node-and-there-never-was"><a class="anchor" href="#there-is-no-node-and-there-never-was" aria-hidden="true">#</a>There is no <code>node</code>, and there never was</h3>
+<p>Deliberate: lazy is a bun project, and bun runs its TypeScript directly. But
+<code>bun install</code> still writes <code>node_modules/.bin/*</code> shims that start with
+<code>#!/usr/bin/env node</code>, and bun does <strong>not</strong> put a <code>node</code> shim on PATH for
+<code>bun run</code> (verified on bun 1.4.0). So any <code>package.json</code> script that invokes a
+dependency&#39;s CLI by its bare name — <code>tsc --noEmit</code>, <code>eslint .</code>, <code>prettier -c</code> —
+dies at the shebang with <strong>exit 127</strong>, before the tool reads a single file.</p>
+<p>Invoke the package&#39;s entry module through bun instead:</p>
+<pre><code class="language-json">&quot;typecheck&quot;: &quot;bun node_modules/typescript/lib/tsc.js --noEmit&quot;
+</code></pre>
+<p>This is not hypothetical. <code>&quot;typecheck&quot;: &quot;tsc --noEmit&quot;</code> is how
+<code>[checks] post_turn = &quot;bun run build &amp;&amp; bun run typecheck&quot;</code> sat dead: both
+halves 127&#39;d every turn, so nothing was typechecked and <code>scripts/build.ts</code> never
+ran, while the gate&#39;s output read as noise rather than as &quot;the gate is not
+running&quot;. It never reproduced on a dev Mac, where <code>mise.toml</code> provisions node.
+<code>test/unit/package-scripts-node-free.test.ts</code> now fails on that shape.</p>
+<p>Adding node to the image would also work, but costs a rebuild for every agent
+and diverges from what the engineer&#39;s Mac runs.</p>
+<h3 id="bubblewrap-and-socat"><a class="anchor" href="#bubblewrap-and-socat" aria-hidden="true">#</a>bubblewrap and socat</h3>
+<p><code>permission_mode = &quot;sandbox&quot;</code> (the default posture for host execution) runs the
+agent under Claude Code&#39;s OS sandbox, which on Linux is bubblewrap plus socat.
+<code>src/runner/host-process-runner.ts</code> checks for both and fails hard with an
+install message rather than silently running unsandboxed.</p>
+<p>Suites affected: <code>test/e2e/agent-binary-seam.test.ts</code> (its sandbox-posture block
+gates itself with <code>sandboxSuiteSkipped()</code> — without the binaries it <strong>skips</strong>,
+which is not a pass), <code>test/e2e/builder.test.ts</code>,
+<code>test/e2e/host-sandbox-posture.test.ts</code>.</p>
+<h3 id="postgresql"><a class="anchor" href="#postgresql" aria-hidden="true">#</a>PostgreSQL</h3>
+<p><code>test/e2e/postgres-storage.test.ts</code> and <code>test/e2e/storage-contract.test.ts</code> are
+the only real coverage of the Postgres storage backend, and both skip their
+whole suite when <code>LAZY_POSTGRES_URL</code> is unset. Debian bookworm ships
+PostgreSQL 15, which satisfies the backend&#39;s requirements.</p>
+<p><strong>It is installed but not running.</strong> The cluster is initialized at image build
+time and left stopped. Nothing in the container&#39;s runtime path starts it: there
+is no init system, no <code>ENTRYPOINT</code>, and Debian&#39;s <code>policy-rc.d</code> already blocks the
+package&#39;s own start during the build. A task that never touches storage pays
+nothing beyond image size.</p>
+<p>To use it:</p>
+<pre><code class="language-bash">LAZY_POSTGRES_URL=$(lazy-pg-start) bun test test/e2e/postgres-storage.test.ts
+</code></pre>
+<p><code>lazy-pg-start</code> is idempotent: it starts the cluster if it isn&#39;t already
+accepting connections and prints
+<code>postgres://user@127.0.0.1:5432/lazy_test</code> either way.</p>
+<p>Authentication is <code>trust</code> on the unix socket and loopback. The cluster is
+disposable, container-private and unpublished — there is no secret to protect,
+and a password would only be one more thing for every agent to rediscover. The
+<code>pg_hba.conf</code> rewrite is guarded at build time, so if Debian&#39;s defaults ever
+stop matching, the build fails loudly instead of shipping an image whose
+advertised URL cannot connect.</p>
+<h2 id="cost"><a class="anchor" href="#cost" aria-hidden="true">#</a>Cost</h2>
+<p>Measured on arm64 by installing the same package set into a running container:</p>
+<ul>
+<li><strong>Image size: ≈ 170 MB larger.</strong> ~180 MB of packages, of which <strong>100 MB is
+<code>libllvm14</code></strong> — a hard <code>Depends</code> of <code>postgresql-15</code> for JIT that Debian gives
+no way to drop — plus a ~40 MB initialized cluster, minus the ~19 MB of apt
+lists the layer deletes.</li>
+<li><strong>Build time: under a minute added.</strong> Two apt operations and one
+<code>initdb</code>/start/stop cycle. Small next to the existing Playwright and Chromium
+download.</li>
+</ul>
+<h2 id="rebuilding"><a class="anchor" href="#rebuilding" aria-hidden="true">#</a>Rebuilding</h2>
+<p>Editing <code>Dockerfile.lazy</code> changes its content hash, which changes the resolved
+image name (<code>lazy-custom-&lt;hash&gt;</code>), so lazy rebuilds automatically on the next
+task launch — no manual step. If an agent finds <code>bwrap</code> or <code>psql</code> missing, it is
+running on a pre-change image; that is a rebuild, not a reason to <code>apt-get</code>.</p>
+<p>That covers what this Dockerfile <em>states</em>. It does nothing about what it
+<em>pulls</em> — nothing here is version-pinned, so the same text produces a
+materially different image a month later. That is true of any runner image
+lazy builds, so lazy handles it generically, with two time-based triggers on
+top of the hash:</p>
+<ul>
+<li><strong><code>lazy upgrade</code> always rebuilds</strong>, from scratch, with no version or hash
+comparison. That is the main path.</li>
+<li><strong>A backstop at 14 days.</strong> If the image on disk is older than that, the next
+task launch rebuilds it once (with <code>--no-cache</code>, since a cached build would
+re-fetch nothing) and then goes quiet again.</li>
+</ul>
+<p>Neither can leave you on an old <em>lazy</em>: no runner image contains lazy, here or
+anywhere else — <code>lazy-agent</code> is bind-mounted in at launch.</p>
+<p>The image <em>tag</em> is only an identity, not a freshness signal: it is lazy&#39;s
+major.minor version (<code>lazy-custom-&lt;hash&gt;:0.21</code>), so it deliberately does not move
+on every commit or patch release. <code>lazy doctor</code> lists the older images left
+behind.</p>
+
+</main>
+</body>
+</html>
