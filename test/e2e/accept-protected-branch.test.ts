@@ -1,7 +1,7 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -45,7 +45,7 @@ describe('lazy accept protected branch', () => {
     // needsSync=true triggers a real `git fetch origin main` in preflight —
     // add a bare origin with main pushed so the sync check passes.
     const bareRemotePath = join(ctx.root, '.test-remote.git');
-    const initBare = spawnSync(['git', 'init', '--bare', bareRemotePath], {
+    const initBare = spawnSyncUnsupervised(['git', 'init', '--bare', bareRemotePath], {
       stdout: 'pipe',
       stderr: 'pipe',
     });

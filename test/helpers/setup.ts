@@ -89,6 +89,14 @@ export interface TestContext {
    * (the harness's own env override is private, like `fakeClaudeBinDir`'s PATH).
    */
   scratchBaseDir: string;
+
+  /**
+   * `LAZY_PASSPHRASE_BASE_DIR` for every process this context spawns — a temp
+   * dir standing in for ~/.lazy, so an e2e run never reads or overwrites the
+   * developer's own enrolled approval passphrase. Use `enrollPassphrase` from
+   * test/helpers/passphrase.ts rather than composing this path by hand.
+   */
+  passphraseBaseDir: string;
 }
 
 export interface SetupOptions {
@@ -474,6 +482,15 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   const scratchBase = await mkdtemp(join(tmpdir(), 'lazy-e2e-scratch-'));
   baseEnv = { ...(baseEnv ?? {}), LAZY_SCRATCH_BASE_DIR: scratchBase };
 
+  // The approval passphrase store lives at ~/.lazy/passphrase.json (see
+  // src/protection/passphrase-store.ts). Only `fakeClaude` contexts get a
+  // private HOME, so without this pin an ordinary e2e run would READ — and a
+  // passphrase test would CLOBBER — the developer's own enrolled passphrase.
+  // Pinned for every process this context spawns so the CLI (enrollment) and
+  // the daemon (verification) agree on one store.
+  const passphraseBase = await mkdtemp(join(tmpdir(), 'lazy-e2e-passphrase-'));
+  baseEnv = { ...baseEnv, LAZY_PASSPHRASE_BASE_DIR: passphraseBase };
+
   // Arm the process-death safety net for this root BEFORE any CLI call can
   // auto-start a daemon (e.g. `lazy init` below). If `afterEach`/cleanup() never
   // runs, the registry's exit/SIGINT/SIGTERM handlers reap this root's daemon.
@@ -570,6 +587,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
     },
     fakeClaudeBinDir: fake?.binDir,
     scratchBaseDir: scratchBase,
+    passphraseBaseDir: passphraseBase,
     clearClaudeInvocations: async () => {
       if (!fake) throw new Error('clearClaudeInvocations requires setupTestLazy({ fakeClaude: true })');
       await clearClaudeInvocations(fake);
@@ -608,6 +626,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
         rm(getDaemonDir(root), { recursive: true, force: true }),
         ...(fakeClaudeDir ? [rm(fakeClaudeDir, { recursive: true, force: true })] : []),
         rm(scratchBase, { recursive: true, force: true }),
+        rm(passphraseBase, { recursive: true, force: true }),
         ...removableStorage,
       ]);
     },

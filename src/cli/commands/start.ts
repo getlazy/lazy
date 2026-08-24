@@ -304,7 +304,7 @@ This command does NOT create tasks. Creation parameters — goal, prompt, code,
 type, parent — belong to 'lazy create', which leaves the task in the backlog
 where 'lazy edit' can still correct them. Once an agent is running, none of them
 can be changed. Use 'lazy create --code <code> ...' then 'lazy start <code>'.
-See docs/surface-asymmetries.md (section 9) for why.
+See public-docs/surface-asymmetries.md (section 9) for why.
 
 Use 'lazy blocked' to check when the agent finishes and needs your input.
 Use 'lazy status <task_id>' to check the current state.
@@ -328,8 +328,9 @@ Model Selection:
   Models are selected in this priority order:
   1. --model flag (session override)
   2. Task's model setting (if set during task creation)
-  3. lazy.toml default model
-  4. Built-in default (claude-opus-4-8)
+  3. The agent's own default, if it has one (Cursor: "auto" — Cursor picks)
+  4. lazy.toml default model
+  5. Built-in default (claude-opus-4-8)
 
 Notes:
   - Each task can only have one session (1:1 relationship)

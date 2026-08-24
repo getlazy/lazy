@@ -1,21 +1,31 @@
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { join, isAbsolute } from 'path';
 import { tmpdir } from 'os';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
+import { getAgentPackaging } from '../agent/registry';
+import { agentSupportsApiKey, resolveAgentApiKey, AGENT_KEY_ENV } from '../agent/credentials';
 import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import type { RoleTarget } from '../config/types';
 import { buildMountArgs } from './mounts';
 import { buildGitMountArgsFor } from './git-mounts';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import { cursorLaunchEnvVars } from '../proxy/cursor-route';
+import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
+import { mintCredentialGrant } from '../proxy/credential-broker';
+import { hasDaemonContext, getDaemonContext } from '../daemon/context';
+// Cycle: auth-env imports getAuthEnvVars from this module. Safe — both sides
+// are hoisted function declarations, called at request time, never during
+// module evaluation.
+import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import { logger } from '../utils/logger';
 import { redactSecrets } from '../utils/redact';
 import { isOfflineMode } from '../utils/offline';
-import { spawn, spawnSync } from '../utils/spawn';
+import { spawn } from '../utils/spawn';
 import { safeArgvPrompt } from '../agent/argv-safety';
 import { markMachineOneshotPrompt } from '../import/machine-oneshot';
 import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
@@ -105,10 +115,42 @@ function getLazyRoot(): string {
 }
 
 /**
- * Resolve the custom Dockerfile path from config.
- * Returns the absolute path if configured and the file exists, null otherwise.
+ * Resolve the custom Dockerfile path.
+ * Returns the absolute path if one is in effect and the file exists, null
+ * otherwise (default image).
+ *
+ * Resolution:
+ * 1. `LAZY_DOCKERFILE_LAZY` (env override, same family as LAZY_CONFIG): used
+ *    verbatim when absolute, resolved against the project root when relative.
+ *    Forces custom-image mode even when [docker].dockerfile is unset. Works
+ *    uniformly across every command AND the daemon (spawned daemons inherit
+ *    the environment), which is the point: export it, `lazy upgrade`, and the
+ *    build and every subsequent launch agree on the file. Intended for
+ *    developing lazy itself (testing a branch's Dockerfile before it merges)
+ *    and for e2e fixtures.
+ * 2. `[docker].dockerfile` from config, joined to the PROJECT ROOT.
+ *
+ * INVARIANT: a task's worktree must never govern the image. Task branches are
+ * agent-writable, and deriving the image from one would let an agent's
+ * Dockerfile.lazy edits execute as build steps under the daemon's docker on
+ * the HOST (build-time RUN runs outside every container guard). Launch paths
+ * therefore never anchor image resolution at the task worktree.
+ *
+ * Exported for `lazy upgrade`'s image-source announcement.
  */
-async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
+export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
+  const override = process.env.LAZY_DOCKERFILE_LAZY;
+  if (override) {
+    const absPath = isAbsolute(override) ? override : join(lazyRoot, override);
+    if (!existsSync(absPath)) {
+      throw new Error(
+        `LAZY_DOCKERFILE_LAZY is set to '${override}' (resolved to ${absPath}) but the file does not exist. ` +
+        `Unset it with LAZY_DOCKERFILE_LAZY= or fix the path.`
+      );
+    }
+    return absPath;
+  }
+
   const config = await loadConfig(lazyRoot);
   const configPath = config.docker.dockerfile;
   if (!configPath) return null;
@@ -134,30 +176,70 @@ async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null>
  * project, not for agent containers. Use `lazy init` to create a Dockerfile.lazy
  * based on the project's Dockerfile if needed.
  */
-async function getDockerfileContent(lazyRoot: string): Promise<{ content: string; isCustom: boolean }> {
+/**
+ * Resolve which agent an image build should bake in.
+ *
+ * Explicit override (the task's agent, threaded from the launch path) wins;
+ * otherwise the project's configured default agent applies. Returns null when
+ * the effective agent needs no extra install: claude-code is already in the
+ * base image, and host-only agents never reach a container build.
+ */
+async function resolveImageAgent(lazyRoot: string, agentId?: string): Promise<string | null> {
+  const effective = agentId ?? (await loadConfig(lazyRoot)).agent.agent_id;
+  if (effective === 'claude-code') return null;
+  try {
+    return getAgentPackaging(effective).supportsContainerRunner() ? effective : null;
+  } catch {
+    // Unknown agent id — validated elsewhere; the image build just uses base.
+    return null;
+  }
+}
+
+async function getDockerfileContent(lazyRoot: string, agentId?: string): Promise<{ content: string; isCustom: boolean }> {
   const customPath = await resolveCustomDockerfile(lazyRoot);
   if (customPath) {
+    // Custom Dockerfiles are the user's own — never silently amended. If they
+    // run a non-claude agent they add its install line themselves (the install
+    // command is printed by `lazy system export-dockerfile` docs).
     return { content: readFileSync(customPath, 'utf-8'), isCustom: true };
+  }
+
+  // Agent-aware default image: bake the configured (or task-overridden) agent's
+  // CLI into the image on top of the base. The Dockerfile-hash label mechanism
+  // then handles rebuilds automatically, since the content differs.
+  const imageAgent = await resolveImageAgent(lazyRoot, agentId);
+  if (imageAgent) {
+    const install = getAgentPackaging(imageAgent).dockerInstallCommand();
+    const content =
+      `${DEFAULT_DOCKERFILE}\n# Agent CLI for the "${imageAgent}" agent (added by lazy)\n${install}\n`;
+    return { content, isCustom: false };
   }
 
   return { content: DEFAULT_DOCKERFILE, isCustom: false };
 }
 
-export async function calculateDockerfileHash(lazyRoot: string): Promise<string> {
-  const { content } = await getDockerfileContent(lazyRoot);
+export async function calculateDockerfileHash(lazyRoot: string, agentId?: string): Promise<string> {
+  const { content } = await getDockerfileContent(lazyRoot, agentId);
   return createHash('sha256').update(content).digest('hex');
 }
 
 /**
  * Determine the Docker image REPOSITORY (name without tag) to use.
  * Default behavior uses 'lazy-runner'. Custom Dockerfiles use 'lazy-custom-{hash}'.
+ * Default-plus-agent images use 'lazy-runner-{agentId}' so they never collide
+ * with the base runner image of other projects.
  */
-export async function resolveImageRepository(lazyRoot: string): Promise<{ repository: string; isCustom: boolean }> {
-  const { isCustom, content } = await getDockerfileContent(lazyRoot);
+export async function resolveImageRepository(lazyRoot: string, agentId?: string): Promise<{ repository: string; isCustom: boolean }> {
+  const { isCustom, content } = await getDockerfileContent(lazyRoot, agentId);
 
   if (isCustom) {
     const hash = createHash('sha256').update(content).digest('hex').substring(0, 12);
     return { repository: `lazy-custom-${hash}`, isCustom: true };
+  }
+
+  const imageAgent = await resolveImageAgent(lazyRoot, agentId);
+  if (imageAgent) {
+    return { repository: `${IMAGE_NAME}-${imageAgent}`, isCustom: false };
   }
 
   return { repository: IMAGE_NAME, isCustom: false };
@@ -167,8 +249,8 @@ export async function resolveImageRepository(lazyRoot: string): Promise<{ reposi
  * Determine the full Docker image reference to run — always tagged with lazy's
  * major.minor version (see IMAGE_TAG), never `:latest`.
  */
-export async function resolveImageName(lazyRoot: string): Promise<string> {
-  const { repository } = await resolveImageRepository(lazyRoot);
+export async function resolveImageName(lazyRoot: string, agentId?: string): Promise<string> {
+  const { repository } = await resolveImageRepository(lazyRoot, agentId);
   return `${repository}:${IMAGE_TAG}`;
 }
 
@@ -362,8 +444,8 @@ async function runDockerBuild(
   logger.debug('Container build completed successfully');
 }
 
-async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false): Promise<void> {
-  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache);
+async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false, agentId?: string): Promise<void> {
+  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache, undefined, agentId);
 }
 
 /**
@@ -382,27 +464,28 @@ async function buildImageWithTags(
   binary: string = 'docker',
   noCache: boolean = false,
   signal?: AbortSignal,
+  agentId?: string,
 ): Promise<void> {
-  logger.info(`Building ${tags[0]} container image...`);
-
   const customPath = await resolveCustomDockerfile(lazyRoot);
 
   let buildCwd: string;
   let dockerfileName: string;
 
   if (customPath) {
+    // Name the Dockerfile in the announcement: from a worktree it is genuinely
+    // ambiguous which copy governs, and a wrong one once cost a whole session.
+    logger.info(`Building ${tags[0]} container image from ${customPath}...`);
     // Custom Dockerfile: build context is project root, Dockerfile path is the custom one
     buildCwd = lazyRoot;
     dockerfileName = customPath;
-    logger.debug(`Using custom Dockerfile: ${customPath}`);
   } else {
+    logger.info(`Building ${tags[0]} container image from the embedded default Dockerfile...`);
     // Write the resolved Dockerfile to a temp directory for the build.
     // Never use the project's own Dockerfile — it's for the project, not agents.
-    const { content } = await getDockerfileContent(lazyRoot);
+    const { content } = await getDockerfileContent(lazyRoot, agentId);
     const temp = await writeDockerfileToTempDir(content);
     buildCwd = temp.buildCwd;
     dockerfileName = temp.dockerfilePath;
-    logger.debug('Using embedded default Dockerfile');
   }
 
   await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal);
@@ -502,13 +585,13 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
  * to an existing lazy image if one is available. This lets users work offline
  * with a previously-built image even if the Dockerfile has changed.
  */
-export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean }): Promise<string> {
+export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean; agentId?: string }): Promise<string> {
   await checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
-  const { repository } = await resolveImageRepository(lazyRoot);
+  const { repository } = await resolveImageRepository(lazyRoot, options?.agentId);
   const imageName = `${repository}:${IMAGE_TAG}`;
-  const currentHash = await calculateDockerfileHash(lazyRoot);
+  const currentHash = await calculateDockerfileHash(lazyRoot, options?.agentId);
   const imageHash = await getImageDockerfileHash(imageName, binary);
   let noCache = options?.noCache ?? false;
 
@@ -548,7 +631,7 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
   }
 
   try {
-    await buildImage(lazyRoot, repository, currentHash, binary, noCache);
+    await buildImage(lazyRoot, repository, currentHash, binary, noCache, options?.agentId);
     return imageName;
   } catch (buildErr) {
     // If not offline, just propagate the build error
@@ -915,10 +998,14 @@ export type { OllamaConfig } from '../config/types';
 /**
  * Get auth environment variables for a resolved role target.
  *
- * - ollama: self-contained dummy credentials + base URL + stability flags.
- * - proxy:  base URL override forwarded with the real Anthropic credential.
- * - anthropic (or no target): the real Anthropic credential (throws if absent,
- *   via ClaudeCodeAgent.getAuthEnvVars()).
+ * - ollama: synthetic credentials ({@link LOCAL_BACKEND_CREDS}) — the ollama
+ *   server ignores auth, and an ollama-only project may hold no real credential
+ *   at all, so demanding one here would break it.
+ * - anthropic / proxy (or no target): the real Anthropic credential (throws if
+ *   absent, via ClaudeCodeAgent.getAuthEnvVars()).
+ *
+ * The base URL is the proxy's for every backend — where a role's traffic goes
+ * upstream is the proxy's routing decision, not the launched process's.
  *
  * `surface` says whether the env is for a container or a host process — see
  * {@link targetEnvVars}. It defaults to `'container'` because every caller in
@@ -931,12 +1018,55 @@ export function getAuthEnvVars(
   surface: LaunchSurface = 'container',
 ): Array<{ key: string; value: string }> {
   const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
-  if (resolved.backend === 'ollama') {
-    // Ollama is self-contained — no real credential needed.
-    return targetEnvVars(resolved, [], surface, hints);
+  const creds = resolved.backend === 'ollama'
+    ? LOCAL_BACKEND_CREDS
+    : _agent.getAuthEnvVars(); // throws, actionably, if genuinely absent
+  return targetEnvVars(resolved, creds, surface, hints);
+}
+
+/**
+ * Launch-time auth env with the credential swapped for a per-launch PLACEHOLDER.
+ *
+ * This is what makes a task container credential-free. {@link getAuthEnvVars}
+ * still returns the REAL credential and is still what the proxy resolves
+ * against inside the daemon — but nothing that hands env to a launched process
+ * should call it any more. Use this.
+ *
+ * Every role's traffic reaches lazy's proxy now — including ollama roles and
+ * roles pinned at an explicit `endpoint`, which the proxy forwards to on their
+ * behalf — so the only remaining condition is that this process is the daemon
+ * that runs the proxy. Without a daemon context (the in-container supervisor
+ * relaunching its own agent, test/daemonless modes) this process cannot mint
+ * against the daemon's grant registry, and in the container case it does not
+ * need to: the value it reads out of its own env is already the placeholder the
+ * daemon minted.
+ *
+ * An ollama role is placeholderized like any other, over synthetic credentials
+ * ({@link LOCAL_BACKEND_CREDS}) rather than the user's token — the grant is what
+ * lets the proxy authenticate the caller and route it to that role's upstream,
+ * so skipping the swap would cost the routing, not just the secrecy.
+ */
+export async function getLaunchAuthEnvVars(
+  identity: LaunchIdentity,
+  target?: RoleTarget,
+  hints?: ProxyAuditHints,
+  surface: LaunchSurface = 'container',
+  injectedCreds?: Array<{ key: string; value: string }>,
+): Promise<Array<{ key: string; value: string }>> {
+  const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
+  // injectedCreds: a runner that holds its own agent instance reads the
+  // credential from THAT agent rather than the module-level default. The
+  // placeholder swap below is identical either way — which is the point of
+  // taking it as a parameter instead of letting that caller bypass this.
+  const real = resolved.backend === 'ollama'
+    ? LOCAL_BACKEND_CREDS
+    : (injectedCreds ?? _agent.getAuthEnvVars());
+  const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+  if (!proxyPort) {
+    return targetEnvVars(resolved, real, surface, hints);
   }
-  // anthropic / proxy: forward the real credential (throwing if absent).
-  return targetEnvVars(resolved, _agent.getAuthEnvVars(), surface, hints);
+  const placeholders = await placeholderizeAuthEnv(getLazyRoot(), real, identity);
+  return targetEnvVars(resolved, placeholders, surface, hints);
 }
 
 /**
@@ -1015,9 +1145,17 @@ export async function runClaude(
   }
 
   logger.debug('Setting up sandbox...');
+  // JIT CREDENTIALS: this is a container launch, so it gets a placeholder like
+  // every other one — the real credential must not reach the container's env or
+  // the docker argv. Resolved through the daemon (the credential's owner) with a
+  // builder identity: this runs on behalf of a human at a terminal, not a task.
+  const authEnvVars = await resolveAuthEnvFromDaemon(
+    target, { role: 'builder' }, 'container', undefined,
+    { role: 'builder', taskId: null, label: `oneshot:${getLazyRoot()}` },
+  );
   const args = buildDockerArgs(
     sandbox, claudeArgs, agentBinaryPath, imageName, binary,
-    getLazyRoot(), getAuthEnvVars(target),
+    getLazyRoot(), authEnvVars,
     await buildGitMountArgsFor(sandbox.worktreePath),
   );
 
@@ -1219,23 +1357,6 @@ export async function getContainerExitCode(containerName: string, binary: string
 }
 
 /**
- * Get the stdout output of a stopped container.
- * Returns null if Docker is not available.
- */
-export function getContainerOutput(containerName: string, binary: string = 'docker'): string | null {
-  try {
-    const result = spawnSync(
-      [binary, 'logs', containerName],
-      { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
-    );
-    if (result.exitCode !== 0) return null;
-    return result.stdout.toString();
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Get the last N lines of container logs (stdout + stderr combined).
  * Returns null if Docker is not available or container doesn't exist.
  */
@@ -1431,6 +1552,9 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     '-v', `${protocolDir}:${protocolDir}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
+    // Cursor's home-config dir, mounted unconditionally (like .claude): the dir
+    // always exists (setupSandbox creates it) and non-Cursor agents ignore it.
+    '-v', `${sandbox.sandboxPath}/.cursor:/home/user/.cursor`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
     ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
@@ -1459,6 +1583,47 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
  * Uses a PID-1 wrapper script that restarts the supervisor between turns
  * so that memory is released back to the OS after each turn.
  */
+/**
+ * Verify a non-claude agent's binary exists in the image that is about to run.
+ *
+ * Only applies when the project uses a CUSTOM Dockerfile: the default image is
+ * agent-aware (getDockerfileContent appends the install command), but custom
+ * Dockerfiles are deliberately never amended, so the human must add the
+ * install line themselves — and the failure mode without this check is a
+ * supervisor whose work phase can never succeed. The probe is a throwaway
+ * `docker run --rm <image> which <binary>` (same pattern as
+ * probeProjectsDirWritable): accurate even when the binary comes from a base
+ * image rather than a visible RUN line.
+ *
+ * Exported for direct unit coverage.
+ */
+export async function preflightAgentBinaryInImage(
+  imageName: string,
+  binary: string,
+  agentId?: string,
+): Promise<void> {
+  if (!agentId || agentId === 'claude-code') return;
+  const lazyRoot = getLazyRoot();
+  if (!(await resolveCustomDockerfile(lazyRoot))) return; // default image is agent-aware
+
+  const pkg = getAgentPackaging(agentId);
+  const agentBinary = pkg.binaryName();
+  const probe = spawn(
+    [binary, 'run', '--rm', imageName, 'which', agentBinary],
+    { stdout: 'ignore', stderr: 'ignore', timeout: 60_000 },
+  );
+  if (await probe.exited !== 0) {
+    const config = await loadConfig(lazyRoot);
+    throw new Error(
+      `The custom Dockerfile image "${imageName}" does not contain '${agentBinary}', ` +
+      `which the "${agentId}" agent needs. Lazy never amends custom Dockerfiles — ` +
+      `add this line to ${config.docker.dockerfile} (in the non-root user section) and relaunch:\n` +
+      `  ${pkg.dockerInstallCommand()}\n` +
+      `The image rebuilds automatically on the next launch once the file changes.`
+    );
+  }
+}
+
 export async function launchSupervisorAsync(
   sandbox: SandboxConfig,
   containerName: string,
@@ -1468,21 +1633,117 @@ export async function launchSupervisorAsync(
   daemonConfigPath?: string,
   target?: RoleTarget,
   taskId?: string,
+  agentId?: string,
 ): Promise<void> {
+  // Image resolution is deliberately NOT anchored at sandbox.worktreePath:
+  // a task branch that edits Dockerfile.lazy must never have those edits
+  // built and run by the daemon's docker on the host (see
+  // resolveCustomDockerfile for the invariant).
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary),
+    ensureImage(binary, { agentId }),
     ensureAgentBinary(),
   ]);
 
+  // Custom Dockerfiles are never amended by lazy, so a non-claude agent's
+  // binary may simply not be in the image. Verify it BEFORE launching the
+  // supervisor — otherwise the missing binary only surfaces inside the work
+  // phase (a cursor task on this repo's own Dockerfile.lazy crash-looped for
+  // a whole session this way before the failure was even classified).
+  await preflightAgentBinaryInImage(imageName, binary, agentId);
+
   // Supervisor launches are always the `agent` role; the task turn it runs
   // inherits this env, so proxied traffic is attributed to agent + task.
-  const authEnvVars = getAuthEnvVars(target, { role: 'agent', taskId });
+  let authEnvVars: Array<{ key: string; value: string }>;
+  // The launch identity every placeholder minted below is bound to. The proxy
+  // derives attribution from the grant rather than from the self-reported
+  // x-lazy-* headers, so this is what the audit trail ends up asserting.
+  const agentIdentity: LaunchIdentity = { role: 'agent', taskId: taskId ?? null, label: containerName };
+  if (agentId && agentId !== 'claude-code') {
+    // Non-claude task agent: its own credentials are what the turn needs.
+    // Resolved at LAUNCH time (env override → per-project .lazy credentials
+    // file), so a key set while the daemon is running takes effect on the
+    // next launch — never "restart the daemon". See src/agent/credentials.ts.
+    authEnvVars = [];
+    if (agentSupportsApiKey(agentId)) {
+      const key = await resolveAgentApiKey(getLazyRoot(), agentId);
+      if (!key) {
+        // A container cannot see the host's login session, so no key from any
+        // source means every turn would fail on auth. Refuse the launch with
+        // the remedy instead.
+        throw new Error(
+          `No API key for the "${agentId}" agent. A container cannot use a host login session, ` +
+          `so this task needs a key from one of:\n` +
+          `  1. lazy system agent set-key ${agentId}   (stored per-project outside the repo — takes effect on the next launch)\n` +
+          `  2. the ${AGENT_KEY_ENV[agentId]} environment variable (override)`
+        );
+      }
+      // JIT INJECTION: the container gets a PLACEHOLDER, never the key. The
+      // real key is resolved above only to prove one EXISTS (a container has no
+      // login session to fall back on) — its value is then dropped on the floor
+      // and the proxy re-resolves it per request, upstream.
+      const agentEnvKey = AGENT_KEY_ENV[agentId]!;
+      const placeholder = await mintCredentialGrant(getLazyRoot(), {
+        role: 'agent', taskId: taskId ?? null, label: containerName, envKey: agentEnvKey,
+      });
+      authEnvVars.push({ key: agentEnvKey, value: placeholder });
+      logger.debug(`Resolved ${agentId} API key from ${key.source}; container gets a placeholder`);
+    }
+    // The Anthropic/proxy env is still forwarded when resolvable — the
+    // in-container merge phase shells out to `claude`
+    // (src/supervisor/merge.ts) — but its absence must not block a task that
+    // never authenticates against Anthropic.
+    try {
+      authEnvVars = [
+        ...(await getLaunchAuthEnvVars(agentIdentity, target, { role: 'agent', taskId })),
+        ...authEnvVars,
+      ];
+    } catch (err) {
+      // Distinguish "there is no credential" from "resolving it BROKE". The
+      // first is ordinary \u2014 a cursor task need not have an Anthropic key, and
+      // only the in-container merge phase would miss it. The second means the
+      // grant registry or the proxy wiring is faulty, and letting that log at
+      // debug as a missing credential is how a broken security path stays
+      // invisible (CLAUDE.md: distinguish not-found from found-but-broken).
+      const message = err instanceof Error ? err.message : String(err);
+      const merelyAbsent = /no .*credential|not authenticated|setup-token|ANTHROPIC_API_KEY/i.test(message);
+      if (merelyAbsent) {
+        logger.debug(
+          `No Anthropic credential forwarded to ${agentId} task container ` +
+          `(merge-conflict turns need one): ${message}`
+        );
+      } else {
+        logger.warn(
+          `[proxy] could not build the placeholder auth env for the ${agentId} task container: ` +
+          `${message}. The launch continues without Anthropic credentials, so an in-container ` +
+          `merge turn will fail on auth. This is not a missing key — it is a failure to mint or ` +
+          `resolve one.`
+        );
+      }
+    }
+  } else {
+    authEnvVars = await getLaunchAuthEnvVars(agentIdentity, target, { role: 'agent', taskId });
+  }
   const repoRoot = getLazyRoot();
 
   // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
   // here we just expand placeholders and build the `-v` args. Empty by default,
   // so default behavior is completely unchanged when no mounts are configured.
   const config = await loadConfig(repoRoot);
+
+  // Cursor API traffic routes through lazy's proxy exactly like Anthropic's,
+  // via cursor-agent's endpoint override. The launch's PLACEHOLDER rides in the
+  // URL path rather than a header because cursor's -H flag does not cover every
+  // request (see src/proxy/cursor-route.ts); the proxy authenticates it there
+  // and swaps in the real CURSOR_API_KEY upstream.
+  authEnvVars.push(...cursorLaunchEnvVars({
+    agentId,
+    // Container surface: `binary` is the container runtime for this launch.
+    runnerType: binary === 'podman' ? 'podman' : 'docker',
+    proxyPort: hasDaemonContext() ? getDaemonContext().proxyPort : undefined,
+    bind: config.proxy.bind,
+    token: authEnvVars.find(v => v.key === AGENT_KEY_ENV.cursor)?.value ?? null,
+  }));
+
   const customMountArgs = buildMountArgs(config.mounts, {
     worktreePath: sandbox.worktreePath,
     repoRoot,

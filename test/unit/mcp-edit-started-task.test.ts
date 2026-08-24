@@ -2,8 +2,8 @@
  * Unit tests for the MCP `lazy_edit` guard on started tasks.
  *
  * The MCP surface must mirror the `lazy edit` CLI: once a task has turns,
- * goal/prompt/type/code/parent edits are rejected, but a MODEL-ONLY edit is
- * allowed. That model-only exemption is the supported way to durably change a
+ * goal/prompt/type/code/parent edits are rejected, but model and effort edits
+ * are allowed. That model-only exemption is the supported way to durably change a
  * running task's model — auto-resume/auto-deliver relaunch from task.model,
  * and a stale value there caused a real crash-loop incident (task relaunched
  * on a model that no longer existed).
@@ -73,12 +73,36 @@ describe('MCP lazy_edit on started tasks', () => {
     }
   });
 
+  // INVARIANT: effort is editable on a started task, like model. It PERSISTS
+  // on the task (lazy start --effort writes it), so a turn that ran at max
+  // would otherwise pin the task there with no way down from this surface.
+  test('effort-only edit succeeds on a task with turns and persists', async () => {
+    const result = await handler()({ task_id: task.id, effort: 'medium' }) as { changes: string[] };
+    expect(result.changes).toEqual(['effort']);
+
+    const verify = new FileStorage(lazyRoot, { basePath });
+    await verify.initialize();
+    try {
+      const updated = await verify.getTask(task.id);
+      expect(updated?.metadata?.effort).toBe('medium');
+    } finally {
+      await verify.close();
+    }
+  });
+
+  // An invalid level is refused with the same value set the CLI enforces —
+  // the schema enum is advisory, the handler is the real boundary.
+  test('invalid effort is rejected', async () => {
+    await expect(handler()({ task_id: task.id, effort: 'banana' }))
+      .rejects.toThrow(/Invalid effort 'banana'/);
+  });
+
   // INVARIANT: Non-model fields stay frozen once the task has turns —
   // changing goal/prompt/etc. mid-flight is unsafe. The error names the one
   // allowed change so the caller knows what IS possible.
   test('goal edit is rejected on a task with turns', async () => {
     await expect(handler()({ task_id: task.id, goal: 'New goal' }))
-      .rejects.toThrow(/only model can be changed/);
+      .rejects.toThrow(/only model and effort can be changed/);
   });
 
   // INVARIANT: The model-only exemption does not extend to combined edits —
@@ -86,7 +110,7 @@ describe('MCP lazy_edit on started tasks', () => {
   // partially applied.
   test('model combined with goal is rejected on a task with turns', async () => {
     await expect(handler()({ task_id: task.id, model: 'claude-haiku-4-5-20251001', goal: 'New goal' }))
-      .rejects.toThrow(/only model can be changed/);
+      .rejects.toThrow(/only model and effort can be changed/);
 
     const verify = new FileStorage(lazyRoot, { basePath });
     await verify.initialize();

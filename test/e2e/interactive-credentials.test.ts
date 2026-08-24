@@ -7,6 +7,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 import { findFullTaskId, setTaskStatus, taskFilePath, worktreePathFor } from '../helpers/storage';
+import { looksLikeLazyPlaceholder, lookupCredentialGrant } from '../../src/proxy/credential-broker';
 
 /**
  * INVARIANT (this whole file): the credential an interactive Claude Code
@@ -25,7 +26,21 @@ import { findFullTaskId, setTaskStatus, taskFilePath, worktreePathFor } from '..
  * A human who deliberately wants their own host login can still type `/login`
  * inside the session. That escape hatch is explicit; the implicit fallback was
  * the bug.
+ *
+ * SINCE JIT CREDENTIALS, the same invariant has a different signature on the
+ * wire. The launched process no longer receives the daemon's raw token at all —
+ * it receives a PLACEHOLDER the daemon minted for this launch, which the proxy
+ * exchanges upstream (src/proxy/credential-broker.ts). So "it came from the
+ * daemon" is no longer proved by value equality; it is proved by the value
+ * resolving to a GRANT in this daemon's own registry. That is a stronger proof
+ * than the old one: a value copied out of the human's shell could never resolve.
  */
+
+/**
+ * The daemon's real credential in this harness. Asserted against NEGATIVELY:
+ * after JIT injection the raw token must never reach a launched process.
+ */
+const DAEMON_RAW_CREDENTIAL = 'sk-test-fake-key-for-testing';
 
 /** The credential env vars the fake `claude` records, in the order it writes them. */
 const RECORDED_ENV = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'] as const;
@@ -58,6 +73,36 @@ async function readClaudeEnv(binDir: string): Promise<Record<string, string>> {
     if (eq > 0) out[line.slice(0, eq)] = line.slice(eq + 1);
   }
   return out;
+}
+
+/**
+ * Assert the launched process received a placeholder THIS daemon minted for
+ * THIS launch — the placeholder-era spelling of "the credential came from the
+ * daemon, not from the invoking shell".
+ *
+ * Three things together make that airtight:
+ *  - it is not the credential-less shell's value (which was empty),
+ *  - it is not the daemon's raw token either (the whole point of JIT: the real
+ *    credential never leaves the daemon process), and
+ *  - it resolves in the grant registry to a BUILDER grant. Only the daemon can
+ *    write that registry, so resolution is evidence of provenance rather than a
+ *    shape check — `looksLikeLazyPlaceholder` alone would pass on any string a
+ *    test happened to prefix correctly.
+ */
+async function expectDaemonMintedPlaceholder(root: string, value: string): Promise<void> {
+  expect(value).not.toBe('');                      // a credential was handed over at all
+  expect(value).not.toBe(DAEMON_RAW_CREDENTIAL);   // ...but not the raw one
+  expect(looksLikeLazyPlaceholder(value)).toBe(true);
+
+  const grant = await lookupCredentialGrant(root, value);
+  expect(grant, `no grant registered for the placeholder handed to claude`).not.toBeNull();
+  // pair and chat are interactive BUILDER sessions (see resolveInteractiveLaunch).
+  expect(grant!.role).toBe('builder');
+  expect(grant!.taskId).toBeNull();
+  expect(grant!.label).toStartWith('host-builder:');
+  // The placeholder occupies the SAME env var the real credential would have,
+  // so the client picks the same auth wire shape it always did.
+  expect(grant!.envKey).toBe('ANTHROPIC_API_KEY');
 }
 
 /**
@@ -127,7 +172,7 @@ describe('interactive launch credentials come from the daemon', () => {
     expectSuccess(result);
 
     const env = await readClaudeEnv(binDir);
-    expect(env.ANTHROPIC_API_KEY).toBe('sk-test-fake-key-for-testing');
+    await expectDaemonMintedPlaceholder(ctx.root, env.ANTHROPIC_API_KEY);
   });
 
   test('branchless lazy pair passes the daemon credential to Claude Code', async () => {
@@ -135,6 +180,6 @@ describe('interactive launch credentials come from the daemon', () => {
     expectSuccess(result);
 
     const env = await readClaudeEnv(binDir);
-    expect(env.ANTHROPIC_API_KEY).toBe('sk-test-fake-key-for-testing');
+    await expectDaemonMintedPlaceholder(ctx.root, env.ANTHROPIC_API_KEY);
   });
 });

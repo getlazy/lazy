@@ -16,7 +16,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 const NUL = String.fromCharCode(0);
 
@@ -29,12 +29,12 @@ describe('MCP argument sanitization', () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-mcp-sanitize-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
 
-    spawnSync(['git', 'init'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
-    spawnSync(['git', 'add', '.'], { cwd: testDir });
-    spawnSync(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
     storage = await createStorage(testDir, { backend: 'external' });
     ctx = { taskId: '', worktreePath: testDir, storage };

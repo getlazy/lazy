@@ -6,7 +6,7 @@
  */
 
 import type { AgentPackaging } from './interface';
-import { spawnSync } from '../utils/spawn';
+import { spawnSyncUnsupervised } from '../utils/spawn';
 
 export class ClaudeCodePackaging implements AgentPackaging {
   readonly agentId = 'claude-code';
@@ -21,6 +21,10 @@ export class ClaudeCodePackaging implements AgentPackaging {
 
   binaryName(): string {
     return 'claude';
+  }
+
+  supportsContainerRunner(): boolean {
+    return true;
   }
 
   dockerInstallCommand(): string {
@@ -57,7 +61,7 @@ WORKDIR /work
 
   diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
     try {
-      const result = spawnSync(['claude', '--version'], {
+      const result = spawnSyncUnsupervised(['claude', '--version'], {
         stdout: 'pipe',
         stderr: 'pipe',
         timeout: 10_000,

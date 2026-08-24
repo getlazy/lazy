@@ -157,7 +157,7 @@ describe('lazy-agent mcp', () => {
     // surfaces — the agent read-only gate lives inside lazy_memory_save's
     // handler, not in tool registration, so agents still see the tool and get a
     // clear server-side rejection instead of a mystery missing tool.
-    expect(result.tools.length).toBe(37);
+    expect(result.tools.length).toBe(38);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
@@ -198,6 +198,7 @@ describe('lazy-agent mcp', () => {
       'lazy_tag',
       'lazy_unblock',
       'lazy_untag',
+      'lazy_update_progress',
       'lazy_wait',
     ]);
 

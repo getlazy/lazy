@@ -21,7 +21,7 @@ import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { CursorAgent } from '../../src/agent/cursor';
 import { QaAgent } from '../../src/agent/qa-agent';
 import { buildMergeClaudeArgs } from '../../src/supervisor/merge';
-import { spawn, spawnSync } from '../../src/utils/spawn';
+import { spawn, spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { sanitizeUserText, findArgvIllegalIndices, NUL_CHAR } from '../../src/utils/sanitize-text';
 
 const NUL = NUL_CHAR;
@@ -132,8 +132,8 @@ describe('NUL-bearing feedback: spawn backstop', () => {
     expect(err!.message).not.toContain('must be a string without null bytes');
   });
 
-  test('spawnSync() applies the same guard', () => {
-    expect(() => spawnSync(['git', 'commit', '-m', `msg${NUL}`])).toThrow(/NUL byte/);
+  test('spawnSyncUnsupervised() applies the same guard', () => {
+    expect(() => spawnSyncUnsupervised(['git', 'commit', '-m', `msg${NUL}`])).toThrow(/NUL byte/);
   });
 
   // INVARIANT: the guard must not disturb ordinary spawns.

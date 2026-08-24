@@ -1,10 +1,12 @@
 /**
- * Unit tests for per-turn launch labels: `model`, `model_id`, and `effort`.
+ * Unit tests for per-turn launch labels: `agent`, `model`, `model_id`, and
+ * `effort`.
  *
- * A Turn used to carry token usage but no record of WHICH model or effort
- * produced it. `task.model` is a task-level alias and `task.metadata.effort` is
- * last-value-wins, so a mid-task model override or effort change erased the
- * history of what each turn actually ran under. These fields close that gap.
+ * A Turn used to carry token usage but no record of WHICH agent, model or
+ * effort produced it. `task.agent_id`, `task.model` and `task.metadata.effort`
+ * are all task-level and last-value-wins, so a mid-task agent switch (`lazy edit
+ * --agent`), model override or effort change erased the history of what each
+ * turn actually ran under. These fields close that gap.
  *
  * INVARIANTS this file encodes:
  *
@@ -20,6 +22,12 @@
  *   4. Old turns stay readable and stay unlabelled. A response from a supervisor
  *      built before these fields existed yields a turn with no labels rather
  *      than a turn labelled with a guess.
+ *   5. An absent label RENDERS as `unknown` on every surface, and is never
+ *      filled in from the task's current agent/model/effort.
+ *
+ *   6. A turn lazy AUTHORED itself (supervisor nudge/sync note, `[system]`
+ *      notice) ran no agent, so it renders no labels at all — `unknown` would
+ *      claim we lost a record that never existed.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -29,15 +37,16 @@ import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
 import { handleCompletedResponses, handleErrorResponse } from '../../src/utils/reconcile';
 import { findStickyModel, launchSettingsFromResponse } from '../../src/utils/turns';
+import { formatTurnLaunchLabels, turnLaunchLabels, turnRanNoAgent } from '../../src/utils/turn-labels';
 import { extractModelId } from '../../src/agent/claude-code';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
 import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import type { Turn } from '../../src/types';
 
 function git(cwd: string, ...args: string[]): string {
-  const result = spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return result.stdout?.toString().trim() ?? '';
 }
 
@@ -160,8 +169,8 @@ describe('extractModelId', () => {
 
 describe('launchSettingsFromResponse', () => {
   test('maps the protocol field names onto CreateTurnOptions names', () => {
-    expect(launchSettingsFromResponse({ model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high' }))
-      .toEqual({ model: 'opus', modelId: 'claude-opus-4-6-20260101', effort: 'high' });
+    expect(launchSettingsFromResponse({ agent: 'cursor', model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high' }))
+      .toEqual({ agent: 'cursor', model: 'opus', modelId: 'claude-opus-4-6-20260101', effort: 'high' });
   });
 
   // INVARIANT 4: an older supervisor's response carries none of these fields.
@@ -170,6 +179,9 @@ describe('launchSettingsFromResponse', () => {
   test('omits every field a response did not carry', () => {
     expect(launchSettingsFromResponse({})).toEqual({});
     expect(launchSettingsFromResponse({ model: 'opus' })).toEqual({ model: 'opus' });
+    // Specifically: no `agent` key at all, rather than one that would later be
+    // rendered as if the turn had actually been launched with something.
+    expect('agent' in launchSettingsFromResponse({ model: 'opus' })).toBe(false);
   });
 });
 
@@ -213,16 +225,19 @@ describe('turn launch labels: storage round-trip', () => {
     await env.cleanup();
   });
 
-  test('FileStorage persists model, model_id and effort', async () => {
+  test('FileStorage persists agent, model, model_id and effort', async () => {
     const task = await env.storage.createTask('round-trip', undefined, env.baseSha);
     const session = await env.storage.createSession(task.id, 'claude-code', 'lazy/rt', env.baseSha);
 
     await env.storage.createTurn({
       sessionId: session.id, sequence: 0, role: 'agent', content: 'labelled',
-      model: 'opus', modelId: 'claude-opus-4-6-20260101', effort: 'high',
+      agent: 'cursor', model: 'opus', modelId: 'claude-opus-4-6-20260101', effort: 'high',
     });
 
     const [turn] = await env.storage.getSessionTurns(session.id);
+    // Deliberately NOT the session's agent ('claude-code'): the turn records
+    // what IT was launched with, which is the whole point after a mid-task switch.
+    expect(turn.agent).toBe('cursor');
     expect(turn.model).toBe('opus');
     expect(turn.model_id).toBe('claude-opus-4-6-20260101');
     expect(turn.effort).toBe('high');
@@ -243,6 +258,10 @@ describe('turn launch labels: storage round-trip', () => {
     expect(turn.model).toBe('opus');
     expect(turn.model_id).toBeUndefined();
     expect(turn.effort).toBeUndefined();
+    // INVARIANT: absent means UNKNOWN. The session's agent is 'claude-code' and
+    // storage must NOT reach for it — a turn recorded without an agent stays
+    // without one.
+    expect(turn.agent).toBeUndefined();
   });
 });
 
@@ -268,12 +287,12 @@ describe('reconciler: stamping launch labels onto turns', () => {
     const responses: CompletedResponse[] = [
       {
         status: 'completed', result: 'Did the work.', session_id: 'sess-work', usage: USAGE,
-        model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high',
+        agent: 'claude-code', model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high',
       },
       {
         status: 'completed', result: 'Docs updated.', session_id: 'sess-maintain', usage: USAGE,
         start_sha_work: env.baseSha, end_sha_work: env.baseSha,
-        model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high',
+        agent: 'claude-code', model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'high',
         supervised: { kind: 'maintain', prompt: 'You skipped docs. Update or justify.' },
       },
     ];
@@ -284,6 +303,7 @@ describe('reconciler: stamping launch labels onto turns', () => {
     const agentTurns = turns.filter(t => t.role === 'agent');
     expect(agentTurns).toHaveLength(2);
     for (const t of agentTurns) {
+      expect(t.agent).toBe('claude-code');
       expect(t.model).toBe('opus');
       expect(t.model_id).toBe('claude-opus-4-6-20260101');
       expect(t.effort).toBe('high');
@@ -293,6 +313,7 @@ describe('reconciler: stamping launch labels onto turns', () => {
     // a model produced text it never saw.
     const promptTurn = turns.find(t => t.turn_type === 'nudge' && t.role === 'human')!;
     expect(promptTurn.actor).toBe('supervisor');
+    expect(promptTurn.agent).toBeUndefined();
     expect(promptTurn.model).toBeUndefined();
     expect(promptTurn.model_id).toBeUndefined();
     expect(promptTurn.effort).toBeUndefined();
@@ -322,7 +343,7 @@ describe('reconciler: stamping launch labels onto turns', () => {
   // model comparison exists to surface, so the crash turn carries its labels —
   // there is no `model_id` counterpart because a crashed invocation produced no
   // parseable result to report one.
-  test('a crash turn records the model and effort it ran under', async () => {
+  test('a crash turn records the agent, model and effort it ran under', async () => {
     const { ref, taskId, sessionId } = await makeWorkingTask(env, 'crashing model', { model: 'opus' });
     const session = await env.storage.getSessionByTaskId(ref);
 
@@ -330,7 +351,7 @@ describe('reconciler: stamping launch labels onto turns', () => {
       env.storage, taskId, { id: session!.id },
       {
         status: 'error', error: 'model provider rejected the credential', phase: 'work',
-        failure_class: 'fatal_auth', model: 'opus', effort: 'high',
+        failure_class: 'fatal_auth', agent: 'cursor', model: 'opus', effort: 'high',
       },
       getProtocolDir(taskId), env.lazyRoot,
     );
@@ -338,6 +359,9 @@ describe('reconciler: stamping launch labels onto turns', () => {
     const last = (await env.storage.getSessionTurns(sessionId)).at(-1)!;
     expect(last.role).toBe('agent');
     expect(last.content).toContain('unrecoverable');
+    // "agent X keeps crashing" is a real finding — dropping the label here would
+    // silently exclude failures from any agent comparison.
+    expect(last.agent).toBe('cursor');
     expect(last.model).toBe('opus');
     expect(last.effort).toBe('high');
     expect(last.model_id).toBeUndefined();
@@ -360,5 +384,96 @@ describe('reconciler: stamping launch labels onto turns', () => {
     expect(agentTurn.model).toBeUndefined();
     expect(agentTurn.model_id).toBeUndefined();
     expect(agentTurn.effort).toBeUndefined();
+    // The task IS running under an agent ('claude-code' — every task has one),
+    // and the turn still records none. That is the point: the response did not
+    // say, so the turn does not claim.
+    expect(agentTurn.agent).toBeUndefined();
+  });
+});
+
+describe('turn launch labels: rendering', () => {
+  const turn = (over: Partial<Turn>): Turn => ({
+    id: 't', session_id: 's', sequence: 1, role: 'agent', content: 'x', timestamp: 0, ...over,
+  } as Turn);
+
+  test('renders agent, model and effort in a fixed order', () => {
+    expect(formatTurnLaunchLabels(turn({ agent: 'cursor', model: 'opus', effort: 'high' })))
+      .toBe('agent: cursor · model: opus · effort: high');
+  });
+
+  test('folds a differing concrete model_id into the model label', () => {
+    expect(turnLaunchLabels(turn({ agent: 'claude-code', model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'low' })))
+      .toEqual(['agent: claude-code', 'model: opus (claude-opus-4-6-20260101)', 'effort: low']);
+    // Nothing to add when the agent reported back the alias it was given.
+    expect(turnLaunchLabels(turn({ model: 'opus', model_id: 'opus' }))[1]).toBe('model: opus');
+  });
+
+  // INVARIANT 5 (absent-renders-as-unknown): a turn that recorded no agent
+  // renders `agent: unknown` — NEVER the task's current agent, and never the
+  // configured default.
+  //
+  // WHY this test exists: the tempting future "fix" is exactly to fill the blank
+  // in from the task. Every turn written before `Turn.agent` existed is blank,
+  // and `lazy edit --agent` switches a task's agent mid-flight — so a renderer
+  // that reached for `task.agent_id` would confidently label old turns with an
+  // agent that never ran them. That is worse than `unknown`, because it is
+  // wrong in exactly the case someone is trying to investigate. Same argument
+  // for model and effort. If this test is failing because a surface now passes
+  // task context to the formatter, the surface is the bug.
+  test('an unrecorded field renders as unknown, never as a default', () => {
+    expect(formatTurnLaunchLabels(turn({})))
+      .toBe('agent: unknown · model: unknown · effort: unknown');
+    // Formatter takes ONLY the turn: there is no parameter through which a
+    // caller could supply the task's agent as a fallback.
+    expect(formatTurnLaunchLabels.length).toBe(1);
+    expect(formatTurnLaunchLabels(turn({ model: 'opus' })))
+      .toBe('agent: unknown · model: opus · effort: unknown');
+  });
+
+  // INVARIANT 6 (nothing-ran is not unknown): a turn lazy wrote ITSELF renders
+  // no launch labels at all — not `unknown`.
+  //
+  // WHY this test exists: `unknown` is a claim that a turn ran something we
+  // failed to record. Supervisor nudge prompts, sync merge notes and `[system]`
+  // notices ran nothing — lazy authored that text — so there was never anything
+  // to record, and labelling them `unknown` reports phantom missing data on the
+  // turns that are working exactly as designed. They are not rare either: a
+  // maintained-files nudge lands on most tasks. The tempting future
+  // "simplification" is to collapse the two cases back into one branch, which
+  // silently reintroduces the phantom. Keep them distinct.
+  test('a turn lazy wrote itself renders no labels, not unknown', () => {
+    // Supervisor-authored: the nudge prompt and the sync merge note.
+    expect(turnLaunchLabels(turn({ role: 'human', actor: 'supervisor', turn_type: 'nudge' }))).toEqual([]);
+    expect(formatTurnLaunchLabels(turn({ role: 'human', actor: 'supervisor', turn_type: 'sync' }))).toBe('');
+    // Daemon-authored '[system]' notices (auto-resume, auto-deliver).
+    expect(formatTurnLaunchLabels(turn({ role: 'human', actor: 'system' }))).toBe('');
+    expect(turnRanNoAgent(turn({ role: 'human', actor: 'system' }))).toBe(true);
+  });
+
+  // The counter-case that keeps INVARIANT 6 narrow: some lazy-authored turns DO
+  // belong to a launch and are stamped for it (the pre-accept '[system]' turn
+  // records what the validation ran under). Those must render normally — the
+  // rule is "carries no label AND lazy wrote it", not "lazy wrote it".
+  test('a lazy-authored turn that DID record a launch still renders its labels', () => {
+    expect(formatTurnLaunchLabels(turn({ role: 'human', actor: 'system', agent: 'claude-code', model: 'opus', effort: 'high' })))
+      .toBe('agent: claude-code · model: opus · effort: high');
+    expect(turnRanNoAgent(turn({ role: 'human', actor: 'system', agent: 'claude-code' }))).toBe(false);
+  });
+
+  // And the other side of the line: a HUMAN-authored turn with no labels is a
+  // genuine gap (a turn from before these fields existed), so it keeps saying
+  // unknown. Actor is what separates the two — never the emptiness alone.
+  test('an unlabelled human turn still says unknown', () => {
+    expect(formatTurnLaunchLabels(turn({ role: 'human', actor: 'human' })))
+      .toBe('agent: unknown · model: unknown · effort: unknown');
+    expect(formatTurnLaunchLabels(turn({ role: 'agent' })))
+      .toBe('agent: unknown · model: unknown · effort: unknown');
+  });
+
+  // A backend that only ever knew the concrete id still says something more
+  // useful than `unknown`.
+  test('falls back to the concrete model_id when no alias was recorded', () => {
+    expect(turnLaunchLabels(turn({ model_id: 'claude-opus-4-6-20260101' }))[1])
+      .toBe('model: claude-opus-4-6-20260101');
   });
 });

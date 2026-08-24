@@ -69,13 +69,50 @@ Never register `--help`/`-h` as a command's own flag: the dispatcher in `src/ind
 
 `lazy system <sub>` and `lazy daemon <sub>` route `-h`/`--help` through `<parent>SubcommandUsage` in the dispatcher. A subcommand with its own `<name>Usage()` that is missing from that map silently prints the PARENT's help — no error anywhere. Add the map entry with the subcommand. `test/unit/cli-subcommand-usage-coverage.test.ts` cross-checks both directions and fails on drift.
 
+### Task worktrees never govern container images; LAZY_DOCKERFILE_LAZY is the only override
+
+The custom Dockerfile path (`resolveCustomDockerfile` in `src/capture/claude.ts`, the single chokepoint for hash, image name, build, and preflight) always joins to the PROJECT ROOT. A task worktree's Dockerfile copy must never pick the image: task branches are agent-writable, and deriving the image from one would let an agent's Dockerfile edits run as build steps under the daemon's docker on the HOST, outside every container guard — so launch paths (`launchSupervisorAsync`, `runClaude`) never anchor image resolution at `sandbox.worktreePath`. The one override is the explicit `LAZY_DOCKERFILE_LAZY` env var (LAZY_CONFIG family): it applies uniformly to every command and reaches the daemon by env inheritance — the supported way to test a source branch's Dockerfile.lazy before it merges. `lazy upgrade` prints the resolved `Config:`/`Dockerfile:` paths (marking the override) so the source is always visible.
+
+### `public-docs/` is published; `docs/` never leaves this repo
+
+Two documentation trees, split by AUDIENCE, and the directory is the whole
+policy — there is no per-file allowlist to keep in sync any more.
+
+- **`public-docs/`** ships in the public source repo (`.releaseinclude` takes
+  `public-docs/**`) and is the tree the docs site generator renders to
+  `docs.getlazy.dev`. Everything in it is world-readable the moment a release
+  is cut. Write for someone who cannot see our tasks: no internal jargon, no
+  task codes, no unreleased or planned work, no spike/review deliberation, no
+  internal infrastructure. Every page `src/docs/links.ts` points at lives here,
+  because lazy's own error messages link to it.
+- **`docs/`** is internal and ships nowhere: spikes, research, reviews, design
+  notes, runbooks, obsolete designs, the builder's `scratch/`. Future plans and
+  deliberation belong here.
+
+A public page must not link into `docs/` — the target does not exist for a
+public reader, and the link advertises internal material by name. If a public
+page needs the substance of an internal note, write the substance into
+`public-docs/`; do not link across the boundary.
+
+This split exists because the old arrangement was a denylist over one mixed
+tree, and it leaked: `DEFAULT_EXCLUDED_DIRS` named only `scratch`, so the first
+real docs-site publish put `docs/reviews/` and `docs/spikes/` on the public
+internet. A tree whose NAME states its audience cannot fail that way by
+omission.
+
 ### Prompts are for the user's project, not for lazy itself
 
 Agent system prompts (`src/prompts/`) are injected into agents working on the USER's codebase. No lazy-internal design decisions, invariants, or implementation details in them — those live here in CLAUDE.md.
 
 ### Never use Bun.spawn/Bun.spawnSync directly
 
-Use `spawn()`/`spawnSync()` from `src/utils/spawn.ts` — they turn raw ENOENT (`posix_spawn`) failures into clear messages naming the missing binary or path. The only exception is `src/utils/spawn.ts` itself.
+Use the wrappers in `src/utils/spawn.ts` — they turn raw ENOENT (`posix_spawn`) failures into clear messages naming the missing binary or path, and they guarantee a timeout. The only exception is `src/utils/spawn.ts` itself.
+
+There is no bare `spawnSync` export, deliberately: a sync spawn holds the whole thread (in the daemon, the event loop), so whether it may run unbounded is a decision the call site must make by name, not one an options bag makes silently.
+
+- `spawn()` — async; timed out at `DEFAULT_SUBPROCESS_TIMEOUT_MS` (60s) unless overridden.
+- `spawnSyncUnsupervised()` — sync, for a child nobody is watching (probes, version checks, `git`/`ps`/`docker` queries). Same 60s default backstop; pass a shorter `timeout` where the command should be fast. Treat `exitCode: null` + `signalCode: 'SIGTERM'` as a possible timeout, not just a failed command.
+- `spawnSyncInteractive()` — sync, for handing the TTY to the child (`lazy shell`, `tmux attach-session`). Never timed out; passing `timeout` is a compile error, because killing a session someone is actively using is a bug, not a backstop.
 
 ### Never use sync filesystem calls
 
@@ -93,7 +130,7 @@ PRs/MRs are created only when merging into a protected branch (one where non-adm
 
 ### The MCP surface is deliberately narrower than the CLI
 
-Humans and agents make different mistakes, so CLI and MCP are not mirror images. Agent-ownership gating, two-step `confirmation_code` friction, "MCP never auto-starts work", and human-only commands (`lazy approve`, `lazy protect`) are design decisions, not gaps — do not "fix" them into symmetry. The full list with rationale is [docs/surface-asymmetries.md](docs/surface-asymmetries.md): read it before filing a CLI/MCP difference as a bug, and add to it when introducing a deliberate asymmetry. Differences NOT listed there are probably real gaps — [docs/reviews/cli-mcp-parity-audit-2026-08.md](docs/reviews/cli-mcp-parity-audit-2026-08.md) classifies the known ones.
+Humans and agents make different mistakes, so CLI and MCP are not mirror images. Agent-ownership gating, two-step `confirmation_code` friction, "MCP never auto-starts work", and human-only commands (`lazy approve`, `lazy protect`) are design decisions, not gaps — do not "fix" them into symmetry. The full list with rationale is [public-docs/surface-asymmetries.md](public-docs/surface-asymmetries.md): read it before filing a CLI/MCP difference as a bug, and add to it when introducing a deliberate asymmetry. Differences NOT listed there are probably real gaps — [docs/reviews/cli-mcp-parity-audit-2026-08.md](docs/reviews/cli-mcp-parity-audit-2026-08.md) classifies the known ones.
 
 ## Working Like a Team Member
 
@@ -161,16 +198,16 @@ All prompts (system prompts, task templates, goal context) live in `src/prompts/
 
 ## CHANGELOG style
 
-The CHANGELOG is for a 30-second human scan of what's new, changed, or fixed — not a record of *how* it was built (that depth lives in each task's history and journal).
+The CHANGELOG is written for people outside this repo: a 30-second human scan of what's new, changed, or fixed — not a record of *how* it was built (that depth lives in each task's history and journal, which readers of the CHANGELOG cannot access).
 
 - **One line per entry.** If you can't say it in a line, the depth belongs in the task.
 - **State the user-visible effect, not the implementation.** No internal type/function names; command names, config keys, and flags are fine — they're the user surface.
-- **Reference the task code in parens as the depth pointer**, e.g. `(daemon-operator-tooling)`.
+- **Never reference task codes.** The audience is external — they cannot look a task up, so `(daemon-operator-tooling)` is noise to them. The depth pointer lives in git history and the task itself, not in the CHANGELOG.
 - **Intro paragraph: 3 sentences max.**
 
 Example entry:
 
-- **`lazy daemon list` / `kill-stray`** — see and reap stray daemons host-wide (`daemon-operator-tooling`)
+- **`lazy daemon list` / `kill-stray`** — see and reap stray daemons host-wide
 
 Keep the `Added` / `Changed` / `Fixed` structure. This standard applies going forward — don't rewrite older sections to match.
 
@@ -187,7 +224,9 @@ bun test                               # whole suite (slow suites skipped)
 LAZY_SLOW_TESTS=1 bun test             # include the opt-in slow suites
 ```
 
-**Before accepting a task, run the FULL unit suite (`bun test test/unit/`) in its worktree** — not just the task's new tests plus typecheck. A signature change elsewhere can leave a pre-existing test stale while everything task-local passes. Classify any failure as pre-existing vs introduced by verifying it yourself, never by relaying the agent's claim.
+**During a turn, run the tests that cover what you touched** — the specific files, suites, or cases your change affects, plus whatever type-check or lint is cheap. Not the whole suite: it costs minutes on every turn, and the project's post-turn check command already runs after you.
+
+**Full verification happens ONCE, at the pre-accept phase**, in the task's worktree: the FULL unit suite (`bun test test/unit/`), not just the task's new tests plus typecheck. A signature change elsewhere can leave a pre-existing test stale while everything task-local passes — which is exactly what the pre-accept pass is for. Classify any failure as pre-existing vs introduced by verifying it yourself, never by relaying the agent's claim.
 
 **Multi-file runs require `--timeout 30000` on the command line.** The npm scripts (`bun run test`, `test:e2e`, `test:all`) pass it for you — `test/unit/test-timeout-coverage.test.ts` keeps them honest — but a bare `bun test <dir>` does not. The flag is the ONLY working mechanism: bunfig's `[test] timeout` key is silently ignored by bun (never add it back), and `setDefaultTimeout()` in the preload reaches exactly ONE file per run — every other file falls back to bun's built-in 5000ms, which is under normal e2e wall-clock. That's why every suite passes alone while bare aggregate sweeps invent hundreds of phantom `timed out after 5000ms` failures. **A bare multi-file `bun test` result is not evidence of anything.** A per-test `test(name, fn, ms)` override still wins.
 
@@ -195,7 +234,7 @@ LAZY_SLOW_TESTS=1 bun test             # include the opt-in slow suites
 
 **Slow suites are opt-in.** `test/e2e/daemon.test.ts` and `test/e2e/remote-storage.test.ts` (>300s each) skip unless `LAZY_SLOW_TESTS=1` (test-only, same family as `LAZY_FORCE_TTY`/`LAZY_PROMPT_DEFAULTS`) via `describe.skipIf(slowSuiteSkipped(...))` from `test/helpers/slow-suite.ts`. Skipped files print one line each, so a default run is never silently green-by-omission. Run them before touching the daemon or RemoteStorage, and in any pre-accept/full-verification pass.
 
-**Linux sandbox prerequisite.** Suites that launch an agent under the OS sandbox need `bwrap` and `socat` on PATH (packages `bubblewrap`, `socat`); without them `checkAvailability()` aborts before any assertion with sandbox errors unrelated to the code under test. Agents working on lazy in a container get them for free: `Dockerfile.lazy` ships both plus PostgreSQL 15 (installed, not running; `LAZY_POSTGRES_URL=$(lazy-pg-start)` starts it) — do NOT `apt-get install` them; if missing, your image predates that change and needs a rebuild. See `docs/agent-container.md`. Only suites passing `hostPermissionMode: 'sandbox'` touch the sandbox (fake-binary suites default to `permission_mode = "bypass"`), and such suites self-gate with `sandboxSuiteSkipped()` from `test/helpers/sandbox-deps.ts` — a skip prints one line, and **a skip is not a pass**. Config-surface/argv-only suites (`host-sandbox-posture`, `test/unit/host-sandbox-posture.test.ts`) never spawn an agent and need no gate.
+**Linux sandbox prerequisite.** Suites that launch an agent under the OS sandbox need `bwrap` and `socat` on PATH (packages `bubblewrap`, `socat`); without them `checkAvailability()` aborts before any assertion with sandbox errors unrelated to the code under test. Agents working on lazy in a container get them for free: `Dockerfile.lazy` ships both plus PostgreSQL 15 (installed, not running; `LAZY_POSTGRES_URL=$(lazy-pg-start)` starts it) — do NOT `apt-get install` them; if missing, your image predates that change and needs a rebuild. See `public-docs/agent-container.md`. Only suites passing `hostPermissionMode: 'sandbox'` touch the sandbox (fake-binary suites default to `permission_mode = "bypass"`), and such suites self-gate with `sandboxSuiteSkipped()` from `test/helpers/sandbox-deps.ts` — a skip prints one line, and **a skip is not a pass**. Config-surface/argv-only suites (`host-sandbox-posture`, `test/unit/host-sandbox-posture.test.ts`) never spawn an agent and need no gate.
 
 **Three reapers keep leaked daemons in check** (in coverage order):
 
@@ -209,6 +248,7 @@ If you add a new way to spawn a daemon from a test, route its env through `setup
 
 - **Daemon state → `LAZY_DAEMON_BASE_DIR`, never `HOME`.** It is the documented seam in `src/daemon/paths.ts` (moves socket/PID/token/log/lock together, nothing else); helpers in `test/helpers/daemon-base-dir.ts`. Redirecting `HOME` also moves credential discovery, `~/.gitconfig`, tool caches, and the default storage path — differently on a dev machine than in CI.
 - **In-process daemons → pin `LAZY_CONFIG`** with `pinConfig()` from `test/helpers/pin-config.ts`. `loadConfig` walks up from cwd, which under `bun test` is lazy's OWN worktree, so an unpinned test daemon silently adopts lazy's `lazy.toml` — including the developer's live `[storage] external_path`. (`process.chdir()` is the weaker old workaround; an unrelated earlier chdir can mask the bug.)
+- **The approval passphrase store → `LAZY_PASSPHRASE_BASE_DIR`**, its own seam, deliberately NOT riding on `LAZY_DAEMON_BASE_DIR` (a human credential that moves when an operator relocates daemon runtime state is a footgun). `setupTestLazy` pins it to a temp dir for every process it spawns and exposes it as `ctx.passphraseBaseDir`; enroll into it with `enrollPassphrase()` from `test/helpers/passphrase.ts`. Only `fakeClaude` contexts get a private `HOME`, so without the pin an ordinary suite would read — and a passphrase suite would clobber — the developer's own enrolled passphrase at `~/.lazy/passphrase.json`.
 - **Port squatters must bind the exact host the daemon binds** (`DEFAULT_SERVER_BIND`), never `Bun.serve`'s wildcard. On macOS/BSD `SO_REUSEADDR` lets a specific bind through a wildcard listener, so "the bind must fail" assertions silently invert on a Mac.
 
 Prefer a probed free port over the shared 26024+ window whenever a test needs a real `daemon start` to SUCCEED — stray daemons can leave the window empty.
@@ -267,10 +307,17 @@ Never read these from production code paths.
 
 - **`LAZY_FORCE_TTY=1`** — makes `isTTY()` return true so interactive code paths run in tests.
 - **`LAZY_PROMPT_DEFAULTS`** — auto-answers prompts without stdin: `"accept"` (all yes), `"decline"` (all no), `"1"` (default value).
+- **`LAZY_PROMPT_SECRET`** — the value `promptSecret()` returns when `LAZY_PROMPT_DEFAULTS` is set, so a masked prompt (the approval passphrase) can be driven from a test without a TTY. Empty string when unset.
 - **`LAZY_FORCE_PROXY_GATE=1`** — arms the proxy fail-loud gate under `LAZY_TEST=1` (normally bypassed — daemonless runs have no proxy address). Only `test/e2e/proxy-fail-loud.test.ts` and the proxy block of `test/unit/auth-env.test.ts` need it.
 - **`LAZY_FORCE_CAPTURE_SWEEP=1`** — arms the daemon's conversation capture sweep (tick sped to 1s) under `LAZY_TEST=1`, where it is off by default because it races suites that seed session JSONLs. Only `test/e2e/daemon-capture-sweep.test.ts` needs it.
 - **`LAZY_FORCE_PREFLIGHT=1`** — runs the filesystem preflight under `LAZY_TEST=1` (normally skipped). Only `test/e2e/preflight.test.ts` needs it.
+- **`LAZY_FORCE_CONTAINER`** — overrides `isRunningInContainer()` (`src/utils/container.ts`): `'1'` forces the container verdict, `'0'` forces the host verdict. Needed because lazy's own suites run INSIDE a container, so `lazy system passphrase set` — which refuses in containers by design — could otherwise only ever be observed refusing.
 - **`LAZY_TEST_PARENT_PID`** — pid a spawned daemon must not outlive; set by `test/helpers/setup.ts` on every subprocess it spawns. Unset in production, where `startTestParentWatch` installs nothing.
+
+**The three prompt seams — `LAZY_FORCE_TTY`, `LAZY_PROMPT_DEFAULTS`, `LAZY_PROMPT_SECRET` — are a complete non-interactive route to any prompt, including the approval passphrase.** Two guards keep that from being a real hole, and neither may be weakened to make a test easier:
+
+- **They do not exist in a released binary.** `scripts/build.ts` passes `--define LAZY_RELEASE_BUILD=true --minify-syntax`, and each read in `src/cli/editor.ts` is written as an inline `typeof LAZY_RELEASE_BUILD === 'undefined' && …` so bun folds and eliminates the branch. Hoisting that test into a module-level `const` breaks the elimination silently (bun rewrites it to `var` when bundling and stops inlining), as does importing the flag from another module. `test/unit/build-release-flags.test.ts` bundles `editor.ts` both ways and fails if a seam survives — or if the build stops passing either flag.
+- **`lazy system passphrase set|delete` refuses outright when any of them is set**, and reads `process.stdin.isTTY` directly rather than through `isTTY()`. This makes the happy path of `set` un-e2e-testable **on purpose** — anything a test can drive, an agent running lazy from source can drive too. **Injection at the function boundary is the supported substitute**, not a weaker gate: `requireCurrentPassphrase`, `promptAndStore` and `offerLegacyCleanup` take their prompt as a parameter defaulting to the real one, so `test/unit/system-passphrase-gating.test.ts` covers rotation and delete being gated on the current passphrase, the length rule, and the legacy-cleanup offer — reaching the behavior without it existing at runtime. Suites that need an enrolled machine use `enrollPassphrase` (`test/helpers/passphrase.ts`); the refusals stay e2e-testable and are where the security-relevant behavior lives.
 
 ### Env leakage between suites — the rules
 

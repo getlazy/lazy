@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { resolveDetachedHead } from '../../src/git/operations';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 /**
  * INVARIANT: remote_target_branch must never be the literal "HEAD".
@@ -19,10 +19,10 @@ describe('resolveDetachedHead', () => {
     // so the test is deterministic regardless of the machine's
     // init.defaultBranch (modern git defaults to "main") — the remote setup
     // below pushes "master" and sets origin/HEAD to it.
-    spawnSync(['git', 'init', '-b', 'master'], { cwd: tmpDir });
-    spawnSync(['git', 'config', 'user.email', 'test@test.com'], { cwd: tmpDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: tmpDir });
-    spawnSync(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'init', '-b', 'master'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@test.com'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: tmpDir });
   });
 
   afterEach(() => {
@@ -39,11 +39,11 @@ describe('resolveDetachedHead', () => {
   test('resolves "HEAD" to remote default branch when symbolic-ref exists', async () => {
     // Set up a remote with a default branch
     const remoteDir = mkdtempSync(join(tmpdir(), 'lazy-test-remote-'));
-    spawnSync(['git', 'init', '--bare'], { cwd: remoteDir });
-    spawnSync(['git', 'remote', 'add', 'origin', remoteDir], { cwd: tmpDir });
-    spawnSync(['git', 'push', '-u', 'origin', 'master'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'init', '--bare'], { cwd: remoteDir });
+    spawnSyncUnsupervised(['git', 'remote', 'add', 'origin', remoteDir], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'push', '-u', 'origin', 'master'], { cwd: tmpDir });
     // Set origin/HEAD to point to master
-    spawnSync(['git', 'remote', 'set-head', 'origin', 'master'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'remote', 'set-head', 'origin', 'master'], { cwd: tmpDir });
 
     const result = await resolveDetachedHead('HEAD', tmpDir, 'origin');
     expect(result).toBe('master');
@@ -61,10 +61,10 @@ describe('resolveDetachedHead', () => {
   test('uses specified remote name', async () => {
     // Set up a custom remote
     const remoteDir = mkdtempSync(join(tmpdir(), 'lazy-test-remote-'));
-    spawnSync(['git', 'init', '--bare'], { cwd: remoteDir });
-    spawnSync(['git', 'remote', 'add', 'upstream', remoteDir], { cwd: tmpDir });
-    spawnSync(['git', 'push', '-u', 'upstream', 'master'], { cwd: tmpDir });
-    spawnSync(['git', 'remote', 'set-head', 'upstream', 'master'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'init', '--bare'], { cwd: remoteDir });
+    spawnSyncUnsupervised(['git', 'remote', 'add', 'upstream', remoteDir], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'push', '-u', 'upstream', 'master'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'remote', 'set-head', 'upstream', 'master'], { cwd: tmpDir });
 
     const result = await resolveDetachedHead('HEAD', tmpDir, 'upstream');
     expect(result).toBe('master');

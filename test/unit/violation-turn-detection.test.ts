@@ -34,8 +34,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
-import { spawnSync } from '../../src/utils/spawn';
-import { pendingViolations, latestViolationTurn } from '../../src/utils/turns';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { pendingViolations, latestViolationTurn, violationRecords } from '../../src/utils/turns';
 import violationRevertNotice from '../../src/prompts/violation-revert-notice.md' with { type: 'text' };
 import type { Turn, FileViolation } from '../../src/types';
 
@@ -115,6 +115,33 @@ describe('pendingViolations', () => {
   });
 });
 
+describe('violationRecords', () => {
+  // INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky):
+  // `violationRecords` reports the violation turn's records WHATEVER their
+  // status, and that — not `pendingViolations` — is what the reviewer-facing
+  // guards ask before refusing an approval. A task whose records are all
+  // approved has nothing pending, but naming those files again is still a
+  // meaningful call; refusing it is what left the reviewer with only the
+  // destructive one.
+  test('reports decided records that pendingViolations filters out', () => {
+    const decided: FileViolation[] = [
+      { file: 'a.test.ts', base_sha: 'aaa', status: 'approved' },
+      { file: 'b.test.ts', base_sha: 'bbb', status: 'rejected' },
+    ];
+    // The verification-only turn that made the incident possible: no violations
+    // of its own, so the decided set is still the latest violation turn.
+    const turns = [agentTurn(1, decided), agentTurn(2)];
+
+    expect(pendingViolations(turns)).toHaveLength(0);
+    expect(violationRecords(turns).map(v => v.file)).toEqual(['a.test.ts', 'b.test.ts']);
+  });
+
+  test('is empty when no turn ever carried violations', () => {
+    expect(violationRecords([agentTurn(1), agentTurn(2)])).toHaveLength(0);
+    expect(violationRecords([])).toHaveLength(0);
+  });
+});
+
 // --- Invariants 2 and 3: the MCP surface ---
 
 describe('lazy_unblock conflict guard', () => {
@@ -127,12 +154,12 @@ describe('lazy_unblock conflict guard', () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-violation-guard-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
 
-    spawnSync(['git', 'init'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
-    spawnSync(['git', 'add', '.'], { cwd: testDir });
-    spawnSync(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
     storage = await createStorage(testDir, { backend: 'external' });
     ctx = { taskId: '', worktreePath: testDir, storage };
@@ -231,6 +258,61 @@ describe('lazy_unblock conflict guard', () => {
     await expect(handler({ task_id: clean.id, feedback: 'ok', approved_files: ['x.ts'] }))
       .rejects.toThrow(/no file permission violations/i);
   });
+
+  // INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky): the
+  // guard asks two different questions of two different sets. "Must a decision
+  // be supplied?" is about the PENDING set; "may one be supplied at all?" is
+  // about every violation record on the turn, decided or not.
+  //
+  // THE BUG: after the reviewer approved a set, the next turn touched no
+  // protected file and so recorded no violations of its own — leaving the
+  // decided set as the latest violation turn with nothing pending. Re-passing
+  // the approvals was then REFUSED ("has no file permission violations"), while
+  // the daemon, on a call without them, re-labelled every approved record
+  // `rejected` and reverted the agent's committed work. The refusal and the
+  // revert together made the correct call unexpressible.
+  test('re-passing already-approved files is accepted when nothing is pending', async () => {
+    const decided = await storage.createTask('Approved already');
+    const session = await storage.createSession(decided.id, 'claude', 'lazy/d', 'HEAD');
+    await storage.createTurn({
+      sessionId: session.id, sequence: 1, role: 'agent', content: 'work turn',
+      violations: [{ file: 'test/unit/foo.test.ts', base_sha: 'abc123', status: 'approved' }],
+    });
+    // The verification-only turn: no file changed, so no violations recorded.
+    await storage.createTurn({ sessionId: session.id, sequence: 2, role: 'agent', content: 'verified' });
+    await storage.updateTaskStatus(decided.id, 'working');
+    await storage.updateTaskStatus(decided.id, 'blocked');
+
+    const handler = createAllHandlers(ctx).get('lazy_unblock')!;
+    const err = await handler({
+      task_id: decided.id, feedback: 'carry on', approved_files: ['test/unit/foo.test.ts'],
+    }).catch(e => e as Error);
+    // Past the guard is all this asserts — there is no daemon in this test, so
+    // the call fails later. It must not fail with the guard's refusal.
+    if (err instanceof Error) {
+      expect(err.message).not.toMatch(/no file permission violations/i);
+    }
+  });
+
+  // INVARIANT: with nothing pending, omitting the parameter is NOT an error —
+  // there is no decision owed. What the daemon must not do is read that silence
+  // as "revert"; that half is pinned by test/e2e/violation-approval-sticky.ts.
+  test('omitting approved_files is fine once every violation is decided', async () => {
+    const decided = await storage.createTask('Approved already');
+    const session = await storage.createSession(decided.id, 'claude', 'lazy/d2', 'HEAD');
+    await storage.createTurn({
+      sessionId: session.id, sequence: 1, role: 'agent', content: 'work turn',
+      violations: [{ file: 'test/unit/foo.test.ts', base_sha: 'abc123', status: 'approved' }],
+    });
+    await storage.updateTaskStatus(decided.id, 'working');
+    await storage.updateTaskStatus(decided.id, 'blocked');
+
+    const handler = createAllHandlers(ctx).get('lazy_unblock')!;
+    const err = await handler({ task_id: decided.id, feedback: 'carry on' }).catch(e => e as Error);
+    if (err instanceof Error) {
+      expect(err.message).not.toMatch(/file permission violation/i);
+    }
+  });
 });
 
 // --- The notice injected into the agent's next prompt after a revert ---
@@ -276,5 +358,102 @@ describe('violation revert notice', () => {
 
   test('stays short — it is injected into every post-revert prompt', () => {
     expect(violationRevertNotice.trim().split(/\s+/).length).toBeLessThan(120);
+  });
+});
+
+// --- The status label may drift; the pending set is what the guards read ---
+//
+// THE BUG (fix-ask-nukes-violations): a read-only `lazy_ask` left a `conflict`
+// task reading `blocked` while its violation was still pending. Every reviewer
+// guard keyed on `task.status`, so the correct call became unexpressible:
+// passing `approved_files` was REFUSED ("this task has no file permission
+// violations") and omitting it was ACCEPTED — after which the daemon's revert,
+// which reads the SET, destroyed the agent's committed work.
+//
+// These tests seed exactly that drifted state (status `blocked`, one pending
+// violation) and pin both halves of the fix.
+describe('guards read the violation set, not the status label', () => {
+  let testDir: string;
+  let storage: Storage;
+  let ctx: McpToolContext;
+  let taskId: string;
+
+  beforeEach(async () => {
+    testDir = mkdtempSync(join(tmpdir(), 'lazy-violation-drift-'));
+    mkdirSync(join(testDir, '.lazy'), { recursive: true });
+
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    writeFileSync(join(testDir, 'README.md'), '# Test\n');
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+
+    storage = await createStorage(testDir, { backend: 'external' });
+    ctx = { taskId: '', worktreePath: testDir, storage };
+
+    const task = await storage.createTask('Do the thing');
+    taskId = task.id;
+    const session = await storage.createSession(task.id, 'claude', 'lazy/t', 'HEAD');
+    await storage.createTurn({
+      sessionId: session.id, sequence: 1, role: 'agent',
+      content: 'work turn', violations: PENDING,
+    });
+    // The side-channel turn: an ask records its own turn and detects nothing,
+    // because an ask runs no permission check at all.
+    await storage.createTurn({
+      sessionId: session.id, sequence: 2, role: 'human', content: 'a question', turnType: 'ask',
+    });
+    await storage.createTurn({
+      sessionId: session.id, sequence: 3, role: 'agent', content: 'an answer', turnType: 'ask',
+    });
+
+    await storage.updateTaskStatus(task.id, 'working');
+    // The drift itself: parked as `blocked` with the violation still pending.
+    await storage.updateTaskStatus(task.id, 'blocked');
+  });
+
+  afterEach(async () => {
+    if (storage) await storage.close();
+    if (testDir) rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // INVARIANT: an unblock can never revert a file the caller was refused
+  // permission to approve. If violations are pending, `approved_files` MUST be
+  // accepted — whatever the status label says.
+  test('approved_files is accepted on a drifted (blocked) task with a pending set', async () => {
+    const handler = createAllHandlers(ctx).get('lazy_unblock')!;
+
+    const err = await handler({
+      task_id: taskId, feedback: 'keep them', approved_files: ['test/unit/foo.test.ts'],
+    }).catch(e => e as Error);
+
+    // This is the refusal the incident hit. Anything else here is the guard
+    // getting past the status label and reaching the daemon (there is none in
+    // this test), which is what we are asserting.
+    if (err instanceof Error) {
+      expect(err.message).not.toMatch(/no file permission violations/i);
+    }
+  });
+
+  // The other half: if the approval is expressible, the refusal for omitting it
+  // must still fire. Otherwise the drifted state silently reverts as before.
+  test('omitting a decision on a drifted task is still refused', async () => {
+    const handler = createAllHandlers(ctx).get('lazy_unblock')!;
+
+    await expect(handler({ task_id: taskId, feedback: 'please fix' }))
+      .rejects.toThrow(/file permission violation/i);
+  });
+
+  // `lazy_resume` cannot express an approval decision at all, so it must refuse
+  // rather than hand the daemon an unblock with no decision attached.
+  test('resume refuses while violations are pending and points at unblock', async () => {
+    const handler = createAllHandlers(ctx).get('lazy_resume');
+    if (!handler) return; // surface not present — nothing to pin
+
+    const err = await handler({ task_id: taskId }).catch(e => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/violation/i);
+    expect((err as Error).message).toMatch(/unblock/i);
   });
 });

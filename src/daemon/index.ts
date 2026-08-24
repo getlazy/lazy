@@ -7,6 +7,7 @@
 export { getDaemonBaseDir, getDaemonDir, getPidPath, getSocketPath, getTokenPath, getLogPath, getDaemonLockPath, getStartupErrorPath, projectSlug } from './paths';
 export {
   checkDaemonHealth,
+  DAEMON_HEALTH_TIMEOUT_MS,
   isDaemonRunning,
   isProcessAlive,
   requestShutdown,

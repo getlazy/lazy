@@ -23,6 +23,8 @@ import { encodeProjectPath } from '../../import/claude-code-logs';
 import { snapshotSessionFiles, captureConversation } from '../../import/capture-session';
 import { markMachineOneshotPrompt } from '../../import/machine-oneshot';
 import { getActor } from '../../constants';
+import { getAgent } from '../../agent/registry';
+import { parkTaskPaused } from '../../utils/paused-status';
 
 const SANDBOX_DIR = '.lazy-task-sandbox';
 /** Max characters of conversation transcript to include in the summary prompt */
@@ -345,7 +347,7 @@ export async function commandPair(args: string[]): Promise<void> {
       }
       // If the task is stuck in 'pairing' state, transition it back to 'blocked'
       if (task.status === 'pairing') {
-        await storage.updateTaskStatus(task.id, 'blocked', getActor());
+        await parkTaskPaused(storage, task.id, getActor());
         await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
         await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
         console.log(`Task status restored to blocked.`);
@@ -373,6 +375,30 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error(`Task ${displayId(task)} is already being paired on (PID ${existingPairingLock.pid}).`);
       console.error(`Started at: ${existingPairingLock.started_at}`);
       console.error(`\nIf this is stale, clear it with: lazy pair ${displayId(task)} --unlock`);
+      process.exit(1);
+    }
+
+    // Pairing is opt-in per agent, and only Claude Code opts in. Refuse here —
+    // before the status moves to `pairing` and before any process launches.
+    //
+    // Cursor's `false` is the security decision from fix-cursor-security-musts:
+    // a container task's chat lives in the worktree sandbox, lazy will not copy
+    // agent-written history onto the host, and `cursor-agent` cannot read it
+    // there — so the session a human got had no memory of the work anyway. The
+    // dangerous half was real and the useful half was not.
+    const taskAgentId = task.agent_id || 'claude-code';
+    if (!getAgent(taskAgentId).supportsPairing()) {
+      console.error(`Cannot pair on a ${taskAgentId} task — pairing is only supported for claude-code.`);
+      console.error('');
+      console.error(`A ${taskAgentId} task's session is written inside the task container, and lazy does`);
+      console.error('not copy container-written chat history onto your host: that history is written by');
+      console.error('the agent, so importing it would make it input to a session running as you. Without');
+      console.error('it there is no conversation to join — pairing would hand you an empty session.');
+      console.error('');
+      console.error('What works instead:');
+      console.error(`  lazy show ${displayId(task)}              # the task's turns, safe to read`);
+      console.error(`  lazy unblock ${displayId(task)} -m "..."  # steer the agent with feedback`);
+      console.error(`  lazy chat ${displayId(task)}              # read-only conversation about the work`);
       process.exit(1);
     }
 
@@ -474,7 +500,7 @@ export async function commandPair(args: string[]): Promise<void> {
         // pairing state and exit with a single line.
         removePairingLock(worktreePath);
         try {
-          await storage.updateTaskStatus(task.id, 'blocked', getActor());
+          await parkTaskPaused(storage, task.id, getActor());
           await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
           await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
         } catch {
@@ -490,7 +516,7 @@ export async function commandPair(args: string[]): Promise<void> {
       removePairingLock(worktreePath);
       // Roll back the pairing state transition since we never actually paired.
       try {
-        await storage.updateTaskStatus(task.id, 'blocked', getActor());
+        await parkTaskPaused(storage, task.id, getActor());
         await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
         await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
       } catch {
@@ -541,7 +567,7 @@ export async function commandPair(args: string[]): Promise<void> {
       // Always transition back to blocked, clean up symlinks, and release lock.
       // The transition back to 'blocked' MUST happen even if Claude crashes.
       try {
-        await storage.updateTaskStatus(task.id, 'blocked', getActor());
+        await parkTaskPaused(storage, task.id, getActor());
         // Clear pairing metadata
         await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
         await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
@@ -722,13 +748,18 @@ Keep the summary concise and factual.`);
 export function pairUsage(): void {
   console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes]
 
-Open an interactive Claude Code session, context-aware.
+Open an interactive agent session, context-aware.
 
 Three modes:
   1. lazy pair <task>           Pair on a specific task's worktree
   2. lazy pair                  On a lazy/* branch: detect the task, pair on it
   3. lazy pair                  On main or non-task branch: launch Claude Code
                                 in the current directory (no task context)
+
+In task mode the TASK'S OWN agent is launched (a Cursor task pairs with
+cursor-agent, never Claude Code). Non-Claude agents pair with reduced
+capture: commits are recorded, but transcript capture and the AI summary
+require Claude's documented session files and are skipped.
 
 In task mode (1 & 2), the task is locked during pairing — other commands
 (start, unblock, accept, reject, resume) will refuse to operate until
@@ -745,7 +776,12 @@ Options:
   --unlock               Force-remove a stale pairing lock (e.g., after a crash)
   --no-summary           Skip AI summarization of the pairing session
   --resume <session_id>  Resume a previous Claude Code session (branchless mode only)
-  --autonomous           Run without permission prompts (adds --dangerously-skip-permissions)
+  --autonomous           Run Claude Code without permission prompts (adds
+                         --dangerously-skip-permissions). Opt-in here, and deliberately NOT
+                         the default the way it is for 'lazy builder': pairing runs Claude
+                         Code directly on your host, with none of the builder's
+                         container/read-only-repo posture. Claude Code ONLY — pairing on a
+                         task with another agent leaves that agent's approvals on.
   --yes                  Auto-confirm prompts (required with --autonomous in non-TTY mode)
 
 Examples:

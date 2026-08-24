@@ -12,7 +12,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 describe('MCP tools with injected storage', () => {
   let testDir: string;
@@ -28,12 +28,12 @@ describe('MCP tools with injected storage', () => {
     mkdirSync(dotLazyDir, { recursive: true });
 
     // Initialize git repo with at least one commit
-    spawnSync(['git', 'init'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
-    spawnSync(['git', 'add', '.'], { cwd: testDir });
-    spawnSync(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
     // Create storage instance
     storage = await createStorage(testDir, { backend: 'external' });

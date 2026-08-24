@@ -3,6 +3,8 @@ import { commandSystemBuild, systemBuildUsage } from './system-build';
 import { commandOffline, commandOnline, offlineUsage, onlineUsage } from './offline';
 import { commandSystemStatus, systemStatusUsage } from './system-status';
 import { commandExportDockerfile, exportDockerfileUsage } from './export-dockerfile';
+import { commandSystemAgent, systemAgentUsage } from './system-agent';
+import { commandSystemPassphrase, systemPassphraseUsage } from './system-passphrase';
 
 export async function commandSystem(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -30,6 +32,12 @@ export async function commandSystem(args: string[]): Promise<void> {
     case 'status':
       await commandSystemStatus(sub);
       break;
+    case 'agent':
+      await commandSystemAgent(sub);
+      break;
+    case 'passphrase':
+      await commandSystemPassphrase(sub);
+      break;
     case 'export-dockerfile':
     // `eject-dockerfile` is the pre-v0.16.x name, kept as a hidden alias for
     // back-compat. Not advertised in usage or completion — prefer the canonical
@@ -56,6 +64,8 @@ export async function commandSystem(args: string[]): Promise<void> {
 export const systemSubcommandUsage: Record<string, () => void> = {
   'build': systemBuildUsage,
   'status': systemStatusUsage,
+  'agent': systemAgentUsage,
+  'passphrase': systemPassphraseUsage,
   'offline': offlineUsage,
   'online': onlineUsage,
   'export-dockerfile': exportDockerfileUsage,
@@ -71,6 +81,8 @@ Subcommands:
   prompts            List built-in system prompt templates
   build <name>       Prebuild a lazy system image (bypasses lazy.toml)
   status             Show current system state (offline/online, driver, daemon, storage)
+  agent              Show agent readiness, switch the default agent, or set an agent API key
+  passphrase         Enroll, inspect, or delete this machine's approval passphrase
   offline            Enable offline mode (skip all remote operations)
   online             Disable offline mode (restore remote operations)
   export-dockerfile  Write the embedded default Dockerfile to disk for customization
@@ -81,6 +93,10 @@ View any with: lazy show <code>
 Examples:
   lazy system prompts                             # List all built-in system prompts
   lazy system status                              # Show current system state
+  lazy system agent set cursor                    # Switch the default agent to Cursor
+  lazy system agent set-key cursor                # Store the Cursor API key (masked prompt)
+  lazy system passphrase set                      # Enroll the approval passphrase (masked prompt)
+  lazy system passphrase                          # Is one enrolled on this machine?
   lazy system build lazy-runner                   # Prebuild the base runner image
   lazy system offline                             # Skip all remote operations
   lazy system online                              # Restore remote operations

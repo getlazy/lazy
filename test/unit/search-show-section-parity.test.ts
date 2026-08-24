@@ -105,8 +105,8 @@ describe('lazy_search locator advice matches lazy_show sections', () => {
     expect(showTool.description).toMatch(/no `follow_ups` value in `sections`/);
   });
 
-  test('docs/search.md carries the same exception', async () => {
-    const doc = await readFile(resolve(REPO_ROOT, 'docs/search.md'), 'utf-8');
+  test('public-docs/search.md carries the same exception', async () => {
+    const doc = await readFile(resolve(REPO_ROOT, 'public-docs/search.md'), 'utf-8');
     expect(doc).toMatch(/Follow-up hits are the exception/);
   });
 });

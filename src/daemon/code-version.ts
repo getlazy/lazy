@@ -18,27 +18,34 @@
  * compiled-binary staleness.
  */
 
-import { spawnSync } from '../utils/spawn';
+import { spawnSyncUnsupervised } from '../utils/spawn';
 
 let cached: string | null | undefined;
+
+/** Deadline for the one-shot `git rev-parse`; unknown beats blocked. */
+const GIT_SHA_TIMEOUT_MS = 5_000;
 
 /**
  * Git short SHA of the source this process runs from, or null when unavailable.
  *
  * Cached: a live process cannot change the code it is executing, so one lookup
- * is authoritative for the process lifetime. Uses spawnSync deliberately — this
- * is called from daemon startup and CLI paths, never a hot async loop.
+ * is authoritative for the process lifetime. Uses a sync spawn deliberately —
+ * this is called from daemon startup and CLI paths, never a hot async loop.
  */
 export function getRunningCodeSha(): string | null {
   if (cached !== undefined) return cached;
   try {
-    const res = spawnSync(['git', 'rev-parse', '--short', 'HEAD'], {
+    const res = spawnSyncUnsupervised(['git', 'rev-parse', '--short', 'HEAD'], {
       // import.meta.dir is the source directory in dev (bun run ./src/index.ts)
       // and a virtual path inside a compiled binary — where git simply fails,
       // yielding null, which is the correct "unknown" answer.
       cwd: import.meta.dir,
       stdout: 'pipe',
       stderr: 'pipe',
+      // DAEMON-REACHABLE sync spawn (daemon startup and `daemon status`): git
+      // can hang on a locked index or a slow filesystem, and the default
+      // backstop is far longer than a rev-parse should ever take.
+      timeout: GIT_SHA_TIMEOUT_MS,
     });
     const out = res.stdout.toString().trim();
     cached = res.exitCode === 0 && out ? out : null;

@@ -1,4 +1,6 @@
-import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, readStdinIfPiped, requireTTY } from '../editor';
 import { buildTurnHistoryContext } from './shared';
 import { theme } from '../theme';
@@ -216,8 +218,19 @@ export async function commandRework(args: string[]): Promise<void> {
     const newGoal = goalOverride ?? `Rework: ${originalTask.goal}`;
     const newModel = modelOverride ?? originalTask.model;
 
-    // Create new task (with parent if resolved)
-    const newTask = await storage.createTask(newGoal, parentTaskId);
+    // Create new task (with parent if resolved). Like redo, a rework is another
+    // pass at the original's work, so it carries the original's agent over.
+    const newTask = await storage.createTask(
+      newGoal,
+      parentTaskId,
+      undefined,
+      undefined,
+      undefined,
+      resolveAgentForNewTask({
+        inheritFrom: originalTask,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      }),
+    );
 
     // Set prompt — CRITICAL: persist before anything else (never lose human feedback)
     await storage.updateTaskPrompt(newTask.id, fullPrompt);

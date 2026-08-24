@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
 
 import { getDataDir } from '../init';
-import { spawnSync } from '../../utils/spawn';
+import { spawnSyncInteractive } from '../../utils/spawn';
 
 export async function commandShell(args: string[]): Promise<void> {
   // Split argv on the first `--` separator. Everything before it is parsed as
@@ -57,8 +57,10 @@ export async function commandShell(args: string[]): Promise<void> {
         console.error(`No command given after '--'. Usage: lazy shell ${displayId(task)} -- <command> [args...]`);
         process.exit(1);
       }
-      // spawnSync (sync) so stdio is inherited and the exit code is available.
-      const result = spawnSync(command, {
+      // Interactive: stdio is inherited and the exit code is available, and the
+      // user's command owns the TTY — it may be long-running or interactive, so
+      // it must never be timed out.
+      const result = spawnSyncInteractive(command, {
         cwd: worktreePath,
         stdin: 'inherit',
         stdout: 'inherit',
@@ -76,9 +78,9 @@ export async function commandShell(args: string[]): Promise<void> {
     console.log(`  Type 'exit' to return.\n`);
 
     const shell = process.env.SHELL || '/bin/sh';
-    // spawnSync (sync) is required: this is an interactive terminal handoff —
-    // the child shell takes over the TTY and must block until the user exits.
-    spawnSync([shell], {
+    // Interactive terminal handoff: the child shell takes over the TTY and must
+    // block until the user exits.
+    spawnSyncInteractive([shell], {
       cwd: worktreePath,
       stdin: 'inherit',
       stdout: 'inherit',

@@ -3,13 +3,16 @@ Dockerfile.lazy that:
 
 1. Starts FROM the same base image as the original Dockerfile
 2. Includes all the original Dockerfile's layers and setup
-3. Adds a layer that installs Claude Code: `bun install -g @anthropic-ai/claude-code@latest`
+3. Adds a layer that installs the {{agentName}} CLI: `{{agentInstall}}`
 4. Sets WORKDIR to /work
 
 Alternatively, if the project does not need a specific base image, Dockerfile.lazy
 can `FROM lazy-runner` to inherit the base runner image (which already includes
-git, bun, node, and claude-code). Users building the project on a fresh machine
-must first run `lazy system build lazy-runner` to prebuild that base image.
+git, bun, node, and the Claude Code CLI — lazy runs Claude Code inside the
+container for its own merge turns regardless of which agent your tasks use). Users
+building the project on a fresh machine must first run `lazy system build
+lazy-runner` to prebuild that base image. When inheriting from lazy-runner you
+still need the layer from step 3 unless {{agentName}} is Claude Code.
 
 Then update lazy.toml to set:
 ```toml
@@ -17,8 +20,9 @@ Then update lazy.toml to set:
 dockerfile = "Dockerfile.lazy"
 ```
 
-Make sure the resulting image would work for running Claude Code agents — it needs
-git, the project's dependencies, and claude-code installed globally via bun.
+Make sure the resulting image would work for running {{agentName}} agents — it
+needs git, the project's dependencies, and the {{agentName}} CLI on PATH for the
+non-root `user` account the container runs as.
 
-Study the default Dockerfile embedded in src/capture/claude.ts for reference on what
-the agent container needs.
+Run `lazy system export-dockerfile --stdout` to see lazy's own default image
+definition for reference on what the agent container needs.

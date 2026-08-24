@@ -8,12 +8,13 @@
 
 import { join } from 'path';
 import { readdir, readFile } from 'fs/promises';
+import { pendingViolations } from './turns';
 import { pathExists } from './fs';
 import { setupSandbox } from './sandbox';
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
 import { loadConfig } from '../config/loader';
-import { resolveAgentModel } from './role-target';
+import { resolveAgentModel } from '../agent/agent-model';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
@@ -130,6 +131,22 @@ export async function autoResumeTask(
   const tRef = taskRef(task);
   const taskShortId = task.id.substring(0, 8);
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
+
+  // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+  // never auto-resume a task that still owes a reviewer an approve/revert
+  // decision on file-permission violations. Auto-resume has no way to express
+  // one, so resuming just piles more agent work on top of files the eventual
+  // unblock will revert to their base commit. The task stays interrupted and
+  // visible; a human `lazy unblock --approve-file / --no-approve-files` is the
+  // only thing that can clear the decision.
+  const pending = pendingViolations(await storage.getSessionTurns(session.id));
+  if (pending.length > 0) {
+    logger.warn(
+      `Auto-resume ${taskShortId}: skipping — ${pending.length} pending file permission violation(s) ` +
+      `(${pending.map(v => v.file).join(', ')}) await a reviewer decision. Run 'lazy unblock ${taskShortId}'.`,
+    );
+    return false;
+  }
 
   // Pre-flight checks
   if (!await pathExists(worktreePath)) {

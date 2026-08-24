@@ -17,7 +17,7 @@
  *
  * READ-ONLY, DELIBERATELY: there is no write path here and no MCP write
  * surface. Managing gates is a human act (`lazy protect`, `lazy approve`) —
- * see docs/surface-asymmetries.md. Reading state is harmless; arranging your
+ * see public-docs/surface-asymmetries.md. Reading state is harmless; arranging your
  * own gates is not.
  *
  * FIDELITY: the target branch is resolved exactly the way accept resolves it

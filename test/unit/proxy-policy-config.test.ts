@@ -41,22 +41,16 @@ describe('[proxy.policy] resolution', () => {
     expect(config.proxy?.policy.connectorAllowlist).toEqual([]); // deny-by-default
   });
 
-  // INVARIANT: `enabled = false` is the ONLY way to get null — the documented
-  // escape hatch back to direct connections (no server, no env injection).
-  test('[proxy] enabled = false → proxy is null (direct connections)', async () => {
+  // INVARIANT: there is NO resolved "no proxy" state. `[proxy] enabled` was
+  // removed, and `enabled = false` — the only value that asked for a null
+  // proxy — is rejected at load rather than ignored. (`enabled = true` warns
+  // and loads; see proxy-config.test.ts.)
+  test('[proxy] enabled = false is rejected at load, never resolved to a null proxy', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = false\n`);
-    const config = await loadConfig(dir, { cwd: dir });
-    expect(config.proxy).toBeNull();
+    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/has been removed/);
   });
 
-  test('[proxy] enabled = true is the same as omitting it', async () => {
-    await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = true\n`);
-    const config = await loadConfig(dir, { cwd: dir });
-    expect(config.proxy).not.toBeNull();
-    expect(config.proxy?.upstream).toBe('https://api.anthropic.com');
-  });
-
-  // INVARIANT: when the proxy is enabled but no [proxy.policy] is given, the
+  // INVARIANT: when no [proxy.policy] is given, the
   // DECIDED default posture is closed — enforcement on and inherited claude.ai
   // connectors deny-by-default (empty allowlist). See proxy-policy.test.ts for
   // why this must not be weakened without human approval.

@@ -50,6 +50,12 @@ function isWithin(parent: string, child: string): boolean {
  * whole per-task identity boundary rests on that directory being unreachable
  * from inside a container.
  *
+ * It also holds `agent-credentials.json`, the project's stored agent API key
+ * (e.g. Cursor's). That key lived under the project root until
+ * `fix-cursor-security-musts` moved it here — and the project root IS mounted
+ * into every task container read-only, so every agent of every task could read
+ * it. Reaching this directory would hand an agent that key back.
+ *
  * Lazy's own launch paths honor that (asserted by
  * test/unit/daemon-dir-never-mounted.test.ts). `[[mounts]]` is the one remaining
  * way the directory could reach a container, so a mount that exposes it is

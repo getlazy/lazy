@@ -198,6 +198,58 @@ describe('lazy upgrade', () => {
     expectOutputExcludes(result, 'Image refresh complete.');
   });
 
+  // Every upgrade image build (and its dry run) names the exact lazy.toml and
+  // Dockerfile it reads. From a worktree it is genuinely ambiguous which copy
+  // governs — the config-override warning is deliberately silent when the two
+  // lazy.toml files are byte-identical — and an upgrade that silently built
+  // from the git root's Dockerfile instead of the worktree's cost a whole
+  // debugging session (cursor-first-class-agent).
+  test('--images names the config and custom Dockerfile it builds from', async () => {
+    const dockerfilePath = join(ctx.root, 'Dockerfile.custom');
+    await writeFile(dockerfilePath, 'FROM debian:bookworm-slim\n');
+    const configPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(configPath, 'utf-8');
+    const updated = toml.replace('dockerfile = ""', 'dockerfile = "Dockerfile.custom"');
+    if (updated === toml) throw new Error('lazy.toml dockerfile key not found — fixture drift');
+    await writeFile(configPath, updated);
+
+    for (const args of [['upgrade', '--images', '--dry-run'], ['upgrade', '--images']]) {
+      const result = await ctx.lazyMocked(args, MOCK_CLAUDE_SUCCESS);
+      expectSuccess(result);
+      expectOutput(result, `Config:     ${configPath}`);
+      expectOutput(result, `Dockerfile: ${dockerfilePath}`);
+    }
+  });
+
+  test('--images says when the embedded default Dockerfile is in use', async () => {
+    const result = await ctx.lazyMocked(['upgrade', '--images', '--dry-run'], MOCK_CLAUDE_SUCCESS);
+
+    expectSuccess(result);
+    expectOutput(result, 'Config:     ');
+    expectOutput(result, 'Dockerfile: embedded default');
+  });
+
+  test('--images marks a LAZY_DOCKERFILE_LAZY override in the Dockerfile line', async () => {
+    const dockerfilePath = join(ctx.root, 'Dockerfile.override');
+    await writeFile(dockerfilePath, 'FROM debian:bookworm-slim\n');
+
+    const result = await ctx.lazyMocked(['upgrade', '--images', '--dry-run'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_DOCKERFILE_LAZY: dockerfilePath },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, `Dockerfile: ${dockerfilePath} (from LAZY_DOCKERFILE_LAZY)`);
+  });
+
+  test('a full upgrade names the image source alongside the background build', async () => {
+    const result = await ctx.lazyMocked(['upgrade'], MOCK_CLAUDE_SUCCESS);
+
+    expectSuccess(result);
+    expectOutput(result, 'Rebuilding the container image in the background');
+    expectOutput(result, 'Config:     ');
+    expectOutput(result, 'Dockerfile: ');
+  });
+
   // INVARIANT: --images does not stop containers, so --force / --wait (which
   // only govern stopping working containers) are meaningless and rejected —
   // never silently ignored (principle of least surprise).

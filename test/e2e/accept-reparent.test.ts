@@ -228,7 +228,7 @@ describe('accept re-parents unfinished children', () => {
   // child's worktree (see reparentChildren in src/cli/orphan.ts), so until the
   // child is synced its merge base is behind the merge that just landed. That
   // is precisely the stale-base condition that let the v0.12 release resurrect
-  // deleted files (docs/resurrection-guard.md), so the note now names
+  // deleted files (public-docs/resurrection-guard.md), so the note now names
   // `lazy sync` instead of promising there is nothing to do.
   test('pre-accept note names lazy sync and never mentions rebasing', async () => {
     // 1. Create and start a parent task

@@ -89,6 +89,15 @@ export interface ClaudeInvocation {
   cwd: string;
   /** Epoch ms when the invocation started. */
   at: number;
+  /**
+   * The auth-shaped environment the agent was actually launched with — the
+   * credential slots plus the base URL. Recorded so a test can assert what the
+   * agent process holds, and in particular what it does NOT hold: under JIT
+   * credential injection these carry a placeholder, never a real credential.
+   *
+   * Only these keys, and only in the fake: every value here is a test fixture.
+   */
+  env: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,9 +396,19 @@ try {
   if (err.code !== 'ENOENT') throw err;
   invocationIndex = 0;
 }
+// Record the auth-shaped env the agent was launched with. Tests assert on the
+// ABSENCE of a real credential here \u2014 see public-docs/proxy-jit-credentials.md.
+const AUTH_ENV_KEYS = [
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+  'CURSOR_API_KEY', 'ANTHROPIC_BASE_URL',
+];
+const authEnv = {};
+for (const key of AUTH_ENV_KEYS) {
+  if (process.env[key] !== undefined) authEnv[key] = process.env[key];
+}
 fs.appendFileSync(
   invocationsPath,
-  JSON.stringify({ argv, cwd: process.cwd(), at: Date.now() }) + '\n',
+  JSON.stringify({ argv, cwd: process.cwd(), at: Date.now(), env: authEnv }) + '\n',
 );
 
 function loadScenario() {

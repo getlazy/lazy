@@ -13,12 +13,12 @@
  * the target. Protected tasks are listed by code in
  * `[protection].protected_tasks` and resolved to their branches at decision
  * time; the human manages the list with `lazy protect <task> on|off`.
- * See docs/protected-branches.md.
+ * See public-docs/protected-branches.md.
  *
  * This is FRICTION, not security: it flips the builder's default from
  * "auto-accept unless forbidden" to "cannot accept without a deliberate human
  * act". It does not defend against a hostile agent — see
- * docs/protected-branches.md.
+ * public-docs/protected-branches.md.
  */
 
 import type { Storage } from '../storage';
@@ -51,7 +51,6 @@ export interface ProtectionConfig {
    */
   protected_tasks: string[];
   gate_default_branch: boolean;
-  passphrase_file: string;
 }
 
 /** A protected task resolved to the branch its work merges out of. */

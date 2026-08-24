@@ -133,6 +133,16 @@ async function chatLive(
 ): Promise<void> {
   const taskShortId = shortId(task.id);
 
+  // Chat is built on Claude Code's session machinery (host-side ~/.claude
+  // session rehydration + `claude --resume`). Other agents have no equivalent
+  // documented session surface yet — refuse honestly rather than resuming the
+  // wrong agent's session with Claude.
+  if (task.agent_id && task.agent_id !== 'claude-code') {
+    console.error(`Task ${displayId(task)} runs on the "${task.agent_id}" agent — \`lazy chat\` only supports Claude Code tasks.`);
+    console.error(`Use \`lazy ask ${displayId(task)} "<question>"\` (agent-aware) or \`lazy pair ${displayId(task)}\` instead.`);
+    process.exit(1);
+  }
+
   if (!sess.agent_session_id) {
     console.error(`Task ${displayId(task)} has no agent session to resume — the agent has not run a turn yet.`);
     console.error(`Start it with: lazy start ${displayId(task)}`);

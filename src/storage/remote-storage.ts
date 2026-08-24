@@ -142,6 +142,10 @@ export class RemoteStorage implements Storage {
     await this.call('updateTaskPriority', { taskId, priority });
   }
 
+  async updateTaskAgent(taskId: string, agentId: string): Promise<void> {
+    await this.call('updateTaskAgent', { taskId, agentId });
+  }
+
   async updateTaskType(taskId: string, type: string): Promise<void> {
     await this.call('updateTaskType', { taskId, type });
   }
@@ -218,6 +222,10 @@ export class RemoteStorage implements Storage {
 
   async updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void> {
     await this.call('updateSessionRunnerType', { sessionId, runnerType });
+  }
+
+  async updateSessionAgent(sessionId: string, agentId: string): Promise<void> {
+    await this.call('updateSessionAgent', { sessionId, agentId });
   }
 
   async updateSessionInteraction(sessionId: string, durationMs: number): Promise<void> {

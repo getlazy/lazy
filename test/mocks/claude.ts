@@ -14,6 +14,21 @@ import type { AgentResponse, TokenUsage } from '../../src/types';
 // circular — the preload only aliases capture/claude.
 import { IMAGE_TAG, IMAGE_NAME, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from '../../src/capture/image-tag';
 import { AGENT_SELFCHECK_SENTINEL } from '../../src/agent/binary-identity';
+// Same reasoning as image-tag above: the placeholder SHAPE and the launch env
+// SHAPE are production's to define, so the mock borrows both rather than
+// inventing look-alikes that would drift. None of these modules imports
+// capture/claude, so the preload alias cannot make them circular.
+import { placeholderValueFor } from '../../src/proxy/credential-broker';
+import { isCredentialEnvKey } from '../../src/utils/redact';
+import {
+  targetEnvVars,
+  ANTHROPIC_DEFAULT_TARGET,
+  LOCAL_BACKEND_CREDS,
+  type ProxyAuditHints,
+  type LaunchSurface,
+} from '../../src/utils/role-target';
+import type { LaunchIdentity } from '../../src/proxy/placeholder-env';
+import type { RoleTarget } from '../../src/config/types';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { mkdir, writeFile } from 'fs/promises';
@@ -58,6 +73,24 @@ export function resolveImageName(_lazyRoot: string): string {
   return MOCK_IMAGE_REF;
 }
 
+/**
+ * Mirrors the real resolution via the REAL loader (which the preload does not
+ * alias), so `lazy upgrade`'s image-source announcement prints truthful paths
+ * in mocked e2e runs instead of a canned stub: LAZY_DOCKERFILE_LAZY override
+ * first, else [docker].dockerfile joined to the project root.
+ */
+export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
+  const override = process.env.LAZY_DOCKERFILE_LAZY;
+  if (override) {
+    const { isAbsolute } = await import('path');
+    return isAbsolute(override) ? override : join(lazyRoot, override);
+  }
+  const { loadConfig } = await import('../../src/config/loader');
+  const config = await loadConfig(lazyRoot);
+  if (!config.docker.dockerfile) return null;
+  return join(lazyRoot, config.docker.dockerfile);
+}
+
 export function resolveImageRepository(_lazyRoot: string): { repository: string; isCustom: boolean } {
   return { repository: 'lazy-runner', isCustom: false };
 }
@@ -95,9 +128,16 @@ export async function removeImageTag(_ref: string, _binary?: string): Promise<bo
   return true;
 }
 
-export async function listLazyImages(): Promise<
-  Array<{ ref: string; repository: string; tag: string; id: string; size: string }>
-> {
+/** Mirrors the real LazyImageInfo, which src/cli/commands/doctor.ts imports as a type. */
+export interface LazyImageInfo {
+  ref: string;
+  repository: string;
+  tag: string;
+  id: string;
+  size: string;
+}
+
+export async function listLazyImages(): Promise<LazyImageInfo[]> {
   // Tests never have real images; doctor's stale-image report is exercised
   // against the real implementation in test/e2e/image-version-tag.test.ts.
   return [];
@@ -138,6 +178,44 @@ export function getAuthEnvVars(): Array<{ key: string; value: string }> {
   throw new Error(
     'Authentication required. Set CLAUDE_CODE_OAUTH_TOKEN (run `claude setup-token`) or ANTHROPIC_API_KEY.'
   );
+}
+
+/**
+ * Mock of the JIT-credential launch path.
+ *
+ * The real one mints a per-launch grant against the daemon's registry and hands
+ * the launched process a PLACEHOLDER that the proxy resolves upstream. There is
+ * no daemon or proxy behind the module mock, so this mints nothing — but it
+ * still placeholder-izes, because the property the production function exists
+ * to guarantee is 'nothing handed to a launch carries a real secret', and a
+ * mock that returned the real credential would let a test assert launch env
+ * that production never produces.
+ *
+ * It runs the result through targetEnvVars for the same reason: the address a
+ * launch is handed is the proxy's, never a role's own endpoint
+ * (proxy-role-upstreams), and a mock that skipped that step would let a test
+ * assert a base URL production cannot emit.
+ *
+ * injectedCreds mirrors the real parameter: a runner holding its own agent
+ * instance passes that agent's credential rather than the module-level default.
+ * An ollama role has no real credential to pass — it carries the same synthetic
+ * one production uses, so the proxy still gets a grant to route by.
+ */
+export async function getLaunchAuthEnvVars(
+  _identity: LaunchIdentity,
+  target?: RoleTarget,
+  hints?: ProxyAuditHints,
+  surface: LaunchSurface = 'container',
+  injectedCreds?: Array<{ key: string; value: string }>,
+): Promise<Array<{ key: string; value: string }>> {
+  const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
+  const real = resolved.backend === 'ollama'
+    ? LOCAL_BACKEND_CREDS
+    : (injectedCreds ?? getAuthEnvVars());
+  const placeholders = real.map(v =>
+    isCredentialEnvKey(v.key) ? { key: v.key, value: placeholderValueFor(v.key) } : v
+  );
+  return targetEnvVars(resolved, placeholders, surface, hints);
 }
 
 function getMockResponse(): AgentResponse {
@@ -788,10 +866,6 @@ export function getContainerInfo(containerName: string): ContainerInfo | null {
     }
   }
   return null; // Container doesn't exist
-}
-
-export function getContainerOutput(containerName: string): string | null {
-  return JSON.stringify(getMockResponse());
 }
 
 export function getContainerLogs(containerName: string, tailLines: number = 50): string | null {

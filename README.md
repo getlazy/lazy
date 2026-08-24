@@ -9,12 +9,18 @@
 ## What are the main benefits
 
 * Prolonged autonomous horizon for agents (hours not tens of minutes)
-* Autonomous, concurrent, asynchronous (turn based) work across multiple tasks
+* Autonomous, concurrent, asynchronous (turn based) work across many tasks
 * Increased agent situational awareness (agents can search over all past tasks and prompts)
 
 ## Quick Start
 
 ```bash
+# Clone lazy source, build the binaries, create ~/.lazy/bin and install the binaries there.
+git clone git@github.com:getlazy/lazy.git
+cd lazy
+bun run install:local
+# After this run `lazy upgrade` in the projects where lazy is already initialized
+
 # Initialize lazy in your git repository. This will detect the remote repository
 # and other things like different runners (e.g. is there Docker)
 cd your-hello-lazy-project/
@@ -68,6 +74,8 @@ lazy unblock <task-id> --message "New direction to pivot to with a different mod
 When you build `lazy`, you get a single executable. This executable will include in itself `lazy-agent` a Linux build of `lazy` with a different CLI surface that runs inside of Docker containers. The agent binary is mounted into Docker containers at runtime. Those are the two core components.
 
 When you run `lazy` inside of a `lazy` initialized project, it will start running as daemon. Daemon is project aware and there is a single daemon running for the project. Daemon runs task reconciliation, CI checks, PR comment harvesting and so on in the background and is the beating heart of the system. `lazy` was originally built just as CLI but later it became obvious to me that it needed a component that actively listens to events so I took a page from `tmux` book. You can check daemon state through `lazy daemon` commands.
+
+Furthermore, the daemon also runs an HTTP proxy through which *all* agent requests toward their upstream model providers are streamed through. This allows some hardening (e.g. no tool calls allowed to directly read ~/.ssh for example), 
 
 Also, whenever you rebuild `lazy`, you need to run `lazy upgrade` to rebuild the `lazy` Docker image for your toolchain and upgrade daemon. Same as with daemon this upgrade will be per project.
 
@@ -197,7 +205,7 @@ The current mechanism for this isolation is [Docker](https://docker.com). Docker
 
 > **`lazy`'s model-traffic proxy denies inherited `mcp__claude_ai_*` account connectors by default.**
 
-**This is on by default.** All agent model traffic routes through `lazy`'s local Anthropic-native proxy (distinct from the orchestrator above) unless you turn it off — no configuration required, nothing to opt into. That chokepoint runs a **mechanistic, injection-proof policy engine** that inspects every `tool_use` an agent proposes *before it executes* and rewrites the response to block a violation — the call never runs, and the agent receives an explanatory denial so it course-corrects. The proxy is a passthrough: your existing credential is forwarded to the same upstream, so authentication is unchanged.
+**This is always on.** All agent model traffic routes through `lazy`'s proxy — no configuration required, and no way to turn it off. That holds for every backend: a role backed by a local Ollama, or pinned at an explicit `endpoint`, is forwarded there *by the proxy* rather than dialed by the agent. That chokepoint runs a **mechanistic, injection-scanning policy engine** that inspects every `tool_use` an agent proposes *before it executes* and rewrites the response to block a violation. These policies are currently simple in nature and they cannot prevent a sophisticated attack but again, this is all within the context of running inside of a container without any way to directly commit outside of the worktree
 
 The load-bearing reason this exists: an agent running under a **claude.ai account silently inherits that account's server-side connectors** — Gmail (read/draft/search), Google Drive, Calendar, Spotify and more — as live, callable tools. These `mcp__claude_ai_*` tools are injected by Anthropic from the authenticated account; **nothing in `lazy` or your local config enables them, and neither the OS sandbox nor Claude Code's own permission settings ever see them.** The proxy is the only place `lazy` controls where they can be stopped, so the default is closed:
 
@@ -205,7 +213,7 @@ The load-bearing reason this exists: an agent running under a **claude.ai accoun
 - **Secret/credential path reads are denied** (`~/.ssh`, `.env`, `.aws/credentials`, private keys, `.npmrc`, kubeconfig, …).
 - **Optional** path-glob denies and a WebFetch egress allowlist.
 
-These deterministic rules are the *real* security boundary — a prompt-injected agent cannot argue its way past a static rule, and the decision is identical for every backend (real Anthropic, Ollama, any Anthropic-native endpoint).
+These deterministic rules are the *real* security boundary — a prompt-injected agent cannot argue its way past a static rule, and the decision is identical for every backend (real Anthropic, Ollama, Cursor).
 
 To **allowlist** a specific connector you actually want an agent to use, name it exactly under `[proxy.policy]`:
 
@@ -220,7 +228,7 @@ deny_secret_path_reads = true     # default true
 # egress_allowlist = ["api.github.com"]   # empty/unset = egress unrestricted
 ```
 
-To opt out of the proxy entirely — direct connections, **no audit trail and no enforcement** — set `[proxy] enabled = false`. If the proxy cannot start, the daemon refuses to start rather than silently connecting direct, because a silent fallback would leave the audit trail lying by omission.
+If the proxy cannot start, the daemon refuses to start rather than silently connecting direct, and a launch that cannot resolve the running proxy's live address fails with an actionable error rather than downgrading to a direct connection — a silent fallback would leave the audit trail lying by omission.
 
 #### My MO for polishing
 
@@ -322,8 +330,10 @@ which answers with presence and the variable *name* only; the credential itself
 never travels back. If the daemon cannot be asked, doctor still answers from your
 shell but labels the result `shell env: …` and says why.
 
-If you run a local model instead, enable `[models.roles.*]` in `lazy.toml` — the gate is
-skipped for Ollama-backed setups, which use local dummy credentials.
+If you run a local model instead, set `[ollama] enabled = true` in `lazy.toml` — the gate
+is skipped for Ollama-backed setups, which use local stand-in credentials. (A per-role
+`[models.roles.*]` table with `backend = "ollama"` launches without a real credential too,
+but the daemon-start gate reads the `[ollama]` block only.)
 
 For GitHub integration (optional):
 
@@ -383,9 +393,16 @@ An interactive session with Claude Code with the addition of `lazy`'s own system
 - Schedule task acceptance trains.
 - Decide on priorities and directions.
 
-In `builder` mode, the assistant is strongly encouraged to *not* do anything itself but rather to create tasks and coordinate work of agents working on those tasks. It is actually *so* discouraged that I mount the repo as read-only into `builder`'s container.
+In `builder` mode, the assistant is prevented from doing anything directly on the repostiory by:
 
-It does get one writable place — `~/.lazy/scratch/<project>/`, outside the repo entirely — for artifacts meant for *you*: a long accept message, a draft doc, a data dump. It can never be committed and no agent can read it. See [docs/builder-scratch-dir.md](docs/builder-scratch-dir.md).
+* Build is running in a container and repository is mounted as read-only.
+* All `lazy` operations that it performs go through the deamon running on the host.
+* There is no `lazy` CLI in the container and even if it were to install one, all operations still have to go through the same external daemon.
+* All requests to model provider go through `lazy` proxy.
+
+Thus builder is lock down so that it can *only* launch tasks, direct them, etc. and finally also accept but limited to non-protected tasks and branches (see [task/branch protection](#protected-branches-and-tasks)). Such hard-lockdown posture is also why `builder` we consider safe to run builders in **autonomous mode by default** — no per-tool permission prompts Each autonomous launch prints that posture and asks you to type `yes`; `--yes` skips the confirmation, and `lazy builder --no-autonomous` opts back into Claude Code's normal permission prompts.
+
+Builder does get one writable place — `~/.lazy/scratch/<project>/`, outside the repo entirely — for artifacts meant for *you*: a long accept message, a draft doc, a data dump. It can never be committed and no agent can read it. See [public-docs/builder-scratch-dir.md](public-docs/builder-scratch-dir.md).
 
 The user <-> `builder` <-> agent relationship follows a clear division of labor:
 
@@ -607,7 +624,24 @@ lazy report --pdf
 lazy report --pdf --out <path-to-pdf>
 ```
 
-An example of the output can be found [here](docs/lazy-report-example-20260523.md).
+An example of the output can be found [here](public-docs/lazy-report-example-20260523.md).
+
+### Protected branches and tasks
+
+Sometimes it happens that [builder](#builder) will go against the intended, but maybe not clearly stated, limits and accept tasks into their parent tasks or other branches when it should not do so. `lazy protect` exists to prevent this by forcing humans to approve tasks. To enable branch protection you have to:
+
+```bash
+# Updates lazy.toml to capture the protection repository wide.
+lazy protect <task-code-or-branch-name>
+```
+
+In order now to accept the tasks into the protected branches or task, you must set the passphrase:
+
+```bash
+# Sets the global passphrase for all lazy projects. This is stored outside of the repository
+# so agents have no way of accessing them when running in a container.
+lazy system passphrase set
+```
 
 ### Protected Files
 
@@ -895,7 +929,7 @@ This rebuilds only the project's container image, with `--no-cache` so the newly
 - **Running builders** — on their next relaunch (a live builder keeps its image).
 - **Working agents** and **blocked tasks** — when their container is next recreated. A blocked task reuses its still-running supervisor on the next unblock, so it does *not* switch on the next turn; it adopts the new image only after its container is recreated (daemon restart, interruption, or crash).
 
-For an immediate, disruptive switch of everything (stop containers, rebuild image **and** agent binary, restart daemon), run a full `lazy upgrade`. `--images` only applies to docker/podman runners — with the host-process runner there is no container image, and Claude Code runs from your host installation. Add `--dry-run` to preview without building.
+For an immediate, disruptive switch of everything (stop containers, rebuild image **and** agent binary, restart daemon), run a full `lazy upgrade`. `--images` only applies to docker/podman runners — with the host-process runner there is no container image, and the agent CLI runs from your host installation. Add `--dry-run` to preview without building.
 
 ### Waiting on a Task
 

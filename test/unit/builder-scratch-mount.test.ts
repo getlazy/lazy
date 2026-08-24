@@ -34,7 +34,7 @@ import { buildBuilderDockerArgs } from '../../src/runner/docker-runner';
 import { buildDockerArgs, buildSupervisorDockerArgs } from '../../src/capture/claude';
 import { buildAgentSandboxArgs, buildBuilderPermissionArgs } from '../../src/runner/host-sandbox';
 import type { HostPermissionConfig } from '../../src/runner/host-sandbox';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { validateMount, buildMountArgs } from '../../src/capture/mounts';
 
 /** True when `fn` threw — used to name WHICH case failed in the assertion. */
@@ -292,7 +292,7 @@ describe('ensureBuilderScratchDir', () => {
   test('never narrows bits the human set deliberately', async () => {
     const dir = await ensureBuilderScratchDir(PROJECT_ROOT);
     // chmod(2) via the shell — Bun's chmod masks the sticky bit away.
-    spawnSync(['chmod', '1777', dir]);
+    spawnSyncUnsupervised(['chmod', '1777', dir]);
     const before = (await stat(dir)).mode & 0o7777;
     if (before !== 0o1777) return; // filesystem doesn't keep sticky — nothing to assert
     await ensureBuilderScratchDir(PROJECT_ROOT);

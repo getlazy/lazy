@@ -22,6 +22,9 @@
  * One test per trigger below, plus the boundary of (2).
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import { createHash } from 'crypto';
+import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
@@ -29,6 +32,7 @@ import {
   ensureImage,
   resolveImageName,
   calculateDockerfileHash,
+  preflightAgentBinaryInImage,
   listLazyImages,
   isImageTooOld,
   IMAGE_TAG,
@@ -255,5 +259,188 @@ describe('runner image identity and freshness', () => {
 
     expect(result.ok).toBe(true);
     expect(result.warning).toBeUndefined();
+  });
+
+  // --- agent-aware images (cursor-first-class-agent) ----------------------
+  //
+  // A container-capable non-claude agent (cursor) gets its OWN image: the
+  // default Dockerfile plus the agent's install command, under a repository
+  // that never collides with the base lazy-runner image.
+
+  test('a cursor-default project resolves an agent-suffixed repository with a distinct hash', async () => {
+    const baseHash = await calculateDockerfileHash(ctx.root);
+
+    const configPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(configPath, 'utf-8');
+    const updated = toml.replace('agent_id = "claude-code"', 'agent_id = "cursor"');
+    expect(updated).not.toBe(toml);
+    await writeFile(configPath, updated);
+
+    const ref = await resolveImageName(ctx.root);
+    expect(ref).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
+
+    const cursorHash = await calculateDockerfileHash(ctx.root);
+    expect(cursorHash).not.toBe(baseHash);
+  });
+
+  // Per-task --agent override: a claude-default project still builds the
+  // cursor image when the TASK's agent is cursor.
+  test('an explicit agentId override resolves the agent image on a claude-default project', async () => {
+    expect(await resolveImageName(ctx.root)).toBe(IMAGE_REF);
+    expect(await resolveImageName(ctx.root, 'cursor')).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
+    // claude-code override is a no-op — the base image already contains it.
+    expect(await resolveImageName(ctx.root, 'claude-code')).toBe(IMAGE_REF);
+  });
+
+  // --- custom-Dockerfile agent-binary preflight (cursor-first-class-agent §2) --
+  //
+  // Custom Dockerfiles are never amended, so a non-claude agent's binary may be
+  // absent from the image. The launch preflight probes for it with a throwaway
+  // `docker run` and refuses the launch with the exact RUN line to add —
+  // instead of the crash loop the engineer hit on this repo's Dockerfile.lazy.
+
+  async function useCustomDockerfile(): Promise<void> {
+    const dockerfilePath = join(ctx.root, 'Dockerfile.custom');
+    await writeFile(dockerfilePath, 'FROM debian:bookworm-slim\n');
+    const configPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(configPath, 'utf-8');
+    const updated = toml.replace('dockerfile = ""', 'dockerfile = "Dockerfile.custom"');
+    expect(updated).not.toBe(toml);
+    await writeFile(configPath, updated);
+  }
+
+  test('preflight refuses a custom image missing the agent binary, naming the RUN line', async () => {
+    await useCustomDockerfile();
+    await docker.failRuns();
+
+    await expect(
+      preflightAgentBinaryInImage('lazy-custom-abc:0.21', docker.binPath, 'cursor'),
+    ).rejects.toThrow(/cursor-agent[\s\S]*RUN curl https:\/\/cursor\.com\/install -fsS \| bash/);
+  });
+
+  test('preflight passes when the custom image has the binary', async () => {
+    await useCustomDockerfile();
+    await preflightAgentBinaryInImage('lazy-custom-abc:0.21', docker.binPath, 'cursor');
+    const runs = (await docker.invocations()).filter(line => line.startsWith('run '));
+    expect(runs.length).toBe(1);
+    expect(runs[0]).toContain('which cursor-agent');
+  });
+
+  test('preflight is a no-op for claude-code and for the agent-aware default image', async () => {
+    // claude-code on a custom Dockerfile: base image responsibility, no probe.
+    await useCustomDockerfile();
+    await preflightAgentBinaryInImage('lazy-custom-abc:0.21', docker.binPath, 'claude-code');
+    // cursor on the DEFAULT image: the image build already baked the agent in.
+    const configPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(configPath, 'utf-8');
+    await writeFile(configPath, toml.replace('dockerfile = "Dockerfile.custom"', 'dockerfile = ""'));
+    await docker.failRuns(); // would fail if a probe ran
+    await preflightAgentBinaryInImage(`lazy-runner-cursor:${IMAGE_TAG}`, docker.binPath, 'cursor');
+    const runs = (await docker.invocations()).filter(line => line.startsWith('run '));
+    expect(runs.length).toBe(0);
+  });
+
+  test('the built agent image Dockerfile contains the cursor install command', async () => {
+    const used = await ensureImage(docker.binPath, { agentId: 'cursor' });
+    expect(used).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    // The build argv carries `-f <path>` to the temp Dockerfile lazy wrote —
+    // read it back to assert the agent install was appended.
+    const match = builds[0].match(/-f (\S+)/);
+    expect(match).not.toBeNull();
+    const dockerfile = await readFile(match![1], 'utf-8');
+    expect(dockerfile).toContain('cursor.com/install');
+    // The base image content is still there (claude stays available for
+    // in-container merge turns).
+    expect(dockerfile).toContain('claude.ai/install.sh');
+  });
+
+  // --- Dockerfile resolution: root-joined, LAZY_DOCKERFILE_LAZY override ---
+  //
+  // INVARIANT: a TASK's worktree never governs the container image. Task
+  // branches are agent-writable, and deriving the image from one would let an
+  // agent's Dockerfile.lazy edits execute as build steps under the daemon's
+  // docker on the HOST. The custom Dockerfile path always joins to the
+  // PROJECT ROOT; the only override is the explicit LAZY_DOCKERFILE_LAZY env
+  // var (LAZY_CONFIG family — dev/e2e use), which reaches the daemon by
+  // ordinary env inheritance.
+
+  async function setupWorktreeWithOwnDockerfile(): Promise<{ wt: string; wtContent: string; rootContent: string }> {
+    // The root project uses a custom Dockerfile...
+    const rootContent = 'FROM debian:bookworm-slim\n# root variant\n';
+    await writeFile(join(ctx.root, 'Dockerfile.custom'), rootContent);
+    const configPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(configPath, 'utf-8');
+    const updated = toml.replace('dockerfile = ""', 'dockerfile = "Dockerfile.custom"');
+    expect(updated).not.toBe(toml);
+    await writeFile(configPath, updated);
+
+    // ...and a task worktree carries its own lazy.toml plus a CHANGED
+    // Dockerfile — the shape of a task branch (possibly agent-authored) that
+    // edits the Dockerfile, e.g. adding an install line.
+    const wt = join(ctx.root, '.lazy', 'worktrees', 'dockerfile-branch');
+    await mkdir(wt, { recursive: true });
+    await writeFile(join(wt, 'lazy.toml'), updated);
+    const wtContent = rootContent + 'RUN curl https://cursor.com/install -fsS | bash\n';
+    await writeFile(join(wt, 'Dockerfile.custom'), wtContent);
+    return { wt, wtContent, rootContent };
+  }
+
+  const shortHashOf = (content: string) =>
+    createHash('sha256').update(content).digest('hex').substring(0, 12);
+
+  test("a worktree's own Dockerfile copy never changes the image", async () => {
+    const { wt, rootContent } = await setupWorktreeWithOwnDockerfile();
+    const rootRef = `lazy-custom-${shortHashOf(rootContent)}:${IMAGE_TAG}`;
+
+    // From the project root (suite default cwd): the root's Dockerfile.
+    expect(await resolveImageName(ctx.root)).toBe(rootRef);
+
+    // Even resolved from INSIDE the worktree (where the config walk finds the
+    // worktree's lazy.toml), the Dockerfile still joins to the PROJECT ROOT —
+    // the worktree's differing copy is never hashed or built.
+    process.chdir(wt);
+    try {
+      const used = await ensureImage(docker.binPath);
+      expect(used).toBe(rootRef);
+      const builds = await docker.builds();
+      expect(builds.length).toBe(1);
+      expect(builds[0]).toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
+      expect(builds[0]).not.toContain(join(wt, 'Dockerfile.custom'));
+    } finally {
+      process.chdir(ctx.root);
+    }
+  });
+
+  test('LAZY_DOCKERFILE_LAZY overrides the Dockerfile for the whole chain', async () => {
+    const { wt, wtContent } = await setupWorktreeWithOwnDockerfile();
+
+    // Read at call time (not module load), so setting it here is safe; always
+    // restored in finally per the env-leakage rules.
+    const prev = process.env.LAZY_DOCKERFILE_LAZY;
+    process.env.LAZY_DOCKERFILE_LAZY = join(wt, 'Dockerfile.custom');
+    try {
+      const used = await ensureImage(docker.binPath);
+      expect(used).toBe(`lazy-custom-${shortHashOf(wtContent)}:${IMAGE_TAG}`);
+      const builds = await docker.builds();
+      expect(builds.length).toBe(1);
+      expect(builds[0]).toContain(`-f ${join(wt, 'Dockerfile.custom')}`);
+    } finally {
+      if (prev === undefined) delete process.env.LAZY_DOCKERFILE_LAZY;
+      else process.env.LAZY_DOCKERFILE_LAZY = prev;
+    }
+  });
+
+  test('LAZY_DOCKERFILE_LAZY pointing at a missing file fails hard, naming the var', async () => {
+    const prev = process.env.LAZY_DOCKERFILE_LAZY;
+    process.env.LAZY_DOCKERFILE_LAZY = join(ctx.root, 'no-such-dockerfile');
+    try {
+      await expect(resolveImageName(ctx.root)).rejects.toThrow(/LAZY_DOCKERFILE_LAZY/);
+    } finally {
+      if (prev === undefined) delete process.env.LAZY_DOCKERFILE_LAZY;
+      else process.env.LAZY_DOCKERFILE_LAZY = prev;
+    }
   });
 });

@@ -138,7 +138,7 @@ describe('lazy builder', () => {
 
   test('shows session disclosure message', async () => {
     // Builder shows disclosure before spawning claude, in non-TTY mode too.
-    const result = await ctx.lazy(['builder'], {
+    const result = await ctx.lazy(['builder', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -147,7 +147,7 @@ describe('lazy builder', () => {
   });
 
   test('creates .builder-launched marker in ~/.lazy/<project>/ after first run', async () => {
-    await ctx.lazy(['builder'], {
+    await ctx.lazy(['builder', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -215,7 +215,7 @@ describe('lazy builder', () => {
   // inference — bare --resume fails loudly and points at `lazy builder list`
   // rather than silently starting a fresh session.
   test('bare --resume fails with an actionable error', async () => {
-    const result = await ctx.lazy(['builder', '--resume'], {
+    const result = await ctx.lazy(['builder', '--resume', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -228,7 +228,7 @@ describe('lazy builder', () => {
 
   // INVARIANT: --resume <id> passes the ID directly to Claude.
   test('--resume with explicit ID uses that ID', async () => {
-    const result = await ctx.lazy(['builder', '--resume', 'cafebabe-1234-5678-9abc-def012345678'], {
+    const result = await ctx.lazy(['builder', '--resume', 'cafebabe-1234-5678-9abc-def012345678', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -238,7 +238,7 @@ describe('lazy builder', () => {
   // INVARIANT: Resume skips the interactive system prompt warning.
   // Users have already seen the warning in the original session.
   test('resume skips session disclosure message', async () => {
-    const result = await ctx.lazy(['builder', '--resume', 'abcdef01-2345-6789-abcd-ef0123456789'], {
+    const result = await ctx.lazy(['builder', '--resume', 'abcdef01-2345-6789-abcd-ef0123456789', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -252,7 +252,7 @@ describe('lazy builder', () => {
   // `lazy builder` in TTY mode starts a fresh session — it never offers to
   // resume, because nothing tracks a "previous" session per terminal.
   test('bare builder in TTY mode starts a new session without a resume offer', async () => {
-    const result = await ctx.lazy(['builder'], {
+    const result = await ctx.lazy(['builder', '--yes'], {
       env: {
         ...launchableBuilderEnv(ctx.root),
         LAZY_FORCE_TTY: '1',
@@ -267,7 +267,7 @@ describe('lazy builder', () => {
 
   // INVARIANT: Without env var or flag, no resume prompt — straight to new session.
   test('no env var and no flag starts new session without prompting', async () => {
-    const result = await ctx.lazy(['builder'], {
+    const result = await ctx.lazy(['builder', '--yes'], {
       env: launchableBuilderEnv(ctx.root),
     });
 
@@ -276,11 +276,31 @@ describe('lazy builder', () => {
     expectOutputExcludes(result, 'Resume previous builder session');
   });
 
-  test('--autonomous shows warning and requires confirmation in TTY mode', async () => {
-    // Configure host-process runner to bypass Docker check
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
-    writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
+  // INVARIANT: autonomous is the builder's DEFAULT posture, not an opt-in. The
+  // builder is an orchestrator that runs with LESS access than the task agents
+  // it directs (container, repo mounted read-only, task ops via the daemon), so
+  // a bare `lazy builder` runs without permission prompts. The warning and the
+  // typed "yes" stay: the default changed, the informed consent did not.
+  test('bare builder is autonomous by default and still asks for confirmation', async () => {
+    useHostProcessRunner(ctx.root);
+
+    const result = await ctx.lazy(['builder'], {
+      env: {
+        PATH: '/usr/local/bin:/usr/bin:/bin',
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: 'decline',
+      },
+    });
+
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
+    expectOutput(result, "Type 'yes' to proceed");
+    expectOutput(result, 'Aborted.');
+  });
+
+  // INVARIANT: --autonomous still parses and still means autonomous. It is now a
+  // no-op restatement of the default, kept so existing scripts and docs work.
+  test('--autonomous is still accepted and behaves identically to the default', async () => {
+    useHostProcessRunner(ctx.root);
 
     const result = await ctx.lazy(['builder', '--autonomous'], {
       env: {
@@ -290,42 +310,74 @@ describe('lazy builder', () => {
       },
     });
 
-    // Should show autonomous mode warning
-    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
-    expectOutput(result, "Type 'yes' to proceed");
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
     expectOutput(result, 'Aborted.');
   });
 
+  // INVARIANT: --no-autonomous is the opt-out. It skips the posture warning AND
+  // the confirmation entirely — there is nothing to consent to when Claude Code
+  // is going to prompt per tool call anyway.
+  test('--no-autonomous opts out: no warning, no confirmation', async () => {
+    const result = await ctx.lazy(['builder', '--no-autonomous'], {
+      env: launchableBuilderEnv(ctx.root),
+    });
+
+    expectSuccess(result);
+    expectOutputExcludes(result, 'Autonomous mode');
+    expectOutputExcludes(result, "Type 'yes' to proceed");
+    expectOutput(result, 'Launching Claude Code in a new session');
+  });
+
+  // INVARIANT: --autonomous and --no-autonomous contradict each other, so lazy
+  // refuses rather than picking a winner silently (principle of least surprise).
+  test('--autonomous and --no-autonomous together are rejected', async () => {
+    const result = await ctx.lazy(['builder', '--autonomous', '--no-autonomous']);
+
+    expectFailure(result, 1);
+    expectError(result, '--autonomous and --no-autonomous are mutually exclusive');
+  });
+
+  test('--yes skips the confirmation in TTY mode', async () => {
+    const result = await ctx.lazy(['builder', '--yes'], {
+      env: {
+        ...launchableBuilderEnv(ctx.root),
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: 'decline',
+      },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
+    expectOutputExcludes(result, "Type 'yes' to proceed");
+    expectOutputExcludes(result, 'Aborted.');
+  });
+
   test('--autonomous with --yes skips confirmation in non-TTY mode', async () => {
-    // Configure host-process runner to bypass Docker check
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
-    writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
+    useHostProcessRunner(ctx.root);
 
     const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
       env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
     });
 
     // Should show warning but not prompt for confirmation
-    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
     // Should not ask for confirmation (proceeds directly, then fails on missing claude)
     expectOutputExcludes(result, "Type 'yes' to proceed");
   });
 
-  test('--autonomous without --yes fails in non-TTY mode', async () => {
-    // Configure host-process runner to bypass Docker check
-    const lazyTomlPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(lazyTomlPath, 'utf-8');
-    writeFileSync(lazyTomlPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
+  // INVARIANT: non-TTY has nobody to type "yes", so an autonomous run there needs
+  // --yes. Now that autonomous is the default this also covers a bare `lazy
+  // builder` — and the error names BOTH ways out, not just --yes.
+  test('bare builder without --yes fails in non-TTY mode and names both escapes', async () => {
+    useHostProcessRunner(ctx.root);
 
-    const result = await ctx.lazy(['builder', '--autonomous'], {
+    const result = await ctx.lazy(['builder'], {
       env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
     });
 
-    // Should show warning
-    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
-    // Should fail with error (error goes to stderr)
-    expectError(result, 'Error: --autonomous requires --yes flag in non-interactive mode.');
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
+    expectError(result, 'Error: autonomous mode (the builder default) requires --yes in non-interactive mode.');
+    expectError(result, 'Pass --yes to confirm, or --no-autonomous to run with permission prompts.');
     expect(result.exitCode).toBe(1);
   });
 
@@ -341,10 +393,29 @@ describe('lazy builder', () => {
       env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
     });
 
-    expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
     expectOutput(result, '⚠ DANGER: Running on the host WITHOUT isolation (permission_mode = "bypass").');
     expectOutput(result, 'The agent has unrestricted access to your system.');
     expectOutput(result, 'Only proceed on an isolated/disposable machine.');
+  });
+
+  // INVARIANT: under a container runner the warning explains the ACTUAL posture —
+  // read-only repo mount, less access than a task agent, task ops via the daemon —
+  // so the typed "yes" is informed rather than scary boilerplate. This prints
+  // before `checkAvailability()`, which is why it is observable without Docker.
+  test('container runner warning explains the read-only / daemon-brokered posture', async () => {
+    // Default runner is docker — leave it, and let the run die on the missing
+    // binary AFTER the posture has been printed.
+    const result = await ctx.lazy(['builder'], {
+      env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    });
+
+    expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
+    expectOutput(result, 'It runs in a container, not on your host.');
+    expectOutput(result, 'Your repository is mounted READ-ONLY');
+    expectOutput(result, 'LESS filesystem access than the task agents it directs');
+    expectOutput(result, 'go through the daemon');
+    expectOutput(result, 'lazy builder --no-autonomous');
   });
 
   test('--help documents the --model flag (builder model, not per-task)', async () => {
@@ -369,7 +440,7 @@ describe('lazy builder', () => {
     const logPath = join(ctx.root, 'claude-args.log');
     const binDir = installFakeClaude(ctx.root, logPath);
 
-    const result = await ctx.lazy(['builder', '--model', 'mythos'], {
+    const result = await ctx.lazy(['builder', '--model', 'mythos', '--yes'], {
       env: { PATH: `${binDir}:${process.env.PATH}` },
     });
     expectSuccess(result);
@@ -396,7 +467,7 @@ describe('lazy builder', () => {
       const logPath = join(ctx.root, 'claude-args.log');
       const binDir = installFakeClaude(ctx.root, logPath);
 
-      const result = await ctx.lazy(['builder', '--model', 'mythos'], {
+      const result = await ctx.lazy(['builder', '--model', 'mythos', '--yes'], {
         env: { PATH: `${binDir}:${process.env.PATH}` },
       });
       expectSuccess(result);
@@ -426,7 +497,7 @@ describe('lazy builder', () => {
       const logPath = join(ctx.root, 'claude-args.log');
       const binDir = installFakeClaude(ctx.root, logPath);
 
-      const result = await ctx.lazy(['builder'], {
+      const result = await ctx.lazy(['builder', '--yes'], {
         env: { PATH: `${binDir}:${process.env.PATH}` },
       });
       expectSuccess(result);
@@ -455,17 +526,23 @@ describe('lazy builder', () => {
   // any name — that path is covered by the "wins over Ollama" test above.)
   test('--model with an unknown name and no local server is rejected up front', async () => {
     useHostProcessRunner(ctx.root);
-    const result = await ctx.lazy(['builder', '--model', 'qwen3-coder']);
+    const result = await ctx.lazy(['builder', '--model', 'qwen3-coder', '--yes']);
     expectFailure(result, 1);
     expectError(result, 'Unknown --model');
   });
 
-  test('--help shows --autonomous flag', async () => {
+  test('--help documents autonomous-by-default and the opt-out', async () => {
     const result = await ctx.lazy(['builder', '--help']);
 
     expectSuccess(result);
     expectOutput(result, '--autonomous');
     expectOutput(result, 'Run without permission prompts');
+    // The default must be stated, not implied.
+    expectOutput(result, 'This is the DEFAULT');
+    expectOutput(result, 'Autonomous by default:');
+    // ...and the opt-out must be discoverable from --help alone.
+    expectOutput(result, '--no-autonomous');
+    expectOutput(result, 'mounted READ-ONLY');
   });
 
   // INVARIANT: builder rejects unknown flags with a non-zero exit code.
@@ -528,7 +605,7 @@ describe.skipIf(sandboxSuiteSkipped('lazy builder sandbox posture'))(
         env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
       });
 
-      expectOutput(result, '⚠ Autonomous mode: the builder will run without permission prompts.');
+      expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');
       expectOutput(result, '⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
       expectOutput(result, 'Bash is confined to the worktree');
     });

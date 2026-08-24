@@ -23,7 +23,7 @@ import { join } from 'path';
 import { stat } from 'fs/promises';
 import { loadConfig } from '../config/loader';
 import type { ResolvedConfig } from '../config/types';
-import { resolveAgentModel } from '../utils/role-target';
+import { resolveAgentModel } from '../agent/agent-model';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
@@ -40,8 +40,9 @@ import { regenerateFidelity } from '../synthesis/fidelity';
 import { getSummarizer } from '../synthesis/summarizer';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { withTaskLifecycleLock } from './task-lifecycle-lock';
+import { ACCEPT_IN_FLIGHT_KEY, escapeMergingForOperation } from './stranded-merge';
 import { resolveAndPersistEffort } from './effort';
-import { getAgent } from '../agent/registry';
+import { getAgent, listAgents } from '../agent/registry';
 import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
 import { hasUncommittedChanges, applyPatch, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getNewCommits, getMergeBase } from '../git/operations';
 import { renderPreAcceptPrompt } from '../supervisor/pre-accept';
@@ -51,8 +52,10 @@ import { checkPairingLock } from '../utils/pairing-lock';
 import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus, completedResponses } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
+import { buildAgentSwitchHandoffContext } from '../agent/switch-handoff';
 import { checkOrphanedChild, retargetOrphanedChild, getActiveChildren, reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { resetAutoReactCounters } from './auto-react-budget';
+import { getNonHumanTurnCount, incrementNonHumanTurnCount, resetNonHumanTurnCount, checkTurnBudget } from './turn-budget';
 import {
   enforceEdgeGate,
   EdgeGateRefusedError,
@@ -63,6 +66,7 @@ import {
 } from '../protection/edge-gate';
 import { enforceResurrectionGuard, ResurrectionRefusedError, stackedChildAdvisory } from '../protection/resurrection-guard';
 import { enforceLfsGuard, LfsPointerRefusedError } from '../protection/lfs-guard';
+import { acceptRefusal, AcceptRefusedError, acceptWithApprovedFilesCommand, shellQuote } from './accept-refusal';
 import { createHumanTokenVerifier } from '../protection/verify-token';
 import { isFeatureEnabled } from '../utils/features';
 import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
@@ -71,11 +75,13 @@ import { logger } from '../utils/logger';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
 import { revokeTaskMcpTokens } from './mcp-tokens';
+import { revokeTaskCredentialGrants } from '../proxy/credential-broker';
 import { setupSandbox } from '../utils/sandbox';
 import { hasDaemonContext } from './context';
 import { runGit } from '../utils/git';
 import { validateBranchInSyncWithRemote } from '../utils/git';
-import { latestViolationTurn, findStickyModel, launchSettingsFromResponse } from '../utils/turns';
+import { latestViolationTurn, pendingViolations, findStickyModel, launchSettingsFromResponse } from '../utils/turns';
+import { parkTaskPaused } from '../utils/paused-status';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../utils/feedback-redelivery';
 import { isOfflineMode } from '../utils/offline';
 import { readdir, readFile } from 'fs/promises';
@@ -124,6 +130,20 @@ async function revokeTaskTokens(projectRoot: string, taskId: string): Promise<vo
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  // The task's PLACEHOLDER credential dies with the same session: after this
+  // point its container must not be able to spend the human's Anthropic or
+  // Cursor credential through the proxy. Revoked separately from the MCP token
+  // so one registry's failure cannot skip the other.
+  try {
+    const revoked = await revokeTaskCredentialGrants(projectRoot, taskId);
+    if (revoked > 0) logger.debug(`Revoked ${revoked} proxy credential grant(s) for task ${shortId(taskId)}`);
+  } catch (err) {
+    logger.warn(
+      `Failed to revoke the proxy credential grant for task ${shortId(taskId)}: ` +
+      `${err instanceof Error ? err.message : String(err)}. ` +
+      `It stays valid until the daemon is restarted.`,
+    );
+  }
 }
 
 function checkPairingLockOrThrow(root: string, tRef: string, displayTaskId: string): void {
@@ -146,16 +166,32 @@ async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskI
   // the one command that fixes it (fix-sync-silent-conflict).
   const mergeState = await readWorktreeMergeState(worktreePath);
   if (isMidMerge(mergeState)) {
-    throw new RpcError(
+    throw acceptRefusal(
       409,
       `Task ${displayTaskId} has an unresolved merge in its worktree (${describeMergeState(mergeState)}). ` +
       `A sync did not finish. Run \`lazy sync ${displayTaskId}\` to complete it, ` +
       `then re-run ${commandName}.`,
+      {
+        reason: 'mid-merge',
+        next: `Finish the interrupted sync, then ${commandName} again.`,
+        command: `lazy sync ${shellQuote(displayTaskId)}`,
+        uiAction: 'sync',
+      },
     );
   }
 
   if (await hasUncommittedChanges(worktreePath)) {
-    throw new RpcError(409, `Task ${displayTaskId} has uncommitted changes. Commit or stash changes before running ${commandName}.`);
+    // No flag to offer: `lazy accept` has no --accept-dirty-worktree (only
+    // reject/MCP do), so the honest remedy names the worktree and stops there
+    // rather than inventing one.
+    throw acceptRefusal(
+      409,
+      `Task ${displayTaskId} has uncommitted changes. Commit or stash changes before running ${commandName}.`,
+      {
+        reason: 'dirty-worktree',
+        next: `Commit or discard the uncommitted changes in the task's worktree (${worktreePath}), then ${commandName} again.`,
+      },
+    );
   }
 }
 
@@ -219,9 +255,17 @@ export async function resolveParentBranchWithFallback(
     };
   }
 
-  // Parent is terminal (or missing) — walk up to find a living ancestor
+  // Parent is terminal (or missing) — walk up to find a living ancestor.
+  //
+  // INVARIANT: a corrupt store must never hang or crash the daemon. `visited`
+  // is a cycle guard, mirroring `collectSubtreeIds` (src/task-target.ts):
+  // without it a parent cycle among terminal tasks (A → B → A) spins this loop
+  // forever inside the reconcile/sync path. A detected cycle is treated exactly
+  // like "ancestor not found" — break out and fall through to the default
+  // integration branch below.
   let currentParentId: string | null = directParentId;
   const staleAncestors: string[] = [];
+  const visited = new Set<string>();
 
   while (currentParentId) {
     const ancestor = await storage.getTask(currentParentId);
@@ -230,6 +274,16 @@ export async function resolveParentBranchWithFallback(
       staleAncestors.push(currentParentId.substring(0, 8));
       break;
     }
+
+    if (visited.has(ancestor.id)) {
+      logger.error(
+        `Corrupt task store: parent cycle detected while resolving the sync target of task ${displayId(task)}. ` +
+        `Task ${ancestor.id} is its own ancestor via ${[...visited].join(' → ')}. ` +
+        `Falling back to the default integration branch; repair the parent links of these tasks.`
+      );
+      break;
+    }
+    visited.add(ancestor.id);
 
     if (!isTerminalStatus(ancestor.status)) {
       // Found a living ancestor — reparent to it. The target becomes a
@@ -297,6 +351,12 @@ export interface UnblockTaskParams {
   /** CLI `--effort` override. Persists on the task so future turns use same value. */
   effortOverride?: string;
   /**
+   * CLI/MCP `--agent` override. Switch to a different agent for this and future
+   * turns. When switching agents, the session is reset (agent_session_id is
+   * cleared) because sessions cannot be resumed across different agents.
+   */
+  agentOverride?: string;
+  /**
    * Agent permission mode for this turn. When 'plan', the agent is launched
    * read-only (Q&A against the session). Used by `lazy review -i` ask path.
    *
@@ -350,12 +410,20 @@ export async function launchUnblockTask(
   let task = result.task;
 
   // --- Session check ---
-  const sess = await storage.getSessionByTaskId(task.id);
+  let sess = await storage.getSessionByTaskId(task.id);
   if (!sess) {
     throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
   }
   if (sess.ended_at) {
     throw new RpcError(409, `Session has ended. Create a variant with: lazy branch ${displayId(task)}`);
+  }
+
+  // --- Validate agent override (if provided) ---
+  if (params.agentOverride !== undefined) {
+    const validAgents = listAgents();
+    if (!validAgents.includes(params.agentOverride)) {
+      throw new RpcError(400, `Unknown agent '${params.agentOverride}'. Available agents: ${validAgents.join(', ')}`);
+    }
   }
 
   // --- Status validation ---
@@ -379,16 +447,32 @@ export async function launchUnblockTask(
     throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
   }
 
-  // Merging → blocked escape hatch
+  // Merging → resting escape hatch. Parks as `conflict` if the task still owes a
+  // decision on file-permission violations — see the violations-are-the-source-
+  // of-truth invariant in src/utils/paused-status.ts.
+  //
+  // This used to park unconditionally, which would yank a task out from under an
+  // accept that was genuinely mid-merge. It now goes through the shared recovery,
+  // which refuses while a live accept owns the merge.
   if (task.status === 'merging') {
-    await storage.updateTaskStatus(task.id, 'blocked', actor);
-    await storage.createComment(task.id, 'Task unblocked from merging state (manual escape hatch).', actor);
-    task = (await storage.getTask(task.id))!;
-    warnings.push('Task was in merging state. Moved back to blocked.');
+    task = await escapeMergingForOperation(storage, task, actor, 'unblock');
+    warnings.push(`Task was in merging state. Moved back to ${task.status}.`);
   }
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
+
+  // --- Agent switching (if requested) ---
+  // When switching agents mid-task, update both task and session. The session's
+  // agent_session_id is cleared because sessions cannot be resumed across
+  // different agents — each agent has its own session format.
+  if (params.agentOverride && params.agentOverride !== task.agent_id) {
+    await storage.updateTaskAgent(task.id, params.agentOverride);
+    await storage.updateSessionAgent(sess.id, params.agentOverride);
+    task = (await storage.getTask(task.id))!;
+    sess = (await storage.getSessionByTaskId(task.id))!;
+    warnings.push(`Switched agent to ${params.agentOverride}. Session reset.`);
+  }
 
   // --- Runner pre-flight (honor per-task runner override) ---
   const runner = await createRunner(projectRoot, task.runner_type ?? undefined);
@@ -412,19 +496,48 @@ export async function launchUnblockTask(
     }
   }
 
-  // --- Reset auto-react counters (human is taking over) ---
-  try {
-    await resetAutoReactCounters(storage, task.id);
-  } catch {
-    // Counter reset is best-effort — task unblock must proceed even if budget tracking fails
+  // --- Turn budget: cap consecutive turns without a human in the loop ---
+  // Builder/agent-initiated unblocks count; a human unblock resets the count.
+  const unblockTurnBudgetConfig = await loadConfig(projectRoot);
+  if (actor !== 'human') {
+    const nonHumanTurnCount = await getNonHumanTurnCount(storage, task.id);
+    const budgetDecision = checkTurnBudget(nonHumanTurnCount, unblockTurnBudgetConfig.limits.max_turns_without_human);
+    if (!budgetDecision.allowed) {
+      throw new RpcError(409, `Task ${displayId(task)}: ${budgetDecision.reason}`);
+    }
   }
 
-  // Manual unblock re-arms auto-resume: clear circuit breaker and user-stop gate.
-  // (resetConsecutiveInterruptions also clears session.user_stopped.)
-  try {
-    await storage.resetConsecutiveInterruptions(sess.id);
-  } catch {
-    // Counter reset is best-effort.
+  // BUG FIX: these resets used to run unconditionally on every unblock, which let an
+  // autonomous builder/agent unblock launder away its own budgets every turn. Only a
+  // human taking over clears them; a builder/agent turn instead increments the new
+  // turn-budget counter above.
+  if (actor === 'human') {
+    // --- Reset auto-react counters (human is taking over) ---
+    try {
+      await resetAutoReactCounters(storage, task.id);
+    } catch {
+      // Counter reset is best-effort — task unblock must proceed even if budget tracking fails
+    }
+
+    // Manual unblock re-arms auto-resume: clear circuit breaker and user-stop gate.
+    // (resetConsecutiveInterruptions also clears session.user_stopped.)
+    try {
+      await storage.resetConsecutiveInterruptions(sess.id);
+    } catch {
+      // Counter reset is best-effort.
+    }
+
+    try {
+      await resetNonHumanTurnCount(storage, task.id);
+    } catch {
+      // Counter reset is best-effort.
+    }
+  } else {
+    try {
+      await incrementNonHumanTurnCount(storage, task.id);
+    } catch {
+      // Counter increment is best-effort — task unblock must proceed even if budget tracking fails
+    }
   }
 
   // --- Launch feedback turn ---
@@ -498,7 +611,15 @@ export async function launchUnblockTask(
     // src/utils/sanitize-text.ts.
     let message = sanitizeUserText(params.message);
 
-    if (task.status === 'conflict') {
+    // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+    // this block is gated on the VIOLATION SET, never on `task.status`. The
+    // status is only a derived label, and any side-channel turn (an ask, a sync,
+    // the end of a pairing session) used to be able to park a task with a pending
+    // set as `blocked`. The revert below read the set and fired anyway, while the
+    // reviewer-facing guards read the status and refused the approvedFiles that
+    // would have prevented it — an unexpressible state that silently destroyed
+    // committed agent work.
+    {
       const existingTurns = await storage.getSessionTurns(sess.id);
       // The FINAL violation set lives on the push-back turn (the last invocation
       // that re-detected them), NOT the work turn — use latestViolationTurn so the
@@ -507,15 +628,57 @@ export async function launchUnblockTask(
 
       if (latestAgentTurn?.violations?.length) {
         const violations = latestAgentTurn.violations;
+        const pendingSet = violations.filter(v => v.status === 'pending');
+
+        // INVARIANT: protected files require an EXPLICIT decision — neither approve
+        // nor revert may be inferred from absence. The daemon is the last stop; a
+        // client that forgets to pass approvedFiles must not cause silent data loss.
+        //
+        // The distinction:
+        //   undefined → caller didn't make a decision → REFUSE
+        //   []        → caller explicitly chose to reject all → PROCEED
+        if (pendingSet.length > 0 && params.approvedFiles === undefined) {
+          const fileList = pendingSet.map(v => v.file).join(', ');
+          throw new RpcError(400, `Task ${displayId(task)} has ${pendingSet.length} pending file permission violation(s) (${fileList}) but no approval decision was provided. Pass approvedFiles (even if empty to reject all) or use --approve-file / --no-approve-files on the CLI.`);
+        }
+
         const approvedSet = new Set(params.approvedFiles ?? []);
 
-        const updatedViolations: FileViolation[] = violations.map(v => ({
-          ...v,
-          status: approvedSet.has(v.file) ? 'approved' as const : 'rejected' as const,
-        }));
+        // INVARIANT (approval-is-sticky — fix-violation-approval-sticky): this
+        // call decides the PENDING records only. A record the reviewer already
+        // decided keeps that decision unless this call names the file.
+        //
+        // WHY: violations live on the violation TURN, and a later turn that
+        // touches no protected file records none — so `latestViolationTurn`
+        // still points at the old, already-decided set. Recomputing every
+        // record from `approvedFiles` alone meant the next unblock that said
+        // nothing about them re-labelled every APPROVED violation `rejected`
+        // and git-reverted the agent's committed work. Absence of the parameter
+        // is not a reviewer decision; it is silence. (This is the other half of
+        // 8beef66b, which closed the same hole for pending violations.)
+        //
+        // A file NAMED in approvedFiles is approved whatever it was before —
+        // that is the documented way a reviewer re-approves something they
+        // earlier reverted (see src/prompts/violation-revert-notice.md).
+        const decisions = violations.map(v => {
+          if (approvedSet.has(v.file)) {
+            return { violation: { ...v, status: 'approved' as const }, newlyApproved: v.status !== 'approved', newlyRejected: false };
+          }
+          if (v.status === 'pending') {
+            return { violation: { ...v, status: 'rejected' as const }, newlyApproved: false, newlyRejected: true };
+          }
+          return { violation: v, newlyApproved: false, newlyRejected: false };
+        });
 
-        const rejectedFiles = updatedViolations.filter(v => v.status === 'rejected');
-        const approvedViolations = updatedViolations.filter(v => v.status === 'approved');
+        const updatedViolations: FileViolation[] = decisions.map(d => d.violation);
+
+        // Only what THIS call decided is acted on and reported. Re-reverting a
+        // file that was already rejected would produce an empty commit and tell
+        // the agent a second time about a revert it was already told about; if
+        // the agent re-applied the change, the next turn's permission check
+        // raises a FRESH pending violation, which is the enforcement path.
+        const rejectedFiles = decisions.filter(d => d.newlyRejected).map(d => d.violation);
+        const approvedViolations = decisions.filter(d => d.newlyApproved).map(d => d.violation);
 
         if (rejectedFiles.length > 0) {
           for (const v of rejectedFiles) {
@@ -604,12 +767,29 @@ export async function launchUnblockTask(
     // patterns, post-turn sync, etc.) but unblock no longer triggers merge.
     // Use `lazy sync <task>` for upstream merge as a separate operation.
 
-    // Build turn history for fresh sessions (no Claude session to resume)
+    // Fresh session (agent switch, reopen, or other reset): inject distilled
+    // handoff — turn history plus branch orientation. Sessions are not migrated
+    // between agents; lazy's turn store + git tree carry the context
+    // (docs/spikes/cross-agent-context-handoff.md).
     let turnHistory: string | undefined;
     if (!canResume) {
       const turns = await storage.getSessionTurns(sess.id);
       if (turns.length > 0) {
-        turnHistory = buildTurnHistoryContext(turns);
+        try {
+          turnHistory = await buildAgentSwitchHandoffContext({
+            turns,
+            branchName: sess.git_branch,
+            gitStartSha: sess.git_start_sha,
+            worktreePath,
+          });
+        } catch (err) {
+          // Orientation is best-effort; never block unblock on git/prompt failure.
+          // Fall back to turn history alone (still has truncation honesty).
+          logger.warn(
+            `Task ${displayId(task)}: agent-switch handoff failed (${err instanceof Error ? err.message : String(err)}); falling back to turn history only`,
+          );
+          turnHistory = buildTurnHistoryContext(turns);
+        }
       }
     }
 
@@ -649,6 +829,7 @@ export async function launchUnblockTask(
       sequence: nextSeq,
       role: 'human',
       content: message.trim(),
+      agent: task.agent_id,
       model: modelName,
       effort: effortValue,
       prompt: fullMessage,
@@ -855,6 +1036,9 @@ export async function launchAskTask(
   }
   // Preserve the pre-ask status so a read-only ask never mutates task state.
   const statusBeforeAsk = task.status;
+  // Set when the ask gives up while the supervisor may still write a response —
+  // the task must then stay 'working' so the reconciler can finalize the turn.
+  let askResponsePending = false;
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
@@ -908,6 +1092,7 @@ export async function launchAskTask(
       sequence: nextSeq,
       role: 'human',
       content: askMessage.trim(),
+      agent: task.agent_id,
       model: modelName,
       effort: effortValue,
       prompt: fullMessage,
@@ -972,6 +1157,11 @@ export async function launchAskTask(
     if (!response) {
       // Timeout — leave the supervisor alone (it may still finish later and
       // be picked up by the reconciler); we just can't hand an answer back.
+      // The task therefore stays 'working': the reconciler only sweeps working
+      // tasks, so restoring the pre-ask status here would strand the answer the
+      // supervisor is still writing. The reconciler's park derives blocked vs
+      // conflict from the violation set, so the label survives that flush.
+      askResponsePending = true;
       throw new RpcError(504, `Ask timed out after ${Math.floor(ASK_TIMEOUT_MS / 1000)}s.`);
     }
 
@@ -989,7 +1179,6 @@ export async function launchAskTask(
     // (e.g. a 'conflict' task stays 'conflict', not silently demoted to
     // 'blocked').
     const turnNumber = await recordAskCompletedTurn(storage, sess, completed, protoDir);
-    await storage.updateTaskStatus(task.id, statusBeforeAsk, 'system');
 
     return {
       sessionId: sess.id,
@@ -1011,6 +1200,28 @@ export async function launchAskTask(
       },
     };
   } finally {
+    // INVARIANT (a read-only turn never mutates task state —
+    // fix-ask-nukes-violations): restoring the pre-ask status belongs in the
+    // `finally`, not on the success path alone. An ask that times out (504) or
+    // whose supervisor reports an error (500) used to leave the task parked in
+    // `working`; the reconciler then flushed the ask response as if it were a
+    // work turn and parked it `blocked` — silently clearing a `conflict` label
+    // while the violations behind it stayed pending.
+    //
+    // Only restore from `working`: a supervisor launch failure deliberately
+    // parks the task `interrupted`, and a concurrent transition is not ours to
+    // stomp.
+    try {
+      const current = await storage.getTask(task.id);
+      if (!askResponsePending && current?.status === 'working') {
+        await storage.updateTaskStatus(task.id, statusBeforeAsk, 'system');
+      }
+    } catch (err) {
+      logger.warn(
+        `Task ${displayId(task)}: failed to restore status '${statusBeforeAsk}' after the ask — ` +
+        `it may be left as 'working'. ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     await removeLock(worktreePath);
   }
 }
@@ -1219,6 +1430,19 @@ async function launchPreAcceptTurn(
   }
 
   const storage = await getOrCreateStorage();
+
+  // Skip pre-accept when EVERY agent turn provably had no effect on the branch.
+  // If any turn succeeded (agent_had_no_effect is undefined) or partially worked
+  // (agent_had_no_effect is false), there is work to validate and pre-accept runs.
+  // Only when all turns have agent_had_no_effect === true — meaning the agent never
+  // successfully ran — do we skip, because there is genuinely nothing to validate.
+  const turns = await storage.getSessionTurns(sess.id);
+  const agentTurns = turns.filter(t => t.role === 'agent');
+  const nothingToValidate = agentTurns.length > 0 && agentTurns.every(t => t.agent_had_no_effect === true);
+  if (nothingToValidate) {
+    warnings.push(`${PRE_ACCEPT_SKIP_PREFIX}: no agent turn affected the branch (nothing to validate).`);
+    return { warnings };
+  }
   const tRef = taskRef(task);
 
   const existingLock = await checkLock(worktreePath);
@@ -1250,6 +1474,7 @@ async function launchPreAcceptTurn(
       sequence: humanSeq,
       role: 'human',
       content: '[system] Pre-accept validation before merge',
+      agent: task.agent_id,
       model: modelName,
       effort: effortValue,
       actor: 'system',
@@ -1469,7 +1694,9 @@ export async function rejectTask(
     }
     throw new RpcError(404, `Task not found: ${params.taskId}`);
   }
-  const task = resolveResult.task;
+  // `let`: a task stranded in `merging` is recovered below, which replaces this
+  // with the refreshed record.
+  let task = resolveResult.task;
 
   // --- Worktree uncommitted changes check ---
   const worktreePath = getWorktreePath(projectRoot, task);
@@ -1496,6 +1723,13 @@ export async function rejectTask(
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, shortId(task.id), displayId(task));
+
+  // A task stranded in 'merging' by a dead accept used to be un-rejectable:
+  // the FSM has no merging → abandoned edge, so the human's typed reason was
+  // saved to .lazy/recovery/ and then thrown away by the refusal. Recover the
+  // task to a real resting state first; the ordinary transition applies from
+  // there, and the reason lands.
+  task = await escapeMergingForOperation(storage, task, actor, 'reject');
 
   // --- State transitions ---
 
@@ -1590,7 +1824,9 @@ export async function closeTask(
     }
     throw new RpcError(404, `Task not found: ${params.taskId}`);
   }
-  const task = resolveResult.task;
+  // `let`: a task stranded in `merging` is recovered below, which replaces this
+  // with the refreshed record.
+  let task = resolveResult.task;
 
   // --- Status check ---
   if (isTerminalStatus(task.status)) {
@@ -1608,6 +1844,10 @@ export async function closeTask(
 
   // --- Session check ---
   const sess = await storage.getSessionByTaskId(task.id);
+
+  // See rejectTask: a merge whose owner is gone must not swallow the close
+  // reason the human typed. Recover to a resting state, then close normally.
+  task = await escapeMergingForOperation(storage, task, actor, 'close');
 
   // --- State transitions ---
 
@@ -1748,7 +1988,11 @@ export async function acceptTaskPreflight(
   // --- Session check (needed early for branch name during worktree recovery) ---
   const sess = await storage.getSessionByTaskId(task.id);
   if (!sess) {
-    throw new RpcError(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+    throw acceptRefusal(400, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`, {
+      reason: 'no-session',
+      next: 'Start the task — there is no work to merge yet.',
+      command: `lazy start ${shellQuote(displayId(task))}`,
+    });
   }
 
   // --- Ended-session checks ---
@@ -1758,7 +2002,11 @@ export async function acceptTaskPreflight(
   // "Worktree is gone and branch ... not found" — burying the one fact the
   // user needs behind an unrelated, unactionable error.
   if (sess.outcome === 'accepted') {
-    throw new RpcError(409, `Task ${displayId(task)} was already accepted (the merge has landed). Run 'lazy show ${displayId(task)}' to verify, or 'lazy reopen ${displayId(task)}' if you need to work on it further.`);
+    throw acceptRefusal(409, `Task ${displayId(task)} was already accepted (the merge has landed). Run 'lazy show ${displayId(task)}' to verify, or 'lazy reopen ${displayId(task)}' if you need to work on it further.`, {
+      reason: 'already-accepted',
+      next: 'Nothing to do — the merge already landed. Reopen the task only if you need more work on it.',
+      command: `lazy show ${shellQuote(displayId(task))}`,
+    });
   }
   if (sess.ended_at) {
     throw new RpcError(409, `Session already ended (${sess.outcome ?? 'ended'}).`);
@@ -1800,9 +2048,16 @@ export async function acceptTaskPreflight(
 
   if (!isBlockedStatus(task.status) && task.status !== 'merging') {
     if (task.status === 'interrupted') {
-      throw new RpcError(409, `Task ${displayId(task)} is interrupted. Resume it first: lazy resume ${displayId(task)}`);
+      throw acceptRefusal(409, `Task ${displayId(task)} is interrupted. Resume it first: lazy resume ${displayId(task)}`, {
+        reason: 'interrupted',
+        next: 'Resume the task so it can finish its turn, then accept.',
+        command: `lazy resume ${shellQuote(displayId(task))}`,
+      });
     } else if (task.status === 'working') {
-      throw new RpcError(409, `Task ${displayId(task)} is still working. Wait for it to finish.`);
+      throw acceptRefusal(409, `Task ${displayId(task)} is still working. Wait for it to finish.`, {
+        reason: 'working',
+        next: 'Wait for the agent to finish this turn, then accept.',
+      });
     } else {
       throw new RpcError(409, `Task ${displayId(task)} is in state '${task.status}' and cannot be accepted.`);
     }
@@ -1821,14 +2076,27 @@ export async function acceptTaskPreflight(
     const approvedFiles = params.approvedFiles ?? [];
 
     if (approvedFiles.length === 0) {
-      throw new RpcError(409, `Task ${displayId(task)} has unresolved file permission violations: ${pendingFiles.join(', ')}. Use --approve-file to approve each file.`);
+      // The command enumerates every file. This is the refusal that motivated
+      // structured remedies: a 43-file violation set is not something a human
+      // should retype flag by flag.
+      throw acceptRefusal(409, `Task ${displayId(task)} has unresolved file permission violations: ${pendingFiles.join(', ')}. Use --approve-file to approve each file.`, {
+        reason: 'pending-violations',
+        next: 'Approve every protected file the agent changed, or unblock instead to have them reverted.',
+        command: acceptWithApprovedFilesCommand(displayId(task), pendingFiles),
+        files: pendingFiles,
+      });
     }
 
     const approvedSet = new Set(approvedFiles);
     const missingFiles = pendingFiles.filter(f => !approvedSet.has(f));
 
     if (missingFiles.length > 0) {
-      throw new RpcError(409, `Missing approval for violated file(s): ${missingFiles.join(', ')}. All violated files must be approved.`);
+      throw acceptRefusal(409, `Missing approval for violated file(s): ${missingFiles.join(', ')}. All violated files must be approved.`, {
+        reason: 'pending-violations',
+        next: 'Approve the remaining protected files — approval is all-or-nothing.',
+        command: acceptWithApprovedFilesCommand(displayId(task), pendingFiles),
+        files: missingFiles,
+      });
     }
 
     // Mark all pending violations as approved
@@ -1846,7 +2114,11 @@ export async function acceptTaskPreflight(
   // --- Check for zero commits ---
   const commits = await storage.getSessionCommits(sess.id);
   if (commits.length === 0) {
-    throw new RpcError(409, `Task ${displayId(task)} has no commits. Nothing to merge. Use 'lazy close' instead.`);
+    throw acceptRefusal(409, `Task ${displayId(task)} has no commits. Nothing to merge. Use 'lazy close' instead.`, {
+      reason: 'no-commits',
+      next: 'There is nothing to merge — close the task instead of accepting it.',
+      command: `lazy close ${shellQuote(displayId(task))} --reason "no work to merge"`,
+    });
   }
 
   // --- Determine merge target ---
@@ -1890,7 +2162,10 @@ export async function acceptTaskPreflight(
       params.callerTaskId === parentTask.id &&
       ACTIVE_PARENT_EXEMPT_STATUSES.has(parentTask.status);
     if (isActiveStatus(parentTask.status) && !callerIsParentAgent) {
-      throw new RpcError(409, `Parent task ${displayId(parentTask)} is currently ${parentTask.status}. Wait for it to become blocked.`);
+      throw acceptRefusal(409, `Parent task ${displayId(parentTask)} is currently ${parentTask.status}. Wait for it to become blocked.`, {
+        reason: 'parent-active',
+        next: `Wait for the parent task ${displayId(parentTask)} to stop working, then accept.`,
+      });
     }
 
     parentDisplayId = displayId(parentTask);
@@ -1909,7 +2184,10 @@ export async function acceptTaskPreflight(
     if (driver.needsSync) {
       const syncCheck = await validateBranchInSyncWithRemote(mergeTargetBranch, config.remote.git_remote, projectRoot);
       if (!syncCheck.inSync) {
-        throw new RpcError(409, `${syncCheck.error} Fix this before accepting to avoid a half-merged state.`);
+        throw acceptRefusal(409, `${syncCheck.error} Fix this before accepting to avoid a half-merged state.`, {
+          reason: 'out-of-sync',
+          next: `Bring ${mergeTargetBranch} back in step with the remote before merging into it.`,
+        });
       }
     }
   }
@@ -2006,21 +2284,6 @@ export async function acceptTask(
   const lockKey = resolved.task?.id ?? params.taskId;
   return withTaskLifecycleLock(lockKey, () => acceptTaskInner(projectRoot, params));
 }
-
-/**
- * Task metadata key marking a LOCAL merge phase that is in flight, carrying the
- * status the task held before the accept began.
- *
- * WHY: `merging` means two different things. On the remote path it means "the
- * forge has the merge, we are waiting" — a durable state a later accept
- * re-enters to ask the forge what happened. Stamping `merging` at the START of
- * the local merge phase (which is what makes status honest during the minutes
- * the merge actually takes) would make a CRASHED local merge look exactly like
- * that, sending the next accept down the remote re-entry path for a merge no
- * forge ever heard of. This marker distinguishes them, and doubles as the record
- * of what to restore to.
- */
-const ACCEPT_IN_FLIGHT_KEY = 'accept_in_flight_from';
 
 /** Enter the merge phase: mark it in flight, then stamp `merging`. */
 async function beginMergePhase(
@@ -2146,6 +2409,12 @@ const APPROVAL_INTACT_NOTE =
 function appendApprovalIntactNote(err: unknown): unknown {
   const message = err instanceof Error ? err.message : String(err);
   const combined = `${message}\n\n${APPROVAL_INTACT_NOTE}`;
+  // Rebuild in kind: dropping to a plain RpcError here would strip the remedy
+  // off exactly the refusals a protected accept produces, which is where the
+  // human most needs the next step.
+  if (err instanceof AcceptRefusedError) {
+    return new AcceptRefusedError(err.status, combined, err.remedy);
+  }
   if (err instanceof RpcError) {
     return new RpcError(err.status, combined);
   }
@@ -2253,7 +2522,7 @@ async function acceptTaskRun(
   // who called accept (CLI --yes, MCP, automation). It is the single decision
   // point that makes protected merges require a deliberate human act
   // (`lazy approve`) — see src/protection/edge-gate.ts and
-  // docs/protected-branches.md.
+  // public-docs/protected-branches.md.
   //
   // A human's approval on the task's PR/MR is a SATISFIER of this same gate,
   // not a second mechanism: it is handed to enforceEdgeGate as a probe rather
@@ -2283,7 +2552,14 @@ async function acceptTaskRun(
       });
     } catch (err) {
       if (err instanceof EdgeGateRefusedError) {
-        throw new RpcError(403, err.message);
+        // The one refusal a HUMAN surface can clear in place: supplying the
+        // approval passphrase is what `lazy accept` prompts for at a terminal.
+        throw acceptRefusal(403, err.message, {
+          reason: 'approval-required',
+          next: 'This merge is protected — approve it with the approval passphrase, then it proceeds.',
+          command: `lazy accept ${shellQuote(preflight.displayId)}`,
+          uiAction: 'passphrase',
+        });
       }
       throw err;
     }
@@ -2326,7 +2602,13 @@ async function acceptTaskRun(
         : undefined);
     } catch (err) {
       if (err instanceof ResurrectionRefusedError) {
-        throw new RpcError(409, err.message);
+        const files = err.resurrections.map((r) => r.path);
+        throw acceptRefusal(409, err.message, {
+          reason: 'resurrection',
+          next: 'Confirm each file you really do mean to bring back, or drop those changes from the branch.',
+          command: acceptWithApprovedFilesCommand(preflight.displayId, files),
+          files,
+        });
       }
       throw err;
     }
@@ -2369,7 +2651,13 @@ async function acceptTaskRun(
         : undefined);
     } catch (err) {
       if (err instanceof LfsPointerRefusedError) {
-        throw new RpcError(409, err.message);
+        const files = err.violations.map((v) => v.path);
+        throw acceptRefusal(409, err.message, {
+          reason: 'lfs-raw-blob',
+          next: 'Fix the LFS setup and re-commit these paths as pointers; approve them only if the raw content is genuinely intended.',
+          command: acceptWithApprovedFilesCommand(preflight.displayId, files),
+          files,
+        });
       }
       throw err;
     }
@@ -2443,7 +2731,11 @@ async function acceptTaskRun(
     }
 
     if (prState === 'CLOSED') {
-      throw new RpcError(409, `The merge request was closed externally. Use 'lazy close ${preflight.displayId}' to close the task, or reopen the MR/PR and re-run 'lazy accept ${preflight.displayId}'.`);
+      throw acceptRefusal(409, `The merge request was closed externally. Use 'lazy close ${preflight.displayId}' to close the task, or reopen the MR/PR and re-run 'lazy accept ${preflight.displayId}'.`, {
+        reason: 'mr-closed',
+        next: 'Reopen the merge request and accept again, or close the task if the work is being dropped.',
+        command: `lazy close ${shellQuote(preflight.displayId)} --reason "merge request closed"`,
+      });
     }
 
     // PR is still open — check CI status
@@ -2453,7 +2745,7 @@ async function acceptTaskRun(
       const failedDetails = checksStatus.failed
         .map(f => f.url ? `${f.name} (${f.url})` : f.name)
         .join('; ');
-      await storage.updateTaskStatus(task.id, 'blocked', acceptActor);
+      await parkTaskPaused(storage, task.id, acceptActor);
       await storage.createComment(task.id, `Pipeline/checks failed: ${failedDetails}. Task moved back to blocked.`, acceptActor);
       throw new RpcError(409, `Pipeline/checks failed: ${failedDetails}. Task moved back to blocked. Fix the issue, then re-accept.`);
     }
@@ -2603,10 +2895,15 @@ async function acceptTaskRun(
       // Without auto_approve, we need an existing external approval to proceed
       const hasApproval = driver.hasRemoteRef(task) && await driver.hasExternalApproval(task);
       if (!hasApproval) {
-        throw new RpcError(409,
+        throw acceptRefusal(409,
           `Branch \`${mergeTargetBranch}\` has protection rules requiring approval. ` +
           `Use \`lazy submit\` to create an MR for external review. ` +
-          `After the MR is approved, run \`lazy accept\` to merge.`);
+          `After the MR is approved, run \`lazy accept\` to merge.`,
+          {
+            reason: 'forge-approval-required',
+            next: `${mergeTargetBranch} requires review on the forge — submit a PR/MR, get it approved, then accept.`,
+            command: `lazy submit ${shellQuote(preflight.displayId)}`,
+          });
       }
     }
     phases.end(targetIsProtected ? `${mergeTargetBranch} is protected` : `${mergeTargetBranch} is unprotected`);
@@ -2776,7 +3073,12 @@ async function acceptTaskRun(
     if (result.status === 'failed') {
       if (result.isConflict) {
         // Conflict detected — agent needs to sync and resolve
-        throw new RpcError(409, `${result.error}\nThe agent needs to merge upstream and resolve conflicts first. Run: lazy sync ${preflight.displayId}`);
+        throw acceptRefusal(409, `${result.error}\nThe agent needs to merge upstream and resolve conflicts first. Run: lazy sync ${preflight.displayId}`, {
+          reason: 'merge-conflict',
+          next: 'Sync the task with its parent so the agent resolves the conflicts, then accept.',
+          command: `lazy sync ${shellQuote(preflight.displayId)}`,
+          uiAction: 'sync',
+        });
       } else {
         throw new RpcError(500, `Merge failed: ${result.error}`);
       }
@@ -3681,7 +3983,9 @@ export async function submitTask(
     }
     throw new RpcError(404, `Task not found: ${params.taskId}`);
   }
-  const task = resolveResult.task;
+  // `let`: a task stranded in `merging` is recovered below, which replaces this
+  // with the refreshed record.
+  let task = resolveResult.task;
 
   // --- Offline check (before any other validation) ---
   const config = await loadConfig(projectRoot);
@@ -3690,9 +3994,35 @@ export async function submitTask(
     throw new RpcError(400, 'Cannot submit while in offline mode. Run `lazy system online` to restore remote operations, then retry.');
   }
 
+  // A task stranded in `merging` by a dead accept used to hit the guard below
+  // and be told "only blocked or conflict tasks can be submitted" — while the
+  // FSM's own refusal from reject/close advertised `submitted` as a valid exit
+  // from `merging`. Both messages were true and neither was usable. The edge in
+  // the transition table is real but belongs to the accept ABORT path (restore a
+  // task that was `submitted` before the accept began), not to a user submit, so
+  // the guard stays: recover the stranded task to its resting state first and
+  // submit from there.
+  task = await escapeMergingForOperation(storage, task, actor, 'submit');
+  if (task.status === 'submitted') {
+    // The recovery restored a task that already had an open PR before the accept.
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      prUrl: null,
+      warnings: [
+        `Task was stranded in merging by an accept that is no longer running. It was already submitted ` +
+        `before that accept, so it has been restored to submitted — its existing PR still stands.`,
+      ],
+    };
+  }
+
   // --- Status validation ---
   if (task.status !== 'blocked' && task.status !== 'conflict') {
-    throw new RpcError(409, `Task ${displayId(task)} is ${task.status}. Only blocked or conflict tasks can be submitted.`);
+    throw new RpcError(
+      409,
+      `Task ${displayId(task)} is ${task.status}. Only blocked or conflict tasks can be submitted. ` +
+      `Run \`lazy show ${displayId(task)}\` to see where it stands.`,
+    );
   }
 
   // --- Session check ---
@@ -3932,10 +4262,11 @@ export async function resumeTask(
   const task = result.task;
 
   // --- Status validation ---
-  // `lazy resume` is deprecated in favor of `lazy unblock`. After unifying
-  // `lazy stop` to transition tasks to 'blocked' (with user_stopped=true)
-  // rather than 'interrupted', resume must also accept blocked-by-stop tasks
-  // so the alias keeps working. Other statuses still reject.
+  // `lazy resume` resumes a task with no new feedback (use `lazy unblock
+  // --message` to send guidance instead). After unifying `lazy stop` to
+  // transition tasks to 'blocked' (with user_stopped=true) rather than
+  // 'interrupted', resume must also accept blocked-by-stop tasks. Other
+  // statuses still reject.
   if (task.status !== 'interrupted' && task.status !== 'blocked') {
     if (task.status === 'working') {
       throw new RpcError(409, `Task ${displayId(task)} is still working. Use 'lazy blocked' to check when it finishes.`);
@@ -3953,6 +4284,32 @@ export async function resumeTask(
   }
   if (sess.ended_at) {
     throw new RpcError(409, `Session has ended. Create a variant with: lazy branch ${displayId(task)}`);
+  }
+
+  // --- Pending file-permission violations ---
+  // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+  // the refusal above is status-based and therefore blind to a task that carries
+  // a pending set while labelled `blocked` (a side-channel turn can park it that
+  // way). Resume has no way to express an approve/revert decision, so it must
+  // refuse on the SET, not the label — otherwise the decision is deferred to the
+  // next unblock, which reverts everything the reviewer never got to approve.
+  const pendingOnResume = pendingViolations(await storage.getSessionTurns(sess.id));
+  if (pendingOnResume.length > 0) {
+    const fileList = pendingOnResume.map(v => v.file).join(', ');
+    throw new RpcError(409,
+      `Task ${displayId(task)} has ${pendingOnResume.length} pending file permission violation(s) (${fileList}) awaiting a decision. ` +
+      `Resume cannot express one — use 'lazy unblock ${displayId(task)}' with --approve-file / --no-approve-files (or approved_files over MCP).`);
+  }
+
+  // --- Turn budget: cap consecutive turns without a human in the loop ---
+  // Builder/agent-initiated resumes count; a human resume resets the count.
+  const resumeTurnBudgetConfig = await loadConfig(projectRoot);
+  if (actor !== 'human') {
+    const nonHumanTurnCount = await getNonHumanTurnCount(storage, task.id);
+    const budgetDecision = checkTurnBudget(nonHumanTurnCount, resumeTurnBudgetConfig.limits.max_turns_without_human);
+    if (!budgetDecision.allowed) {
+      throw new RpcError(409, `Task ${displayId(task)}: ${budgetDecision.reason}`);
+    }
   }
 
   const tRef = taskRef(task);
@@ -4069,6 +4426,7 @@ export async function resumeTask(
       content: pendingFeedback
         ? '[system] Session interrupted and resumed (unconsumed feedback re-delivered)'
         : '[system] Session interrupted and resumed',
+      agent: task.agent_id,
       model: modelName,
       effort: effortValue,
       actor,
@@ -4121,14 +4479,32 @@ export async function resumeTask(
     // Store container name
     await storage.updateSessionContainerName(sess.id, containerName);
 
-    // Manual resume resets the circuit breaker
-    await storage.resetConsecutiveInterruptions(sess.id);
+    // BUG FIX: these resets used to run unconditionally on every resume, which let an
+    // autonomous builder/agent resume launder away its own budgets every turn. Only a
+    // human taking over clears them; a builder/agent turn instead increments the new
+    // turn-budget counter checked above.
+    if (actor === 'human') {
+      // Manual resume resets the circuit breaker
+      await storage.resetConsecutiveInterruptions(sess.id);
 
-    // Manual resume resets auto-react counters (human is taking over)
-    try {
-      await resetAutoReactCounters(storage, task.id);
-    } catch {
-      // Non-critical
+      // Manual resume resets auto-react counters (human is taking over)
+      try {
+        await resetAutoReactCounters(storage, task.id);
+      } catch {
+        // Non-critical
+      }
+
+      try {
+        await resetNonHumanTurnCount(storage, task.id);
+      } catch {
+        // Non-critical
+      }
+    } else {
+      try {
+        await incrementNonHumanTurnCount(storage, task.id);
+      } catch {
+        // Counter increment is best-effort — task resume must proceed even if budget tracking fails
+      }
     }
 
     // Update last interaction timestamp
@@ -4265,7 +4641,11 @@ export async function stopTask(
   // see shouldSkipAutoResumeForUserStop in src/utils/reconcile.ts.
   // 'interrupted' is reserved for ungraceful interruptions (crash, watchdog
   // kill, supervisor died) which should auto-resume.
-  await storage.updateTaskStatus(task.id, 'blocked', actor);
+  //
+  // Parks as `conflict` when the task still owes a decision on file-permission
+  // violations: a stop must not clear the label the pending set earns (see
+  // src/utils/paused-status.ts).
+  await parkTaskPaused(storage, task.id, actor, { sessionId: sess.id });
   await storage.recordInterrupt(sess.id, {
     reason: `Stopped by user: ${reason}`,
     exit_code: null,
@@ -4344,8 +4724,7 @@ export async function approveTaskPreflight(
     throw new RpcError(404, `Task not found: ${params.taskId}`);
   }
 
-  const config = await loadConfig(projectRoot);
-  const verifier = createHumanTokenVerifier(config, projectRoot);
+  const verifier = createHumanTokenVerifier(projectRoot);
   const probe = await verifier.probeEnrollment();
 
   return {
@@ -4379,8 +4758,7 @@ export async function approveTask(
     throw new RpcError(400, 'An approval passphrase is required.');
   }
 
-  const config = await loadConfig(projectRoot);
-  const verifier = createHumanTokenVerifier(config, projectRoot);
+  const verifier = createHumanTokenVerifier(projectRoot);
   const verdict = await verifier.verify(params.token);
   if (!verdict.ok) {
     throw new RpcError(403, verdict.message);

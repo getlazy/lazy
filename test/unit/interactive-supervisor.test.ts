@@ -70,7 +70,7 @@ async function harness(opts: {
         },
       };
     },
-    spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+    spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
     DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
   }));
 

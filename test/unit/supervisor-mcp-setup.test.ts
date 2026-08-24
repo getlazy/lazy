@@ -98,6 +98,32 @@ describe('prepareTurnMcp', () => {
     expect(allow).not.toContain('mcp__lazy__lazy_commit');
   });
 
+  // INVARIANT (cursor-first-class-agent): a cursor turn must get the lazy MCP
+  // server in ~/.cursor/mcp.json — cursor-agent never reads ~/.claude.json, so
+  // without this file the cursor agent runs with NO lazy tools at all.
+  test('a cursor turn additionally writes ~/.cursor/mcp.json', async () => {
+    await prepareTurnMcp(stubRunner({}), 'abcdef1234', '/wt', { readOnly: false, agentId: 'cursor' }, silent);
+
+    const cursorConfig = JSON.parse(await readFile(join(home, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.lazy.command).toBe('lazy-agent');
+    // The claude config is still written — in-container merge turns run claude.
+    expect((await readConfig()).mcpServers.lazy).toBeDefined();
+  });
+
+  test('a claude turn does not create ~/.cursor/mcp.json', async () => {
+    await prepareTurnMcp(stubRunner({}), 'abcdef1234', '/wt', { readOnly: false }, silent);
+    expect(await Bun.file(join(home, '.cursor', 'mcp.json')).exists()).toBe(false);
+  });
+
+  test('cursor mcp.json write preserves other servers', async () => {
+    await Bun.write(join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { other: { command: 'x' } } }));
+    await prepareTurnMcp(stubRunner({}), 'abcdef1234', '/wt', { agentId: 'cursor' }, silent);
+
+    const cursorConfig = JSON.parse(await readFile(join(home, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursorConfig.mcpServers.other).toEqual({ command: 'x' });
+    expect(cursorConfig.mcpServers.lazy).toBeDefined();
+  });
+
   test('preserves other MCP servers already in the config', async () => {
     await Bun.write(join(home, '.claude.json'), JSON.stringify({ mcpServers: { other: { command: 'x' } } }));
     await prepareTurnMcp(stubRunner({}), 'abcdef1234', '/wt', {}, silent);
@@ -197,6 +223,6 @@ describe('supervisor MCP coverage', () => {
     );
     const start = source.indexOf('async function handleAskCommand(');
     const body = source.slice(start, start + 6000);
-    expect(body).toContain('prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true })');
+    expect(body).toContain('prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true, agentId: cmd.agent_id })');
   });
 });

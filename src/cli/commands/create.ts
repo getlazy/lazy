@@ -1,8 +1,9 @@
 import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
 import { openEditor, promptLine, removeRecoveryFile, readStdinIfPiped } from '../editor';
-import type { TaskType, TaskPriority } from '../../types';
+import type { Task, TaskType, TaskPriority } from '../../types';
 import { VALID_TASK_TYPES, VALID_TASK_PRIORITIES } from '../../types';
 import { listAgents } from '../../agent/registry';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { loadConfig } from '../../config/loader';
 import { VALID_EFFORT_LEVELS, type EffortLevel, type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT } from '../../config/types';
 import { parentTaskIdOf, branchTarget } from '../../task-target';
@@ -112,7 +113,9 @@ export async function commandCreate(args: string[]): Promise<void> {
     code = codeValue;
   }
 
-  // Parse --agent flag (falls back to config's agent.agent_id)
+  // Parse --agent flag. Resolution (explicit > parent > project default) is
+  // finished below, once we know whether this is a subtask — a subtask must
+  // inherit its parent's agent rather than the project default.
   const agentValue = parsed.flags.get('agent') as string | undefined;
   if (agentValue !== undefined) {
     const validAgents = listAgents();
@@ -120,14 +123,8 @@ export async function commandCreate(args: string[]): Promise<void> {
       console.error(`Unknown agent '${agentValue}'. Available agents: ${validAgents.join(', ')}`);
       process.exit(1);
     }
-    agentId = agentValue;
-  } else {
-    // Default to config's agent_id so tasks inherit the project's configured agent
-    const config = await loadConfig(process.cwd());
-    if (config.agent.agent_id && config.agent.agent_id !== 'claude-code') {
-      agentId = config.agent.agent_id;
-    }
   }
+  const configAgentId = (await loadConfig(process.cwd())).agent.agent_id;
 
   // Flag mode: both goal and optionally prompt provided
   const goalValue = parsed.flags.get('goal') as string | undefined;
@@ -185,6 +182,7 @@ export async function commandCreate(args: string[]): Promise<void> {
   try {
     // Resolve --parent: a task code/short-ID, or (fall-through) a raw git branch
     // name. Same precedence as `lazy reparent` — try task first, then branch.
+    let parentTask: Task | null = null;
     if (parentValue !== undefined) {
       const resolved = await storage.resolveTask(parentValue);
       if (resolved.task) {
@@ -193,6 +191,7 @@ export async function commandCreate(args: string[]): Promise<void> {
           process.exit(1);
         }
         parentTaskId = resolved.task.id;
+        parentTask = resolved.task;
       } else if (resolved.ambiguousMatches?.length) {
         console.error(`Ambiguous parent '${parentValue}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
         process.exit(1);
@@ -212,6 +211,14 @@ export async function commandCreate(args: string[]): Promise<void> {
         explicitBranchTarget = parentValue;
       }
     }
+
+    // A subtask inherits its parent's agent — the project default must not
+    // quietly retarget a child of a task that is deliberately on another agent.
+    agentId = resolveAgentForNewTask({
+      explicit: agentValue,
+      inheritFrom: parentTask,
+      configDefault: configAgentId,
+    });
 
     const t = await storage.createTask(goal, parentTaskId, undefined, code, taskType ?? undefined, agentId);
 

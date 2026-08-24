@@ -13,7 +13,7 @@
  *
  * INVARIANT: these surfaces are read-only. There is no `lazy_protect` /
  * `lazy_approve` tool and nothing here creates one — arranging your own gates
- * is a human act (docs/surface-asymmetries.md).
+ * is a human act (public-docs/surface-asymmetries.md).
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -23,8 +23,21 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { runMcpSession } from '../helpers/mcp-session';
+import { enrollPassphrase } from '../helpers/passphrase';
 
 const PASSPHRASE = 'test-approval-passphrase';
+
+/**
+ * Env that drives the masked `lazy approve` prompt as if a human typed the
+ * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
+ * no env var, no piped-stdin route — so this test-only pair is the only way a
+ * test can supply it (see test/e2e/system-passphrase.test.ts).
+ */
+const TYPES_PASSPHRASE = {
+  LAZY_FORCE_TTY: '1',
+  LAZY_PROMPT_DEFAULTS: '1',
+  LAZY_PROMPT_SECRET: PASSPHRASE,
+};
 
 /**
  * Opt in to branch protection (OFF by default) and enroll the passphrase.
@@ -42,7 +55,7 @@ async function enableProtection(ctx: TestContext, extraProtectionToml = ''): Pro
   const updated = toml.replace('[protection]\n', `[protection]\nenabled = true\n${extraProtectionToml}`);
   expect(updated).not.toBe(toml);
   await writeFile(tomlPath, updated);
-  await writeFile(join(ctx.root, '.lazy', 'approve-passphrase'), `${PASSPHRASE}\n`);
+  await enrollPassphrase(ctx.passphraseBaseDir, PASSPHRASE);
 }
 
 /** List `taskCode` in [protection].protected_tasks WITHOUT enabling protection. */
@@ -94,7 +107,7 @@ describe('protection surfacing (read-only)', () => {
     await enableProtection(ctx);
     const taskId = await startedTask(ctx, 'Show pending approval');
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
@@ -122,7 +135,7 @@ describe('protection surfacing (read-only)', () => {
     expect(before.stdout).not.toContain('[P][A]');
     expect(before.stdout).toContain('protected — accepting needs');
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     const after = await ctx.lazy(['list']);
     expectSuccess(after);
@@ -168,7 +181,7 @@ describe('protection surfacing (read-only)', () => {
   test('MCP lazy_show carries the protection object', async () => {
     await enableProtection(ctx);
     const taskId = await startedTask(ctx, 'MCP protection field');
-    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     const responses = await runMcpSession(ctx.root, '', ctx.root, [
       { method: 'initialize', id: 1, params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } } },

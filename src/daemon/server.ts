@@ -41,7 +41,21 @@ import { lookupMcpIdentity } from './mcp-tokens';
 import { initTracing, shutdownTracing } from '../tracing';
 import { withRequestSpan } from './request-span';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
+import { acceptRemedyOf } from '../types';
+
+/**
+ * The body of a failed reply.
+ *
+ * Errors that carry a structured remedy (a refused accept) send it alongside
+ * the message so the client does not have to pattern-match prose to learn what
+ * the human should do next. Everything else is unchanged: `{ error }`.
+ */
+function errorBody(err: unknown, message: string): { error: string; remedy?: unknown } {
+  const remedy = acceptRemedyOf(err);
+  return remedy ? { error: message, remedy } : { error: message };
+}
 import { clearAllWaits } from './wait-registry';
+import { clearAllProgress } from './progress-registry';
 import { readJsonBody, readJsonObjectBody } from './http-body';
 import {
   clientAcceptsHeartbeat,
@@ -66,6 +80,8 @@ import { getLogPath } from './paths';
 import { loadConfig, resolveConfigPath } from '../config/loader';
 import type { RunnerType } from '../config/types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
+import { buildProxyCredentialDeps } from '../proxy/credential-deps';
+import { roleUpstreamMap } from '../proxy/role-upstreams';
 import {
   createProxyServer,
   ProxyAuditLog,
@@ -87,6 +103,7 @@ import {
   type StateChange,
 } from './auto-deliver';
 import { runAutoReact } from './auto-react';
+import { processAutoResumeQueue } from './auto-resume-queue';
 import { closeSignalDb, initSignalDb } from './signals';
 import { startSyncRetryLoop } from './sync-retry';
 import { sweepConversations, createSweepCursor } from '../import/capture-sweep';
@@ -140,7 +157,7 @@ export interface RunningDaemon {
   webPort?: number;
   /** Interface the web dashboard bound to (= config.server.bind), if bound. */
   bindHost?: string;
-  /** Anthropic passthrough proxy server, if [proxy] is configured. */
+  /** Anthropic passthrough proxy server — always started; undefined only if startup failed. */
   proxyServer?: ReturnType<typeof Bun.serve>;
   /**
    * Stop the daemon server and clean up files. Does NOT exit the process.
@@ -268,6 +285,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // removes the temp directory, leaving cwd pointing at a deleted path.
   if (!process.env.LAZY_TEST) {
     process.chdir(projectRoot);
+  }
+
+  // Container-image resolution honors LAZY_DOCKERFILE_LAZY (see
+  // resolveCustomDockerfile in src/capture/claude.ts). Say so once at startup:
+  // every container this daemon launches will resolve that file, and a daemon
+  // started WITHOUT the var keeps ignoring it until restarted.
+  if (process.env.LAZY_DOCKERFILE_LAZY) {
+    logger.info(`Container images follow LAZY_DOCKERFILE_LAZY=${process.env.LAZY_DOCKERFILE_LAZY}`);
   }
 
   const socketPath = options.socketPath ?? getSocketPath(projectRoot);
@@ -479,7 +504,6 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // flows (the primary way to find the address now that the port is
       // OS-assigned by default). File read only; no storage/lock.
       let proxy: {
-        enabled: boolean;
         running: boolean;
         bind: string;
         port: number | null;
@@ -490,27 +514,18 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       } | undefined;
       try {
         const config = await loadConfig(projectRoot, { cwd: projectRoot });
-        if (config.proxy) {
-          const port = proxyServer?.port ?? null;
-          proxy = {
-            enabled: true,
-            running: proxyServer !== undefined,
-            bind: config.proxy.bind,
-            port,
-            address: port !== null ? `http://${config.proxy.bind}:${port}` : null,
-            upstream: config.proxy.upstream,
-            fallbacks: config.proxy.fallbacks.length,
-            policyEnforce: config.proxy.policy.enforce,
-          };
-        } else {
-          // Explicitly disabled. Report it rather than omitting the field: with
-          // the proxy on by default, silence would be indistinguishable from
-          // "running" and would hide that traffic is unaudited.
-          proxy = {
-            enabled: false, running: false, bind: '', port: null, address: null,
-            upstream: '', fallbacks: 0, policyEnforce: false,
-          };
-        }
+        // The proxy is always configured — `running` is the only question, and
+        // `false` means a degraded daemon, not an operator's choice.
+        const port = proxyServer?.port ?? null;
+        proxy = {
+          running: proxyServer !== undefined,
+          bind: config.proxy.bind,
+          port,
+          address: port !== null ? `http://${config.proxy.bind}:${port}` : null,
+          upstream: config.proxy.upstream,
+          fallbacks: config.proxy.fallbacks.length,
+          policyEnforce: config.proxy.policy.enforce,
+        };
       } catch { /* proxy status is optional; never block the health probe */ }
 
       return Response.json({
@@ -629,7 +644,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           // matching how the /rpc route below treats an RpcError.
           const line = `MCP ${toolName} for task ${taskIdParam.substring(0, 8)} failed (${status}) in ${durationMs}ms: ${message}`;
           if (status >= 500) logger.error(line); else logger.info(line);
-          return { status, body: { error: message } };
+          return { status, body: errorBody(err, message) };
         }
       };
 
@@ -692,7 +707,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           const message = err instanceof Error ? err.message : String(err);
           const line = `Builder storage call failed (${status}): ${message}`;
           if (status >= 500) logger.error(line); else logger.info(line);
-          return { status, body: { error: message } };
+          return { status, body: errorBody(err, message) };
         }
       };
 
@@ -736,11 +751,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           if (status !== 500) {
             const message = err instanceof Error ? err.message : String(err);
             logger.info(`RPC ${command} failed (${status}) in ${durationMs}ms: ${message}`);
-            return { status, body: { error: message } };
+            return { status, body: errorBody(err, message) };
           }
           const message = err instanceof Error ? err.message : 'Internal error';
           logger.error(`RPC ${command} error in ${durationMs}ms: ${message}`);
-          return { status: 500, body: { error: message } };
+          return { status: 500, body: errorBody(err, message) };
         }
       };
 
@@ -828,7 +843,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   let webPort: number | undefined;
   // Additional listeners on the same port (e.g. docker bridge gateway on Linux).
   const extraWebServers: ReturnType<typeof Bun.serve>[] = [];
-  // Anthropic passthrough proxy — started after the web server if [proxy] is set.
+  // Anthropic passthrough proxy — always started, after the web server.
   // Declared here (not in the start block below) so teardownPartialStart can stop
   // it if a LATER startup step fails.
   let proxyServer: ReturnType<typeof Bun.serve> | undefined;
@@ -1237,9 +1252,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     }
   }
 
-  // Start the Anthropic passthrough proxy. This is ON BY DEFAULT — `cfg.proxy`
-  // is non-null unless the operator set `[proxy] enabled = false` — so the proxy
-  // is part of a normal daemon start, like the web server.
+  // Start the Anthropic passthrough proxy. This is ALWAYS ON — there is no
+  // config option to turn it off — so the proxy is part of a normal daemon
+  // start, like the web server.
   // The daemon owns the proxy: it announces its address at INFO next to the
   // dashboard. Audit records do NOT go through Storage — they are disposable
   // telemetry written to the project-local, size-capped
@@ -1256,11 +1271,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // it — telemetry, not durable state — and say so rather than letting data
     // disappear silently.
     //
-    // Deliberately OUTSIDE the `cfg.proxy` check: this is cleanup of a file a
-    // PREVIOUS version wrote, so whether the proxy runs now is irrelevant.
-    // Gating it on the proxy would strand the oversized file forever on exactly
-    // the machines that set `[proxy] enabled = false`, while `lazy doctor` told
-    // them to restart the daemon to remove it.
+    // This is cleanup of a file a PREVIOUS version wrote, and runs on every
+    // start regardless of how the proxy is doing.
     try {
       const storePath = (await getOrCreateStorage()).getStoragePath();
       const pruned = await pruneLegacyAuditLog(storePath);
@@ -1283,20 +1295,26 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       );
     }
 
-    if (cfg.proxy) {
-      proxyServer = createProxyServer(cfg.proxy, new ProxyAuditLog(dataDir));
-      // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
-      // omitted) so per-launch env injection and `lazy daemon status` resolve
-      // the real proxy address.
-      if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
-      // Announce the proxy at INFO alongside the web-dashboard line, on start
-      // and restart, so operators can see where audited traffic flows.
-      const fbCount = cfg.proxy.fallbacks.length;
-      logger.info(
-        `Proxy: http://${cfg.proxy.bind}:${proxyServer.port} → ${cfg.proxy.upstream} ` +
-        `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'})`,
-      );
-    }
+    proxyServer = createProxyServer(
+      // ROLE UPSTREAMS: a role's `endpoint` is where the PROXY forwards that
+      // role's traffic — the launched agent always dials the proxy itself.
+      { ...cfg.proxy, roleUpstreams: roleUpstreamMap(cfg) },
+      new ProxyAuditLog(dataDir),
+      // JIT credentials: from here on the daemon is the only process that holds
+      // a real one. Launched agents carry placeholders the proxy exchanges.
+      buildProxyCredentialDeps(projectRoot, cfg),
+    );
+    // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
+    // omitted) so per-launch env injection and `lazy daemon status` resolve
+    // the real proxy address.
+    if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
+    // Announce the proxy at INFO alongside the web-dashboard line, on start
+    // and restart, so operators can see where audited traffic flows.
+    const fbCount = cfg.proxy.fallbacks.length;
+    logger.info(
+      `Proxy: http://${cfg.proxy.bind}:${proxyServer.port} → ${cfg.proxy.upstream} ` +
+      `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'})`,
+    );
   } catch (err) {
     // A proxy startup failure is a CONTROLLED startup error — never an unhandled
     // rejection that silently kills reconcile/sync/web (that was the ~6s-after-boot
@@ -1311,9 +1329,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     const errorMessage =
       `Daemon failed to start the [proxy] server: ${detail}\n` +
       `\n` +
-      `lazy routes all agent model traffic through its local audit/policy proxy by default, ` +
+      `lazy routes all agent model traffic through its local audit/policy proxy, always, ` +
       `and will not run half-configured: continuing without it would send agent traffic ` +
-      `direct while the audit trail recorded nothing.\n` +
+      `direct while the audit trail recorded nothing. There is no way to turn the proxy ` +
+      `off — the fix is to get it running.\n` +
       `\n` +
       `To fix:\n` +
       `  • Port already in use: the proxy picks a free port automatically, so this means a\n` +
@@ -1323,10 +1342,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       `  • Storage lock contention (another project's daemon holds the lock): two projects\n` +
       `    must not share one store — check [storage] external_path in lazy.toml, and run\n` +
       `    'lazy daemon list' to see which project each daemon serves.\n` +
-      `  • To get unblocked right now, turn the proxy off and connect directly\n` +
-      `    (no audit trail, no policy enforcement):\n` +
-      `      [proxy]\n` +
-      `      enabled = false`;
+      `  • Bind address unavailable: [proxy] bind must be an address this host owns\n` +
+      `    (the default, 127.0.0.1, always works).`;
     throw await failStartup(errorMessage);
   }
 
@@ -1431,6 +1448,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // rely on that fallback.
     await clearAllWaits().catch(err => {
       logger.warn(`Shutdown: clearing wait markers failed: ${err instanceof Error ? err.message : err}`);
+    });
+    // Same for agent-reported progress lines (progress.json) — same rationale.
+    await clearAllProgress().catch(err => {
+      logger.warn(`Shutdown: clearing progress markers failed: ${err instanceof Error ? err.message : err}`);
     });
     // Flush any batched spans BEFORE storage closes — the span sink writes
     // through Storage, so it must still be open here.
@@ -1621,6 +1642,14 @@ function startDaemonReconcileLoop(
     const myStartTime = Date.now();
     reconcileStartedAt = myStartTime;
 
+    // Announce the tick BEFORE doing anything in it. Until this line existed, a
+    // tick that wedged in an early phase (storage open, listTasks, loadConfig,
+    // reconcileTasks) logged nothing at all — the first entry was the
+    // "tick completed" line at the very end — so an unfinished tick was
+    // indistinguishable from an idle daemon in the log. Debug level: this fires
+    // every few seconds and is a diagnostic, not an event.
+    logger.debug('Daemon reconcile tick starting');
+
     // Check log rotation at the start of each tick
     logger.checkRotation();
 
@@ -1801,6 +1830,19 @@ function startDaemonReconcileLoop(
             if (onBudgetUpdate && autoReactResult.budgetSkipped.length > 0) {
               onBudgetUpdate(autoReactResult.budgetSkipped);
             }
+          }
+        });
+      }
+
+      // Slow-lane auto-resume: retry tasks whose fast-lane circuit breaker has
+      // tripped, at most one per tick, respecting daemon.auto_resume_gap_minutes.
+      if (!stopped) {
+        await runPhase('processAutoResumeQueue', async () => {
+          const config = await loadConfig(projectRoot);
+          const dataDir = join(projectRoot, config.data.path);
+          const result = await processAutoResumeQueue(storage, projectRoot, config, dataDir, Date.now());
+          if (result.attempted) {
+            logger.debug(`Auto-resume queue: attempted task ${result.taskId} (success=${result.success}, exhausted=${result.exhausted})`);
           }
         });
       }

@@ -55,8 +55,7 @@ import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
-import { spawnSync } from '../utils/spawn';
-import { spawn } from '../utils/spawn';
+import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
@@ -231,7 +230,9 @@ export function detectGitHub(repoDir: string, remoteName: string = 'origin'): Dr
   try {
     // SYNC CALL: This is called during `lazy init` before any async context exists.
     // It's a one-time detection check, not a runtime operation — blocking is acceptable here.
-    const proc = spawnSync(['git', 'remote', 'get-url', remoteName], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe' });
+    // Bounded at 10s: git can hang on a locked config or a slow filesystem, and
+    // the default backstop is far longer than a `remote get-url` should take.
+    const proc = spawnSyncUnsupervised(['git', 'remote', 'get-url', remoteName], { cwd: repoDir, stdout: 'pipe', stderr: 'pipe', timeout: 10_000 });
     const exitCode = proc.exitCode ?? 1;
     const url = proc.stdout ? proc.stdout.toString().trim() : '';
 

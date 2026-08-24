@@ -5,10 +5,11 @@ import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
-import { storageDirFor } from '../helpers/storage';
+import { storageDirFor, setTaskStatus, setTaskMetadata } from '../helpers/storage';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawn } from '../../src/utils/spawn';
 import { readProcessIdentity } from '../../src/utils/process-identity';
+import { enrollPassphrase } from '../helpers/passphrase';
 
 describe('lazy doctor', () => {
   let ctx: TestContext;
@@ -35,6 +36,21 @@ describe('lazy doctor', () => {
   test('reports data directory valid in initialized project', async () => {
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, 'Data directory valid');
+  });
+
+  // REGRESSION (fix-stranded-merging): a task whose accept died mid-merge used to
+  // be invisible — `lazy doctor` said nothing and every exit refused. Doctor now
+  // names the task and the remedy.
+  test('reports a task stranded in merging and names the remedy', async () => {
+    const create = await ctx.lazy(['create', '--goal', 'Wedged task']);
+    expectSuccess(create);
+    const taskId = create.stdout.match(/([0-9a-f]{8})/)![1];
+    setTaskStatus(ctx.root, taskId, 'merging');
+    setTaskMetadata(ctx.root, taskId, 'accept_in_flight_from', 'blocked');
+
+    const result = await ctx.lazy(['doctor']);
+    expectOutput(result, "task(s) in 'merging'");
+    expectOutput(result, 'lazy unblock');
   });
 
   // `lazy doctor` is the single surface that spells out the memory-context size
@@ -418,6 +434,71 @@ describe('lazy doctor', () => {
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, 'No unknown config options');
     expectOutput(result, 'No deprecated config options');
+  });
+
+  // The approval passphrase left the repository in v0.23: it is enrolled once
+  // per machine, hashed, at ~/.lazy/passphrase.json. That makes "can a gated
+  // merge be approved HERE?" a machine question the project cannot answer from
+  // its config — so doctor is where it gets answered.
+  describe('approval passphrase checks', () => {
+    test('reports enrollment when this machine has a passphrase', async () => {
+      await enrollPassphrase(ctx.passphraseBaseDir, 'correct-horse-battery');
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'Approval passphrase enrolled');
+      // Never the hash, never the phrase — doctor output is pasted into issues.
+      expectOutputExcludes(result, 'correct-horse-battery');
+      expectOutputExcludes(result, '$argon2');
+    });
+
+    test('warns when protection is on but nothing is enrolled here', async () => {
+      expectSuccess(await ctx.lazy(['protect', 'main', 'on']));
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'no approval passphrase is enrolled on this machine');
+      expectOutput(result, 'lazy system passphrase set');
+    });
+
+    // Protection off is the default, and an unenrolled machine is then simply
+    // not a finding — doctor must not nag every project about a gate nobody
+    // armed.
+    test('says nothing is needed when protection is off', async () => {
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'not needed — protection is off');
+    });
+
+    // The migration's other half: the pre-v0.23 plaintext file is no longer
+    // consulted, but a live secret sitting in a tree every agent can read is
+    // exactly what the move was for. Flagged whether or not protection is on.
+    test('flags a leftover plaintext passphrase file with the command to remove it', async () => {
+      const legacy = join(ctx.root, '.lazy', 'approve-passphrase');
+      writeFileSync(legacy, 'old-plaintext-secret\n');
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'Legacy plaintext passphrase file');
+      expectOutput(result, 'NO LONGER CONSULTED');
+      expectOutput(result, `rm ${legacy}`);
+      // The file's CONTENTS must never be echoed by a diagnostic command.
+      expectOutputExcludes(result, 'old-plaintext-secret');
+    });
+
+    // A removed key must get its migration, not a generic "unknown option"
+    // that sends the human hunting for a typo.
+    test('reports the removed [protection] passphrase_file key with its migration', async () => {
+      const configPath = join(ctx.root, 'lazy.toml');
+      const before = readFileSync(configPath, 'utf-8');
+      const after = before.replace(
+        '[protection]',
+        '[protection]\npassphrase_file = ".lazy/approve-passphrase"',
+      );
+      expect(after).not.toBe(before);
+      writeFileSync(configPath, after);
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, "'protection.passphrase_file' is obsolete and is IGNORED");
+      expectOutput(result, 'lazy system passphrase set');
+      expectOutputExcludes(result, "Unknown config option 'protection.passphrase_file'");
+    });
   });
 
   test('shows shell detection status', async () => {

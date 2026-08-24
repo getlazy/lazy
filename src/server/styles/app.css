@@ -156,6 +156,13 @@ tr:hover { background: var(--bg-secondary); }
   font-size: 11px;
   margin-left: 8px;
 }
+/* Which agent/model/effort a turn ran under — same weight as the token counts:
+   present on every turn, but never louder than the turn itself. */
+.turn-launch {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-left: 8px;
+}
 .turn-content {
   font-family: var(--font-ui);
   font-size: 13px;

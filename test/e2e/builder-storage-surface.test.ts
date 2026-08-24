@@ -15,7 +15,7 @@
  *     whose agent can read its own config file the full /rpc/<command> CLI
  *     pass-through and the unrestricted Storage interface.
  *   - Teach /rpc/* to accept MCP tokens. That collapses the deliberate,
- *     documented split between the two surfaces (docs/lazy-agent-design.md).
+ *     documented split between the two surfaces (public-docs/lazy-agent-design.md).
  * So capture got its own surface instead, strictly narrower than both: builder
  * tokens only, four methods only.
  *

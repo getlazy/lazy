@@ -6,8 +6,11 @@ import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, DEFAULT_MEMORY_WARN_BYTES } from
 import { pathExists, readFile } from '../utils/fs';
 import { expandTilde } from '../utils/home';
 import { validateMounts } from '../capture/mounts';
+import { DEFAULT_CURSOR_UPSTREAM } from '../proxy/cursor-route';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from '../proxy/policy';
 import { DEFAULT_DOCS_URL, normalizeDocsUrl, setDocsBaseUrl } from '../docs/links';
+import { endpointForHost } from '../utils/role-target';
+import { findDeprecatedConfigKeys } from './schema';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -184,7 +187,6 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     protected_branches: [],
     protected_tasks: [],
     gate_default_branch: true,
-    passphrase_file: '.lazy/approve-passphrase',
   },
   automation: {
     maintain: [],
@@ -207,9 +209,19 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   ollama: {
     enabled: false,
     model: '',
-    endpoint: 'http://host.docker.internal:11434',
+    endpoint: 'http://localhost:11434',
   },
-  proxy: null,
+  // The proxy is always on: a project with no lazy.toml at all still gets a
+  // fully-defaulted, live proxy config. There is no "no proxy" resolved state.
+  proxy: {
+    port: 0,
+    bind: '127.0.0.1',
+    upstream: 'https://api.anthropic.com',
+    cursorUpstream: DEFAULT_CURSOR_UPSTREAM,
+    fallbacks: [],
+    retryAfterThreshold: 5,
+    policy: defaultPolicyConfig(),
+  },
   memory: {
     warn_bytes: DEFAULT_MEMORY_WARN_BYTES,
   },
@@ -220,6 +232,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     max_concurrent_agents: 8,
     max_concurrent_builders: 8,
     idle_grace_minutes: 10,
+    max_turns_without_human: 10,
   },
   daemon: {
     auto_react_ci: true,
@@ -228,6 +241,10 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     auto_react_backoff: 'exponential',
     auto_react_daily_budget: 50,
     max_auto_turns: 3,
+    auto_resume: true,
+    auto_resume_interval_minutes: 30,
+    auto_resume_gap_minutes: 5,
+    auto_resume_max_attempts: 24,
   },
 };
 
@@ -298,6 +315,34 @@ function resolveProxyPolicy(
   };
 }
 
+/**
+ * Reinterpret a role `endpoint` from the host's perspective.
+ *
+ * MIGRATION (proxy-role-upstreams): a role's `endpoint` used to be an address
+ * the AGENT dialed, so it was written from the agent's perspective — inside a
+ * container, that means `host.docker.internal`. It is now the upstream lazy's
+ * PROXY forwards the role to, and the proxy runs in the daemon, on the host.
+ * The same string therefore names a different thing than it did, so lazy
+ * rewrites it to the host-side spelling of the same service and says so.
+ *
+ * The built-in default is host-perspective too, so anything reaching the rewrite
+ * below is a value the user typed — and their lazy.toml now says something they
+ * did not mean, which is exactly what a warning is for.
+ */
+function endpointFromHostPerspective(role: RoleName, endpoint: string): string {
+  if (!endpoint) return endpoint;
+  const rewritten = endpointForHost(endpoint);
+  if (rewritten !== endpoint) {
+    console.warn(
+      `Warning: lazy.toml [models.roles.${role}] endpoint = "${endpoint}" — this is now the ` +
+      `upstream lazy's proxy forwards this role to, and the proxy runs on the host, not in ` +
+      `the agent's container. Reading it as "${rewritten}". ` +
+      `Update lazy.toml to the host-side address to silence this warning.`,
+    );
+  }
+  return rewritten;
+}
+
 function resolveRole(
   role: RoleName,
   explicit: RoleTargetConfig | undefined,
@@ -323,11 +368,12 @@ function resolveRole(
       if (!endpoint && backend === 'ollama') {
         endpoint = DEFAULT_CONFIG.ollama.endpoint;
       }
-      // proxy: an empty endpoint is allowed and is the recommended default — the
-      // daemon injects its own live proxy base URL (with the OS-assigned port) at
-      // launch. An explicit endpoint still works as an override. The cross-check
-      // that a `[proxy]` section actually exists happens after proxy resolution.
-      return { backend, model: merged.model, endpoint };
+// proxy: an empty endpoint is allowed and is the recommended default — the
+      // role's traffic then goes to the proxy's primary upstream, exactly like an
+      // `anthropic` role. A non-empty endpoint routes this role's traffic there
+      // instead; it is never an address the agent dials. The cross-check that a
+      // `[proxy]` section actually exists happens after proxy resolution.
+      return { backend, model: merged.model, endpoint: endpointFromHostPerspective(role, endpoint) };
     }
     // anthropic: model may be empty (means "use models.default / the chain").
     return { backend: 'anthropic', model: merged.model ?? '', endpoint: '' };
@@ -335,7 +381,11 @@ function resolveRole(
 
   // No explicit per-role config — legacy [ollama] maps every role to ollama.
   if (config.ollama.enabled && config.ollama.model) {
-    return { backend: 'ollama', model: config.ollama.model, endpoint: config.ollama.endpoint };
+    return {
+      backend: 'ollama',
+      model: config.ollama.model,
+      endpoint: endpointFromHostPerspective(role, config.ollama.endpoint),
+    };
   }
 
   return { backend: 'anthropic', model: '', endpoint: '' };
@@ -376,6 +426,47 @@ function describeTomlError(error: unknown): string {
   return `line ${position.line}${source} — ${reason}`;
 }
 
+/** Emitted once per process, so a repeated loadConfig does not repeat itself. */
+const removedKeysWarned = new Set<string>();
+
+/** Test seam: reset the one-shot removed-key warnings. */
+export function resetRemovedKeyDeprecationWarnings(): void {
+  removedKeysWarned.clear();
+}
+
+/**
+ * Handle config keys lazy has REMOVED outright (DEPRECATED_SECTION_KEYS).
+ *
+ * Two jobs. First, strip the key off the resolved config: deepMerge copies keys
+ * it does not know about, so a removed key would otherwise ride along as a
+ * stray second source of truth. Second, say something — a removed key the human
+ * still believes is in force is exactly the "gate believed armed but isn't"
+ * failure protection must never have. One short line here per the
+ * single-warning-surface convention, naming the replacement command; the full
+ * diagnosis and remedy live in `lazy doctor`.
+ */
+function applyRemovedKeyDeprecations(
+  raw: Record<string, unknown>,
+  config: ResolvedConfig,
+): void {
+  for (const dotted of findDeprecatedConfigKeys(raw)) {
+    const [section, key] = dotted.split('.');
+    const resolvedSection = (config as unknown as Record<string, unknown>)[section];
+    if (resolvedSection && typeof resolvedSection === 'object') {
+      delete (resolvedSection as Record<string, unknown>)[key];
+    }
+    if (removedKeysWarned.has(dotted)) continue;
+    removedKeysWarned.add(dotted);
+    console.warn(
+      `Warning: [${section}] ${key} in lazy.toml is obsolete and is ignored. ` +
+      `${dotted === 'protection.passphrase_file'
+        ? 'Enroll the approval passphrase with `lazy system passphrase set` instead. '
+        : ''}` +
+      `Run \`lazy doctor\` for details.`,
+    );
+  }
+}
+
 /**
  * Load and parse lazy.toml, returning the raw (un-merged) TOML object.
  * Returns null if no config file exists or parsing fails.
@@ -406,15 +497,7 @@ export async function loadRawConfig(lazyRoot: string): Promise<Record<string, un
  *   because its own cwd may belong to a different project.
  */
 export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): Promise<ResolvedConfig> {
-  // When LAZY_CONFIG is an absolute path, use it directly instead of walking
-  // directories. This supports VMs and CI where the config lives outside the repo.
-  let configPath: string;
-  if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
-    configPath = process.env.LAZY_CONFIG;
-  } else {
-    const configDir = await findConfigDir(lazyRoot, options?.cwd);
-    configPath = join(configDir, CONFIG_FILENAME);
-  }
+  const configPath = await resolveConfigPath(lazyRoot, options?.cwd);
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
   if (process.env.LAZY_CONFIG && !(await pathExists(configPath))) {
@@ -446,8 +529,8 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     // worst possible behaviour: every setting the user wrote is discarded at
     // once and lazy runs with defaults that look deliberate. A duplicate
     // `[runner]` table meant agents ran in Docker while the file plainly said
-    // host-process; `[proxy] enabled = false` would be ignored and traffic
-    // would be proxied anyway; `[storage] external_path` would be ignored and
+    // host-process; `[proxy] upstream` would be ignored and traffic
+    // would go to the stock upstream anyway; `[storage] external_path` would be ignored and
     // the store would split. Each one surfaces far from its cause.
     throw new Error(
       `Failed to parse ${configPath}: ${describeTomlError(error)}\n` +
@@ -532,6 +615,11 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
   if (legacyWindDown !== undefined && parsed.agent?.wind_down_timeout_ms === undefined) {
     config.agent.wind_down_timeout_ms = legacyWindDown;
   }
+
+  // Keys lazy has REMOVED (as opposed to renamed). There is no honoured old
+  // spelling — `[protection].passphrase_file` cannot be honoured, because the
+  // file it pointed at is exactly the hazard the move removed.
+  applyRemovedKeyDeprecations(parsed as unknown as Record<string, unknown>, config);
 
   // Validate agent_id against registry
   const validAgents = listAgents();
@@ -620,6 +708,25 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
       `Invalid idle_grace_minutes = ${config.limits.idle_grace_minutes} in lazy.toml [limits] section: must be a non-negative integer.`,
     );
   }
+  // max_turns_without_human: 0 means unlimited, so it's the one [limits] key
+  // allowed to be 0 without meaning "disabled".
+  if (!Number.isInteger(config.limits.max_turns_without_human) || config.limits.max_turns_without_human < 0) {
+    throw new Error(
+      `Invalid max_turns_without_human = ${config.limits.max_turns_without_human} in lazy.toml [limits] section: must be a non-negative integer (0 = unlimited).`,
+    );
+  }
+
+  // Auto-resume knobs — all must be positive; auto_resume itself is the switch
+  // that disables the whole mechanism, so a "0 = unlimited" escape hatch here
+  // would be ambiguous with that switch.
+  for (const key of ['auto_resume_interval_minutes', 'auto_resume_gap_minutes', 'auto_resume_max_attempts'] as const) {
+    const value = config.daemon[key];
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(
+        `Invalid ${key} = ${value} in lazy.toml [daemon] section: must be a positive integer.`,
+      );
+    }
+  }
 
   // The memory size threshold is ADVISORY (it only decides when a launch warns
   // and suggests `lazy memory compact`), but a nonsense value would make the
@@ -648,14 +755,36 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     agent: resolveRole('agent', parsed.models?.roles?.agent, config),
   };
 
-  // Resolve proxy config. The proxy is ON BY DEFAULT — it is how lazy runs, the
-  // same way the daemon is — so a project with NO [proxy] section still gets a
-  // fully-defaulted proxy. `null` means exactly one thing: `enabled = false`,
-  // the explicit escape hatch back to direct connections.
-  if (parsed.proxy?.enabled === false) {
-    config.proxy = null;
-  } else {
+  // Resolve proxy config. The proxy is ALWAYS ON — it is how lazy runs, the same
+  // way the daemon is — so a project with NO [proxy] section still gets a fully
+  // defaulted proxy, and there is no resolved state in which it is absent.
+  {
     const parsedProxy = parsed.proxy ?? {};
+    // `[proxy] enabled` was REMOVED. A config that still carries it is a config
+    // the user believes is doing something, so it must never be silently
+    // ignored — but the right response depends on the VALUE. `enabled = true`
+    // asks for exactly what lazy already does, so the line is merely dead: warn,
+    // name the removed option, and continue. `enabled = false` asks for
+    // something lazy no longer does, so it stays a hard reject.
+    if ('enabled' in parsedProxy) {
+      const value = (parsedProxy as { enabled?: unknown }).enabled;
+      if (value === true) {
+        console.warn(
+          'Warning: lazy.toml [proxy] enabled = true — the `enabled` option has been removed. ' +
+          'The audit/policy proxy is always on, so this line does nothing. ' +
+          'Delete the `enabled` line from [proxy] in lazy.toml.',
+        );
+      } else {
+        throw new Error(
+          `lazy.toml [proxy] enabled = ${JSON.stringify(value)} — the \`enabled\` option has been removed. ` +
+          'The audit/policy proxy is always on: all agent model traffic routes through it, ' +
+          'and a launch that cannot reach it fails rather than connecting direct.\n' +
+          'Delete the `enabled` line from [proxy] in lazy.toml. ' +
+          '(There is no per-role opt-out either: an `endpoint` under [models.roles.*] now ' +
+          'chooses where the PROXY forwards that role, not whether it is proxied.)',
+        );
+      }
+    }
     // Port is OPTIONAL. Omitted → 0, meaning "let the OS assign a free port at
     // bind time" (the daemon reads the actual port back and advertises it). A
     // hardcoded port conflicts across per-project daemons, so auto-assign is the
@@ -690,9 +819,21 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
           'omit it to keep the original model, or set a non-empty model name.',
         );
       }
+      // Which credential the proxy injects on a reroute here. Defaults to
+      // "none" deliberately — see LazyConfig.proxy.fallbacks.
+      const credential: 'anthropic' | 'none' =
+        (f.credential ?? 'none') as 'anthropic' | 'none';
+      if (credential !== 'anthropic' && credential !== 'none') {
+        throw new Error(
+          `lazy.toml [[proxy.fallback]] entry #${i + 1} has an invalid "credential" — ` +
+          'use credential = "anthropic" for an Anthropic-credentialed target, or omit it ' +
+          '(equivalent to credential = "none") for a target that needs no credential.',
+        );
+      }
       return {
         upstream: f.upstream.replace(/\/$/, ''),
         ...(f.model !== undefined ? { model: f.model } : {}),
+        credential,
       };
     });
 
@@ -709,30 +850,16 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
       port,
       bind: parsedProxy.bind ?? '127.0.0.1',
       upstream: (parsedProxy.upstream ?? 'https://api.anthropic.com').replace(/\/$/, ''),
+      cursorUpstream: (parsedProxy.cursor_upstream ?? DEFAULT_CURSOR_UPSTREAM).replace(/\/$/, ''),
       fallbacks,
       retryAfterThreshold: threshold ?? 5,
       policy: resolveProxyPolicy(parsedProxy.policy),
     };
   }
 
-  // Cross-check: a role that routes through the proxy with no explicit endpoint
-  // relies on the daemon injecting its live proxy base URL — which does not exist
-  // when the proxy was explicitly turned off. Fail hard at load (never silently at
-  // launch with an empty ANTHROPIC_BASE_URL). Since the proxy is on by default,
-  // this can now only trip on `[proxy] enabled = false`.
-  if (!config.proxy) {
-    for (const role of ['builder', 'agent'] as const) {
-      const t = config.models.roles[role];
-      if (t.backend === 'proxy' && !t.endpoint) {
-        throw new Error(
-          `[models.roles.${role}] uses backend = "proxy" but the proxy is disabled ` +
-          `([proxy] enabled = false in lazy.toml). Remove \`enabled = false\` to run the proxy, ` +
-          `set an explicit endpoint on the role to point at an external one, ` +
-          `or switch the role to backend = "anthropic".`,
-        );
-      }
-    }
-  }
+  // NOTE: there used to be a cross-check here for `backend = "proxy"` roles with
+  // no endpoint under a disabled proxy. With the proxy always on, the daemon
+  // always has a live address to inject, so that state is unreachable.
 
   // Install the docs base for this process. Doc pointers are built deep inside
   // guards and thrown errors that never see a ResolvedConfig; this is the one
@@ -775,7 +902,7 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
   const remoteName = gitRemote || 'origin';
 
   return `# Lazy configuration
-# Documentation: https://gitlab.com/getlazy/lazy/-/blob/main/docs/lazy-toml.md
+# Documentation: https://gitlab.com/getlazy/lazy/-/blob/main/public-docs/lazy-toml.md
 #
 # Override the config filename with the LAZY_CONFIG environment variable
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
@@ -789,9 +916,11 @@ default = "claude-opus-4-8"
 # different backends — e.g. keep the builder on real Anthropic while agents run
 # on a local Ollama model. backend = "anthropic" | "ollama" | "proxy".
 # When set, these override the legacy [ollama] block for that role. ollama/proxy
-# require a model; proxy requires an endpoint; ollama defaults the endpoint to
-# host.docker.internal:11434. Lazy preflights each backend before launch and
-# fails (never silently falls back) if it is unreachable.
+# require a model; ollama defaults the endpoint to localhost:11434. An endpoint
+# is the upstream lazy's PROXY forwards that role to, so it is host-perspective:
+# every launch dials the proxy, whatever the backend. Lazy preflights each
+# backend before launch and fails (never silently falls back) if it is
+# unreachable.
 #
 # [models.roles.builder]
 # backend = "anthropic"
@@ -800,7 +929,7 @@ default = "claude-opus-4-8"
 # [models.roles.agent]
 # backend = "ollama"
 # model = "qwen3.5:35b-a3b-coding-nvfp4"
-# endpoint = "http://host.docker.internal:11434"
+# endpoint = "http://localhost:11434"
 
 [session]
 # Show Docker output in real-time during session execution
@@ -845,7 +974,7 @@ shortid_length = 8
 # url = "https://docs.internal.example.com/lazy"
 
 [agent]
-# Default agent type to use for sessions
+# Default agent for task execution. Available: "claude-code", "cursor".
 agent_id = "claude-code"
 # Reasoning effort level passed to Claude Code via --effort for task agents.
 # Higher levels spend more tokens thinking before responding.
@@ -961,7 +1090,7 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]
-# Path to custom Dockerfile (relative to project root)
+# Path to custom Dockerfile (relative to the project root)
 # If empty, uses the base image (Ubuntu with Claude Code + passwordless sudo).
 # Agents install what they need via apt-get.
 dockerfile = ""
@@ -1001,8 +1130,9 @@ dockerfile = ""
 # into any target, needs approval:
 # protected_tasks = ["add-auth"]
 # Manage both lists with: lazy protect <branch|task> on|off
-# File holding the approval passphrase (create it out-of-band; gitignored):
-# passphrase_file = ".lazy/approve-passphrase"
+# The approval passphrase itself is NOT configured here. It lives hashed
+# outside every repository, one per machine — enroll it once with:
+#   lazy system passphrase set
 
 [automation]
 # Maintained files — the inverse of [permissions].protected. Patterns agents are
@@ -1061,17 +1191,27 @@ dockerfile = ""
 # enabled = false
 # Model name to pass to Claude Code (e.g., "qwen3.5:35b-a3b-coding-nvfp4")
 # model = ""
-# Ollama API endpoint (containers use host.docker.internal to reach the host)
-# endpoint = "http://host.docker.internal:11434"
+# Ollama API endpoint, dialed by lazy's proxy on the host (host-perspective)
+# endpoint = "http://localhost:11434"
 
 # [proxy]
-# Built-in Anthropic-native passthrough proxy — enables request-level audit
-# logging (tool_use / tool_result contents, token usage, routing hints).
-# When set, the daemon starts the proxy on 'port'. Point a role target at it
-# with backend = "proxy" and endpoint = "http://127.0.0.1:<port>".
+# Built-in Anthropic-native passthrough proxy — ALWAYS ON, and there is no
+# option to turn it off. It gives you request-level audit logging (tool_use /
+# tool_result contents, token usage, routing hints) plus the policy plane below.
+# This whole section is optional tuning: with no [proxy] block the daemon starts
+# the proxy on an OS-assigned port and routes all agent model traffic through it.
+# 'port' is optional — set it only to pin a specific port.
 # port = 8766
 # bind = "127.0.0.1"
 # upstream = "https://api.anthropic.com"
+#
+# Cursor API traffic (the cursor-agent) routes through the SAME proxy port via a
+# /_lazy/cursor/<placeholder> path prefix, so cursor turns are audited and
+# attributed like Anthropic turns. Cursor requests are forwarded verbatim: no
+# policy enforcement and no failover chain apply to them, and the audit record is
+# coarse (role, task, method, path, status, duration) because the wire format is
+# not Anthropic's. Point this elsewhere only for a Cursor-compatible endpoint.
+# cursor_upstream = "https://api2.cursor.sh"
 #
 # Smart routing (opt-in): on a primary 429/529 or an unreachable primary, the
 # proxy reroutes to the fallback targets below, in order — re-sending the same
@@ -1087,8 +1227,8 @@ dockerfile = ""
 # model = "qwen3.5:35b-a3b-coding-nvfp4"           # optional model override
 
 # Mechanistic policy plane (§6.3 layer 1) — deterministic, injection-proof
-# deny-rules applied to each tool_use BEFORE it executes. When [proxy] is set
-# these are ON by default with a closed posture: inherited claude.ai account
+# deny-rules applied to each tool_use BEFORE it executes. These are ON by
+# default with a closed posture: inherited claude.ai account
 # connectors (mcp__claude_ai_*) are DENIED by default (they are injected
 # server-side and bypass the OS sandbox and lazy's permission model), and reads
 # of secret/credential paths (~/.ssh, .env, credentials) are denied. On a
@@ -1120,6 +1260,20 @@ dockerfile = ""
 # Max consecutive auto-triggered turns per task before pausing for human review.
 # max_auto_turns = 3
 
+# Auto-resume: when a task's turn crashes, lazy resumes it automatically.
+# Master switch for auto-resuming interrupted tasks (fast lane and slow lane).
+# auto_resume = true
+# A fresh crash resumes immediately, up to 3 consecutive interruptions (fixed).
+# Past that, the task enters a slow-lane retry queue instead of giving up.
+# Minutes between slow-lane retries of a given task.
+# auto_resume_interval_minutes = 30
+# Minimum minutes between any two auto-resumes project-wide, so one flapping
+# task can't starve every other queued task (round-robin, oldest attempt first).
+# auto_resume_gap_minutes = 5
+# Slow-lane attempts before giving up for good and requiring a manual resume.
+# 24 x 30min = ~12 hours by default: if it hasn't recovered by then it never will.
+# auto_resume_max_attempts = 24
+
 [limits]
 # Concurrency caps for containers. When many tasks launch at once Docker
 # struggles (slow launches, probe timeouts), so lazy caps how many run at once.
@@ -1138,5 +1292,9 @@ dockerfile = ""
 # idle_grace_minutes = 10
 # Override either cap for the running daemon only (ephemeral, no lazy.toml edit):
 #   lazy daemon config set max_concurrent_agents 12
+# Max consecutive work turns a task may run without a human in the loop.
+# Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
+# 0 = unlimited.
+# max_turns_without_human = 10
 `;
 }

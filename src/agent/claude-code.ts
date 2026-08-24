@@ -281,8 +281,23 @@ export class ClaudeCodeAgent implements Agent {
     return 0;
   }
 
+  defaultModel(): null {
+    // No opinion: Claude Code speaks Anthropic model names, which is exactly
+    // what `[models] default` (and [models.roles.agent]) already configures.
+    // Declaring "opus" here would hardcode project policy into an agent class.
+    return null;
+  }
+
   activityStream(): ClaudeCodeActivityStream {
     return new ClaudeCodeActivityStream();
+  }
+
+  supportsPairing(): boolean {
+    // The one agent whose container-written sessions lazy can surface to a host
+    // session deliberately: bridgeSessionFiles symlinks the sandbox JSONL into
+    // ~/.claude/projects for the session and removes it after, rather than
+    // copying agent-written bytes onto the host. See pair-bridge.ts.
+    return true;
   }
 
   discoverSessionFiles(opts: {

@@ -138,6 +138,94 @@ export function collectSubtreeIds(rootId: string, allTasks: Task[]): Set<string>
   return ids;
 }
 
+/** Result of pruning a task set to a depth limit. See {@link pruneTasksToDepth}. */
+export interface DepthPruneResult {
+  /** The tasks that survive the limit, in the input order. */
+  kept: Task[];
+  /**
+   * For each kept task sitting at the limit, how many of its descendants (in
+   * the input set) were elided. Only boundary tasks appear — a task above the
+   * limit has all its children kept, so nothing is hidden under it directly.
+   */
+  hidden: Map<string, number>;
+  /** Total number of elided tasks (the sum of `hidden`'s values). */
+  hiddenTotal: number;
+}
+
+/**
+ * Prune a task set to the first `levels` levels of the hierarchy it forms.
+ *
+ * DEPTH IS COUNTED WITHIN THE GIVEN SET, 1-BASED: a task whose parent is not in
+ * the set is level 1, its children level 2, and so on. That is deliberately the
+ * same rule `buildTaskTree` uses to decide what is a display root, so the number
+ * a user passes always matches the rows they see — including after a subtree
+ * filter, where the filter's task is the level-1 root, and in an `active` view
+ * where a terminal parent is absent and its active children are the roots.
+ *
+ * Counting against the FULL hierarchy instead would hide such children with
+ * nothing visible to hang an "N hidden" note on, which is exactly the silent
+ * truncation this function's `hidden` map exists to prevent.
+ *
+ * `levels` must be a positive integer; callers validate user input before
+ * calling (this throws on a bad value rather than guessing).
+ */
+export function pruneTasksToDepth(tasks: Task[], levels: number): DepthPruneResult {
+  if (!Number.isInteger(levels) || levels < 1) {
+    throw new Error(`pruneTasksToDepth: levels must be a positive integer, got ${levels}`);
+  }
+
+  const present = new Set(tasks.map(t => t.id));
+  const childrenByParent = new Map<string, Task[]>();
+  const roots: Task[] = [];
+  for (const task of tasks) {
+    const parentId = parentTaskIdOf(task);
+    if (parentId && present.has(parentId)) {
+      const siblings = childrenByParent.get(parentId);
+      if (siblings) siblings.push(task);
+      else childrenByParent.set(parentId, [task]);
+    } else {
+      roots.push(task);
+    }
+  }
+
+  const keptIds = new Set<string>();
+  const hidden = new Map<string, number>();
+  let hiddenTotal = 0;
+
+  /** Count every descendant of `id` within the set (cycle-safe). */
+  const countDescendants = (id: string, seen: Set<string>): number => {
+    let count = 0;
+    for (const child of childrenByParent.get(id) ?? []) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      count += 1 + countDescendants(child.id, seen);
+    }
+    return count;
+  };
+
+  const queue: Array<{ task: Task; level: number }> = roots.map(task => ({ task, level: 1 }));
+  while (queue.length > 0) {
+    const { task, level } = queue.pop()!;
+    // Guard against a cyclic parent link so a corrupt store can't hang us.
+    if (keptIds.has(task.id)) continue;
+    keptIds.add(task.id);
+
+    if (level >= levels) {
+      const elided = countDescendants(task.id, new Set([task.id]));
+      if (elided > 0) {
+        hidden.set(task.id, elided);
+        hiddenTotal += elided;
+      }
+      continue;
+    }
+    for (const child of childrenByParent.get(task.id) ?? []) {
+      queue.push({ task: child, level: level + 1 });
+    }
+  }
+
+  return { kept: tasks.filter(t => keptIds.has(t.id)), hidden, hiddenTotal };
+}
+
 /**
  * Projection for "what named branch does this top-level task integrate into".
  * Returns undefined when the task is stacked on another task (kind === 'task')

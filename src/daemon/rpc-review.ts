@@ -98,7 +98,15 @@ export async function handleReviewUnblock(projectRoot: string, params: Record<st
 export async function handleReviewAccept(projectRoot: string, params: Record<string, unknown>) {
   const taskId = requireString(params, 'taskId');
   const reason = optionalString(params, 'reason');
-  return await createReviewActions(projectRoot).accept(taskId, reason);
+  // Optional, and never logged anywhere on the way through: present only when
+  // the reviewer is clearing a protection gate from the page.
+  const passphrase = optionalString(params, 'passphrase');
+  return await createReviewActions(projectRoot).accept(taskId, reason, passphrase);
+}
+
+export async function handleReviewSync(projectRoot: string, params: Record<string, unknown>) {
+  const taskId = requireString(params, 'taskId');
+  return await createReviewActions(projectRoot).sync(taskId);
 }
 
 export async function handleReviewViolationDecision(

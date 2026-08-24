@@ -15,6 +15,8 @@
  */
 
 import { existsSync } from 'fs';
+import { parkTaskPaused } from '../../utils/paused-status';
+import { getActor } from '../../constants';
 import type { Task, Session } from '../../types';
 import type { Storage } from '../../storage';
 import { isTerminalStatus } from '../../task-state-machine';
@@ -319,10 +321,12 @@ async function checkStatusMismatch(
     label: `Status mismatch: task has work (${commits.length} commits, ${turns.length} turns) but status is 'backlog'`,
     detail: '    → Transition to blocked for review?',
     fix: async () => {
-      // Must go through valid transitions: backlog → working → blocked
+      // Must go through valid transitions: backlog → working → blocked/conflict.
+      // The paused label is DERIVED from the pending violation set — see
+      // src/utils/paused-status.ts (fix-ask-nukes-violations).
       await storage.updateTaskStatus(task.id, 'working');
-      await storage.updateTaskStatus(task.id, 'blocked');
-      console.log(theme.success('    Status updated to blocked'));
+      const parked = await parkTaskPaused(storage, task.id, getActor());
+      console.log(theme.success(`    Status updated to ${parked}`));
     },
   };
 }

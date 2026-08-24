@@ -7,11 +7,14 @@ import { createStorage } from '../storage';
 import { isTTY, promptLine, promptChoice, promptYesNo } from './editor';
 import { repoHasCommits } from '../git/operations';
 import { detectRemote } from '../remote';
-import setupDockerfilePrompt from '../prompts/setup-dockerfile.md' with { type: 'text' };
+import { renderSetupDockerfilePrompt } from './setup-dockerfile-prompt';
+import { agentDisplayName } from '../agent/registry';
 import { detectShell, getCompletionSetupCommand } from '../shell/detect';
 import { theme } from './theme';
+import { setSectionBoolean } from '../config/toml-edit';
+import { enrollAtInit } from './commands/system-passphrase';
 import { runGit } from '../utils/git';
-import { spawnSync } from '../utils/spawn';
+import { spawnSyncUnsupervised } from '../utils/spawn';
 import { loadConfig } from '../config/loader';
 import { discoverCandidateSessions, reimportConversations } from '../import/reimport-conversations';
 import {
@@ -308,11 +311,14 @@ function checkAuthSetup(): void {
   console.log('Checking authentication...');
 
   // Check for Claude Code CLI installation.
-  // spawnSync (sync) is acceptable: `lazy init` is one-shot CLI startup that
+  // A sync spawn is acceptable: `lazy init` is one-shot CLI startup that
   // runs once before any event loop matters.
-  const claudeCheck = spawnSync(['claude', '--version'], {
+  const claudeCheck = spawnSyncUnsupervised(['claude', '--version'], {
     stdout: 'pipe',
     stderr: 'pipe',
+    // Bounded at 10s: a wedged `claude` must not hang init forever, and the
+    // default backstop is far longer than a `--version` should take.
+    timeout: 10_000,
   });
   const claudeInstalled = claudeCheck.exitCode === 0;
 
@@ -388,6 +394,9 @@ const LEGACY_LAZY_IGNORE_ENTRIES = [
   '.lazy/storage.lock',
   '.lazy/.reconcile-lock',
   '.lazy/tmp',
+  // The in-repo plaintext approval passphrase is GONE (v0.23) — it lives
+  // hashed outside every repository now. Kept in this legacy list so init
+  // sweeps the stale line out of existing .gitignore files.
   '.lazy/approve-passphrase',
 ];
 
@@ -657,9 +666,14 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
   // Offer to create Dockerfile.lazy task if Dockerfile exists
   if (isTTY() && !options.nonInteractive && existsSync(join(targetDir, 'Dockerfile'))) {
+    // The seeded prompt features the project's OWN agent CLI — lazy init runs
+    // for cursor projects too, and a hardcoded Claude Code install would bake
+    // the wrong agent into their image.
+    const dockerfileTaskAgentId = (await loadConfig(targetDir)).agent.agent_id;
+    const dockerfileTaskAgentName = agentDisplayName(dockerfileTaskAgentId);
     console.log('');
     console.log('Found a Dockerfile in your project. Lazy can create a Dockerfile.lazy based on it');
-    console.log('that adds Claude Code to your existing environment — so agents work with your');
+    console.log(`that adds ${dockerfileTaskAgentName} to your existing environment — so agents work with your`);
     console.log("project's dependencies and tools.");
     const createDockerfileTask = await promptYesNo(
       "Would you like to create a task for this? (It won't start automatically — you\n" +
@@ -680,7 +694,10 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
           undefined,
           'setup-dockerfile',
         );
-        await dockerfileTaskStorage.updateTaskPrompt(task.id, setupDockerfilePrompt);
+        await dockerfileTaskStorage.updateTaskPrompt(
+          task.id,
+          renderSetupDockerfilePrompt(dockerfileTaskAgentId),
+        );
         console.log(`  Created task ${task.id.substring(0, 8)} (setup-dockerfile): Create Dockerfile.lazy from project Dockerfile`);
         console.log(`  To start it: ${theme.command('lazy start setup-dockerfile')}`);
       } finally {
@@ -795,6 +812,55 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
       // Onboarding import is best-effort — a detection/import hiccup must never
       // fail init. Surface it so it isn't silently swallowed, then continue.
       console.log(`  (Skipped Claude Code history import: ${err instanceof Error ? err.message : err})`);
+    }
+  }
+
+  // Offer branch protection.
+  //
+  // Protection stays OPT-IN and OFF by default — the offer defaults to "no"
+  // and is skipped in silence under --non-interactive/CI, so nothing here
+  // changes what a scripted init produces. What it fixes is discovery: a gate
+  // nobody knows exists protects nothing.
+  //
+  // Accepting walks straight into passphrase enrollment, which only works
+  // because the passphrase is machine-global: enroll once and every later
+  // `lazy init` on this machine skips that half (enrollAtInit returns
+  // 'already' without prompting).
+  if (isTTY() && !options.nonInteractive) {
+    console.log('');
+    console.log('Branch protection makes merges into your default branch require a human:');
+    console.log('  accepting a task into it asks for an approval passphrase you type yourself,');
+    console.log('  so an agent cannot merge its own work there. Off unless you turn it on.');
+    const wantProtection = await promptYesNo('  Protect this repo\'s default branch?', false);
+    if (wantProtection) {
+      try {
+        // Same comment-preserving editor `lazy protect` uses, so the template's
+        // explanatory [protection] comments survive.
+        writeFileSync(
+          configPath,
+          setSectionBoolean(readFileSync(configPath, 'utf-8'), 'protection', 'enabled', true),
+        );
+        console.log(`  Set enabled = true under [protection] in ${CONFIG_FILENAME}`);
+        const outcome = await enrollAtInit();
+        if (outcome === 'already') {
+          console.log('  An approval passphrase is already enrolled on this machine — reusing it.');
+        } else if (outcome === 'failed') {
+          console.log(theme.warning(
+            '  Protection is ON but no passphrase is enrolled — gated merges will refuse here.',
+          ));
+          console.log(`  Enroll when ready: ${theme.command('lazy system passphrase set')}`);
+        }
+      } catch (err) {
+        // Never fail init over the optional offer — say what went wrong and
+        // name the two commands that finish the job by hand.
+        console.log(theme.warning(
+          `  Could not finish protection setup: ${err instanceof Error ? err.message : err}`,
+        ));
+        console.log(`  Finish by hand: ${theme.command('lazy protect main on')} and ` +
+          `${theme.command('lazy system passphrase set')}`);
+      }
+    } else {
+      console.log(theme.separator(`  Left off. Turn it on later with: lazy protect <branch> on`));
     }
   }
 

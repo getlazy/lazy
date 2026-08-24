@@ -24,15 +24,17 @@ import type { CompletedResponse, ErrorResponse, WorktreeRecovery, AgentHandoffEn
 import { completedResponses } from '../protocol';
 import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
 import { launchSettingsFromResponse } from './turns';
+import { parkTaskPaused } from './paused-status';
 import { checkLock, removeLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
-import { getDataDir } from '../cli/init';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import type { AutoReactTrigger } from '../daemon/auto-react-budget';
+import { resetSlowLaneState, getLastProjectAutoResumeAt, recordProjectAutoResume } from '../daemon/auto-resume-queue';
 import { tryAdmitAgentSlot, releaseAgentSlot, countActiveAgents, effectiveAgentLimit, orderQueuedTasks, selectContainersToReap } from '../daemon/concurrency';
+import { sweepStrandedMerging } from '../daemon/stranded-merge';
 import { loadConfig } from '../config/loader';
 import { runGit } from './git';
 import { reparentChildren, formatReparentWarning } from '../cli/orphan';
@@ -223,7 +225,21 @@ export async function reconcileTasks(
       logger.warn(`Recover stranded working tasks failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 8: reap idle blocked containers that are eating concurrency slots.
+    // Sweep 8: recover tasks stranded in `merging` by an accept that died.
+    // `merging` is stamped by the accept orchestration and only that
+    // orchestration clears it, so a daemon killed mid-accept leaves the task
+    // there with nothing able to finish or undo it — and every exit (reject,
+    // close, submit) refuses. Running here means it also runs shortly after
+    // daemon startup, which is exactly when a killed accept is discovered.
+    // See src/daemon/stranded-merge.ts for why this never touches a live merge
+    // or a legitimately forge-pending one.
+    try {
+      await sweepStrandedMerging(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Recover stranded merging tasks failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // Sweep 9: reap idle blocked containers that are eating concurrency slots.
     // A blocked task keeps a live (idle-polling) supervisor container with no
     // idle reaper of its own — this is that reaper. Runs BEFORE the drain so a
     // freed slot is filled by a queued task in the same tick.
@@ -233,7 +249,7 @@ export async function reconcileTasks(
       logger.warn(`Reap idle containers failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 9: drain queued tasks as agent slots free up.
+    // Sweep 10: drain queued tasks as agent slots free up.
     // Tasks queued at the concurrency cap (backlog→queued in launchTask) wait
     // here until a slot frees (a working turn ends or an idle container is reaped).
     try {
@@ -279,7 +295,10 @@ export async function reapIdleContainers(storage: Storage, lazyRoot: string, run
       continue;
     }
     // Only turn-done, container-idle statuses are reap candidates. `pairing`,
-    // `merging`, `interrupted` are excluded (transient, or container already cleared).
+    // `merging`, `interrupted` are excluded (transient, or container already
+    // cleared). A `merging` task with no owner is not left to rot by that
+    // exclusion — sweep 8 (sweepStrandedMerging) recovers it to a resting
+    // status, and it becomes a reap candidate on the next tick.
     if (!isBlockedStatus(t.status)) continue;
     const session = await storage.getSessionByTaskId(t.id);
     if (!session?.container_name) continue; // no live container to reap
@@ -540,6 +559,7 @@ export async function interruptForDaemonRestart(
   // never undo a human's `lazy stop`.
   if (!shouldSkipAutoResumeForUserStop(session)) {
     await storage.resetConsecutiveInterruptions(session.id);
+    await resetSlowLaneState(storage, taskId);
   }
   await storage.updateSessionContainerName(session.id, null);
 
@@ -588,9 +608,13 @@ async function maybeAutoResume(
     return;
   }
 
-  // Circuit breaker: stop auto-resuming after too many consecutive interruptions
+  // Circuit breaker: stop auto-resuming on this fast lane after too many
+  // consecutive interruptions. The task isn't abandoned — it falls to the
+  // slow-lane round-robin queue (src/daemon/auto-resume-queue.ts), which
+  // retries it on daemon.auto_resume_interval_minutes up to
+  // daemon.auto_resume_max_attempts.
   if (session.consecutive_interruptions >= MAX_CONSECUTIVE_INTERRUPTIONS) {
-    logger.warn(`Task ${taskShortId}: circuit breaker triggered (${session.consecutive_interruptions} consecutive interruptions), not auto-resuming`);
+    logger.warn(`Task ${taskShortId}: fast-lane circuit breaker triggered (${session.consecutive_interruptions} consecutive interruptions), falling to slow-lane auto-resume queue`);
     return;
   }
 
@@ -601,10 +625,29 @@ async function maybeAutoResume(
   // Only auto-resume interrupted tasks
   if (task.status !== 'interrupted') return;
 
+  const config = await loadConfig(lazyRoot, { cwd: lazyRoot });
+  const dataDir = join(lazyRoot, config.data.path);
+
+  // Project-wide gap: shared with the slow lane (src/daemon/auto-resume-queue.ts)
+  // via the same auto-resume-queue.json timestamp, so daemon.auto_resume_gap_minutes
+  // spaces out ANY two auto-resumes, fast-lane or slow-lane. Without this, a burst
+  // of simultaneous crashes (e.g. many tasks hitting a shared token-exhaustion
+  // error) would relaunch all of them immediately on the fast lane — exactly the
+  // pile-up the gap exists to prevent — before any of them ever reached the slow
+  // lane's throttling.
+  if (config.daemon.auto_resume_gap_minutes > 0) {
+    const lastProjectAttempt = await getLastProjectAutoResumeAt(dataDir);
+    if (lastProjectAttempt !== null) {
+      const gapEligibleAt = lastProjectAttempt + config.daemon.auto_resume_gap_minutes * 60_000;
+      if (Date.now() < gapEligibleAt) {
+        logger.debug(`Task ${taskShortId}: within project-wide auto-resume gap (auto_resume_gap_minutes=${config.daemon.auto_resume_gap_minutes}), deferring`);
+        return;
+      }
+    }
+  }
+
   // Auto-react budget gate: check per-task limits, backoff, and daily budget
   try {
-    const config = await loadConfig(lazyRoot, { cwd: lazyRoot });
-    const dataDir = join(lazyRoot, '.lazy');
     const decision = await shouldAutoReact(storage, taskId, trigger, config, dataDir);
 
     if (!decision.allowed) {
@@ -627,7 +670,6 @@ async function maybeAutoResume(
   // once a slot frees (no durable queue needed for this autonomous path).
   let slotAdmitted = false;
   try {
-    const config = await loadConfig(lazyRoot, { cwd: lazyRoot });
     const decision = await tryAdmitAgentSlot(storage, taskId, effectiveAgentLimit(config));
     if (!decision.admitted) {
       logger.debug(`Task ${taskShortId}: at agent cap (${decision.running}/${decision.limit}), deferring auto-resume`);
@@ -641,10 +683,17 @@ async function maybeAutoResume(
 
   try {
     const success = await autoResumeTask(storage, task, session, lazyRoot);
+    // Record the project-wide gap timestamp regardless of outcome — a failed
+    // attempt still launched a container and cost the shared resource the gap
+    // is protecting.
+    try {
+      await recordProjectAutoResume(dataDir, Date.now());
+    } catch (err) {
+      logger.debug(`Task ${taskShortId}: failed to record project-wide auto-resume timestamp: ${err instanceof Error ? err.message : err}`);
+    }
     if (success) {
       // Record the auto-react consumption (counter + daily budget)
       try {
-        const dataDir = join(lazyRoot, '.lazy');
         await recordAutoReact(storage, taskId, trigger, dataDir);
       } catch (err) {
         logger.debug(`Task ${taskShortId}: failed to record auto-react: ${err instanceof Error ? err.message : err}`);
@@ -868,8 +917,10 @@ async function recoverStrandedCompletion(
     logger.debug(`Task ${taskShortId}: could not mark feedback consumed during recovery: ${err instanceof Error ? err.message : err}`);
   }
 
-  // Canonical working→blocked transition (validated by src/task-state-machine.ts).
-  await storage.updateTaskStatus(taskId, 'blocked', 'system');
+  // Canonical working→paused transition (validated by src/task-state-machine.ts).
+  // Stranded recovery saw no response at all, so it learned nothing about
+  // violations — it must not clear a pending set (violations-are-the-source-of-truth).
+  await parkTaskPaused(storage, taskId, 'system', { sessionId: session.id });
 
   // A healthy completion clears the crash counters.
   try {
@@ -882,6 +933,11 @@ async function recoverStrandedCompletion(
     await resetAutoReactCounters(storage, taskId);
   } catch (err) {
     logger.debug(`Task ${taskShortId}: could not reset auto-react counters during recovery: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    await resetSlowLaneState(storage, taskId);
+  } catch (err) {
+    logger.debug(`Task ${taskShortId}: could not reset slow-lane state during recovery: ${err instanceof Error ? err.message : err}`);
   }
 
   // Clear stale status so a future turn starts clean.
@@ -1212,13 +1268,16 @@ async function recordSyncTurns(
   // merged: false → NO turn recorded (skip-when-noop). The task still transitions
   // out of 'working' below so a no-op sync doesn't strand it.
 
-  // Sync completion returns the task to 'blocked' — the same terminal-of-turn status
-  // the work path uses. Sync runs no violation detection, so there is never a
-  // 'conflict' outcome here.
-  await storage.updateTaskStatus(taskId, 'blocked', 'system');
+  // Sync completion returns the task to its paused status — the same
+  // terminal-of-turn transition the work path uses. Sync runs no violation
+  // detection, so it never PRODUCES a conflict; but it must not CLEAR one
+  // either. Syncing a conflict task used to park it 'blocked' and orphan the
+  // pending set (violations-are-the-source-of-truth).
+  await parkTaskPaused(storage, taskId, 'system', { sessionId: session.id });
 
   // A completed sync means the worktree is healthy.
   await storage.resetConsecutiveInterruptions(session.id);
+  await resetSlowLaneState(storage, taskId);
 
   consumeResponse(protoDir);
   clearStatus(protoDir);
@@ -1395,9 +1454,14 @@ export async function handleCompletedResponses(
   // the truth. The push-back response carries an explicit (possibly empty) array,
   // so a resolved push-back ([]) correctly yields 'blocked' rather than falling
   // back to the work response's stale pre-push-back set.
+  //
+  // INVARIANT (violations-are-the-source-of-truth): a bundle that carries NO
+  // violations field ran no permission check — an ask response flushed here by
+  // the reconciler is the case that motivated this — and must not clear a
+  // pending set that is still owed a reviewer decision. parkTaskPaused unions
+  // the fresh set with what the turns already hold. See src/utils/paused-status.ts.
   const finalViolations = [...responses].reverse().find(r => r.violations !== undefined)?.violations ?? [];
-  const nextStatus = finalViolations.length > 0 ? 'conflict' : 'blocked';
-  await storage.updateTaskStatus(taskId, nextStatus, 'system');
+  await parkTaskPaused(storage, taskId, 'system', { sessionId: session.id, detected: finalViolations });
 
   // pending_sync is managed by the daemon sync retry loop (src/daemon/sync-retry.ts).
   // The reconciler does not touch the counter — only syncTask resets it on launch.
@@ -1407,6 +1471,9 @@ export async function handleCompletedResponses(
   // healthy turn, otherwise old crashes accumulate forever and block legitimate
   // auto-resume. Deliberately kept (see the auto-react note directly below).
   await storage.resetConsecutiveInterruptions(session.id);
+  // Same reasoning applies to the slow lane: a healthy turn earns the task its
+  // way out of the round-robin retry queue too.
+  await resetSlowLaneState(storage, taskId);
 
   // INVARIANT: auto-react budget counters are NOT reset here. A successful turn is
   // not human review, and resetting on every turn zeroes the per-task counters
@@ -1450,11 +1517,16 @@ export async function handleErrorResponse(
   // cannot heal by itself, so the task must land in `blocked` (human's queue),
   // not `interrupted` (auto-resume's queue) — auto-resuming into a dead
   // credential or a bad model id just re-crashes on a timer.
-  // `failure_class` is set ONLY when the supervisor stopped on purpose (a
-  // `fatal_*` class, or `transient_unreachable` that outlived its bounded
-  // retries) — so its mere presence is the signal. Absent means an ordinary
-  // crash, which keeps the pre-existing interrupted + auto-resume behavior.
-  const fatalClass = response.failure_class;
+  // `failure_class` is set when the supervisor ended the turn on purpose: a
+  // `fatal_*` class, a `transient_unreachable` that outlived its bounded
+  // retries, or the fast-crash-loop backstop. The first two cannot heal and
+  // must block; the backstop only ever reports `unknown` — by construction, it
+  // runs for no other class — and an unclassifiable failure has never been a
+  // reason to stop auto-resume. So `unknown` is carried for DIAGNOSIS only and
+  // keeps the pre-existing interrupted + auto-resume behavior, exactly as an
+  // absent class does.
+  const classified = response.failure_class;
+  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
 
   // Build a human-readable error turn content
   const watchdogKill = isWatchdogKill(response);
@@ -1467,8 +1539,8 @@ export async function handleErrorResponse(
   if (watchdogKill) {
     lines.push(...watchdogTurnLines(response), '');
   }
-  if (fatalClass) {
-    lines.push(`Failure class: ${fatalClass}`);
+  if (classified) {
+    lines.push(`Failure class: ${classified}`);
     if (response.failure_reason) lines.push(`Reason: ${response.failure_reason}`);
     if (response.failure_attempts !== undefined) {
       lines.push(`Attempts before giving up: ${response.failure_attempts}`);
@@ -1533,12 +1605,16 @@ export async function handleErrorResponse(
       sequence: seq,
       role: 'agent',
       content: turnContent,
-      // A crash turn still records what it ran under — "model X keeps crashing"
-      // is a real finding, and dropping the labels here would silently exclude
-      // failures from any model/effort comparison.
+      // A crash turn still records what it ran under — "agent/model X keeps
+      // crashing" is a real finding, and dropping the labels here would silently
+      // exclude failures from any agent/model/effort comparison.
+      ...(response.agent ? { agent: response.agent } : {}),
       ...(response.model ? { model: response.model } : {}),
       ...(response.effort ? { effort: response.effort } : {}),
       ...(errorUsage ? { usage: errorUsage } : {}),
+      // Preserve the "agent had no effect" flag from the supervisor so downstream
+      // consumers (pre-accept, etc.) know there's nothing to reflect on.
+      ...(response.agent_had_no_effect !== undefined ? { agent_had_no_effect: response.agent_had_no_effect } : {}),
     });
     // Roll the same tokens into the session total, inside the same idempotency
     // guard as the turn write (see rollUpSessionUsage). A crashed turn's tokens
@@ -1567,7 +1643,9 @@ export async function handleErrorResponse(
     if (current?.status === 'interrupted') {
       await storage.updateTaskStatus(taskId, 'working', 'system');
     }
-    await storage.updateTaskStatus(taskId, 'blocked', 'system');
+    // A crashed turn detected nothing, so it cannot clear an owed decision —
+    // park on the violation set (violations-are-the-source-of-truth).
+    await parkTaskPaused(storage, taskId, 'system', { sessionId: session.id });
     await storage.recordInterrupt(session.id, {
       reason: `${fatalClass}: ${response.failure_reason ?? response.error}`,
       exit_code: response.exit_code ?? null,
@@ -1841,7 +1919,9 @@ async function sweepStalePairing(storage: Storage, lazyRoot: string): Promise<vo
 
         // No valid PID or process is dead — transition back to blocked
         logger.warn(`Task ${taskShortId}: stale pairing state detected, transitioning back to blocked`);
-        await storage.updateTaskStatus(task.id, 'blocked', 'system');
+        // A pairing session runs no permission check — parking must not clear a
+        // pending set (violations-are-the-source-of-truth).
+        await parkTaskPaused(storage, task.id, 'system');
         await storage.updateTaskMetadata(task.id, 'pairing_pid', '');
         await storage.updateTaskMetadata(task.id, 'pairing_started_at', '');
 

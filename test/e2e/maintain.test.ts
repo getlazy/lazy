@@ -26,7 +26,7 @@ import { join } from 'path';
 import { readFileSync, writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS, setProtectedPatterns } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
 import { readTaskStatus, readTurns } from '../helpers/storage';
 
@@ -180,8 +180,7 @@ describe('maintained files automation', () => {
   // (the push-back response carries the final violation set; the maintain response
   // carries none), but the maintain nudge still fired.
   test('fires the maintain nudge after push-back even when violations remain', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, readFileSync(configPath, 'utf-8') + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Protected spec files');
     enableMaintain(ctx, [DOCS]);
@@ -228,8 +227,7 @@ describe('maintained files automation', () => {
   // Branch (a): the agent RESOLVED the violation during push-back → the final set is
   // empty so the task blocks normally, AND the maintain nudge still fires afterwards.
   test('fires the maintain nudge after push-back even when the agent resolved violations', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, readFileSync(configPath, 'utf-8') + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Protected spec files');
     enableMaintain(ctx, [DOCS]);

@@ -11,6 +11,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateCode, deriveCode, resolveTaskOrExit, taskRef } from '../helpers';
 import { createWorktree, findWorktreeForBranch, getCurrentBranch, getRemoteDefaultBranch, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { createDriver } from '../../remote';
 import { getDataDir } from '../init';
 import { theme } from '../theme';
@@ -119,8 +120,17 @@ export async function commandLink(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Create task
-    const task = await storage.createTask(goal, parentTaskId, undefined, codeValue);
+    // Create task. This uses the same agent the session below is stamped with
+    // (config.agent.agent_id) — leaving it unset made the task claim
+    // claude-code while its own session said otherwise.
+    const task = await storage.createTask(
+      goal,
+      parentTaskId,
+      undefined,
+      codeValue,
+      undefined,
+      resolveAgentForNewTask({ configDefault: config.agent.agent_id }),
+    );
 
     // Store metadata
     for (const [key, value] of Object.entries(result.metadata)) {

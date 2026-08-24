@@ -10,7 +10,7 @@ import { join } from 'path';
 import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
 import { safeArgvPrompt } from './argv-safety';
-import type { AgentFailure, AgentFailureInput } from './failure-taxonomy';
+import { failureHaystack, type AgentFailure, type AgentFailureInput } from './failure-taxonomy';
 
 // Resolve the absolute path to the qa-agent script.
 // QA_AGENT_SCRIPT env var takes priority (set by QA test driver when running
@@ -79,7 +79,15 @@ export class QaAgent implements Agent {
    * permanently. `unknown` keeps the existing conservative retry behavior
    * (bounded in practice by the crash-loop detector, since qa-agent fails fast).
    */
-  classifyFailure(_input: AgentFailureInput): AgentFailure {
+  classifyFailure(input: AgentFailureInput): AgentFailure {
+    // No remote provider is involved, so provider signals (429, 5xx, auth)
+    // deliberately stay `unknown` here. The ONE common signal that still
+    // applies is environment-shaped: a missing binary is fatal for every
+    // agent — retrying installs nothing.
+    const text = failureHaystack(input);
+    if (input.exitCode === 127 || /spawn failed: binary '[^']+' not found/.test(text)) {
+      return { class: 'fatal_config', reason: 'agent binary not installed in this environment' };
+    }
     return { class: 'unknown', reason: 'qa-agent failure (no remote provider involved)' };
   }
 
@@ -88,10 +96,22 @@ export class QaAgent implements Agent {
     return 30_000;
   }
 
+  defaultModel(): null {
+    // No opinion — the scripted agent ignores the model entirely, so leave the
+    // configured default in place rather than inventing a name for the record.
+    return null;
+  }
+
   activityStream(): null {
     // Scripted and fast — it prints one JSON blob and exits. Byte-level
     // watchdogging is sufficient.
     return null;
+  }
+
+  supportsPairing(): boolean {
+    // Scriptable and LLM-free: it replays a scenario file, so there is no
+    // conversation for a human to join.
+    return false;
   }
 
   discoverSessionFiles(_opts: {

@@ -1,6 +1,6 @@
 /**
  * E2E tests for protected branches: human-approved accepts via `lazy approve`
- * (see docs/protected-branches.md and src/protection/edge-gate.ts).
+ * (see public-docs/protected-branches.md and src/protection/edge-gate.ts).
  *
  * Branch protection is an opt-in feature (OFF by default), so the plain
  * harness state already exercises the unprotected default path; these tests
@@ -9,31 +9,51 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFile, writeFile, rm } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { enrollPassphrase, clearPassphrase } from '../helpers/passphrase';
 
 const PASSPHRASE = 'test-approval-passphrase';
 
 /**
- * Opt in to branch protection (OFF by default — it's an opt-in feature) and
- * enroll a passphrase. Optionally add extra keys inside the [protection]
- * section.
+ * Env that drives `lazy approve`'s masked prompt as if a human typed the
+ * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
+ * no env var, no piped-stdin route — so the test-only LAZY_PROMPT_DEFAULTS /
+ * LAZY_PROMPT_SECRET pair is the ONLY way a test can supply it. Released
+ * binaries do not contain those branches at all (see
+ * test/unit/build-release-flags.test.ts).
  */
-async function enableProtection(ctx: TestContext, extraProtectionToml = ''): Promise<void> {
+const TYPES_PASSPHRASE = {
+  LAZY_FORCE_TTY: '1',
+  LAZY_PROMPT_DEFAULTS: '1',
+  LAZY_PROMPT_SECRET: PASSPHRASE,
+};
+
+/**
+ * Opt in to branch protection (OFF by default — it's an opt-in feature) and
+ * enroll a passphrase on the "machine".
+ *
+ * The two halves are deliberately independent: the config lives in the repo,
+ * the passphrase lives in the machine-global hashed store (pinned to this
+ * context's temp base dir), and neither knows about the other.
+ */
+async function enableProtection(ctx: TestContext): Promise<void> {
+  await enableProtectionConfigOnly(ctx);
+  await enrollPassphrase(ctx.passphraseBaseDir, PASSPHRASE);
+}
+
+/** Turn protection on in lazy.toml WITHOUT enrolling anything. */
+async function enableProtectionConfigOnly(ctx: TestContext): Promise<void> {
   const tomlPath = join(ctx.root, 'lazy.toml');
   const toml = await readFile(tomlPath, 'utf-8');
   if (!toml.includes('[protection]')) {
     throw new Error('Expected lazy init template to contain a [protection] section');
   }
-  await writeFile(
-    tomlPath,
-    toml.replace('[protection]\n', `[protection]\nenabled = true\n${extraProtectionToml}`),
-  );
-  await writeFile(join(ctx.root, '.lazy', 'approve-passphrase'), `${PASSPHRASE}\n`);
+  await writeFile(tomlPath, toml.replace('[protection]\n', '[protection]\nenabled = true\n'));
 }
 
 /** Create a task, run a mocked turn, and commit a file so it's ready for accept. */
@@ -93,7 +113,7 @@ describe('protected branches: lazy approve + protected accepts', () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'approved');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
     expectSuccess(approveResult);
     expectOutput(approveResult, 'Approval recorded');
 
@@ -112,7 +132,7 @@ describe('protected branches: lazy approve + protected accepts', () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'single-use');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
     expectSuccess(approveResult);
     expectOutput(await ctx.lazy(['show', taskId]), 'Approval pending');
 
@@ -134,7 +154,9 @@ describe('protected branches: lazy approve + protected accepts', () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'wrong-pass');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: 'not-the-passphrase\n' });
+    const approveResult = await ctx.lazy(['approve', taskId], {
+      env: { ...TYPES_PASSPHRASE, LAZY_PROMPT_SECRET: 'not-the-passphrase' },
+    });
     expectFailure(approveResult);
     expectError(approveResult, 'does not match');
 
@@ -143,15 +165,19 @@ describe('protected branches: lazy approve + protected accepts', () => {
     expectError(acceptResult, 'requires human approval');
   });
 
+  // INVARIANT: the remedy names `lazy system passphrase set` and NOTHING that
+  // asks the human to write a secret into the repo. A message still telling
+  // them to `echo "..." > .lazy/approve-passphrase` is the hole this closed.
   test('approve without an enrolled passphrase gives setup instructions', async () => {
-    await enableProtection(ctx);
-    await rm(join(ctx.root, '.lazy', 'approve-passphrase'));
+    await enableProtectionConfigOnly(ctx);
+    await clearPassphrase(ctx.passphraseBaseDir);
     const taskId = await setupBlockedTask(ctx, 'no-enroll');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: 'whatever\n' });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
     expectFailure(approveResult);
     expectError(approveResult, 'No approval passphrase is enrolled');
-    expectError(approveResult, '.lazy/approve-passphrase');
+    expectError(approveResult, 'lazy system passphrase set');
+    expect(approveResult.stderr).not.toContain('> .lazy/approve-passphrase');
   });
 
   // INVARIANT: pre-flight before prompting (CLAUDE.md). With nothing enrolled,
@@ -159,8 +185,8 @@ describe('protected branches: lazy approve + protected accepts', () => {
   // asks the human to type a secret. Do NOT "simplify" this by letting the
   // daemon's verify() produce the message: that is the bug this test pins.
   test('approve without enrollment exits without ever prompting', async () => {
-    await enableProtection(ctx);
-    await rm(join(ctx.root, '.lazy', 'approve-passphrase'));
+    await enableProtectionConfigOnly(ctx);
+    await clearPassphrase(ctx.passphraseBaseDir);
     const taskId = await setupBlockedTask(ctx, 'no-prompt');
 
     // A TTY with a prompt default armed: if the command reached promptLine,
@@ -175,59 +201,91 @@ describe('protected branches: lazy approve + protected accepts', () => {
     expect(approveResult.stderr).not.toContain('Approval passphrase (from');
   });
 
-  // The interactive prompt names its source of truth, from the configured
-  // path — a bare "Approval passphrase" leaves the human guessing what is
-  // being checked and where to change it.
-  test('the interactive prompt names the passphrase file', async () => {
+  // INVARIANT: the gate is decided from COMMITTED CONFIG ALONE —
+  // evaluateEdgeGate() never consults enrollment. A fresh clone of a protected
+  // repo on a machine that has never enrolled is protected, and fails CLOSED
+  // (at the enrollment probe, with instructions) rather than merging because
+  // the local machine happens to hold no credential.
+  test('a protected repo on a never-enrolled machine fails closed, not open', async () => {
+    await enableProtectionConfigOnly(ctx);
+    const taskId = await setupBlockedTask(ctx, 'never-enrolled');
+
+    // The gate still refuses the un-approved accept...
+    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    expectFailure(acceptResult);
+    expectError(acceptResult, 'requires human approval');
+
+    // ...and there is no way to get past it on this machine: approve refuses
+    // at the probe and says how to enroll.
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
+    expectFailure(approveResult);
+    expectError(approveResult, 'lazy system passphrase set');
+
+    const log = ctx.git('log', '--oneline', 'main');
+    expect(log.stdout).not.toContain('never-enrolled');
+  }, 30000);
+
+  // The prompt names NOTHING to read: the passphrase lives in the human's
+  // memory and the store holds only a hash, so a "(from <path>)" suffix would
+  // invite them to go cat a secret that no longer exists anywhere in the repo.
+  test('the prompt names no file, and an empty entry refuses', async () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'prompt-path');
 
-    // LAZY_PROMPT_DEFAULTS makes promptLine echo its message and return the
-    // (absent) default, so the command fails on the empty token afterwards.
+    // LAZY_PROMPT_SECRET unset: the driven masked prompt "types" nothing.
     const approveResult = await ctx.lazy(['approve', taskId], {
       env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: '1' },
     });
 
-    expectOutput(approveResult, 'Approval passphrase (from .lazy/approve-passphrase)');
+    expectOutput(approveResult, 'Approval passphrase');
+    expect(approveResult.stdout).not.toContain('Approval passphrase (from');
     expectFailure(approveResult);
     expectError(approveResult, 'must not be empty');
   });
 
-  // The prompt path follows [protection].passphrase_file, not a hardcoded
-  // string.
-  test('the prompt names a custom configured passphrase file', async () => {
-    await enableProtection(ctx, 'passphrase_file = ".lazy/custom-pass"\n');
-    await writeFile(join(ctx.root, '.lazy', 'custom-pass'), `${PASSPHRASE}\n`);
-    const taskId = await setupBlockedTask(ctx, 'custom-path');
+  // INVARIANT: the passphrase is machine-global and hashed — a plaintext file
+  // in the repo is NOT a credential any more, however tempting the old path
+  // looks. Re-creating it must not unlock anything.
+  test('a leftover plaintext .lazy/approve-passphrase does not satisfy the gate', async () => {
+    await enableProtectionConfigOnly(ctx);
+    await writeFile(join(ctx.root, '.lazy', 'approve-passphrase'), `${PASSPHRASE}\n`);
+    const taskId = await setupBlockedTask(ctx, 'legacy-file');
 
-    const approveResult = await ctx.lazy(['approve', taskId], {
-      env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: '1' },
-    });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
 
-    expectOutput(approveResult, 'Approval passphrase (from .lazy/custom-pass)');
-  });
+    expectFailure(approveResult);
+    expectError(approveResult, 'No approval passphrase is enrolled');
+    // ...and the human is told the stale file is dead, not silently left with it.
+    expectError(approveResult, 'no longer consulted');
+  }, 30000);
 
-  // INVARIANT: piped stdin is the supported CI/scripting path — there is no
-  // --yes and no --passphrase flag, so this must keep working.
-  test('piped stdin remains the script-friendly approval path', async () => {
+  // INVARIANT (BREAKING, v0.23): there is NO piped-stdin route for the
+  // passphrase any more. A value a script can supply lives on in shell
+  // history, CI logs and agent transcripts, which defeats the one property
+  // this credential has — that it originates outside anything an agent can
+  // reach. The refusal must name the interactive route rather than failing
+  // obscurely on an empty token.
+  test('piped stdin is refused and points at an interactive terminal', async () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'piped');
 
-    // No TTY, passphrase piped exactly as CI would from a secret.
     const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
-    expectSuccess(approveResult);
-    expectOutput(approveResult, 'Approval recorded');
-    // Nothing was prompted for.
-    expect(approveResult.stdout).not.toContain('Approval passphrase (from');
 
-    expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
+    expectFailure(approveResult);
+    expectError(approveResult, 'no flag, env var, or stdin route');
+    expectError(approveResult, 'from a terminal');
+
+    // And nothing was recorded, so the accept is still gated.
+    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    expectFailure(acceptResult);
+    expectError(acceptResult, 'requires human approval');
   }, 30000);
 
   // INVARIANT: the passphrase prompt is MASKED, so it needs a real TTY. When
-  // it cannot have one it refuses loudly and names the piped route — it must
-  // never fall back to an echoing line reader, which is the bug the mask
-  // exists to fix. (LAZY_FORCE_TTY makes isTTY() true without a real TTY, so
-  // this exercises exactly that gap.)
+  // it cannot have one it refuses loudly — it must never fall back to an
+  // echoing line reader, which is the bug the mask exists to fix. And there is
+  // no piped route to point at any more. (LAZY_FORCE_TTY makes isTTY() true
+  // without a real TTY, so this exercises exactly that gap.)
   test('the passphrase prompt refuses rather than echoing when it cannot mask', async () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'no-mask');
@@ -238,7 +296,7 @@ describe('protected branches: lazy approve + protected accepts', () => {
 
     expectFailure(approveResult);
     expectError(approveResult, 'not an interactive terminal');
-    expectError(approveResult, 'pipe the value instead');
+    expect(approveResult.stderr).not.toContain('pipe the value instead');
   }, 30000);
 
   // INVARIANT: an approval is scoped to its task — approving task A does not
@@ -248,7 +306,7 @@ describe('protected branches: lazy approve + protected accepts', () => {
     const taskA = await setupBlockedTask(ctx, 'task-a');
     const taskB = await setupBlockedTask(ctx, 'task-b');
 
-    const approveResult = await ctx.lazy(['approve', taskA], { input: `${PASSPHRASE}\n` });
+    const approveResult = await ctx.lazy(['approve', taskA], { env: TYPES_PASSPHRASE });
     expectSuccess(approveResult);
 
     const acceptB = await ctx.lazy(['accept', taskB, '--yes']);
@@ -363,7 +421,7 @@ describe('protected branches: a failed accept does not spend the approval', () =
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'survives');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
     expectSuccess(approveResult);
 
     // Fail the accept at the pre-merge gates — well past the protection gate.
@@ -395,7 +453,7 @@ describe('protected branches: a failed accept does not spend the approval', () =
     await enableProtection(ctx);
     const taskId = await setupBlockedTask(ctx, 'twice');
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     setGates([{ gate: 'ci', message: 'CI checks failing: lint, test' }]);
     expectFailure(await ctx.lazy(['accept', taskId, '--yes']));

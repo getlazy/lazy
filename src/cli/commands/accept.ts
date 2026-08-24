@@ -4,6 +4,7 @@ import { targetBranchOf } from '../../task-target';
 import { isTTY, promptYesNo, promptLine, readStdinIfPiped } from '../editor';
 import { commandSyncTask } from './sync';
 import { loadConfig, loadRawConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { protectionHintForAccept } from '../../protection/discovery';
 import { logger } from '../../utils/logger';
 import { createDriver } from '../../remote';
@@ -65,7 +66,7 @@ export async function commandAccept(args: string[]): Promise<void> {
       const activeChildren = await getActiveChildren(task.id, storage);
       if (activeChildren.length > 0) {
         const one = activeChildren.length === 1;
-        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${one ? 'child' : 'children'}; ${one ? "it'll" : "they'll"} be automatically re-parented on accept. Run \`lazy sync\` on ${one ? 'it' : 'each'} afterwards — until then ${one ? 'its' : 'their'} merge base is behind this merge, which is how deletions silently reappear (see ${docsUrl('resurrection-guard') ?? 'docs/resurrection-guard.md'}).`));
+        console.log(theme.warning(`\nNote: This task has ${activeChildren.length} active ${one ? 'child' : 'children'}; ${one ? "it'll" : "they'll"} be automatically re-parented on accept. Run \`lazy sync\` on ${one ? 'it' : 'each'} afterwards — until then ${one ? 'its' : 'their'} merge base is behind this merge, which is how deletions silently reappear (see ${docsUrl('resurrection-guard') ?? 'public-docs/resurrection-guard.md'}).`));
         for (const child of activeChildren) {
           console.log(`  ${theme.taskId(displayId(child))} [${theme.status(child.status)}] ${child.goal}`);
         }
@@ -366,11 +367,18 @@ async function handleContinuationTaskOffer(
         `Use \`lazy show ${originalTaskCode} --full\` to see the full conversation history from the original task.`,
       ].join('\n');
 
+      // A continuation redoes the reverted task's work, so it runs on that
+      // task's agent (falling back to the project default if it is unknown).
       const contTask = await storage.createTask(
         originalGoal,
         undefined,
         undefined,
         continuationCode || undefined,
+        undefined,
+        resolveAgentForNewTask({
+          inheritFrom: originalTask,
+          configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+        }),
       );
       await storage.updateTaskPrompt(contTask.id, continuationPrompt);
 

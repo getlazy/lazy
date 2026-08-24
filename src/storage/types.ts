@@ -503,11 +503,22 @@ export interface ProxyAuditRecord {
   ts: number;
 
   // --- Routing / identity ---
-  /** Role hint from the `x-lazy-role` request header (builder|agent), if set. */
+  /**
+   * Role hint from the `x-lazy-role` request header (builder|agent), if set.
+   * Cursor traffic carries no such header — its hint comes from the URL prefix
+   * the launch pinned (see src/proxy/cursor-route.ts).
+   */
   role: string | null;
-  /** Task id hint from the `x-lazy-task-id` request header, if set. */
+  /** Task id hint, from the `x-lazy-task-id` header or the cursor URL prefix. */
   taskId: string | null;
-  /** Resolved backend the request was forwarded to (anthropic|ollama|proxy-upstream|unknown). */
+  /**
+   * Resolved backend the request was forwarded to
+   * (anthropic|ollama|proxy-upstream|cursor|unknown). `cursor` marks a record
+   * from the verbatim cursor passthrough route: every Anthropic-wire field
+   * below (model, tier, usage, requestShape, tool uses/results, enforcement)
+   * is null or empty on purpose, because that wire format is not Anthropic's
+   * and the extractor never sees it.
+   */
   backend: string;
   /** Upstream base URL the request was forwarded to. */
   upstream: string;

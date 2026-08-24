@@ -19,7 +19,8 @@ import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { theme } from '../theme';
 import { parentTaskIdOf } from '../../task-target';
 import { sanitizeUserText } from '../../utils/sanitize-text';
-import { pendingViolations } from '../../utils/turns';
+import { pendingViolations, violationRecords } from '../../utils/turns';
+import { listAgents, agentDisplayName } from '../../agent/registry';
 
 /**
  * Determine whether unblock should run in interactive mode.
@@ -44,6 +45,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'model', takesValue: true },
     { name: 'effort', takesValue: true },
+    { name: 'agent', takesValue: true },
     { name: 'follow', takesValue: false },
 
     { name: 'approve-file', takesValue: true, accumulate: true },
@@ -83,6 +85,18 @@ export async function commandUnblock(args: string[]): Promise<void> {
     effortOverride = effortValue as EffortLevel;
   }
 
+  // Parse --agent flag
+  let agentOverride: string | undefined;
+  const agentValue = parsed.flags.get('agent') as string | undefined;
+  if (agentValue !== undefined) {
+    const validAgents = listAgents();
+    if (!validAgents.includes(agentValue)) {
+      console.error(`Unknown agent '${agentValue}'. Available agents: ${validAgents.join(', ')}`);
+      process.exit(1);
+    }
+    agentOverride = agentValue;
+  }
+
   const root = requireLazyRoot();
   let storage = await requireStorage();
 
@@ -98,7 +112,11 @@ export async function commandUnblock(args: string[]): Promise<void> {
     }
     const canResume = !!sess.agent_session_id;
     if (!canResume) {
-      console.log('Session has no Claude session ID. Will start a fresh Claude session.');
+      // Name the agent that will actually run — `--agent` switches it for this
+      // turn — never "Claude", which is wrong on a cursor task.
+      console.log(
+        `Session has no agent session ID. Will start a fresh ${agentDisplayName(agentOverride ?? task.agent_id)} session.`,
+      );
     }
     if (sess.ended_at) {
       console.error('Session has ended. Create a variant with: lazy branch ' + displayId(task));
@@ -132,7 +150,20 @@ export async function commandUnblock(args: string[]): Promise<void> {
     {
       const existingTurns = await storage.getSessionTurns(sess.id);
       const violations = pendingViolations(existingTurns);
-      const hasViolations = task.status === 'conflict' && violations.length > 0;
+      // INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky):
+      // whether a decision MAY be given is asked of every violation record, not
+      // only the pending ones. After the reviewer approves a set and the agent
+      // runs a turn that touches no protected file, nothing is pending — but
+      // `--approve-file` on those same files is still a legitimate call, and
+      // refusing it left the reviewer no option but the one that reverted them.
+      const records = violationRecords(existingTurns);
+      // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+      // gate on the pending SET, never on `task.status`. `conflict` is a derived
+      // label that any side-channel turn (an ask, a sync, a pairing session) can
+      // leave behind as `blocked` — and when it did, this guard rejected the
+      // --approve-file the reviewer needed while the daemon reverted those files
+      // anyway.
+      const hasViolations = violations.length > 0;
 
       // Contradictory flags — approving specific files and reverting everything
       // cannot both be meant.
@@ -142,10 +173,11 @@ export async function commandUnblock(args: string[]): Promise<void> {
         process.exit(1);
       }
 
-      // Misuse — the flags only mean anything when there is something to decide.
-      if (!hasViolations && (approvedFiles.length > 0 || noApproveFiles)) {
+      // Misuse — the flags only mean anything for a task that violated a
+      // protected file at some point.
+      if (records.length === 0 && (approvedFiles.length > 0 || noApproveFiles)) {
         console.error(`Error: Task ${displayId(task)} has no file permission violations.`);
-        console.error('--approve-file and --no-approve-files are only meaningful for conflict tasks.');
+        console.error('--approve-file and --no-approve-files are only meaningful for tasks that changed protected files.');
         process.exit(1);
       }
 
@@ -229,7 +261,9 @@ export async function commandUnblock(args: string[]): Promise<void> {
         // --- Interactive mode: handle conflict tasks ---
         // When task is in conflict status (file permission violations), prompt user
         // to choose whether to approve or revert. Neither is "safe" — both require active choice.
-        if (task.status === 'conflict' && approvedFiles.length === 0 && !noApproveFiles) {
+        // Gated on the pending violation set, not on `task.status` — see the
+        // violations-are-the-source-of-truth invariant above.
+        if (approvedFiles.length === 0 && !noApproveFiles) {
           const existingTurns = await storage.getSessionTurns(sess.id);
           // Must match what the daemon reverts against — see the
           // violations-come-from-the-violation-turn invariant in utils/turns.ts.
@@ -360,7 +394,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           const sess2 = await storage2.getSessionByTaskId(task2.id);
           if (!sess2) { console.error(`Task ${taskShortId} has no session.`); process.exit(1); }
 
-          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride, effortOverride);
+          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride, effortOverride, agentOverride, approvedFiles);
           shouldContinue = result === 'continue';
         } finally {
           await storage2.close();
@@ -461,6 +495,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
         retargetOrphan,
         notesInEditor,
         effortOverride,
+        agentOverride,
       });
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -519,7 +554,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <agent_id>] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -547,10 +582,14 @@ Options:
   --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-4-8)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.
+  --agent <agent_id>  Switch to a different agent for this task (e.g. claude-code, cursor).
+                      Persists on the task for future turns. When switching agents,
+                      the session is reset (cannot resume across agents).
   --approve-file <file>   Keep the agent's changes to a violated file (repeatable,
-                      conflict tasks only). Every violated file you do NOT name is
-                      reverted to its base commit.
-  --no-approve-files  Explicitly revert all violated files (for conflict tasks)
+                      conflict tasks only). Every file with a PENDING violation
+                      that you do NOT name is reverted to its base commit. Files
+                      you approved on an earlier unblock stay approved.
+  --no-approve-files  Explicitly revert all pending violated files (conflict tasks)
   --yes               Skip interactive prompts (non-interactive mode)
   --follow            Wait for the agent to finish, streaming output in real time
 
@@ -593,22 +632,36 @@ File Permission Violations (conflict status):
     - --no-approve-files : explicitly revert all (destructive)
     - Omitting both flags with a conflict task is an error
 
+  Approval is sticky:
+    A file you approved on one unblock STAYS approved. A later unblock that says
+    nothing about it does not revert it — only PENDING violations are decided by
+    the call, and a turn that touches no protected file raises none. Naming an
+    already-approved file again is accepted and changes nothing, so replaying
+    your past decisions is always safe.
+
+    To change your mind about a file you approved, there is no flag here — two
+    remedies: un-approve it on the review page (the web dashboard's
+    /review/<task>, URL from 'lazy daemon status'), which returns that record to
+    PENDING so the next unblock decides it again; or say so in the feedback text
+    and let the agent revert the file in the next turn.
+
   Misuse errors:
     - Using --approve-file and --no-approve-files together: error
-    - Using these flags when task has no violations: error
+    - Using these flags on a task that never changed a protected file: error
     - --yes does NOT bypass the conflict guard
 
   Approving in the feedback text does nothing. Only these flags are read.
 
   Not the same as 'lazy accept --approve-file': accept is all-or-nothing (every
-  violated file must be named or the accept is refused) and never reverts
-  anything. Unblock reverts whatever you leave out.
+  pending violated file must be named or the accept is refused) and never reverts
+  anything. Unblock reverts the pending files you leave out.
 
 Examples:
   lazy unblock abc123                                   # Interactive review
   lazy unblock abc123 --message "Add error handling"    # Direct feedback
   lazy unblock abc123 -f feedback.md
   lazy unblock abc123 --model opus --message "Complex refactoring needed"
+  lazy unblock abc123 --agent cursor --message "Continue with Cursor"  # Switch agent
   lazy unblock abc123 --message "Fix it" --follow       # Wait for completion
   lazy unblock abc123 --message "Fix it" --yes          # Non-interactive
   echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback

@@ -27,8 +27,8 @@ let mockExitCode = 0;
 
 await mockModule(resolve(import.meta.dir, '../../src/utils/spawn.ts'), () => ({
   DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
-  spawnSync: () => {
-    throw new Error('spawnSync() not expected in these tests');
+  spawnSyncUnsupervised: () => {
+    throw new Error('spawnSyncUnsupervised() not expected in these tests');
   },
   spawn: (cmd: string[], _options: unknown) => {
     recordedCalls.push({ cmd });

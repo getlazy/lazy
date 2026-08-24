@@ -78,6 +78,8 @@ describe('proxy enforcement (server integration)', () => {
         policy: { ...defaultPolicyConfig(), ...policyOverrides },
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     return { proxy, ms, port: (proxy as unknown as { port: number }).port };
   }

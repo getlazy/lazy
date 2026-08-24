@@ -19,12 +19,17 @@ default = "sonnet"
 # All three are Anthropic-native; lazy never translates between API shapes.
 # When set, these override the legacy [ollama] block below for that role.
 #   - ollama/proxy require `model`.
-#   - ollama defaults `endpoint` to http://host.docker.internal:11434.
-#   - proxy `endpoint` is OPTIONAL: omit it and the daemon injects its own live
-#     proxy URL (see [proxy] below); set it only to point at a specific address.
-# NOTE: you do not need backend = "proxy" to get the audit/policy proxy — an
-# `anthropic` role already routes through it by default (see [proxy] below).
-# `ollama` roles are never proxied; they talk to the local model directly.
+#   - `endpoint` is the UPSTREAM lazy's proxy forwards this role to — never an
+#     address the agent dials. Write it the way the HOST reaches the service.
+#   - ollama defaults `endpoint` to http://localhost:11434. A container-
+#     perspective host.docker.internal spelling is read as localhost, with a
+#     warning — the proxy dials it from the host, where that alias does not
+#     resolve.
+#   - proxy `endpoint` is OPTIONAL: omit it and the role goes to the proxy's
+#     primary upstream, exactly like `anthropic`.
+# NOTE: you do not need backend = "proxy" to get the audit/policy proxy. EVERY
+# role routes through it, ollama and pinned endpoints included — the backend
+# chooses the upstream, never whether the role is proxied (see [proxy] below).
 # Lazy preflights each backend before launch and fails with an actionable
 # error if it is unreachable — it never silently falls back to another backend.
 # Example: keep the builder on real Anthropic, run agents on a local Ollama model.
@@ -36,7 +41,7 @@ default = "sonnet"
 # [models.roles.agent]
 # backend = "ollama"
 # model = "qwen3.5:35b-a3b-coding-nvfp4"
-# endpoint = "http://host.docker.internal:11434"
+# endpoint = "http://localhost:11434"   # host-perspective: the proxy dials this
 
 [session]
 # Show Docker output in real-time during session execution
@@ -77,7 +82,23 @@ default_branch_prefix = "lazy"
 shortid_length = 8
 
 [agent]
-# Default agent for task execution (default: "claude-code")
+# Default agent for task execution (default: "claude-code").
+# Available agents: "claude-code", "cursor" (Cursor CLI, `cursor-agent`).
+# Switch with `lazy system agent set <id>` (readiness view: `lazy system agent`);
+# per-task override: lazy create/start/edit/unblock --agent <id>.
+# This is the default only for a task created from scratch: a subtask, clone,
+# redo or rework inherits the agent of the task it came from.
+# Switching agents mid-task (via edit or unblock) starts a new session on the
+# new agent; sessions are not migrated. The next prompt gets a distilled copy of
+# the task's turn history plus a short branch orientation (commits and changed files).
+# Cursor auth: `lazy system agent set-key cursor` (stored per-project in
+# ~/.lazy/daemon/<slug>/agent-credentials.json, mode 0600, outside the repo
+# so task containers cannot read it; the CURSOR_API_KEY env var
+# overrides it). Container runners need a key — they cannot see a host
+# `cursor-agent login` session. Never put keys in this file: it is committed.
+# `lazy pair` is claude-code only and refuses on a Cursor task: a container
+# task's chat lives inside the sandbox and lazy will not copy agent-written
+# history onto your host, so there would be nothing to join.
 agent_id = "claude-code"
 
 # Hang backstop for agent processes (milliseconds). NOT a turn deadline: the
@@ -156,6 +177,36 @@ type = "docker"
 # staleness, and the fix; nothing is ever truncated and no launch is blocked.
 # warn_bytes = 4096
 
+[daemon]
+# Auto-react: daemon auto-unblocks tasks on CI failures and PR comments.
+# React to CI failures (auto-unblock blocked tasks when CI fails).
+# auto_react_ci = true
+# React to PR comments (auto-unblock blocked tasks when humans comment on PRs).
+# auto_react_comments = true
+# Auto-react budget controls — prevent runaway costs from auto-triggered turns.
+# Max auto-unblocks per task per trigger type before escalating to human.
+# auto_react_max_retries = 3
+# Backoff strategy between repeated auto-unblocks: "none", "linear", "exponential".
+# auto_react_backoff = "exponential"
+# Max auto-triggered turns per day across all tasks in this project.
+# auto_react_daily_budget = 50
+# Max consecutive auto-triggered turns per task before pausing for human review.
+# max_auto_turns = 3
+
+# Auto-resume: when a task's turn crashes, lazy resumes it automatically.
+# Master switch for auto-resuming interrupted tasks (fast lane and slow lane).
+# auto_resume = true
+# A fresh crash resumes immediately, up to 3 consecutive interruptions (fixed).
+# Past that, the task enters a slow-lane retry queue instead of giving up.
+# Minutes between slow-lane retries of a given task.
+# auto_resume_interval_minutes = 30
+# Minimum minutes between any two auto-resumes project-wide, so one flapping
+# task can't starve every other queued task (round-robin, oldest attempt first).
+# auto_resume_gap_minutes = 5
+# Slow-lane attempts before giving up for good and requiring a manual resume.
+# 24 x 30min = ~12 hours by default: if it hasn't recovered by then it never will.
+# auto_resume_max_attempts = 24
+
 [limits]
 # Concurrency caps for containers. When many tasks launch at once Docker
 # struggles (slow launches, probe timeouts), so lazy caps how many run at once.
@@ -174,6 +225,10 @@ type = "docker"
 # idle_grace_minutes = 10
 # Override either cap for the running daemon only (ephemeral, no lazy.toml edit):
 #   lazy daemon config set max_concurrent_agents 12
+# Max consecutive work turns a task may run without a human in the loop.
+# Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
+# 0 = unlimited.
+# max_turns_without_human = 10
 
 [remote]
 # Remote driver: "local" (default), "github", or "gitlab"
@@ -190,8 +245,12 @@ driver = "local"
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]
-# Path to custom Dockerfile (relative to project root, empty = use the base
-# image: Ubuntu with Claude Code + passwordless sudo; agents apt-get what they need)
+# Path to custom Dockerfile, relative to the project root. Empty = use the base
+# image (Ubuntu with Claude Code + passwordless sudo; agents apt-get what they
+# need). A task worktree's copy never governs the image. To build from another
+# file (e.g. a source branch's Dockerfile.lazy before it merges), export
+# LAZY_DOCKERFILE_LAZY=<path> — it overrides this key for every command and,
+# via ordinary env inheritance, for the daemon you (re)start.
 dockerfile = ""
 
 [documents]
@@ -296,9 +355,11 @@ protected = ["README.md", "test/**/*.ts"]
 # Both lists are managed by `lazy protect <branch|task> on|off`, which edits
 # this section in place and preserves these comments. `lazy protect` with no
 # arguments prints the current state.
-# File holding the approval passphrase. Create it out-of-band (it's
-# gitignored); `lazy approve` checks typed/piped input against it:
-# passphrase_file = ".lazy/approve-passphrase"
+#
+# The approval passphrase is NOT configured here, and lives nowhere in this
+# repository: it is enrolled once per machine, hashed, with
+# `lazy system passphrase set`. (Before v0.23 it sat in PLAINTEXT at
+# .lazy/approve-passphrase, readable by every agent it was meant to gate.)
 
 [automation]
 # Maintained files — the inverse of [permissions].protected. Patterns agents are
@@ -356,10 +417,14 @@ post_turn_timeout = 300
 # [models.roles.*] tables above, which override this block for any role they set.
 # enabled = true
 # model = "qwen3.5:35b-a3b-coding-nvfp4"
-# endpoint defaults to http://host.docker.internal:11434 if omitted
+# endpoint defaults to http://localhost:11434 if omitted. It is the proxy (a
+# host process) that dials Ollama, not the agent, so a container-perspective
+# host.docker.internal spelling is read as localhost, with a warning.
 
 # [proxy]
-# Built-in Anthropic-native passthrough proxy — ON BY DEFAULT.
+# Built-in Anthropic-native passthrough proxy — ALWAYS ON. There is no option to
+# turn it off: if you still carry the removed `enabled` key, `enabled = false` is
+# rejected at load and `enabled = true` warns that the line is dead.
 #
 # You do NOT need this section. With no [proxy] block at all, the daemon starts
 # the proxy on an OS-assigned port and routes all agent model traffic through it:
@@ -370,21 +435,27 @@ post_turn_timeout = 300
 #
 # Find the live address with `lazy daemon status` (also logged at daemon start).
 #
-# ESCAPE HATCH — restore direct, unproxied connections entirely (no proxy server,
-# no ANTHROPIC_BASE_URL injection, no audit trail, no policy enforcement):
-# enabled = false
-#
 # 'port' is OPTIONAL: omit it and the daemon binds an OS-assigned free port
 # (recommended — a hardcoded port conflicts across per-project daemons). Set a
 # port only to pin one. If the proxy cannot start, the daemon FAILS to start
-# rather than silently connecting direct (which would make the audit trail lie);
-# `enabled = false` is the documented way to get unblocked. The same rule holds
-# at launch time: if a launch cannot resolve the running proxy's live address
-# (daemon down, RPC blip), that LAUNCH fails with an actionable error — a
-# transient failure never silently downgrades traffic to a direct connection.
+# rather than silently connecting direct (which would make the audit trail lie).
+# The same rule holds at launch time: if a launch cannot resolve the running
+# proxy's live address (daemon down, RPC blip), that LAUNCH fails with an
+# actionable error — a transient failure never silently downgrades traffic to a
+# direct connection. To send a role somewhere else entirely, point it at an
+# explicit `endpoint` under [models.roles.*] rather than disabling the proxy.
 # port = 8766                          # optional — omit for an OS-assigned port
 # bind = "127.0.0.1"
 # upstream = "https://api.anthropic.com"
+#
+# Cursor traffic rides the SAME proxy port. When the task's agent is cursor, lazy
+# points cursor-agent's endpoint at http://<proxy>/_lazy/cursor/<role>/<task>, so
+# its requests are audited and attributed exactly like Anthropic turns. They are
+# forwarded VERBATIM: the policy plane and the failover chain below do NOT apply
+# to them, and the audit record is coarse (role, task, method, path, status,
+# duration) rather than model/token-level, because Cursor's wire format is not
+# Anthropic's. Set this only to point at a Cursor-compatible endpoint.
+# cursor_upstream = "https://api2.cursor.sh"
 #
 # Smart routing (opt-in): on a primary 429/529 or an unreachable primary, the
 # proxy reroutes to the fallback targets below, in order — re-sending the same
@@ -396,9 +467,19 @@ post_turn_timeout = 300
 # (default 5).
 # retry_after_threshold = 5
 #
+# Each target gets its own credential, or none: the proxy presents the credential
+# configured for the target it actually calls, never whatever the client sent.
+# credential defaults to "none" so your real Anthropic key is not handed to a
+# third-party endpoint you only listed as a spare. Set "anthropic" for a
+# fallback that really is Anthropic (a hot spare or a cheaper tier).
+# Credentials are keyed by ORIGIN (scheme+host+port), so a fallback sharing an
+# origin with a credentialed upstream would inherit its credential no matter what
+# you wrote here. Rather than let this key lie, lazy refuses to start: give the
+# fallback a distinct host or port, or declare credential = "anthropic" and mean it.
 # [[proxy.fallback]]
-# upstream = "http://host.docker.internal:11434"   # e.g. local Ollama
+# upstream = "http://localhost:11434"   # e.g. local Ollama
 # model = "qwen3.5:35b-a3b-coding-nvfp4"           # optional model override
+# credential = "none"                              # "none" (default) | "anthropic"
 #
 # Mechanistic policy plane — deterministic, injection-proof deny rules applied to
 # every tool call BEFORE it executes. ON by default with a closed posture, so you

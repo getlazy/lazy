@@ -7,6 +7,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitHubDriver } from '../../src/remote/github-driver';
 import type { Task } from '../../src/types';
 import type { ResolvedConfig } from '../../src/config/types';
@@ -39,12 +40,12 @@ const mockConfig: ResolvedConfig = {
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
-  protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true, passphrase_file: '.lazy/approve-passphrase' },
+  protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
   automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
   mounts: [],
   checks: { post_turn: '', post_turn_timeout: 300 },
   ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10 },
+  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -52,10 +53,14 @@ const mockConfig: ResolvedConfig = {
     auto_react_backoff: 'exponential' as const,
     auto_react_daily_budget: 50,
     max_auto_turns: 3,
+    auto_resume: true,
+    auto_resume_interval_minutes: 30,
+    auto_resume_gap_minutes: 5,
+    auto_resume_max_attempts: 24,
   },
   memory: { warn_bytes: 4096 },
   docs: { url: 'https://docs.getlazy.dev' },
-  proxy: null,
+  proxy: DEFAULT_CONFIG.proxy,
 };
 
 function makeTask(overrides?: Partial<Task>): Task {

@@ -32,6 +32,11 @@ export async function setupSandbox(worktreePath: string): Promise<SandboxConfig>
   const sandboxPath = join(worktreePath, SANDBOX_DIR);
   const claudeDir = join(sandboxPath, '.claude');
   await mkdir(claudeDir, { recursive: true });
+  // Cursor's equivalent home-config dir. Created unconditionally (cheap, and
+  // agent-agnostic callers don't need to know the task's agent): the container
+  // bind-mounts it to /home/user/.cursor so a Cursor task's chat state lands in
+  // the sandbox instead of vanishing with the container.
+  await mkdir(join(sandboxPath, '.cursor'), { recursive: true });
 
   const hostGitconfig = join(getHome(), '.gitconfig');
   const sandboxGitconfig = join(sandboxPath, '.gitconfig');

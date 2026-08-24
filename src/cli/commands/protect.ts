@@ -26,6 +26,7 @@ import { setSectionStringArray, setSectionBoolean, TomlEditError } from '../../c
 import { branchExists, getRemoteDefaultBranch } from '../../git/operations';
 import { theme } from '../theme';
 import { docsFooter } from '../../docs/links';
+import { isPassphraseEnrolled, readPassphraseEnrollment } from '../../protection/passphrase-store';
 import type { Storage } from '../../storage';
 import type { Task } from '../../types';
 
@@ -260,6 +261,7 @@ async function setProtection(
         console.log(theme.warning('  Note: the task has no branch yet (never started) — the gate arms when it does.'));
       }
     }
+    await warnIfNotEnrolled();
   }
 
   warnIfGloballyDisabled(config.protection.enabled || engagesSwitch);
@@ -278,6 +280,25 @@ function describeTarget(target: Target): string {
  * edit while the human flips the switch would be worse), but the change has
  * no effect yet, so say so, with the exact fix.
  */
+/**
+ * After arming a gate, say whether this machine can actually satisfy it.
+ *
+ * Deliberately does NOT block the config change: protection is a property of
+ * the repository, enrollment is a property of the machine, and the gate stays
+ * config-only (evaluateEdgeGate never looks at enrollment) so a fresh clone of
+ * a protected repo is protected everywhere. Someone arming protection for a
+ * team should not be stopped because they have not enrolled here yet — they
+ * should be told, which is what this does.
+ */
+async function warnIfNotEnrolled(): Promise<void> {
+  if (await isPassphraseEnrolled()) return;
+  console.log('');
+  console.log(theme.warning(
+    'No approval passphrase is enrolled on this machine, so gated merges will fail closed here.',
+  ));
+  console.log(`  Enroll once (covers every lazy project): ${theme.command('lazy system passphrase set')}`);
+}
+
 function warnIfGloballyDisabled(enabled: boolean): void {
   if (enabled) return;
   console.log('');
@@ -316,7 +337,17 @@ async function showProtectionState(): Promise<void> {
         : 'not protected (gate_default_branch = false)'
     }`,
   );
-  console.log(`  ${theme.label('Passphrase file'.padEnd(18))} ${p.passphrase_file}`);
+  // Enrollment, not a path: the passphrase lives hashed in a machine-global
+  // store, so there is nothing project-local to point at — and naming a file
+  // here used to invite reading it.
+  const enrollment = await readPassphraseEnrollment();
+  console.log(
+    `  ${theme.label('Passphrase'.padEnd(18))} ${
+      enrollment.enrolled
+        ? 'enrolled on this machine'
+        : theme.warning('not enrolled — gated merges will fail closed (`lazy system passphrase set`)')
+    }`,
+  );
 
   console.log(`\n${theme.header('Protected branches')} ${theme.separator('(merges IN need approval)')}`);
   // The default branch is gated without being listed. Show it here too, marked
@@ -366,6 +397,10 @@ export function protectUsage(): void {
 Manage branch protection — which merges require a one-time HUMAN approval
 (recorded with 'lazy approve'). All settings live in the [protection] section
 of lazy.toml; this command edits that section, preserving its comments.
+
+The passphrase itself is NOT configured here or anywhere in the repository: it
+lives hashed outside every repo, one per machine. Enroll it once with
+'lazy system passphrase set'.
 
 With no arguments, prints the current protection state.
 

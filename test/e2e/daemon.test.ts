@@ -1540,10 +1540,15 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       }
     });
 
-    // INVARIANT: `enabled = false` is the escape hatch — it must start NOTHING,
-    // and must say so rather than going quiet (silence would be indistinguishable
-    // from a running proxy and would hide that traffic is unaudited).
-    test('[proxy] enabled = false starts no proxy and says so', async () => {
+    // INVARIANT: `[proxy] enabled` was REMOVED — the proxy is always on. The
+    // value decides what carrying the key still does, and this test covers the
+    // refusing half: `enabled = false` asks for something lazy no longer does,
+    // so the daemon REFUSES TO START, naming the option, rather than coming up
+    // while the user believes their traffic is unproxied. (`enabled = true`
+    // asks for what lazy already does, so it only warns and runs on — covered
+    // in test/e2e/proxy-fail-loud.test.ts.) This replaces the old
+    // "enabled = false starts no proxy" test: that state no longer exists.
+    test('a config carrying [proxy] enabled = false fails daemon startup', async () => {
       // Route the DEFAULT daemon paths into a private dir. LAZY_DAEMON_BASE_DIR
       // (not HOME) is the targeted seam — see test/helpers/daemon-base-dir.ts.
       const tmpDir = await makeDaemonBaseDir();
@@ -1559,23 +1564,10 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         await writeFile(configPath, `${existing}\n[proxy]\nenabled = false\n`);
 
         const { getSocketPath } = await import('../../src/daemon/paths');
-        const daemon = await startDaemonServer({
+        await expect(startDaemonServer({
           projectRoot: ctx.root,
           socketPath: getSocketPath(ctx.root),
-        });
-        try {
-          // No proxy server at all.
-          expect(daemon.proxyServer).toBeUndefined();
-
-          const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
-            env: { LAZY_DAEMON_BASE_DIR: tmpDir, LAZY_CONFIG: join(ctx.root, 'lazy.toml'), LAZY_TEST: '1' },
-          });
-          expectSuccess(result);
-          expectOutput(result, 'Daemon is running');
-          expectOutput(result, 'disabled');
-        } finally {
-          await daemon.stop();
-        }
+        })).rejects.toThrow(/`enabled` option has been removed/);
       } finally {
         process.chdir(STABLE_CWD);
         unpinConfig();

@@ -33,18 +33,38 @@ const REPEAT_WARN_INTERVAL = 100;
 
 export class AuditQueue {
   private sink: AuditSink;
+  private tap: ((record: ProxyAuditRecord) => void) | null;
   // Serial promise chain: each enqueue() tacks on a new .then() so appends
   // never overlap even when many requests are in-flight simultaneously.
   private chain: Promise<void> = Promise.resolve();
   private lastFailure: string | null = null;
   private repeatCount = 0;
 
-  constructor(sink: AuditSink) {
+  /**
+   * `tap` is the LIVE observer (src/proxy/activity.ts), called synchronously on
+   * every enqueue, before the durable append is even scheduled. It is wired
+   * here rather than at each of the proxy's half-dozen record sites so a future
+   * audit site cannot forget it — every record that reaches the trail reaches
+   * `lazy watch` too, by construction.
+   */
+  constructor(sink: AuditSink, tap?: (record: ProxyAuditRecord) => void) {
     this.sink = sink;
+    this.tap = tap ?? null;
   }
 
   /** Fire-and-forget: enqueue a record. Returns immediately; write is async. */
   enqueue(record: ProxyAuditRecord): void {
+    if (this.tap) {
+      try {
+        this.tap(record);
+      } catch (err) {
+        // Observation must never break the request being observed — and a
+        // broken tap must not stop the DURABLE append below from happening.
+        logger.warn(
+          `[proxy] activity tap failed for seq=${record.seq}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     this.chain = this.chain.then(async () => {
       try {
         await this.sink.append(record);

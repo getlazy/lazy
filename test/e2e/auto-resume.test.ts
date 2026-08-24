@@ -9,6 +9,7 @@ import {
   writeResponse,
   consumeResponse,
   readCommand,
+  consumeCommand,
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse, UnblockCommand } from '../../src/protocol';
@@ -417,6 +418,68 @@ describe('circuit breaker', () => {
     // 5. Verify counter was reset
     const updatedSession = readSession(ctx.root, fullTaskId);
     expect(updatedSession.consecutive_interruptions).toBe(0);
+  });
+});
+
+// ============================================================
+// Section 3b: Project-wide gap applies to the fast lane too
+//
+// INVARIANT: daemon.auto_resume_gap_minutes spaces out ANY two auto-resumes,
+// fast-lane or slow-lane, via the same auto-resume-queue.json timestamp.
+// Without this, a burst of simultaneous crashes would relaunch every task
+// immediately on the fast lane (well below the circuit-breaker threshold),
+// defeating the gap entirely until they eventually fell to the slow lane.
+// ============================================================
+
+describe('project-wide gap on the fast lane', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  test('a recent project-wide auto-resume defers a fresh fast-lane crash', async () => {
+    // 1. Create and start a task
+    const taskId = await createTask(ctx, 'Gap test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // Consume the leftover initial `start` command.json so a later readCommand
+    // null-check actually proves no NEW (resume) command was written, rather
+    // than just seeing the original start command untouched.
+    consumeCommand(getProtocolDir(fullTaskId));
+
+    // 2. Seed the project-wide gap file as if some other task was just
+    //    auto-resumed a moment ago (well within the default 5-minute gap).
+    const gapFile = join(ctx.root, '.lazy', 'auto-resume-queue.json');
+    writeFileSync(gapFile, JSON.stringify({ lastAutoResumeAt: Date.now() }));
+
+    // 3. Set to working and remove response (simulating container crash) —
+    //    consecutive_interruptions will land at 1, well below the circuit
+    //    breaker, so this task would normally auto-resume immediately.
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    consumeResponse(getProtocolDir(fullTaskId));
+
+    // 4. Trigger reconciliation — the interruption is recorded, but the
+    //    project-wide gap should defer the actual resume attempt.
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    // 5. Task stays interrupted; no unblock command was written.
+    const showResult = await ctx.lazy(['show', taskId]);
+    expectSuccess(showResult);
+    expectOutput(showResult, 'interrupted');
+
+    const command = readCommand(getProtocolDir(fullTaskId));
+    expect(command).toBeNull();
+
+    const session = readSession(ctx.root, fullTaskId);
+    expect(session.consecutive_interruptions).toBe(1);
   });
 });
 

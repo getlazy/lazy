@@ -6,9 +6,9 @@
  * parsed out of the response. This command is the reader for that trail: overall
  * totals plus per-role, per-task and per-model breakdowns.
  *
- * Scope caveat, stated in the readout rather than buried here: only traffic that
- * goes THROUGH the proxy is audited. An agent on the `anthropic` or `ollama`
- * backend talks to its upstream directly and is invisible to this command.
+ * Scope, stated in the readout rather than buried here: every launch lazy makes
+ * is proxied, whatever its role's backend — so this trail covers all of them.
+ * What it cannot cover is a process lazy did not launch.
  */
 import { join } from 'path';
 import { requireLazyRoot, parseFlags } from '../helpers';
@@ -123,7 +123,7 @@ export async function commandTokens(args: string[]): Promise<void> {
 
   if (report.totals.requests === 0) {
     console.log(
-      'No proxied requests recorded yet — run a task with the proxy backend enabled and retry.',
+      'No proxied requests recorded yet — run a task and retry.',
     );
     return;
   }
@@ -145,10 +145,10 @@ command rolls those records up:
   By task        which task burned them
   By model       which wire model served them
 
-Only traffic that goes THROUGH the proxy is audited. An agent configured on the
-'anthropic' or 'ollama' backend talks to its upstream directly and never appears
-here. Requests that failed before a response carry no usage and are counted in
-"requests" but not in "with usage".
+Every launch lazy makes routes through the proxy, whatever the role's backend, so
+all of it is audited here; a process lazy did not launch is not. Requests that
+failed before a response carry no usage and are counted in "requests" but not in
+"with usage".
 
 Options:
   --since <duration>   Only records within this window (e.g. 30m, 2h, 1d)

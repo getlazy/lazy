@@ -31,10 +31,10 @@ import { handleCompletedResponses } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
 import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {
-  const result = spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return result.stdout?.toString().trim() ?? '';
 }
 

@@ -56,10 +56,13 @@ export interface ListResult {
 export async function queryTaskList(params: {
   all?: boolean;
   taskFilter?: string;
+  /** Depth limit — see pruneTasksToDepth. Undefined means no limit. */
+  levels?: number;
 }): Promise<ListResult> {
   const rpc = await tryRpc<ListResult>('list', {
     all: params.all,
     taskFilter: params.taskFilter,
+    levels: params.levels,
   });
   if (rpc) return rpc;
 
@@ -78,19 +81,21 @@ export async function queryTaskList(params: {
 
 // --- Blocked ---
 
-export async function queryBlockedTasks(): Promise<ListResult> {
-  const rpc = await tryRpc<ListResult>('blocked');
+export async function queryBlockedTasks(params: { levels?: number } = {}): Promise<ListResult> {
+  const rpc = await tryRpc<ListResult>('blocked', { levels: params.levels });
   if (rpc) return rpc;
 
   const root = requireLazyRoot();
-  return await handleBlocked(root) as ListResult;
+  return await handleBlocked(root, params) as ListResult;
 }
 
 // --- Active ---
 
-export async function queryActiveTasks(params: { taskFilter?: string } = {}): Promise<ListResult> {
+export async function queryActiveTasks(
+  params: { taskFilter?: string; levels?: number } = {},
+): Promise<ListResult> {
   try {
-    const rpc = await tryRpc<ListResult>('active', { taskFilter: params.taskFilter });
+    const rpc = await tryRpc<ListResult>('active', { taskFilter: params.taskFilter, levels: params.levels });
     if (rpc) return rpc;
   } catch (err) {
     // Same user-error treatment as the direct path below: an unknown or
@@ -464,6 +469,7 @@ export async function queryUnblockTask(params: {
   retargetOrphan?: boolean;
   notesInEditor?: boolean;
   effortOverride?: string;
+  agentOverride?: string;
   permissionMode?: 'plan' | 'default';
   actor?: Actor;
 }): Promise<UnblockTaskRpcResult> {
@@ -475,6 +481,7 @@ export async function queryUnblockTask(params: {
     retargetOrphan: params.retargetOrphan,
     notesInEditor: params.notesInEditor,
     effortOverride: params.effortOverride,
+    agentOverride: params.agentOverride,
     permissionMode: params.permissionMode,
     actor: params.actor,
   });

@@ -7,6 +7,8 @@ import { commandStart } from './start';
 
 
 import { getDataDir } from '../init';
+import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 
 export async function commandBranch(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -118,8 +120,19 @@ export async function commandBranch(args: string[]): Promise<void> {
       }
     }
 
-    // Create child task with parent reference
-    const childTask = await storage.createTask(childGoal, parentTask.id, branchFromSha, childCode);
+    // Create child task with parent reference. A subtask runs on its parent's
+    // agent — it is a continuation of the parent's work, not a fresh task.
+    const childTask = await storage.createTask(
+      childGoal,
+      parentTask.id,
+      branchFromSha,
+      childCode,
+      undefined,
+      resolveAgentForNewTask({
+        inheritFrom: parentTask,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      }),
+    );
 
     // Set prompt
     await storage.updateTaskPrompt(childTask.id, childPrompt);

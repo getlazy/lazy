@@ -63,22 +63,47 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * rewriting it to `blocked` loses a real signal (unresolved violations, an open
  * PR awaiting review). That is why `working` and `merging` can reach every
  * blocked-family status rather than `blocked` alone.
+ * INVARIANT (violations-are-the-source-of-truth): `blocked` and `conflict` are
+ * the same resting place wearing two labels — the label is DERIVED from whether
+ * the task still has pending file-permission violations (`parkTaskPaused` in
+ * src/utils/paused-status.ts). Re-deriving it must therefore always be legal,
+ * which is why `blocked → conflict`, `conflict → blocked` and `pairing →
+ * conflict` are in the table. Before they were, a side-channel turn on a
+ * `conflict` task (an ask, a sync, the end of a pairing session) could only park
+ * it as `blocked`, orphaning a pending violation set: the reviewer surfaces then
+ * refused `approved_files` while the daemon still reverted the unapproved files,
+ * silently destroying committed agent work (fix-ask-nukes-violations).
  *   remote-sync: working/interrupted → merging → complete (externally merged MR)
  *   abandon:     blocked/conflict/interrupted/submitted/backlog → abandoned
  *   pair:        blocked/conflict/interrupted/submitted → pairing, pairing → blocked
  *   resume:      interrupted → working
  *   reopen:      complete/abandoned → blocked (with session) or backlog (no session)
  *   zombie:      any non-terminal → zombie (system only), zombie → complete
+ *
+ * `merging` has NO edge to `abandoned`, deliberately. A task genuinely mid-merge
+ * must not be abandonable — that would trade a wedge for a half-applied merge.
+ * The three edges out of it to non-terminal states (`blocked`, `conflict`,
+ * `submitted`) are the accept ABORT path restoring the TRUE status the task held
+ * before the accept began; `submitted` is there for a task that had an open PR,
+ * not because a human may `lazy submit` a merging task (submitTask still requires
+ * blocked/conflict — see src/daemon/task-lifecycle.ts).
+ *
+ * That leaves the question of a `merging` task whose accept died. It is NOT
+ * answered by widening this table: src/daemon/stranded-merge.ts returns such a
+ * task to a real resting state — on demand from reject/close/submit/unblock, and
+ * automatically from the reconciler — after which the ordinary transitions above
+ * apply. Before that existed, one field task sat inescapably wedged for two weeks
+ * (fix-stranded-merging).
  */
 export const VALID_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   backlog:     ['working', 'blocked', 'abandoned', 'queued'],
   queued:      ['working', 'backlog', 'abandoned'],
   working:     ['blocked', 'conflict', 'interrupted', 'merging', 'submitted'],
-  blocked:     ['working', 'submitted', 'merging', 'pairing', 'abandoned', 'backlog'],
-  conflict:    ['working', 'submitted', 'merging', 'pairing', 'abandoned'],
+  blocked:     ['working', 'conflict', 'submitted', 'merging', 'pairing', 'abandoned', 'backlog'],
+  conflict:    ['working', 'blocked', 'submitted', 'merging', 'pairing', 'abandoned'],
   interrupted: ['working', 'merging', 'pairing', 'abandoned'],
   submitted:   ['working', 'merging', 'pairing', 'abandoned'],
-  pairing:     ['blocked'],
+  pairing:     ['blocked', 'conflict'],
   merging:     ['complete', 'blocked', 'conflict', 'submitted'],
   zombie:      ['complete'],
   complete:    ['blocked', 'backlog'],

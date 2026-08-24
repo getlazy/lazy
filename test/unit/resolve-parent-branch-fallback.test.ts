@@ -80,9 +80,16 @@ await mockModule(resolve(import.meta.dir, '../../src/constants.ts'), () => ({
   getActor: () => 'test',
 }));
 
-// Mock logger
+// Mock logger — errors are captured so the cycle-guard test can assert the
+// diagnostic actually names the offending task ids.
+let loggedErrors: string[] = [];
 await mockModule(resolve(import.meta.dir, '../../src/utils/logger.ts'), () => ({
-  logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+  logger: {
+    info: () => {},
+    warn: () => {},
+    debug: () => {},
+    error: (msg: string) => { loggedErrors.push(msg); },
+  },
 }));
 
 // Import the real function after mocks are registered
@@ -98,6 +105,7 @@ describe('resolveParentBranch stale parent fallback', () => {
     comments = [];
     taskStore.clear();
     branchNameMap.clear();
+    loggedErrors = [];
     mockRemoteDefaultBranch = 'main';
   });
 
@@ -239,6 +247,51 @@ describe('resolveParentBranch stale parent fallback', () => {
 
     expect(result.branch).toBe('main');
     expect(result.branch).not.toBe('lazy/release-v015');
+  });
+
+  // INVARIANT: a corrupt store must never hang the daemon. A parent cycle
+  // among terminal ancestors (A → B → A) is only reachable through corrupt
+  // data, but this walk runs on the daemon's reconcile/sync path — unguarded,
+  // it spins forever and the daemon freezes. The guard mirrors
+  // `collectSubtreeIds` (src/task-target.ts) and treats a detected cycle
+  // exactly like the existing "ancestor not found" break: fall through to the
+  // default integration branch. Without the guard this test never returns.
+  test('terminates on a parent cycle among terminal ancestors and falls back to main', async () => {
+    // gp's parent is parent, and parent's parent is gp — a closed loop of
+    // terminal tasks above the task being synced.
+    const gp = { id: 'gp-id-12345678', status: 'complete', code: 'gp', target: taskT('parent-id-1234') };
+    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', target: taskT('gp-id-12345678') };
+    taskStore.set(gp.id, gp);
+    taskStore.set(parent.id, parent);
+    mockRemoteDefaultBranch = 'main';
+
+    const task = { id: 'child-id-1234', code: 'child', target: taskT(parent.id), metadata: {} };
+    const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
+
+    // Same fallback as a missing ancestor.
+    expect(result.branch).toBe('main');
+    expect(targetUpdates).toEqual([{ taskId: 'child-id-1234', target: { kind: 'branch' as const, branch: 'main' } }]);
+
+    // Errors are for humans: the diagnostic names the actual cycling ids so the
+    // store can be repaired.
+    expect(loggedErrors.length).toBe(1);
+    expect(loggedErrors[0]).toContain('parent cycle detected');
+    expect(loggedErrors[0]).toContain(parent.id);
+    expect(loggedErrors[0]).toContain(gp.id);
+  });
+
+  // A self-parent (A → A) is the degenerate one-node cycle — same fallback.
+  test('terminates on a self-referential terminal parent', async () => {
+    const parent = { id: 'parent-id-1234', status: 'complete', code: 'parent', target: taskT('parent-id-1234') };
+    taskStore.set(parent.id, parent);
+    mockRemoteDefaultBranch = 'main';
+
+    const task = { id: 'child-id-1234', code: 'child', target: taskT(parent.id), metadata: {} };
+    const result = await resolveParentBranchWithFallback(task as any, mockStorage as any, '/project');
+
+    expect(result.branch).toBe('main');
+    expect(loggedErrors.length).toBe(1);
+    expect(loggedErrors[0]).toContain(parent.id);
   });
 });
 

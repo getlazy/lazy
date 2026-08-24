@@ -19,7 +19,7 @@ import { join } from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
-import { createTask, disablePreAccept, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, disablePreAccept, MOCK_CLAUDE_SUCCESS, setProtectedPatterns } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
 import { readTaskStatus, readTurns, writeTurns, type StoredTurn } from '../helpers/storage';
 
@@ -52,9 +52,7 @@ describe('file permission violations', () => {
   // Agents must not modify existing test content without human review.
   test('detects violations when agent modifies a test file', async () => {
     // Enable permissions with test file patterns
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns for spec files');
 
@@ -104,9 +102,7 @@ describe('file permission violations', () => {
   // Agents should be free to create new tests without triggering violations.
   test('allows pure additions to test files without violations', async () => {
     // Enable permissions with test file patterns
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["test/**"]\n');
+    setProtectedPatterns(ctx.root, ["test/**"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns for test dir');
 
@@ -151,9 +147,7 @@ describe('file permission violations', () => {
   // protected files the reviewer never ruled on — the destructive direction.
   test('unblock refuses without a decision, and --no-approve-files reverts all', async () => {
     // Set up protected pattern and existing file
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -229,9 +223,7 @@ describe('file permission violations', () => {
   // is last passes even against the buggy code. Real nudge turns need a live
   // supervisor, so the shape is seeded directly into storage.
   test('unblock is still refused when nudge turns follow the violation turn', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -285,9 +277,7 @@ describe('file permission violations', () => {
   // Only non-approved files are reverted; approved files keep their changes.
   test('unblock with --approve-file approves specified files and reverts others', async () => {
     // Set up protected pattern and two existing files
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -346,9 +336,7 @@ describe('file permission violations', () => {
   // All violations must be explicitly approved or rejected before merging.
   test('accept refuses task with pending violations', async () => {
     // Set up protected pattern and existing file
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -382,9 +370,7 @@ describe('file permission violations', () => {
   // INVARIANT: Accept succeeds after violations are resolved (approved or rejected).
   test('accept succeeds after violations are resolved via unblock', async () => {
     // Set up protected pattern and existing file
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -422,17 +408,16 @@ describe('file permission violations', () => {
     await runReconcile(ctx.root, ctx.protocolBase);
     expectSuccess(unblockResult);
 
-    // Now accept should work — violations are resolved
-    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    // Now accept should work — violations are resolved.
+    // Mocked: accept generates a merge description via a one-shot agent call.
+    const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {});
     expectSuccess(acceptResult);
   });
 
   // INVARIANT: Accept with --approve-file covering ALL pending violations succeeds.
   // This allows direct accept of conflict tasks without an unnecessary unblock round-trip.
   test('accept with --approve-file covering all violations succeeds', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -458,9 +443,12 @@ describe('file permission violations', () => {
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
     // Accept with --approve-file covering the violated file → should succeed
-    const acceptResult = await ctx.lazy([
-      'accept', taskId, '--approve-file', 'test.spec.ts', '--yes',
-    ]);
+    // Mocked: accept generates a merge description via a one-shot agent call.
+    const acceptResult = await ctx.lazyMocked(
+      ['accept', taskId, '--approve-file', 'test.spec.ts', '--yes'],
+      MOCK_CLAUDE_SUCCESS,
+      {},
+    );
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'Approved 1 protected file change(s)');
 
@@ -474,9 +462,7 @@ describe('file permission violations', () => {
   // INVARIANT: Accept with partial --approve-file refuses with specific missing files.
   // Partial approval at accept time is not allowed — all or nothing.
   test('accept with partial --approve-file fails listing missing files', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -514,9 +500,7 @@ describe('file permission violations', () => {
   // and merged with built-in defaults.
   test('respects custom protected patterns from lazy.toml', async () => {
     // Add a custom protected pattern to lazy.toml
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["docs/**"]\n');
+    setProtectedPatterns(ctx.root, ["docs/**"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Add custom protected pattern');
 
@@ -558,9 +542,7 @@ describe('file permission violations', () => {
   // INVARIANT: Push-back fires when violations are detected, giving the agent one chance
   // to self-correct. If the agent reverts the file, no violations remain in the output.
   test('push-back allows agent to revert violation and clear it', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -620,9 +602,7 @@ describe('file permission violations', () => {
   // INVARIANT: When push-back fires and the agent keeps the file, violations persist
   // and the task enters 'conflict' status with the agent's justification.
   test('push-back with agent keeping changes preserves violations with justification', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -680,9 +660,7 @@ describe('file permission violations', () => {
   // INVARIANT: Push-back only happens once per turn (no infinite loop).
   // Even after push-back, the result is final and the turn completes.
   test('push-back happens only once — no re-push-back after agent response', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns');
 
@@ -724,9 +702,7 @@ describe('file permission violations', () => {
   // detectViolations can distinguish task-created files from pre-existing ones across turns.
   test('no violation when file created in turn 1 is modified in turn 2', async () => {
     // Enable permissions with test dir pattern
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["test/**/*.ts"]\n');
+    setProtectedPatterns(ctx.root, ["test/**/*.ts"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns for test dir');
 
@@ -780,9 +756,7 @@ describe('file permission violations', () => {
   // protected_patterns must be passed through unblock commands to the supervisor.
   test('detects violations on unblock turns', async () => {
     // Enable permissions with test file patterns
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, existingConfig + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns for spec files');
 

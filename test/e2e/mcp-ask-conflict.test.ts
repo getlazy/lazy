@@ -19,7 +19,7 @@ import { readFileSync, readdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTask, setProtectedPatterns } from '../helpers/fixtures';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -143,8 +143,7 @@ describe('lazy_ask on conflict tasks', () => {
   test('asking a conflict task returns an answer and leaves it in conflict', async () => {
     // Enable a protected pattern + add the file the mock agent will modify, so
     // the start turn completes with a violation → task lands in `conflict`.
-    const configPath = join(ctx.root, 'lazy.toml');
-    writeFileSync(configPath, readFileSync(configPath, 'utf-8') + '\n[permissions]\nprotected = ["*.spec.*"]\n');
+    setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');
     ctx.git('commit', '-m', 'Enable protected patterns for spec files');
 

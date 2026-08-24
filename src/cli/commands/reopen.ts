@@ -234,7 +234,7 @@ Notes:
   - Only works on tasks with 'abandoned' or 'complete' status
   - For complete tasks, a reason is required and recorded as a comment
   - Resets the session so the task can receive new feedback
-  - For complete tasks, clears the old Claude session ID to start fresh
+  - For complete tasks, clears the old agent session ID to start fresh
   - After reopening, use 'lazy unblock' to continue (or 'lazy start' for never-started tasks)
 
 Examples:

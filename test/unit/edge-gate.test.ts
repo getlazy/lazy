@@ -28,7 +28,6 @@ function protection(overrides: Partial<ProtectionConfig> = {}): ProtectionConfig
     protected_branches: [],
     protected_tasks: [],
     gate_default_branch: true,
-    passphrase_file: '.lazy/approve-passphrase',
     ...overrides,
   };
 }

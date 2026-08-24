@@ -334,6 +334,6 @@ export function stackedChildAdvisory(childCount: number, targetBranch: string): 
     `\`${targetBranch}\` silently reappear (lazy refuses such an accept; see ` +
     // In-sentence reference: the hosted page when doc pointers are on, the
     // in-repo file when a project has turned them off.
-    `${docsUrl('resurrection-guard') ?? 'docs/resurrection-guard.md'})`
+    `${docsUrl('resurrection-guard') ?? 'public-docs/resurrection-guard.md'})`
   );
 }

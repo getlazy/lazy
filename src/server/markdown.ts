@@ -41,8 +41,39 @@ function renderInline(text: string): string {
   return result;
 }
 
+// Block-level line classification.
+//
+// INVARIANT: this is the ONE place a line's block kind is decided. The outer
+// render loop and the paragraph-collection lookahead MUST both go through
+// `classifyLine` — they used to carry separate, hand-maintained copies of these
+// patterns, and the copies drifted: the outer patterns ended in `(.*)$`, which
+// (in JS, without /m) rejects a trailing `\r`, while the lookahead's prefix-only
+// copies accepted it. A CRLF heading/list line therefore fell through to the
+// paragraph branch, which then refused to consume it — `i` never advanced and
+// the whole daemon event loop spun forever. One classifier, no drift.
+const HEADING_RE = /^(#{1,6})\s+(.*)$/;
+const UL_RE = /^(\s*)[-*+]\s+(.*)$/;
+const OL_RE = /^(\s*)\d+\.\s+(.*)$/;
+const HR_RE = /^(\-{3,}|\*{3,}|_{3,})$/;
+
+type LineKind = 'fence' | 'heading' | 'hr' | 'blockquote' | 'ul' | 'ol' | 'blank' | 'paragraph';
+
+function classifyLine(line: string): LineKind {
+  // Order matters and mirrors the order the render loop handles blocks in.
+  if (line.trimStart().startsWith('```')) return 'fence';
+  if (HEADING_RE.test(line)) return 'heading';
+  if (HR_RE.test(line.trim())) return 'hr';
+  if (line.startsWith('> ')) return 'blockquote';
+  if (UL_RE.test(line)) return 'ul';
+  if (OL_RE.test(line)) return 'ol';
+  if (line.trim() === '') return 'blank';
+  return 'paragraph';
+}
+
 export function renderMarkdown(markdown: string): string {
-  const lines = markdown.split('\n');
+  // Normalize line endings first: a CRLF (or classic-Mac CR) document must
+  // render identically to its LF twin. Everything below assumes no stray \r.
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
   const output: string[] = [];
   let i = 0;
 
@@ -89,14 +120,15 @@ export function renderMarkdown(markdown: string): string {
 
   while (i < lines.length) {
     const line = lines[i];
+    const kind = classifyLine(line);
 
     // Fenced code blocks
-    if (line.trimStart().startsWith('```')) {
+    if (kind === 'fence') {
       closeList();
       const lang = line.trimStart().slice(3).trim();
       const codeLines: string[] = [];
       i++;
-      while (i < lines.length && !lines[i].trimStart().startsWith('```')) {
+      while (i < lines.length && classifyLine(lines[i]) !== 'fence') {
         codeLines.push(lines[i]);
         i++;
       }
@@ -107,8 +139,8 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Headings
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
+    if (kind === 'heading') {
+      const headingMatch = line.match(HEADING_RE)!;
       closeList();
       const level = headingMatch[1].length;
       output.push(`<h${level}>${renderInline(headingMatch[2])}</h${level}>`);
@@ -117,7 +149,7 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Horizontal rule
-    if (/^(\-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+    if (kind === 'hr') {
       closeList();
       output.push('<hr>');
       i++;
@@ -125,10 +157,10 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Blockquote
-    if (line.startsWith('> ')) {
+    if (kind === 'blockquote') {
       closeList();
       const quoteLines: string[] = [];
-      while (i < lines.length && lines[i].startsWith('> ')) {
+      while (i < lines.length && classifyLine(lines[i]) === 'blockquote') {
         quoteLines.push(lines[i].slice(2));
         i++;
       }
@@ -137,8 +169,8 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Unordered list (indent-aware nesting via the listStack helper)
-    const ulMatch = line.match(/^(\s*)[-*+]\s+(.*)$/);
-    if (ulMatch) {
+    if (kind === 'ul') {
+      const ulMatch = line.match(UL_RE)!;
       const indent = ulMatch[1].length;
       adjustListsTo(indent, 'ul');
       output.push(`<li>${renderInline(ulMatch[2])}</li>`);
@@ -147,8 +179,8 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Ordered list (same nesting story as unordered)
-    const olMatch = line.match(/^(\s*)\d+\.\s+(.*)$/);
-    if (olMatch) {
+    if (kind === 'ol') {
+      const olMatch = line.match(OL_RE)!;
       const indent = olMatch[1].length;
       adjustListsTo(indent, 'ol');
       output.push(`<li>${renderInline(olMatch[2])}</li>`);
@@ -157,7 +189,7 @@ export function renderMarkdown(markdown: string): string {
     }
 
     // Empty line
-    if (line.trim() === '') {
+    if (kind === 'blank') {
       closeList();
       i++;
       continue;
@@ -166,13 +198,20 @@ export function renderMarkdown(markdown: string): string {
     // Paragraph - collect consecutive non-empty lines
     closeList();
     const paraLines: string[] = [];
-    while (i < lines.length && lines[i].trim() !== '' && !lines[i].match(/^#{1,6}\s/) && !lines[i].trimStart().startsWith('```') && !lines[i].startsWith('> ') && !lines[i].match(/^(\s*)[-*+]\s+/) && !lines[i].match(/^(\s*)\d+\.\s+/) && !/^(\-{3,}|\*{3,}|_{3,})$/.test(lines[i].trim())) {
+    while (i < lines.length && classifyLine(lines[i]) === 'paragraph') {
       paraLines.push(lines[i]);
       i++;
     }
-    if (paraLines.length > 0) {
-      output.push(`<p>${renderInline(paraLines.join('\n'))}</p>`);
+    // INVARIANT: the outer loop must advance on every iteration. `kind` is
+    // 'paragraph' here, so the collection loop consumes at least this line —
+    // but consume it unconditionally anyway, so no future classifier change can
+    // reintroduce a zero-progress iteration (an infinite loop that freezes the
+    // daemon's whole event loop, not just the request rendering it).
+    if (paraLines.length === 0) {
+      paraLines.push(lines[i]);
+      i++;
     }
+    output.push(`<p>${renderInline(paraLines.join('\n'))}</p>`);
   }
 
   closeList();

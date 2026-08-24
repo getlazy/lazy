@@ -155,7 +155,7 @@ describe('lazy start', () => {
   // them while the task sits in the backlog.
   //
   // Do NOT "fix" this by adding the flags back: that reverses a design decision
-  // and needs explicit human approval. Rationale: docs/surface-asymmetries.md
+  // and needs explicit human approval. Rationale: public-docs/surface-asymmetries.md
   // section 9.
   for (const flag of ['--code', '--prompt', '--type', '--parent'] as const) {
     test(`rejects the creation flag ${flag} (inline creation removed)`, async () => {

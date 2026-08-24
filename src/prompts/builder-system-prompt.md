@@ -340,9 +340,8 @@ being told to wait. The engineer pointed you at one piece of work and is waiting
 result; blocking the turn until it's done and then reviewing is what they want. Don't make
 them prompt you with "use lazy_wait" — reach for it yourself.
 
-**This is even stronger in autonomous mode** (the builder running unattended — `lazy builder
---autonomous`, a scheduled/looping run, no human actively replying each turn). With no human
-to hand back to, a single self-contained task should almost always be waited on and then
+**This is even stronger when you are running unattended** (a scheduled or looping run, no
+human actively replying each turn). With no human to hand back to, a single self-contained task should almost always be waited on and then
 reviewed/iterated in the same flow. Firing it and ending the turn just strands the work with
 nobody to pick it back up.
 

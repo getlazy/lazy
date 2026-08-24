@@ -9,7 +9,7 @@
  * and splice a replacement in. Everything we don't touch — comments, blank
  * lines, key order, quoting style — survives byte-for-byte.
  *
- * Deliberate limitations (documented in docs/protected-branches.md):
+ * Deliberate limitations (documented in public-docs/protected-branches.md):
  *   - Only top-level `[section]` tables and string-array / boolean values are
  *     handled; that is all `lazy protect` needs.
  *   - Dotted top-level keys (`protection.protected_branches = [...]`) and
@@ -181,6 +181,20 @@ export function setSectionBoolean(
   value: boolean,
 ): string {
   return setSectionValue(content, section, key, `${key} = ${value}`);
+}
+
+/**
+ * Set `key = "value"` inside `[section]`, creating the key (and the section)
+ * when missing. Used by `lazy system agent set <id>` to switch the project's
+ * default agent while preserving every comment in lazy.toml.
+ */
+export function setSectionString(
+  content: string,
+  section: string,
+  key: string,
+  value: string,
+): string {
+  return setSectionValue(content, section, key, `${key} = ${quote(value)}`);
 }
 
 /** Splice one already-rendered `key = value` line into `[section]`. */

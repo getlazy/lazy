@@ -19,8 +19,12 @@ import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
 import type { RoleTarget } from '../config/types';
 import type { BuilderLaunchProjects } from '../builder/projects-isolation';
 import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
-import { getAuthEnvVars as getDefaultAuthEnvVars } from '../capture/claude';
+import { getAuthEnvVars as getDefaultAuthEnvVars, getLaunchAuthEnvVars } from '../capture/claude';
+import { mintCredentialGrant } from '../proxy/credential-broker';
+import type { LaunchIdentity } from '../proxy/placeholder-env';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
+import { getAgentPackaging } from '../agent/registry';
+import { agentSupportsApiKey, resolveAgentApiKey, AGENT_KEY_ENV } from '../agent/credentials';
 import { encodeProjectPath } from '../import/claude-code-logs';
 import { logger } from '../utils/logger';
 import { redactSecrets } from '../utils/redact';
@@ -30,6 +34,9 @@ import {
   ANTHROPIC_DEFAULT_TARGET,
   type ProxyAuditHints,
 } from '../utils/role-target';
+import { cursorLaunchEnvVars } from '../proxy/cursor-route';
+import { hasDaemonContext, getDaemonContext } from '../daemon/context';
+import { loadConfig } from '../config/loader';
 import { getLazyCommand } from '../utils/cli-path';
 import type { Agent } from '../agent/interface';
 import { safeArgvPrompt } from '../agent/argv-safety';
@@ -153,6 +160,30 @@ export class HostProcessRunner implements Runner {
     return this._roleTargets?.builder ?? ANTHROPIC_DEFAULT_TARGET;
   }
 
+  /**
+   * Launch-time auth env with the Anthropic credential swapped for a per-launch
+   * placeholder (src/proxy/placeholder-env.ts). Every path that hands env to a
+   * process it is about to SPAWN uses this; {@link getAuthEnvVars} stays for
+   * the in-process/non-launch readers.
+   *
+   * The injected agent still supplies the credential (see {@link getAuthEnvVars}),
+   * but it is handed DOWN as injectedCreds rather than returned directly: the
+   * swap has to happen on whichever credential this launch would really carry,
+   * and a branch that returned early here is exactly how a real key would keep
+   * reaching a launched process unnoticed.
+   */
+  private async getLaunchAuthEnvVars(
+    identity: LaunchIdentity,
+    target?: RoleTarget,
+    hints?: ProxyAuditHints,
+  ): Promise<Array<{ key: string; value: string }>> {
+    const resolved = target ?? this.agentTarget();
+    const injected = resolved.backend === 'anthropic' && this._agent
+      ? this._agent.getAuthEnvVars()
+      : undefined;
+    return getLaunchAuthEnvVars(identity, resolved, hints, 'host', injected);
+  }
+
   private getAuthEnvVars(
     target?: RoleTarget,
     hints?: ProxyAuditHints,
@@ -177,10 +208,12 @@ export class HostProcessRunner implements Runner {
   }
 
   async checkAvailability(): Promise<void> {
-    // Check that the agent binary is on PATH.
-    // Skip for non-claude agents (e.g., qa-agent) — they don't use the claude CLI.
-    if (!this._agent || this._agent.id === 'claude-code') {
-      const binaryName = agentPackaging.binaryName();
+    // Check that the agent binary is on PATH, using the task agent's own
+    // packaging when one is set (qa-agent's binary is `bun`, cursor's is
+    // `cursor-agent`; the Claude Code default covers agent-less callers).
+    {
+      const pkg = this._agent ? getAgentPackaging(this._agent.id) : agentPackaging;
+      const binaryName = pkg.binaryName();
       const proc = spawn([binaryName, '--version'], {
         stdout: 'pipe',
         stderr: 'pipe',
@@ -188,8 +221,13 @@ export class HostProcessRunner implements Runner {
       });
       const exitCode = await proc.exited;
       if (exitCode !== 0) {
+        const npmPackage = pkg.npmPackage();
+        const installHint = npmPackage
+          ? `Install it with: npm install -g ${npmPackage}`
+          : pkg.supervisorToolChecks().find(c => c.cmd.startsWith(binaryName))?.hint
+            ?? `Install the ${pkg.agentId} CLI.`;
         throw new Error(
-          `${binaryName} CLI not found. Install it with: npm install -g ${agentPackaging.npmPackage()}\n` +
+          `${binaryName} CLI not found. ${installHint}\n` +
           `Host-process runner requires ${binaryName} to be installed on the host.`
         );
       }
@@ -258,7 +296,49 @@ export class HostProcessRunner implements Runner {
 
     // Supervisor launches are always the `agent` role; the task turn it runs
     // inherits this env, so proxied traffic is attributed to agent + task.
-    const authEnvVars = this.getAuthEnvVars(this.agentTarget(), { role: 'agent', taskId });
+    const supervisorIdentity: LaunchIdentity = {
+      role: 'agent',
+      taskId: taskId ?? null,
+      label: runName,
+    };
+    const authEnvVars = await this.getLaunchAuthEnvVars(
+      supervisorIdentity, this.agentTarget(), { role: 'agent', taskId },
+    );
+
+    // Non-claude agents with a managed API key (cursor): resolve it at LAUNCH
+    // time (env override → per-project .lazy credentials file) so a key set
+    // while the daemon runs takes effect on the next launch. No gate here:
+    // a host process can also use the agent's own login session, and the CLI
+    // fails with its own actionable auth error when neither exists.
+    if (this._agent && this._agent.id !== 'claude-code' && agentSupportsApiKey(this._agent.id) && this.lazyRoot) {
+      const key = await resolveAgentApiKey(this.lazyRoot, this._agent.id);
+      if (key) {
+        // JIT INJECTION: the launched process gets a PLACEHOLDER. The real key
+        // is resolved here only to establish that one exists — the proxy
+        // re-resolves it per request and injects it upstream.
+        const envVar = AGENT_KEY_ENV[this._agent.id]!;
+        const placeholder = await mintCredentialGrant(this.lazyRoot, {
+          ...supervisorIdentity, envKey: envVar,
+        });
+        authEnvVars.push({ key: envVar, value: placeholder });
+        logger.debug(`Resolved ${this._agent.id} API key from ${key.source}; host launch gets a placeholder`);
+      }
+    }
+
+    // Cursor API traffic routes through lazy's proxy, same as Anthropic's. The
+    // host surface must get a loopback address, never host.docker.internal —
+    // see LaunchSurface. The path segment carries this launch's placeholder, or
+    // `-` when the process authenticates with its own `cursor-agent login`
+    // session (no key to swap — the only launch that stays unattributed).
+    if (this._agent?.id === 'cursor') {
+      authEnvVars.push(...cursorLaunchEnvVars({
+        agentId: this._agent.id,
+        runnerType: 'dangerously-host-process-without-any-isolation',
+        proxyPort: hasDaemonContext() ? getDaemonContext().proxyPort : undefined,
+        bind: this.lazyRoot ? (await loadConfig(this.lazyRoot)).proxy.bind : '127.0.0.1',
+        token: authEnvVars.find(v => v.key === AGENT_KEY_ENV.cursor)?.value ?? null,
+      }));
+    }
 
     // Set up log file for this run
     const logDir = join(getHome(), '.lazy', 'logs');
@@ -590,12 +670,10 @@ export class HostProcessRunner implements Runner {
   }
 
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
-    const binaryName = agentPackaging.binaryName();
-    return [
-      { cmd: 'git', name: 'git', hint: 'Required tool not found: git' },
-      { cmd: binaryName, name: binaryName, hint: `${binaryName} CLI not found. Install with: npm install -g ${agentPackaging.npmPackage()}` },
-      // No lazy-agent check — in host-process mode, the supervisor IS lazy itself.
-    ];
+    const pkg = this._agent ? getAgentPackaging(this._agent.id) : agentPackaging;
+    // Filter out the packaging's lazy-agent check — in host-process mode, the
+    // supervisor IS lazy itself.
+    return pkg.supervisorToolChecks().filter(c => c.name !== 'lazy-agent');
   }
 
   mcpServerConfig(
@@ -622,8 +700,8 @@ export class HostProcessRunner implements Runner {
   async diagnose(): Promise<HealthCheck[]> {
     const results: HealthCheck[] = [];
 
-    // Delegate agent-specific checks to packaging
-    results.push(...agentPackaging.diagnose());
+    // Delegate agent-specific checks to packaging (task agent's own when set)
+    results.push(...(this._agent ? getAgentPackaging(this._agent.id) : agentPackaging).diagnose());
 
     if (this._hostPermission.mode === 'bypass') {
       results.push({ state: 'ok', what: 'Runner mode: host-process, permission_mode = "bypass" (no sandbox, full --dangerously-skip-permissions)' });
@@ -695,7 +773,11 @@ export class HostProcessRunner implements Runner {
     // Inject the builder target's backend env vars (base URL for ollama/proxy,
     // dummy credentials for ollama) so a local-backend builder actually talks to
     // that backend rather than the inherited shell's default endpoint.
-    const builderEnvVars = this.getAuthEnvVars(this.builderTarget(), { role: 'builder' });
+    const builderEnvVars = await this.getLaunchAuthEnvVars(
+      { role: 'builder', taskId: null, label: `host-builder:${lazyRoot}` },
+      this.builderTarget(),
+      { role: 'builder' },
+    );
 
     // Builder scratch dir — same contract as the container runner: a writable
     // place outside the repo, at the path the human reads. Derived from lazyRoot

@@ -7,7 +7,9 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { runWork, CrashError, FatalAgentError, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { runWork, CrashError, FatalAgentError, CrashLoopError, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { describeTurnFailure } from '../../src/supervisor';
+import type { ErrorResponse } from '../../src/protocol';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { createRunnerFromType } from '../../src/runner';
 import { UNREACHABLE_MAX_ATTEMPTS } from '../../src/supervisor/retry-policy';
@@ -135,6 +137,56 @@ describe('runWork — transient classifications retry on the tight ladder', () =
     expect(calls).toBe(3);
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain('Crash loop detected');
+  });
+
+  // INVARIANT (fix-cursor-action-required): the crash-loop backstop must carry
+  // what the loop learned. It used to throw a bare Error, so the class, the
+  // agent's reason and the attempt count never reached the ErrorResponse —
+  // the recorded turn said only "Crash loop detected: …" and `lazy watch`
+  // showed no attempt count at all.
+  test('a crash-loop exit carries class, reason and attempts', async () => {
+    const { error } = await run({
+      execute: async () => { throw crash('Segmentation fault (core dumped)'); },
+    });
+
+    expect(error).toBeInstanceOf(CrashLoopError);
+    const loop = error as CrashLoopError;
+    expect(loop.failureClass).toBe('unknown');
+    expect(loop.failureReason).toBeTruthy();
+    expect(loop.attempts).toBe(3);
+  });
+
+  // The classification has to survive the trip onto the wire — that is the
+  // half that was silently dropped, in describeTurnFailure.
+  test('the crash-loop classification reaches the ErrorResponse', async () => {
+    const { error } = await run({
+      execute: async () => { throw crash('Segmentation fault (core dumped)'); },
+    });
+
+    const response: ErrorResponse = {
+      status: 'error',
+      error: (error as Error).message,
+      phase: 'work',
+    };
+    describeTurnFailure(response, error);
+
+    expect(response.failure_class).toBe('unknown');
+    expect(response.failure_reason).toBeTruthy();
+    expect(response.failure_attempts).toBe(3);
+  });
+
+  // INVARIANT: carrying the class must NOT flip crash loops from `interrupted`
+  // to `blocked`. The detector only fires for `unknown` — precisely the
+  // failures we could not judge — and many of those heal on a relaunch, so the
+  // reconciler keeps them on the auto-resume path. See the comment above the
+  // detector in work.ts and handleErrorResponse in reconcile.ts.
+  test('a crash loop is reported as unknown, so it stays auto-resumable', async () => {
+    const { error } = await run({
+      execute: async () => { throw crash('Segmentation fault (core dumped)'); },
+    });
+
+    expect(error).not.toBeInstanceOf(FatalAgentError);
+    expect((error as CrashLoopError).failureClass).toBe('unknown');
   });
 });
 

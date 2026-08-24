@@ -25,11 +25,12 @@ import { join } from 'path';
 import { readFile, stat } from 'fs/promises';
 import type { SupervisorPhase, SupervisorStatus } from '../protocol/types';
 import { readActiveWaits, type WaitingEntry } from '../protocol/waiting';
+import { readTaskProgress, type ProgressEntry } from '../protocol/progress';
 import { elapsedFrom } from './elapsed';
 import { formatRetrySummary, type RetrySummaryInput } from './retry-summary';
 import { logger } from './logger';
 
-export type WorkingSubstate =
+type WorkingSubstateKind =
   | {
       kind: 'agent';
       /** The turn is an `lazy ask` question, not ordinary work. */
@@ -78,6 +79,17 @@ export type WorkingSubstate =
     }
   | { kind: 'not-alive' };
 
+/**
+ * A derived working substate, optionally decorated with the agent's own
+ * self-reported progress line (`lazy_update_progress`).
+ *
+ * `progress` rides ALONGSIDE the kind rather than being a kind of its own: it
+ * answers "doing what?", not "who is active?", and the two are independent. It
+ * is only ever attached to the agent-is-the-active-thing kinds — see
+ * {@link deriveWorkingSubstate}.
+ */
+export type WorkingSubstate = WorkingSubstateKind & { progress?: string };
+
 /** Liveness inputs to the derivation, gathered from the runner + protocol dir. */
 export interface LivenessContext {
   /** True when the supervisor run/pid is confirmed alive (`runner.isRunning`). */
@@ -89,6 +101,13 @@ export interface LivenessContext {
    * daemon. Empty/absent means the agent is not blocked on anything.
    */
   waits?: WaitingEntry[];
+  /**
+   * The agent's latest self-reported progress line for the CURRENT turn, as
+   * recorded by the daemon (`progress.json`). Absent means the agent has not
+   * reported anything — which is the normal case and renders exactly as it did
+   * before this existed.
+   */
+  progress?: ProgressEntry | null;
 }
 
 /** Phases where the agent itself is the active thing. Everything else is harness work. */
@@ -123,10 +142,15 @@ export function deriveWorkingSubstate(
       // right now — so it outranks the ask/pre-accept flavors, which describe
       // what the turn IS rather than what it is doing this second.
       const waiting = deriveWaiting(ctx.waits);
-      if (waiting) return waiting;
-      if (status.command_type === 'ask') return { kind: 'agent', answering: true };
-      if (status.command_type === 'pre_accept') return { kind: 'agent', preAccept: true };
-      return { kind: 'agent' };
+      // The progress line is the AGENT's own account of what it is doing, so it
+      // decorates only the kinds where the agent is the active thing. A harness
+      // phase is the supervisor's work: showing the agent's last line there
+      // would report a claim about a turn phase that has already ended.
+      const progress = ctx.progress?.message || undefined;
+      if (waiting) return { ...waiting, progress };
+      if (status.command_type === 'ask') return { kind: 'agent', answering: true, progress };
+      if (status.command_type === 'pre_accept') return { kind: 'agent', preAccept: true, progress };
+      return { kind: 'agent', progress };
     }
     // A harness phase outranks any lingering wait marker: the supervisor, not
     // the agent, is the active thing, so `harness:<phase>` is the more useful
@@ -225,12 +249,13 @@ export async function computeWorkingSubstate(
   protoDir: string,
   isAlive: boolean,
 ): Promise<WorkingSubstate | null> {
-  const [status, hasResponse, waits] = await Promise.all([
+  const [status, hasResponse, waits, progress] = await Promise.all([
     readSupervisorStatusAsync(protoDir),
     responseExists(protoDir),
     readActiveWaits(protoDir),
+    readTaskProgress(protoDir),
   ]);
-  return deriveWorkingSubstate(status, { isAlive, hasResponse, waits });
+  return deriveWorkingSubstate(status, { isAlive, hasResponse, waits, progress });
 }
 
 /** Max error-snippet length inside a substate label (tighter than the watch header). */
@@ -248,6 +273,27 @@ const SUBSTATE_SNIPPET_MAX = 60;
 export function formatWorkingSubstate(
   substate: WorkingSubstate,
   now: Date = new Date(),
+): string {
+  return withProgress(formatSubstateKind(substate, now), substate.progress);
+}
+
+/**
+ * Append the agent's progress line to a substate label:
+ * `agent` + `running migration 3/7` → `agent: running migration 3/7`.
+ *
+ * The separator is a colon rather than a dash so the label still reads as one
+ * cell — `working(agent: running migration 3/7)` — next to a task goal in
+ * `lazy list`. Length is already capped at the write boundary.
+ */
+function withProgress(label: string, progress: string | undefined): string {
+  const trimmed = progress?.trim();
+  return trimmed ? `${label}: ${trimmed}` : label;
+}
+
+/** The kind-specific part of the label, without the progress decoration. */
+function formatSubstateKind(
+  substate: WorkingSubstate,
+  now: Date,
 ): string {
   switch (substate.kind) {
     case 'agent':

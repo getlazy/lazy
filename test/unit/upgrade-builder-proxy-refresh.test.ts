@@ -74,8 +74,8 @@ describe('builder proxy target refresh across an upgrade', () => {
     const fresh: RoleTarget = { backend: 'anthropic', model: '', endpoint: '' };
     const stamped: RoleTarget = { ...fresh, proxyUrl: 'http://127.0.0.1:40001' };
 
-    expect(needsLiveProxyUrl(fresh, config)).toBe(true);
-    expect(needsLiveProxyUrl(stamped, config)).toBe(false);
+    expect(needsLiveProxyUrl(fresh)).toBe(true);
+    expect(needsLiveProxyUrl(stamped)).toBe(false);
   });
 
   // The headline behavior: the daemon comes back on a different OS-assigned
@@ -113,14 +113,20 @@ describe('builder proxy target refresh across an upgrade', () => {
     await expect(refreshRunnerProxyTargets(runner, projectRoot)).rejects.toThrow(ProxyUnavailableError);
   });
 
-  // The explicit opt-out stays an opt-out: no proxy, no address to refresh, no
-  // failure. `[proxy] enabled = false` must not start failing relaunches.
-  test('is a no-op when [proxy] enabled = false', async () => {
+  // The proxy is always on, so there is no "opt out" branch left to be a no-op.
+  // INVARIANT (proxy-role-upstreams): a role with an explicit endpoint is NOT a
+  // no-op any more. That endpoint is where the PROXY forwards the role, so the
+  // role still needs the proxy's live address — and with the gate armed and no
+  // daemon to answer, the refresh must FAIL rather than quietly leave the role
+  // with no address and let the launch connect somewhere unaudited.
+  test('a role with an explicit endpoint still needs the proxy address', async () => {
     process.env.LAZY_TEST = '1';
     process.env.LAZY_FORCE_PROXY_GATE = '1';
-    await configWith('[proxy]\nenabled = false\n');
+    await configWith(
+      '[models.roles.builder]\nbackend = "proxy"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n' +
+      '[models.roles.agent]\nbackend = "proxy"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n',
+    );
     const runner = fakeRunner();
-    await refreshRunnerProxyTargets(runner, projectRoot);
-    expect(runner.targets?.builder.proxyUrl).toBeUndefined();
+    await expect(refreshRunnerProxyTargets(runner, projectRoot)).rejects.toThrow(/proxy address/i);
   });
 });

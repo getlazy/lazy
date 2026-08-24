@@ -34,7 +34,7 @@
 
 import { readFileSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { spawn, spawnSync } from './spawn';
+import { spawn, spawnSyncUnsupervised } from './spawn';
 
 /**
  * Where a start time came from. The two sources use different units (procfs
@@ -151,6 +151,13 @@ export function parseProcStat(raw: string, cmdline: string | null): ProcessIdent
 const PS_IDENTITY_ARGS = ['-o', 'state=,lstart=,command=', '-p'];
 const PS_STATE_ARGS = ['-o', 'state=', '-p'];
 
+/**
+ * Deadline for a `ps` lookup. `ps` on a single pid returns in milliseconds; a
+ * multi-second wait means the system is wedged, and an unbounded wait in the
+ * sync path would take the daemon's event loop with it.
+ */
+const PS_TIMEOUT_MS = 5_000;
+
 /** Read a process's identity from procfs. Returns null when procfs is absent. */
 async function readProcIdentity(pid: number): Promise<ProcessIdentity | null> {
   let stat: string;
@@ -237,8 +244,12 @@ export function readProcessIdentitySync(pid: number): ProcessIdentity | null {
   const fromProc = readProcIdentitySync(pid);
   if (fromProc) return fromProc;
 
+  // DAEMON-REACHABLE sync spawn: the pairing lock is read from the reconciler
+  // and task-lifecycle guards, so a wedged `ps` would block the daemon's event
+  // loop. 5s overrides the (much longer) default backstop — a `ps` that has not
+  // answered in five seconds is not going to.
   try {
-    const proc = spawnSync(['ps', ...PS_IDENTITY_ARGS, String(pid)], { stdout: 'pipe', stderr: 'ignore' });
+    const proc = spawnSyncUnsupervised(['ps', ...PS_IDENTITY_ARGS, String(pid)], { stdout: 'pipe', stderr: 'ignore', timeout: PS_TIMEOUT_MS });
     const parsed = parsePsIdentityLine(proc.stdout.toString());
     if (parsed) return parsed;
   } catch {
@@ -246,7 +257,7 @@ export function readProcessIdentitySync(pid: number): ProcessIdentity | null {
   }
 
   try {
-    const proc = spawnSync(['ps', ...PS_STATE_ARGS, String(pid)], { stdout: 'pipe', stderr: 'ignore' });
+    const proc = spawnSyncUnsupervised(['ps', ...PS_STATE_ARGS, String(pid)], { stdout: 'pipe', stderr: 'ignore', timeout: PS_TIMEOUT_MS });
     const state = proc.stdout.toString().trim();
     if (!state) return null;
     return { state, started: null, startedSource: null, command: null };

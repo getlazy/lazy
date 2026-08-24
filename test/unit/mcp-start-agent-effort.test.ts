@@ -23,7 +23,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createAllHandlers, allTools, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { VALID_EFFORT_LEVELS } from '../../src/config/types';
 import { listAgents } from '../../src/agent/registry';
 
@@ -41,12 +41,12 @@ describe('MCP lazy_start agent/effort parity', () => {
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-mcp-start-parity-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
-    spawnSync(['git', 'init'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
-    spawnSync(['git', 'add', '.'], { cwd: testDir });
-    spawnSync(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
     storage = await createStorage(testDir, { backend: 'external' });
     ctx = { taskId: '', worktreePath: testDir, storage };
@@ -87,7 +87,7 @@ describe('MCP lazy_start agent/effort parity', () => {
   // `remove-start-inline-create` (commit a709663) because a task created and
   // started in one step cannot have a forgotten --parent/--code corrected. This
   // pins the schema so the flags cannot be re-added without a human noticing.
-  // Rationale: docs/surface-asymmetries.md section 9.
+  // Rationale: public-docs/surface-asymmetries.md section 9.
   test('lazy_start advertises NO creation parameters', () => {
     const props = toolNamed('lazy_start').inputSchema.properties ?? {};
 

@@ -36,11 +36,40 @@ function getLinuxArch(): string {
  * Run bun build --compile from a temp directory to avoid filesystem rename issues.
  * Compiles to the temp dir first, then copies the result to the final destination.
  */
+/**
+ * Flags that make a build a RELEASE build, in the security sense.
+ *
+ * `--define LAZY_RELEASE_BUILD=true` turns the test-only prompt seams in
+ * src/cli/editor.ts (LAZY_FORCE_TTY, LAZY_PROMPT_DEFAULTS, LAZY_PROMPT_SECRET)
+ * into dead code, and `--minify-syntax` is what actually removes it — without
+ * it bun folds the constant but keeps the branch. Together they mean a released
+ * binary has no environment-variable route to auto-answering a prompt, which
+ * matters most for the approval passphrase `lazy approve` demands on a
+ * protected merge: a runtime check would be one an agent could satisfy too.
+ *
+ * EXACTLY ONE THIRD OF `--minify` IS ENABLED, ON PURPOSE. `--minify` is
+ * `--minify-syntax` + `--minify-whitespace` + `--minify-identifiers`:
+ *
+ * - syntax        constant folding and dead-code elimination — the half that
+ *                 removes the seams, and the only half we want.
+ * - identifiers   renames functions and variables, so a stack trace from a
+ *                 released binary names `t` instead of `approveTaskPreflight`.
+ * - whitespace    collapses everything onto few lines, so the line numbers in
+ *                 that trace stop pointing anywhere useful.
+ *
+ * A released binary's stack traces are how a user's bug report becomes
+ * actionable, so enabling either of the other two later is a regression in
+ * exchange for a smaller file — not a trade worth making here.
+ *
+ * test/unit/build-release-flags.test.ts fails if either flag disappears.
+ */
+const RELEASE_DEFINES = ['--define', 'LAZY_RELEASE_BUILD=true', '--minify-syntax'];
+
 function bunCompile(args: string[], finalOutfile: string): void {
   const tempDir = mkdtempSync(join(tmpdir(), 'lazy-build-'));
   const tempOutfile = join(tempDir, basename(finalOutfile));
   try {
-    const proc = Bun.spawnSync(['bun', 'build', '--compile', ...args, '--outfile', tempOutfile], {
+    const proc = Bun.spawnSync(['bun', 'build', '--compile', ...RELEASE_DEFINES, ...args, '--outfile', tempOutfile], {
       cwd: tempDir,
       stdout: 'inherit',
       stderr: 'inherit',

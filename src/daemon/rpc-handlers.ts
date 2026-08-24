@@ -39,6 +39,7 @@ import {
   handleReviewWithdrawComment,
   handleReviewUnblock,
   handleReviewAccept,
+  handleReviewSync,
   handleReviewViolationDecision,
 } from './rpc-review';
 import { loadConfig } from '../config/loader';
@@ -50,13 +51,13 @@ import type { SpanRecord } from '../tracing/types';
 import { withRootSpan, contextFromTraceparent } from '../tracing';
 import type { TaskTarget, Actor } from '../types';
 import type { RunnerType } from '../config/types';
-import { parentTaskIdOf, targetBranchOf, collectSubtreeIds } from '../task-target';
+import { parentTaskIdOf, targetBranchOf, collectSubtreeIds, pruneTasksToDepth } from '../task-target';
 import { buildTaskTree, collectActiveTasks } from '../cli/commands/list';
 import { loadTaskShowData } from '../cli/commands/show';
 import { isStructuredQuery, structuredSearch, buildTagHint } from '../search';
 import { getDiffStat, getDiffFull, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch } from '../git/operations';
 import { getNewNotesSince } from '../cli/commands/shared';
-import { getWorktreePath, getBranchNameFromId, displayId, formatDate, shortId } from '../cli/helpers';
+import { getWorktreePath, getBranchNameFromId, displayId, formatDate, shortId, taskRef } from '../cli/helpers';
 import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
 import { pathExists } from '../utils/fs';
 import { saveConversationWithoutRegression } from '../import/conversation-storage';
@@ -65,7 +66,10 @@ import { raceWait, normalizeWaitInputs } from './wait-race';
 import { revokeBuilderMcpToken } from './mcp-tokens';
 import { hasDaemonContext, getDaemonContext } from './context';
 import type { ProgressEmitter } from './progress';
-import { proxyBaseUrlForRunner } from '../utils/role-target';
+import { handleWatchProxyActivity } from './proxy-watch';
+import { proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS } from '../utils/role-target';
+import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
+import { revokeBuilderCredentialGrant } from '../proxy/credential-broker';
 import { launchUnblockTask, launchAskTask, rejectTask, closeTask, stopTask, acceptTaskPreflight, acceptTask, approveTaskPreflight, approveTask, syncTask, reparentTask, submitTask, resumeTask, type UnblockTaskParams, type AskTaskParams, type RejectTaskParams, type CloseTaskParams, type StopTaskParams, type AcceptTaskPreflightParams, type AcceptTaskParams, type ApproveTaskParams, type SyncTaskParams, type ReparentTaskParams, type SubmitTaskParams, type ResumeTaskParams } from './task-lifecycle';
 import type { Comment } from '../types';
 import { logger } from '../utils/logger';
@@ -227,7 +231,7 @@ export async function handleRpc(
 
   switch (command) {
     case 'list': return handleList(projectRoot, params);
-    case 'blocked': return handleBlocked(projectRoot);
+    case 'blocked': return handleBlocked(projectRoot, params);
     case 'active': return handleActive(projectRoot, params);
     case 'show': return handleShow(projectRoot, params);
     case 'search': return handleSearch(projectRoot, params);
@@ -238,6 +242,7 @@ export async function handleRpc(
     case 'askTask': return handleAskTask(projectRoot, params);
     case 'acceptTaskPreflight': return handleAcceptTaskPreflight(projectRoot, params);
     case 'acceptTask': return handleAcceptTask(projectRoot, params, progress);
+    case 'watchProxyActivity': return handleWatchProxyActivity(await resolveActivityFilterParams(params), progress);
     case 'approveTaskPreflight': return handleApproveTaskPreflight(projectRoot, params);
     case 'approveTask': return handleApproveTask(projectRoot, params);
     case 'rejectTask': return handleRejectTask(projectRoot, params);
@@ -263,10 +268,68 @@ export async function handleRpc(
     case 'reviewWithdrawComment': return handleReviewWithdrawComment(projectRoot, params);
     case 'reviewUnblock': return handleReviewUnblock(projectRoot, params);
     case 'reviewAccept': return handleReviewAccept(projectRoot, params);
+    case 'reviewSync': return handleReviewSync(projectRoot, params);
     case 'reviewViolationDecision': return handleReviewViolationDecision(projectRoot, params);
     case 'storage': return handleStorageCall(projectRoot, params);
     default: throw new RpcError(404, `Unknown RPC command: ${command}`);
   }
+}
+
+/**
+ * Expand `taskId` into every attribution form that task answers to.
+ *
+ * WHY THIS EXISTS: proxy events are attributed from the agent's credential
+ * grant, which carries the task REF it was launched with — the task's code, or
+ * its short id when it has none. A caller (`lazy watch`) holds the full task id.
+ * Matching one against the other found nothing, so watch printed its header and
+ * then sat silent for a whole turn while the agent was demonstrably making
+ * calls. Resolution belongs here rather than in the handler because storage
+ * lives on this side; proxy-watch.ts importing it back would be a cycle.
+ *
+ * An unresolvable id is passed through untouched — an operator watching a
+ * partial id, or a task the store no longer has, still gets prefix matching
+ * rather than an error, because this is an observability surface.
+ */
+async function resolveActivityFilterParams(
+  params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const raw = params.taskId;
+  if (typeof raw !== 'string' || !raw) return params;
+
+  // Start from whatever the caller already asked for. Replacing their list with
+  // ours would NARROW the subscription behind their back — a client that passed
+  // both `taskIds` and a `taskId` means the union, and dropping half of it is
+  // the same "watch shows nothing" failure this resolution exists to prevent.
+  // A malformed `taskIds` is left untouched so the handler's own validator is
+  // the one that reports it — sanitizing it here would turn a 400 into a
+  // silently different filter.
+  if (params.taskIds !== undefined && params.taskIds !== null) {
+    if (!Array.isArray(params.taskIds) || params.taskIds.some((v) => typeof v !== 'string')) {
+      return params;
+    }
+  }
+  const existing = (Array.isArray(params.taskIds) ? params.taskIds : []) as string[];
+  const forms = new Set<string>([raw, ...existing.filter((f) => f.trim().length > 0)]);
+  try {
+    const storage = await getOrCreateStorage();
+    const { task } = await storage.resolveTask(raw);
+    if (task) {
+      forms.add(task.id);
+      forms.add(shortId(task.id));
+      forms.add(taskRef(task));
+      if (task.code) forms.add(task.code);
+    }
+  } catch (err) {
+    // Resolution is an enrichment, not a precondition: the raw form is still a
+    // usable filter, and failing a watch because the store hiccuped would trade
+    // a degraded view for no view at all.
+    logger.debug(
+      `[proxy] could not resolve task '${raw}' for activity filter: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const { taskId: _dropped, ...rest } = params;
+  return { ...rest, taskIds: [...forms] };
 }
 
 // --- List ---
@@ -304,9 +367,40 @@ export async function filterToSubtree(storage: Storage, tasks: Task[], taskFilte
   return tasks.filter(t => allowedIds.has(t.id));
 }
 
+/**
+ * Read and validate the optional `levels` depth limit shared by the list /
+ * blocked / active handlers. Absent means "no limit"; a non-positive or
+ * non-integer value is a caller error, not something to silently clamp.
+ */
+function optionalLevels(params: Record<string, unknown>): number | undefined {
+  const raw = params.levels;
+  if (raw === undefined || raw === null) return undefined;
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RpcError(400, `'levels' must be a positive integer (1 = top level only), got '${String(raw)}'.`);
+  }
+  return value;
+}
+
+/**
+ * Apply an optional depth limit and build the display tree. Shared by every
+ * listing handler so `levels` means the same thing on all of them.
+ */
+async function buildTreeWithDepth(
+  storage: Storage,
+  tasks: Task[],
+  projectRoot: string,
+  levels: number | undefined,
+) {
+  if (levels === undefined) return buildTaskTree(storage, tasks, projectRoot);
+  const { kept, hidden } = pruneTasksToDepth(tasks, levels);
+  return buildTaskTree(storage, kept, projectRoot, { hiddenDescendants: hidden });
+}
+
 export async function handleList(projectRoot: string, params: Record<string, unknown>) {
   const storage = await getOrCreateStorage();
   const all = params.all === true;
+  const levels = optionalLevels(params);
   let tasks = all
     ? await storage.listTasks()
     : await storage.listTasksWithOptions({ nonTerminalOnly: true });
@@ -315,16 +409,17 @@ export async function handleList(projectRoot: string, params: Record<string, unk
     tasks = await filterToSubtree(storage, tasks, params.taskFilter);
   }
 
-  const tree = await buildTaskTree(storage, tasks, projectRoot);
+  const tree = await buildTreeWithDepth(storage, tasks, projectRoot, levels);
   return { tree };
 }
 
 // --- Blocked ---
 
-export async function handleBlocked(projectRoot: string) {
+export async function handleBlocked(projectRoot: string, params: Record<string, unknown> = {}) {
   const storage = await getOrCreateStorage();
+  const levels = optionalLevels(params);
   const tasks = await storage.listTasksWithOptions({ blockedOnly: true });
-  const tree = await buildTaskTree(storage, tasks, projectRoot);
+  const tree = await buildTreeWithDepth(storage, tasks, projectRoot, levels);
   return { tree };
 }
 
@@ -332,6 +427,7 @@ export async function handleBlocked(projectRoot: string) {
 
 export async function handleActive(projectRoot: string, params: Record<string, unknown> = {}) {
   const storage = await getOrCreateStorage();
+  const levels = optionalLevels(params);
   let tasks = await collectActiveTasks(storage);
 
   // Optional subtree filter: show only the given task and its descendants.
@@ -339,7 +435,10 @@ export async function handleActive(projectRoot: string, params: Record<string, u
     tasks = await filterToSubtree(storage, tasks, params.taskFilter);
   }
 
-  const tree = await buildTaskTree(storage, tasks, projectRoot);
+  // Depth limit applies AFTER the subtree filter, so `active <task> --levels 1`
+  // means "that task, no descendants" rather than one of the two silently
+  // winning.
+  const tree = await buildTreeWithDepth(storage, tasks, projectRoot, levels);
   return { tree };
 }
 
@@ -468,6 +567,10 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     // serialized here, and omitting it silently restores the old behavior
     // where a gate was invisible until accept refused.
     protection: data.protection,
+    // Same rule again: the slow-lane indicator silently disappears from a
+    // daemon-backed `lazy show` if this field is omitted here, even though
+    // loadTaskShowData computed it correctly.
+    autoResumeQueue: data.autoResumeQueue,
   };
 }
 
@@ -783,6 +886,7 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
     retargetOrphan: optionalBoolean(params, 'retargetOrphan'),
     notesInEditor: optionalBoolean(params, 'notesInEditor'),
     effortOverride: optionalString(params, 'effortOverride'),
+    agentOverride: optionalString(params, 'agentOverride'),
     permissionMode,
     actor: optionalEnum(params, 'actor', ACTORS),
   };
@@ -1000,6 +1104,24 @@ export async function handleGetDaemonMcpConfig(projectRoot: string, params: Reco
 export async function handleRevokeDaemonMcpToken(projectRoot: string, params: Record<string, unknown>) {
   const name = requireString(params, 'name');
   const revoked = await revokeBuilderMcpToken(projectRoot, name);
+  // The builder's placeholder credential has the same lifetime as its MCP
+  // token — both are minted for one session and are worthless after it. Keyed
+  // by the same session name, so the two registries stay in step.
+  //
+  // Independently guarded: the MCP token is already revoked by the line above,
+  // and reporting THAT as failed would make the caller retry a revocation that
+  // succeeded — or worse, treat a revoked token as still live. A grant that
+  // outlives its session is bounded anyway (the registry cap evicts it), so a
+  // loud log is the right cost here.
+  try {
+    await revokeBuilderCredentialGrant(projectRoot, name);
+  } catch (err) {
+    logger.warn(
+      `[proxy] failed to revoke the builder credential grant for "${name}": ` +
+      `${err instanceof Error ? err.message : err}. Its MCP token IS revoked. The stale ` +
+      `grant is evicted by the registry cap; to clear it now: lazy daemon restart`,
+    );
+  }
   return { revoked };
 }
 
@@ -1022,11 +1144,39 @@ export async function handleRevokeDaemonMcpToken(projectRoot: string, params: Re
  * Secrets hygiene: the value crosses the local, token-authenticated unix
  * socket only and is never logged.
  */
-export async function handleGetAuthEnv(projectRoot: string, _params: Record<string, unknown>) {
+export async function handleGetAuthEnv(projectRoot: string, params: Record<string, unknown>) {
+  // SCHEMA-VALIDATE AT THE BOUNDARY (CLAUDE.md: every external surface parses
+  // and confirms its inputs). `proxied` decides whether this call hands back a
+  // PLACEHOLDER or the user's real credential, so it is required rather than
+  // defaulted: a caller that forgets it is a caller that would silently have
+  // received the real token and shipped it into a container. That is the exact
+  // forgotten-argument failure this task exists to remove, so it must fail
+  // loudly instead of failing open.
+  if (typeof params.proxied !== 'boolean') {
+    throw new Error(
+      'getAuthEnv: the `proxied` parameter is required and must be a boolean. It selects ' +
+      'between a placeholder credential and the real one, so there is no safe default. ' +
+      'This is a lazy bug — please report it.',
+    );
+  }
+  const proxied = params.proxied === true;
+  // `selfCredentialed`: the caller's role speaks to an upstream that needs no
+  // real credential (today: ollama, which ignores auth). It still wants a
+  // placeholder — that grant is how the proxy authenticates the caller and
+  // routes it to that role's upstream — but minting one over the user's token
+  // would be both pointless and, in an ollama-only project with no Anthropic
+  // credential at all, fatal. Validated as a boolean like `proxied`, but
+  // optional: absent means "the normal case", which is the safe one.
+  if (params.selfCredentialed !== undefined && typeof params.selfCredentialed !== 'boolean') {
+    throw new Error(
+      'getAuthEnv: the `selfCredentialed` parameter must be a boolean when present. ' +
+      'This is a lazy bug — please report it.',
+    );
+  }
+  const selfCredentialed = params.selfCredentialed === true;
   // Returns the bare Anthropic credential from the daemon process env. Callers
-  // (resolveAuthEnvFromDaemon) wrap it for their resolved role target — e.g. a
-  // proxy target layers its base URL on top. Ollama-backed roles need no
-  // credential and derive their dummy env client-side without this RPC.
+  // (resolveAuthEnvFromDaemon) wrap it for their resolved role target, layering
+  // the proxy's base URL on top.
   //
   // Reads the daemon process env. Throws an actionable error if absent, but the
   // credential gate makes that practically unreachable for a running daemon.
@@ -1039,13 +1189,78 @@ export async function handleGetAuthEnv(projectRoot: string, _params: Record<stri
   const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
   if (proxyPort) {
     const config = await loadConfig(projectRoot, { cwd: projectRoot });
-    if (config.proxy) {
-      proxyBaseUrl = proxyBaseUrlForRunner(config.runner.type, proxyPort, config.proxy.bind);
-    }
+    proxyBaseUrl = proxyBaseUrlForRunner(config.runner.type, proxyPort, config.proxy.bind);
   }
-  // Omit proxyBaseUrl entirely when absent (no proxy) — don't send an `undefined`
-  // field over the wire, and keep the shape stable for callers that don't proxy.
-  return { authEnvVars: getAuthEnvVars(), ...(proxyBaseUrl ? { proxyBaseUrl } : {}) };
+
+  // A caller that only needs the address (resolveLiveProxyUrl) says so, and the
+  // secret does not cross the socket at all. Same principle as
+  // handleGetCredentialState: nothing that merely describes auth moves it.
+  if (params.credentials === false) {
+    return { authEnvVars: [] as AuthEnvVar[], ...(proxyBaseUrl ? { proxyBaseUrl } : {}) };
+  }
+
+  // A self-credentialed role never touches the daemon's own credential — which
+  // is the point: the daemon may not have one, and the gate lets it start
+  // anyway precisely because ollama projects do not need it.
+  const real = selfCredentialed ? LOCAL_BACKEND_CREDS : getAuthEnvVars();
+
+  // JIT CREDENTIALS: a launch whose traffic will flow through lazy's proxy gets
+  // per-launch PLACEHOLDERS, and the proxy swaps the real value back in just
+  // before forwarding. The client decides `proxied` — it resolved the role
+  // target and is the only side that knows whether the address actually points
+  // at this daemon's proxy (see resolveAuthEnvFromDaemon).
+  const identity = parseLaunchIdentity(params);
+  if (proxied) {
+    if (!identity) {
+      // Fail loud rather than fall back to the real credential: a launch path
+      // that forgot its identity would otherwise quietly keep shipping the
+      // user's token into a container, which is the whole thing this prevents.
+      throw new Error(
+        'getAuthEnv: proxied launches must identify themselves (role, label) so a ' +
+        'placeholder credential can be minted for them. This is a lazy bug — please report it.',
+      );
+    }
+    if (proxyPort) {
+      return {
+        authEnvVars: await placeholderizeAuthEnv(projectRoot, real, identity),
+        ...(proxyBaseUrl ? { proxyBaseUrl } : {}),
+      };
+    }
+    // No proxy bound: hand back the real credential and let the client's
+    // fail-loud gate refuse the launch. Minting here would produce a
+    // placeholder nothing can exchange.
+  }
+
+  // Omit proxyBaseUrl entirely when the port is not yet bound — don't send an
+  // `undefined` field over the wire. The client treats its absence as a failure
+  // to resolve the audit plane, not as permission to connect direct.
+  return { authEnvVars: real, ...(proxyBaseUrl ? { proxyBaseUrl } : {}) };
+}
+
+interface AuthEnvVar { key: string; value: string }
+
+/**
+ * Parse the launch identity a proxied caller must send, or null if absent.
+ *
+ * Validated at the boundary (CLAUDE.md): the identity is what the minted grant
+ * binds attribution to, so a malformed one would produce audit records naming a
+ * task that does not exist. Rejected loudly rather than coerced.
+ */
+function parseLaunchIdentity(params: Record<string, unknown>): LaunchIdentity | null {
+  const role = params.role;
+  const label = params.label;
+  if (role === undefined && label === undefined) return null;
+  if (role !== 'agent' && role !== 'builder') {
+    throw new Error(`getAuthEnv: role must be "agent" or "builder", got ${JSON.stringify(role)}`);
+  }
+  if (typeof label !== 'string' || label.length === 0) {
+    throw new Error('getAuthEnv: label must be a non-empty string identifying the launch');
+  }
+  const taskId = params.taskId;
+  if (taskId !== undefined && taskId !== null && typeof taskId !== 'string') {
+    throw new Error(`getAuthEnv: taskId must be a string or null, got ${JSON.stringify(taskId)}`);
+  }
+  return { role, label, taskId: (taskId as string | null | undefined) ?? null };
 }
 
 // --- Get Credential State ---
@@ -1120,6 +1335,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   updateTaskBranchedFromSha: (s, a) => s.updateTaskBranchedFromSha(a.taskId as string, a.sha as string),
   updateTaskModel: (s, a) => s.updateTaskModel(a.taskId as string, a.model as string),
   updateTaskRunnerType: (s, a) => s.updateTaskRunnerType(a.taskId as string, a.runnerType as RunnerType | null),
+  updateTaskAgent: (s, a) => s.updateTaskAgent(a.taskId as string, a.agentId as string),
   updateTaskType: (s, a) => s.updateTaskType(a.taskId as string, a.type as string),
   updateTaskPriority: (s, a) => s.updateTaskPriority(a.taskId as string, a.priority as string),
   resetTaskPendingSync: (s, a) => s.resetTaskPendingSync(a.taskId as string),
@@ -1148,6 +1364,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   updateSessionClaudeId: (s, a) => s.updateSessionClaudeId(a.sessionId as string, a.claudeSessionId as string),
   updateSessionContainerName: (s, a) => s.updateSessionContainerName(a.sessionId as string, a.containerName as string | null),
   updateSessionRunnerType: (s, a) => s.updateSessionRunnerType(a.sessionId as string, a.runnerType as RunnerType | null),
+  updateSessionAgent: (s, a) => s.updateSessionAgent(a.sessionId as string, a.agentId as string),
   updateSessionInteraction: (s, a) => s.updateSessionInteraction(a.sessionId as string, a.durationMs as number),
   updateSessionUsage: (s, a) => s.updateSessionUsage(a.sessionId as string, a.usage as any),
   updateSessionUpstreamMergeSha: (s, a) => s.updateSessionUpstreamMergeSha(a.sessionId as string, a.sha as string),

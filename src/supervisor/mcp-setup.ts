@@ -18,7 +18,8 @@
  */
 
 import { hostname } from 'os';
-import { writeMcpConfig, writeToolPermissions } from '../mcp/config';
+import { writeMcpConfig, writeCursorMcpConfig, writeToolPermissions } from '../mcp/config';
+import { ensureCursorHttp1Config, cursorCliConfigPath } from '../agent/cursor-cli-config';
 import { allTools } from '../mcp/tools';
 import { READ_ONLY_TOOL_NAMES } from '../mcp/tool-access';
 import { log as supervisorLog, logWarn as supervisorLogWarn } from './log';
@@ -57,6 +58,12 @@ export interface TurnMcpOptions {
    * the write tools before anything is proxied.
    */
   readOnly?: boolean;
+  /**
+   * The turn's agent id. Cursor discovers MCP servers via ~/.cursor/mcp.json,
+   * not ~/.claude.json, so its config file is written IN ADDITION when the
+   * agent is cursor. Defaults to claude-code behavior when omitted.
+   */
+  agentId?: string;
 }
 
 /**
@@ -86,9 +93,16 @@ export async function prepareTurnMcp(
   try {
     const mcpConfig = runner.mcpServerConfig(taskId, worktreePath, { readOnly });
     await writeMcpConfig(mcpConfig);
+    if (opts.agentId === 'cursor') {
+      // Cursor reads ~/.cursor/mcp.json; without this the cursor agent runs
+      // with no lazy_* tools at all. The ~/.claude.json write above stays —
+      // in-container merge turns still run claude.
+      await writeCursorMcpConfig(mcpConfig);
+    }
     log.info(
       `[supervisor] Wrote MCP config for task ${taskId.substring(0, 8)}` +
-      `${readOnly ? ' (read-only toolset)' : ''}`,
+      `${readOnly ? ' (read-only toolset)' : ''}` +
+      `${opts.agentId === 'cursor' ? ' (claude + cursor discovery files)' : ''}`,
     );
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
@@ -107,6 +121,32 @@ export async function prepareTurnMcp(
       `reach any lazy state, so its turn is not trustworthy. Check the daemon is running ` +
       `(\`lazy daemon status\`) and re-run the turn; \`lazy doctor\` reports launch-path problems.`,
     );
+  }
+
+  // Cursor's CLI config rides on this chokepoint rather than on each of the four
+  // supervisor call sites: this function is the enforced per-turn place to write
+  // "the files this turn's agent will read out of its ephemeral HOME", and that
+  // is exactly what ~/.cursor/cli-config.json is. Without it cursor's agent
+  // stream either fails against lazy's HTTP/1.1 proxy or routes around it — see
+  // src/agent/cursor-cli-config.ts. FAILS THE TURN for the same reason the MCP
+  // write does: silently running unproxied would leave no audit trail at all.
+  if (opts.agentId === 'cursor') {
+    try {
+      if (await ensureCursorHttp1Config()) {
+        log.info(
+          `[supervisor] Set network.useHttp1ForAgent in ${cursorCliConfigPath()} ` +
+          `— cursor's agent stream needs HTTP/1.1 to reach lazy's proxy`,
+        );
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new McpToolsUnavailableError(
+        `Could not write ${cursorCliConfigPath()} for task ${taskId.substring(0, 8)}, so this ` +
+        `cursor turn would run with its agent stream unable to reach lazy's audit proxy — ` +
+        `refusing to run it.\n  Cause: ${detail}\n` +
+        `Fix or move that file aside and re-run the turn.`,
+      );
+    }
   }
 
   // Pre-approve so Claude Code doesn't prompt for permission mid-turn. A

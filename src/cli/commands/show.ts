@@ -5,6 +5,7 @@ import { createRunner } from '../../runner';
 import { theme, dim } from '../theme';
 import { renderStatusHeader } from '../status-header';
 import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
+import { formatTurnLaunchLabels } from '../../utils/turn-labels';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
@@ -24,8 +25,12 @@ import { showFileViewer } from '../tui/file-viewer';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
 import { logger } from '../../utils/logger';
 import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 import { turnText } from '../../utils/turn-content';
 import { loadConfig } from '../../config/loader';
+import { describeExpiry } from '../../utils/local-day';
+import { getSlowLaneState, getLastProjectAutoResumeAt } from '../../daemon/auto-resume-queue';
+import { MAX_CONSECUTIVE_INTERRUPTIONS } from '../../utils/auto-resume';
 import {
   loadTaskProtectionStatus,
   protectionSummary,
@@ -87,6 +92,13 @@ export interface TaskShowData {
    * an unprotected task carries a status object saying so.
    */
   protection: TaskProtectionStatus | null;
+  /**
+   * Slow-lane auto-resume queue position (src/daemon/auto-resume-queue.ts),
+   * present only when this task's fast-lane circuit breaker has tripped and
+   * it is now waiting for a round-robin retry. Null otherwise — including
+   * when daemon.auto_resume is off, since nothing is queued then.
+   */
+  autoResumeQueue: { attempts: number; maxAttempts: number; nextEligibleAt: number } | null;
 }
 
 /**
@@ -178,18 +190,46 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   // config or git we cannot read must still show the task, so this degrades to
   // null rather than failing the command.
   let protection: TaskProtectionStatus | null = null;
+  let autoResumeQueue: TaskShowData['autoResumeQueue'] = null;
   if (root) {
     try {
       const config = await loadConfig(root);
       protection = await loadTaskProtectionStatus(storage, config, root, task, {
         hasBranch: Boolean(sess?.git_branch),
       });
+
+      // Slow-lane queue position — only meaningful for an interrupted task
+      // whose fast-lane circuit breaker has already tripped (mirrors
+      // listSlowLaneQueue's own filter, so this can't disagree with
+      // `lazy daemon resume-queue`/`lazy list`).
+      if (config.daemon.auto_resume && task.status === 'interrupted' && sess && !sess.ended_at
+        && sess.consecutive_interruptions >= MAX_CONSECUTIVE_INTERRUPTIONS && !sess.user_stopped) {
+        const state = await getSlowLaneState(storage, task.id);
+        if (!state.exhausted) {
+          const now = Date.now();
+          const intervalMs = config.daemon.auto_resume_interval_minutes * 60_000;
+          const dataDir = join(root, config.data.path);
+          const lastProjectAttempt = await getLastProjectAutoResumeAt(dataDir);
+          const gapMs = config.daemon.auto_resume_gap_minutes * 60_000;
+          const gapEligibleAt = lastProjectAttempt === null ? now : lastProjectAttempt + gapMs;
+          const intervalEligibleAt = state.lastAttemptAt === null ? now : state.lastAttemptAt + intervalMs;
+          // Approximation: this floors the ETA at the project-wide gap as if this
+          // task were always next in the round-robin. When another task is ahead
+          // of it, the real wait is longer — `lazy daemon resume-queue` shows the
+          // exact order for that case.
+          autoResumeQueue = {
+            attempts: state.attempts,
+            maxAttempts: config.daemon.auto_resume_max_attempts,
+            nextEligibleAt: Math.max(intervalEligibleAt, gapEligibleAt),
+          };
+        }
+      }
     } catch (err) {
-      logger.debug(`Task ${shortId(task.id)}: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
+      logger.debug(`Task ${shortId(task.id)}: could not resolve protection/auto-resume status: ${err instanceof Error ? err.message : err}`);
     }
   }
 
-  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection };
+  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection, autoResumeQueue };
 }
 
 /**
@@ -202,7 +242,7 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * rendering is identical in both modes — only the grouping/headers differ.
  */
 export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showChunks = false): string[] {
-  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection } = data;
+  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection, autoResumeQueue } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
@@ -325,6 +365,13 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       if (sess.user_stopped) {
         outputLines.push(`    ${theme.label('User-stopped:')} yes (reconciler will not auto-resume)`);
       }
+      if (autoResumeQueue) {
+        const eta = autoResumeQueue.nextEligibleAt <= Date.now() ? 'now' : describeExpiry(new Date(autoResumeQueue.nextEligibleAt));
+        outputLines.push(
+          `    ${theme.label('Slow-lane auto-resume:')} ${eta} (attempt ${autoResumeQueue.attempts + 1}/${autoResumeQueue.maxAttempts})`,
+        );
+        outputLines.push(`      ${dim(`Full queue: ${theme.command('lazy daemon resume-queue')}`)}`);
+      }
       if (showFull && sess.interrupt_logs) {
         outputLines.push(`    ${theme.label('Logs (last 50 lines):')}`);
         for (const line of sess.interrupt_logs.split('\n').slice(0, 50)) {
@@ -389,15 +436,15 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
         const usageSuffix = turn.usage
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
           : '';
-        // Per-turn launch labels. `model` is the REQUEST-side resolution (usually
-        // a tier alias) and is only worth printing when it departs from the task's
-        // current model — that is the mid-task override a reviewer needs to see.
-        // `model_id` is what the agent itself reported, so it prints whenever it
-        // says something the alias doesn't. `effort` prints whenever recorded.
-        const launchLabels: string[] = [];
-        if (turn.model && turn.model !== task.model) launchLabels.push(turn.model);
-        if (turn.model_id && turn.model_id !== turn.model) launchLabels.push(turn.model_id);
-        if (turn.effort) launchLabels.push(`effort: ${turn.effort}`);
+        // Per-turn launch labels: which agent, model and effort this turn ran
+        // under, always all three, `unknown` for anything the turn does not
+        // carry. Built by the shared formatter so `lazy show`, `lazy review` and
+        // the web UI agree; an absent field is never filled in from the task's
+        // current setting (see src/utils/turn-labels.ts).
+        // A turn lazy wrote itself (supervisor nudge, [system] notice) ran no
+        // agent and gets no labels at all — see turnRanNoAgent.
+        const launchSegment = formatTurnLaunchLabels(turn);
+        const launchLabels: string[] = launchSegment ? [launchSegment] : [];
         // What the agent reported about its own lazy tools at session start.
         // Printed only when it is NEWS — i.e. the turn ran with no lazy tools —
         // since the healthy case is every turn and would be pure noise. Absent
@@ -870,6 +917,10 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       prompt: t.prompt ?? null,
       timestamp: t.timestamp,
       usage: t.usage,
+      // Null means "unknown", never the task's current agent — turns written
+      // before this field existed have no agent, and `lazy edit --agent` can
+      // switch agents mid-task. See `Turn.agent`.
+      agent: t.agent ?? null,
       model: t.model ?? null,
       // Null, not the alias, when the agent reported no concrete id — a consumer
       // labelling experiment arms must be able to tell "ran on this exact model"

@@ -1,6 +1,6 @@
 {
   "name": "lazy",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "type": "module",
   "bin": {
     "lazy": "./src/index.ts"
@@ -8,15 +8,15 @@
   "scripts": {
     "dev": "bun run generate:version && bun run ensure:agent-placeholder && bun run src/index.ts",
     "dev:server": "bun --watch ./src/dev/web-server.ts",
-    "build": "bun run generate:version && bun run typecheck && bun run scripts/build.ts",
-    "install:local": "bun run build && mkdir -p ~/.lazy/bin && mv lazy ~/.lazy/bin/lazy && mv lazy-agent ~/.lazy/bin/lazy-agent && echo 'Installation to ~/.lazy.bin complete.'",
+    "build": "bun install && bun run generate:version && bun run typecheck && bun run scripts/build.ts",
+    "install:local": "bun run build && mkdir -p ~/.lazy/bin && mv lazy ~/.lazy/bin/lazy && mv lazy-agent ~/.lazy/bin/lazy-agent && echo 'Installation to ~/.lazy/bin complete.' && echo '' && echo 'If `lazy` is not found, add ~/.lazy/bin to your PATH:' && echo '  zsh/bash: export PATH=\"$HOME/.lazy/bin:$PATH\"' && echo '  fish: set -Ux PATH $HOME/.lazy/bin $PATH'",
     "generate:version": "test -f scripts/generate-version.ts && bun run scripts/generate-version.ts || true",
     "test": "bun run generate:version && bun run ensure:agent-placeholder && bun test --timeout 30000",
     "test:e2e": "bun run generate:version && bun run ensure:agent-placeholder && bun test --timeout 30000 test/e2e/",
     "test:all": "bun run generate:version && bun run ensure:agent-placeholder && LAZY_SLOW_TESTS=1 bun test --timeout 30000",
     "ensure:agent-placeholder": "test -f lazy-agent || echo placeholder > lazy-agent",
     "prepare": "bun run generate:version && bun run ensure:agent-placeholder",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "bun node_modules/typescript/lib/tsc.js --noEmit"
   },
   "devDependencies": {
     "@types/bun": "^1.1.0",

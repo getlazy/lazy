@@ -27,6 +27,7 @@ import {
   type AutoReactTrigger,
 } from '../../daemon/auto-react-budget';
 import { runGit } from '../../utils/git';
+import { agentDisplayName } from '../../agent/registry';
 
 export async function commandStatus(args: string[]): Promise<void> {
   // Parse and validate flags (no flags supported, but validate against unknown flags)
@@ -180,12 +181,13 @@ export async function commandStatus(args: string[]): Promise<void> {
       }
     }
 
-    // Claude session info
+    // Agent session info — labelled with the TASK's agent, not "Claude"
+    const agentLabel = task.agent_id ? agentDisplayName(task.agent_id) : 'Agent';
     if (sess.agent_session_id) {
-      console.log(`\n  Claude session: ${sess.agent_session_id}`);
+      console.log(`\n  ${agentLabel} session: ${sess.agent_session_id}`);
       console.log(`  Can resume: ${sess.ended_at ? 'NO (session ended)' : 'YES'}`);
     } else {
-      console.log(`\n  Claude session: (none)`);
+      console.log(`\n  ${agentLabel} session: (none)`);
       console.log(`  Can resume: NO`);
     }
 

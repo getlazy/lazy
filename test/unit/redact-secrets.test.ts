@@ -10,7 +10,7 @@
 
 import { describe, test, expect, afterEach } from 'bun:test';
 import { buildDockerArgs } from '../../src/capture/claude';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
+import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS } from '../../src/utils/role-target';
 import {
   redactSecrets,
   redactSecretValues,
@@ -72,21 +72,31 @@ describe('redactSecrets', () => {
   });
 
   test('redacts every credential key targetEnvVars can emit, including ollama dummies', () => {
-    // Ollama deliberately sets ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN to the
-    // literal "ollama" (src/utils/role-target.ts). Redaction is key-driven, so
-    // those are redacted too — correct, and not special-cased.
+    // Ollama roles carry the dummy credential LOCAL_BACKEND_CREDS
+    // (ANTHROPIC_AUTH_TOKEN = "ollama", src/utils/role-target.ts) so the proxy
+    // has a grant to authenticate and route by. Redaction is key-driven, so
+    // that dummy is redacted too — correct, and not special-cased.
+    //
+    // NOTE the target shape: an ollama role's base URL is lazy's PROXY, never
+    // the ollama endpoint. The endpoint is where the proxy FORWARDS
+    // (proxy-role-upstreams), so no launch env ever names it.
     const vars = targetEnvVars(
-      { backend: 'ollama', endpoint: 'http://localhost:11434', model: 'x' } as any,
-      [],
+      {
+        backend: 'ollama',
+        endpoint: 'http://localhost:11434',
+        model: 'x',
+        proxyUrl: 'http://localhost:8317',
+      } as any,
+      LOCAL_BACKEND_CREDS,
       'container',
     );
     const argv = vars.flatMap(v => ['-e', `${v.key}=${v.value}`]);
     const printed = redactSecrets(argv).join(' ');
 
-    expect(printed).toContain(`ANTHROPIC_API_KEY=${REDACTED}`);
     expect(printed).toContain(`ANTHROPIC_AUTH_TOKEN=${REDACTED}`);
+    expect(printed).not.toContain('ANTHROPIC_AUTH_TOKEN=ollama');
     // The base URL is where traffic goes — informational, must stay readable.
-    expect(printed).toContain('ANTHROPIC_BASE_URL=http://localhost:11434');
+    expect(printed).toContain('ANTHROPIC_BASE_URL=http://localhost:8317');
   });
 
   test('is position-independent, so a differently framed call site is covered too', () => {

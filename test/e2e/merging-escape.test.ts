@@ -5,8 +5,18 @@ import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } 
 // setTaskStatus lives in the shared helper, which is the ONE place that knows
 // tasks live at lazy.toml's external_path — the local copy this suite carried
 // hardcoded <root>/.lazy/tasks and died with ENOENT once storage moved.
-import { setTaskStatus } from '../helpers/storage';
+import { setTaskStatus, setTaskMetadata, readTaskStatus, readTaskJson } from '../helpers/storage';
 import { runReconcile } from '../helpers/reconcile';
+
+/**
+ * Seed the exact field wedge: a task in `merging` carrying the in-flight marker
+ * a LOCAL merge phase stamps, with no accept running anywhere. That is what a
+ * daemon killed mid-accept leaves behind.
+ */
+function strandInMerging(root: string, taskId: string, priorStatus = 'blocked'): void {
+  setTaskStatus(root, taskId, 'merging');
+  setTaskMetadata(root, taskId, 'accept_in_flight_from', priorStatus);
+}
 
 describe('merging escape hatch', () => {
   let ctx: TestContext;
@@ -54,6 +64,47 @@ describe('merging escape hatch', () => {
     const statusMatch = showAfter.stdout.match(/Status:\s+(\w+)/);
     expect(statusMatch).toBeTruthy();
     expect(statusMatch![1]).not.toBe('merging');
+  });
+
+  // REGRESSION (fix-stranded-merging): a task stranded in `merging` by a dead
+  // accept was inescapable — reject, close and submit all refused, and nothing
+  // swept it back. One task in the field sat wedged for two weeks. Each of the
+  // three now recovers the task first and then does its job.
+  test('reject escapes a task stranded in merging', async () => {
+    const taskId = await createTask(ctx, 'Wedged task', 'Something');
+    await startAndReconcile(ctx, taskId);
+    strandInMerging(ctx.root, taskId);
+
+    const result = await ctx.lazy(['reject', taskId, '--reason', 'not what I wanted', '--yes']);
+    expectSuccess(result);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('abandoned');
+  });
+
+  test('close escapes a task stranded in merging and keeps the reason', async () => {
+    const taskId = await createTask(ctx, 'Wedged task', 'Something');
+    await startAndReconcile(ctx, taskId);
+    strandInMerging(ctx.root, taskId);
+
+    const result = await ctx.lazy(['close', taskId, '--reason', 'abandoning this line of work', '--yes']);
+    expectSuccess(result);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('abandoned');
+    // Never lose human feedback: the reason the human typed must survive the
+    // recovery, not be orphaned by a refusal.
+    expect(readTaskJson(ctx.root, taskId).close_reason).toBe('abandoning this line of work');
+  });
+
+  // The reconciler is the prevention half: a stranded merge with no live owner
+  // is returned to a real resting state without the human knowing any incantation.
+  test('the reconciler sweeps a stranded merging task back to a resting state', async () => {
+    const taskId = await createTask(ctx, 'Wedged task', 'Something');
+    await startAndReconcile(ctx, taskId);
+    strandInMerging(ctx.root, taskId);
+
+    await runReconcile(ctx.root, ctx.protocolBase);
+
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    // The marker is the record of a merge in flight; a swept task has none.
+    expect(readTaskJson(ctx.root, taskId).metadata?.accept_in_flight_from ?? '').toBe('');
   });
 
   // INVARIANT: accept on a merging task with the local driver must not crash or

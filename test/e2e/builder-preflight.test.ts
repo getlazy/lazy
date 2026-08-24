@@ -15,7 +15,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { resolve } from 'path';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { preflightAgentBinary } from '../../src/supervisor/builder';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -25,7 +25,7 @@ describe('agent-entry selfcheck sentinel', () => {
   // is what the builder preflight matches on to distinguish the real compiled
   // agent from a bare Bun binary. Changing the sentinel breaks the preflight.
   test('selfcheck prints the sentinel and exits 0', () => {
-    const res = spawnSync(['bun', 'run', AGENT_ENTRY, 'selfcheck'], { stdout: 'pipe', stderr: 'pipe' });
+    const res = spawnSyncUnsupervised(['bun', 'run', AGENT_ENTRY, 'selfcheck'], { stdout: 'pipe', stderr: 'pipe' });
     expect(res.exitCode).toBe(0);
     expect(res.stdout.toString()).toContain('lazy-agent ok');
   });
@@ -33,7 +33,7 @@ describe('agent-entry selfcheck sentinel', () => {
   // INVARIANT: --version / --revision self-identify too (a bare Bun binary would
   // print Bun's version here), so the agent is never mistaken for bare Bun.
   test('--version self-identifies as the lazy agent', () => {
-    const res = spawnSync(['bun', 'run', AGENT_ENTRY, '--version'], { stdout: 'pipe', stderr: 'pipe' });
+    const res = spawnSyncUnsupervised(['bun', 'run', AGENT_ENTRY, '--version'], { stdout: 'pipe', stderr: 'pipe' });
     expect(res.exitCode).toBe(0);
     expect(res.stdout.toString()).toContain('lazy-agent ok');
   });

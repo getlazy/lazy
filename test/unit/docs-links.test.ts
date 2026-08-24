@@ -34,7 +34,7 @@ let siteDir: string;
 beforeAll(async () => {
   siteDir = await mkdtemp(join(tmpdir(), 'lazy-docs-site-'));
   manifest = await buildDocsSite({
-    docsDir: join(REPO_ROOT, 'docs'),
+    docsDir: join(REPO_ROOT, 'public-docs'),
     outDir: siteDir,
     version: DOCS_VERSION_SEGMENT,
   });
@@ -57,7 +57,7 @@ describe('docs links', () => {
     for (const page of PAGES) {
       test(`${page} points at a docs file that exists`, async () => {
         const source = DOCS_PAGES[page].source;
-        const info = await stat(join(REPO_ROOT, 'docs', source));
+        const info = await stat(join(REPO_ROOT, 'public-docs', source));
         expect(info.isFile()).toBe(true);
       });
     }

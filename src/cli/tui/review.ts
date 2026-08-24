@@ -14,6 +14,7 @@ import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBra
 import type { TaskTreeNode } from '../../storage/types';
 import { getNewNotesSince } from '../commands/shared';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
+import { formatTurnLaunchLabels } from '../../utils/turn-labels';
 import type { Task, Session, Turn, Comment, Commit, JournalEntry, FollowUp } from '../../types';
 import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage';
@@ -903,6 +904,10 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
   const roleLabel = turn.role.toUpperCase();
   const lines: string[] = [];
   lines.push(roleColor + ansi.bold + `── Turn #${turn.sequence} [${roleLabel}] ──` + ansi.reset);
+  // What this turn ran under. Always all three, `unknown` for anything the turn
+  // does not carry — never back-filled from the task's current settings.
+  const detailLabels = formatTurnLaunchLabels(turn);
+  if (detailLabels) lines.push(ansi.dim + detailLabels + ansi.reset);
   lines.push('');
 
   // Show violations prominently for agent turns (before the agent's response)
@@ -1252,8 +1257,12 @@ function getTurnsOverview(data: ReviewData): string[] {
   for (const turn of data.turns) {
     const roleColor = turn.role === 'human' ? ansi.fg.green : ansi.fg.blue;
     const roleLabel = turn.role.toUpperCase();
-    const preview = turnText(turn).substring(0, 60).replace(/\n/g, ' ');
-    lines.push(roleColor + `#${turn.sequence} [${roleLabel}]` + ansi.reset + ` ${preview}...`);
+    const preview = turnText(turn).substring(0, 40).replace(/\n/g, ' ');
+    // Launch labels sit in a fixed position (right after the role tag) so a
+    // reviewer can scan the agent/model/effort column straight down the list.
+    const segment = formatTurnLaunchLabels(turn);
+    const labels = segment ? ` ` + ansi.dim + segment + ansi.reset : '';
+    lines.push(roleColor + `#${turn.sequence} [${roleLabel}]` + ansi.reset + labels + ` ${preview}...`);
   }
 
   lines.push('');
@@ -1283,8 +1292,10 @@ export function getChunkOverview(data: ReviewData, index: number): string[] {
       ? turn.actor.toUpperCase()
       : turn.role.toUpperCase();
     const autoSuffix = turn.auto_triggered ? ansi.dim + ' (auto)' + ansi.reset : '';
-    const preview = turnText(turn).substring(0, 60).replace(/\n/g, ' ');
-    lines.push(roleColor + `#${turn.sequence} [${actorLabel}]` + ansi.reset + autoSuffix + ` ${preview}...`);
+    const preview = turnText(turn).substring(0, 40).replace(/\n/g, ' ');
+    const segment = formatTurnLaunchLabels(turn);
+    const labels = segment ? ` ` + ansi.dim + segment + ansi.reset : '';
+    lines.push(roleColor + `#${turn.sequence} [${actorLabel}]` + ansi.reset + autoSuffix + labels + ` ${preview}...`);
   }
 
   lines.push('');
@@ -1320,6 +1331,7 @@ function getTaskOverviewContent(data: ReviewData): string[] {
     lines.push(`  ${ansi.bold}Code:${ansi.reset}    ${task.code}`);
   }
   lines.push(`  ${ansi.bold}Status:${ansi.reset}  ${task.status}`);
+  lines.push(`  ${ansi.bold}Agent:${ansi.reset}   ${task.agent_id}`);
   lines.push(`  ${ansi.bold}Model:${ansi.reset}   ${task.model ?? '-'}`);
 
   // Show parent task if exists

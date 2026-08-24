@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtemp, mkdir, rm, readFile, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 const ROOT = join(import.meta.dir, '..', '..');
 const WORKFLOW = join(ROOT, '.github', 'workflows', 'build.yml');
@@ -54,7 +54,7 @@ describe('build workflow version extraction', () => {
   /** Run the workflow's extraction against whatever src/version.ts is in `cwd`. */
   async function runExtraction(cwd: string): Promise<{ exitCode: number; version: string }> {
     const command = await extractionCommand();
-    const result = spawnSync(['bash', '-c', `${command}\nprintf '%s' "$VERSION"`], {
+    const result = spawnSyncUnsupervised(['bash', '-c', `${command}\nprintf '%s' "$VERSION"`], {
       cwd,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -64,7 +64,7 @@ describe('build workflow version extraction', () => {
 
   test('yields exactly one version line, so $GITHUB_OUTPUT stays well-formed', async () => {
     // version.ts is gitignored and generated; make sure it reflects package.json.
-    const gen = spawnSync(['bun', 'run', 'generate:version'], {
+    const gen = spawnSyncUnsupervised(['bun', 'run', 'generate:version'], {
       cwd: ROOT,
       stdout: 'pipe',
       stderr: 'pipe',

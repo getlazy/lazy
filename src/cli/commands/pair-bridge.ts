@@ -12,7 +12,36 @@
  *
  * Kept in its own module so unit tests can import it without pulling in
  * heavy supervisor / docker launch modules.
+ *
+ * SECURITY — THIS MODULE HOLDS THE ONLY SANCTIONED WRITE INTO HOST HOME STATE.
+ *
+ * `lazy pair` otherwise NEVER copies, clobbers, overwrites or merges anything
+ * under `~/.claude` or `~/.cursor`: the sandbox is written by the in-container
+ * agent, so importing it onto the host turns agent-authored content into host
+ * input. The Cursor branch's sandbox→host `cp` was removed for exactly that
+ * reason (see the SECURITY INVARIANT note in pair.ts).
+ *
+ * The bridge survives only because it is a strictly weaker operation, and it
+ * must stay that way. Four properties, asserted in
+ * test/unit/pair-no-host-home-writes.test.ts — do not weaken one without the
+ * human:
+ *
+ *   1. SYMLINKS ONLY — no sandbox bytes ever land on the host, so nothing
+ *      persists once the sandbox is gone.
+ *   2. PURELY ADDITIVE — an existing host entry is never replaced or merged
+ *      into. The only thing removed is a DANGLING symlink from a crashed run.
+ *   3. NAMESPACED — writes are confined to `~/.claude/projects/<encoded
+ *      worktree path>`, a directory keyed to the task worktree. No config file
+ *      (`~/.claude.json`, `~/.claude/settings.json`) is touched, ever.
+ *   4. REVERSIBLE — `cleanup()` removes every link it made at session end.
+ *
+ * Residual risk the human accepted knowingly: the transcript a host `--resume`
+ * then reads was written by the task's agent. Removing the bridge would remove
+ * container-task pairing altogether, which is the feature. `--autonomous`
+ * (`--dangerously-skip-permissions`) on top of that history stays opt-in and
+ * separately confirmed — it is never implied by pairing.
  */
+
 import { join } from 'path';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync, lstatSync, readdirSync } from 'fs';
 import { stat, readFile, mkdir, copyFile, access } from 'fs/promises';

@@ -4,7 +4,7 @@
  * Detects tmux via $TMUX env var. Supports read-only watching of agent sessions.
  */
 
-import { spawnSync } from '../utils/spawn';
+import { spawnSyncInteractive, spawnSyncUnsupervised } from '../utils/spawn';
 import type { Terminal, WatchResult } from './interface';
 
 export class TmuxDriver implements Terminal {
@@ -24,8 +24,11 @@ export class TmuxDriver implements Terminal {
     const insideTmux = !!process.env.TMUX;
 
     if (insideTmux) {
+      // Interactive by construction: both calls below hand the terminal to tmux
+      // for as long as the human watches, so they must never be timed out —
+      // killing a live session mid-use is a bug, not a backstop.
       // Inside tmux: switch to the target session in read-only mode
-      const result = spawnSync(
+      const result = spawnSyncInteractive(
         ['tmux', 'switch-client', '-t', tmuxSessionName, '-r'],
         { stdin: 'inherit', stdout: 'inherit', stderr: 'pipe' },
       );
@@ -36,7 +39,7 @@ export class TmuxDriver implements Terminal {
       return { exitCode: result.exitCode };
     } else {
       // Outside tmux: attach read-only
-      const result = spawnSync(
+      const result = spawnSyncInteractive(
         ['tmux', 'attach-session', '-t', tmuxSessionName, '-r'],
         { stdin: 'inherit', stdout: 'inherit', stderr: 'pipe' },
       );
@@ -50,9 +53,12 @@ export class TmuxDriver implements Terminal {
 
   private tmuxSessionExists(sessionName: string): boolean {
     try {
-      const result = spawnSync(
+      // Unsupervised, unlike the attach/switch calls above: nobody is watching
+      // this probe, and a hung tmux server must not wedge the CLI. 5s overrides
+      // the (much longer) default backstop — a `has-session` is instant or broken.
+      const result = spawnSyncUnsupervised(
         ['tmux', 'has-session', '-t', sessionName],
-        { stdout: 'pipe', stderr: 'pipe' },
+        { stdout: 'pipe', stderr: 'pipe', timeout: 5_000 },
       );
       return result.exitCode === 0;
     } catch {

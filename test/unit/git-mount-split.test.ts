@@ -13,7 +13,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtemp, rm, mkdir, writeFile, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import {
   resolveGitMountPaths,
   buildGitMountArgs,
@@ -22,7 +22,7 @@ import {
 import { buildDockerArgs } from '../../src/capture/claude';
 
 function git(cwd: string, ...args: string[]): void {
-  const r = spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const r = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   if (r.exitCode !== 0) {
     throw new Error(`git ${args.join(' ')} failed: ${r.stderr.toString()}`);
   }

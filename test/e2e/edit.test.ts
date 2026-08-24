@@ -26,6 +26,15 @@ function readTaskModel(root: string, shortId: string): string | undefined {
   return task.model;
 }
 
+/** Read the persisted effort metadata straight from task.json. */
+function readTaskEffort(root: string, shortId: string): string | undefined {
+  const tasksDir = tasksDirFor(root);
+  const match = readdirSync(tasksDir).find(d => d.startsWith(shortId));
+  if (!match) throw new Error(`Task directory not found for ${shortId}`);
+  const task = JSON.parse(readFileSync(join(tasksDir, match, 'task.json'), 'utf-8'));
+  return task.metadata?.effort;
+}
+
 describe('lazy edit', () => {
   let ctx: TestContext;
 
@@ -299,7 +308,7 @@ describe('lazy edit on started tasks', () => {
 
     const editResult = await ctx.lazy(['edit', taskId, '--goal', 'New goal']);
     expectFailure(editResult);
-    expectError(editResult, 'only --model can be changed');
+    expectError(editResult, 'only --model and --effort can be changed');
   });
 
   // INVARIANT: The model-only exemption does not extend to combined edits —
@@ -311,8 +320,69 @@ describe('lazy edit on started tasks', () => {
     const before = readTaskModel(ctx.root, taskId);
     const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6', '--goal', 'New goal']);
     expectFailure(editResult);
-    expectError(editResult, 'only --model can be changed');
+    expectError(editResult, 'only --model and --effort can be changed');
     // Nothing was applied — the model is unchanged too.
     expect(readTaskModel(ctx.root, taskId)).toBe(before);
+  });
+
+  // INVARIANT: --effort is editable on a STARTED task, exactly like --model.
+  // `lazy start --effort` persists the level on the task, so without this a
+  // task that ran one turn at max would stay pinned there; dialing it between
+  // turns is the entire reason the flag exists on edit.
+  test('effort-only edit succeeds on a started task and persists', async () => {
+    const taskId = await startedTask();
+
+    const editResult = await ctx.lazy(['edit', taskId, '--effort', 'medium']);
+    expectSuccess(editResult);
+    expectOutput(editResult, 'Updated effort: medium');
+
+    expect(readTaskEffort(ctx.root, taskId)).toBe('medium');
+  });
+
+  // INVARIANT: model + effort together is still a mid-flight-safe edit —
+  // neither restates the work, so the pair is allowed on a started task.
+  test('model and effort together succeed on a started task', async () => {
+    const taskId = await startedTask();
+
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-opus-4-6', '--effort', 'xhigh']);
+    expectSuccess(editResult);
+    expectOutput(editResult, 'Updated effort: xhigh');
+    expectOutput(editResult, 'Updated model: claude-opus-4-6');
+
+    expect(readTaskModel(ctx.root, taskId)).toBe('claude-opus-4-6');
+    expect(readTaskEffort(ctx.root, taskId)).toBe('xhigh');
+  });
+
+  test('effort combined with goal is rejected on a started task', async () => {
+    const taskId = await startedTask();
+
+    // Starting the task already persisted the resolved effort, so "unchanged"
+    // is the assertion — nothing from the rejected edit was partially applied.
+    const before = readTaskEffort(ctx.root, taskId);
+    const editResult = await ctx.lazy(['edit', taskId, '--effort', 'low', '--goal', 'New goal']);
+    expectFailure(editResult);
+    expectError(editResult, 'only --model and --effort can be changed');
+    expect(readTaskEffort(ctx.root, taskId)).toBe(before);
+  });
+
+  test('sets effort on a not-yet-started task', async () => {
+    const taskId = await createTask(ctx, 'Effort task');
+
+    const editResult = await ctx.lazy(['edit', taskId, '--effort', 'high']);
+    expectSuccess(editResult);
+    expectOutput(editResult, 'Updated effort: high (takes effect next turn)');
+    expect(readTaskEffort(ctx.root, taskId)).toBe('high');
+  });
+
+  // Same value set and message shape as `lazy start --effort` — the two
+  // surfaces must never disagree about what is legal.
+  test('rejects an invalid effort level', async () => {
+    const taskId = await createTask(ctx, 'Effort task');
+
+    const editResult = await ctx.lazy(['edit', taskId, '--effort', 'banana']);
+    expectFailure(editResult);
+    expectError(editResult, "Invalid effort 'banana'");
+    expectError(editResult, 'low, medium, high, xhigh, max');
+    expect(readTaskEffort(ctx.root, taskId)).toBeUndefined();
   });
 });

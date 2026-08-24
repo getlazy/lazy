@@ -1,4 +1,6 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, taskRef, parseFlags, resolveTaskOrExit, formatDate, getBranchNameFromId } from '../helpers';
+import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, isTTY } from '../editor';
 import { theme } from '../theme';
 import { getActor } from '../../constants';
@@ -148,8 +150,19 @@ export async function commandRevert(args: string[]): Promise<void> {
       `After the revert is clean, commit and you're done.`,
     ].join('\n');
 
-    // Create the revert task
-    const revertTask = await storage.createTask(revertGoal, undefined, undefined, revertCode);
+    // Create the revert task. It undoes the original task's work, so it runs
+    // on the same agent rather than the project default.
+    const revertTask = await storage.createTask(
+      revertGoal,
+      undefined,
+      undefined,
+      revertCode,
+      undefined,
+      resolveAgentForNewTask({
+        inheritFrom: task,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      }),
+    );
 
     // Set prompt
     await storage.updateTaskPrompt(revertTask.id, revertPrompt);

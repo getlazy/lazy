@@ -1,4 +1,5 @@
 import { requireLazyRoot, requireStorage, shortId, displayId, validateModel, parseFlags, formatDate, taskRef, getWorktreePath, getBranchNameFromId, resolveTaskOrExit } from '../helpers';
+import { pendingViolations } from '../../utils/turns';
 import { promptChoice, promptYesNo, isTTY } from '../editor';
 import { commandStart } from './start';
 import { runInteractiveReview } from '../tui/per-hunk-review';
@@ -429,6 +430,20 @@ async function executeGateDecision(
           console.error(`Task ${taskShortId} has no session.`);
           return 'advance';
         }
+
+        // Conflict tasks have file permission violations that require explicit
+        // approval/rejection decisions. Loop doesn't have the UI for that — use
+        // `lazy unblock` directly, which prompts for each violated file.
+        // Gated on the pending violation SET, not the `conflict` label: a
+        // side-channel turn can leave a task labelled `blocked` while the set is
+        // still pending, and running the feedback flow there would revert the
+        // agent's committed work (fix-ask-nukes-violations).
+        if (pendingViolations(await storage.getSessionTurns(sess.id)).length > 0) {
+          console.log(theme.warning(`\nTask ${taskShortId} has file permission violations.`));
+          console.log(`Use ${theme.command(`lazy unblock ${taskShortId}`)} to handle them interactively.`);
+          return 'advance';
+        }
+
         const worktreePath = getWorktreePath(root, fresh);
         await runFeedbackFlow(fresh, sess, root, storage, worktreePath, taskShortId, follow, modelOverride);
       } finally {
@@ -969,6 +984,15 @@ export async function commandLoop(args: string[]): Promise<void> {
             if (!task2) { console.error(`Task not found: ${taskShortId}`); process.exit(1); }
             const sess2 = await storage2.getSessionByTaskId(task2.id);
             if (!sess2) { console.error(`Task ${taskShortId} has no session.`); process.exit(1); }
+
+            // Conflict tasks have file permission violations that require explicit
+            // approval/rejection decisions. Loop doesn't have the UI for that.
+            // Same violation-set gate as above (fix-ask-nukes-violations).
+            if (pendingViolations(await storage2.getSessionTurns(sess2.id)).length > 0) {
+              console.log(theme.warning(`\nTask ${taskShortId} has file permission violations.`));
+              console.log(`Use ${theme.command(`lazy unblock ${taskShortId}`)} to handle them interactively.`);
+              break;
+            }
 
             await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride);
           } finally {

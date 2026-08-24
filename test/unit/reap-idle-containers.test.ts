@@ -9,12 +9,13 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { reapIdleContainers } from '../../src/utils/reconcile';
 import type { Runner } from '../../src/runner';
 import type { Storage } from '../../src/storage';
+import { pinConfig } from '../helpers/pin-config';
 
 interface FakeTask { id: string; status: string; priority: string; created_at: number; }
 interface FakeSession { id: string; container_name: string | null; last_interaction_at: number | null; started_at: number; }
@@ -53,8 +54,22 @@ function fakeRunner(removed: string[], reapsIdleRuns = true): Runner {
 
 describe('reapIdleContainers sweep', () => {
   let root: string;
-  beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'lazy-reap-')); });
-  afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+  let unpinConfig: () => void;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'lazy-reap-'));
+    // reapIdleContainers -> loadConfig walks up from process.cwd() (this repo's
+    // own worktree under `bun test`) when LAZY_CONFIG isn't pinned, silently
+    // picking up ITS lazy.toml (idle_grace_minutes = 120) instead of the
+    // DEFAULT_CONFIG (10) this suite's comments assume. Write an empty config
+    // so the temp root resolves to a real, existing file with no [limits]
+    // override, and pin LAZY_CONFIG to it to stop the upward walk.
+    await writeFile(join(root, 'lazy.toml'), '');
+    unpinConfig = pinConfig(root);
+  });
+  afterEach(async () => {
+    unpinConfig();
+    await rm(root, { recursive: true, force: true });
+  });
 
   test('base-reaps an over-grace blocked container: removeRun + clear container_name', async () => {
     const now = Date.now();

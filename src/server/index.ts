@@ -21,7 +21,8 @@ import {
   totalInputTokens,
 } from './templates';
 import type { DashboardStats, TaskWithSession, ChartDataPoint, ActiveTaskInfo, ActivityDay, ActiveStates } from './templates';
-import { reviewQueueHtml, reviewTaskHtml, threadsJson, type ReviewLiveState } from './review';
+import { reviewQueueHtml, reviewTaskHtml, threadsJson, type ReviewDraft, type ReviewLiveState } from './review';
+import { acceptRemedyOf, type AcceptRemedy } from '../types';
 import { askUnavailableReason, acceptBlockedByViolations, type ReviewActions } from './review-actions';
 import { STYLESHEET_PATH, bundledStylesheet, stylesheetFromDisk } from './styles';
 import { taskRefFromId } from '../cli/helpers';
@@ -83,7 +84,7 @@ function json(data: unknown, status: number = 200): Response {
   });
 }
 
-type SortField = 'status' | 'model' | 'turns' | 'last_active' | 'duration' | 'tokens' | 'goal' | 'created';
+type SortField = 'status' | 'agent' | 'model' | 'turns' | 'last_active' | 'duration' | 'tokens' | 'goal' | 'created';
 type SortDirection = 'asc' | 'desc';
 
 interface SortConfig {
@@ -101,7 +102,7 @@ function parseSortParam(sort: string | null, filter: string): SortConfig {
 
   const desc = sort.startsWith('-');
   const fieldName = desc ? sort.slice(1) : sort;
-  const validFields: SortField[] = ['status', 'model', 'last_active', 'duration', 'tokens', 'goal', 'created'];
+  const validFields: SortField[] = ['status', 'agent', 'model', 'last_active', 'duration', 'tokens', 'goal', 'created'];
 
   if (!validFields.includes(fieldName as SortField)) {
     return { field: 'created', direction: 'desc' };
@@ -124,6 +125,10 @@ function sortTasks(
         const aStatus = a.session?.outcome ?? (a.session?.ended_at ? 'ended' : a.task.status);
         const bStatus = b.session?.outcome ?? (b.session?.ended_at ? 'ended' : b.task.status);
         cmp = aStatus.localeCompare(bStatus);
+        break;
+      }
+      case 'agent': {
+        cmp = a.task.agent_id.localeCompare(b.task.agent_id);
         break;
       }
       case 'model': {
@@ -1028,21 +1033,70 @@ async function handleReviewRoute(
     if (!resolved.task) return html(errorHtml('Not Found', 'Task not found'), 404);
     const form = await req.formData();
     const reason = String(form.get('reason') ?? '').trim() || undefined;
+    // Everything the reviewer had typed, carried through every re-render below.
+    const draft: ReviewDraft = {
+      reason,
+      feedback: String(form.get('feedback') ?? '') || undefined,
+    };
+    // Present only when the reviewer is clearing a protection gate from the
+    // page. It goes to the daemon and nowhere else — never into the draft,
+    // never into a log line, never back into the rendered form.
+    const passphrase = String(form.get('passphrase') ?? '') || undefined;
     // Presentation only — acceptTaskPreflight enforces this too, but its advice
     // ("use --approve-file") is meaningless in a browser.
     const blocked = acceptBlockedByViolations(await taskFileViolations(storage, resolved.task.id));
     if (blocked) {
-      return renderReviewPage(storage, actions, resolved.task.id, { text: blocked, error: true });
+      return renderReviewPage(storage, actions, resolved.task.id, { text: blocked, error: true }, draft);
     }
     try {
-      await actions.accept(resolved.task.id, reason);
+      await actions.accept(resolved.task.id, reason, passphrase);
     } catch (err) {
-      return renderReviewPage(storage, actions, resolved.task.id, {
-        text: `Accept failed: ${err instanceof Error ? err.message : String(err)}`,
-        error: true,
-      });
+      // The remedy is the daemon's, read straight off the error — this page
+      // never reads the message to guess what went wrong. An error without one
+      // still shows the daemon's words verbatim, as before.
+      const remedy: AcceptRemedy | undefined = acceptRemedyOf(err);
+      return renderReviewPage(
+        storage,
+        actions,
+        resolved.task.id,
+        { text: `Accept failed: ${err instanceof Error ? err.message : String(err)}`, error: true },
+        draft,
+        remedy,
+      );
     }
     return Response.redirect(`${url.origin}/tasks/${resolved.task.id}`, 303);
+  }
+
+  // The in-page half of a "sync first" remedy: same syncTask the CLI runs, so
+  // the reviewer does not have to leave the page to clear a stale merge base.
+  params = matchRoute(path, '/review/:id/sync');
+  if (params) {
+    if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+    const resolved = await storage.resolveTask(params.id);
+    if (!resolved.task) return html(errorHtml('Not Found', 'Task not found'), 404);
+    const form = await req.formData();
+    const draft: ReviewDraft = {
+      reason: String(form.get('reason') ?? '') || undefined,
+      feedback: String(form.get('feedback') ?? '') || undefined,
+    };
+    try {
+      const result = await actions.sync(resolved.task.id);
+      return renderReviewPage(
+        storage,
+        actions,
+        resolved.task.id,
+        { text: result.message ?? 'Sync started.' },
+        draft,
+      );
+    } catch (err) {
+      return renderReviewPage(
+        storage,
+        actions,
+        resolved.task.id,
+        { text: `Sync failed: ${err instanceof Error ? err.message : String(err)}`, error: true },
+        draft,
+      );
+    }
   }
 
   params = matchRoute(path, '/review/:id/violation');
@@ -1088,6 +1142,10 @@ async function renderReviewPage(
   actions: ReviewActions,
   taskId: string,
   notice?: { text: string; error?: boolean },
+  /** Text the reviewer had typed, re-rendered into the boxes it came from. */
+  draft?: ReviewDraft,
+  /** The daemon's remedy for a refused accept, rendered as offered actions. */
+  remedy?: AcceptRemedy,
 ): Promise<Response> {
   const resolved = await storage.resolveTask(taskId);
   if (!resolved.task) return html(errorHtml('Not Found', 'Task not found'), 404);
@@ -1107,7 +1165,7 @@ async function renderReviewPage(
   }
   const state = await reviewLiveState(storage, resolved.task);
   const violations = await taskFileViolations(storage, resolved.task.id);
-  return html(reviewTaskHtml(resolved.task, diffText, comments, diffNotice, state, violations));
+  return html(reviewTaskHtml(resolved.task, diffText, comments, diffNotice, state, violations, { draft, remedy }));
 }
 
 /**

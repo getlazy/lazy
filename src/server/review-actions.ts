@@ -174,6 +174,13 @@ export interface AcceptResult {
   warnings?: string[];
 }
 
+/** Deliberately loose, for the same reason as {@link UnblockResult}. */
+export interface SyncResult {
+  status?: string;
+  message?: string;
+  warnings?: string[];
+}
+
 export interface ReviewActions {
   /** Blocked tasks awaiting review, newest activity first is the caller's job. */
   listQueue(): Promise<ReviewQueueEntry[]>;
@@ -220,8 +227,26 @@ export interface ReviewActions {
    * is applied whether they decided one minute or one day ago.
    */
   unblock(taskId: string, message: string): Promise<UnblockResult>;
-  /** Accept the task's work and merge it into the parent. */
-  accept(taskId: string, reason?: string): Promise<AcceptResult>;
+  /**
+   * Accept the task's work and merge it into the parent.
+   *
+   * `passphrase` satisfies a protection gate in place, exactly as `lazy approve`
+   * does at a terminal: it is verified by the daemon, records the one-shot
+   * approval the merge then consumes, and is never stored or logged anywhere.
+   * The "gated merges are human-only" asymmetry is about AGENTS; a person
+   * sitting in the review page is the human it was written for.
+   *
+   * A refused accept throws an error carrying a structured remedy — see
+   * src/types/accept-remedy.ts — so the caller can offer the fix rather than
+   * printing "accept failed".
+   */
+  accept(taskId: string, reason?: string, passphrase?: string): Promise<AcceptResult>;
+  /**
+   * Merge the parent branch into the task's worktree — the remedy for the
+   * refusals that say "sync first", performed in-page instead of sending the
+   * reviewer to a terminal.
+   */
+  sync(taskId: string): Promise<SyncResult>;
   /**
    * Record the reviewer's ⛔/✅ decision on one protected file the agent changed
    * without permission, and return the task's violations as they now stand.

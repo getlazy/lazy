@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { setTaskStatus, setTaskMetadata, readTaskStatus } from '../helpers/storage';
 import { reconcileTasks } from '../../src/utils/reconcile';
 import { createStorage } from '../../src/storage';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
@@ -88,6 +89,29 @@ describe('lazy submit', () => {
     const submitResult = await lazy(['submit', taskId]);
     expectFailure(submitResult);
     expectError(submitResult, 'remote driver');
+  });
+
+  // REGRESSION (fix-stranded-merging): submit used to refuse a task stranded in
+  // `merging` with "Only blocked or conflict tasks can be submitted" — while the
+  // FSM's refusal from reject/close advertised `submitted` as a valid exit from
+  // `merging`. The human was told the door existed and found it locked. Submit
+  // now recovers a merge whose accept is gone and proceeds from the resting
+  // status, so the only thing left to refuse here is the missing remote driver.
+  test('submit recovers a task stranded in merging instead of refusing it', async () => {
+    const taskId = await createTaskTest(lazy, 'Wedged task', 'Test prompt');
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    expectSuccess(startResult);
+    await runReconcile(ctx.root);
+
+    // Exactly what a daemon killed mid-accept leaves behind.
+    setTaskStatus(ctx.root, taskId, 'merging');
+    setTaskMetadata(ctx.root, taskId, 'accept_in_flight_from', 'blocked');
+
+    const submitResult = await lazy(['submit', taskId]);
+    expectFailure(submitResult);
+    expectError(submitResult, 'remote driver');
+    expect(submitResult.stderr).not.toContain('Only blocked or conflict tasks can be submitted');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
   });
 
   test('submit with github driver fails at push (no real remote)', async () => {

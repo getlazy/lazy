@@ -120,6 +120,19 @@ describe('lazy show', () => {
     expectOutput(result, 'Chunk 1');
   });
 
+  // --- Per-turn launch labels ---
+
+  test('every turn says which agent, model and effort ran it', async () => {
+    const taskId = await createTask(ctx, 'Launch label task', 'Test per-turn labels');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    const result = await ctx.lazy(['show', taskId]);
+    expectSuccess(result);
+    // The request-side turn records the agent the launch resolved to.
+    expectOutput(result, 'agent: claude-code');
+    expectOutput(result, 'effort:');
+  });
+
   // --- JSON output tests ---
 
   describe('--json', () => {

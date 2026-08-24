@@ -333,6 +333,125 @@ describe('lazy init', () => {
     expect(result.stdout).not.toContain('Shell detected');
   });
 
+  // Branch protection exists but nobody finds it: a gate nobody knows about
+  // protects nothing. Init offers it — OFF by default, TTY only — and walks
+  // straight into enrolling the machine-global approval passphrase when taken.
+  describe('branch protection offer', () => {
+    let passphraseDir: string;
+
+    /**
+     * A human at a real terminal on the host. LAZY_PASSPHRASE_BASE_DIR is
+     * pinned per test: this file spawns from `...process.env`, so without it an
+     * accepted offer would enroll into the DEVELOPER's own ~/.lazy.
+     */
+    function atATerminal(secret?: string): Record<string, string> {
+      return {
+        LAZY_FORCE_TTY: '1',
+        LAZY_FORCE_CONTAINER: '0',
+        LAZY_PASSPHRASE_BASE_DIR: passphraseDir,
+        LAZY_PROMPT_DEFAULTS: 'accept',
+        ...(secret ? { LAZY_PROMPT_SECRET: secret } : {}),
+      };
+    }
+
+    afterEach(async () => {
+      if (passphraseDir) await rm(passphraseDir, { recursive: true, force: true });
+    });
+
+    async function setUp(): Promise<void> {
+      tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+      passphraseDir = await mkdtemp(join(tmpdir(), 'lazy-init-passphrase-'));
+      initGitRepo(tmpDir);
+    }
+
+    test('accepting turns protection on and enrolls the passphrase', async () => {
+      await setUp();
+
+      const result = await runLazy(
+        tmpDir,
+        ['init', '--skip-auth-check', '--skip-remote-check'],
+        atATerminal('correct-horse-battery'),
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Branch protection');
+      expect(result.stdout).toContain('Set enabled = true under [protection]');
+      // Uncommented, not the "# enabled = true" example the template ships.
+      expect(readFileSync(join(tmpDir, 'lazy.toml'), 'utf-8')).toMatch(/^enabled = true$/m);
+
+      // Enrolled machine-globally, hashed — never a file in the new project.
+      const store = join(passphraseDir, 'passphrase.json');
+      expect(existsSync(store)).toBe(true);
+      const raw = readFileSync(store, 'utf-8');
+      expect(raw).not.toContain('correct-horse-battery');
+      expect(JSON.parse(raw).hash).toStartWith('$argon2');
+      expect(existsSync(join(tmpDir, '.lazy', 'approve-passphrase'))).toBe(false);
+    });
+
+    // INVARIANT: protection stays OPT-IN and off by default. The offer defaults
+    // to "no", so declining must leave a project identical to one that never
+    // saw the prompt.
+    test('declining leaves protection off and enrolls nothing', async () => {
+      await setUp();
+
+      const result = await runLazy(
+        tmpDir,
+        ['init', '--skip-auth-check', '--skip-remote-check'],
+        { ...atATerminal(), LAZY_PROMPT_DEFAULTS: 'decline' },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Left off');
+      expect(readFileSync(join(tmpDir, 'lazy.toml'), 'utf-8')).not.toMatch(/^enabled = true$/m);
+      expect(existsSync(join(passphraseDir, 'passphrase.json'))).toBe(false);
+    });
+
+    // A scripted init must produce exactly what it did before — no prompt, and
+    // nothing enrolled behind the operator's back.
+    test('--non-interactive skips the offer in silence', async () => {
+      await setUp();
+
+      const result = await runLazy(
+        tmpDir,
+        ['init', '--skip-auth-check', '--non-interactive'],
+        { LAZY_PASSPHRASE_BASE_DIR: passphraseDir },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).not.toContain('Branch protection');
+      expect(existsSync(join(passphraseDir, 'passphrase.json'))).toBe(false);
+    });
+
+    // The passphrase is machine-global, so the second project on a machine has
+    // nothing left to enroll — and must not ask again.
+    test('a second init reuses the existing enrollment instead of re-asking', async () => {
+      await setUp();
+      await runLazy(
+        tmpDir,
+        ['init', '--skip-auth-check', '--skip-remote-check'],
+        atATerminal('correct-horse-battery'),
+      );
+      const firstStore = readFileSync(join(passphraseDir, 'passphrase.json'), 'utf-8');
+
+      const second = await mkdtemp(join(tmpdir(), 'lazy-init-second-'));
+      try {
+        initGitRepo(second);
+        const result = await runLazy(
+          second,
+          ['init', '--skip-auth-check', '--skip-remote-check'],
+          atATerminal('a-completely-different-phrase'),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('already enrolled on this machine');
+        // Untouched: a second init must never rotate the machine's passphrase.
+        expect(readFileSync(join(passphraseDir, 'passphrase.json'), 'utf-8')).toBe(firstStore);
+      } finally {
+        await rm(second, { recursive: true, force: true });
+      }
+    });
+  });
+
   test('shows --skip-completion-check in help', async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
 

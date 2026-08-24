@@ -28,8 +28,8 @@ describe('DockerRunner.stopRun', () => {
         calls.push(cmd);
         return { exited: Promise.resolve(0), kill: () => {} };
       },
-      // Other code paths in the module may touch spawnSync at import time.
-      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      // Other code paths in the module may touch a sync spawn at import time.
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
     }));
 
@@ -62,7 +62,7 @@ describe('DockerRunner.stopRun', () => {
         timeouts.push(opts?.timeout);
         return { exited: Promise.resolve(0), kill: () => {} };
       },
-      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
     }));
 
@@ -86,7 +86,7 @@ describe('DockerRunner.stopRun', () => {
   test('resolves false when kill exits non-zero', async () => {
     await mockModule(SPAWN_PATH, () => ({
       spawn: () => ({ exited: Promise.resolve(1), kill: () => {} }),
-      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
     }));
 

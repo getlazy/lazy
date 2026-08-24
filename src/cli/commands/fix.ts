@@ -1,4 +1,7 @@
-import { requireStorage, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireStorage, requireLazyRoot, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
+import type { Task } from '../../types';
+import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 
 
@@ -91,6 +94,7 @@ export async function commandFix(args: string[]): Promise<void> {
   const storage = await requireStorage();
   try {
     // Resolve and validate parent if provided
+    let parent: Task | null = null;
     if (parentValue !== undefined) {
       const { resolveTaskOrExit } = await import('../helpers');
       const parentTask = await resolveTaskOrExit(storage, parentValue);
@@ -99,9 +103,14 @@ export async function commandFix(args: string[]): Promise<void> {
         process.exit(1);
       }
       parentTaskId = parentTask.id;
+      parent = parentTask;
     }
 
-    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'fix');
+    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'fix',
+      resolveAgentForNewTask({
+        inheritFrom: parent,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      }));
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);

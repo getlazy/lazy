@@ -43,6 +43,17 @@ export interface AutoReactBudgetEntry {
 
 export interface DaemonStatus {
   running: boolean;
+  /**
+   * True when the daemon's socket accepted the connection but no response came
+   * back within {@link DAEMON_HEALTH_TIMEOUT_MS}, and the recorded pid is still
+   * alive — i.e. the process exists but its event loop is not turning.
+   *
+   * This is a THIRD state, distinct from both `running: true` and the plain
+   * `running: false` that means "nothing is there". `running` stays false so
+   * every existing caller keeps treating it as unusable; only diagnostic
+   * surfaces need to read this field.
+   */
+  unresponsive?: boolean;
   pid?: number;
   socketPath?: string;
   uptime?: number;
@@ -65,15 +76,18 @@ export interface DaemonStatus {
    *  print a dashboard URL that points at the real interface, not `localhost`. */
   bindHost?: string;
   autoReactBudget?: AutoReactBudgetEntry[];
-  /** Anthropic passthrough proxy status, when a `[proxy]` section is configured. */
+  /** Anthropic passthrough proxy status. Absent only when the daemon could not
+   *  read its own config while answering the health probe. */
   proxy?: DaemonProxyStatus;
 }
 
 /** Live proxy status surfaced in `lazy daemon status` / GET /daemon/status. */
 export interface DaemonProxyStatus {
-  /** False only when `[proxy] enabled = false` — agent traffic connects directly. */
-  enabled: boolean;
-  /** Whether the proxy server is currently listening. */
+  /**
+   * Whether the proxy server is currently listening. There is no `enabled`
+   * counterpart: the proxy has no off switch, so `running: false` always means
+   * a degraded daemon, never an operator's choice.
+   */
   running: boolean;
   /** Bind address. */
   bind: string;
@@ -369,9 +383,42 @@ export function isDaemonRunning(projectRoot: string): boolean {
 }
 
 /**
+ * How long a diagnostic probe of the daemon socket waits for an answer.
+ *
+ * INVARIANT: a diagnostic must never hang on the thing it diagnoses. A daemon
+ * whose event loop is frozen still has a live kernel listener on its unix
+ * socket, so `connect(2)` succeeds and the request is queued to a process that
+ * will never read it — an unbounded fetch then waits forever. That is exactly
+ * how `lazy daemon status` came to hang during a real freeze incident (see
+ * fix-markdown-crlf-daemon-hang), turning the one command meant to explain the
+ * problem into another symptom of it.
+ *
+ * The value is a diagnostic budget, not a performance target: /daemon/status is
+ * a trivial in-memory read, and a daemon that cannot answer it in seconds is
+ * not usefully "up" from the caller's point of view either. Matches
+ * STATUS_PROBE_TIMEOUT_MS in src/daemon/mcp-proxy.ts.
+ */
+export const DAEMON_HEALTH_TIMEOUT_MS = 3_000;
+
+/** True for the DOMException an aborted/timed-out fetch rejects with. */
+function isAbortError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
+/**
  * Full health check: verify socket responds to HTTP request.
  * Used ONLY for diagnostic display (lazy daemon status), NOT for liveness.
- * Returns DaemonStatus with running=true if the daemon responds.
+ *
+ * Reports one of THREE states, which a boolean cannot express:
+ *   (a) `running: true` — the daemon answered.
+ *   (b) `running: false` — socket file absent, no token, or the connection was
+ *       refused: nothing is there.
+ *   (c) `running: false, unresponsive: true` — the socket accepted us but no
+ *       answer arrived within {@link DAEMON_HEALTH_TIMEOUT_MS} while the
+ *       recorded pid is still alive: the process exists with a frozen event
+ *       loop. Collapsing this into (b) is what made a wedged daemon look
+ *       identical to no daemon at all.
  */
 export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStatus> {
   const pid = readPid(projectRoot);
@@ -393,6 +440,9 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       headers: {
         'Authorization': `Bearer ${token}`,
       },
+      // Bounded: see DAEMON_HEALTH_TIMEOUT_MS. The signal covers the body read
+      // too, so a daemon that sends headers and then stalls also times out.
+      signal: AbortSignal.timeout(DAEMON_HEALTH_TIMEOUT_MS),
     } as any);
 
     if (!response.ok) {
@@ -414,7 +464,13 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       autoReactBudget: data.autoReactBudget,
       proxy: data.proxy,
     };
-  } catch {
+  } catch (err) {
+    // Timed out with the pid still alive → state (c): the process is there but
+    // its loop is frozen. Any other failure (ECONNREFUSED, absent socket, dead
+    // pid) is state (b): nothing is answering because nothing is there.
+    if (isAbortError(err) && pid !== null && isProcessAlive(pid)) {
+      return { running: false, unresponsive: true, pid, socketPath };
+    }
     return { running: false, pid: pid ?? undefined };
   }
 }
@@ -422,6 +478,13 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
 /**
  * Send a graceful shutdown request to the daemon via its socket.
  * Returns true if the shutdown request was accepted.
+ *
+ * Bounded by {@link DAEMON_HEALTH_TIMEOUT_MS} for the same reason as
+ * {@link checkDaemonHealth}: a frozen daemon accepts the connection and never
+ * replies, so an unbounded fetch here hangs `lazy daemon stop`/`restart`
+ * forever instead of falling through to the SIGTERM path the caller already
+ * has. A timeout returns false — "the request was not accepted" — which is
+ * exactly what the caller needs to know to escalate.
  */
 export async function requestShutdown(projectRoot: string): Promise<boolean> {
   const socketPath = getSocketPath(projectRoot);
@@ -435,6 +498,7 @@ export async function requestShutdown(projectRoot: string): Promise<boolean> {
       headers: {
         'Authorization': `Bearer ${token}`,
       },
+      signal: AbortSignal.timeout(DAEMON_HEALTH_TIMEOUT_MS),
     } as any);
 
     return response.ok;

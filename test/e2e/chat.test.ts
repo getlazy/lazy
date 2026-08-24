@@ -7,6 +7,14 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { looksLikeLazyPlaceholder, lookupCredentialGrant } from '../../src/proxy/credential-broker';
+
+/**
+ * The daemon's real credential in this harness. Asserted against NEGATIVELY:
+ * since JIT credential injection the raw token must never reach a launched
+ * process — a placeholder does, and the proxy swaps it back upstream.
+ */
+const DAEMON_RAW_CREDENTIAL = 'sk-test-fake-key-for-testing';
 
 const RAW_JSONL =
   '{"type":"user","message":{"role":"user","content":"hello"}}\n' +
@@ -193,6 +201,12 @@ describe('lazy chat', () => {
   // a freshly opened terminal looks like — handed Claude Code no credential at
   // all and it fell through to the host store or a `/login` prompt, while task
   // agents kept running fine on the daemon's token.
+  //
+  // Since JIT credential injection the daemon hands over a PLACEHOLDER it minted
+  // for this launch rather than its raw token, so "came from the daemon" is
+  // proved by the value resolving to a builder GRANT in this daemon's registry —
+  // only the daemon writes that registry, so a value the shell supplied could
+  // never resolve. Same invariant, stronger evidence.
   test('runs on the daemon credential, not the invoking shell', async () => {
     const { taskId } = await makeClosedTaskWithSession(ctx);
 
@@ -212,7 +226,18 @@ describe('lazy chat', () => {
       });
       expectSuccess(result);
 
-      expect(await readClaudeCredential(binDir)).toBe('sk-test-fake-key-for-testing');
+      const handed = await readClaudeCredential(binDir);
+      expect(handed).not.toBe('');                    // a credential was handed over at all
+      expect(handed).not.toBe(DAEMON_RAW_CREDENTIAL); // ...but never the raw one
+      expect(looksLikeLazyPlaceholder(handed)).toBe(true);
+
+      const grant = await lookupCredentialGrant(ctx.root, handed);
+      expect(grant, 'no grant registered for the placeholder handed to claude').not.toBeNull();
+      expect(grant!.role).toBe('builder');
+      expect(grant!.taskId).toBeNull();
+      // The placeholder occupies the SAME env var the real credential would
+      // have, so the client's auth wire shape is unchanged.
+      expect(grant!.envKey).toBe('ANTHROPIC_API_KEY');
     } finally {
       await rm(rehydratedDir, { recursive: true, force: true });
     }
@@ -303,6 +328,12 @@ describe('lazy chat', () => {
   // This is the regression that shipped: preflight probed the host-converted
   // address (and passed) while ANTHROPIC_BASE_URL was set to the raw configured
   // one, so Claude Code failed to connect despite a green preflight.
+  //
+  // Since proxy-role-upstreams the address in question is the PROXY's, not the
+  // role's: a role `endpoint` is now the upstream lazy's proxy forwards to, never
+  // something the launched process dials. The invariant is unchanged and still
+  // the point — a host process must be handed a host-reachable base URL — so
+  // this now asserts it against the live proxy address the daemon reports.
   test('hands the host-reachable endpoint to claude, not the docker-internal one', async () => {
     const { taskId } = await makeClosedTaskWithSession(ctx);
 
@@ -335,8 +366,17 @@ describe('lazy chat', () => {
       });
       expectSuccess(result);
 
-      // The launched process got localhost — NOT host.docker.internal.
-      expect(await readClaudeBaseUrl(binDir)).toBe(`http://localhost:${ollama.port}`);
+      // The launched process got localhost — NOT host.docker.internal. The
+      // port is the daemon's live proxy port: the ollama endpoint configured
+      // above is the proxy's UPSTREAM for this role now, not an address claude
+      // dials, so it must not appear here either.
+      const status = await ctx.lazy(['daemon', 'status']);
+      const proxyPort = status.stdout.match(/Proxy:\s+http:\/\/\S+?:(\d+)\s+→/)?.[1];
+      expect(proxyPort, `no proxy address in daemon status:\n${status.stdout}`).toBeTruthy();
+      const baseUrl = await readClaudeBaseUrl(binDir);
+      expect(baseUrl).toBe(`http://localhost:${proxyPort}`);
+      expect(baseUrl).not.toContain('host.docker.internal');
+      expect(baseUrl).not.toContain(String(ollama.port));
 
       // Sanity: the ollama role is genuinely in play (its model was forwarded),
       // so this is not passing because the backend silently fell back.

@@ -29,7 +29,7 @@ describe('DockerRunner.execInRun', () => {
         opts.push(o ?? {});
         return { exited: Promise.resolve(3), kill: () => {} };
       },
-      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
     }));
 
@@ -62,7 +62,7 @@ describe('DockerRunner.execInRun', () => {
         opts.push(o ?? {});
         return { exited: Promise.resolve(0), kill: () => {} };
       },
-      spawnSync: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
       DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
     }));
 

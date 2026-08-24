@@ -11,6 +11,7 @@ import { logger } from '../../utils/logger';
 import { getActor } from '../../constants';
 import type { Storage } from '../../storage/interface';
 import { parentTaskIdOf } from '../../task-target';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 
 import { getDataDir } from '../init';
 import { theme } from '../theme';
@@ -159,7 +160,7 @@ export async function commandRedo(args: string[]): Promise<void> {
       }
 
       if (redoContext) {
-        redoContext = '\n' + redoContext + '\nUse this context as a starting point, but work from the current state of main.\n';
+        redoContext = '\n' + redoContext + '\nUse this context as a starting point, but work from the current state of the codebase in your worktree.\n';
       }
     }
 
@@ -178,8 +179,20 @@ export async function commandRedo(args: string[]): Promise<void> {
     const newModel = modelOverride ?? oldTask.model;
 
     // --- Create new task first (so we have its ID for the close reason) ---
-    // Preserve parent relationship if the old task had one
-    const newTask = await storage.createTask(oldTask.goal, parentTaskIdOf(oldTask) ?? undefined, undefined, undefined);
+    // Preserve parent relationship if the old task had one. The agent carries
+    // over too: a redo is a second attempt at the SAME work, so it must run on
+    // the agent the original was on, not on the project default.
+    const newTask = await storage.createTask(
+      oldTask.goal,
+      parentTaskIdOf(oldTask) ?? undefined,
+      undefined,
+      undefined,
+      undefined,
+      resolveAgentForNewTask({
+        inheritFrom: oldTask,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      }),
+    );
 
     // Set prompt
     await storage.updateTaskPrompt(newTask.id, newPrompt);
@@ -256,11 +269,18 @@ export async function commandRedo(args: string[]): Promise<void> {
 export function redoUsage(): void {
   console.log(`Usage: lazy redo <task_id> [--prompt <text>] [--model <model>] [--no-start] [--yes]
 
-Close a stale task and restart the same work fresh on current main.
+Close a stale task and restart the same work on a fresh branch.
 
-This is useful when a task's branch has fallen too far behind main and merging
-would be more expensive than redoing the work from scratch. The old task's
-history is preserved (closed, not deleted) and the new task links back to it.
+This is useful when a task's branch has fallen too far behind its parent and
+merging would be more expensive than redoing the work from scratch. The old
+task's history is preserved (closed, not deleted) and the new task links back
+to it.
+
+The replacement keeps the old task's PARENT: redoing a task that sits under a
+release hub creates the replacement under that same hub, not on main. Only the
+base ref is fresh — the branch is cut from that parent's current HEAD when the
+task starts. To move the work elsewhere, use --no-start and re-parent the
+replacement (lazy reparent <new_task> main) before starting it.
 
 Arguments:
   <task_id>          ID of the task to redo
@@ -276,10 +296,11 @@ What gets carried over:
   - Prompt (latest version, unless --prompt overrides)
   - Model (unless --model overrides)
   - Task code (if set, best-effort)
+  - Parent task (the replacement is created under the same parent)
   - Context from previous attempt (agent summary + diff stat)
 
 What starts fresh:
-  - Git branch (created from current main HEAD)
+  - Git branch (cut from the parent's current HEAD at start time)
   - Session (new agent session)
   - Turn history (only injected as context, not replayed)
 

@@ -13,7 +13,7 @@ export interface DaemonContext {
   token: string;
   /**
    * Actual TCP port the Anthropic passthrough proxy bound to, once started.
-   * Undefined when no `[proxy]` section is configured. May be an OS-assigned
+   * Undefined only before the proxy has bound (it is always started). May be an OS-assigned
    * port (when `[proxy] port` was omitted), so this — not the config — is the
    * source of truth for where proxied traffic flows.
    */

@@ -106,12 +106,12 @@ export interface DaemonStopInventory {
   pairing: PreStopTaskSession[];
   /**
    * True when the daemon's audit/policy proxy is live. When it is, stopping the
-   * daemon strands every child that was launched against it. When the proxy is
-   * disabled, children talk to the model directly and survive untouched.
+   * daemon strands every child that was launched against it.
    *
-   * Derived from CONFIG (the proxy is on unless explicitly disabled) and only
+   * Assumed true (the proxy is always on — there is no off switch) and only
    * downgraded by a daemon that successfully reports it not running — never by
-   * a daemon that could not be asked.
+   * a daemon that could not be asked. A daemon reporting `running: false` here
+   * is degraded, not configured that way.
    */
   proxyLive: boolean;
   /** Set when the inventory could not be completed (wedged daemon, timeout, …). */
@@ -192,8 +192,9 @@ export async function collectDaemonStopInventory(projectRoot: string): Promise<D
     }, INVENTORY_TIMEOUT_MS),
   ]);
 
-  // The proxy is ON unless `[proxy] enabled = false` (src/config/loader.ts), so
-  // CONFIG is the baseline and daemon health may only DOWNGRADE that claim.
+  // The proxy is ALWAYS ON (src/config/loader.ts), so "live" is the baseline and
+  // only daemon health may DOWNGRADE that claim — by reporting the server not
+  // running, i.e. a degraded daemon.
   //
   // Deriving it from health alone was the original bug: health is a live
   // round-trip, so on a WEDGED daemon — the single most likely reason anyone
@@ -201,9 +202,9 @@ export async function collectDaemonStopInventory(projectRoot: string): Promise<D
   // below went unprinted, in exactly the case this warning exists for. An
   // unreachable daemon is not evidence of "no proxy"; under-warning is the
   // costly direction here, so silence about the proxy is never the default.
-  let proxyLive = config.ok ? config.value.proxy !== null : true;
-  if (proxyLive && health.ok && health.value.proxy) {
-    if (health.value.proxy.enabled === false || health.value.proxy.running === false) proxyLive = false;
+  let proxyLive = true;
+  if (health.ok && health.value.proxy && health.value.proxy.running === false) {
+    proxyLive = false;
   }
 
   const reasons: string[] = [];

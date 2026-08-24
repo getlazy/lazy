@@ -9,7 +9,7 @@
  * test instead of scattered across dozens of string literals.
  *
  * URL CONVENTION: `<base>/<path-of-the-docs/-file-without-.md>`. The docs site
- * renders this repo's `docs/` tree, so `docs/protected-branches.md` is
+ * renders this repo's `public-docs/` tree, so `public-docs/protected-branches.md` is
  * `<base>/protected-branches`. Every entry in {@link DOCS_PAGES} therefore
  * names the repo file it is rendered from, and `test/unit/docs-links.test.ts`
  * fails if that file does not exist, if the site generator does not emit a page

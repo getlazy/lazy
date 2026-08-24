@@ -26,10 +26,10 @@ import { hostname } from 'os';
 import { join } from 'path';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
-import { ensureImage, ensureAgentBinary, resolveImageName } from '../../capture/claude';
+import { ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile } from '../../capture/claude';
 import { verifyAgentBinary, formatAgentBinaryError } from '../../agent/binary-identity';
 import { logger } from '../../utils/logger';
-import { loadConfig } from '../../config/loader';
+import { loadConfig, resolveConfigPath } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
 import { isTTY } from '../editor';
@@ -39,6 +39,7 @@ import type { Task } from '../../types';
 import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
 import { startBackgroundImageBuild, type BackgroundImageBuild } from '../../upgrade/background-image-build';
+import { maybePromptWorktreeDockerfileOverride } from '../../upgrade/worktree-dockerfile-prompt';
 import { ensureDaemon } from '../../daemon/auto-start';
 import {
   findLegacyDaemonMcpConfigs,
@@ -51,7 +52,7 @@ import {
   describeInteractiveSession,
   type InteractiveSessionEntry,
 } from '../../daemon/interactive-registry';
-import { spawnSync } from '../../utils/spawn';
+import { spawnSyncUnsupervised } from '../../utils/spawn';
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
@@ -203,6 +204,22 @@ async function waitForWorkingTasks(storage: Storage, workingContainers: Containe
 }
 
 /**
+ * Say exactly which files the image build reads. Printed unconditionally
+ * before every upgrade image build (and its dry run): the config-override
+ * warning is deliberately silent when a worktree's lazy.toml is byte-identical
+ * to the root's (see findConfigDir), and building from an unexpected
+ * Dockerfile once cost a whole debugging session — so upgrade always names
+ * its inputs, including when LAZY_DOCKERFILE_LAZY overrides the Dockerfile.
+ */
+async function printImageSource(root: string): Promise<void> {
+  const configPath = await resolveConfigPath(root);
+  const dockerfilePath = await resolveCustomDockerfile(root);
+  const overrideNote = process.env.LAZY_DOCKERFILE_LAZY ? ' (from LAZY_DOCKERFILE_LAZY)' : '';
+  console.log(`  Config:     ${configPath}`);
+  console.log(`  Dockerfile: ${dockerfilePath ? `${dockerfilePath}${overrideNote}` : 'embedded default ([docker].dockerfile is not set)'}`);
+}
+
+/**
  * Force-rebuild the container image by removing the existing one first.
  */
 async function forceRebuildImage(root: string, binary: string = 'docker'): Promise<string> {
@@ -210,9 +227,9 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
 
   // Remove existing image to force rebuild
   try {
-    // spawnSync (sync) is acceptable: `lazy upgrade` is a one-shot CLI command
+    // A sync spawn is acceptable: `lazy upgrade` is a one-shot CLI command
     // that runs to completion; there is no daemon event loop to block here.
-    spawnSync(
+    spawnSyncUnsupervised(
       [binary, 'rmi', '-f', imageName],
       { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -474,7 +491,7 @@ async function refreshImagesOnly(root: string, dryRun: boolean): Promise<void> {
   if (!isContainerRunner) {
     console.error(`Error: \`lazy upgrade --images\` only applies to container runners (docker/podman).`);
     console.error(`The current runner is '${config.runner.type}', which has no container image —`);
-    console.error(`Claude Code runs from your host installation. Update it there instead.`);
+    console.error(`the agent CLI runs from your host installation. Update it there instead.`);
     process.exit(1);
   }
 
@@ -495,13 +512,19 @@ async function refreshImagesOnly(root: string, dryRun: boolean): Promise<void> {
     console.log(theme.header('Image refresh dry run:'));
     console.log('');
     console.log(`  Rebuild (--no-cache): ${imageName}`);
+    await printImageSource(root);
     console.log('  No containers stopped, no daemon restart, agent binary untouched.');
     console.log('');
     printImageRefreshBoundary();
     return;
   }
 
+  // Ask about LAZY_DOCKERFILE_LAZY before the build starts — same ordering
+  // constraint as the full upgrade's background rebuild.
+  await maybePromptWorktreeDockerfileOverride(root);
+
   console.log('\nRefreshing container image for future sessions (--no-cache)...');
+  await printImageSource(root);
   const built = await forceRebuildImage(root, binary);
   console.log(`  ${theme.success('rebuilt')} container image (${built})`);
   console.log('');
@@ -711,8 +734,13 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     const config = await loadConfig(root);
     const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
     if (isContainerRunner) {
+      // The background rebuild reads LAZY_DOCKERFILE_LAZY at start time — ask
+      // before kicking it off so the human's answer can change what gets built.
+      await maybePromptWorktreeDockerfileOverride(root);
+
       imageBuild = startBackgroundImageBuild(root, config.runner.type);
       console.log(`\nRebuilding the container image in the background (staged as :${imageBuild.stagingTag})...`);
+      await printImageSource(root);
       console.log('  Running containers are untouched; the image is promoted only once you proceed.');
     }
 
@@ -947,6 +975,11 @@ If any builder sessions are running, you'll be warned to submit any in-progress
 message before they restart — their conversation resumes automatically, but a
 typed-but-unsent message cannot be preserved. With --force or no TTY this
 warning is printed but not blocked on, and unsent builder input may be lost.
+
+When run interactively from a task worktree whose Dockerfile.lazy differs from
+the project root's, you'll be asked whether to set LAZY_DOCKERFILE_LAZY for
+this upgrade so the build uses the worktree's copy. Without a TTY the question
+is skipped (the default root Dockerfile applies).
 
 Options:
   --force     Don't prompt, stop everything including working containers

@@ -25,6 +25,7 @@ import type {
   PostReviewCommentInput,
   UnblockResult,
   AcceptResult,
+  SyncResult,
 } from '../server/review-actions';
 import type { FileViolation, ReviewComment } from '../types';
 
@@ -80,8 +81,14 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
       return (await call('reviewUnblock', { taskId, message })) as UnblockResult;
     },
 
-    async accept(taskId: string, reason?: string): Promise<AcceptResult> {
-      return (await call('reviewAccept', { taskId, reason })) as AcceptResult;
+    async accept(taskId: string, reason?: string, passphrase?: string): Promise<AcceptResult> {
+      // The passphrase rides this one call and nothing else: it is not cached,
+      // not retried, and not part of any URL.
+      return (await call('reviewAccept', { taskId, reason, passphrase })) as AcceptResult;
+    },
+
+    async sync(taskId: string): Promise<SyncResult> {
+      return (await call('reviewSync', { taskId })) as SyncResult;
     },
 
     async setViolationDecision(

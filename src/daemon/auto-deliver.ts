@@ -21,7 +21,7 @@ import type { Storage } from '../storage';
 import type { Task, Session, TaskStatus } from '../types';
 
 import { loadConfig } from '../config/loader';
-import { resolveAgentModel } from '../utils/role-target';
+import { resolveAgentModel } from '../agent/agent-model';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
@@ -43,6 +43,8 @@ import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
 import resumeContextText from '../prompts/resume-context.md' with { type: 'text' };
 import goalContextResumeText from '../prompts/goal-context-resume.md' with { type: 'text' };
+import { parkTaskPaused } from '../utils/paused-status';
+import { pendingViolations } from '../utils/turns';
 
 /**
  * Check whether a task's parent branch has commits that the task branch
@@ -129,6 +131,22 @@ export async function autoUnblockTask(
   const tRef = taskRef(task);
   const taskShortId = shortId(task.id);
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
+
+  // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+  // a task that still owes a reviewer an approve/revert decision on
+  // file-permission violations is not auto-deliverable. Auto-delivery cannot
+  // express the decision, and relaunching the agent piles further work onto
+  // files the eventual unblock reverts to their base commit. Gate on the SET,
+  // not on the `conflict` label — a side-channel turn can leave the task
+  // labelled `blocked` with the set still pending.
+  const pending = pendingViolations(await storage.getSessionTurns(session.id));
+  if (pending.length > 0) {
+    logger.info(
+      `Auto-unblock ${taskShortId}: skipping — ${pending.length} pending file permission violation(s) ` +
+      `await a reviewer decision ('lazy unblock ${taskShortId}').`,
+    );
+    return false;
+  }
 
   // Pre-flight checks
   if (!await pathExists(worktreePath)) {
@@ -259,7 +277,7 @@ export async function autoUnblockTask(
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef);
       } catch (err) {
         logger.warn(`Auto-unblock ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
-        await storage.updateTaskStatus(task.id, 'blocked', 'system');
+        await parkTaskPaused(storage, task.id, 'system');
         return false;
       }
     }
@@ -273,7 +291,7 @@ export async function autoUnblockTask(
   } catch (err) {
     logger.warn(`Auto-unblock ${taskShortId} failed: ${err instanceof Error ? err.message : err}`);
     try {
-      await storage.updateTaskStatus(task.id, 'blocked', 'system');
+      await parkTaskPaused(storage, task.id, 'system');
     } catch {
       // Best effort
     }

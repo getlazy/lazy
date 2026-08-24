@@ -189,3 +189,28 @@ export function disablePreAccept(root: string): void {
   const existing = readFileSync(configPath, 'utf-8');
   writeFileSync(configPath, `${existing}\n[automation.pre_accept]\nenabled = false\n`);
 }
+
+/**
+ * Enable `[permissions] protected` in a test project's lazy.toml.
+ *
+ * The init template ALREADY writes a `[permissions]` table (with the key
+ * commented out), so appending a second one is a TOML redefinition error and
+ * every command in the test then dies on a config parse failure. Suites used to
+ * append; this helper edits the key that is already there, per CLAUDE.md
+ * ("Change a test's lazy.toml by EDITING the key, never by overwriting").
+ */
+export function setProtectedPatterns(root: string, patterns: string[]): void {
+  const configPath = join(root, 'lazy.toml');
+  const before = readFileSync(configPath, 'utf-8');
+  const line = `protected = [${patterns.map(p => JSON.stringify(p)).join(', ')}]`;
+  let after = before.replace(/^#\s*protected = \[.*\]$/m, line);
+  if (after === before) {
+    // No commented template line to edit (older/hand-written config) — add the
+    // key under the existing table, still without redefining it.
+    after = before.replace(/^\[permissions\]$/m, `[permissions]\n${line}`);
+  }
+  if (after === before) {
+    throw new Error(`setProtectedPatterns: no [permissions] table found in ${configPath}`);
+  }
+  writeFileSync(configPath, after);
+}

@@ -24,6 +24,12 @@ export class QaAgentPackaging implements AgentPackaging {
     return 'bun';
   }
 
+  supportsContainerRunner(): boolean {
+    // qa-agent has always been blocked from container runners by the runner
+    // guard; keep that behavior (it is a test agent, host-process is enough).
+    return false;
+  }
+
   dockerInstallCommand(): string {
     // qa-agent is a bun script shipped with lazy — no install needed.
     // Bun is already in the base Docker image.

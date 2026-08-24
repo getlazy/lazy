@@ -50,3 +50,22 @@ export function getAgentPackaging(agentId: string): AgentPackaging {
 export function listAgents(): string[] {
   return Object.keys(agents);
 }
+
+const displayNames: Record<string, string> = {
+  'claude-code': 'Claude Code',
+  'cursor': 'Cursor',
+  'qa-agent': 'QA agent',
+};
+
+/**
+ * Human-readable name for an agent id, for user-facing messages.
+ *
+ * Exists so no message has to hardcode "Claude" where the TASK'S agent is
+ * meant — a cursor task told "no Claude session ID" names the wrong product.
+ * Unknown ids pass through verbatim (a message naming the raw id beats one
+ * naming the wrong agent), and a missing id falls back to the generic word.
+ */
+export function agentDisplayName(agentId: string | null | undefined): string {
+  if (!agentId) return 'agent';
+  return displayNames[agentId] ?? agentId;
+}

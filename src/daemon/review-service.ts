@@ -23,7 +23,8 @@
  */
 
 import { getOrCreateStorage, handleDiff, RpcError } from './rpc-handlers';
-import { launchAskTask, launchUnblockTask, acceptTask } from './task-lifecycle';
+import { launchAskTask, launchUnblockTask, acceptTask, approveTask, syncTask } from './task-lifecycle';
+import { acceptRefusal } from './accept-refusal';
 import { logger } from '../utils/logger';
 import { saveRecoveryFileAsync, removeRecoveryFileAsync } from '../utils/recovery';
 import type { FileViolation, ReviewComment, ReviewCommentSide, ReviewCommentIntent } from '../types';
@@ -350,11 +351,40 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       });
     },
 
-    async accept(taskId: string, reason?: string) {
+    async accept(taskId: string, reason?: string, passphrase?: string) {
+      // A supplied passphrase is verified FIRST, through the very same
+      // approveTask the CLI's `lazy approve` calls — one verifier, one audit
+      // comment, one one-shot approval that the merge below consumes. The
+      // passphrase is not stored, not echoed back, and not logged: it exists
+      // only as this argument.
+      if (passphrase !== undefined) {
+        try {
+          await approveTask(projectRoot, { taskId, token: passphrase });
+        } catch (err) {
+          const status = err instanceof RpcError ? err.status : 500;
+          // 400 (nothing entered) and 403 (wrong passphrase) are both the
+          // reviewer's to retry, so they come back as the SAME refusal that
+          // asked for the passphrase — the form is offered again rather than
+          // dead-ending on a message.
+          if (status === 400 || status === 403) {
+            throw acceptRefusal(status, err instanceof Error ? err.message : String(err), {
+              reason: 'approval-invalid',
+              next: 'Enter the approval passphrase again — nothing you typed on this page is lost.',
+              command: `lazy approve ${taskId}`,
+              uiAction: 'passphrase',
+            });
+          }
+          throw err;
+        }
+      }
       // No approvedFiles: a ✅ decision is already stored as `approved`, so the
       // preflight sees no `pending` violation to object to. A file still ⛔ is
       // still `pending`, and the preflight refuses — which is the intent.
       return acceptTask(projectRoot, { taskId, reason });
+    },
+
+    async sync(taskId: string) {
+      return syncTask(projectRoot, { taskId });
     },
 
     async setViolationDecision(taskId: string, file: string, approved: boolean) {

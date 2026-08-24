@@ -1,5 +1,5 @@
 import type { OllamaConfig } from '../config/types';
-import { spawnSync } from './spawn';
+import { spawnSyncUnsupervised } from './spawn';
 
 export type OllamaCheckResult =
   | { reachable: true; endpoint: string }
@@ -13,7 +13,7 @@ export type OllamaCheckResult =
 export function checkOllamaConnectivity(ollamaConfig: OllamaConfig): OllamaCheckResult {
   const endpoint = ollamaEndpointForHost(ollamaConfig.endpoint);
   try {
-    const result = spawnSync(
+    const result = spawnSyncUnsupervised(
       ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', `${endpoint}/api/tags`],
       { stdout: 'pipe', stderr: 'ignore', timeout: 5_000 },
     );

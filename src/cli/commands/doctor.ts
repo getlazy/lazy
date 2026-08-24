@@ -28,7 +28,7 @@ import { resolveImageName, calculateDockerfileHash, listLazyImages, type LazyIma
 import { loadConfig, loadRawConfig } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
-import { findUnknownConfigKeys } from '../../config/schema';
+import { findUnknownConfigKeys, findDeprecatedConfigKeys, DEPRECATED_SECTION_KEYS } from '../../config/schema';
 import { getKnownFeatures, getUnknownFlags, isFeatureEnabled } from '../../utils/features';
 import { createDriver } from '../../remote';
 import type { ResolvedConfig } from '../../config/types';
@@ -36,7 +36,7 @@ import type { RepositoryDriver } from '../../remote';
 import { resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../../shell/detect';
 import type { ShellInfo } from '../../shell/detect';
-import { spawnSync } from '../../utils/spawn';
+import { spawnSyncUnsupervised } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
 import { which } from 'bun';
 import {
@@ -75,6 +75,11 @@ import {
 import { isTTY, promptYesNo } from '../editor';
 import type { Storage } from '../../storage/interface';
 import { classifyProtectedTasks } from '../../protection/edge-gate';
+import {
+  readPassphraseEnrollment,
+  legacyPassphraseFileExists,
+  legacyPassphrasePath,
+} from '../../protection/passphrase-store';
 import { docsFooter, docsSuffix, type DocsPage } from '../../docs/links';
 import { inspectLfsEnvironment, type LfsEnvironmentReport } from '../../git/lfs';
 
@@ -581,11 +586,11 @@ async function checkDaemonStateFiles(root: string): Promise<CheckResult> {
 /** Size at which doctor starts nudging about manual cleanup (100 MB). */
 const SCRATCH_LARGE_BYTES = 100 * 1024 * 1024;
 
-// spawnSync (sync) is acceptable throughout this function: `lazy doctor` is a
+// A sync spawn is acceptable throughout this function: `lazy doctor` is a
 // one-shot CLI health check, not a daemon path — blocking here is fine.
 function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
   try {
-    const result = spawnSync(
+    const result = spawnSyncUnsupervised(
       [binary, 'image', 'inspect', imageName, '--format', '{{.Id}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -617,9 +622,9 @@ async function checkImageUpToDate(root: string, imageName: string, binary: strin
   }
 
   try {
-    // spawnSync (sync) is acceptable: `lazy doctor` is a one-shot CLI health
+    // A sync spawn is acceptable: `lazy doctor` is a one-shot CLI health
     // check, not a daemon path — blocking here is fine.
-    const inspect = spawnSync(
+    const inspect = spawnSyncUnsupervised(
       [binary, 'image', 'inspect', imageName, '--format', '{{index .Config.Labels "lazy.dockerfile.hash"}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -1150,11 +1155,11 @@ async function findCrashedTasks(root: string, runner: Runner): Promise<CrashedTa
 
 // TERMINAL_STATUSES imported from ../../types
 
-// spawnSync (sync) is acceptable here: `lazy doctor` is a one-shot CLI health
+// A sync spawn is acceptable here: `lazy doctor` is a one-shot CLI health
 // check, not a daemon path — blocking the (otherwise idle) loop is fine.
 async function checkOrphanedContainers(root: string | null, binary: string = 'docker'): Promise<CheckResult> {
   try {
-    const result = spawnSync(
+    const result = spawnSyncUnsupervised(
       [binary, 'ps', '-a', '--filter', 'name=^lazy-', '--format', '{{.Names}} {{.Status}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
     );
@@ -1367,6 +1372,19 @@ function checkConfigKeys(raw: Record<string, unknown>, driver: RepositoryDriver)
   }
   for (const w of unknownWarnings) {
     results.push({ ok: true, label: 'Config option', warning: w });
+  }
+
+  // Keys lazy REMOVED outright (DEPRECATED_SECTION_KEYS). These have no
+  // honored old spelling — the key is ignored — so the migration sentence
+  // matters more, not less. The loader prints one line at load time and points
+  // here for this.
+  const removedKeys = findDeprecatedConfigKeys(raw);
+  for (const dotted of removedKeys) {
+    results.push({
+      ok: true,
+      label: `Config option '${dotted}'`,
+      warning: `'${dotted}' is obsolete and is IGNORED. ${DEPRECATED_SECTION_KEYS[dotted]}`,
+    });
   }
 
   // Check for deprecated remote keys in [remote] section
@@ -1689,6 +1707,46 @@ async function checkImportableMemories(root: string, dataDirAbs: string): Promis
 }
 
 /**
+ * Report tasks sitting in `merging`.
+ *
+ * `merging` is transient: an accept is either merging the task locally right now
+ * (seconds to minutes) or a forge holds the merge and remote-sync is polling it.
+ * A task that stays there is neither — its accept died — and until
+ * fix-stranded-merging that was invisible AND inescapable, so one task sat wedged
+ * for two weeks while reject, close and submit all refused it.
+ *
+ * The daemon's reconciler now recovers these on its own, so a task showing up
+ * here means either the daemon is not running to do that, or the merge is
+ * legitimately pending on a forge. Both are worth a human's eye, and both have
+ * the same escape. Report-only, like every other doctor check.
+ */
+async function checkStrandedMerging(root: string): Promise<CheckResult> {
+  let storage: Storage | null = null;
+  let ownsStorage = false;
+  try {
+    ({ storage, ownsStorage } = await openDoctorStorage(root));
+    const merging = await storage.listTasksWithOptions({ mergingOnly: true });
+    if (merging.length === 0) return { ok: true, label: 'No tasks stranded in merging' };
+    const names = merging.map(t => displayId(t)).join(', ');
+    return {
+      ok: false,
+      label: 'No tasks stranded in merging',
+      detail:
+        `${merging.length} task(s) in 'merging': ${names}. ` +
+        `That state is transient — an accept holds it for the length of the merge, or a forge holds ` +
+        `the PR. A task that stays there has no owner; the daemon recovers it on its next reconcile ` +
+        `tick, so start it with ${theme.command('lazy daemon start')} if it is down. To act now, ` +
+        `${theme.command('lazy unblock')}, ${theme.command('lazy reject')} or ${theme.command('lazy close')} ` +
+        `the task — each returns it to a real status first.`,
+    };
+  } catch {
+    return { ok: true, label: 'No tasks stranded in merging (check skipped)' };
+  } finally {
+    if (storage && ownsStorage) await storage.close();
+  }
+}
+
+/**
  * Report the size of the shared-memory context injected into every builder and
  * agent launch, against `[memory] warn_bytes`.
  *
@@ -1872,6 +1930,73 @@ async function checkDefaultBranchProtectionResolvable(
       `  Fix with: ${theme.command(`git remote set-head ${remote} --auto`)}\n` +
       `  Or name the branch outright: ${theme.command('lazy protect --branch <branch> on')}`,
   };
+}
+
+/**
+ * Report whether an approval passphrase is enrolled on THIS machine, and flag
+ * a leftover pre-v0.23 plaintext passphrase file in the project.
+ *
+ * Two distinct findings, deliberately in one check because they are two halves
+ * of the same question ("can a protected merge be approved here, and is the
+ * old secret gone?"):
+ *
+ * - Not enrolled WHILE protection is on: gated approvals fail closed on this
+ *   machine. Report-only — the repository is healthy and the config is right;
+ *   it is this machine that is not set up. (A fresh clone of a protected repo
+ *   is SUPPOSED to be protected before anyone enrolls, which is why the gate
+ *   itself never consults enrollment.)
+ * - Leftover `.lazy/approve-passphrase`: never consulted any more, but it is a
+ *   passphrase in the clear inside a tree every task agent can read. Flagged
+ *   whether or not protection is on, because the exposure does not depend on
+ *   the config.
+ */
+async function checkPassphraseEnrollment(root: string, config: ResolvedConfig): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+
+  let enrollment: Awaited<ReturnType<typeof readPassphraseEnrollment>> | null = null;
+  try {
+    enrollment = await readPassphraseEnrollment();
+  } catch (err) {
+    // A store that exists but is unusable (bad mode, corrupt JSON) is exactly
+    // what doctor is for — surface the store's own message, which carries the
+    // fix, rather than reducing it to "check skipped".
+    results.push({
+      ok: false,
+      label: 'Approval passphrase store',
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  if (enrollment) {
+    if (enrollment.enrolled) {
+      results.push({ ok: true, label: 'Approval passphrase enrolled (this machine)' });
+    } else if (config.protection.enabled) {
+      results.push({
+        ok: true,
+        label: 'Approval passphrase enrolled',
+        warning:
+          'Protection is on, but no approval passphrase is enrolled on this machine — ' +
+          'gated merges will refuse here.\n' +
+          `  Enroll once (covers every lazy project): ${theme.command('lazy system passphrase set')}`,
+      });
+    } else {
+      results.push({ ok: true, label: 'Approval passphrase (not needed — protection is off)' });
+    }
+  }
+
+  if (await legacyPassphraseFileExists(root)) {
+    results.push({
+      ok: true,
+      label: 'Legacy plaintext passphrase file',
+      warning:
+        `${legacyPassphrasePath(root)} still exists. It is NO LONGER CONSULTED, but it holds a ` +
+        `passphrase in the clear inside a repository every task agent can read.\n` +
+        `  Delete it: ${theme.command(`rm ${legacyPassphrasePath(root)}`)}\n` +
+        `  Then enroll the machine-global one if you have not: ${theme.command('lazy system passphrase set')}`,
+    });
+  }
+
+  return results;
 }
 
 /**
@@ -2300,7 +2425,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
   // createRunner loads config itself, so it throws on the same broken file.
   //
   // It also RESOLVES the live proxy address up front and fails loud when it
-  // cannot (ProxyUnavailableError) — which, with the proxy on by default, is
+  // cannot (ProxyUnavailableError) — which, the proxy being always on, is
   // what a daemon that is down (or that lost its proxy) looks like. `lazy
   // doctor` is THE surface for "my setup is broken", so it must not be the one
   // command that dies in that state: that ONE error becomes a reported check
@@ -2462,6 +2587,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
       // rest would spend the acquire timeout and then report itself skipped
       // with no reason given; naming the holder once, up front, is the whole
       // point of the probe.
+      results.push(skippedForLock('No tasks stranded in merging'));
       results.push(skippedForLock('Conversation capture is live'));
       results.push(skippedForLock('Shared memory up to date'));
       results.push(skippedForLock('Injected memory context'));
@@ -2469,6 +2595,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
       results.push(skippedForLock('No legacy proxy audit log in the store'));
       results.push(skippedForLock('Protected tasks resolvable'));
     } else {
+      results.push(await checkStrandedMerging(root));
       results.push(await checkReimportableConversations(root, join(root, config!.data.path)));
       results.push(await checkImportableMemories(root, join(root, config!.data.path)));
       results.push(await checkMemoryContext(root, config!));
@@ -2477,6 +2604,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
       results.push(await checkProtectedTasksResolvable(root, config!));
     }
     results.push(await checkDefaultBranchProtectionResolvable(root, config!));
+    results.push(...(await checkPassphraseEnrollment(root, config!)));
     results.push(await checkTaskBranchUpstreamTracking());
     results.push(await checkLfsEnvironment(root, config));
     results.push(checkDiskSpace(root));
@@ -2537,7 +2665,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
         const code = c.taskCode;
         console.log(`  Resuming ${theme.taskId(code)}...`);
         try {
-          const proc = spawnSync(
+          const proc = spawnSyncUnsupervised(
             [process.argv[0], process.argv[1], 'resume', code],
             {
               stdout: 'pipe',
@@ -2623,6 +2751,8 @@ Project-level checks (no task ID):
   - Injected memory context size vs [memory] warn_bytes (compact staleness + remedy)
   - Stale [protection].protected_tasks entries that gate nothing
   - Default-branch protection resolves to a real branch (not the "main" fallback)
+  - Approval passphrase enrollment on this machine, and any leftover plaintext
+    .lazy/approve-passphrase file from before it moved out of the repo
   - [protection] gate keys configured while the master switch is off (inert)
   - Crashed task containers (auto-resumes interrupted tasks by default)
   - No task branches with upstream tracking (prevents git pull pollution)

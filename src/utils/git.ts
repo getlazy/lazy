@@ -4,7 +4,7 @@
 
 import { existsSync } from 'node:fs';
 import { logger } from './logger';
-import { spawn, spawnSync } from './spawn';
+import { spawn } from './spawn';
 
 export interface GitResult {
   stdout: string;

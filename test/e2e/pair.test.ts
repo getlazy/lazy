@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
-import { findFullTaskId, setTaskMetadata, setTaskStatus, taskFilePath, worktreePathFor } from '../helpers/storage';
+import { findFullTaskId, readTaskJson, readTaskStatus, setTaskMetadata, setTaskStatus, taskFilePath, worktreePathFor, writeTaskJson } from '../helpers/storage';
 
 /** The lock path lazy actually uses — see getPairingLockPath in src/utils/pairing-lock.ts. */
 function pairingLockPath(root: string, shortId: string): string {
@@ -140,6 +140,31 @@ describe('lazy pair', () => {
     const result = await ctx.lazy(['pair', '--unlock']);
     expectFailure(result);
     expectError(result, '--unlock requires a task argument');
+  });
+
+  // SECURITY INVARIANT (fix-cursor-security-musts): pairing is opt-in per agent
+  // and only claude-code opts in. `lazy pair` hands a human a session on the
+  // HOST; for an agent whose container-written chat lazy will not import, that
+  // session is both dangerous (agent-authored text becomes input to a session
+  // running as the human) and useless (no memory of the work). The refusal must
+  // land BEFORE the status moves — a refused task stays exactly as it was.
+  test('refuses to pair on a Cursor task, and leaves its status untouched', async () => {
+    const taskId = await createTask(ctx, 'Cursor task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const task = readTaskJson(ctx.root, taskId);
+    task.agent_id = 'cursor';
+    writeTaskJson(ctx.root, taskId, task);
+
+    const result = await ctx.lazy(['pair', taskId]);
+
+    expectFailure(result);
+    expectError(result, 'Cannot pair on a cursor task');
+    // The refusal points somewhere useful rather than just saying no.
+    expectError(result, 'lazy unblock');
+    // Never launched, never locked, never moved.
+    expectOutputExcludes(result, 'Launching Claude Code');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
   });
 
   test('fails when task has no session', async () => {
@@ -360,7 +385,7 @@ describe('pairing state blocks operations', () => {
   }
 
   // INVARIANT: pair accepts blocked | conflict | interrupted and nothing else
-  // (docs/state-machine.md: "lazy pair <task> — blocked|conflict|interrupted →
+  // (public-docs/state-machine.md: "lazy pair <task> — blocked|conflict|interrupted →
   // pairing"). This test used to assert that `interrupted` was REJECTED, which
   // has been wrong since v0.9 made interrupted pairable — it only ever passed
   // because pair failed later for an unrelated reason.

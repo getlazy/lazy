@@ -13,10 +13,14 @@ export type ResolvedProxyPolicy = ProxyPolicyConfig;
 /**
  * Model backend for a per-role target.
  * - `anthropic`: real Anthropic API (or whatever CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY point at).
- * - `ollama`: local Ollama serving the Anthropic Messages API (dummy credentials).
- * - `proxy`: an Anthropic-compatible proxy endpoint, forwarded with the real credential.
+ * - `ollama`: local Ollama serving the Anthropic Messages API (no credential needed).
+ * - `proxy`: another Anthropic-compatible endpoint, forwarded with the real credential.
  *
  * All three are Anthropic-native targets — lazy never translates between API shapes.
+ *
+ * The backend chooses the UPSTREAM and the credential it gets; it never chooses
+ * whether the role is proxied. Every role's traffic goes through lazy's proxy,
+ * which then forwards it to that upstream.
  */
 export type RoleBackend = 'anthropic' | 'ollama' | 'proxy';
 
@@ -44,22 +48,32 @@ export interface RoleTarget {
    * `ollama`/`proxy` it is the authoritative model name (never substituted).
    */
   model: string;
-  /** ANTHROPIC_BASE_URL for `ollama`/`proxy` backends. Empty for `anthropic`. */
+  /**
+   * The upstream lazy's PROXY forwards this role's traffic to. Empty means "the
+   * proxy's primary upstream" (`[proxy] upstream`, i.e. api.anthropic.com).
+   *
+   * NEVER an address the launched agent dials itself, and never turned into an
+   * env var — see src/proxy/role-upstreams.ts for the routing and
+   * src/utils/role-target.ts for the env it does (not) produce. Host-perspective
+   * by definition, because the daemon makes the upstream call.
+   */
   endpoint: string;
   /**
    * Live lazy-proxy base URL to route this role's traffic through, filled in at
-   * launch when the (default-on) proxy is running.
+   * launch when the (always-on) proxy is running.
    *
-   * Only meaningful for the `anthropic` backend: that traffic used to go straight
-   * to api.anthropic.com and now flows through lazy's local audit/policy proxy,
-   * which forwards to the same upstream. `proxy` roles carry their address in
-   * `endpoint` instead, and `ollama` roles are NEVER proxied (the proxy has a
-   * single Anthropic-native upstream; a local model is not it).
+   * The ONLY base URL a launch ever receives, for every backend — an ollama role
+   * and a role pinned at an explicit `endpoint` get this address too, and the
+   * proxy forwards them onward. There is no backend for which this is skipped.
    *
-   * Undefined = direct connection, which now means exactly one thing:
-   * `[proxy] enabled = false`. A proxy that is enabled but whose live address
-   * cannot be resolved FAILS the launch instead of leaving this undefined —
-   * see ProxyUnavailableError in daemon/auth-env.ts.
+   * Undefined does NOT mean "connect direct" — the proxy is always on and has
+   * no off switch. It means either that the launching process inherits an
+   * already-proxied `ANTHROPIC_BASE_URL` from its parent (the supervisor's own
+   * runner carries no role targets — see ANTHROPIC_DEFAULT_TARGET), or that the
+   * daemon RPC is bypassed by design (test harness / daemon-self). Every launch
+   * path that OWNS the proxy decision resolves the address through
+   * `daemon/auth-env.ts` and FAILS (ProxyUnavailableError) when it cannot,
+   * rather than leaving this undefined and connecting direct.
    */
   proxyUrl?: string;
 }
@@ -340,7 +354,7 @@ export interface LazyConfig {
    * Protected branches: merges into a protected branch require a
    * human-recorded approval (`lazy approve <task>`) before `lazy accept`
    * will complete. This is friction against an over-eager builder, not a
-   * security boundary — see docs/protected-branches.md.
+   * security boundary — see public-docs/protected-branches.md.
    */
   protection?: {
     /**
@@ -361,8 +375,6 @@ export interface LazyConfig {
     protected_tasks?: string[];
     /** When protection is enabled, protect the repo's default branch (e.g. `main`). Default: true — flipping `enabled` on protects the default branch without further config. */
     gate_default_branch?: boolean;
-    /** Path (relative to the project root) of the file holding the approval passphrase. Default: ".lazy/approve-passphrase". */
-    passphrase_file?: string;
   };
   automation?: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
@@ -382,7 +394,7 @@ export interface LazyConfig {
     enabled?: boolean;
     /** Model name to pass to Claude Code via --model (e.g., "qwen3.5:35b-a3b-coding-nvfp4") */
     model?: string;
-    /** Ollama API endpoint (e.g., "http://host.docker.internal:11434") */
+    /** Ollama API endpoint the PROXY dials, host-perspective (e.g., "http://localhost:11434") */
     endpoint?: string;
   };
   /**
@@ -392,16 +404,13 @@ export interface LazyConfig {
    * to route that role's traffic through this proxy.
    */
   proxy?: {
-    /**
-     * Master switch. DEFAULT TRUE — the proxy is how lazy runs by default, the
-     * same way the daemon is: with no `[proxy]` section at all the daemon still
-     * starts the proxy (defaults below) and routes agent traffic through it.
-     *
-     * Set `enabled = false` to restore direct-to-Anthropic connections entirely:
-     * no proxy server is started and no `ANTHROPIC_BASE_URL` is injected. This is
-     * the escape hatch — there is deliberately no partial mode.
+    /*
+     * There is deliberately NO `enabled` key. The proxy is always on — it is how
+     * lazy runs, the same way the daemon is — so this whole section is optional
+     * tuning, never an on/off switch. A lazy.toml that still carries the removed
+     * `enabled` key is REJECTED at load with an actionable error rather than
+     * silently ignored (see resolveProxy in src/config/loader.ts).
      */
-    enabled?: boolean;
     /**
      * TCP port the proxy server listens on. OPTIONAL — omit it to let the daemon
      * pick a free OS-assigned port at start (avoids conflicts across per-project
@@ -413,12 +422,27 @@ export interface LazyConfig {
     /** Upstream Anthropic-compatible base URL (default: "https://api.anthropic.com"). */
     upstream?: string;
     /**
+     * Cursor API base URL the `/_lazy/cursor/*` passthrough route forwards to
+     * (default: "https://api2.cursor.sh"). Cursor traffic is a VERBATIM
+     * passthrough — no policy enforcement, no failover chain, coarse audit only.
+     */
+    cursor_upstream?: string;
+    /**
 * Smart-routing failover chain, as `[[proxy.fallback]]` array-of-tables.
      * On a primary 429/529 or unreachable primary, the proxy reroutes to these
      * targets in order. Empty/absent = fail hard (no failover). Each Anthropic-
      * native target may override the model for a different tier/backend.
      */
-    fallback?: Array<{ upstream?: string; model?: string }>;
+    fallback?: Array<{
+      upstream?: string;
+      model?: string;
+      /**
+       * Which credential the proxy injects when it reroutes here:
+       * "anthropic" (this target really is Anthropic) or "none" (default — the
+       * target authenticates some other way, or not at all).
+       */
+      credential?: string;
+    }>;
     /**
      * On a primary 429 whose `Retry-After` is ≤ this many seconds, wait and
      * retry the primary once before failing over (default 5).
@@ -470,6 +494,12 @@ export interface LazyConfig {
     max_concurrent_builders?: number;
     /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
     idle_grace_minutes?: number;
+    /**
+     * Max consecutive work turns a task may run without a human in the loop.
+     * Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
+     * 0 = unlimited (default: 10).
+     */
+    max_turns_without_human?: number;
   };
   daemon?: {
     /** React to CI failures (default: true). */
@@ -484,6 +514,14 @@ export interface LazyConfig {
     auto_react_daily_budget?: number;
     /** Maximum consecutive auto-triggered turns per task before pausing for human review (default: 3). */
     max_auto_turns?: number;
+    /** Master switch for auto-resuming interrupted tasks, fast lane and slow lane alike (default: true). */
+    auto_resume?: boolean;
+    /** Minutes between slow-lane retries of a given task once its fast-lane retries are spent (default: 30). */
+    auto_resume_interval_minutes?: number;
+    /** Minimum minutes between any two auto-resumes project-wide (default: 5). */
+    auto_resume_gap_minutes?: number;
+    /** Slow-lane attempts before giving up for good — 24 x 30min = ~12 hours by default (default: 24). */
+    auto_resume_max_attempts?: number;
   };
 }
 
@@ -613,7 +651,6 @@ export interface ResolvedConfig {
     protected_branches: string[];
     protected_tasks: string[];
     gate_default_branch: boolean;
-    passphrase_file: string;
   };
   automation: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
@@ -637,14 +674,14 @@ export interface ResolvedConfig {
     enabled: boolean;
     /** Model name to pass to Claude Code via --model (e.g., "qwen3.5:35b-a3b-coding-nvfp4") */
     model: string;
-    /** Ollama API endpoint (e.g., "http://host.docker.internal:11434") */
+    /** Ollama API endpoint the PROXY dials, host-perspective (e.g., "http://localhost:11434") */
     endpoint: string;
   };
   /**
-   * Resolved proxy config. Non-null by DEFAULT — the proxy runs unless it was
-   * explicitly turned off. `null` means and only means `[proxy] enabled = false`
-   * (direct connections, no proxy server, no base-URL injection); every other
-   * config, including no `[proxy]` section at all, resolves to a live object.
+   * Resolved proxy config. ALWAYS present — the proxy has no off switch, so
+   * every config (including one with no `[proxy]` section at all) resolves to a
+   * live object. Never re-introduce a nullable "no proxy" branch here: the
+   * audit/policy plane not running is a failure to surface, not a mode.
    */
   proxy: {
     /**
@@ -657,13 +694,24 @@ export interface ResolvedConfig {
     bind: string;
     /** Upstream Anthropic-compatible base URL. */
     upstream: string;
-    /** Ordered failover targets (empty = fail hard, no failover). */
-    fallbacks: { upstream: string; model?: string }[];
+    /** Cursor API base URL for the `/_lazy/cursor/*` passthrough route. */
+    cursorUpstream: string;
+    /**
+     * Ordered failover targets (empty = fail hard, no failover).
+     *
+     * `credential` says which credential the proxy injects when it reroutes
+     * here. Default "none": a fallback is by definition a DIFFERENT backend,
+     * and handing it the user's Anthropic key because it speaks the Anthropic
+     * wire format is a credential leak, not a convenience. Set
+     * `credential = "anthropic"` on a fallback that really is Anthropic
+     * (a second tier, a gateway that proxies to Anthropic).
+     */
+    fallbacks: { upstream: string; model?: string; credential: 'anthropic' | 'none' }[];
     /** Retry-After threshold (seconds) below which the primary is waited-out and retried before failover. */
     retryAfterThreshold: number;
     /** Fully-resolved mechanistic policy (§6.3 layer 1). Always present. */
     policy: ResolvedProxyPolicy;
-  } | null;
+  };
   memory: {
     /**
      * Advisory size (bytes) for the injected memory context. Over this, launches
@@ -687,6 +735,12 @@ export interface ResolvedConfig {
     max_concurrent_builders: number;
     /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
     idle_grace_minutes: number;
+    /**
+     * Max consecutive work turns a task may run without a human in the loop.
+     * Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
+     * 0 = unlimited (default: 10).
+     */
+    max_turns_without_human: number;
   };
   daemon: {
     /** React to CI failures (default: true). */
@@ -701,5 +755,13 @@ export interface ResolvedConfig {
     auto_react_daily_budget: number;
     /** Maximum consecutive auto-triggered turns per task before pausing for human review (default: 3). */
     max_auto_turns: number;
+    /** Master switch for auto-resuming interrupted tasks, fast lane and slow lane alike (default: true). */
+    auto_resume: boolean;
+    /** Minutes between slow-lane retries of a given task once its fast-lane retries are spent (default: 30). */
+    auto_resume_interval_minutes: number;
+    /** Minimum minutes between any two auto-resumes project-wide (default: 5). */
+    auto_resume_gap_minutes: number;
+    /** Slow-lane attempts before giving up for good — 24 x 30min = ~12 hours by default (default: 24). */
+    auto_resume_max_attempts: number;
   };
 }

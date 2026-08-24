@@ -30,7 +30,7 @@ import { findFullTaskId, worktreePathFor } from '../helpers/storage';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 
 const SHARED_TOKEN = 'shared-daemon-token-arg-validation';
@@ -113,7 +113,7 @@ describe('MCP route validates tool arguments', () => {
 
   /** Every commit subject on the task branch, newest first. */
   function commitSubjects(): string[] {
-    const result = spawnSync(['git', 'log', '--format=%s'], { cwd: worktree, stdout: 'pipe', stderr: 'pipe' });
+    const result = spawnSyncUnsupervised(['git', 'log', '--format=%s'], { cwd: worktree, stdout: 'pipe', stderr: 'pipe' });
     return result.stdout.toString().trim().split('\n').filter(Boolean);
   }
 

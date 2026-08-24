@@ -11,6 +11,31 @@ import { join } from 'path';
 import { getHome } from '../utils/home';
 import { pathExists, readFileSafe, writeFile, ensureDir } from '../utils/fs';
 
+/**
+ * Parse a config file lazy is about to MERGE ITS OWN ENTRY INTO.
+ *
+ * These are the user's real files on host-process runs (~/.claude.json,
+ * ~/.cursor/mcp.json, ~/.claude/settings.json). A malformed one used to be
+ * swallowed and replaced with `{}`, which silently deleted every other MCP
+ * server and every permission the user had configured — a destructive edit
+ * they would only discover much later, with no copy to restore from.
+ *
+ * Per CLAUDE.md's "found but broken" rule: missing falls through to defaults,
+ * but present-and-unparseable is an error the human must see. `prepareTurnMcp`
+ * fails the turn on a config-write error, so throwing here surfaces properly.
+ */
+export function parseMergeTarget<T>(content: string, path: string): T {
+  try {
+    return JSON.parse(content) as T;
+  } catch (err) {
+    throw new Error(
+      `${path} exists but is not valid JSON: ${err instanceof Error ? err.message : err}. ` +
+      `Refusing to overwrite it — that would delete everything else configured there. ` +
+      `Fix the JSON (or move the file aside) and retry.`,
+    );
+  }
+}
+
 interface ClaudeConfig {
   mcpServers?: Record<string, {
     command: string;
@@ -43,12 +68,7 @@ export async function writeMcpConfig(mcpServerConfig: { command: string; args: s
   // Read existing config if present
   const existingContent = await readFileSafe(claudeConfigPath);
   if (existingContent) {
-    try {
-      config = JSON.parse(existingContent);
-    } catch {
-      // Malformed JSON — overwrite with fresh config
-      config = {};
-    }
+    config = parseMergeTarget<ClaudeConfig>(existingContent, claudeConfigPath);
   }
 
   // Ensure mcpServers object exists
@@ -63,6 +83,37 @@ export async function writeMcpConfig(mcpServerConfig: { command: string; args: s
   };
 
   await writeFile(claudeConfigPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+}
+
+/**
+ * Write the lazy MCP server entry to ~/.cursor/mcp.json — Cursor's MCP
+ * discovery file (same `mcpServers` shape as Claude's).
+ *
+ * Merges with any existing config, preserving other servers. In a task
+ * container ~/.cursor is the sandbox mount (see setupSandbox), so this is
+ * per-task state; on host-process runs it merges into the user's real
+ * ~/.cursor/mcp.json exactly as the Claude path merges into ~/.claude.json.
+ */
+export async function writeCursorMcpConfig(mcpServerConfig: { command: string; args: string[] }): Promise<void> {
+  const cursorDir = join(getHome(), '.cursor');
+  await ensureDir(cursorDir);
+  const configPath = join(cursorDir, 'mcp.json');
+
+  let config: ClaudeConfig = {};
+  const existingContent = await readFileSafe(configPath);
+  if (existingContent) {
+    config = parseMergeTarget<ClaudeConfig>(existingContent, configPath);
+  }
+
+  if (!config.mcpServers) {
+    config.mcpServers = {};
+  }
+  config.mcpServers['lazy'] = {
+    command: mcpServerConfig.command,
+    args: mcpServerConfig.args,
+  };
+
+  await writeFile(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
 }
 
 /**
@@ -87,11 +138,10 @@ export async function writeToolPermissions(toolNames: string[]): Promise<void> {
 
   const existingContent = await readFileSafe(settingsPath);
   if (existingContent) {
-    try {
-      settings = JSON.parse(existingContent);
-    } catch {
-      settings = {};
-    }
+    // Same rule as the MCP configs above: this is the user's real settings
+    // file on host runs, and a silent reset would drop every permission,
+    // hook, and preference in it.
+    settings = parseMergeTarget<ClaudeSettings>(existingContent, settingsPath);
   }
 
   if (!settings.permissions) {

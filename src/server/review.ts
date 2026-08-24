@@ -31,7 +31,7 @@ import {
   type ReviewActions,
   type ReviewQueueEntry,
 } from './review-actions';
-import type { FileViolation, ReviewComment } from '../types';
+import type { AcceptRemedy, FileViolation, ReviewComment } from '../types';
 import type { Task } from '../storage';
 
 
@@ -412,6 +412,19 @@ function reviewScript(taskId: string): string {
         if (ta) ta.focus();
       });
     }
+  })();
+
+  // Carry whatever is in the feedback box into the accept form, so a refused
+  // accept re-renders with those words still there. Never-lose-human-feedback
+  // applies to text the reviewer has typed but not yet sent.
+  (function () {
+    var accept = document.querySelector('.rv-accept-form');
+    if (!accept) return;
+    accept.addEventListener('submit', function () {
+      var hidden = accept.querySelector('input[name="feedback"]');
+      var box = document.querySelector('[data-rv-sync="feedback"]');
+      if (hidden && box) hidden.value = box.value;
+    });
   })();
 
   // Keep the mirrored feedback boxes in sync so scrolling to the other copy
@@ -820,7 +833,74 @@ function violationSummary(taskId: string, violations: FileViolation[], filesInDi
     </div>`;
 }
 
-function actionsHtml(task: Task, queued: ReviewComment[]): string {
+/**
+ * What the reviewer had typed when an action failed.
+ *
+ * CLAUDE.md's first invariant is that human feedback is never lost. A refused
+ * accept re-renders the page, and without this the unblock feedback and the
+ * accept reason the reviewer had already written would be blanked by that
+ * re-render — punishing them for an accept the DAEMON refused.
+ */
+export interface ReviewDraft {
+  reason?: string;
+  feedback?: string;
+}
+
+/**
+ * The remedy panel: what to do about a refused accept.
+ *
+ * Everything here is composed by the DAEMON and merely rendered — the reason
+ * slug decides which in-page affordance to offer, and the command is printed
+ * exactly as it arrived. A reason this page has no affordance for still shows
+ * `next` and the command, so a refusal added later degrades to correct advice
+ * rather than to silence.
+ */
+function remedyPanelHtml(taskId: string, remedy: AcceptRemedy, draft: ReviewDraft): string {
+  const action = escapeHtml(`/review/${taskId}/accept`);
+  // Carried through every remedy form so a second failure still cannot eat the
+  // reviewer's words.
+  const carried =
+    `<input type="hidden" name="reason" value="${escapeHtml(draft.reason ?? '')}">` +
+    `<input type="hidden" name="feedback" value="${escapeHtml(draft.feedback ?? '')}">`;
+
+  const files = remedy.files?.length
+    ? `<ul class="rv-remedy-files">${remedy.files.map((f) => `<li><code>${escapeHtml(f)}</code></li>`).join('')}</ul>`
+    : '';
+
+  const command = remedy.command
+    ? `<p class="rv-hint">Run this in the project directory:</p>
+       <pre class="rv-remedy-cmd"><code>${escapeHtml(remedy.command)}</code></pre>`
+    : '';
+
+  let uiForm = '';
+  if (remedy.uiAction === 'passphrase') {
+    // Typed here, verified by the daemon, kept nowhere: no autofill, no
+    // storage, and it is never echoed back into the re-rendered page.
+    uiForm = `<form class="rv-remedy-form" method="post" action="${action}">
+        <label>Approval passphrase
+          <input type="password" name="passphrase" required autocomplete="off"
+                 spellcheck="false" placeholder="Approval passphrase">
+        </label>
+        ${carried}
+        <div class="rv-form-actions"><button type="submit" class="rv-primary">Approve and accept</button></div>
+      </form>`;
+  } else if (remedy.uiAction === 'sync') {
+    uiForm = `<form class="rv-remedy-form" method="post" action="${escapeHtml(`/review/${taskId}/sync`)}">
+        ${carried}
+        <div class="rv-form-actions"><button type="submit">Sync with parent</button></div>
+      </form>`;
+  }
+
+  return `<div class="rv-remedy" data-rv-remedy="${escapeHtml(remedy.reason)}">
+      <strong>What to do next</strong>
+      <p>${escapeHtml(remedy.next)}</p>
+      ${files}
+      ${uiForm}
+      ${command}
+    </div>`;
+}
+
+function actionsHtml(task: Task, queued: ReviewComment[], draft: ReviewDraft = {}): string {
   const unblockLabel = queued.length
     ? `<strong>Unblock with feedback</strong> — resumes the agent, carrying the ${queued.length} queued comment${queued.length === 1 ? '' : 's'} above`
     : '<strong>Unblock with feedback</strong> — resumes the agent to change code';
@@ -829,7 +909,7 @@ function actionsHtml(task: Task, queued: ReviewComment[]): string {
       <div${queued.length ? ' class="rv-pending-box"' : ''} data-rv-queued>${queuedHtml(queued)}</div>
       <form method="post" action="/review/${escapeHtml(task.id)}/unblock">
         <label>${unblockLabel}
-          <textarea name="message" rows="6" required data-rv-sync="feedback" placeholder="What should the agent do next?"></textarea>
+          <textarea name="message" rows="6" required data-rv-sync="feedback" placeholder="What should the agent do next?">${escapeHtml(draft.feedback ?? '')}</textarea>
         </label>
         <div class="rv-form-actions">
           <button type="submit">Unblock</button>
@@ -838,8 +918,11 @@ function actionsHtml(task: Task, queued: ReviewComment[]): string {
       </form>
       <form class="rv-accept-form" method="post" action="/review/${escapeHtml(task.id)}/accept">
         <label><strong>Accept</strong> — merge this work into the parent
-          <textarea name="reason" rows="3" placeholder="Reason (optional)"></textarea>
+          <textarea name="reason" rows="3" placeholder="Reason (optional)">${escapeHtml(draft.reason ?? '')}</textarea>
         </label>
+        <!-- Filled by the island from the feedback box on submit, so a refused
+             accept can hand the reviewer's unblock text back to them. -->
+        <input type="hidden" name="feedback" value="${escapeHtml(draft.feedback ?? '')}">
         <div class="rv-form-actions"><button type="submit" class="rv-primary">Accept</button></div>
       </form>
     </div>`;
@@ -896,6 +979,12 @@ export function reviewTaskHtml(
    * stayed inside its allowed paths.
    */
   fileViolations: FileViolation[] = [],
+  /**
+   * The remedy for a refused accept, and the text the reviewer had typed when
+   * it was refused. Both come from the failing POST — the page itself never
+   * infers a remedy.
+   */
+  extras: { remedy?: AcceptRemedy; draft?: ReviewDraft } = {},
 ): string {
   const files = parseUnifiedDiff(diffText);
   const violationsByPath = new Map(fileViolations.map((v) => [v.file, v.status]));
@@ -938,13 +1027,16 @@ export function reviewTaskHtml(
   const queued = pendingDeliveryComments(comments);
   const pendingAsks = comments.filter((c) => c.ask_state === 'pending').length;
   const live = state ?? fallbackState(task);
-  const actions = actionsHtml(task, queued);
+  const draft = extras.draft ?? {};
+  const actions = actionsHtml(task, queued, draft);
+  const remedyHtml = extras.remedy ? remedyPanelHtml(task.id, extras.remedy, draft) : '';
 
   const content = `
     <h1>Review: ${escapeHtml(label)}</h1>
     <p>${escapeHtml(task.goal)}</p>
     <p><a href="/review">← queue</a> · <a href="/tasks/${escapeHtml(task.id)}">task detail</a></p>
     ${noticeHtml}
+    ${remedyHtml}
     ${violationSummary(task.id, fileViolations, new Set(files.map((f) => f.path)))}
     ${actions}
     ${orphanHtml}

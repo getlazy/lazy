@@ -8,6 +8,34 @@ import { StringDecoder } from 'string_decoder';
 import { findLazyRoot, getDataDir } from './init';
 
 /**
+ * Build-time flag, defined only in a compiled `lazy` / `lazy-agent` binary.
+ *
+ * `scripts/build.ts` passes `--define LAZY_RELEASE_BUILD=true --minify-syntax`,
+ * so every `typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_*`
+ * branch below folds to a constant and is ELIMINATED from the released binary:
+ * the prompt test seams (LAZY_FORCE_TTY, LAZY_PROMPT_DEFAULTS,
+ * LAZY_PROMPT_SECRET) are not merely disabled there, they are absent. Running
+ * from source the identifier is undefined and the seams work as always.
+ *
+ * A build-time constant, not a runtime check, precisely because a runtime check
+ * is something an agent can satisfy too. `lazy approve`'s protected passphrase
+ * prompt is driven through these seams by e2e tests and must stay that way in
+ * the tree — so the guard that matters for users has to live in the build.
+ *
+ * TWO SHAPES THAT LOOK EQUIVALENT ARE NOT. The `typeof` test must appear
+ * INLINE at each use site. Hoisting it into a module-level
+ * `const RELEASE_BUILD = ...` does NOT work: bun rewrites module-scope `const`
+ * to `var` when bundling, stops inlining it, and every seam branch survives in
+ * the binary (verified on bun 1.4.0). Nor can the flag be imported from a
+ * shared module — bun folds a define within the module that reads it and does
+ * not propagate the constant across module boundaries. If you refactor these
+ * five branches, re-check the built binary with
+ * `test/unit/build-release-flags.test.ts`, which also fails if the build stops
+ * passing either flag.
+ */
+declare const LAZY_RELEASE_BUILD: boolean;
+
+/**
  * Save edited content to a recovery file in <datadir>/recovery/.
  *
  * CRITICAL: This ensures human feedback is never lost. The recovery file
@@ -49,7 +77,7 @@ export function removeRecoveryFile(recoveryPath: string): void {
  * In test environments, LAZY_FORCE_TTY=1 overrides this to return true.
  */
 export function isTTY(): boolean {
-  if (process.env.LAZY_FORCE_TTY === '1') return true;
+  if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_FORCE_TTY === '1') return true;
   return process.stdin.isTTY ?? false;
 }
 
@@ -124,7 +152,7 @@ export async function openEditor(initialContent: string = '', recoveryTag?: stri
  */
 export async function promptLine(message: string, defaultValue?: string): Promise<string> {
   // In test mode, use the default value without prompting
-  if (process.env.LAZY_PROMPT_DEFAULTS) {
+  if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_PROMPT_DEFAULTS) {
     const prompt = defaultValue ? `${message} [${defaultValue}]: ` : `${message}: `;
     console.log(prompt);
     return defaultValue || '';
@@ -212,9 +240,13 @@ export interface SecretOutputStream {
  * promptLine so e2e tests can drive interactive paths without a TTY.
  */
 export async function promptSecret(message: string): Promise<string> {
-  if (process.env.LAZY_PROMPT_DEFAULTS) {
+  if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_PROMPT_DEFAULTS) {
     console.log(`${message}: `);
-    return '';
+    // Test-only companion to LAZY_PROMPT_DEFAULTS (same family — never read
+    // in production paths): the value a masked prompt "types". Without it the
+    // driven prompt returns '', which exercises the empty-token refusal; e2e
+    // suites that need the happy path set it to the enrolled passphrase.
+    return process.env.LAZY_PROMPT_SECRET ?? '';
   }
   return promptSecretFrom(message, process.stdin, process.stdout);
 }
@@ -231,8 +263,14 @@ export async function promptSecretFrom(
 ): Promise<string> {
   if (!input.isTTY || typeof input.setRawMode !== 'function') {
     throw new Error(
+      // Deliberately does NOT suggest piping. Whether a piped value is an
+      // acceptable substitute is the CALLER's decision, not this helper's:
+      // `lazy system agent set-key` accepts one (and reads it itself, before
+      // ever reaching here), while the approval passphrase refuses one by
+      // design. A blanket "pipe it instead" here advertised a route that no
+      // longer exists for the passphrase.
       'Cannot read a secret without echoing it: stdin is not an interactive terminal.\n' +
-        'Run this command from a terminal, or pipe the value instead (e.g. echo "..." | lazy ...).',
+        'Run this command from a terminal.',
     );
   }
 
@@ -360,7 +398,8 @@ export async function promptSecretFrom(
  *   "accept" → always yes, "decline" → always no, "1" → return the default.
  */
 export async function promptYesNo(message: string, defaultYes: boolean = false): Promise<boolean> {
-  const override = process.env.LAZY_PROMPT_DEFAULTS;
+  const override =
+    typeof LAZY_RELEASE_BUILD === 'undefined' ? process.env.LAZY_PROMPT_DEFAULTS : undefined;
   if (override) {
     const suffix = defaultYes ? ' [Y/n]: ' : ' [y/N]: ';
     console.log(message + suffix);
@@ -401,7 +440,7 @@ export async function promptYesNo(message: string, defaultYes: boolean = false):
  * In test environments with LAZY_PROMPT_DEFAULTS set, returns 0 (first option) without waiting for input.
  */
 export async function promptChoice(message: string, options: string[]): Promise<number> {
-  if (process.env.LAZY_PROMPT_DEFAULTS) {
+  if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_PROMPT_DEFAULTS) {
     console.log(message);
     for (let i = 0; i < options.length; i++) {
       console.log(`  ${i + 1}) ${options[i]}`);

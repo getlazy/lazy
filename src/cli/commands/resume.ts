@@ -11,14 +11,6 @@ import { theme } from '../theme';
 export { buildSystemPromptForResume, buildResumePrompt } from '../../daemon/task-lifecycle';
 
 export async function commandResume(args: string[]): Promise<void> {
-  // This used to announce itself as deprecated in favour of a messageless
-  // `lazy unblock` — a call that cannot succeed: unblock rejects empty
-  // feedback ("Empty feedback.") and refuses to run with none at all ("No
-  // feedback provided."). Nothing else expresses a no-feedback resume, so the
-  // command is not deprecated; the notice just points at the right tool for
-  // the OTHER case. Same wording as lazy_resume's MCP description, on purpose.
-  console.error(`[note] 'lazy resume' resumes a task with NO new feedback. To send guidance instead, use 'lazy unblock <task> --message "..."' — unblock requires non-empty feedback, so it cannot express a no-feedback resume.`);
-
   // Parse and validate flags
   const parsed = parseFlags(args, [
     { name: 'follow', takesValue: false },
@@ -102,19 +94,20 @@ export async function commandResume(args: string[]): Promise<void> {
 export function resumeUsage(): void {
   console.log(`Usage: lazy resume <task_id> [--model <model>] [--effort <level>] [--follow]
 
-Resume an interrupted task. Writes a command for the supervisor and launches
-a container if needed.
+Resume a task with NO new feedback — writes a command for the supervisor and
+launches a container if needed. To send guidance instead, use
+'lazy unblock <task_id> --message "..."'.
 
 Tasks become 'interrupted' when:
   - The Docker container crashes or is killed
   - The machine goes down while an agent is running
   - Network connectivity is lost during execution
 
-The agent receives a special prompt telling it to review the branch state
-and continue working towards the goal.
+Also resumes a 'blocked' task exactly as it left off, with no new context —
+the agent picks up where its last turn ended.
 
 Arguments:
-  <task_id>    ID of the interrupted task to resume
+  <task_id>    ID of the task to resume
 
 Options:
   --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-4-8)

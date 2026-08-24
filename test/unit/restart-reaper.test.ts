@@ -107,6 +107,11 @@ function fakeStorage(opts: FakeStorageOpts): {
       if (opts.failIntentFor?.includes(intent.builderId)) throw new Error('storage down');
       calls.intents.push({ builderId: intent.builderId, reason: intent.reason, at: seq++ });
     },
+    // interruptForDaemonRestart clears slow-lane auto-resume state (a daemon
+    // restart is a fresh chance, same as any other healthy recovery) via
+    // resetSlowLaneState, which reads/writes task metadata.
+    getTaskMetadata: async () => null,
+    updateTaskMetadata: async () => {},
   } as unknown as Storage;
 
   return { storage, calls, stopOrder: () => seq++ };

@@ -6,6 +6,11 @@ export type TaskStatus = 'working' | 'blocked' | 'pairing' | 'interrupted' | 'su
 // Re-exported here for backward compatibility — consumers can import from either location.
 export { TERMINAL_STATUSES, isTerminalStatus, isActiveStatus, isBlockedStatus } from '../task-state-machine';
 
+// The structured remedy carried by a refused accept — shared by the daemon
+// (which composes it) and the review UI (which renders it).
+export { parseAcceptRemedy, acceptRemedyOf } from './accept-remedy';
+export type { AcceptRemedy, AcceptRefusalReason, AcceptRemedyUiAction } from './accept-remedy';
+
 export type TaskType = 'task' | 'fix' | 'spike' | 'refactor' | 'test' | 'audit' | 'migrate' | 'document' | 'tidy' | 'rework' | 'feature' | 'release';
 
 export const DEFAULT_TASK_TYPE: TaskType = 'task';
@@ -241,6 +246,26 @@ export interface Turn {
   /** Merge conflicts present at the start of this turn (before agent resolution) */
   merge_conflicts?: MergeConflict[];
   /**
+   * The agent id this turn was LAUNCHED with (e.g. `claude-code`, `cursor`), as
+   * resolved at launch.
+   *
+   * Task-level `agent_id` is last-value-wins — `lazy edit --agent` / the MCP
+   * `agent` field switch a task's agent mid-flight (and reset the session), so
+   * the task record only remembers the LATEST agent and cannot answer "which
+   * agent produced turn N". This field can. Same argument as `effort` below.
+   *
+   * Recorded on the human/builder turn that requests the work AND on the agent
+   * turn that answers it, so a mid-task agent switch is visible on exactly the
+   * turns it applied to.
+   *
+   * Absent means UNKNOWN, and must render as unknown. Every turn written before
+   * this field existed has no agent, and there is deliberately no back-fill: a
+   * turn labelled `claude-code` because that is today's default, when it in fact
+   * ran under something else, is worse than one labelled unknown. Same
+   * convention as `effort` and `mcp_tools`.
+   */
+  agent?: string;
+  /**
    * The model this turn was LAUNCHED with — the resolved value passed as
    * `--model` (usually a tier alias like `opus`, or a concrete id for a local
    * backend). Recorded on the human/builder turn that requests the work AND on
@@ -320,6 +345,18 @@ export interface Turn {
    * - consumed — an agent response completed after this feedback was delivered.
    */
   feedback_delivery?: FeedbackDelivery;
+  /**
+   * True when the turn that recorded this error provably had no effect on the
+   * branch: no new commits AND the worktree was clean when the turn ended.
+   *
+   * Only meaningful on agent error turns — successful turns always have some
+   * effect (at minimum, the agent's response). Downstream consumers use this to
+   * skip mechanisms that only make sense when work was done (e.g., pre-accept
+   * reflection is nonsensical when there's nothing to reflect on).
+   *
+   * Absence means unknown, not "had effect" — fall back to existing behavior.
+   */
+  agent_had_no_effect?: boolean;
 }
 
 /**

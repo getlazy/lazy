@@ -203,6 +203,83 @@ describe('lazy active <task_id> (subtree filter)', () => {
     expect(output).toContain('following');
   });
 
+  // --- Depth scoping (`--levels`) ---------------------------------------
+  //
+  // INVARIANT: `--levels <n>` is 1-BASED and counts levels of the listing AS
+  // RENDERED, so it composes with the subtree positional — `active <task>
+  // --levels 1` is "that task, nothing below it", not one of the two scopings
+  // silently winning.
+
+  test('--levels 1 shows only top-level active tasks, with a hidden count', async () => {
+    const rootId = await createCodedTask(ctx, 'Levels root', 'levels-root');
+    await startAndReconcile(ctx, rootId);
+
+    const childId = await createCodedTask(ctx, 'Levels child', 'levels-child', rootId);
+    await startAndReconcile(ctx, childId);
+
+    const grandchildId = await createCodedTask(ctx, 'Levels grandchild', 'levels-gk', childId);
+    await startAndReconcile(ctx, grandchildId);
+
+    const result = await ctx.lazy(['active', '--levels', '1']);
+    expectSuccess(result);
+    expectOutput(result, 'Levels root');
+    expectOutputExcludes(result, 'Levels child');
+    expectOutputExcludes(result, 'Levels grandchild');
+    // Never silently truncated: per-row marker plus a footnote.
+    expectOutput(result, '(+2 hidden)');
+    expectOutput(result, '2 descendant task(s) hidden below --levels 1');
+  });
+
+  test('--levels composes with the subtree positional', async () => {
+    const rootId = await createCodedTask(ctx, 'Combo root', 'combo-root');
+    await startAndReconcile(ctx, rootId);
+
+    const childId = await createCodedTask(ctx, 'Combo child', 'combo-child', rootId);
+    await startAndReconcile(ctx, childId);
+
+    const grandchildId = await createCodedTask(ctx, 'Combo grandchild', 'combo-gk', childId);
+    await startAndReconcile(ctx, grandchildId);
+
+    const outsiderId = await createTask(ctx, 'Combo outsider', 'Do other work');
+    await startAndReconcile(ctx, outsiderId);
+
+    // The filtered task is level 1, so --levels 2 reaches its children only.
+    const result = await ctx.lazy(['active', 'combo-root', '--levels', '2']);
+    expectSuccess(result);
+    expectOutput(result, 'Combo root');
+    expectOutput(result, 'Combo child');
+    expectOutputExcludes(result, 'Combo grandchild');
+    expectOutputExcludes(result, 'Combo outsider');
+    expectOutput(result, '(+1 hidden)');
+  });
+
+  test('--ids-only respects the depth limit', async () => {
+    const rootId = await createCodedTask(ctx, 'Idlvl root', 'idlvl-root');
+    await startAndReconcile(ctx, rootId);
+
+    const childId = await createCodedTask(ctx, 'Idlvl child', 'idlvl-child', rootId);
+    await startAndReconcile(ctx, childId);
+
+    const result = await ctx.lazy(['active', '--levels', '1', '--ids-only']);
+    expectSuccess(result);
+    const ids = result.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+    expect(ids).toContain('idlvl-root');
+    expect(ids).not.toContain('idlvl-child');
+  });
+
+  test('rejects --levels 0 rather than guessing what it means', async () => {
+    const result = await ctx.lazy(['active', '--levels', '0']);
+    expectFailure(result);
+    expectError(result, '--levels must be a positive integer');
+  });
+
+  test('usage documents --levels and what the number counts', async () => {
+    const result = await ctx.lazy(['active', '--help']);
+    expectSuccess(result);
+    expectOutput(result, '--levels');
+    expectOutput(result, '1 = top-level tasks only');
+  });
+
   test('usage documents the positional', async () => {
     const result = await ctx.lazy(['active', '--help']);
     expectSuccess(result);

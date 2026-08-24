@@ -26,7 +26,7 @@ import { mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createStorage } from '../../src/storage';
 import type { Storage } from '../../src/storage';
-import { protocolDir as getProtocolDir, writeWaitingFile } from '../../src/protocol';
+import { protocolDir as getProtocolDir, writeWaitingFile, writeProgressFile, writeCommand } from '../../src/protocol';
 import type { SupervisorStatus } from '../../src/protocol';
 import { getHome } from '../../src/utils/home';
 
@@ -334,6 +334,76 @@ describe('working-substate observability', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('working(agent)');
     expect(result.stdout).not.toContain('waiting on');
+  });
+
+  // A progress line posted with lazy_update_progress rides ALONGSIDE the substate:
+  // `working(agent)` says the agent is alive, the line says what it is doing.
+  test('ls and status show the agent-reported progress line', async () => {
+    const taskId = await makeWorkingTask(ctx, 'progress task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeProgressFile(getProtocolDir(taskId), {
+      version: 1,
+      writer_pid: process.pid,
+      message: 'running migration 3/7',
+      recorded_at: new Date().toISOString(),
+    });
+    await writeAlivePidFile();
+
+    const list = await ctx.lazy(['list']);
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout).toContain('working(agent: running migration 3/7)');
+
+    const status = await ctx.lazy(['status', taskId]);
+    expect(status.exitCode).toBe(0);
+    expect(status.stdout).toContain('working(agent: running migration 3/7)');
+  });
+
+  // INVARIANT: same tripwire as the wait marker — a progress line whose writer is
+  // gone is a claim about a turn that is over, so readers disbelieve it.
+  test('a progress marker from a dead writer is ignored', async () => {
+    const taskId = await makeWorkingTask(ctx, 'stale progress task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeProgressFile(getProtocolDir(taskId), {
+      version: 1,
+      writer_pid: 2 ** 31 - 1, // no such process
+      message: 'running migration 3/7',
+      recorded_at: new Date().toISOString(),
+    });
+    await writeAlivePidFile();
+
+    const result = await ctx.lazy(['list']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('working(agent)');
+    expect(result.stdout).not.toContain('running migration');
+  });
+
+  // INVARIANT: a new turn starts with no progress. Clearing happens inside
+  // writeCommand — the one place every turn passes through — so a message from a
+  // finished turn structurally cannot linger into the next one.
+  test('starting a new turn clears the previous turn\'s progress line', async () => {
+    const taskId = await makeWorkingTask(ctx, 'progress cleared task');
+    await writeStatusJson(taskId, baseStatus(taskId, { phase: 'work' }));
+    await writeProgressFile(getProtocolDir(taskId), {
+      version: 1,
+      writer_pid: process.pid,
+      message: 'running migration 3/7',
+      recorded_at: new Date().toISOString(),
+    });
+    await writeAlivePidFile();
+
+    expect((await ctx.lazy(['list'])).stdout).toContain('running migration 3/7');
+
+    writeCommand(getProtocolDir(taskId), {
+      type: 'start',
+      task_id: taskId,
+      goal: 'progress cleared task',
+      prompt: 'next turn',
+    });
+
+    const after = await ctx.lazy(['list']);
+    expect(after.exitCode).toBe(0);
+    expect(after.stdout).toContain('working(agent)');
+    expect(after.stdout).not.toContain('running migration');
   });
 
   test('status shows working(agent:answering) for an ask-phase task', async () => {

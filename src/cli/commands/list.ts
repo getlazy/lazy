@@ -1,17 +1,19 @@
+import { join } from 'path';
 import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef, resolveTaskOrExit } from '../helpers';
 import type { Task, Session, Storage } from '../../storage';
 
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { createRunner } from '../../runner';
-import { getDataDir } from '../init';
 import { theme } from '../theme';
 import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
-import { parentTaskIdOf, collectSubtreeIds } from '../../task-target';
+import { parentTaskIdOf, collectSubtreeIds, pruneTasksToDepth } from '../../task-target';
 import { normalizeTag } from '../../utils/tags';
 import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
 import { orderQueuedTasks } from '../../daemon/concurrency';
 import { loadConfig } from '../../config/loader';
 import { logger } from '../../utils/logger';
+import { listSlowLaneQueue, getLastProjectAutoResumeAt } from '../../daemon/auto-resume-queue';
+import { describeExpiry } from '../../utils/local-day';
 import {
   loadProtectionContext,
   contextIsInert,
@@ -46,9 +48,27 @@ export interface TaskWithSession {
    * is rendered — list output stays byte-for-byte what it was.
    */
   protection?: TaskProtectionStatus;
+  /**
+   * Slow-lane auto-resume queue position (src/daemon/auto-resume-queue.ts),
+   * present only for `interrupted` tasks whose fast-lane circuit breaker has
+   * tripped and are now waiting for a round-robin retry. Undefined otherwise —
+   * including when daemon.auto_resume is off, since nothing is queued then.
+   */
+  autoResume?: { attempts: number; maxAttempts: number; nextEligibleAt: number };
+  /**
+   * How many descendants of this task were elided by a `--levels` limit.
+   * Present only on the deepest visible rows of a depth-limited listing, so a
+   * truncated view always says what it is not showing. Undefined otherwise.
+   */
+  hiddenDescendants?: number;
 }
 
-export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: string): Promise<TaskWithSession[]> {
+export async function buildTaskTree(
+  storage: Storage,
+  tasks: Task[],
+  lazyRoot: string,
+  opts: { hiddenDescendants?: Map<string, number> } = {},
+): Promise<TaskWithSession[]> {
   const runner = await createRunner(lazyRoot);
   const taskMap = new Map<string, TaskWithSession>();
 
@@ -56,13 +76,37 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
   // default-branch lookup, one resolve per protected entry — not N of each. An
   // inert context (nothing protected anywhere) skips the per-task work below.
   let protectionCtx = null as Awaited<ReturnType<typeof loadProtectionContext>> | null;
+  const config = await loadConfig(lazyRoot);
   try {
-    const config = await loadConfig(lazyRoot);
     const ctx = await loadProtectionContext(storage, config, lazyRoot);
     if (!contextIsInert(ctx)) protectionCtx = ctx;
   } catch (err) {
     // A listing must never fail over an advisory marker.
     logger.debug(`Protection markers unavailable for this listing: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Slow-lane auto-resume queue positions, computed once against ALL tasks
+  // (same reasoning as queuePos below — the queue's round-robin order is a
+  // project-wide fact, not scoped to this view). Skipped entirely when
+  // nothing is interrupted or auto_resume is off, so a stock listing pays
+  // nothing extra.
+  const autoResumeMap = new Map<string, { attempts: number; maxAttempts: number; nextEligibleAt: number }>();
+  if (config.daemon.auto_resume && tasks.some(t => t.status === 'interrupted')) {
+    try {
+      const now = Date.now();
+      const queue = await listSlowLaneQueue(storage, config, now);
+      const dataDir = join(lazyRoot, config.data.path);
+      const lastProjectAttempt = await getLastProjectAutoResumeAt(dataDir);
+      const gapMs = config.daemon.auto_resume_gap_minutes * 60_000;
+      const gapEligibleAt = lastProjectAttempt === null ? now : lastProjectAttempt + gapMs;
+      queue.forEach((entry, i) => {
+        const nextEligibleAt = Math.max(entry.intervalEligibleAt, i === 0 ? gapEligibleAt : 0);
+        autoResumeMap.set(entry.task.id, { attempts: entry.attempts, maxAttempts: entry.maxAttempts, nextEligibleAt });
+      });
+    } catch (err) {
+      // Observational only — never fail a listing over queue visibility.
+      logger.debug(`Slow-lane queue unavailable for this listing: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   // Drain-order positions for queued tasks, computed once against ALL queued
@@ -130,6 +174,8 @@ export async function buildTaskTree(storage: Storage, tasks: Task[], lazyRoot: s
       workingSubstate,
       queuePosition: task.status === 'queued' ? queuePos.get(task.id) : undefined,
       protection,
+      autoResume: autoResumeMap.get(task.id),
+      hiddenDescendants: opts.hiddenDescendants?.get(task.id),
     });
   }
 
@@ -251,6 +297,15 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = `${status} [STOPPED]`;
   }
 
+  // Indicate a task queued on the slow-lane auto-resume round-robin
+  // (src/daemon/auto-resume-queue.ts) — the fast lane gave up, but the task
+  // isn't abandoned: it'll be retried again, on its own schedule.
+  if (node.autoResume) {
+    const { attempts, maxAttempts, nextEligibleAt } = node.autoResume;
+    const eta = nextEligibleAt <= Date.now() ? 'now' : describeExpiry(new Date(nextEligibleAt));
+    status = `${status} [auto-resume ${eta} (attempt ${attempts + 1}/${maxAttempts})]`;
+  }
+
   // Add auto-react paused indicator
   if (task.metadata?.auto_react_paused === 'true') {
     status = `${status} [AUTO-REACT PAUSED]`;
@@ -309,17 +364,24 @@ export async function commandList(args: string[]): Promise<void> {
     { name: 'tree', takesValue: false },
     { name: 'ids-only', takesValue: false },
     { name: 'tag', takesValue: true },
+    { name: 'levels', takesValue: true },
   ], 'list');
 
   const idsOnly = parsed.flags.get('ids-only') === true;
   const showAll = parsed.flags.get('all') === true;
   let showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
   const tagFilter = normalizeFilterTag(parsed.flags.get('tag') as string | undefined);
+  const levels = parseLevels(parsed.flags.get('levels'), 'list');
 
   let { tree } = await queryTaskList({
     all: showAll,
     taskFilter: parsed.positional[0] || undefined,
+    levels,
   });
+
+  // Counted before any tag filter flattens the tree, so the footnote reports
+  // everything the depth limit dropped rather than only the tagged part of it.
+  const hiddenCount = countHidden(tree);
 
   // A tag filter selects tasks across the hierarchy, so it renders as a flat
   // list of matches (a partial tree would be misleading).
@@ -328,7 +390,7 @@ export async function commandList(args: string[]): Promise<void> {
     showTree = false;
   }
 
-  renderListOutput(tree, { idsOnly, showTree, showAll });
+  renderListOutput(tree, { idsOnly, showTree, showAll, levels, hiddenCount });
 }
 
 /** Normalize a --tag filter value; returns undefined when no filter was given. */
@@ -360,7 +422,51 @@ function filterTreeByTag(tree: TaskWithSession[], tag: string): TaskWithSession[
 function goalCell(node: TaskWithSession, goal: string): string {
   const markers = node.protection ? protectionMarkers(node.protection) : '';
   const prefix = markers ? `${theme.warning(markers)} ` : '';
-  return `${prefix}${goal}${tagSuffix(node.task)}`;
+  // Elision note last: a depth-limited listing must never look complete.
+  const hidden = node.hiddenDescendants
+    ? ` ${theme.warning(`(+${node.hiddenDescendants} hidden)`)}`
+    : '';
+  return `${prefix}${goal}${tagSuffix(node.task)}${hidden}`;
+}
+
+/** Total descendants elided by a `--levels` limit across a rendered tree. */
+function countHidden(nodes: TaskWithSession[]): number {
+  return nodes.reduce((sum, n) => sum + (n.hiddenDescendants ?? 0) + countHidden(n.children), 0);
+}
+
+/**
+ * Footnote naming what a `--levels` limit left out. Printed whenever anything
+ * was elided, so the per-row "(+N hidden)" markers are never the only signal
+ * (they are easy to miss at the end of a long goal column).
+ */
+function printDepthFootnote(hidden: number, levels: number | undefined): void {
+  if (levels === undefined || hidden === 0) return;
+  console.log('');
+  console.log(theme.warning(
+    `${hidden} descendant task(s) hidden below --levels ${levels}. ` +
+    `Re-run with a larger --levels (or without it) to see them.`
+  ));
+}
+
+/**
+ * Validate a `--levels` value from the command line.
+ *
+ * 1-based on purpose: `--levels 1` shows only the top level. A 0-based
+ * `--depth 0` would read as "nothing" just as easily as "roots only", and a
+ * listing flag whose most useful value is ambiguous is a trap.
+ */
+function parseLevels(raw: unknown, command: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = typeof raw === 'string' ? Number(raw) : NaN;
+  if (!Number.isInteger(value) || value < 1) {
+    console.error(
+      `--levels must be a positive integer (got '${String(raw)}'). ` +
+      `--levels 1 shows only top-level tasks, --levels 2 adds their children. ` +
+      `Run \`lazy ${command} --help\` for usage.`
+    );
+    process.exit(1);
+  }
+  return value;
 }
 
 /** True when any node in the tree renders a protection marker. */
@@ -384,7 +490,7 @@ function tagSuffix(task: Task): string {
 /** Shared rendering for list command — used by both daemon and direct paths. */
 function renderListOutput(
   tree: TaskWithSession[],
-  opts: { idsOnly: boolean; showTree: boolean; showAll: boolean },
+  opts: { idsOnly: boolean; showTree: boolean; showAll: boolean; levels?: number; hiddenCount?: number },
 ): void {
   // Machine-readable output for shell completion
   if (opts.idsOnly) {
@@ -430,6 +536,7 @@ function renderListOutput(
   }
 
   printProtectionLegend(tree);
+  printDepthFootnote(opts.hiddenCount ?? countHidden(tree), opts.levels);
   printCrashedFootnote(countCrashed(tree));
 }
 
@@ -482,12 +589,14 @@ export async function commandActive(args: string[]): Promise<void> {
     { name: 'tree', takesValue: false },
     { name: 'follow', aliases: ['f'], takesValue: false },
     { name: 'ids-only', takesValue: false },
+    { name: 'levels', takesValue: true },
   ], 'active');
 
   const idsOnly = parsed.flags.get('ids-only') === true;
   const showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
   const follow = parsed.flags.get('follow') === true;
   const taskFilter = parsed.positional[0] || undefined;
+  const levels = parseLevels(parsed.flags.get('levels'), 'active');
 
   // --follow needs continuous reconciliation with open storage — can't use RPC
   if (follow) {
@@ -518,8 +627,16 @@ export async function commandActive(args: string[]): Promise<void> {
           console.log(emptyActiveMessage(filterLabel));
           done = true;
         } else {
-          const tree = await buildTaskTree(storage, tasks, root);
-          renderActiveOutput(tree, { idsOnly, showTree, filterLabel });
+          // Depth limit applied to the same task set the tree is built from, so
+          // the live view counts levels exactly like the one-shot view.
+          let hiddenDescendants: Map<string, number> | undefined;
+          if (levels !== undefined) {
+            const pruned = pruneTasksToDepth(tasks, levels);
+            tasks = pruned.kept;
+            hiddenDescendants = pruned.hidden;
+          }
+          const tree = await buildTaskTree(storage, tasks, root, { hiddenDescendants });
+          renderActiveOutput(tree, { idsOnly, showTree, filterLabel, levels });
           console.log(`\n(following — press Ctrl+C to stop, polling every ${pollIntervalMs / 1000}s)`);
           await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
         }
@@ -530,8 +647,8 @@ export async function commandActive(args: string[]): Promise<void> {
     return;
   }
 
-  const { tree } = await queryActiveTasks({ taskFilter });
-  renderActiveOutput(tree, { idsOnly, showTree, filterLabel: taskFilter });
+  const { tree } = await queryActiveTasks({ taskFilter, levels });
+  renderActiveOutput(tree, { idsOnly, showTree, filterLabel: taskFilter, levels });
 }
 
 /**
@@ -547,7 +664,7 @@ function emptyActiveMessage(filterLabel: string | undefined): string {
 /** Shared rendering for active command. */
 function renderActiveOutput(
   tree: TaskWithSession[],
-  opts: { idsOnly: boolean; showTree: boolean; filterLabel?: string },
+  opts: { idsOnly: boolean; showTree: boolean; filterLabel?: string; levels?: number },
 ): void {
   if (opts.idsOnly) {
     const allNodes = flattenTree(tree);
@@ -589,6 +706,7 @@ function renderActiveOutput(
   }
 
   printProtectionLegend(tree);
+  printDepthFootnote(countHidden(tree), opts.levels);
   printCrashedFootnote(countCrashed(tree));
 }
 
@@ -598,13 +716,18 @@ export async function commandBlocked(args: string[]): Promise<void> {
     { name: 'flat', takesValue: false },
     { name: 'tree', takesValue: false },
     { name: 'tag', takesValue: true },
+    { name: 'levels', takesValue: true },
   ], 'blocked');
 
   let showTree = parsed.flags.get('tree') === true || parsed.flags.get('flat') !== true;
   const tagFilter = normalizeFilterTag(parsed.flags.get('tag') as string | undefined);
+  const levels = parseLevels(parsed.flags.get('levels'), 'blocked');
 
-  let { tree } = await queryBlockedTasks();
+  let { tree } = await queryBlockedTasks({ levels });
   sortByLastActive(tree);
+
+  // Counted before any tag filter flattens the tree (see commandList).
+  const hiddenCount = countHidden(tree);
 
   // Tag filter → flat list of matches (see filterTreeByTag / commandList).
   if (tagFilter) {
@@ -612,11 +735,15 @@ export async function commandBlocked(args: string[]): Promise<void> {
     showTree = false;
   }
 
-  renderBlockedOutput(tree, showTree);
+  renderBlockedOutput(tree, showTree, { levels, hiddenCount });
 }
 
 /** Shared rendering for blocked command. */
-function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
+function renderBlockedOutput(
+  tree: TaskWithSession[],
+  showTree: boolean,
+  opts: { levels?: number; hiddenCount?: number } = {},
+): void {
   if (tree.length === 0) {
     console.log('No blocked tasks.');
     return;
@@ -649,11 +776,12 @@ function renderBlockedOutput(tree: TaskWithSession[], showTree: boolean): void {
   }
 
   printProtectionLegend(tree);
+  printDepthFootnote(opts.hiddenCount ?? countHidden(tree), opts.levels);
   printCrashedFootnote(countCrashed(tree));
 }
 
 export function listUsage(): void {
-  console.log(`Usage: lazy list [<task_id>] [--all] [--flat] [--tag <tag>]
+  console.log(`Usage: lazy list [<task_id>] [--all] [--flat] [--tag <tag>] [--levels <n>]
 
 List all non-terminal tasks (working + blocked + interrupted).
 
@@ -661,11 +789,16 @@ Arguments:
   <task_id>   Optional task ID or code to filter - shows only that task and its descendants
 
 Options:
-  --all       Show all tasks including completed/abandoned/closed
-  --flat      Show flat list instead of tree structure
-  --tree      Show tree structure (default)
-  --tag <tag> Show only tasks carrying this tag (flat list of matches)
-  --ids-only  Output only task IDs, one per line (for shell completion)
+  --all          Show all tasks including completed/abandoned/closed
+  --flat         Show flat list instead of tree structure
+  --tree         Show tree structure (default)
+  --tag <tag>    Show only tasks carrying this tag (flat list of matches)
+  --levels <n>   Show only the first <n> levels of the hierarchy (1-based:
+                 1 = top-level tasks only, 2 = those plus their children).
+                 Levels are counted from the rows this listing shows, so with
+                 a <task_id> filter that task is level 1. Tasks hidden by the
+                 limit are counted as "(+N hidden)" on their parent's row.
+  --ids-only     Output only task IDs, one per line (for shell completion)
 
 The tree view shows child tasks indented under their parents. Tags are shown
 after each task's goal.
@@ -673,13 +806,15 @@ after each task's goal.
 Examples:
   lazy list                  # All non-terminal tasks in tree view
   lazy list release-v05      # Only release-v05 task and its descendants
+  lazy list --levels 1       # Top-level tasks only, with hidden-child counts
+  lazy list release-v05 --levels 2 # That task and its direct children
   lazy list --all            # All tasks including terminal states
   lazy list --tag onboarding # Non-terminal tasks tagged 'onboarding'
   lazy list --all --tag infra # All tasks (incl. terminal) tagged 'infra'`);
 }
 
 export function activeUsage(): void {
-  console.log(`Usage: lazy active [<task_id>] [--flat] [--follow | -f]
+  console.log(`Usage: lazy active [<task_id>] [--flat] [--levels <n>] [--follow | -f]
 
 List all non-terminal tasks (working + blocked + interrupted).
 
@@ -690,6 +825,11 @@ Arguments:
 Options:
   --flat         Show flat list instead of tree structure
   --tree         Show tree structure (default)
+  --levels <n>   Show only the first <n> levels of the hierarchy (1-based:
+                 1 = top-level tasks only, 2 = those plus their children).
+                 Levels are counted from the rows this listing shows, so with
+                 a <task_id> filter that task is level 1. Tasks hidden by the
+                 limit are counted as "(+N hidden)" on their parent's row.
   --follow, -f   Poll and refresh the display (press Ctrl+C to stop)
   --ids-only     Output only task IDs, one per line (for shell completion)
 
@@ -697,26 +837,34 @@ The tree view shows child tasks indented under their parents.
 
 Examples:
   lazy active                # All active tasks in tree view
+  lazy active --levels 1     # Only top-level active tasks (+N hidden per row)
+  lazy active release-v020 --levels 2 # That release and its direct children
   lazy active --flat         # Active tasks in flat list
   lazy active --follow       # Live-updating active tasks view
   lazy active release-v020 -f # Live view of one release's subtree`);
 }
 
 export function blockedUsage(): void {
-  console.log(`Usage: lazy blocked [--flat] [--tag <tag>]
+  console.log(`Usage: lazy blocked [--flat] [--tag <tag>] [--levels <n>]
 
 List blocked tasks (waiting for user input).
 
 Options:
-  --flat      Show flat list instead of tree structure
-  --tree      Show tree structure (default)
-  --tag <tag> Show only blocked tasks carrying this tag (flat list of matches)
+  --flat         Show flat list instead of tree structure
+  --tree         Show tree structure (default)
+  --tag <tag>    Show only blocked tasks carrying this tag (flat list of matches)
+  --levels <n>   Show only the first <n> levels of the hierarchy (1-based:
+                 1 = top-level blocked tasks only, 2 = those plus their
+                 children). Levels are counted from the rows this listing
+                 shows; tasks hidden by the limit are counted as "(+N hidden)"
+                 on their parent's row.
 
 The tree view shows child tasks indented under their parents. Tags are shown
 after each task's goal.
 
 Examples:
   lazy blocked                 # Blocked tasks in tree view
+  lazy blocked --levels 1      # Only top-level blocked tasks
   lazy blocked --flat          # Blocked tasks in flat list
   lazy blocked --tag onboarding # Blocked tasks tagged 'onboarding'`);
 }

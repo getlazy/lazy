@@ -82,20 +82,21 @@ describe('legacy proxy audit log cleanup on daemon start', () => {
     }
   });
 
-  // INVARIANT: the cleanup is NOT gated on the proxy being enabled. It removes
-  // a file a PREVIOUS version wrote, so whether the proxy runs now is
-  // irrelevant — and gating it would strand the oversized blob forever on
-  // exactly the machines that turned the proxy off, while `lazy doctor` told
-  // them to restart the daemon to remove it.
-  test('runs even when [proxy] enabled = false', async () => {
+  // INVARIANT: the cleanup is NOT gated on anything about the proxy's current
+  // configuration. It removes a file a PREVIOUS version wrote, so the proxy's
+  // present state is irrelevant — gating it would strand the oversized blob
+  // forever while `lazy doctor` told the user to restart the daemon to remove
+  // it. (This used to be written as `[proxy] enabled = false`; that option was
+  // removed, so the section now carries an unrelated explicit setting.)
+  test('runs regardless of the [proxy] settings in lazy.toml', async () => {
     await pinFreeServerPort(ctx.root);
     const configPath = join(ctx.root, 'lazy.toml');
     const before = await readFile(configPath, 'utf-8');
-    // The init template mentions [proxy] only in comments (the proxy is on by
-    // default with no config), so appending a real section is not a
+    // The init template mentions [proxy] only in comments (the proxy is always
+    // on with no config), so appending a real section is not a
     // duplicate-key error here.
     expect(before).not.toMatch(/^\s*\[proxy\]/m);
-    await writeFile(configPath, `${before}\n[proxy]\nenabled = false\n`);
+    await writeFile(configPath, `${before}\n[proxy]\nbind = "127.0.0.1"\n`);
 
     const legacyPath = await seedLegacyLog();
 

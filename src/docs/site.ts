@@ -75,7 +75,7 @@ export interface BuildDocsSiteOptions {
   /**
    * `docs/`-relative directory names to skip entirely. Defaults to
    * {@link DEFAULT_EXCLUDED_DIRS}. Matching is on the full relative directory
-   * path, so `design` excludes `docs/design/` but not `docs/x/design/`.
+   * path, so `design` excludes `public-docs/design/` but not `public-docs/x/design/`.
    */
   exclude?: string[];
   /** Version label rendered in the page header (`v0.21`). Purely cosmetic; also recorded in the manifest. */
@@ -87,20 +87,23 @@ export interface BuildDocsSiteOptions {
 }
 
 /**
- * Directories under `docs/` the site never publishes.
+ * Directories under `public-docs/` the site never publishes.
  *
- * ONE list, deliberately: "what is public" is a policy question and it should be
- * answerable by reading a single constant rather than by tracing a build script.
- * `scratch/` is the builder's own working area (docs/builder-scratch-dir.md) and
- * has never been intended for readers.
+ * The primary control on what is public is the TREE, not this list:
+ * `public-docs/` is the published documentation and `docs/` is internal
+ * material (spikes, research, reviews, obsolete designs, runbooks) that the
+ * generator never reads and `.releaseinclude` never ships. Where a file lives
+ * decides who may read it.
  *
- * Note that this is a DENY list — a new directory under docs/ is published by
- * default. That is the opposite of `.releaseinclude`, which is an allowlist for
- * the public source tarball. See docs/docs-site.md § What gets published.
+ * This list survives that split as defence in depth, for a working directory
+ * that ends up inside the public tree anyway. It is a DENY list — a new
+ * directory under `public-docs/` is published by default — which is exactly
+ * why the tree split, and not this constant, is what the policy rests on.
+ * See docs/docs-site.md § What gets published.
  */
 export const DEFAULT_EXCLUDED_DIRS = ['scratch'];
 
-/** Files under `docs/` that are never published regardless of directory. */
+/** Files under `public-docs/` that are never published regardless of directory. */
 const EXCLUDED_FILE_NAMES = new Set(['.DS_Store']);
 
 /** Extensions copied through verbatim as assets. Anything else is ignored. */
@@ -133,7 +136,7 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
 
   if (markdown.includes('index.md')) {
     throw new Error(
-      `docs/index.md is not supported by the docs site generator: the generator owns ` +
+      `public-docs/index.md is not supported by the docs site generator: the generator owns ` +
       `index.html (it renders the page listing there). Rename the file, or teach ` +
       `src/docs/site.ts to use it as the site index.`,
     );
@@ -343,7 +346,7 @@ interface ResolveHrefInput {
  * Absolute URLs, `mailto:`, protocol-relative URLs and pure `#fragment` links
  * pass through untouched. Everything else is resolved against the markdown
  * file's directory and then re-expressed relative to the rendered page's
- * directory — which is NOT the same directory, because `docs/a/b.md` renders to
+ * directory — which is NOT the same directory, because `public-docs/a/b.md` renders to
  * `a/b/index.html`. Getting that wrong is the classic pretty-URL bug: every
  * sibling link ends up one level too high.
  *

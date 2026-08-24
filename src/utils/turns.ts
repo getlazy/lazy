@@ -17,7 +17,7 @@ import type { Turn, FileViolation } from '../types';
 
 /**
  * The launch settings a supervisor response carries, in `CreateTurnOptions`
- * shape (`model` / `modelId` / `effort`).
+ * shape (`agent` / `model` / `modelId` / `effort`).
  *
  * Apply to AGENT turns only — a supervisor-authored announcement (sync merge
  * note, nudge prompt) ran no model, so stamping one there would claim a model
@@ -28,9 +28,10 @@ import type { Turn, FileViolation } from '../types';
  * yield turns with no labels rather than turns labelled with a guess.
  */
 export function launchSettingsFromResponse(
-  resp: { model?: string; model_id?: string; effort?: string; mcp_tools?: string },
-): { model?: string; modelId?: string; effort?: string; mcpTools?: string } {
+  resp: { agent?: string; model?: string; model_id?: string; effort?: string; mcp_tools?: string },
+): { agent?: string; model?: string; modelId?: string; effort?: string; mcpTools?: string } {
   return {
+    ...(resp.agent ? { agent: resp.agent } : {}),
     ...(resp.model ? { model: resp.model } : {}),
     ...(resp.model_id ? { modelId: resp.model_id } : {}),
     ...(resp.effort ? { effort: resp.effort } : {}),
@@ -81,6 +82,22 @@ export function latestViolationTurn(turns: Turn[]): Turn | undefined {
     if (t.role === 'agent' && t.violations && t.violations.length > 0) return t;
   }
   return undefined;
+}
+
+/**
+ * Every violation record on `latestViolationTurn`, whatever its status —
+ * pending, approved, or rejected.
+ *
+ * INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky): the
+ * reviewer-facing guards that decide whether `approvedFiles` MAY be passed read
+ * this, not `pendingViolations`. A task whose violations are all `approved` has
+ * nothing pending, but naming those files again is still a meaningful call —
+ * it is how a reviewer re-asserts a decision, and how the web review page
+ * replays its stored ✅ decisions. Gating the parameter on the PENDING set made
+ * that call unexpressible while the daemon still reverted on the same records.
+ */
+export function violationRecords(turns: Turn[]): FileViolation[] {
+  return latestViolationTurn(turns)?.violations ?? [];
 }
 
 /**

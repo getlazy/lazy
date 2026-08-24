@@ -64,6 +64,8 @@ describe('proxy server', () => {
     proxyServer = createProxyServer(
       { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
       mockSink.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
 
     // Give servers a moment to bind
@@ -137,6 +139,8 @@ describe('proxy server', () => {
     const p = createProxyServer(
       { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${up}` },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
     const pp = (p as unknown as { port: number }).port;
@@ -218,6 +222,8 @@ describe('proxy server', () => {
     const badProxy = createProxyServer(
       { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${badPort}` },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
     const pp = (badProxy as unknown as { port: number }).port;
@@ -286,6 +292,8 @@ describe('proxy smart routing (failover)', () => {
         fallbacks: [{ upstream: fallback.url, model: 'qwen-local' }],
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -330,6 +338,8 @@ describe('proxy smart routing (failover)', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primary.url, fallbacks: [{ upstream: fallback.url }] },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -363,6 +373,8 @@ describe('proxy smart routing (failover)', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primary.url },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -397,6 +409,8 @@ describe('proxy smart routing (failover)', () => {
         fallbacks: [{ upstream: fallback.url }],
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -428,6 +442,8 @@ describe('proxy smart routing (failover)', () => {
         fallbacks: [{ upstream: `http://127.0.0.1:${deadB}` }],
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -472,6 +488,8 @@ describe('proxy smart routing (failover)', () => {
         retryAfterThreshold: 5,
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -518,6 +536,8 @@ describe('proxy smart routing (failover)', () => {
         retryAfterThreshold: 5,
       },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -567,6 +587,8 @@ describe('proxy smart routing (failover)', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: primaryUrl, fallbacks: [{ upstream: fallback.url }] },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);
@@ -643,6 +665,8 @@ describe('proxy usage capture', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: upstream.url },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
 
@@ -686,6 +710,8 @@ describe('proxy usage capture', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: upstream.url },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
 
@@ -722,6 +748,8 @@ describe('proxy usage capture', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: upstream.url },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
 
@@ -759,6 +787,8 @@ describe('proxy usage capture', () => {
     const proxy = createProxyServer(
       { port: 0, bind: '127.0.0.1', upstream: upstream.url },
       ms.sink,
+      // No credential broker: these tests exercise forwarding, not JIT injection.
+      null,
     );
     await waitForFlush(20);
     const pp = portOf(proxy);

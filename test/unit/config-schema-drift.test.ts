@@ -15,7 +15,7 @@
  * here instead of surfacing as a bogus doctor warning.
  *
  * If this test fails, the fix is almost always one of:
- *   - the key is real → add it to KNOWN_CONFIG_SCHEMA (and docs/lazy-toml.md), or
+ *   - the key is real → add it to KNOWN_CONFIG_SCHEMA (and public-docs/lazy-toml.md), or
  *   - the key no longer exists → delete it from lazy.toml.example.
  * Do NOT "fix" it by loosening the scan.
  */
@@ -111,7 +111,6 @@ describe('KNOWN_CONFIG_SCHEMA vs the documented config surface', () => {
   test('a config using [proxy.policy] and [memory] is clean', () => {
     const raw = Bun.TOML.parse(`
 [proxy]
-enabled = true
 port = 8766
 
 [proxy.policy]

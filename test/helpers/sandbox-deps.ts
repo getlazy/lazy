@@ -20,11 +20,11 @@
  * `test/unit/host-sandbox-posture.test.ts`) never spawn one and need no gate.
  */
 
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 /** True when `name` resolves on PATH. */
 function onPath(name: string): boolean {
-  const result = spawnSync(['sh', '-c', `command -v ${name}`], {
+  const result = spawnSyncUnsupervised(['sh', '-c', `command -v ${name}`], {
     stdout: 'pipe',
     stderr: 'pipe',
   });

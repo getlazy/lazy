@@ -233,10 +233,11 @@ export interface CompletedResponse {
    * bundle's supervised follow-ups are separate `claude -p` invocations and, for
    * sync, run under different settings than the work phase.
    *
-   * `model`/`effort` are what was requested (the resolved `--model`/`--effort`
-   * values from the command); `model_id` is the concrete id the agent itself
-   * reported, present only when it reports one.
+   * `agent`/`model`/`effort` are what was requested (the command's `agent_id`
+   * and the resolved `--model`/`--effort` values); `model_id` is the concrete id
+   * the agent itself reported, present only when it reports one.
    */
+  agent?: string;
   model?: string;
   model_id?: string;
   effort?: string;
@@ -445,12 +446,13 @@ export interface ErrorResponse {
    */
   session_id?: string;
   /**
-   * Launch settings the failed invocation ran under (the requested `--model` and
-   * `--effort`). A crash turn is still an agent turn, and "which model crashed"
-   * is exactly the question a model/effort comparison needs answered. No
-   * `model_id` counterpart: a crashed invocation produced no parseable result,
-   * so the agent never self-reported one.
+   * Launch settings the failed invocation ran under (the command's `agent_id`
+   * and the requested `--model` / `--effort`). A crash turn is still an agent
+   * turn, and "which agent/model crashed" is exactly the question a comparison
+   * needs answered. No `model_id` counterpart: a crashed invocation produced no
+   * parseable result, so the agent never self-reported one.
    */
+  agent?: string;
   model?: string;
   effort?: string;
   /** See `CompletedResponse.worktree_recovery` — same field, failing turn. */
@@ -471,6 +473,17 @@ export interface ErrorResponse {
     settled: boolean;
     detail: string;
   };
+  /**
+   * True when the failed turn provably had no effect on the branch: no commits
+   * between turn start and turn end, AND the worktree is clean. This lets
+   * downstream consumers (reconciler, accept/pre-accept) skip mechanisms that
+   * only make sense when the agent actually did something — asking a crashed
+   * agent to "reflect on its work" is nonsensical when there is no work.
+   *
+   * Absence means "unknown" (older supervisor, or detection failed), not "had
+   * effect" — consumers must fall back to existing behavior when undefined.
+   */
+  agent_had_no_effect?: boolean;
 }
 
 export type Response = CompletedResponse | CompletedResponseBundle | ErrorResponse;

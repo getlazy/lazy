@@ -33,6 +33,7 @@ import { reparentChildren, formatReparentWarning } from '../cli/orphan';
 import { emitSignal } from './signals';
 import type { Storage } from '../storage';
 import { turnText } from '../utils/turn-content';
+import { parkTaskPaused } from '../utils/paused-status';
 
 /**
  * SyncLogger abstracts how sync progress is reported.
@@ -176,7 +177,7 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
         if (task.status === 'merging') {
           // Merging task's PR/MR was closed remotely — return to blocked so human can act
           log.detail(`  Remote ref closed while merging → task ${theme.taskId(displayId(task))} blocked`);
-          await storage.updateTaskStatus(task.id, 'blocked', getActor());
+          await parkTaskPaused(storage, task.id, getActor());
           await storage.createComment(task.id, 'Merge cancelled: PR/MR was closed on the remote while waiting for merge.', getActor());
         } else {
           log.detail(`  Remote ref closed externally → task ${theme.taskId(displayId(task))} closed`);
@@ -198,7 +199,7 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
           if (checksStatus.status === 'failed') {
             const failedNames = checksStatus.failed.map(f => f.name).join(', ');
             log.detail(`  Pipeline failed for merging task ${theme.taskId(displayId(task))} → blocked`);
-            await storage.updateTaskStatus(task.id, 'blocked', getActor());
+            await parkTaskPaused(storage, task.id, getActor());
             const failedDetails = checksStatus.failed
               .map(f => f.url ? `${f.name} (${f.url})` : f.name)
               .join(', ');

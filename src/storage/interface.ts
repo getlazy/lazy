@@ -67,6 +67,12 @@ export interface CreateTurnOptions {
   endShaWork?: string;
   mergeConflicts?: MergeConflict[];
   violations?: FileViolation[];
+  /**
+   * Agent id this turn was launched with (e.g. `claude-code`, `cursor`). Omit
+   * when it is not known — absent means "unknown", never "the task's current
+   * agent" and never the configured default. See `Turn.agent`.
+   */
+  agent?: string;
   /** Model this turn was launched with (request side — usually a tier alias). */
   model?: string;
   /**
@@ -108,6 +114,11 @@ export interface CreateTurnOptions {
    * those must never trigger redelivery. See `findPendingFeedback()`.
    */
   carriesFeedback?: boolean;
+  /**
+   * True when the error turn provably had no effect on the branch (no commits,
+   * clean worktree). See `Turn.agent_had_no_effect` for semantics.
+   */
+  agent_had_no_effect?: boolean;
 }
 
 export interface Storage {
@@ -230,6 +241,14 @@ export interface Storage {
   updateTaskPriority(taskId: string, priority: string): Promise<void>;
 
   /**
+   * Update the agent to use for this task. Allowed at any time while the task
+   * is live (not in terminal status). The change takes effect on the next turn.
+   * NOTE: When switching agents mid-task, the caller must also clear the
+   * session's agent_session_id since sessions cannot be resumed across agents.
+   */
+  updateTaskAgent(taskId: string, agentId: string): Promise<void>;
+
+  /**
    * Reset the pending_sync counter to 0 (called when sync launches).
    */
   resetTaskPendingSync(taskId: string): Promise<void>;
@@ -328,6 +347,14 @@ export interface Storage {
    * to discover/stop the run on the correct runner (see {@link Session.runner_type}).
    */
   updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void>;
+
+  /**
+   * Update session's agent when switching agents mid-task. This updates the
+   * session's agent_id AND clears the agent_session_id (sessions cannot be
+   * resumed across different agents — each agent has its own session format).
+   * The next turn starts a fresh agent session with the new agent.
+   */
+  updateSessionAgent(sessionId: string, agentId: string): Promise<void>;
 
   /**
    * Update session interaction tracking

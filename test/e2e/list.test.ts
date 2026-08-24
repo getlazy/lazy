@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
 
 describe('lazy list', () => {
@@ -417,5 +417,133 @@ describe('lazy list', () => {
     expectOutput(result, 'Parent');
     expectOutput(result, 'Child');
     expectOutputExcludes(result, 'Unrelated');
+  });
+});
+
+/**
+ * `--levels <n>` depth scoping on `lazy list` / `lazy blocked`.
+ *
+ * INVARIANT — the number is 1-BASED and counts the levels of the listing as
+ * rendered: `--levels 1` shows top-level rows only, `--levels 2` adds their
+ * children. It is deliberately NOT the engineer's literal `--depth 0` spelling:
+ * "0" reads as "nothing" as easily as "roots only", and a listing flag whose
+ * most useful value is ambiguous is a trap (CLAUDE.md, principle of least
+ * surprise).
+ *
+ * INVARIANT — a depth-limited listing must never look complete. Every elided
+ * subtree is reported twice: "(+N hidden)" on the deepest visible row, and a
+ * footnote totalling what the limit dropped.
+ */
+describe('lazy list/blocked --levels', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+    disablePreAccept(ctx.root);
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  /** grandparent → parent → child, plus an unrelated top-level task. */
+  async function createHierarchy(): Promise<void> {
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Depth root', '--code', 'depth-root']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Depth kid', '--code', 'depth-kid', '--parent', 'depth-root']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Depth grandkid', '--code', 'depth-gk', '--parent', 'depth-kid']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Depth sibling', '--code', 'depth-sib']));
+  }
+
+  test('--levels 1 shows only top-level tasks and counts what it hid', async () => {
+    await createHierarchy();
+
+    const result = await ctx.lazy(['list', '--levels', '1']);
+    expectSuccess(result);
+    expectOutput(result, 'Depth root');
+    expectOutput(result, 'Depth sibling');
+    expectOutputExcludes(result, 'Depth kid');
+    expectOutputExcludes(result, 'Depth grandkid');
+
+    // Both elision signals: the per-row marker and the footnote.
+    expectOutput(result, '(+2 hidden)');
+    expectOutput(result, '2 descendant task(s) hidden below --levels 1');
+  });
+
+  test('--levels 2 shows one level of children and hides below it', async () => {
+    await createHierarchy();
+
+    const result = await ctx.lazy(['list', '--levels', '2']);
+    expectSuccess(result);
+    expectOutput(result, 'Depth root');
+    expectOutput(result, 'Depth kid');
+    expectOutputExcludes(result, 'Depth grandkid');
+    expectOutput(result, '(+1 hidden)');
+    expectOutput(result, '1 descendant task(s) hidden below --levels 2');
+  });
+
+  test('no --levels means no limit and no elision noise', async () => {
+    await createHierarchy();
+
+    const result = await ctx.lazy(['list']);
+    expectSuccess(result);
+    expectOutput(result, 'Depth grandkid');
+    expectOutputExcludes(result, 'hidden');
+  });
+
+  // INVARIANT: levels are counted from the ROWS THIS LISTING SHOWS, so a
+  // subtree filter makes the filtered task level 1 — the two scopings compose
+  // rather than one silently winning.
+  test('composes with the subtree positional', async () => {
+    await createHierarchy();
+
+    const result = await ctx.lazy(['list', 'depth-kid', '--levels', '1']);
+    expectSuccess(result);
+    expectOutput(result, 'Depth kid');
+    expectOutputExcludes(result, 'Depth grandkid');
+    expectOutputExcludes(result, 'Depth root');
+    expectOutput(result, '(+1 hidden)');
+  });
+
+  test('--flat honors the limit too', async () => {
+    await createHierarchy();
+
+    const result = await ctx.lazy(['list', '--levels', '1', '--flat']);
+    expectSuccess(result);
+    expectOutput(result, 'PARENT');
+    expectOutput(result, 'Depth root');
+    expectOutputExcludes(result, 'Depth kid');
+    expectOutput(result, '(+2 hidden)');
+  });
+
+  test('rejects a non-positive or non-numeric value instead of guessing', async () => {
+    const zero = await ctx.lazy(['list', '--levels', '0']);
+    expectFailure(zero);
+    expectError(zero, '--levels must be a positive integer');
+
+    const word = await ctx.lazy(['list', '--levels', 'deep']);
+    expectFailure(word);
+    expectError(word, '--levels must be a positive integer');
+  });
+
+  test('lazy blocked --levels 1 hides blocked descendants and says so', async () => {
+    const parentId = await createTask(ctx, 'Blocked parent', 'Do work');
+    await startAndReconcile(ctx, parentId);
+
+    expectSuccess(await ctx.lazy([
+      'create', '--goal', 'Blocked kid', '--prompt', 'Do work', '--code', 'blocked-kid', '--parent', parentId,
+    ]));
+    await startAndReconcile(ctx, 'blocked-kid');
+
+    const unlimited = await ctx.lazy(['blocked']);
+    expectSuccess(unlimited);
+    expectOutput(unlimited, 'Blocked parent');
+    expectOutput(unlimited, 'Blocked kid');
+
+    const limited = await ctx.lazy(['blocked', '--levels', '1']);
+    expectSuccess(limited);
+    expectOutput(limited, 'Blocked parent');
+    expectOutputExcludes(limited, 'Blocked kid');
+    expectOutput(limited, '(+1 hidden)');
+    expectOutput(limited, '1 descendant task(s) hidden below --levels 1');
   });
 });

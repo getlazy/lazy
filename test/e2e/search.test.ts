@@ -373,7 +373,7 @@ describe('lazy search', () => {
     // INVARIANT: adjacent terms with no operator are an implicit AND — NOT a
     // parse error. This is the documented grammar ("and_expr → term ((AND |
     // implicit_AND) term)*" in src/search/parser.ts) and documented user-facing
-    // behavior (docs/search.md, "adjacent tokens are an implicit AND", which is
+    // behavior (public-docs/search.md, "adjacent tokens are an implicit AND", which is
     // also why `tag:My Feature Work` silently matches nothing). This test
     // previously asserted the opposite; implicit AND shipped in v0.9, after the
     // assertion was written in v0.5, and the assertion was never updated.

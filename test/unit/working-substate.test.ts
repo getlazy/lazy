@@ -259,6 +259,84 @@ describe('deriveWorkingSubstate', () => {
   });
 });
 
+describe('agent-reported progress', () => {
+  const progress = { message: 'running migration 3/7', recorded_at: '2026-08-19T10:00:00.000Z' };
+
+  // The progress line rides ALONGSIDE the kind: it answers "doing what?", not
+  // "who is active?", so it never changes which substate is derived.
+  test('decorates the plain agent substate', () => {
+    const s = deriveWorkingSubstate(baseStatus, { isAlive: true, hasResponse: false, progress });
+    expect(s).toEqual({ kind: 'agent', progress: 'running migration 3/7' });
+  });
+
+  test('decorates agent:answering and agent:pre-accept', () => {
+    expect(
+      deriveWorkingSubstate({ ...baseStatus, command_type: 'ask' }, { isAlive: true, hasResponse: false, progress }),
+    ).toEqual({ kind: 'agent', answering: true, progress: 'running migration 3/7' });
+    expect(
+      deriveWorkingSubstate(
+        { ...baseStatus, command_type: 'pre_accept' },
+        { isAlive: true, hasResponse: false, progress },
+      ),
+    ).toEqual({ kind: 'agent', preAccept: true, progress: 'running migration 3/7' });
+  });
+
+  test('decorates a wait', () => {
+    const s = deriveWorkingSubstate(baseStatus, {
+      isAlive: true,
+      hasResponse: false,
+      progress,
+      waits: [
+        {
+          id: 'w1',
+          tool: 'lazy_wait',
+          targets: ['task-2'],
+          labels: ['fix-foo'],
+          started_at: '2026-08-19T09:59:00.000Z',
+        },
+      ],
+    });
+    expect(s!.kind).toBe('waiting');
+    expect(s!.progress).toBe('running migration 3/7');
+  });
+
+  // INVARIANT: a harness phase is the SUPERVISOR's work. Showing the agent's
+  // last line there would report a claim about a turn phase that has ended.
+  test('is absent from harness phases', () => {
+    const s = deriveWorkingSubstate(
+      { ...baseStatus, phase: 'post_turn_check' },
+      { isAlive: true, hasResponse: false, progress },
+    );
+    expect(s!.kind).toBe('harness');
+    expect(s!.progress).toBeUndefined();
+  });
+
+  // A dead run is not making progress, whatever the marker says.
+  test('is absent from not-alive', () => {
+    const s = deriveWorkingSubstate(baseStatus, { isAlive: false, hasResponse: false, progress });
+    expect(s).toEqual({ kind: 'not-alive' });
+  });
+
+  test('no progress reported renders exactly as before', () => {
+    expect(deriveWorkingSubstate(baseStatus, { isAlive: true, hasResponse: false, progress: null })).toEqual({
+      kind: 'agent',
+    });
+  });
+
+  test('the label appends the line after a colon', () => {
+    const now = new Date('2026-08-19T10:01:00.000Z');
+    expect(formatWorkingSubstate({ kind: 'agent', progress: 'running migration 3/7' }, now)).toBe(
+      'agent: running migration 3/7',
+    );
+    expect(formatWorkingSubstate({ kind: 'agent', answering: true, progress: 'drafting' }, now)).toBe(
+      'agent:answering: drafting',
+    );
+    expect(renderWorkingStatus({ kind: 'agent', progress: 'running migration 3/7' }, now)).toBe(
+      'working(agent: running migration 3/7)',
+    );
+  });
+});
+
 describe('formatWorkingSubstate', () => {
   const now = new Date('2026-05-17T10:03:00.000Z');
 

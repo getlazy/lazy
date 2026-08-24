@@ -38,6 +38,14 @@ export const LOG_FILE = 'daemon.log';
  * token stored in-repo would be readable by every other agent.
  */
 export const MCP_TOKENS_FILE = 'mcp-tokens.json';
+/**
+ * Registry binding each minted proxy PLACEHOLDER credential to ONE launch
+ * identity (a task agent, or the builder). See src/proxy/credential-broker.ts.
+ * Same placement rationale as MCP_TOKENS_FILE: task containers mount the repo
+ * read-only, so a registry stored in-repo would be readable by every agent it
+ * is meant to separate.
+ */
+export const PROXY_TOKENS_FILE = 'proxy-tokens.json';
 /** Directory holding per-identity daemon MCP config files (see MCP_TOKENS_FILE). */
 export const MCP_CONFIG_DIR = 'mcp';
 export const DAEMON_LOCK_FILE = 'daemon.lock';
@@ -92,6 +100,11 @@ export function getTokenPath(projectRoot: string): string {
 /** MCP token registry: ~/.lazy/daemon/<slug>/mcp-tokens.json */
 export function getMcpTokensPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), MCP_TOKENS_FILE);
+}
+
+/** Proxy placeholder-credential registry: ~/.lazy/daemon/<slug>/proxy-tokens.json */
+export function getProxyTokensPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), PROXY_TOKENS_FILE);
 }
 
 /** Per-identity daemon MCP config dir: ~/.lazy/daemon/<slug>/mcp/ */

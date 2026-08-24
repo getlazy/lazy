@@ -103,6 +103,42 @@ export class FatalAgentError extends Error {
   }
 }
 
+/**
+ * The fast-crash-loop backstop firing: 3 sub-10s failures in a row.
+ *
+ * WHY IT IS NOT A `FatalAgentError`: a crash loop is not a verdict that the
+ * condition is unrecoverable — the detector only runs for `unknown` failures
+ * (see appliesFastFailDetection), i.e. exactly the ones we could not judge. Many
+ * are transient, so the task stays on the `interrupted` + auto-resume path.
+ *
+ * It used to throw a bare `Error`, which meant everything the loop HAD learned
+ * (class, agent-authored reason, how many attempts it burned) never reached the
+ * ErrorResponse — the recorded turn said only "Crash loop detected: …" and the
+ * `lazy watch` header rendered `(unknown)` with no attempt count. This carries
+ * it so the diagnosis survives, without changing where the task lands.
+ */
+export class CrashLoopError extends Error {
+  failureClass: AgentFailureClass;
+  failureReason: string;
+  attempts: number;
+  usage?: AgentTokenUsage;
+
+  constructor(opts: {
+    message: string;
+    failureClass: AgentFailureClass;
+    failureReason: string;
+    attempts: number;
+    usage?: AgentTokenUsage;
+  }) {
+    super(opts.message);
+    this.name = 'CrashLoopError';
+    this.failureClass = opts.failureClass;
+    this.failureReason = opts.failureReason;
+    this.attempts = opts.attempts;
+    this.usage = opts.usage;
+  }
+}
+
 export interface RetryState {
   count: number;
   errors: RetryError[];
@@ -264,8 +300,9 @@ async function executeAgent(
       `  Container/host: ${hostname()}\n` +
       `  Observed at session start: ${mcpObservation ?? 'unavailable'}\n` +
       `An agent without lazy tools cannot read task history, record follow-ups, or reach any ` +
-      `lazy state, so its turn is not trustworthy. Note that \`claude mcp list\` printing ` +
-      `"✔ Connected" does NOT contradict this: it proves only that the MCP server process ` +
+      `lazy state, so its turn is not trustworthy. Note that the agent CLI's own MCP status ` +
+      `check (e.g. \`claude mcp list\`) printing "✔ Connected" does NOT contradict this: it ` +
+      `proves only that the MCP server process ` +
       `starts and answers \`initialize\`, never that it registered any tools or that the agent ` +
       `loaded them. Run \`lazy-agent doctor\` inside the agent container to find out which ` +
       `link is broken, and \`lazy daemon status\` on the host.`,
@@ -758,6 +795,15 @@ export async function runWork(
       const failure: AgentFailure = classifyFailure(agent, err, errorMessage);
       log(`[work] Failure classified as ${failure.class}: ${failure.reason}`);
 
+      // Record the error BEFORE any decision below can end the turn — the
+      // crash-loop backstop exits from inside the detector, and it must be able
+      // to report the attempt it died on rather than the one before it.
+      retryState.errors = recordError(retryState.errors, errorMessage, failure.class);
+      retryState.count++;
+      retryState.lastLaunchTime = launchTime;
+      retryState.failureClass = failure.class;
+      retryState.failureReason = failure.reason;
+
       // Track fast failures for crash loop detection.
       // Only for `unknown`: a 429 or a refused connection fails in milliseconds,
       // so counting those as a "crash loop" would abort a turn that is about to
@@ -769,21 +815,26 @@ export async function runWork(
           retryState.consecutiveFastFails = 0;
         }
 
-        // Fast-fail detection: 3 consecutive crashes under 10s = crash loop
+        // Fast-fail detection: 3 consecutive crashes under 10s = crash loop.
+        // Stop retrying; the task lands in `interrupted` for auto-resume later.
+        // We don't force `blocked` here because many crash-loop causes are transient
+        // (network blips, provider 529s, temporary API bugs) and resolve on their own.
         if (retryState.consecutiveFastFails >= 3) {
           logError('[work] Detected crash loop (3 fast failures). Stopping retries.');
-          fail(new Error(`Crash loop detected: ${errorMessage}`));
+          retryState.nextDelayMs = undefined;
+          if (onRetryStateChange) {
+            onRetryStateChange(retryState);
+          }
+          fail(new CrashLoopError({
+            message: `Crash loop detected: ${errorMessage}`,
+            failureClass: failure.class,
+            failureReason: failure.reason,
+            attempts: retryState.count,
+          }));
         }
       } else {
         retryState.consecutiveFastFails = 0;
       }
-
-      // Record the error
-      retryState.errors = recordError(retryState.errors, errorMessage, failure.class);
-      retryState.count++;
-      retryState.lastLaunchTime = launchTime;
-      retryState.failureClass = failure.class;
-      retryState.failureReason = failure.reason;
 
       const decision = decideRetry(failure, retryState.count);
 

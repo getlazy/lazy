@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { setSectionStringArray, setSectionBoolean, TomlEditError } from '../../src/config/toml-edit';
+import { setSectionStringArray, setSectionBoolean, setSectionString, TomlEditError } from '../../src/config/toml-edit';
 
 describe('setSectionStringArray', () => {
   test('adds a key to an existing section without touching its comments', () => {
@@ -44,9 +44,9 @@ describe('setSectionStringArray', () => {
   });
 
   test('replaces an existing value in place, keeping order and indentation', () => {
-    const input = '[protection]\nenabled = true\nprotected_branches = ["release"]\npassphrase_file = "x"\n';
+    const input = '[protection]\nenabled = true\nprotected_branches = ["release"]\ngate_default_branch = true\n';
     const out = setSectionStringArray(input, 'protection', 'protected_branches', ['release', 'main']);
-    expect(out).toBe('[protection]\nenabled = true\nprotected_branches = ["release", "main"]\npassphrase_file = "x"\n');
+    expect(out).toBe('[protection]\nenabled = true\nprotected_branches = ["release", "main"]\ngate_default_branch = true\n');
   });
 
   test('collapses a multi-line array into one line', () => {
@@ -168,5 +168,43 @@ describe('setSectionBoolean', () => {
     const parsed = Bun.TOML.parse(out) as { protection: Record<string, unknown>; remote: Record<string, unknown> };
     expect(parsed.protection.enabled).toBe(true);
     expect(parsed.remote.driver).toBe('local');
+  });
+});
+
+describe('setSectionString', () => {
+  test('replaces an existing string value, preserving comments around it', () => {
+    const input = [
+      '[agent]',
+      '# Default agent for task execution. Available: "claude-code", "cursor".',
+      'agent_id = "claude-code"',
+      '# effort docs',
+      '# effort = "medium"',
+      '',
+    ].join('\n');
+    const out = setSectionString(input, 'agent', 'agent_id', 'cursor');
+    const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown> };
+    expect(parsed.agent.agent_id).toBe('cursor');
+    // Comments survive byte-for-byte.
+    expect(out).toContain('# Default agent for task execution');
+    expect(out).toContain('# effort = "medium"');
+    expect(out).not.toContain('agent_id = "claude-code"');
+  });
+
+  test('creates the key when only the section exists', () => {
+    const out = setSectionString('[agent]\n# docs only\n', 'agent', 'agent_id', 'cursor');
+    const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown> };
+    expect(parsed.agent.agent_id).toBe('cursor');
+  });
+
+  test('creates the section when it does not exist', () => {
+    const out = setSectionString('[remote]\ndriver = "local"\n', 'agent', 'agent_id', 'cursor');
+    const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown> };
+    expect(parsed.agent.agent_id).toBe('cursor');
+  });
+
+  test('escapes quotes and backslashes', () => {
+    const out = setSectionString('', 'agent', 'agent_id', 'we"ird\\name');
+    const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown> };
+    expect(parsed.agent.agent_id).toBe('we"ird\\name');
   });
 });

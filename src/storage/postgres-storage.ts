@@ -111,6 +111,7 @@ function dropNullOptionals<T>(row: Record<string, unknown>, optionalColumns: rea
 const TURN_OPTIONAL_COLUMNS = [
   'merge_conflicts',
   'violations',
+  'agent',
   'model',
   'model_id',
   'effort',
@@ -122,6 +123,7 @@ const TURN_OPTIONAL_COLUMNS = [
   'auto_triggered',
   'turn_type',
   'feedback_delivery',
+  'agent_had_no_effect',
 ] as const;
 
 /** JSONB columns on `turns` that must come back as structured values. */
@@ -286,6 +288,9 @@ export class PostgresStorage implements Storage {
     if (version < 15) {
       await this.migrateToV15();
     }
+    if (version < 16) {
+      await this.migrateToV16();
+    }
   }
 
   private async migrateToV1(): Promise<void> {
@@ -382,7 +387,8 @@ export class PostgresStorage implements Storage {
           check_output TEXT,
           model_id TEXT,
           effort TEXT,
-          mcp_tools TEXT
+          mcp_tools TEXT,
+          agent TEXT
         )
       `;
 
@@ -452,10 +458,10 @@ export class PostgresStorage implements Storage {
         END $$
       `;
       await sql`
-        DO $ BEGIN
+        DO $$ BEGIN
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS effort TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
-        END $
+        END $$
       `;
 
       // Migration: add mcp_tools — what the agent reported about its own lazy
@@ -463,10 +469,22 @@ export class PostgresStorage implements Storage {
       // honest reading: those turns were never observed, which is not the same
       // as having had no tools.
       await sql`
-        DO $ BEGIN
+        DO $$ BEGIN
           ALTER TABLE turns ADD COLUMN IF NOT EXISTS mcp_tools TEXT;
         EXCEPTION WHEN duplicate_column THEN NULL;
-        END $
+        END $$
+      `;
+
+      // Migration: add agent — which agent id ran this turn. NULL on every
+      // pre-existing row is the honest reading: `lazy edit --agent` switches a
+      // task's agent mid-flight, so back-filling from today's task-level
+      // agent_id would relabel turns that ran under a different agent. Old
+      // turns stay readable with NULL and render as unknown.
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE turns ADD COLUMN IF NOT EXISTS agent TEXT;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
       `;
 
       // Commits table
@@ -1192,6 +1210,10 @@ export class PostgresStorage implements Storage {
     await this.sql`UPDATE tasks SET priority = ${priority} WHERE id = ${taskId}`;
   }
 
+  async updateTaskAgent(taskId: string, agentId: string): Promise<void> {
+    await this.sql`UPDATE tasks SET agent_id = ${agentId} WHERE id = ${taskId}`;
+  }
+
   async resetTaskPendingSync(taskId: string): Promise<void> {
     await this.sql`UPDATE tasks SET pending_sync = 0 WHERE id = ${taskId}`;
   }
@@ -1400,6 +1422,12 @@ export class PostgresStorage implements Storage {
     await this.sql`UPDATE sessions SET runner_type = ${runnerType} WHERE id = ${sessionId}`;
   }
 
+  async updateSessionAgent(sessionId: string, agentId: string): Promise<void> {
+    // Update agent and clear agent_session_id — sessions cannot be resumed
+    // across different agents because each agent has its own session format.
+    await this.sql`UPDATE sessions SET agent_id = ${agentId}, agent_session_id = NULL WHERE id = ${sessionId}`;
+  }
+
   async updateSessionInteraction(sessionId: string, durationMs: number): Promise<void> {
     const now = Date.now();
     await this.sql`
@@ -1485,7 +1513,7 @@ export class PostgresStorage implements Storage {
         start_sha, end_sha, start_sha_work, end_sha_work,
         merge_conflicts, violations, usage, timestamp,
         check_exit_code, check_output, auto_triggered, turn_type,
-        feedback_delivery, model_id, effort, mcp_tools
+        feedback_delivery, model_id, effort, mcp_tools, agent_had_no_effect, agent
       )
       VALUES (
         ${id}, ${options.sessionId}, ${options.sequence}, ${options.role}, ${content},
@@ -1498,7 +1526,8 @@ export class PostgresStorage implements Storage {
         ${options.checkExitCode ?? null}, ${options.checkOutput ?? null},
         ${options.autoTriggered ?? false}, ${storedTurnType},
         ${storedFeedbackDelivery}, ${options.modelId ?? null}, ${options.effort ?? null},
-        ${options.mcpTools ?? null}
+        ${options.mcpTools ?? null}, ${options.agent_had_no_effect ?? null},
+        ${options.agent ?? null}
       )
     `;
 
@@ -1519,6 +1548,7 @@ export class PostgresStorage implements Storage {
       timestamp: now,
       ...(options.mergeConflicts ? { merge_conflicts: options.mergeConflicts } : {}),
       ...(options.violations ? { violations: options.violations } : {}),
+      ...(options.agent ? { agent: options.agent } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.prompt ? { prompt: options.prompt } : {}),
       ...(options.actor ? { actor: options.actor } : {}),
@@ -1530,6 +1560,7 @@ export class PostgresStorage implements Storage {
       ...(options.modelId ? { model_id: options.modelId } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
       ...(options.mcpTools ? { mcp_tools: options.mcpTools } : {}),
+      ...(options.agent_had_no_effect !== undefined ? { agent_had_no_effect: options.agent_had_no_effect } : {}),
     };
   }
 
@@ -1683,16 +1714,30 @@ export class PostgresStorage implements Storage {
     return ancestry.length > 0 ? ancestry[0] : null;
   }
 
+  /**
+   * Ancestry of a task, root first.
+   *
+   * INVARIANT: a corrupt store must never hang or crash the daemon. The `path`
+   * column below is a cycle guard: without it a parent cycle (A → B → A) makes
+   * this recursive CTE recurse forever, hanging whichever daemon request asked
+   * for the ancestry. On a cycle the walk stops at the repeat and the chain
+   * walked so far is returned — same contract as FileStorage.getTaskAncestry
+   * and the guard in `collectSubtreeIds` (src/task-target.ts).
+   */
   async getTaskAncestry(taskId: string): Promise<Task[]> {
-    const results = this.rowsToTasks(await this.sql`
+    return this.rowsToTasks(await this.sql`
       WITH RECURSIVE ancestors AS (
-        SELECT * FROM tasks WHERE id = ${taskId}
+        SELECT t.id, t.parent_task_id, 0 AS depth, ARRAY[t.id] AS path
+        FROM tasks t WHERE t.id = ${taskId}
         UNION ALL
-        SELECT t.* FROM tasks t INNER JOIN ancestors a ON t.id = a.parent_task_id
+        SELECT t.id, t.parent_task_id, a.depth + 1, a.path || t.id
+        FROM tasks t
+        INNER JOIN ancestors a ON t.id = a.parent_task_id
+        WHERE NOT t.id = ANY(a.path)
       )
-      SELECT * FROM ancestors
+      SELECT t.* FROM ancestors a INNER JOIN tasks t ON t.id = a.id
+      ORDER BY a.depth DESC
     `);
-    return results.reverse();
   }
 
   async getTaskTree(rootTaskId: string, depth: number = 0): Promise<TaskTreeNode | null> {
@@ -2033,6 +2078,22 @@ export class PostgresStorage implements Storage {
       await sql`
         INSERT INTO schema_version (version, migrated_from)
         VALUES (15, '14')
+        ON CONFLICT (version) DO NOTHING
+      `;
+    });
+  }
+
+  private async migrateToV16(): Promise<void> {
+    // Track when an agent error turn had no effect on the branch (no commits,
+    // clean worktree). Lets downstream (accept, pre-accept) skip mechanisms
+    // that only make sense when the agent actually did work — asking a crashed
+    // agent to "reflect on its work" is nonsensical when there is no work.
+    await this.sql.begin(async (txSql) => {
+      const sql = txSql as unknown as ReturnType<typeof postgres>;
+      await sql`ALTER TABLE turns ADD COLUMN IF NOT EXISTS agent_had_no_effect BOOLEAN`;
+      await sql`
+        INSERT INTO schema_version (version, migrated_from)
+        VALUES (16, '15')
         ON CONFLICT (version) DO NOTHING
       `;
     });

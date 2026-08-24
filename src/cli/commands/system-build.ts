@@ -73,7 +73,7 @@ Images are tagged with lazy's major.minor version (lazy-runner:${IMAGE_TAG}). Th
 base image also gets a \`:latest\` alias pointing at that same build, which is
 what \`FROM lazy-runner\` resolves to.
 
-The image carries Claude Code and the Dockerfile's own packages, not lazy
+The image carries the configured agent's CLI and the Dockerfile's own packages, not lazy
 itself — lazy-agent is mounted into the container at launch. It is rebuilt by
 \`lazy upgrade\`, when the Dockerfile changes, and automatically once it is more
 than ${IMAGE_MAX_AGE_DAYS} days old.

@@ -16,15 +16,15 @@ import {
   _resetPushState,
 } from '../../src/daemon/push';
 import { localBranchExists, branchExists } from '../../src/git/operations';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 describe('localBranchExists', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-branch-test-'));
-    spawnSync(['git', 'init', tmpDir]);
-    spawnSync(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'init', tmpDir]);
+    spawnSyncUnsupervised(['git', 'commit', '--allow-empty', '-m', 'init'], { cwd: tmpDir });
   });
 
   afterEach(async () => {
@@ -33,7 +33,7 @@ describe('localBranchExists', () => {
 
   // INVARIANT: localBranchExists returns true for existing local branches.
   test('returns true for existing local branch', async () => {
-    spawnSync(['git', 'branch', 'test-branch'], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'branch', 'test-branch'], { cwd: tmpDir });
     expect(await localBranchExists('test-branch', tmpDir)).toBe(true);
   });
 
@@ -49,12 +49,12 @@ describe('localBranchExists', () => {
   // refs exist but local branches don't. pushBranch needs local refs to work.
   test('returns false for remote-only tracking branch', async () => {
     // Create a remote tracking ref manually (simulating fetched remote)
-    spawnSync(['git', 'branch', 'temp-branch'], { cwd: tmpDir });
-    const sha = spawnSync(['git', 'rev-parse', 'temp-branch'], { cwd: tmpDir, stdout: 'pipe' });
+    spawnSyncUnsupervised(['git', 'branch', 'temp-branch'], { cwd: tmpDir });
+    const sha = spawnSyncUnsupervised(['git', 'rev-parse', 'temp-branch'], { cwd: tmpDir, stdout: 'pipe' });
     const commitHash = sha.stdout.toString().trim();
 
     // Create a remote tracking ref
-    spawnSync(['git', 'update-ref', 'refs/remotes/origin/lazy/test.abc12345', commitHash], { cwd: tmpDir });
+    spawnSyncUnsupervised(['git', 'update-ref', 'refs/remotes/origin/lazy/test.abc12345', commitHash], { cwd: tmpDir });
 
     // localBranchExists should NOT find the remote tracking ref
     expect(await localBranchExists('lazy/test.abc12345', tmpDir)).toBe(false);

@@ -57,6 +57,10 @@ function ts(): string {
  * context about prior conversations. Includes as many recent turns as
  * fit within the character budget, prioritizing the most recent ones.
  *
+ * When the budget is exceeded, oldest turns are dropped and an explicit
+ * truncation notice is prepended — silent elision would let the agent treat
+ * a partial transcript as complete (see docs/spikes/cross-agent-context-handoff.md).
+ *
  * Returns empty string if no turns are provided.
  */
 export function buildTurnHistoryContext(turns: Turn[], maxChars: number = 80000): string {
@@ -76,19 +80,35 @@ export function buildTurnHistoryContext(turns: Turn[], maxChars: number = 80000)
 
   if (selected.length === 0) return '';
 
+  const truncated = selected.length < turns.length;
+  const omittedOriginalPrompt =
+    truncated && selected[0] !== undefined && selected[0].sequence > 1;
+
+  // Agent-neutral wording: this path also runs after a Cursor→Claude (or
+  // reverse) switch, so naming Claude Code specifically was wrong.
   const header = `PREVIOUS CONVERSATION HISTORY:
-The previous Claude Code session for this task was destroyed. Below is the conversation
-history from that session so you have context about what was discussed, what decisions
-were made, and what feedback was given. Use this to continue the work effectively.
+The previous agent session for this task could not be resumed (session reset or
+agent switch). Below is a distilled conversation history from lazy's turn store
+so you have context about what was discussed, what decisions were made, and what
+feedback was given. Use this to continue the work effectively — it is not a
+verbatim transcript of the prior agent's tool calls or private reasoning.
 
 `;
+
+  const truncationNotice = truncated
+    ? `NOTE: History is truncated to the most recent ${selected.length} of ${turns.length} turns ` +
+      `(~${maxChars} character budget). Older turns` +
+      (omittedOriginalPrompt ? ' (including possibly the original task prompt)' : '') +
+      ` were omitted. Do not assume this transcript is complete — inspect the branch ` +
+      `and commits for work that may predate the retained turns.\n\n`
+    : '';
 
   const turnTexts = selected.map(t => {
     const role = t.role === 'human' ? 'HUMAN' : 'AGENT';
     return `--- ${role} (turn ${t.sequence}) ---\n${turnText(t)}`;
   });
 
-  return header + turnTexts.join('\n\n') + '\n\n--- END OF PREVIOUS CONVERSATION ---\n\n';
+  return header + truncationNotice + turnTexts.join('\n\n') + '\n\n--- END OF PREVIOUS CONVERSATION ---\n\n';
 }
 
 /**
@@ -944,6 +964,12 @@ export async function getEditorFeedback(
  * Run the editor-based feedback flow from interactive mode.
  * This is the "Give feedback" path from the interactive choice menu.
  * Returns 'continue' to return to the interactive menu, or 'done' when complete.
+ *
+ * @param approvedFiles - For conflict tasks: which violated files to keep (approve).
+ *   Files not in this array are reverted. The caller is responsible for prompting
+ *   the user before passing this — runFeedbackFlow does not prompt on its own.
+ *   Pass [] to revert all files (explicit rejection), or undefined when the task
+ *   has no violations.
  */
 export async function runFeedbackFlow(
   task: Awaited<ReturnType<Awaited<ReturnType<typeof requireStorage>>['getTask']>>,
@@ -955,6 +981,8 @@ export async function runFeedbackFlow(
   follow: boolean,
   modelOverride?: string,
   effortOverride?: string,
+  agentOverride?: string,
+  approvedFiles?: string[],
 ): Promise<'continue' | 'done'> {
   const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, parentTaskIdOf(task!), root, displayId(task!));
 
@@ -984,6 +1012,8 @@ export async function runFeedbackFlow(
         modelOverride,
         notesInEditor: result.notesInEditor,
         effortOverride,
+        agentOverride,
+        approvedFiles,
       });
 
       // Clean up recovery file — feedback is now durably persisted in daemon

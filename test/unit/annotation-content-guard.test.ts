@@ -26,7 +26,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createStorage, type Storage } from '../../src/storage';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import {
   MISSING_RECORD_CONTENT,
   normalizeRecordContent,
@@ -74,12 +74,12 @@ describe('storage reads over content-less annotation records', () => {
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-annotation-content-test-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
-    spawnSync(['git', 'init'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
-    spawnSync(['git', 'config', 'user.email', 't@example.com'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 't@example.com'], { cwd: testDir });
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
-    spawnSync(['git', 'add', '.'], { cwd: testDir });
-    spawnSync(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
     storage = await createStorage(testDir, { backend: 'external' });
     task = await storage.createTask('Test task', undefined, undefined, 'test-task');

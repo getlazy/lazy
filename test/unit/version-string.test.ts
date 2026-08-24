@@ -15,7 +15,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { computeVersion, detectBranch } from '../../scripts/version-string';
 
 /** A repo with a known package.json version and exactly `commits` commits. */
@@ -24,7 +24,7 @@ async function makeRepo(commits = 3): Promise<string> {
   await writeFile(join(dir, 'package.json'), JSON.stringify({ name: 'x', version: '7.4.0' }));
 
   const run = (...args: string[]) => {
-    const result = spawnSync(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+    const result = spawnSyncUnsupervised(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
     if (result.exitCode !== 0) {
       throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
     }
@@ -42,7 +42,7 @@ async function makeRepo(commits = 3): Promise<string> {
 }
 
 function git(dir: string, ...args: string[]): string {
-  const result = spawnSync(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
+  const result = spawnSyncUnsupervised(['git', ...args], { cwd: dir, stdout: 'pipe', stderr: 'pipe' });
   return result.stdout.toString().trim();
 }
 

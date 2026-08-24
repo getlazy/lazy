@@ -136,7 +136,7 @@ Inspect:
   reject <task_id>       Reject a task's work and close its PR
   revert <task_id>       Undo an accepted task (create revert task)
   rework <task_id>       Create follow-up task for accepted work that needs changes
-  redo <task_id>         Abandon stale task and restart fresh on current main
+  redo <task_id>         Abandon stale task and restart it on a fresh branch
   submit <task_id>       Submit a task for human review (opens a PR)
 
 Link:
@@ -462,8 +462,8 @@ if (!isHelpOrVersion) {
       //
       // This removes the FIRST abort, not every one. On a broken config doctor
       // now completes, because it skips createRunner when the config did not
-      // load. When the daemon is absent for some OTHER reason and `[proxy]` is
-      // enabled, doctor still dies further in, at createRunner's proxy
+      // load. When the daemon is absent for some OTHER reason, doctor
+      // still dies further in, at createRunner's proxy
       // fail-loud gate — a separate blocker on the same goal, recorded as a
       // follow-up rather than fixed here.
       if (command === 'doctor') {

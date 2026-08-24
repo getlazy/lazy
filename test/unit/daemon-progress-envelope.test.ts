@@ -31,7 +31,9 @@ describe('progress lines in the heartbeat envelope', () => {
     const result = await readHeartbeatEnvelope(response, 'accept', undefined, e => seen.push(e));
 
     expect(result).toEqual({ status: 200, body: { merged: true } });
-    expect(seen.map(e => (e.kind === 'plan' ? 'plan' : `${e.id}:${e.state}`))).toEqual([
+    // `kind !== 'phase'` rather than `kind === 'plan'`: ProgressEvent also
+    // carries live 'activity' lines now, and this assertion is about phases.
+    expect(seen.map(e => (e.kind !== 'phase' ? e.kind : `${e.id}:${e.state}`))).toEqual([
       'plan', 'merge:start', 'merge:done', 'cleanup:skipped',
     ]);
   });

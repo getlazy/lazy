@@ -40,3 +40,33 @@ const lifecycleMutex = new TaskMutex();
 export function withTaskLifecycleLock<T>(canonicalTaskId: string, fn: () => Promise<T>): Promise<T> {
   return lifecycleMutex.withLock(canonicalTaskId, fn);
 }
+
+/**
+ * Is a lifecycle mutation (today: an accept) running for this task in THIS
+ * process right now?
+ *
+ * This is the owner-liveness answer for the transient `merging` state. `merging`
+ * is stamped by the accept orchestration and only that orchestration clears it,
+ * so a `merging` task with no lifecycle lock held has no owner: whatever process
+ * stamped it is gone (daemon restart, crash, kill). Recovery paths use this to
+ * tell a genuinely in-flight merge — which must never be disturbed — from the
+ * wreckage of a dead one.
+ *
+ * In-process only, for the same reason the lock itself is: a single daemon owns
+ * every lifecycle mutation for a repo, and a daemon that died is precisely the
+ * case being recovered from.
+ */
+export function isTaskLifecycleLocked(canonicalTaskId: string): boolean {
+  return lifecycleMutex.isLocked(canonicalTaskId);
+}
+
+/**
+ * Run `fn` under the task's lifecycle lock, or return `{ ran: false }` at once
+ * when a lifecycle mutation already owns the task. See {@link TaskMutex.tryWithLock}.
+ */
+export function tryWithTaskLifecycleLock<T>(
+  canonicalTaskId: string,
+  fn: () => Promise<T>,
+): Promise<{ ran: true; value: T } | { ran: false }> {
+  return lifecycleMutex.tryWithLock(canonicalTaskId, fn);
+}

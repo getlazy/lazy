@@ -1,6 +1,6 @@
 /**
  * E2E tests for `lazy protect <branch|task> on|off` — the single CLI for
- * branch protection (see docs/protected-branches.md).
+ * branch protection (see public-docs/protected-branches.md).
  *
  * Two suites, because they need different harnesses:
  *   - config editing + listing: no daemon needed (pure lazy.toml round trips)
@@ -16,8 +16,21 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { enrollPassphrase } from '../helpers/passphrase';
 
 const PASSPHRASE = 'test-approval-passphrase';
+
+/**
+ * Env that drives the masked `lazy approve` prompt as if a human typed the
+ * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
+ * no env var, no piped-stdin route — so this test-only pair is the only way a
+ * test can supply it (see test/e2e/system-passphrase.test.ts).
+ */
+const TYPES_PASSPHRASE = {
+  LAZY_FORCE_TTY: '1',
+  LAZY_PROMPT_DEFAULTS: '1',
+  LAZY_PROMPT_SECRET: PASSPHRASE,
+};
 
 /** Read lazy.toml and parse its [protection] section. */
 async function readProtection(ctx: TestContext): Promise<Record<string, unknown>> {
@@ -31,7 +44,7 @@ async function enableProtection(ctx: TestContext): Promise<void> {
   const tomlPath = join(ctx.root, 'lazy.toml');
   const toml = await readFile(tomlPath, 'utf-8');
   await writeFile(tomlPath, toml.replace('[protection]\n', '[protection]\nenabled = true\n'));
-  await writeFile(join(ctx.root, '.lazy', 'approve-passphrase'), `${PASSPHRASE}\n`);
+  await enrollPassphrase(ctx.passphraseBaseDir, PASSPHRASE);
 }
 
 describe('lazy protect: lazy.toml is the one store', () => {
@@ -429,7 +442,7 @@ describe('lazy protect: the task form gates that task\'s accept', () => {
     const taskId = await setupBlockedTask('approve-outgoing');
     expectSuccess(await ctx.lazy(['protect', taskId, 'on']));
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` }));
+    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     const accepted = await ctx.lazy(['accept', taskId, '--yes']);
     expectSuccess(accepted);

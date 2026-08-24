@@ -114,8 +114,8 @@ function hasCredential(envVars: AuthEnvVar[]): boolean {
  *
  * The target goes through `withLiveProxyTarget` FIRST, and `config` is then
  * passed to `resolveAuthEnvFromDaemon` as well. Both arm the fail-loud proxy
- * gate: with `[proxy]` enabled, a launch that cannot reach the audit plane fails
- * instead of connecting direct.
+ * gate: the proxy is always on, so a launch that cannot reach the audit plane
+ * fails instead of connecting direct.
  *
  * The first call is not redundant, though it looks it — `resolveAuthEnvFromDaemon`
  * would report the live proxy address on the same RPC that carries the
@@ -139,7 +139,20 @@ export async function resolveInteractiveLaunch(
 
   const surface: LaunchSurface = 'host';
   const proxied = await withLiveProxyTarget(target, config);
-  const envVars = await resolveAuthEnvFromDaemon(proxied, { role: 'builder' }, surface, config);
+  // JIT CREDENTIALS: what comes back is a PLACEHOLDER bound to this project's
+  // host builder sessions, not the user's token — the proxy exchanges it
+  // upstream. One shared label (not one per invocation) on purpose: an
+  // interactive session ends when the human closes the terminal, so nothing
+  // would ever revoke a per-invocation grant, and they would accumulate until
+  // the registry's builder cap evicted a live session's own placeholder. The
+  // same label the host-process runner's builder uses, so both share one grant.
+  const envVars = await resolveAuthEnvFromDaemon(
+    proxied,
+    { role: 'builder' },
+    surface,
+    config,
+    { role: 'builder', taskId: null, label: `host-builder:${root}` },
+  );
 
   // Ollama-backed roles authenticate against a local server with a dummy token,
   // so there is no daemon credential to check for and nothing to fail on.

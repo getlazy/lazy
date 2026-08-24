@@ -17,6 +17,7 @@ import { STYLESHEET_PATH } from './styles';
 import { parentTaskIdOf } from '../task-target';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import { turnText } from '../utils/turn-content';
+import { formatTurnLaunchLabels, NO_LAUNCH_LABEL } from '../utils/turn-labels';
 import {
   protectionMarkers,
   protectionHeadline,
@@ -191,6 +192,7 @@ export function taskListHtml(
   // Build sortable column header
   const sortableColumns: { field: string; label: string }[] = [
     { field: 'status', label: 'Status' },
+    { field: 'agent', label: 'Agent' },
     { field: 'model', label: 'Model' },
     { field: 'turns', label: 'Turns' },
     { field: 'last_active', label: 'Last Active' },
@@ -226,6 +228,7 @@ export function taskListHtml(
     return `<tr>
       <td><a href="/tasks/${task.id}">${escapeHtml(displayId(task))}</a></td>
       <td>${statusBadge(status)}${reviewLink}</td>
+      <td>${escapeHtml(task.agent_id)}</td>
       <td>${escapeHtml(task.model ?? '-')}</td>
       <td>${escapeHtml(turns)}</td>
       <td>${escapeHtml(lastActive)}</td>
@@ -306,6 +309,7 @@ export function taskDetailHtml(
       ${task.code ? `<div class="detail-row"><span class="detail-label">Code</span><span>${escapeHtml(task.code)}</span></div>` : ''}
       <div class="detail-row"><span class="detail-label">Goal</span><span>${escapeHtml(task.goal)}</span></div>
       <div class="detail-row"><span class="detail-label">Status</span><span>${statusBadge(status)}</span></div>
+      <div class="detail-row"><span class="detail-label">Agent</span><span>${escapeHtml(task.agent_id)}</span></div>
       ${task.model ? `<div class="detail-row"><span class="detail-label">Model</span><span>${escapeHtml(task.model)}</span></div>` : ''}
       <div class="detail-row"><span class="detail-label">Created</span><span>${escapeHtml(formatDate(task.created_at))}</span></div>
       ${task.completed_at ? `<div class="detail-row"><span class="detail-label">Completed</span><span>${escapeHtml(formatDate(task.completed_at))}</span></div>` : ''}
@@ -362,10 +366,16 @@ export function taskDetailHtml(
       // Surface auto-triggered provenance so a reviewer can tell automation turns
       // (auto-resume, nudge) from a real human/builder turn.
       const autoBadge = turn.auto_triggered ? ` <span class="turn-auto">auto</span>` : '';
+      // What the turn ran under. Always all three fields, `unknown` for anything
+      // the turn does not carry — never back-filled from the task's current agent.
+      // Omitted entirely for a turn lazy wrote itself — no agent ran it, so
+      // there is nothing missing to report.
+      const launchSegment = formatTurnLaunchLabels(turn);
+      const launchInfo = launchSegment ? ` <span class="turn-launch">${escapeHtml(launchSegment)}</span>` : '';
       return `
       <div class="turn">
         <div class="turn-header">
-          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(authorLabel)}]${autoBadge} ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}</span>
+          <span><a href="${turnLink}">#${turn.sequence}</a> [${escapeHtml(authorLabel)}]${autoBadge} ${escapeHtml(formatDate(turn.timestamp))}${usageInfo}${launchInfo}</span>
         </div>
         <div class="turn-content">${preview}</div>
       </div>
@@ -571,6 +581,22 @@ export function commitDetailHtml(task: Task, commit: Commit, diffText: string): 
   `);
 }
 
+/**
+ * "Ran As" row for a single turn on the turn detail page: which agent, model and
+ * effort it was launched with. Always all three; an absent field renders as
+ * `unknown` rather than being filled in from the task's current settings.
+ */
+function launchDetailRow(turn: Turn): string {
+  // The row has a fixed slot on this page, so it says not-applicable in words
+  // rather than going blank — a blank row reads as a rendering bug.
+  const segment = formatTurnLaunchLabels(turn) || NO_LAUNCH_LABEL;
+  return `
+      <div class="detail-row" style="margin-bottom:8px">
+        <span class="detail-label">Ran As</span>
+        <span>${escapeHtml(segment)}</span>
+      </div>`;
+}
+
 export function turnDetailHtml(
   task: Task,
   session: Session,
@@ -609,6 +635,7 @@ export function turnDetailHtml(
     content += `
       <div class="detail-section">
         <h2>${authorHeading}</h2>
+        ${launchDetailRow(humanTurn)}
         <div class="turn-content">${renderMarkdown(turnText(humanTurn))}</div>
       </div>
     `;
@@ -630,6 +657,7 @@ export function turnDetailHtml(
     content += `
       <div class="detail-section">
         <h2>Agent</h2>
+        ${launchDetailRow(agentTurn)}
         ${agentUsageHtml}
         <div class="turn-content">${renderMarkdown(turnText(agentTurn))}</div>
       </div>

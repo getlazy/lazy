@@ -89,6 +89,7 @@ import type {
 import { isTerminalStatus, isBlockedStatus } from '../types';
 import { normalizeTagOrThrow } from '../utils/tags';
 import { targetFromLegacy, parentTaskIdOf } from '../task-target';
+import { logger } from '../utils/logger';
 import type { TaskTarget, WaitInterval, WaitOutcome } from '../types';
 import type { RunnerType } from '../config/types';
 import { assertValidTransition } from '../task-state-machine';
@@ -1045,6 +1046,24 @@ export class FileStorage implements Storage {
     });
   }
 
+  async updateTaskAgent(taskId: string, agentId: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const fullId = await this.findTaskIdByPrefix(taskId);
+      if (!fullId) return;
+
+      const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
+      if (!task) return;
+
+      // Allowed at any time while the task is live; the change takes effect on
+      // the next turn. Terminal tasks are immutable.
+      this.assertNotTerminal(task, 'update agent');
+
+      task.agent_id = agentId;
+
+      await this.atomicWriteTask(fullId, { 'task.json': task });
+    });
+  }
+
   async resetTaskPendingSync(taskId: string): Promise<void> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
@@ -1387,6 +1406,23 @@ export class FileStorage implements Storage {
     });
   }
 
+  async updateSessionAgent(sessionId: string, agentId: string): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) return;
+
+      const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
+      if (!session) return;
+
+      // Update agent and clear the agent session ID — sessions cannot be resumed
+      // across different agents because each agent has its own session format.
+      session.agent_id = agentId;
+      session.agent_session_id = null;
+
+      await this.atomicWriteTask(taskId, { 'session.json': session });
+    });
+  }
+
   async updateSessionInteraction(sessionId: string, durationMs: number): Promise<void> {
     return this.lock.withLock(async () => {
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1520,6 +1556,7 @@ export class FileStorage implements Storage {
         endShaWork,
         mergeConflicts,
         violations,
+        agent,
         model,
         modelId,
         effort,
@@ -1531,6 +1568,7 @@ export class FileStorage implements Storage {
         autoTriggered,
         turnType,
         carriesFeedback,
+        agent_had_no_effect,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -1575,6 +1613,7 @@ export class FileStorage implements Storage {
         end_sha: endSha ?? null,
         ...(mergeConflicts && mergeConflicts.length > 0 ? { merge_conflicts: mergeConflicts } : {}),
         ...(violations && violations.length > 0 ? { violations } : {}),
+        ...(agent ? { agent } : {}),
         ...(model ? { model } : {}),
         ...(modelId ? { model_id: modelId } : {}),
         ...(effort ? { effort } : {}),
@@ -1588,6 +1627,8 @@ export class FileStorage implements Storage {
         ...(turnType && turnType !== 'work' ? { turn_type: turnType } : {}),
         // Feedback starts life unconsumed; absent means "carries no feedback".
         ...(carriesFeedback ? { feedback_delivery: 'pending' as const } : {}),
+        // Agent-had-no-effect flag for error turns — absent means unknown.
+        ...(agent_had_no_effect !== undefined ? { agent_had_no_effect } : {}),
       };
 
       turns.push(turn);
@@ -1956,21 +1997,46 @@ export class FileStorage implements Storage {
     return allTasks.filter((t) => parentTaskIdOf(t) === parentTaskId);
   }
 
+  /**
+   * Highest ancestor of a task. Walks iteratively (not recursively) and stops
+   * on a repeated id.
+   *
+   * INVARIANT: a corrupt store must never hang or crash the daemon. A parent
+   * cycle (A → B → A) used to recurse until the stack overflowed; now the walk
+   * stops at the repeat and returns the highest task reached, matching the
+   * cycle guard in `collectSubtreeIds` (src/task-target.ts).
+   */
   async getRootTask(taskId: string): Promise<Task | null> {
-    const task = await this.getTask(taskId);
-    if (!task) return null;
-    const parentId = parentTaskIdOf(task);
-    if (!parentId) return task;
-    return this.getRootTask(parentId);
+    const ancestry = await this.getTaskAncestry(taskId);
+    return ancestry.length > 0 ? ancestry[0] : null;
   }
 
+  /**
+   * Ancestry of a task, root first.
+   *
+   * INVARIANT: a corrupt store must never hang or crash the daemon. A parent
+   * cycle used to spin this `while` loop forever while `unshift` grew the
+   * array without bound; now a repeated id ends the walk and the chain walked
+   * so far is returned, matching the cycle guard in `collectSubtreeIds`
+   * (src/task-target.ts).
+   */
   async getTaskAncestry(taskId: string): Promise<Task[]> {
     const ancestry: Task[] = [];
+    const visited = new Set<string>();
     let currentId: string | null = taskId;
 
     while (currentId) {
       const task = await this.getTask(currentId);
       if (!task) break;
+      if (visited.has(task.id)) {
+        logger.error(
+          `Corrupt task store: parent cycle detected while walking ancestry of task ${taskId}. ` +
+          `Task ${task.id} is its own ancestor via ${[...visited].join(' → ')}. ` +
+          `Returning the partial chain; repair the parent links of these tasks.`
+        );
+        break;
+      }
+      visited.add(task.id);
       ancestry.unshift(task); // Add to front (root first)
       currentId = parentTaskIdOf(task);
     }

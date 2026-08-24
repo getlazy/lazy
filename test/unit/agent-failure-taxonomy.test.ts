@@ -87,6 +87,19 @@ describe('ClaudeCodeAgent.classifyFailure', () => {
     expect(failure.class).toBe('fatal_config');
   });
 
+  // INVARIANT (cursor-first-class-agent §1): the spawn wrapper's ENOENT
+  // diagnosis is a COMMON signal — every agent must classify it fatal, since
+  // no amount of retrying installs a binary. Uses the exact message from
+  // src/utils/spawn.ts and no exit code (the spawn threw before one existed).
+  test("the spawn wrapper's binary-not-found message is fatal_config for every agent", () => {
+    for (const agentId of listAgents()) {
+      const failure = getAgent(agentId).classifyFailure({
+        message: "spawn failed: binary 'whatever' not found",
+      });
+      expect(failure.class, `${agentId} must classify a missing binary as fatal`).toBe('fatal_config');
+    }
+  });
+
   test('bad model or unknown flag is fatal_config', () => {
     expect(agent.classifyFailure({ message: "error: unknown option '--nope'" }).class).toBe('fatal_config');
     expect(agent.classifyFailure({ message: 'Invalid model name: claude-imaginary-9' }).class).toBe('fatal_config');
@@ -104,6 +117,19 @@ describe('ClaudeCodeAgent.classifyFailure', () => {
       stdoutError: 'Invalid API key · Please run /login',
     });
     expect(fromStdout.class).toBe('fatal_auth');
+  });
+
+  // INVARIANT (fix-cursor-action-required): Claude's "usage limit reached" is a
+  // rolling 5-hour window that heals with no human involved, so it stays
+  // transient. Cursor's plan wall is fatal (see below) — that is why the fatal
+  // patterns live in Cursor's own classifier and NOT in the shared signals.
+  test('a Claude usage limit stays transient — it heals on its own', () => {
+    const failure = agent.classifyFailure({
+      message: 'Claude AI usage limit reached|1758300000',
+      exitCode: 1,
+    });
+    expect(failure.class).toBe('transient_overload');
+    expect(isFatalFailureClass(failure.class)).toBe(false);
   });
 
   test('unrecognized failures are unknown — never guessed into fatal', () => {
@@ -127,6 +153,31 @@ describe('CursorAgent.classifyFailure', () => {
     expect(agent.classifyFailure({ message: '429 Too Many Requests' }).class).toBe('transient_overload');
     expect(agent.classifyFailure({ message: 'connect ECONNREFUSED 127.0.0.1:4000' }).class)
       .toBe('transient_unreachable');
+  });
+
+  // The counterpart to the Claude case above: same two words, opposite class,
+  // decided in each agent's own dialect rather than in the shared matcher.
+  test('a Cursor plan/spend-limit wall is fatal_auth — it needs a human', () => {
+    const failure = agent.classifyFailure({
+      message:
+        "ActionRequiredError: You've hit your usage limit for Opus. Switch to a different model " +
+        'or set a Spend Limit to continue with Opus.',
+      exitCode: 1,
+    });
+    expect(failure.class).toBe('fatal_auth');
+    expect(isFatalFailureClass(failure.class)).toBe(true);
+  });
+
+  // ...but only a wall a human must act on. The same words over a window that
+  // says it clears shortly stay transient — ambiguity resolves toward "keep
+  // trying", never toward a block. This message carries BOTH signals at once.
+  test('a short-window Cursor cap saying "usage limit" is NOT fatal', () => {
+    const failure = agent.classifyFailure({
+      message: "API Error: 429 — you've hit your usage limit for Sonnet. Resets in 20 minutes.",
+      exitCode: 1,
+    });
+    expect(failure.class).toBe('transient_overload');
+    expect(isFatalFailureClass(failure.class)).toBe(false);
   });
 
   test('unrecognized failures are unknown', () => {

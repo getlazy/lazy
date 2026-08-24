@@ -57,8 +57,11 @@ upstream = "https://api.anthropic.com"
     expect(config.proxy?.retryAfterThreshold).toBe(2);
     expect(config.proxy?.fallbacks).toEqual([
       // Trailing slash is normalized away so path joins stay clean.
-      { upstream: 'http://host.docker.internal:11434', model: 'qwen3.5:35b' },
-      { upstream: 'https://api.anthropic.com' },
+      // `credential: 'none'` is the default: a fallback forwards NO credential
+      // unless the config opts it in, so a reroute cannot leak the user's
+      // Anthropic token to an unrelated upstream.
+      { upstream: 'http://host.docker.internal:11434', model: 'qwen3.5:35b', credential: 'none' },
+      { upstream: 'https://api.anthropic.com', credential: 'none' },
     ]);
   });
 
@@ -130,15 +133,51 @@ model = "qwen3.5:35b"
     expect(config.models.roles.agent.endpoint).toBe('');
   });
 
-  // INVARIANT: the one remaining hard failure — routing a role at a proxy that is
-  // switched off. Fail at load rather than silently launching with an empty
-  // ANTHROPIC_BASE_URL (which would quietly bypass the audit/policy plane).
-  test('a proxy role with no endpoint AND [proxy] enabled = false fails config load', async () => {
+  // INVARIANT: the REMOVED `[proxy] enabled` key is never silently ignored — a
+  // user who wrote it believes it is doing something. `false` asks for something
+  // lazy no longer does, so it is REJECTED with a message naming the option and
+  // saying the proxy is always on.
+  test('[proxy] enabled = false is rejected with an actionable message', async () => {
+    await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = false\n`);
+    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/`enabled` option has been removed/);
+    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/always on/);
+  });
+
+  // INVARIANT: `enabled = true` asks for exactly what lazy already does, so the
+  // line is merely dead — WARN and continue rather than refusing to start. A
+  // config whose only sin is a stale line must not take the command down.
+  test('[proxy] enabled = true warns about the removed option and still loads', async () => {
+    await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = true\n`);
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    try {
+      const config = await loadConfig(dir, { cwd: dir });
+      expect(config.proxy).not.toBeNull();
+    } finally {
+      console.warn = originalWarn;
+    }
+    expect(warnings.some((w) => /`enabled` option has been removed/.test(w))).toBe(true);
+    expect(warnings.some((w) => /always on/.test(w))).toBe(true);
+  });
+
+  // INVARIANT: cursor traffic rides the SAME proxy as Anthropic traffic, so its
+  // upstream resolves with no configuration at all. There is no opt-out key here
+  // for the same reason `[proxy] enabled` was removed — a config that quietly
+  // sent cursor traffic direct would leave the user believing it was audited.
+  test('cursor_upstream defaults to Cursor even with no [proxy] section', async () => {
+    await writeFile(join(dir, 'lazy.toml'), `[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\n`);
+    const config = await loadConfig(dir, { cwd: dir });
+    expect(config.proxy?.cursorUpstream).toBe('https://api2.cursor.sh');
+  });
+
+  test('an explicit cursor_upstream is honored, with the trailing slash normalized away', async () => {
     await writeFile(
       join(dir, 'lazy.toml'),
-      `[proxy]\nenabled = false\n\n[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\n`,
+      `[proxy]\ncursor_upstream = "http://127.0.0.1:9911/"\n`,
     );
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/proxy is disabled|enabled = false/i);
+    const config = await loadConfig(dir, { cwd: dir });
+    expect(config.proxy?.cursorUpstream).toBe('http://127.0.0.1:9911');
   });
 
   test('a proxy role with an explicit endpoint still works with no [proxy] section', async () => {

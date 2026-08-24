@@ -19,9 +19,22 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
+import { enrollPassphrase } from '../helpers/passphrase';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 const PASSPHRASE = 'test-approval-passphrase';
+
+/**
+ * Env that drives the masked `lazy approve` prompt as if a human typed the
+ * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
+ * no env var, no piped-stdin route — so this test-only pair is the only way a
+ * test can supply it (see test/e2e/system-passphrase.test.ts).
+ */
+const TYPES_PASSPHRASE = {
+  LAZY_FORCE_TTY: '1',
+  LAZY_PROMPT_DEFAULTS: '1',
+  LAZY_PROMPT_SECRET: PASSPHRASE,
+};
 
 interface JsonRpcResponse {
   jsonrpc: '2.0';
@@ -113,7 +126,7 @@ async function enableProtection(ctx: TestContext): Promise<void> {
     throw new Error('Expected lazy init template to contain a [protection] section');
   }
   await writeFile(tomlPath, toml.replace('[protection]\n', '[protection]\nenabled = true\n'));
-  await writeFile(join(ctx.root, '.lazy', 'approve-passphrase'), `${PASSPHRASE}\n`);
+  await enrollPassphrase(ctx.passphraseBaseDir, PASSPHRASE);
 }
 
 async function setupBlockedTask(ctx: TestContext, name: string): Promise<string> {
@@ -183,7 +196,7 @@ describe('MCP lazy_accept into protected branches (P0.2d)', () => {
   test('after human lazy approve, MCP lazy_accept completes the merge', async () => {
     const taskId = await setupBlockedTask(ctx, 'approved-mcp');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { input: `${PASSPHRASE}\n` });
+    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
     expectSuccess(approveResult);
 
     // Tiny diff → confirmation level 'none' → executes directly; the daemon

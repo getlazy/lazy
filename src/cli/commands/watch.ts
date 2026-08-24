@@ -1,20 +1,28 @@
 /**
  * lazy watch — Unified task timeline.
  *
- * `lazy watch` follows the *task*, not the agent. The supervisor and the
- * agent are both parts of the task: this command tails the supervisor's
- * stdout (phase transitions, merges, post-turn check output) and the agent
- * JSONL session log together so the user sees whichever side is currently
- * driving — pre-turn merge, agent thinking, post-turn check, retries, etc.
+ * `lazy watch` follows the *task*, not the agent. The supervisor, the proxy
+ * and the agent are all parts of the task: this command tails all three so
+ * the user sees whichever side is currently driving — pre-turn merge, agent
+ * thinking, API calls in flight, post-turn check, retries, etc.
  *
  * Layout per refresh:
  *   - A one-line supervisor header (phase + elapsed) re-printed every 5s.
+ *   - Proxy traffic lines as requests open and settle (prefixed `net>`).
  *   - Supervisor stdout lines streamed as they arrive (dim, prefixed `sup>`).
  *   - Agent JSONL entries rendered via the existing pretty renderer.
  *
- * The two streams are printed as they arrive (no time-merge) — supervisor
- * lines stand out visually via dim() so they don't compete with the
- * formatted agent output.
+ * WHY PROXY TRAFFIC IS THE LOAD-BEARING STREAM: the other two are
+ * agent-specific in practice. Only Claude writes a readable session JSONL;
+ * cursor-agent's --print emits one blob at exit and its agent stream is
+ * opaque connect-rpc protobuf lazy deliberately does not parse. Every agent's
+ * API calls ride lazy's always-on proxy with per-task attribution, so the
+ * proxy is the ONE agent-agnostic place where "the agent is doing something"
+ * is observable. Passage only — never request or response content.
+ *
+ * The streams are printed as they arrive (no time-merge) — supervisor lines
+ * stand out visually via dim() so they don't compete with the formatted agent
+ * output.
  */
 
 import { open, stat } from 'fs/promises';
@@ -30,6 +38,8 @@ import type { FollowHandle, Runner } from '../../runner/types';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { renderStatusHeader } from '../status-header';
 import { computeWorkingSubstate, formatWorkingSubstate } from '../../utils/working-substate';
+import { streamProxyActivity, type ProxyStreamHandle } from '../proxy-activity-stream';
+import { PROXY_LINE_PREFIX } from '../proxy-activity-renderer';
 
 const POLL_INTERVAL_MS = 500;
 const STATUS_CHECK_INTERVAL_MS = 5000;
@@ -44,7 +54,39 @@ async function findSessionFile(projectDir: string): Promise<string | null> {
 // ── Main command ────────────────────────────────────────────────────────
 
 export async function commandWatch(args: string[]): Promise<void> {
-  const parsed = parseFlags(args, [], 'watch');
+  const parsed = parseFlags(args, [
+    { name: 'traffic', takesValue: false },
+    { name: 'no-traffic', takesValue: false },
+  ], 'watch');
+
+  const trafficOnly = parsed.flags.get('traffic') === true;
+  const showTraffic = parsed.flags.get('no-traffic') !== true;
+
+  if (trafficOnly && !showTraffic) {
+    console.error('--traffic and --no-traffic contradict each other. Pick one.');
+    process.exit(1);
+  }
+
+  // Traffic only, no task stream at all. With no task named this is the
+  // firehose across every task — useful when several are running and the
+  // question is "is anything moving?" rather than "what is THIS task doing?".
+  if (trafficOnly) {
+    if (parsed.positional.length === 0) {
+      await watchTrafficOnly(null, null);
+      return;
+    }
+    const storage = await requireStorage();
+    try {
+      const task = await resolveTaskOrExit(storage, parsed.positional[0]);
+      // Deliberately NOT gated on status === 'working': a task's last requests
+      // are worth seeing right after it stops, and the replay window carries
+      // them. The full watch below does gate, because it tails a live run.
+      await watchTrafficOnly(task.id, displayId(task));
+    } finally {
+      await storage.close();
+    }
+    return;
+  }
 
   if (parsed.positional.length === 0) {
     const storage = await requireStorage();
@@ -57,7 +99,7 @@ export async function commandWatch(args: string[]): Promise<void> {
       }
 
       if (tasks.length === 1) {
-        await doWatch(storage, tasks[0]);
+        await doWatch(storage, tasks[0], showTraffic);
         return;
       }
 
@@ -84,19 +126,69 @@ export async function commandWatch(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    await doWatch(storage, task);
+    await doWatch(storage, task, showTraffic);
   } finally {
     await storage.close();
   }
 }
 
-async function doWatch(storage: import('../../storage').Storage, task: import('../../types').Task): Promise<void> {
+/**
+ * `lazy watch --traffic`: proxy requests only, no agent or supervisor stream.
+ * Agent-agnostic by construction — this view never touches an agent's own
+ * output format, so a Cursor task and a Claude task look the same here.
+ */
+async function watchTrafficOnly(taskId: string | null, display: string | null): Promise<void> {
+  const scope = display ? `task ${theme.taskId(display)}` : 'all tasks';
+  console.log(`Watching ${theme.label('proxy traffic')} for ${scope}. Ctrl-C to stop.\n`);
+  console.log(dim('Every agent API request rides lazy\'s proxy; lines below are requests passing through it.\n'));
+
+  const stream = streamProxyActivity({
+    ...(taskId ? { taskId } : {}),
+    // Only worth repeating the task on every line when more than one can appear.
+    includeTask: taskId === null,
+    write: (line) => process.stdout.write(line + '\n'),
+  });
+
+  const onSigint = () => {
+    stream.stop();
+    console.log(dim('\n\nStopped watching.'));
+    process.exit(0);
+  };
+  process.on('SIGINT', onSigint);
+  try {
+    await stream.done;
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    stream.stop();
+  }
+}
+
+async function doWatch(
+  storage: import('../../storage').Storage,
+  task: import('../../types').Task,
+  showTraffic: boolean,
+): Promise<void> {
   const root = requireLazyRoot();
   const worktreePath = getWorktreePath(root, task);
   const display = displayId(task);
   const protoDir = getProtocolDir(task.id);
 
   console.log(`Watching task ${theme.taskId(display)}...\n`);
+
+  // The universal layer. The supervisor stream and the agent's session log are
+  // both agent-specific in practice (only Claude writes a readable JSONL;
+  // cursor-agent emits one blob at exit), so proxy traffic is the only stream
+  // that says "the agent is doing something" for EVERY agent lazy runs.
+  let proxyStream: ProxyStreamHandle | null = null;
+  if (showTraffic) {
+    console.log(dim(`${PROXY_LINE_PREFIX} agent API requests through lazy's proxy (--no-traffic to hide)`));
+    proxyStream = streamProxyActivity({
+      taskId: task.id,
+      // One task on screen — repeating its id on every line would be noise.
+      includeTask: false,
+      write: (line) => process.stdout.write(line + '\n'),
+    });
+  }
 
   // The runner is the source of truth for where the agent writes its session
   // JSONL, so we create it up front (construction is cheap and doesn't touch
@@ -165,6 +257,7 @@ async function doWatch(storage: import('../../storage').Storage, task: import('.
   let running = true;
   const stopFollowing = () => {
     try { followHandle?.process.kill(); } catch { /* best effort */ }
+    proxyStream?.stop();
   };
   const onSigint = () => {
     running = false;
@@ -300,20 +393,33 @@ export function watchUsage(): void {
 
 Watch a task in real-time as a unified timeline.
 
-Tails both the supervisor's stdout (pre-turn merges, post-turn check output,
-phase transitions, retries) and the agent's JSONL session log, printing each
-stream as lines arrive. A one-line status header above the stream shows the
-current supervisor phase and how long it has been running; it refreshes
-every 5 seconds.
+Streams three things as they happen:
+  net>   every API request the agent makes through lazy's proxy — the one
+         signal that works for EVERY agent (Claude, Cursor, anything else),
+         because it watches traffic rather than an agent's output format
+  sup>   the supervisor's stdout (pre-turn merges, post-turn check output,
+         phase transitions, retries)
+  agent  the agent's own JSONL session log, rendered — where the agent
+         writes one (Claude does; cursor-agent does not)
+
+A one-line status header shows the current supervisor phase and how long it
+has been running; it refreshes every 5 seconds.
 
 Arguments:
   <task-code>    Task to watch (code or short ID). If omitted and only one
                  task is running, watches that task automatically.
+
+Options:
+  --traffic      Show ONLY proxy traffic. With no task, that is every task's
+                 traffic at once (the firehose).
+  --no-traffic   Hide the proxy traffic lines.
 
 Exits when the task leaves 'working' status or you press Ctrl-C.
 
 Examples:
   lazy watch fix-auth      # Watch a specific task
   lazy watch               # Watch the only running task
-  lazy watch abc12345      # Watch by short ID`);
+  lazy watch abc12345      # Watch by short ID
+  lazy watch --traffic     # Proxy traffic across every running task
+  lazy watch fix-auth --traffic   # Only fix-auth's API requests`);
 }

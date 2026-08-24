@@ -80,6 +80,9 @@ function createPlainDisplay(): PhaseDisplay {
       console.log(planHeader(event));
       return;
     }
+    // Activity events belong to a live subscription (proxy traffic), not to a
+    // phased operation — the subscriber renders those itself. See ../daemon/progress.ts.
+    if (event.kind === 'activity') return;
     const pos = position(event);
     switch (event.state) {
       case 'start':
@@ -134,6 +137,8 @@ function createTtyDisplay(): PhaseDisplay {
       settle(planHeader(event));
       return;
     }
+    // See the plain display: not a phase, not this renderer's business.
+    if (event.kind === 'activity') return;
     const pos = position(event);
     const elapsed = theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`);
     switch (event.state) {

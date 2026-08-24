@@ -9,7 +9,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { getRunningCodeSha, resetRunningCodeShaCache } from '../../src/daemon/code-version';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 describe('getRunningCodeSha', () => {
   // INVARIANT: in a git checkout (dev / test), the helper returns the current
@@ -18,7 +18,7 @@ describe('getRunningCodeSha', () => {
     resetRunningCodeShaCache();
     const sha = getRunningCodeSha();
 
-    const expected = spawnSync(['git', 'rev-parse', '--short', 'HEAD'], {
+    const expected = spawnSyncUnsupervised(['git', 'rev-parse', '--short', 'HEAD'], {
       cwd: import.meta.dir,
       stdout: 'pipe',
       stderr: 'pipe',

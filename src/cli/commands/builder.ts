@@ -43,6 +43,7 @@ import { ensureBuilderScratchDir } from '../../builder/scratch';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { resolveBuilderChattiness, renderChattinessSnippet } from '../../config/chattiness';
 import { buildMemorySection } from '../../memory';
+import { agentDisplayName } from '../../agent/registry';
 
 // Embedded at build/compile time — changes to these files require rebuild
 import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
@@ -175,6 +176,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Parse and validate all flags — unknown flags exit with an error
   const BUILDER_FLAGS: FlagDefinition[] = [
     { name: 'autonomous', takesValue: false },
+    { name: 'no-autonomous', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'resume', takesValue: true, optionalValue: true },
     { name: 'import', takesValue: false },
@@ -182,7 +184,21 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'model', takesValue: true },
   ];
   const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
-  const autonomous = parsed.flags.get('autonomous') === true;
+  // Autonomous is the DEFAULT for the builder. The builder is an orchestrator,
+  // not a task agent, and it runs with LESS access than the agents it directs
+  // (containerised, repository mounted read-only, every task operation brokered
+  // by the daemon), so per-tool permission prompts buy little here.
+  // `--no-autonomous` is the explicit opt-out; `--autonomous` stays accepted so
+  // existing scripts and docs keep working — it now just restates the default.
+  // Passing both is a contradiction, so it errors rather than resolving via a
+  // silent precedence rule.
+  const autonomousFlag = parsed.flags.get('autonomous') === true;
+  const noAutonomousFlag = parsed.flags.get('no-autonomous') === true;
+  if (autonomousFlag && noAutonomousFlag) {
+    console.error('Error: --autonomous and --no-autonomous are mutually exclusive. Pass at most one.');
+    process.exit(1);
+  }
+  const autonomous = !noAutonomousFlag;
   const yes = parsed.flags.get('yes') === true;
   const resumeArg = parsed.flags.get('resume') ?? null;
   const importSession = parsed.flags.get('import') === true;
@@ -221,14 +237,19 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const runner = await createRunner(root);
   const config = await loadConfig(root);
 
-  // Autonomous mode warnings and confirmation
-  // Show these BEFORE pre-flight checks so users see the warnings even if infrastructure fails
+  // Autonomous mode warnings and confirmation.
+  // Shown BEFORE pre-flight checks so users see them even if infrastructure fails.
+  // Autonomous is the default, so this is the posture disclosure for a normal
+  // `lazy builder` run — the copy explains what the builder can and cannot reach
+  // so the typed "yes" is an informed one rather than scary boilerplate.
   if (autonomous) {
     console.log('');
-    console.log('⚠ Autonomous mode: the builder will run without permission prompts.');
+    console.log('⚠ Autonomous mode (the default): the builder will run without permission prompts.');
+    console.log('');
 
-    // Additional warning for host-process runner — severity depends on posture.
     if (runner.type === 'dangerously-host-process-without-any-isolation') {
+      // Host-process runner — there is no container, so the posture below does
+      // not apply and the severity depends on permission_mode.
       if (config.runner.permission_mode === 'bypass') {
         console.log('⚠ DANGER: Running on the host WITHOUT isolation (permission_mode = "bypass").');
         console.log('  The agent has unrestricted access to your system.');
@@ -236,22 +257,37 @@ export async function commandBuilder(args: string[]): Promise<void> {
       } else {
         console.log('⚠ Running on the host under the OS sandbox (permission_mode = "sandbox").');
         console.log('  Autonomous + sandbox: Bash is confined to the worktree and the');
-        console.log(`  network allowlist, but the agent will not prompt before acting.`);
+        console.log('  network allowlist, but the agent will not prompt before acting.');
       }
+    } else {
+      // Container runner — the actual posture, which is deliberately narrower
+      // than a task agent's. See buildBuilderDockerArgs: the repo is mounted :ro.
+      console.log('  What the builder can reach:');
+      console.log(`  • It runs in a ${runner.runLabel.toLowerCase()}, not on your host.`);
+      console.log('  • Your repository is mounted READ-ONLY — it cannot edit your working');
+      console.log('    tree, so it has LESS filesystem access than the task agents it directs.');
+      console.log('  • Task operations (create, start, accept, commit) go through the daemon,');
+      console.log('    which applies the same ownership and confirmation rules as the CLI.');
     }
 
     console.log('');
+    console.log('  Want permission prompts back? Run: lazy builder --no-autonomous');
+    console.log('');
 
-    // Require confirmation
-    if (isTTY()) {
-      const response = await promptLine("Type 'yes' to proceed");
-      if (response !== 'yes') {
-        console.log('Aborted.');
-        process.exit(0);
-      }
-    } else {
-      if (!yes) {
-        console.error('Error: --autonomous requires --yes flag in non-interactive mode.');
+    // Require confirmation. `--yes` auto-confirms, matching what it means on
+    // every other lazy command — and it is the only way through in non-TTY mode,
+    // where there is nobody to type it. Now that autonomous is the default, this
+    // is also how a human who has read the posture once stops being asked again.
+    if (!yes) {
+      if (isTTY()) {
+        const response = await promptLine("Type 'yes' to proceed");
+        if (response !== 'yes') {
+          console.log('Aborted.');
+          process.exit(0);
+        }
+      } else {
+        console.error('Error: autonomous mode (the builder default) requires --yes in non-interactive mode.');
+        console.error('Pass --yes to confirm, or --no-autonomous to run with permission prompts.');
         process.exit(1);
       }
     }
@@ -337,7 +373,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   // Session disclosure — skip on resume (user already saw it in the original session)
   if (!isResuming) {
-    const agentName = config.agent.agent_id === 'claude-code' ? 'Claude Code' : config.agent.agent_id;
+    const agentName = agentDisplayName(config.agent.agent_id);
     const firstRun = await isFirstBuilderRun(root);
 
     console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
@@ -655,6 +691,14 @@ with --resume <id>. Use 'lazy builder list' to look up an earlier session ID.
 
 The interactive system prompt warning is automatically skipped when resuming.
 
+Autonomous by default:
+  The builder runs without permission prompts unless you pass --no-autonomous.
+  It is an orchestrator, not a task agent: under Docker/Podman it runs in a
+  container with your repository mounted READ-ONLY — less filesystem access than
+  the task agents it directs — and every task operation goes through the daemon.
+  Each autonomous launch prints that posture and asks you to type 'yes'; --yes
+  skips the prompt (and is required in non-TTY mode).
+
 Auto-resume across upgrade (docker/podman only):
   If 'lazy upgrade' stops this builder to rebuild the image, the session is
   automatically relaunched in place — same conversation, same terminal — once
@@ -665,10 +709,15 @@ Auto-resume across upgrade (docker/podman only):
   'lazy builder --resume <id>' to run.
 
 Flags:
-  --autonomous         Run without permission prompts. Under the host sandbox (default) the
-                       OS sandbox still confines the builder; under permission_mode="bypass"
-                       or Docker this adds --dangerously-skip-permissions.
-  --yes                Auto-confirm prompts (required with --autonomous in non-TTY mode)
+  --autonomous         Run without permission prompts. This is the DEFAULT — the flag
+                       is accepted so existing scripts keep working, but it changes
+                       nothing. Under the host sandbox (default) the OS sandbox still
+                       confines the builder; under permission_mode="bypass" or Docker
+                       this adds --dangerously-skip-permissions.
+  --no-autonomous      Opt out: run with Claude Code's normal permission prompts.
+  --yes                Auto-confirm prompts, including the autonomous-posture
+                       confirmation (required for autonomous runs in non-TTY mode —
+                       pass --no-autonomous instead to run with prompts)
   --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
                        Defaults to lazy.toml [builder].effort (default "high")
   --model <id>         Override the model the builder itself runs as (passed
@@ -681,6 +730,6 @@ Examples:
   lazy builder                    # Start new session
   lazy builder --resume <uuid>    # Resume a specific session
   lazy builder list               # List captured conversations
-  lazy builder --autonomous       # Run without permission prompts
+  lazy builder --no-autonomous    # Run with permission prompts instead
   lazy builder --model mythos     # Run the builder on a specific model`);
 }

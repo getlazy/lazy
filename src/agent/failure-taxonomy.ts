@@ -92,6 +92,14 @@ export function classifyCommonFailureSignals(input: AgentFailureInput): AgentFai
     return { class: 'fatal_config', reason: 'agent binary not found (exit 127)' };
   }
 
+  // The spawn wrapper's ENOENT diagnosis (src/utils/spawn.ts): the binary is
+  // not installed in this environment. Retrying can never install it — this
+  // crash-looped a real cursor task for a full session before it was
+  // classified (cursor-first-class-agent, item 1).
+  if (/spawn failed: binary '[^']+' not found/.test(text) || text.includes('command not found')) {
+    return { class: 'fatal_config', reason: 'agent binary not installed in this environment' };
+  }
+
   if (
     /\b401\b|\b403\b/.test(text) ||
     text.includes('unauthorized') ||

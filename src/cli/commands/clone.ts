@@ -5,6 +5,8 @@ import type { Storage } from '../../storage/interface';
 import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
 import { parentTaskIdOf } from '../../task-target';
+import { loadConfig } from '../../config/loader';
+import { resolveAgentForNewTask } from '../../agent/task-agent';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -137,13 +139,19 @@ export async function commandClone(args: string[]): Promise<void> {
       cloneCode = await generateCloneCode(sourceTask.code, storage);
     }
 
-    // Create cloned task
+    // Create cloned task. The agent is inherited alongside goal/type/model:
+    // a clone of a Cursor task is still a Cursor task, and without this it
+    // would silently fall back to Claude Code (see resolveAgentForNewTask).
     const clonedTask = await storage.createTask(
       sourceTask.goal,
       newParentTaskId,
       undefined,
       cloneCode,
-      sourceTask.type
+      sourceTask.type,
+      resolveAgentForNewTask({
+        inheritFrom: sourceTask,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      })
     );
 
     // Set prompt

@@ -79,11 +79,14 @@ import type { Task, TaskTarget, TaskPriority } from '../types';
 import { VALID_TASK_PRIORITIES } from '../types';
 import { type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS, type EffortLevel } from '../config/types';
 import { listAgents } from '../agent/registry';
+import { resolveAgentForNewTask } from '../agent/task-agent';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { computeWorkingSubstate, formatWorkingSubstate, readSupervisorStatusAsync } from '../utils/working-substate';
+import { MAX_PROGRESS_MESSAGE_LENGTH } from '../protocol/progress';
+import { recordProgress } from '../daemon/progress-registry';
 import { formatRetrySummary } from '../utils/retry-summary';
-import { parentTaskIdOf, taskTarget, branchTarget, targetBranchOf } from '../task-target';
+import { parentTaskIdOf, taskTarget, branchTarget, targetBranchOf, pruneTasksToDepth } from '../task-target';
 import { loadConfig } from '../config/loader';
 import { resolveEdgeGateDecision, peekHumanApproval } from '../protection/edge-gate';
 import { loadTaskProtectionStatus, protectionSummary, protectionToJson } from '../protection/status';
@@ -136,7 +139,7 @@ import {
 // under LAZY_IS_DAEMON=1 / LAZY_TEST=1 — without spawning a lazy subprocess.
 import { type StartTaskParams } from '../daemon/task-launcher';
 import { turnText } from '../utils/turn-content';
-import { pendingViolations } from '../utils/turns';
+import { pendingViolations, violationRecords } from '../utils/turns';
 import {
   type UnblockTaskParams,
   type AskTaskParams,
@@ -579,10 +582,13 @@ function mapShowTurn(t: Turn): Record<string, unknown> {
     timestamp: new Date(t.timestamp).toISOString(),
     ...(t.auto_triggered ? { auto_triggered: true } : {}),
     // Per-turn launch labels. Emitted only when recorded: a pre-feature turn
-    // stays label-free rather than inheriting the task's current model/effort,
-    // which would invent history. `model` is the request-side resolution
+    // stays label-free rather than inheriting the task's current agent/model/
+    // effort, which would invent history. `agent` is the agent id the turn was
+    // launched with — the task's `agent_id` can be switched mid-flight, so it
+    // cannot answer this for turn N. `model` is the request-side resolution
     // (usually a tier alias); `model_id` is what the agent itself reported, and
     // its absence is the honest signal that only the alias was ever known.
+    ...(t.agent !== undefined ? { agent: t.agent } : {}),
     ...(t.model !== undefined ? { model: t.model } : {}),
     ...(t.model_id !== undefined ? { model_id: t.model_id } : {}),
     ...(t.effort !== undefined ? { effort: t.effort } : {}),
@@ -656,7 +662,7 @@ export async function buildRetryStatus(task: Task): Promise<Record<string, unkno
  * nothing to report (the common case — protection is opt-in).
  *
  * Read-only on purpose: there is no MCP write surface for protection, because
- * arranging your own gate defeats the gate. See docs/surface-asymmetries.md.
+ * arranging your own gate defeats the gate. See public-docs/surface-asymmetries.md.
  */
 export async function buildProtection(
   storage: Storage,
@@ -704,6 +710,9 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         code: task.code ?? null,
         goal: task.goal,
         status: task.status,
+        // The task's CURRENT agent. Always populated — per-turn `agent` is what
+        // answers "which agent ran turn N" after a mid-task switch.
+        agent: task.agent_id,
         model: task.model ?? null,
         tags: task.tags ?? [],
         created_at: new Date(task.created_at).toISOString(),
@@ -916,6 +925,10 @@ export const createTool: McpTool = {
         enum: ['host', 'docker', 'container', 'podman'],
         description: 'Runner to execute this task on, overriding the global [runner] type: "host" (host process, no container isolation), "docker"/"container", or "podman". Persists on the task. Omit to inherit the global default.',
       },
+      agent: {
+        type: 'string',
+        description: 'Agent to run this task with (e.g. "claude-code", "cursor"). Persists on the task. Omit to inherit the parent task\'s agent for a subtask, or the lazy.toml default for a top-level task.',
+      },
       type: {
         type: 'string',
         description: 'Task type',
@@ -945,6 +958,7 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
     const code = args.code as string | undefined;
     const model = args.model as string | undefined;
     const runnerArg = args.runner as string | undefined;
+    const agentArg = args.agent as string | undefined;
     const type = args.type as string | undefined;
     const priority = args.priority as string | undefined;
     const parent = args.parent as string | undefined;
@@ -958,6 +972,10 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Invalid runner '${runnerArg}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
       }
       runnerType = resolved;
+    }
+
+    if (agentArg !== undefined && !listAgents().includes(agentArg)) {
+      throw new Error(`Unknown agent '${agentArg}'. Available agents: ${listAgents().join(', ')}`);
     }
 
     if (priority !== undefined && !VALID_TASK_PRIORITIES.includes(priority as TaskPriority)) {
@@ -987,7 +1005,17 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
           }
         }
 
-        const task = await storage.createTask(goal, ctx.taskId, undefined, code, type, undefined, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
+        // A subtask runs on its parent's agent unless the caller says otherwise
+        // — an agent decomposing its own work should not have the children
+        // silently retargeted to the project default.
+        const ownTask = await storage.getTask(ctx.taskId);
+        const subtaskAgentId = resolveAgentForNewTask({
+          explicit: agentArg,
+          inheritFrom: ownTask,
+          configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+        });
+
+        const task = await storage.createTask(goal, ctx.taskId, undefined, code, type, subtaskAgentId, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
         if (prompt) {
           await storage.updateTaskPrompt(task.id, prompt);
         }
@@ -1024,11 +1052,13 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
       // branch (top-level task targeting that branch). Same precedence as
       // `lazy reparent` / CLI `lazy create`: try task first, then branch.
       let parentTaskId: string | undefined;
+      let parentTask: Task | null = null;
       let explicitBranchTarget: string | undefined;
       if (parent) {
         const resolved = await storage.resolveTask(parent);
         if (resolved.task) {
           parentTaskId = resolved.task.id;
+          parentTask = resolved.task;
         } else if (resolved.ambiguousMatches?.length) {
           throw new Error(`Ambiguous parent '${parent}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
         } else {
@@ -1101,7 +1131,15 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
         }
       }
 
-      const task = await storage.createTask(goal, parentTaskId, undefined, code, type, undefined, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
+      // Explicit agent > parent task's agent (a subtask stays on its parent's
+      // agent) > project default.
+      const newTaskAgentId = resolveAgentForNewTask({
+        explicit: agentArg,
+        inheritFrom: parentTask,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      });
+
+      const task = await storage.createTask(goal, parentTaskId, undefined, code, type, newTaskAgentId, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
 
       if (explicitBranchTarget) {
         await storage.updateTaskTarget(task.id, branchTarget(explicitBranchTarget));
@@ -1625,6 +1663,67 @@ export function createAddFollowUpHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_update_progress
+// ---------------------------------------------------------------------------
+
+export const updateProgressTool: McpTool = {
+  name: 'lazy_update_progress',
+  description:
+    'Post a short, human-readable line saying what you are doing RIGHT NOW, so ' +
+    'someone watching this task can see inside a long turn instead of a bare ' +
+    '"working". Fire-and-forget and latest-wins: each call replaces the previous ' +
+    'message, nothing is stored as task history, and the line is discarded when ' +
+    'the turn ends. Call it SPARINGLY — at phase boundaries ("reproducing the ' +
+    'bug", "running migration 3/7", "running the unit suite"), never on every ' +
+    'tool call. Not a log, not a place for findings or rationale: use ' +
+    'lazy_journal to record and lazy_comment to instruct.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      message: {
+        type: 'string',
+        description:
+          'What you are doing right now — one short phrase, ideally under ' +
+          `${MAX_PROGRESS_MESSAGE_LENGTH} characters. Longer messages are truncated, not rejected.`,
+        minLength: 1,
+      },
+    },
+    required: ['message'],
+  },
+};
+
+export function createUpdateProgressHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    rejectIfReadOnly('lazy_update_progress');
+    if (!ctx.taskId) {
+      throw new Error(
+        'lazy_update_progress requires a task context — it reports what a running ' +
+        'TASK is doing. This tool is not available in builder mode.',
+      );
+    }
+
+    // Boundary validation is strict about SHAPE (an empty or non-string message
+    // is a caller mistake worth naming) and forgiving about LENGTH (truncated,
+    // never rejected) — a progress post must never be able to cost a turn.
+    const raw = args.message;
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new Error("lazy_update_progress requires a non-empty 'message' string.");
+    }
+
+    // Touches no Storage at all: this is per-turn runtime state, not task
+    // history. See src/protocol/progress.ts.
+    const { message, truncated } = await recordProgress(ctx.taskId, raw);
+
+    return {
+      task_id: shortId(ctx.taskId),
+      // Echoed back so a truncation is visible to the agent rather than silent.
+      message,
+      truncated,
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // lazy_commit
 // ---------------------------------------------------------------------------
 
@@ -1800,6 +1899,7 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
           code: task.code ?? null,
           goal: task.goal,
           status: task.status,
+          agent: task.agent_id,
           model: task.model ?? null,
         } : null,
         session: session ? {
@@ -2346,14 +2446,26 @@ export const unblockTool: McpTool = {
         description: 'Model override for this turn (optional)',
 
       },
+      agent: {
+        type: 'string',
+        description:
+          'Switch to a different agent for this task (e.g. claude-code, cursor). ' +
+          'Persists on the task for future turns. When switching agents, the ' +
+          'session is reset (cannot resume across agents).',
+      },
       approved_files: {
         type: 'array',
         items: { type: 'string' },
         description:
           'Conflict tasks ONLY (file permission violations), and REQUIRED for them — there is no default. ' +
-          'List the violated files to approve; any pending violation you leave out is reverted to its base commit. ' +
-          'Pass [] to revert all of them explicitly. Omitting the parameter on a conflict task is an error. ' +
-          'Do not pass it when the task has no violations. ' +
+          'List the violated files to approve; any PENDING violation you leave out is reverted to its base commit. ' +
+          'Pass [] to revert all pending ones explicitly. Omitting the parameter on a conflict task is an error. ' +
+          'A file you already approved on an earlier unblock STAYS approved whether or not you name it again, ' +
+          'and re-naming it is always accepted — so a later unblock never has to re-assert past decisions ' +
+          'to keep them. There is no un-approve value: to reverse an approval, the human un-approves it on ' +
+          'the web review page (that record returns to PENDING and the next unblock decides it again), or you ' +
+          'ask the agent to revert the file in the feedback text. ' +
+          'Do not pass it when the task has never violated a protected file. ' +
           'Approving in the feedback text does nothing — this parameter is the only channel that is read. ' +
           '(lazy_accept\'s approved_files is different: there every pending violation must be listed or the accept is refused.)',
       },
@@ -2367,7 +2479,16 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
     const taskId = args.task_id as string;
     const feedback = args.feedback as string;
     const model = args.model as string | undefined;
+    const agent = args.agent as string | undefined;
     const approvedFiles = args.approved_files as string[] | undefined;
+
+    // Validate agent if provided
+    if (agent !== undefined) {
+      const validAgents = listAgents();
+      if (!validAgents.includes(agent)) {
+        throw new Error(`Unknown agent '${agent}'. Available agents: ${validAgents.join(', ')}`);
+      }
+    }
 
     // --- Guard: validate approved_files parameter ---
     // The approved_files parameter is only meaningful when there are actual
@@ -2382,25 +2503,39 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       // INVARIANT: an agent may only unblock its own task or a direct subtask.
       assertAgentMayTarget(ctx, task, 'unblock');
 
-      // Get violations if task is in conflict status
+      // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
+      // read the pending set REGARDLESS of task.status. `conflict` is a derived
+      // label, and a side-channel turn (an ask, a sync, a pairing session) can
+      // leave a task labelled `blocked` while a set is still pending. Gating on
+      // the label made the correct call unexpressible: this guard refused
+      // approved_files ("no file permission violations") while the daemon read
+      // the set and reverted the unapproved files anyway.
+      //
+      // INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky):
+      // the two questions are asked of DIFFERENT sets. "Must a decision be
+      // supplied?" is about the PENDING set. "May one be supplied at all?" is
+      // about every record on the violation turn, decided or not — re-naming an
+      // already-approved file is a legitimate no-op re-assertion, and refusing
+      // it is what left the reviewer with no call to make but the destructive
+      // one.
       let violations: Array<{ file: string; status: string }> = [];
-      if (task.status === 'conflict') {
-        const sess = await storage.getSessionByTaskId(task.id);
-        if (sess) {
-          const turns = await storage.getSessionTurns(sess.id);
-          // Must match what the daemon reverts against — see the
-          // violations-come-from-the-violation-turn invariant in utils/turns.ts.
-          violations = pendingViolations(turns);
-        }
+      let records: Array<{ file: string; status: string }> = [];
+      const sess = await storage.getSessionByTaskId(task.id);
+      if (sess) {
+        const turns = await storage.getSessionTurns(sess.id);
+        // Must match what the daemon reverts against — see the
+        // violations-come-from-the-violation-turn invariant in utils/turns.ts.
+        violations = pendingViolations(turns);
+        records = violationRecords(turns);
       }
 
       const hasViolations = violations.length > 0;
 
-      // Error: approved_files passed when there are no violations
-      if (!hasViolations && approvedFiles !== undefined) {
+      // Error: approved_files passed when the task never violated anything
+      if (records.length === 0 && approvedFiles !== undefined) {
         throw new Error(
           `Task ${taskId} has no file permission violations. ` +
-          `The "approved_files" parameter is only meaningful for conflict tasks. ` +
+          `The "approved_files" parameter is only meaningful for tasks that violated protected-file patterns. ` +
           `Do not pass it when there are no violations.`
         );
       }
@@ -2427,6 +2562,7 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       taskId,
       message: feedback,
       modelOverride: model,
+      agentOverride: agent,
       approvedFiles,
       retargetOrphan: true, // Builder doesn't prompt, auto-accept orphan retargeting
       notesInEditor: false,
@@ -2440,11 +2576,22 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
 
     const result = await queryUnblockTask(params);
 
+    // INVARIANT (reverting committed work is never silent —
+    // fix-ask-nukes-violations): the daemon reports every reverted and approved
+    // protected file in `warnings`. Dropping them here is what let a revert of
+    // an agent's committed work read as a plain success to the reviewer.
+    const warnings = result.warnings ?? [];
+    const output = [
+      `Unblocked task ${result.sessionId} on branch ${result.branchName}`,
+      ...warnings.map(w => `WARNING: ${w}`),
+    ].join('\n');
+
     return {
-      output: `Unblocked task ${result.sessionId} on branch ${result.branchName}`,
+      output,
       sessionId: result.sessionId,
       containerName: result.containerName,
       turnNumber: result.turnNumber,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   };
 }
@@ -3102,6 +3249,32 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
     // INVARIANT: an agent may only resume its own task or a direct subtask.
     await gateAgentTarget(ctx, taskId, 'resume');
 
+    // INVARIANT (an unblock can never revert a file the caller was refused
+    // permission to approve — fix-ask-nukes-violations): resume routes through
+    // unblock, which reverts unapproved file-permission violations, but
+    // lazy_resume has no `approved_files` channel to express a decision. Refuse
+    // on the pending SET (not on `task.status`, which a side-channel turn can
+    // have relabelled) and point at the tool that CAN express the decision.
+    const resumeStorage = await getStorage(ctx);
+    try {
+      const resolved = await resumeStorage.resolveTask(taskId);
+      if (resolved.task) {
+        const sess = await resumeStorage.getSessionByTaskId(resolved.task.id);
+        const pending = sess ? pendingViolations(await resumeStorage.getSessionTurns(sess.id)) : [];
+        if (pending.length > 0) {
+          throw new Error(
+            `Task ${taskId} has ${pending.length} pending file permission violation(s):\n` +
+            pending.map(v => `  - ${v.file}`).join('\n') + '\n\n' +
+            `lazy_resume cannot express an approve/revert decision, and resuming without one would ` +
+            `revert the agent's committed changes to those files. Use lazy_unblock with "approved_files" instead ` +
+            `(pass [] to revert all explicitly).`
+          );
+        }
+      }
+    } finally {
+      await resumeStorage.close();
+    }
+
     // Resume is like unblock but for interrupted tasks, without a feedback message.
     // Use unblock with a standard resume message.
     const params: UnblockTaskParams = {
@@ -3115,11 +3288,17 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
 
     const result = await queryUnblockTask(params);
 
+    // Same never-silent rule as lazy_unblock: surface whatever the daemon warned about.
+    const resumeWarnings = result.warnings ?? [];
     return {
-      output: `Resumed task ${result.sessionId} on branch ${result.branchName}`,
+      output: [
+        `Resumed task ${result.sessionId} on branch ${result.branchName}`,
+        ...resumeWarnings.map(w => `WARNING: ${w}`),
+      ].join('\n'),
       sessionId: result.sessionId,
       containerName: result.containerName,
       turnNumber: result.turnNumber,
+      ...(resumeWarnings.length > 0 ? { warnings: resumeWarnings } : {}),
     };
   };
 }
@@ -3205,6 +3384,63 @@ async function withSubstate<T extends { id: string; status: string }>(
 }
 
 // ---------------------------------------------------------------------------
+// Depth scoping (shared by lazy_list / lazy_active)
+// ---------------------------------------------------------------------------
+
+/** Schema fragment for the `levels` depth limit, identical on both listing tools. */
+const LEVELS_PROPERTY = {
+  type: 'integer' as const,
+  description:
+    'Show only the first N levels of the hierarchy (1-based: 1 = top-level tasks ' +
+    'only, 2 = those plus their children). Levels are counted from the tasks this ' +
+    'listing returns, so with "task_id" that task is level 1. Composes with ' +
+    '"task_id" — both apply. Tasks omitted by the limit are reported as ' +
+    '"hidden_descendants" on the deepest task returned, and totalled as ' +
+    '"hidden_count", so a depth-limited listing never looks complete when it is not.',
+};
+
+/** Validate the MCP `levels` argument (absent → no limit). */
+function parseLevelsArg(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(
+      `'levels' must be a positive integer (1 = top-level tasks only), got '${String(raw)}'.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Apply a depth limit to a flat task list for MCP output, returning both the
+ * surviving tasks and the elision bookkeeping the response must carry.
+ */
+function applyLevels(
+  tasks: Task[],
+  levels: number | undefined,
+): { tasks: Task[]; hidden: Map<string, number>; hiddenTotal: number } {
+  if (levels === undefined) return { tasks, hidden: new Map(), hiddenTotal: 0 };
+  const pruned = pruneTasksToDepth(tasks, levels);
+  return { tasks: pruned.kept, hidden: pruned.hidden, hiddenTotal: pruned.hiddenTotal };
+}
+
+/**
+ * Attach `hidden_descendants` to each task of a depth-limited listing. Absent
+ * entirely when no limit was asked for, so an unlimited listing's shape is
+ * exactly what it always was.
+ */
+function withHiddenCounts<T extends { id: string }>(
+  rows: T[],
+  hidden: Map<string, number>,
+  levels: number | undefined,
+): T[] {
+  if (levels === undefined) return rows;
+  // `hidden` is keyed by full task id; rows carry the short id.
+  const byShortId = new Map([...hidden].map(([id, n]) => [shortId(id), n]));
+  return rows.map(row => ({ ...row, hidden_descendants: byShortId.get(row.id) ?? 0 }));
+}
+
+// ---------------------------------------------------------------------------
 // lazy_list
 // ---------------------------------------------------------------------------
 
@@ -3218,7 +3454,9 @@ export const listTool: McpTool = {
     'Each task includes its status and, for working ' +
     'tasks, a derived substate (e.g. "agent:answering", "waiting on fix-foo" when ' +
     'the agent is blocked on a subtask, "harness:post_turn_check", ' +
-    '"not-alive").',
+    '"not-alive"). When the agent has posted a progress line via ' +
+    'lazy_update_progress, it is appended to the substate ' +
+    '("agent: running migration 3/7").',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3232,6 +3470,7 @@ export const listTool: McpTool = {
           "Filter to this task's subtree: the task itself and all its descendants " +
           '(short hex prefix or code)',
       },
+      levels: LEVELS_PROPERTY,
     },
   },
 };
@@ -3240,6 +3479,7 @@ export function createListHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const showAll = args.all as boolean | undefined;
     const taskIdInput = args.task_id as string | undefined;
+    const levels = parseLevelsArg(args.levels);
 
     const storage = await getStorage(ctx);
     try {
@@ -3256,9 +3496,15 @@ export function createListHandler(ctx: McpToolContext): McpToolHandler {
         tasks = await filterToSubtree(storage, tasks, taskIdInput);
       }
 
+      // Depth limit applies AFTER the subtree filter, so both scopings compose
+      // (`task_id` + `levels: 1` = that task alone) instead of one winning.
+      const pruned = applyLevels(tasks, levels);
+      tasks = pruned.tasks;
+
       return {
         count: tasks.length,
-        tasks: await withSubstate(storage, tasks, (t, substate, queue) => ({
+        ...(levels === undefined ? {} : { hidden_count: pruned.hiddenTotal }),
+        tasks: withHiddenCounts(await withSubstate(storage, tasks, (t, substate, queue) => ({
           id: shortId(t.id),
           code: t.code ?? null,
           goal: t.goal,
@@ -3269,9 +3515,10 @@ export function createListHandler(ctx: McpToolContext): McpToolHandler {
           priority: t.priority,
           // Drain position for a `queued` task ({position,total}); null otherwise.
           queue,
+          agent: t.agent_id,
           model: t.model ?? null,
           parent_task_id: parentTaskIdOf(t) ? shortId(parentTaskIdOf(t)!) : null,
-        })),
+        })), pruned.hidden, levels),
       };
     } finally {
       await storage.close();
@@ -3307,6 +3554,7 @@ export function createBlockedHandler(ctx: McpToolContext): McpToolHandler {
           id: shortId(t.id),
           code: t.code ?? null,
           goal: t.goal,
+          agent: t.agent_id,
           model: t.model ?? null,
         })),
       };
@@ -3329,10 +3577,14 @@ export const activeTool: McpTool = {
     '(e.g. "agent:answering" while an ask is in flight, "agent:pre-accept" during ' +
     'an accept\'s validation turn, "waiting on fix-foo" while the agent is blocked ' +
     'in lazy_wait on a subtask, "harness:post_turn_check", ' +
-    '"not-alive") so you can see what each active task is actually doing. ' +
+    '"not-alive") so you can see what each active task is actually doing — ' +
+    "with the agent's own latest progress line appended when it posted one " +
+    '("agent: running migration 3/7"). ' +
     'Pass "task_id" to narrow the listing to one task\'s subtree — that task plus ' +
     'ALL its descendants (children, grandchildren, ...), the same scope ' +
-    'lazy_list\'s "task_id" uses.',
+    'lazy_list\'s "task_id" uses. Pass "levels" to cap how deep the listing goes ' +
+    '— "levels": 1 shows only top-level tasks, which is how you observe a busy ' +
+    'project without every descendant of every release hub.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3342,6 +3594,7 @@ export const activeTool: McpTool = {
           "Filter to this task's subtree: the task itself and all its descendants " +
           '(short hex prefix or code)',
       },
+      levels: LEVELS_PROPERTY,
     },
   },
 };
@@ -3349,6 +3602,7 @@ export const activeTool: McpTool = {
 export function createActiveHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     const taskIdInput = args.task_id as string | undefined;
+    const levels = parseLevelsArg(args.levels);
     const storage = await getStorage(ctx);
     try {
 
@@ -3368,9 +3622,15 @@ export function createActiveHandler(ctx: McpToolContext): McpToolHandler {
         tasks = await filterToSubtree(storage, tasks, taskIdInput);
       }
 
+      // Depth limit applies AFTER the subtree filter so the two compose (see
+      // createListHandler and the daemon's handleActive).
+      const pruned = applyLevels(tasks, levels);
+      tasks = pruned.tasks;
+
       return {
         count: tasks.length,
-        tasks: await withSubstate(storage, tasks, (t, substate, queue) => ({
+        ...(levels === undefined ? {} : { hidden_count: pruned.hiddenTotal }),
+        tasks: withHiddenCounts(await withSubstate(storage, tasks, (t, substate, queue) => ({
           id: shortId(t.id),
           code: t.code ?? null,
           goal: t.goal,
@@ -3381,10 +3641,11 @@ export function createActiveHandler(ctx: McpToolContext): McpToolHandler {
           priority: t.priority,
           // Drain position for a `queued` task ({position,total}); null otherwise.
           queue,
+          agent: t.agent_id,
           model: t.model ?? null,
           // Parent link so a subtree listing can be reassembled into a hierarchy.
           parent_task_id: parentTaskIdOf(t) ? shortId(parentTaskIdOf(t)!) : null,
-        })),
+        })), pruned.hidden, levels),
       };
     } finally {
       await storage.close();
@@ -3614,9 +3875,12 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
 export const editTool: McpTool = {
   name: 'lazy_edit',
   description:
-    'Edit a task\'s goal, prompt, model, type, code, or parent. ' +
+    'Edit a task\'s goal, prompt, model, effort, type, code, parent, or agent. ' +
     'Goal/prompt/type/code/parent edits only work on tasks that have not been ' +
-    'started by an agent (no turns); a model-only edit is also allowed on started tasks.',
+    'started by an agent (no turns); model, effort, and agent edits are also ' +
+    'allowed on started tasks. When switching agents mid-task, the session is ' +
+    'reset (cannot resume across agents), but the task\'s conversation history ' +
+    'is preserved.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -3638,6 +3902,13 @@ export const editTool: McpTool = {
         description: 'New model',
 
       },
+      effort: {
+        type: 'string',
+        description:
+          'New reasoning effort for the next turn. PERSISTS on the task. ' +
+          'Editable on started tasks, like model.',
+        enum: ['low', 'medium', 'high', 'xhigh', 'max'],
+      },
       type: {
         type: 'string',
         description: 'New task type',
@@ -3649,6 +3920,13 @@ export const editTool: McpTool = {
       parent: {
         type: 'string',
         description: 'New parent task ID (pass empty string to clear)',
+      },
+      agent: {
+        type: 'string',
+        description:
+          'New agent to use for this task (e.g. claude-code, cursor). ' +
+          'Editable on started tasks. When switching agents mid-task, the ' +
+          'session is reset (cannot resume across agents).',
       },
     },
     required: ['task_id'],
@@ -3664,6 +3942,8 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
     const type = args.type as string | undefined;
     const code = args.code as string | undefined;
     const parent = args.parent as string | undefined;
+    const effort = args.effort as string | undefined;
+    const agent = args.agent as string | undefined;
 
     const storage = await getStorage(ctx);
     try {
@@ -3691,16 +3971,28 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
         throw new Error(`Cannot edit task in ${task.status} status`);
       }
 
-      // Check no turns (agent hasn't started working). Exception: a
-      // model-only edit is safe mid-flight and is the supported way to
-      // durably switch a started task's model — auto-resume/auto-deliver
-      // relaunch from task.model. Same relaxation as the `lazy edit` CLI.
+      // Validate agent if provided
+      if (agent !== undefined) {
+        const validAgents = listAgents();
+        if (!validAgents.includes(agent)) {
+          throw new Error(`Unknown agent '${agent}'. Available agents: ${validAgents.join(', ')}`);
+        }
+      }
+
+      // Check no turns (agent hasn't started working). Exception: model,
+      // effort, and agent edits are safe mid-flight — they are per-turn dials
+      // that take effect on the next turn without changing the task's work
+      // definition. Same relaxation as the `lazy edit` CLI.
       const turnCount = await storage.getTurnCountByTaskId(task.id);
-      const isModelOnlyEdit = model !== undefined
+      const isMidFlightSafeEdit = (model !== undefined || effort !== undefined || agent !== undefined)
         && goal === undefined && prompt === undefined
         && type === undefined && code === undefined && parent === undefined;
-      if (turnCount > 0 && !isModelOnlyEdit) {
-        throw new Error('Cannot edit task after agent has started working (has turns); only model can be changed on a started task');
+      if (turnCount > 0 && !isMidFlightSafeEdit) {
+        throw new Error('Cannot edit task after agent has started working (has turns); only model and effort can be changed on a started task (agent too, but only on its own — not combined with a goal/prompt/type/code/parent edit)');
+      }
+
+      if (effort !== undefined && !VALID_EFFORT_LEVELS.includes(effort as EffortLevel)) {
+        throw new Error(`Invalid effort '${effort}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
       }
 
       const changes: string[] = [];
@@ -3718,6 +4010,23 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
       if (model !== undefined) {
         await storage.updateTaskModel(task.id, model);
         changes.push('model');
+      }
+
+      if (effort !== undefined) {
+        // Same metadata slot resolveAndPersistEffort writes on every launch.
+        await storage.updateTaskMetadata(task.id, 'effort', effort);
+        changes.push('effort');
+      }
+
+      if (agent !== undefined) {
+        // Update task agent
+        await storage.updateTaskAgent(task.id, agent);
+        // If a session exists, update it too (clears agent_session_id)
+        const sess = await storage.getSessionByTaskId(task.id);
+        if (sess) {
+          await storage.updateSessionAgent(sess.id, agent);
+        }
+        changes.push('agent');
       }
 
       if (type !== undefined) {
@@ -3831,8 +4140,13 @@ export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
 
       const goal = goalOverride ?? `${parent.goal} (variant)`;
 
-      // Create child task
-      const child = await storage.createTask(goal, parent.id, undefined, code, undefined, undefined, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
+      // Create child task. It is a variant of the parent's work, so it runs on
+      // the parent's agent rather than the project default.
+      const childAgentId = resolveAgentForNewTask({
+        inheritFrom: parent,
+        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+      });
+      const child = await storage.createTask(goal, parent.id, undefined, code, undefined, childAgentId, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
 
       // Set prompt (inherit from parent or use override)
       if (promptOverride) {
@@ -3984,9 +4298,16 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
 export const redoTool: McpTool = {
   name: 'lazy_redo',
   description:
-    'Close a stale task and create a fresh replacement starting from current ' +
-    'main. Carries over goal and prompt. Does NOT auto-start — call lazy_start ' +
-    'on the new task to begin work.',
+    'Close a stale task and create a fresh replacement of it. The replacement ' +
+    'is created under the SAME parent as the old task — a redo of a release-hub ' +
+    'child lands under that same hub, NOT on main — and its base ref is only ' +
+    'resolved when it starts, so it branches from that parent\'s current HEAD. ' +
+    'Carries over goal and prompt. Does NOT auto-start, deliberately: that gap ' +
+    'is where you fix anything the replacement should not inherit. If the work ' +
+    'belongs somewhere else now, move it BEFORE calling lazy_start — once the ' +
+    'task starts its branch is cut from whatever parent it had. Use ' +
+    'lazy_reparent to point it at another task or a raw branch such as main, ' +
+    'or lazy_edit with parent="" to make it top-level.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4067,14 +4388,18 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
           }
         }
 
-        // Create new task
+        // Create new task. A redo is a second attempt at the SAME work, so it
+        // carries the original's agent over rather than the project default.
         const newTask = await storage.createTask(
           oldTask.goal,
           parentTaskIdOf(oldTask) ?? undefined,
           undefined,
           redoCode || undefined,
           undefined,
-          undefined,
+          resolveAgentForNewTask({
+            inheritFrom: oldTask,
+            configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
+          }),
           // channel actor on the initial backlog entry: 'builder' or 'agent'
           mcpActor(ctx),
         );
@@ -4319,6 +4644,7 @@ export const allTools: McpTool[] = [
   memorySaveTool,
   memoryRecallTool,
   addFollowUpTool,
+  updateProgressTool,
   commitTool,
   statusTool,
   conversationsTool,
@@ -4429,6 +4755,7 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_memory_save', createMemorySaveHandler(ctx));
   handlers.set('lazy_memory_recall', createMemoryRecallHandler(ctx));
   handlers.set('lazy_add_followup', createAddFollowUpHandler(ctx));
+  handlers.set('lazy_update_progress', createUpdateProgressHandler(ctx));
   handlers.set('lazy_commit', createCommitHandler(ctx));
   handlers.set('lazy_status', createStatusHandler(ctx));
   handlers.set('lazy_conversations', createConversationsHandler(ctx));

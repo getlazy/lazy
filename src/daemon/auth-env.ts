@@ -19,7 +19,8 @@
 import { tryRpc, isDaemonRpcBypassed } from './client';
 import { getAuthEnvVars } from '../capture/claude';
 import type { RoleTarget, ResolvedConfig } from '../config/types';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, proxyBaseUrlForRunner, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import type { LaunchIdentity } from '../proxy/placeholder-env';
 import { hasDaemonContext, getDaemonContext } from './context';
 
 export interface AuthEnvVar {
@@ -57,17 +58,16 @@ export async function fetchDaemonCredentialState(): Promise<DaemonCredentialStat
 }
 
 /**
- * Thrown when `[proxy]` is enabled but the live proxy address cannot be
- * resolved for a launch.
+ * Thrown when the live proxy address cannot be resolved for a launch.
  *
- * INVARIANT (audit plane must not silently degrade): with the proxy enabled —
- * which is the DEFAULT — every agent/builder launch routes model traffic
- * through lazy's local audit/policy proxy. If the address cannot be resolved
- * (daemon down, RPC failure, proxy not bound), the launch FAILS. It must never
- * fall through to a direct api.anthropic.com connection: that traffic would be
- * unaudited and unenforced while the trail recorded nothing, and — being
- * silent — would rot unnoticed. `[proxy] enabled = false` is the explicit
- * opt-out; a daemon blip is not.
+ * INVARIANT (audit plane must not silently degrade): the proxy is ALWAYS ON —
+ * there is no config option to turn it off — so every agent/builder launch
+ * routes model traffic through lazy's local audit/policy proxy. If the address
+ * cannot be resolved (daemon down, RPC failure, proxy not bound), the launch
+ * FAILS. It must never fall through to a direct api.anthropic.com connection:
+ * that traffic would be unaudited and unenforced while the trail recorded
+ * nothing, and — being silent — would rot unnoticed. There is no opt-out to
+ * offer as a remedy; the remedy is a healthy daemon.
  *
  * The wording deliberately does NOT say "cannot launch". Proxy targets are
  * resolved in `createRunner`, which read-only commands (`lazy list`, `lazy
@@ -78,17 +78,18 @@ export async function fetchDaemonCredentialState(): Promise<DaemonCredentialStat
 export class ProxyUnavailableError extends Error {
   constructor(reason: string) {
     super(
-      `[proxy] is enabled but lazy could not resolve the live proxy address.\n` +
+      `lazy could not resolve the live proxy address.\n` +
       `Reason: ${reason}\n\n` +
-      `lazy routes all agent model traffic through its local audit/policy proxy. Continuing\n` +
-      `without it would connect straight to api.anthropic.com with no audit record and no\n` +
-      `policy enforcement, so lazy refuses rather than silently degrade.\n\n` +
+      `lazy routes ALL agent model traffic through its local audit/policy proxy, always —\n` +
+      `including ollama roles and roles with an explicit \`endpoint\`, which the proxy now\n` +
+      `forwards to rather than the agent dialing them itself. Continuing without it would\n` +
+      `connect straight to the upstream with no audit record and no policy enforcement, so\n` +
+      `lazy refuses rather than silently degrade. There is no way to turn the proxy off and\n` +
+      `no role configuration that opts out — the fix is to get it running.\n\n` +
       `What to do:\n` +
       `  - Check the daemon:    lazy daemon status\n` +
       `  - Start / restart it:  lazy daemon start   (or: lazy daemon restart)\n` +
-      `  - Or opt out of the audit plane explicitly, in lazy.toml:\n` +
-      `        [proxy]\n` +
-      `        enabled = false`,
+      `  - Still failing? Its startup log says why the proxy did not bind: lazy daemon logs`,
     );
     this.name = 'ProxyUnavailableError';
   }
@@ -120,15 +121,12 @@ function proxyGateBypassed(): boolean {
  *  - In a CLI CLIENT (e.g. `lazy builder`, `pair`, `chat`): ask the daemon over
  *    the `getAuthEnv` RPC, which reports the same live address.
  *
- * FAILS LOUD (throws {@link ProxyUnavailableError}) when the proxy is enabled
- * but no address can be resolved. Returns undefined in exactly two cases, both
- * explicit rather than incidental:
- *  - `[proxy] enabled = false` — the user's opt-out, so the escape hatch costs
- *    nothing; and
- *  - the daemon RPC is bypassed by design (see {@link proxyGateBypassed}).
+ * FAILS LOUD (throws {@link ProxyUnavailableError}) when no address can be
+ * resolved. Returns undefined in exactly ONE case, explicit rather than
+ * incidental: the daemon RPC is bypassed by design (see {@link
+ * proxyGateBypassed}).
  */
 export async function resolveLiveProxyUrl(config: ResolvedConfig): Promise<string | undefined> {
-  if (!config.proxy) return undefined;
   if (hasDaemonContext()) {
     const port = getDaemonContext().proxyPort;
     // The daemon refuses to start when the proxy cannot start, so a running
@@ -144,7 +142,15 @@ export async function resolveLiveProxyUrl(config: ResolvedConfig): Promise<strin
 
   let rpc: { proxyBaseUrl?: string } | null;
   try {
-    rpc = await tryRpc<{ proxyBaseUrl?: string }>('getAuthEnv', {});
+    // Address only — this caller has no launch to inject a credential into,
+    // so the daemon is told not to send one.
+    rpc = await tryRpc<{ proxyBaseUrl?: string }>('getAuthEnv', {
+      credentials: false,
+      // Required by the handler even here, where no credential is requested:
+      // the parameter is mandatory at the boundary precisely so that no caller
+      // can reach it without having decided.
+      proxied: false,
+    });
   } catch (err) {
     // tryRpc already throws actionably for a missing/unreachable daemon. Keep
     // its FIRST line as the reason — the rest of its message is remediation
@@ -171,23 +177,21 @@ export async function resolveLiveProxyUrl(config: ResolvedConfig): Promise<strin
  * address (`src/runner/index.ts`, `lazy pair` ×2, `lazy chat`), so the
  * fail-loud contract is structural instead of repeated at each call site.
  *
- *  - `anthropic` roles (the default) get `proxyUrl` — traffic that used to go
- *    straight to api.anthropic.com now flows through the proxy, which forwards
- *    to that same upstream with the credential passed through untouched.
- *  - `proxy` roles that left `endpoint` unset get it filled in (the port is
- *    OS-assigned, so it isn't knowable from config). An explicit endpoint wins.
- *  - `ollama` roles are deliberately untouched — and deliberately do NOT
- *    trigger the gate: the proxy has a single Anthropic-native upstream and a
- *    local model is not it, so a proxied launch was never in question.
+ * EVERY backend gets `proxyUrl`, with no exceptions — that is the point. An
+ * ollama role and a role with an explicit `endpoint` used to be skipped here and
+ * connected direct; now their `endpoint` is the upstream the PROXY forwards to
+ * (src/proxy/role-upstreams.ts), so they need the proxy's address like everyone
+ * else and they trigger the same fail-loud gate.
  *
- * Targets are returned unchanged when `[proxy] enabled = false` (the explicit
- * opt-out) or the role is already pointed somewhere explicit.
+ * A target that already carries a `proxyUrl` is returned unchanged: it was
+ * resolved by whoever stamped it (the runner factory), and re-resolving would
+ * only risk disagreeing with the address the launch is already built around.
  */
 export async function withLiveProxyTarget(
   target: RoleTarget,
   config: ResolvedConfig,
 ): Promise<RoleTarget> {
-  if (!needsLiveProxyUrl(target, config)) return target;
+  if (!needsLiveProxyUrl(target)) return target;
   const proxyUrl = await resolveLiveProxyUrl(config);
   // Undefined only reaches here in the explicit bypass modes (test harness /
   // daemon-self); every genuine resolution failure threw above.
@@ -201,26 +205,35 @@ export async function withLiveProxyTarget(
  * here so a caller resolving the address ONCE for several roles (the runner
  * factory) applies exactly the same rules as the single-target seam.
  */
-export function needsLiveProxyUrl(target: RoleTarget, config: ResolvedConfig): boolean {
-  if (!config.proxy) return false;
-  if (target.backend === 'ollama') return false;
-  if (target.backend === 'proxy') return !target.endpoint;
+export function needsLiveProxyUrl(target: RoleTarget): boolean {
+  // INVARIANT: backend-independent. Every role is proxied, so the only question
+  // is whether this target already carries the address.
   return !target.proxyUrl;
 }
 
-/** Attach an already-resolved live proxy address to a role target. */
+/**
+ * Attach an already-resolved live proxy address to a role target.
+ *
+ * Sets `proxyUrl` and NEVER touches `endpoint`. It used to overwrite a `proxy`
+ * role's endpoint with the proxy's own address, which made "endpoint" mean two
+ * incompatible things depending on who had written it last. `endpoint` is now
+ * exclusively the upstream the proxy forwards this role to, and clobbering it
+ * here would erase the very routing the daemon reads at request time.
+ */
 export function applyLiveProxyUrl(target: RoleTarget, proxyUrl: string): RoleTarget {
-  if (target.backend === 'ollama') return target;
-  return target.backend === 'proxy'
-    ? { ...target, endpoint: proxyUrl }
-    : { ...target, proxyUrl };
+  return { ...target, proxyUrl };
 }
 
 /**
  * Resolve the auth env vars for a client-launched container, preferring the
  * daemon as the credential source.
  *
- * - Ollama: dummy local credentials, no daemon needed — computed in-process.
+ * - Ollama: the ollama server ignores auth, so there is no real credential to
+ *   fetch — but the launch still needs the proxy's address and a placeholder to
+ *   present to it, so the RPC is told the caller is self-credentialed and mints
+ *   a grant over {@link LOCAL_BACKEND_CREDS} instead of the user's token. This
+ *   is what keeps ollama-only projects (which legitimately have no Anthropic
+ *   credential at all) launchable while still being fully proxied.
  * - anthropic/proxy: the Anthropic credential is fetched from the daemon via the
  *   `getAuthEnv` RPC, then wrapped for the target (proxy prepends its base URL).
  * - Test (LAZY_TEST=1) / daemon-self (LAZY_IS_DAEMON=1): `tryRpc` returns null,
@@ -232,47 +245,56 @@ export function applyLiveProxyUrl(target: RoleTarget, proxyUrl: string): RoleTar
  * the configured runner would use, so a host launch MUST say so — otherwise a
  * docker-runner project hands `host.docker.internal` to a host process.
  *
- * `config`, when supplied, arms the same fail-loud proxy gate as
- * {@link withLiveProxyTarget}: with `[proxy]` enabled, an anthropic role that
- * ends up with no proxy address fails instead of connecting direct. Callers
- * that resolved their target through `withLiveProxyTarget` already passed the
- * gate; passing config here makes this last hop check rather than assume.
+ * `config` is accepted for symmetry with {@link withLiveProxyTarget} and is no
+ * longer load-bearing: the proxy is always on, so an anthropic role that ends up
+ * with no proxy address fails whether or not a config was passed. Callers that
+ * resolved their target through `withLiveProxyTarget` already passed the gate;
+ * this last hop checks rather than assumes.
  */
 export async function resolveAuthEnvFromDaemon(
   target?: RoleTarget,
   hints?: ProxyAuditHints,
   surface: LaunchSurface = 'container',
   config?: ResolvedConfig,
+  identity?: LaunchIdentity,
 ): Promise<AuthEnvVar[]> {
   const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
 
-  // Ollama-backed setups use local dummy credentials — the daemon adds nothing.
-  if (resolved.backend === 'ollama') {
-    return targetEnvVars(resolved, [], surface, hints);
-  }
+  // The ollama server ignores auth, so the daemon has no real credential to
+  // source for this role — and demanding one would break the very projects
+  // ollama exists to serve. The launch is proxied all the same: the daemon
+  // mints a placeholder over these synthetic vars, and the proxy strips it
+  // before forwarding to an upstream mapped to "no credential".
+  const selfCredentialed = resolved.backend === 'ollama';
 
-  // anthropic/proxy: source the real Anthropic credential, preferring the daemon.
-  const rpc = await tryRpc<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string }>('getAuthEnv', {});
+  // JIT CREDENTIALS: every role's traffic reaches lazy's proxy now, so the only
+  // question left is whether this caller identified itself well enough to mint
+  // a grant. A caller that passes no identity gets the real credential,
+  // unchanged. That is not a loophole to widen: every launch path in lazy passes
+  // one, and the remaining callers are diagnostics that never hand the value to
+  // a process.
+  const proxied = identity !== undefined;
+
+  const rpc = await tryRpc<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string }>('getAuthEnv', {
+    proxied,
+    ...(selfCredentialed ? { selfCredentialed: true } : {}),
+    ...(proxied ? { role: identity!.role, taskId: identity!.taskId ?? null, label: identity!.label } : {}),
+  });
   if (rpc) {
-    // The RPC returns the bare Anthropic credential; for proxy targets the base
-    // URL (and the audit headers) must still be layered on top here. When the
-    // role omitted `endpoint`, use the daemon's live proxy URL (OS-assigned port)
-    // from the RPC — the client can't read the daemon context itself.
-    if (resolved.backend === 'proxy') {
-      const endpoint = resolved.endpoint || rpc.proxyBaseUrl || '';
-      return targetEnvVars({ ...resolved, endpoint }, rpc.authEnvVars, surface, hints);
-    }
-    // DEFAULT-ON PROXY: an anthropic role routes through the proxy too whenever
-    // the daemon reports one, so client-launched containers (notably the docker
-    // builder) get the same audit/policy coverage as daemon-launched agents.
-    // Already-set proxyUrl (from the resolved role targets) wins.
+    // The RPC returns the bare credential; the base URL (and the audit headers)
+    // are layered on top here. The client can't read the daemon context itself,
+    // so the daemon's live proxy URL (OS-assigned port) comes back over the RPC.
+    // An already-set proxyUrl (from the resolved role targets) wins.
+    //
+    // `resolved.endpoint` is deliberately NOT consulted: it is the upstream the
+    // PROXY forwards to, never an address this launch dials.
     const proxyUrl = resolved.proxyUrl ?? rpc.proxyBaseUrl;
     if (proxyUrl) {
       return targetEnvVars({ ...resolved, proxyUrl }, rpc.authEnvVars, surface, hints);
     }
     // No proxy address for a role that should have one: the audit plane would
     // be silently bypassed, so fail loud (same contract as resolveLiveProxyUrl).
-    if (config?.proxy && !proxyGateBypassed()) {
+    if (!proxyGateBypassed()) {
       throw new ProxyUnavailableError(
         'the daemon is running but reports no live proxy address (its proxy is not running)',
       );
@@ -281,7 +303,14 @@ export async function resolveAuthEnvFromDaemon(
   }
 
   // Daemon bypassed (test or daemon-self mode): the credential is in this
-  // process. getAuthEnvVars throws an actionable error if it is genuinely
-  // absent, which is the correct behavior for those modes.
+  // process — or, for an ollama role, is synthetic and needs no process at all.
+  // getAuthEnvVars throws an actionable error if it is genuinely absent, which
+  // is the correct behavior for those modes.
+  //
+  // No placeholder swap here on purpose: these are the modes with no daemon,
+  // and therefore no proxy to exchange a placeholder against. The daemon-self
+  // case never reaches this function for a launch — in-daemon launches go
+  // through getLaunchAuthEnvVars, which does swap.
+  if (selfCredentialed) return targetEnvVars(resolved, LOCAL_BACKEND_CREDS, surface, hints);
   return getAuthEnvVars(resolved, hints, surface);
 }

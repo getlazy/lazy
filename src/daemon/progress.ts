@@ -65,7 +65,25 @@ export interface ProgressPhaseEvent {
   detail?: string;
 }
 
-export type ProgressEvent = ProgressPlanEvent | ProgressPhaseEvent;
+/**
+ * A live event from a long-lived subscription (today: proxy traffic, streamed
+ * to `lazy watch`). Distinct from the phase events above because it narrates a
+ * STREAM rather than the progress of the request that carries it — there is no
+ * plan, no position, and no end state.
+ *
+ * `payload` is deliberately opaque here: this module is the transport, and
+ * teaching it the shape of proxy audit data would couple the daemon's envelope
+ * to the proxy. The subscriber validates the payload at its own boundary (see
+ * `parseProxyActivityEvent` in src/proxy/activity.ts).
+ */
+export interface ProgressActivityEvent {
+  kind: 'activity';
+  /** Stream this event belongs to, e.g. `proxy`. */
+  channel: string;
+  payload: unknown;
+}
+
+export type ProgressEvent = ProgressPlanEvent | ProgressPhaseEvent | ProgressActivityEvent;
 
 /**
  * Sink for progress events. Supplied by the transport (the heartbeat envelope
@@ -79,6 +97,12 @@ export function describeProgress(event: ProgressEvent): string {
   if (event.kind === 'plan') {
     const target = event.target ? ` ${event.target}` : '';
     return `${event.operation}${target}: ${event.phases.length} phases`;
+  }
+  if (event.kind === 'activity') {
+    // Generic by design — a caller that wants a rendered activity line renders
+    // the payload itself; this is the fallback for surfaces that only know how
+    // to print a progress event.
+    return `${event.channel} activity`;
   }
   const position = event.total > 0 && event.index > 0 ? `[${event.index}/${event.total}] ` : '';
   const elapsed = event.elapsedMs !== undefined ? ` (${formatDuration(event.elapsedMs)})` : '';

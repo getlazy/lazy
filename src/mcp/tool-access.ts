@@ -61,6 +61,12 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_tag: 'write',
   lazy_untag: 'write',
   lazy_add_followup: 'write',
+  // Writes no task state, no worktree, launches nothing — but it does write a
+  // per-turn observability marker the daemon owns, and 'read' is the promise
+  // that a tool is inert. Classified by effect: an ask turn's contract is "your
+  // final message is the answer, call no tools", so there is nothing for a
+  // progress line to narrate there either.
+  lazy_update_progress: 'write',
   lazy_commit: 'write',
   lazy_memory_save: 'write',
 };

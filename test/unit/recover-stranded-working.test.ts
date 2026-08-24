@@ -43,10 +43,10 @@ import { recoverStrandedWorkingTasks } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir, ensureProtocolDir, writeStatus } from '../../src/protocol';
 import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
 import type { Runner } from '../../src/runner';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): { stdout: string; stderr: string; exitCode: number } {
-  const result = spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return {
     stdout: result.stdout?.toString().trim() ?? '',
     stderr: result.stderr?.toString().trim() ?? '',

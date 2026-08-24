@@ -210,11 +210,12 @@ describe('daemon restart resilience', () => {
     }, null, 2));
     const beforeIno = (await stat(stalePath)).ino;
 
-    // The API proxy is irrelevant here and binds/writes outside the temp HOME,
-    // which some containers refuse — an environmental failure with nothing to
-    // say about this invariant.
-    const cfgFile = join(tmpDir, 'no-proxy-lazy.toml');
-    await writeFile(cfgFile, '[proxy]\nenabled = false\n');
+    // Pin LAZY_CONFIG so this in-process daemon cannot adopt lazy's own
+    // lazy.toml (see CLAUDE.md). The API proxy is irrelevant here but is always
+    // on, so keep it on loopback with an OS-assigned port — the one posture
+    // that binds nothing a container would refuse.
+    const cfgFile = join(tmpDir, 'pinned-lazy.toml');
+    await writeFile(cfgFile, '[proxy]\nbind = "127.0.0.1"\n');
     const savedLazyConfig = process.env.LAZY_CONFIG;
     process.env.LAZY_CONFIG = cfgFile;
     try {

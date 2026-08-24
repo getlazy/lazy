@@ -7,6 +7,8 @@
  */
 
 import { existsSync } from 'fs';
+import { parseAcceptRemedy } from '../types';
+import type { AcceptRemedy } from '../types';
 import {
   heartbeatRequestHeaders,
   isHeartbeatEnvelope,
@@ -36,6 +38,13 @@ export class RpcApplicationError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * The structured remedy the daemon attached to a refused accept, if any.
+     * Carried across the wire so a client (the review page talking to a daemon
+     * in another process) has exactly what an in-process caller has, instead of
+     * re-deriving next steps from the message prose.
+     */
+    public readonly remedy?: AcceptRemedy,
   ) {
     super(message);
     this.name = 'RpcApplicationError';
@@ -202,15 +211,22 @@ export class DaemonClient {
     project: string,
     params: Record<string, unknown> = {},
     observers?: RpcObservers,
+    /**
+     * Abort the call in flight. A long-lived subscription (`lazy watch`'s
+     * traffic stream) must be able to let go of its window immediately when the
+     * task it is watching finishes — without one, the pending request keeps the
+     * connection and the process alive for the rest of the window.
+     */
+    signal?: AbortSignal,
   ): Promise<unknown> {
-    let response = await this.send(command, project, params);
+    let response = await this.send(command, project, params, signal);
 
     if (response.status === 401 && this.credentialSource) {
       const fresh = await this.credentialSource().catch(() => null);
       if (fresh && (fresh.token !== this.token || fresh.target !== this.target)) {
         this.target = fresh.target;
         this.token = fresh.token;
-        response = await this.send(command, project, params);
+        response = await this.send(command, project, params, signal);
       }
     }
 
@@ -226,17 +242,31 @@ export class DaemonClient {
         const detail = typeof (body as { error?: unknown })?.error === 'string'
           ? (body as { error: string }).error
           : JSON.stringify(body ?? null);
-        throw new RpcApplicationError(status, `RPC ${command} failed: ${status} ${detail}`);
+        throw new RpcApplicationError(
+          status,
+          `RPC ${command} failed: ${status} ${detail}`,
+          parseAcceptRemedy((body as { remedy?: unknown })?.remedy),
+        );
       }
       return body;
     }
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      // Application-level error — daemon responded but rejected the request
+      // Application-level error — daemon responded but rejected the request.
+      // The body is JSON in every daemon reply; a non-JSON body (a proxy page,
+      // a truncated stream) is not an error worth surfacing here, so it simply
+      // yields no remedy and the text still reaches the message.
+      let remedy: AcceptRemedy | undefined;
+      try {
+        remedy = parseAcceptRemedy((JSON.parse(body) as { remedy?: unknown })?.remedy);
+      } catch {
+        remedy = undefined;
+      }
       throw new RpcApplicationError(
         response.status,
         `RPC ${command} failed: ${response.status} ${body}`,
+        remedy,
       );
     }
 
@@ -247,10 +277,14 @@ export class DaemonClient {
     command: string,
     project: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<Response> {
     const { url, options } = buildDaemonRpcRequest(
       this.target, this.token, command, project, params, this.routePrefix,
     );
+    // Applied here rather than inside the pure request builder: aborting is a
+    // property of THIS call, not of the request's shape.
+    if (signal) options.signal = signal;
     return await fetch(url, options as any);
   }
 }
@@ -315,6 +349,8 @@ export async function tryRpc<T>(
   command: string,
   params: Record<string, unknown> = {},
   observers?: RpcObservers,
+  /** Abort the in-flight call — see DaemonClient.rpc. */
+  signal?: AbortSignal,
 ): Promise<T | null> {
   // Test mode and daemon-self bypass still return null
   if (isDaemonRpcBypassed()) return null;
@@ -326,7 +362,7 @@ export async function tryRpc<T>(
   if (!client) throw new DaemonNotRunningError();
 
   try {
-    return await client.rpc(command, root, params, observers) as T;
+    return await client.rpc(command, root, params, observers, signal) as T;
   } catch (err) {
     // Application-level error (daemon responded with error) — surface it directly
     if (err instanceof RpcApplicationError) {

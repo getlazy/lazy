@@ -110,6 +110,38 @@ export interface Agent {
   defaultWatchdogTimeoutMs(): number;
 
   /**
+   * The model this agent runs when nothing more specific was chosen, or `null`
+   * for "no opinion — let lazy's configured default decide".
+   *
+   * `null`, NOT `''`: "I have no default" is a different answer from "my
+   * default is a model name", and the type says so — an empty string is a
+   * sentinel the compiler cannot police, and it reads as a real (broken) value
+   * at every call site. `resolveAgentModel` rejects one rather than treating it
+   * as either answer. Same reason {@link activityStream} returns `null` instead
+   * of an inert stream.
+   *
+   * Otherwise the same shape as {@link defaultWatchdogTimeoutMs}: an agent
+   * declaring a fact about itself, not a caller branch. Cursor returns `auto`
+   * because letting Cursor pick the model is its own sensible default, and
+   * lazy's `[models] default` is an Anthropic model name that means nothing to
+   * it.
+   *
+   * PRECEDENCE — decided once in `resolveAgentModel` (src/agent/agent-model.ts):
+   *   1. an explicit `--model` override (`overrideModel`)
+   *   2. the authoritative model of a local backend ([models.roles.agent] with
+   *      backend ollama/proxy) — a pinned local model is never stomped
+   *   3. a soft per-task model (sticky model, `task.model`) on the anthropic backend
+   *   4. this agent-declared default
+   *   5. `[models] default`
+   *
+   * A future per-agent config key slots in between (3) and (4): it would
+   * override this declaration while still yielding to an explicit per-task
+   * choice. Do NOT return a model here merely to restate lazy's global default
+   * — an agent with no opinion returns `null` so config keeps deciding.
+   */
+  defaultModel(): string | null;
+
+  /**
    * Parser for this agent's incremental stdout, or `null` if it has none.
    *
    * Returning a stream is a capability declaration, not a caller branch: the
@@ -125,6 +157,32 @@ export interface Agent {
    * @see src/agent/activity-stream.ts
    */
   activityStream(): AgentActivityStream | null;
+
+  /**
+   * Whether `lazy pair` may hand a human an interactive session on this
+   * agent's CLI, in the task's worktree, on the HOST.
+   *
+   * This is a refusal gate, not a caller branch in the sense the note above
+   * forbids — same shape as AgentPackaging.supportsContainerRunner(). An agent
+   * cannot "do the right thing internally" here, because the right thing is to
+   * not run at all: the decision has to be made before a lock is taken, a
+   * status is moved, or a process is launched.
+   *
+   * Returning false is the safe default for a new agent. Say true only once
+   * BOTH hold:
+   *
+   *   1. A session the agent wrote INSIDE a task container is not silently
+   *      resumed on the host. Chat history is written by the agent, so
+   *      resuming it host-side turns agent-authored text into input for a
+   *      session running as the human with their credentials. Claude Code
+   *      qualifies only because lazy bridges those files explicitly and
+   *      narrowly (symlinks, additive, removed on exit — see pair-bridge.ts).
+   *   2. Pairing is actually useful — the human gets the agent's prior
+   *      conversation, not an empty session with no memory of the work.
+   *
+   * @see src/cli/commands/pair.ts
+   */
+  supportsPairing(): boolean;
 
   /**
    * Discover session log files for conversation capture.
@@ -154,6 +212,17 @@ export interface AgentPackaging {
 
   /** CLI binary name (e.g., 'claude', 'agent', 'codex'). */
   binaryName(): string;
+
+  /**
+   * Whether this agent can run under container runners (docker/podman).
+   *
+   * Gates the runner/agent compatibility checks in src/runner/index.ts and
+   * src/daemon/task-launcher.ts, and controls whether the container image is
+   * augmented with this agent's install (see getDockerfileContent in
+   * src/capture/claude.ts). An agent returning true MUST provide a working
+   * dockerInstallCommand().
+   */
+  supportsContainerRunner(): boolean;
 
   /** Install command for the Dockerfile (some agents use curl, not npm). */
   dockerInstallCommand(): string;

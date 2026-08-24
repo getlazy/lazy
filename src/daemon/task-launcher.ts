@@ -24,7 +24,7 @@ import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
 import type { RunnerType } from '../config/types';
-import { resolveAgentModel } from '../utils/role-target';
+import { resolveAgentModel } from '../agent/agent-model';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
@@ -41,11 +41,12 @@ import { buildNotesContext, buildSystemPrompt } from '../cli/commands/shared';
 import { buildMemorySection } from '../memory';
 import { checkOrphanedChild, retargetOrphanedChild } from '../cli/orphan';
 import { parentTaskIdOf, branchTarget } from '../task-target';
-import { getAgent, listAgents } from '../agent/registry';
+import { getAgent, getAgentPackaging, listAgents } from '../agent/registry';
 import { getDataDir } from '../cli/init';
 import { isFeatureEnabled } from '../utils/features';
 import { logger } from '../utils/logger';
 import { getActor } from '../constants';
+import { getNonHumanTurnCount, incrementNonHumanTurnCount, resetNonHumanTurnCount, checkTurnBudget } from './turn-budget';
 import type { Actor } from '../types';
 import { runGit } from '../utils/git';
 import { withSpan } from '../tracing';
@@ -439,6 +440,9 @@ export async function launchTask(
 ): Promise<StartTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
+  // Channel actor: MCP-originated starts are 'builder'/'agent', CLI 'human'.
+  // Falls back to getActor() for CLI (env-var / 'human').
+  const actor = params.actor ?? getActor();
 
   // --- Validate task ---
   let t = await withSpan('start.validate', { 'lazy.task_id': params.taskId }, () =>
@@ -460,8 +464,12 @@ export async function launchTask(
   }
   const runner = await createRunner(projectRoot, t.runner_type ?? undefined);
 
-  // Validate runner/agent compatibility against the RESOLVED runner.
-  if (t.agent_id !== 'claude-code' && runner.type !== 'dangerously-host-process-without-any-isolation') {
+  // Validate runner/agent compatibility against the RESOLVED runner. The
+  // capability comes from the agent's packaging, not a hardcoded id list.
+  if (
+    runner.type !== 'dangerously-host-process-without-any-isolation' &&
+    !getAgentPackaging(t.agent_id).supportsContainerRunner()
+  ) {
     throw new RpcError(400, `Agent "${t.agent_id}" only supports host-process runner. Set runner type to "dangerously-host-process-without-any-isolation" in lazy.toml.`);
   }
 
@@ -476,6 +484,19 @@ export async function launchTask(
   await runner.checkAvailability();
 
   const config = await loadConfig(projectRoot);
+
+  // --- Turn budget: cap consecutive turns without a human in the loop ---
+  // Builder/agent-initiated starts count; a human start resets the count.
+  // Checked before the queue gate so a task that would be refused never even
+  // joins the queue — refusing after queueing would still consume a turn once
+  // the reconciler drained it.
+  if (actor !== 'human') {
+    const nonHumanTurnCount = await getNonHumanTurnCount(storage, t.id);
+    const budgetDecision = checkTurnBudget(nonHumanTurnCount, config.limits.max_turns_without_human);
+    if (!budgetDecision.allowed) {
+      throw new RpcError(409, `Task ${displayId(t)}: ${budgetDecision.reason}`);
+    }
+  }
 
   // --- Concurrency gate (agent slot) ---
   // A slot is held by each *working* agent task. At the cap, queue instead of
@@ -497,7 +518,7 @@ export async function launchTask(
       await resolveAndPersistEffort(t, params.effortOverride, config.agent.effort, storage);
     }
     if (t.status !== 'queued') {
-      await storage.updateTaskStatus(t.id, 'queued', params.actor ?? getActor());
+      await storage.updateTaskStatus(t.id, 'queued', actor);
     }
     logger.info(`Task ${displayId(t)} queued (${slot.running}/${slot.limit} agents running)`);
     return {
@@ -828,19 +849,34 @@ export async function launchTask(
       sequence: 1,
       role: 'human',
       content: turnPrompt,
+      agent: t.agent_id,
       model: modelName,
       effort: effortValue,
       prompt: fullPrompt,
-      // Channel actor: MCP-originated starts are 'builder', CLI 'human'.
-      // Falls back to getActor() for CLI (env-var / 'human').
-      actor: params.actor ?? getActor(),
+      actor,
       // INVARIANT: the task prompt is the human's first and most important
       // feedback. If the very first turn crashes before the agent reads it,
       // resume must re-deliver it verbatim rather than say "carry on".
       carriesFeedback: true,
     });
 
-    await storage.updateTaskStatus(t.id, 'working', params.actor ?? getActor());
+    await storage.updateTaskStatus(t.id, 'working', actor);
+
+    // BUG FIX (same class as unblock/resume): only a human taking over clears
+    // the turn budget counter; a builder/agent-initiated start increments it.
+    if (actor === 'human') {
+      try {
+        await resetNonHumanTurnCount(storage, t.id);
+      } catch {
+        // Counter reset is best-effort — task start must proceed even if budget tracking fails
+      }
+    } else {
+      try {
+        await incrementNonHumanTurnCount(storage, t.id);
+      } catch {
+        // Counter increment is best-effort — task start must proceed even if budget tracking fails
+      }
+    }
 
     // --- Publish branch ---
     let parentDisplayId: string | null = null;

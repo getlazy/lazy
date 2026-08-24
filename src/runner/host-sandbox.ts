@@ -70,12 +70,16 @@
  *     daemon / CI where lazy may run as root.
  *
  * Interactive BUILDER:
- *   sandbox.enabled + the DEFAULT permission mode (prompts), unless `--autonomous`.
- *   - the builder has a human at the terminal, so a sandbox-escape prompt is
- *     answerable. `allowUnsandboxedCommands: true` lets the human approve an
+ *   sandbox.enabled, plus bypass whenever the builder is autonomous — which it
+ *   is BY DEFAULT (`lazy builder --no-autonomous` is the opt-out).
+ *   - autonomous (default): the headless agent posture above (sandbox + bypass),
+ *     so the builder never hangs on a prompt.
+ *   - `--no-autonomous`: sandbox + the DEFAULT permission mode (prompts). The
+ *     builder has a human at the terminal, so a sandbox-escape prompt is
+ *     answerable; `allowUnsandboxedCommands: true` lets the human approve an
  *     escape via the `dangerouslyDisableSandbox` retry.
- *   - `--autonomous` opts the builder into the headless agent posture above
- *     (sandbox + bypass), so it still never hangs.
+ *   This function takes `autonomous` as a parameter and does not know the CLI
+ *   default — `lazy pair --autonomous` is still opt-in and passes false.
  *
  * INVARIANT: headless agents NEVER hang on an interactive permission prompt.
  * The OS sandbox (Bash) and `permissions.deny` (file tools) — not a prompt — are

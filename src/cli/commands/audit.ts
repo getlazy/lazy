@@ -295,7 +295,7 @@ export async function commandAudit(args: string[]): Promise<void> {
 
   if (all.length === 0) {
     console.log(
-      'No proxied requests recorded yet — run a task with the proxy enabled and retry.',
+      'No proxied requests recorded yet — run a task and retry.',
     );
     console.log(dim(SCOPE_NOTE));
     return;
@@ -332,9 +332,8 @@ the rows worth looking at (DENY, REROUTE, FAIL). Pass a record id — the short
 form from the ID column is enough — for the full detail view of one request,
 including denied tool calls with the rule that fired and the reason given.
 
-Only traffic that goes THROUGH the proxy is audited. An agent configured on the
-'anthropic' or 'ollama' backend talks to its upstream directly and never appears
-here.
+Every launch lazy makes routes through the proxy, whatever the role's backend, so
+all of it is audited here; a process lazy did not launch is not.
 
 Filters (all combine):
   --task <id>          Only this task (short-id prefix match)

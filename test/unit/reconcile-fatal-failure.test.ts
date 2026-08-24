@@ -20,10 +20,10 @@ import { FileStorage } from '../../src/storage';
 import { handleErrorResponse } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { ErrorResponse } from '../../src/protocol';
-import { spawnSync } from '../../src/utils/spawn';
+import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {
-  const result = spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return result.stdout?.toString().trim() ?? '';
 }
 
@@ -101,6 +101,19 @@ const plainCrash: ErrorResponse = {
   exit_code: 139,
 };
 
+/**
+ * What the fast-crash-loop backstop puts on the wire: a class, but always
+ * `unknown` — the detector runs for no other class (fix-cursor-action-required).
+ */
+const crashLoop: ErrorResponse = {
+  status: 'error',
+  error: 'Work phase failed: Crash loop detected: Segmentation fault',
+  phase: 'work',
+  failure_class: 'unknown',
+  failure_reason: 'unrecognized claude-code failure',
+  failure_attempts: 3,
+};
+
 describe('reconciler: classified agent failures', () => {
   let env: Env;
 
@@ -153,5 +166,26 @@ describe('reconciler: classified agent failures', () => {
 
     const turns = await env.storage.getSessionTurns(sessionId);
     expect(turns[turns.length - 1]!.content).toContain('[Agent crashed]');
+  });
+
+  // INVARIANT: an `unknown` class is DIAGNOSIS, never a verdict. The crash-loop
+  // backstop now reports what it knows, but "we could not classify this" has
+  // never been a reason to stop auto-resume — making it block would flip every
+  // crash loop onto the human's queue, which the detector's own comment
+  // explicitly rejects.
+  test('a crash-loop report stays interrupted, but shows its class and attempts', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, crashLoop, protoDir, env.lazyRoot);
+
+    const task = await env.storage.getTask(taskId);
+    expect(task?.status).toBe('interrupted');
+
+    const turns = await env.storage.getSessionTurns(sessionId);
+    const last = turns[turns.length - 1]!;
+    expect(last.content).toContain('[Agent crashed]');
+    expect(last.content).not.toContain('unrecoverable');
+    expect(last.content).toContain('Failure class: unknown');
+    expect(last.content).toContain('Attempts before giving up: 3');
   });
 });

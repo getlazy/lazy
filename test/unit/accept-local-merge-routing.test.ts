@@ -53,7 +53,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
     git: { default_branch_prefix: 'lazy' },
     // Routing behavior under test predates the edge gate; gate scenarios are
     // covered by test/unit/edge-gate.test.ts + test/e2e/approve.test.ts.
-    protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true, passphrase_file: '.lazy/approve-passphrase' },
+    protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,

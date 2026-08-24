@@ -38,6 +38,8 @@ import {
 } from '../capture/claude';
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
+import { getAgentPackaging } from '../agent/registry';
+import type { Agent } from '../agent/interface';
 import { encodeProjectPath } from '../import/claude-code-logs';
 import { shouldMountProjectsDir, type BuilderLaunchProjects } from '../builder/projects-isolation';
 import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
@@ -92,6 +94,7 @@ export class DockerRunner implements Runner {
   protected readonly binary: string;
   private lazyRoot: string | undefined;
   protected _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
+  protected _agent?: Agent;
 
   constructor(binary: string = 'docker', type: RunnerType = 'docker', lazyRoot?: string) {
     this.binary = binary;
@@ -102,6 +105,15 @@ export class DockerRunner implements Runner {
   /** Set the per-role model targets (builder vs agent backends). */
   setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void {
     this._roleTargets = targets;
+  }
+
+  /**
+   * Set the task's agent so launches build the right image, forward the right
+   * credentials, and run the right tool checks. Called by the daemon's task
+   * paths (task-lifecycle/task-launcher) after createRunner.
+   */
+  setAgent(agent: Agent): void {
+    this._agent = agent;
   }
 
   /** The resolved target for task/supervisor (agent) launches. */
@@ -158,7 +170,7 @@ export class DockerRunner implements Runner {
     // Fail hard before launch if the agent's backend is unreachable — never
     // silently fall back to a different backend (CLAUDE.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget(), taskId);
+    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget(), taskId, this._agent?.id);
   }
 
   async runClaudeSync(
@@ -347,7 +359,10 @@ export class DockerRunner implements Runner {
   }
 
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
-    return agentPackaging.supervisorToolChecks();
+    // Check the task's agent when one was set; the Claude Code default keeps
+    // agent-less callers (builder paths) behaving as before.
+    const pkg = this._agent ? getAgentPackaging(this._agent.id) : agentPackaging;
+    return pkg.supervisorToolChecks();
   }
 
   mcpServerConfig(
@@ -525,8 +540,8 @@ export class DockerRunner implements Runner {
     // which in a daemon-only-env deployment legitimately has none. (Reading the
     // client env here was the cause of the spurious "Authentication required"
     // failure on `lazy builder`.) Passing the config arms the proxy fail-loud
-    // gate on this last hop too: with [proxy] enabled, a builder that ends up
-    // with no proxy address fails instead of connecting direct.
+    // gate on this last hop too: the proxy is always on, so a builder that
+    // ends up with no proxy address fails instead of connecting direct.
     const { loadConfig } = await import('../config/loader');
     const config = await loadConfig(lazyRoot);
     //
@@ -534,7 +549,20 @@ export class DockerRunner implements Runner {
     // task agent and like pairing. It never falls back to the human's own
     // ~/.claude/.credentials.json — see src/builder/claude-home.ts for why that
     // store is deliberately shadowed inside the container.
-    const authEnvVars = await resolveAuthEnvFromDaemon(this.builderTarget(), { role: 'builder' }, 'container', config);
+    //
+    // JIT CREDENTIALS: the daemon answers with a PLACEHOLDER bound to this
+    // builder session, not the real token — the proxy swaps the real one in
+    // upstream. The label is `builder-<id>`, the same identity the session's
+    // daemon MCP token is minted under (see src/cli/commands/builder.ts), so the
+    // revoke on the way out clears both.
+    const builderId = basename(builderConfigPath, '.json').replace('builder-', '');
+    const authEnvVars = await resolveAuthEnvFromDaemon(
+      this.builderTarget(),
+      { role: 'builder' },
+      'container',
+      config,
+      { role: 'builder', taskId: null, label: `builder-${builderId}` },
+    );
 
     // Read the builder config to get port for the container config
     const builderConfig = JSON.parse(readFileSync(builderConfigPath, 'utf-8'));
@@ -548,9 +576,6 @@ export class DockerRunner implements Runner {
     const promptFile = join(tmpDir, `builder-prompt-${Date.now()}.txt`);
     writeFileSync(promptFile, systemPrompt);
 
-    // Extract short ID from config filename (e.g., "builder-a1b2c3d4.json" → "a1b2c3d4")
-    const configBasename = basename(builderConfigPath, '.json');
-    const builderId = configBasename.replace('builder-', '');
 
     // Determine MCP proxy mode: daemon (preferred) or legacy builder server
     const useDaemonProxy = !!daemonConfigPath;

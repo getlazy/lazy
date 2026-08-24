@@ -23,6 +23,7 @@ import { describeExpiry } from '../../utils/local-day';
 import { isTTY, promptYesNo } from '../editor';
 import {
   checkDaemonHealth,
+  DAEMON_HEALTH_TIMEOUT_MS,
   isDaemonRunning,
   readPid,
   readToken,
@@ -46,6 +47,7 @@ import { collectDaemonStopInventory, confirmDaemonStop } from './daemon-pre-stop
 import { commandLogs, logsUsage } from './logs';
 import { commandAutoBudget, autoBudgetUsage } from './auto-budget';
 import { commandDaemonConfig, daemonConfigUsage } from './daemon-config';
+import { commandResumeQueue, resumeQueueUsage } from './resume-queue';
 
 export async function commandDaemon(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -81,6 +83,9 @@ export async function commandDaemon(args: string[]): Promise<void> {
       break;
     case 'config':
       await commandDaemonConfig(subArgs);
+      break;
+    case 'resume-queue':
+      await commandResumeQueue(subArgs);
       break;
     default:
       if (subcommand === '--help' || subcommand === '-h' || !subcommand) {
@@ -206,6 +211,12 @@ async function noticeInteractiveSessions(projectRoot: string, resuming: boolean)
   console.log('');
 }
 
+/** Time allowed for a SIGKILLed process to disappear. Kernel-immediate; slack only. */
+const SIGKILL_GRACE_MS = 2_000;
+
+/** Poll interval while waiting for the daemon process to disappear. */
+const EXIT_POLL_MS = 100;
+
 /**
  * @param opts.skipPreStop set by `daemon restart`, which has already run (and
  *   shown) the pre-stop warning itself — a restart must warn ONCE, not twice, and
@@ -245,30 +256,132 @@ async function daemonStop(
   const pid = readPid(projectRoot);
   console.log(`Stopping daemon${pid ? ` (PID ${pid})` : ''}...`);
 
-  // Try graceful shutdown via socket
+  // Try graceful shutdown via socket. Bounded (see DAEMON_HEALTH_TIMEOUT_MS):
+  // a frozen daemon accepts the connection and never answers, so an unbounded
+  // request here would hang the stop on exactly the daemon that needs stopping.
   const shutdownAccepted = await requestShutdown(projectRoot);
 
   if (!shutdownAccepted && pid && isProcessAlive(pid)) {
     // Socket shutdown failed — try SIGTERM directly
+    console.log('  Daemon did not accept the shutdown request — sending SIGTERM...');
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
 
-  // Wait for daemon exit using blocking flock. When flock returns,
-  // daemon is dead (OS released the lock on process exit).
-  const result = blockingFlock(projectRoot, 5000);
-  if (result) {
-    // Release BEFORE cleaning up: cleanupStaleFiles refuses while the daemon
-    // lock is held, and flock conflicts across separate fds even within one
-    // process — so cleaning up while still holding our own probe lock would
-    // refuse and leave the files behind.
-    releaseDaemonLock(result.fd);
-    cleanupStaleFiles(projectRoot);
+  // How long to wait before force-killing. A daemon that ACCEPTED the request is
+  // winding down on purpose — closing storage, waiting on children — and gets the
+  // longer window; one that never answered has already failed to behave and gets
+  // the short one. Escalating on the same short clock in both cases would
+  // SIGKILL a healthy daemon in the middle of a slow but correct shutdown.
+  const graceMs = shutdownAccepted ? 15_000 : 5_000;
+
+  if (await waitForDaemonExit(projectRoot, graceMs, pid)) {
     console.log('Daemon stopped.');
     return true;
   }
 
-  console.error(`Error: daemon did not stop within 5 seconds.${pid ? ` Try: kill -9 ${pid}` : ''}`);
+  // ESCALATE, rather than telling the human to run `kill -9` themselves.
+  //
+  // This is the frozen-daemon case: the shutdown request went unanswered and
+  // SIGTERM changed nothing, because the daemon's signal handler runs on the
+  // very event loop that is stuck. Nothing short of SIGKILL will clear it, and
+  // until it is cleared the dead-but-alive process holds the daemon lock, so no
+  // replacement can start — which makes "did not stop, try kill -9 yourself"
+  // both the wrong answer and the only thing standing between the human and a
+  // working project. The stop was already confirmed; escalating to finish the
+  // job the human asked for is not a new decision, so it does not need a
+  // separate --force flag. It is narrated at every step.
+  if (pid && isProcessAlive(pid)) {
+    console.log(`  Still running after ${graceMs / 1000}s — SIGTERM is handled on the daemon's own`);
+    console.log('  event loop, which is stuck. Escalating to SIGKILL...');
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (err) {
+      // EPERM (another user's process) is the only realistic failure here; a
+      // dead pid is the outcome we wanted anyway. Either way, say what happened
+      // rather than reporting a clean stop.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Error: could not SIGKILL PID ${pid}: ${msg}`);
+      process.exit(1);
+    }
+
+    // The kernel reaps a SIGKILLed process immediately, so this is a formality —
+    // but it is also what releases the lock and cleans up the state files the
+    // killed daemon never got to remove.
+    if (await waitForDaemonExit(projectRoot, SIGKILL_GRACE_MS, pid)) {
+      console.log('Daemon stopped (SIGKILL — it was not responding).');
+      return true;
+    }
+  }
+
+  // Two distinct dead ends, and conflating them would send the human the wrong
+  // way: a pid that survived SIGKILL is a kernel problem, while no recorded pid
+  // at all means there was nothing left to escalate against.
+  if (pid) {
+    console.error(
+      `Error: daemon did not stop — PID ${pid} is still alive after SIGKILL.\n` +
+      'A process that survives SIGKILL is stuck in the kernel (uninterruptible I/O —\n' +
+      'often a hung network mount). Run `lazy doctor` for details; the process cannot\n' +
+      'be cleared from user space and the machine may need a reboot.',
+    );
+  } else {
+    console.error(
+      'Error: daemon did not stop, and no daemon PID is recorded, so there is nothing\n' +
+      'to signal. Its state files are still in place. Run `lazy doctor` for details, and\n' +
+      '`lazy daemon list` to find a daemon still holding this project.',
+    );
+  }
   process.exit(1);
+}
+
+/**
+ * Wait for the daemon process to exit, then remove its state files. Returns
+ * true once it is gone.
+ *
+ * This is `daemon stop`'s own wait rather than `waitForDaemonStop`, because stop
+ * also has to REMOVE the state files a killed daemon never got to clean up, and
+ * doing that safely depends on having held (and then released) the lock.
+ *
+ * The flock is the primary signal, for the reason `waitForDaemonStop` documents:
+ * the daemon releases it as the very LAST step of exit, after removing its own
+ * socket and PID files, so acquiring it proves the exit finished rather than
+ * merely started.
+ *
+ * `blockingFlock` returning null is AMBIGUOUS — it means either "timed out" or
+ * "there is no lock file at all" (a daemon predating flock enforcement, or one
+ * started under LAZY_TEST=1, which skips the lock). In the second case it returns
+ * null INSTANTLY, which is why the pid is polled rather than checked once: taking
+ * the instant null at face value would collapse the whole grace window to zero
+ * and escalate to SIGKILL on a daemon that was given no time to exit, while
+ * treating it as "still running" would report a stop failure for one that had
+ * already exited. The pid is unambiguous either way.
+ */
+async function waitForDaemonExit(
+  projectRoot: string,
+  timeoutMs: number,
+  pid: number | null,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    const result = blockingFlock(projectRoot, Math.max(0, remaining));
+    if (result) {
+      // Release BEFORE cleaning up: cleanupStaleFiles refuses while the daemon
+      // lock is held, and flock conflicts across separate fds even within one
+      // process — so cleaning up while still holding our own probe lock would
+      // refuse and leave the files behind.
+      releaseDaemonLock(result.fd);
+      cleanupStaleFiles(projectRoot);
+      return true;
+    }
+
+    if (pid !== null && !isProcessAlive(pid)) {
+      cleanupStaleFiles(projectRoot);
+      return true;
+    }
+
+    if (Date.now() >= deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS));
+  }
 }
 
 async function daemonRestart(args: string[]): Promise<void> {
@@ -359,18 +472,16 @@ async function daemonStatus(args: string[]): Promise<void> {
       console.log('  Web:     not bound (degraded — restart after freeing the port)');
     }
     // Proxy: the primary way to find the (OS-assigned by default) proxy address.
-    // INVARIANT: always print this line. The proxy is on by default, so an absent
+    // INVARIANT: always print this line. The proxy is always on, so an absent
     // line would be indistinguishable from a running one and would hide that
     // agent traffic is flowing unaudited.
     if (status.proxy) {
       const p = status.proxy;
-      if (!p.enabled) {
-        console.log('  Proxy:   disabled ([proxy] enabled = false) — agent traffic connects directly, not audited');
-      } else if (p.running && p.address) {
+      if (p.running && p.address) {
         const fb = `${p.fallbacks} fallback${p.fallbacks === 1 ? '' : 's'}`;
         console.log(`  Proxy:   ${p.address} → ${p.upstream} (${fb}, policy ${p.policyEnforce ? 'on' : 'off'})`);
       } else {
-        console.log('  Proxy:   enabled but not running (degraded — restart the daemon)');
+        console.log('  Proxy:   not running (degraded — restart the daemon)');
       }
     }
     if (status.uptime !== undefined) {
@@ -424,6 +535,25 @@ async function daemonStatus(args: string[]): Promise<void> {
         }
       }
     }
+  } else if (status.unresponsive) {
+    // The socket ACCEPTED the connection and then nothing came back — the
+    // process is alive with a frozen event loop. This is a different failure
+    // from "not responding" below (connection refused / socket gone) and needs
+    // a different remedy, so say so explicitly rather than letting the human
+    // spend an hour deciding which one they are looking at.
+    const pid = status.pid ?? readPid(projectRoot);
+    console.log(`Daemon is ALIVE but UNRESPONSIVE${pid ? ` (PID ${pid})` : ''}.`);
+    console.log(`  Socket:  ${status.socketPath ?? getSocketPath(projectRoot)}`);
+    console.log(`  Probe:   connected, but no reply within ${DAEMON_HEALTH_TIMEOUT_MS / 1000}s`);
+    console.log('');
+    console.log('  Its event loop is stuck: the socket is still listening, so the connection');
+    console.log('  succeeds, but nothing in the daemon is running to answer. Reconciliation,');
+    console.log('  turns, and every other daemon-owned activity are stalled.');
+    console.log('');
+    console.log('  Recover with:');
+    console.log('    lazy daemon restart');
+    console.log('  It force-kills a daemon in this state — SIGTERM alone would be ignored,');
+    console.log('  because the signal handler runs on the same frozen loop.');
   } else {
     // Process is alive (isDaemonRunning passed) but socket isn't responding.
     // This can happen if the daemon is still starting up or the HTTP handler is stuck.
@@ -463,7 +593,11 @@ async function daemonDashboardUrl(args: string[]): Promise<void> {
 
   const status = await checkDaemonHealth(projectRoot);
   if (!status.running) {
-    console.error('Error: daemon process is alive but not responding on socket. Try: lazy daemon restart');
+    console.error(
+      status.unresponsive
+        ? 'Error: daemon is alive but unresponsive (event loop stuck). Clear it with `lazy daemon restart`.'
+        : 'Error: daemon process is alive but not responding on socket. Try: lazy daemon restart',
+    );
     process.exit(1);
   }
 
@@ -684,6 +818,7 @@ export const daemonSubcommandUsage: Record<string, () => void> = {
   'logs': logsUsage,
   'auto-budget': autoBudgetUsage,
   'config': daemonConfigUsage,
+  'resume-queue': resumeQueueUsage,
 };
 
 export function daemonUsage(): void {
@@ -704,6 +839,7 @@ Subcommands:
   logs        Tail the daemon log file (primary debugging tool)
   auto-budget Control + inspect the auto-react daily budget (list/update/pause/resume)
   config      Inspect + override concurrency caps at runtime (get/set/reset, ephemeral)
+  resume-queue  Show the slow-lane auto-resume queue (read-only)
 
 Start options:
   --foreground    Run in foreground (don't detach)

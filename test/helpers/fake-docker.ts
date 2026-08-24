@@ -52,6 +52,15 @@ case "\${1:-}" in
     cat "\$STATE/images.tsv" 2>/dev/null
     exit 0
     ;;
+  run)
+    # Throwaway probe containers (e.g. \`docker run --rm <image> which <bin>\`).
+    # Succeed by default; a test flips the fail-run flag to simulate a probe
+    # that finds the binary missing.
+    if [ -f "\$STATE/fail-run" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
   build)
     shift
     tags=()
@@ -115,6 +124,8 @@ export interface FakeDocker {
   invocations(): Promise<string[]>;
   /** Make the next build fail (offline-fallback tests). */
   failBuilds(): Promise<void>;
+  /** Make `docker run` probes fail (missing-binary preflight tests). */
+  failRuns(): Promise<void>;
 }
 
 export async function installFakeDocker(baseDir: string): Promise<FakeDocker> {
@@ -173,6 +184,9 @@ export async function installFakeDocker(baseDir: string): Promise<FakeDocker> {
     },
     async failBuilds() {
       await writeFile(join(stateDir, 'fail-build'), '1');
+    },
+    async failRuns() {
+      await writeFile(join(stateDir, 'fail-run'), '1');
     },
   };
 }

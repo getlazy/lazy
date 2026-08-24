@@ -20,6 +20,7 @@ import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
 import { PROTOCOL_VERSION } from './types';
+import { PROGRESS_FILE } from './progress';
 import type { ResolvedConfig, MaintainEntry } from '../config/types';
 import { buildAgentSandboxArgs } from '../runner/host-sandbox';
 
@@ -165,6 +166,15 @@ export function writeCommand(dir: string, command: Command): void {
   if (existsSync(rPath)) {
     try { unlinkSync(rPath); } catch { /* best effort */ }
   }
+  // INVARIANT: a command starts a turn, and a turn starts with no progress.
+  // The agent's self-reported progress line (progress.json) is per-TURN
+  // ephemera, so clearing it here — the one place every turn passes through —
+  // is what makes "a stale message from a finished turn never lingers" a
+  // structural guarantee rather than eight call sites that must remember.
+  const pPath = join(dir, PROGRESS_FILE);
+  if (existsSync(pPath)) {
+    try { unlinkSync(pPath); } catch { /* best effort */ }
+  }
   atomicWrite(commandPath(dir), JSON.stringify(command, null, 2));
 }
 
@@ -302,7 +312,8 @@ export function ensureProtocolDir(dir: string): void {
 export function cleanProtocol(dir: string): void {
   // waiting.json is included: a torn-down turn cannot still be blocked on a
   // subtask, so leaving the marker behind would render a dead task as waiting.
-  for (const file of ['command.json', 'response.json', 'status.json', 'waiting.json']) {
+  // progress.json likewise — a torn-down turn is not making progress.
+  for (const file of ['command.json', 'response.json', 'status.json', 'waiting.json', PROGRESS_FILE]) {
     const p = join(dir, file);
     try { if (existsSync(p)) unlinkSync(p); } catch { /* best effort */ }
   }

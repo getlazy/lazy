@@ -8,7 +8,7 @@
  * The 'remote' section's valid keys are extended at runtime by the driver.
  *
  * When you add, rename, or remove a key here, also update
- * docs/lazy-toml.md so the user-facing reference stays in sync.
+ * public-docs/lazy-toml.md so the user-facing reference stays in sync.
  *
  * A key missing from this schema is reported to the user as an unknown option
  * even though it works, so test/unit/config-schema-drift.test.ts cross-checks
@@ -57,13 +57,21 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // 'policy' is a nested table ([proxy.policy]); its inner keys (enforce,
   // connector_allowlist, deny_secret_path_reads, deny_path_globs,
   // egress_allowlist) are likewise resolved by the config loader.
-  proxy: ['enabled', 'port', 'bind', 'upstream', 'fallback', 'retry_after_threshold', 'policy'],
+  // 'enabled' was REMOVED — the proxy is always on. It is deliberately absent
+  // here so a stale key is reported rather than tolerated; the config loader
+  // rejects it outright with the migration message.
+  proxy: ['port', 'bind', 'upstream', 'cursor_upstream', 'fallback', 'retry_after_threshold', 'policy'],
   memory: ['warn_bytes'],
   documents: ['path'],
   docs: ['url'],
   worktree: ['include'],
   permissions: ['protected'],
-  protection: ['enabled', 'protected_branches', 'protected_tasks', 'gate_default_branch', 'passphrase_file'],
+  // `passphrase_file` is REMOVED, not renamed: the approval passphrase now
+  // lives hashed in a machine-global store outside every repo, so there is no
+  // path left for the repo to point at. It is deliberately absent here and
+  // listed in DEPRECATED_SECTION_KEYS below, so a stale key gets the migration
+  // message instead of a generic "unknown option".
+  protection: ['enabled', 'protected_branches', 'protected_tasks', 'gate_default_branch'],
   // 'pre_accept' is a nested table ([automation.pre_accept]); its inner keys
   // (enabled, commands, timeout) are validated by the config loader/defaults,
   // not this one-level scan.
@@ -72,13 +80,48 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // name, target, readonly) are validated by the config loader, not this scan.
   mounts: ['type', 'source', 'name', 'target', 'readonly'],
   checks: ['post_turn', 'post_turn_timeout'],
-  limits: ['max_concurrent_agents', 'max_concurrent_builders', 'idle_grace_minutes'],
-  daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns'],
+  limits: ['max_concurrent_agents', 'max_concurrent_builders', 'idle_grace_minutes', 'max_turns_without_human'],
+  daemon: ['auto_react_ci', 'auto_react_comments', 'auto_react_max_retries', 'auto_react_backoff', 'auto_react_daily_budget', 'max_auto_turns', 'auto_resume', 'auto_resume_interval_minutes', 'auto_resume_gap_minutes', 'auto_resume_max_attempts'],
   features: [], // accepts arbitrary keys — checked separately by feature flags system
 };
 
 /** Sections that accept arbitrary keys (not checked for unknown keys). */
 const FREEFORM_SECTIONS = new Set(['features']);
+
+/**
+ * Keys that USED to be valid and now are not, with the migration each one
+ * needs. `[remote]` has had a driver-provided version of this forever
+ * (`getConfigOptions().deprecated`); this is the same idea for the sections
+ * lazy owns itself.
+ *
+ * A key listed here is NOT reported as unknown — a generic "Unknown config
+ * option" sends the human hunting for a typo when the real answer is "that
+ * moved, here is where". `lazy doctor` renders these as their own findings
+ * (checkConfigKeys), and the config loader prints one short line at load time
+ * pointing there (single-warning-surface convention).
+ *
+ * Keyed `section.key`; the value is the full remedy sentence.
+ */
+export const DEPRECATED_SECTION_KEYS: Record<string, string> = {
+  'protection.passphrase_file':
+    'The approval passphrase is no longer a file inside the repository. It lives hashed in a ' +
+    'machine-global store (~/.lazy/passphrase.json), because an in-repo plaintext file was ' +
+    'readable by every task agent, and a repo-controlled path let an agent point the gate at a ' +
+    'file it had just written. Enroll once with `lazy system passphrase set`, delete any ' +
+    'leftover `.lazy/approve-passphrase`, then remove this key from [protection].',
+};
+
+/** Every `section.key` in a raw config that is deprecated, in file order. */
+export function findDeprecatedConfigKeys(raw: Record<string, unknown>): string[] {
+  const found: string[] = [];
+  for (const dotted of Object.keys(DEPRECATED_SECTION_KEYS)) {
+    const [section, key] = dotted.split('.');
+    const sectionValue = raw[section];
+    if (typeof sectionValue !== 'object' || sectionValue === null || Array.isArray(sectionValue)) continue;
+    if (key in (sectionValue as Record<string, unknown>)) found.push(dotted);
+  }
+  return found;
+}
 
 /**
  * Compare a raw TOML config object against the known schema.
@@ -124,6 +167,9 @@ export function findUnknownConfigKeys(
 
     const knownKeys = section === 'remote' ? remoteAllKnown : KNOWN_CONFIG_SCHEMA[section];
     for (const key of Object.keys(sectionValue)) {
+      // A deprecated key is known-but-obsolete: it gets its own migration
+      // message (see DEPRECATED_SECTION_KEYS), never "unknown option".
+      if (`${section}.${key}` in DEPRECATED_SECTION_KEYS) continue;
       if (!knownKeys.includes(key)) {
         warnings.push(`Unknown config option '${section}.${key}' in lazy.toml`);
       }

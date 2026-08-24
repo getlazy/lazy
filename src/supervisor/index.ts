@@ -49,14 +49,14 @@ import type {
 } from '../protocol/types';
 import type { MergeConflict } from '../types';
 import { runSyncWithUpstream, runSyncWithRemote, type MergeGuardOptions, hasUnmergedFiles, abortMergeIfInProgress, settleConflictedWorktree } from './merge';
-import { readWorktreeMergeState, describeMergeState, isMidMerge } from '../git/operations';
-import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError } from './work';
+import { readWorktreeMergeState, describeMergeState, isMidMerge, hasUncommittedChanges } from '../git/operations';
+import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError, CrashLoopError } from './work';
 import { makeRetryStatusHandler } from './retry-status';
 import askSystemPrompt from '../prompts/ask-system-prompt.md' with { type: 'text' };
 import { runPostTurnCheck } from './post-turn-check';
 import { resolveWatchdogTimeout } from './watchdog';
 import { readUsage } from './usage';
-import { getAgent } from '../agent/registry';
+import { getAgent, getAgentPackaging } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
 import { prepareTurnMcp } from './mcp-setup';
 import { clearTurnHandoff, handoffField } from './turn-handoff';
@@ -111,6 +111,36 @@ async function checkRequiredTools(runner: Runner): Promise<void> {
   }
 }
 
+/**
+ * Verify the COMMAND's agent binary exists before running its turn.
+ *
+ * The startup tool checks above cannot do this: they run before any command
+ * has been read, on a runner built by createRunnerFromType with no agent set,
+ * so they only ever cover the base environment (git, claude, lazy-agent). A
+ * task whose agent is NOT baked into the image (e.g. a cursor task on a custom
+ * Dockerfile without the install line) sailed past them and crash-looped in
+ * the work phase with "spawn failed: binary 'cursor-agent' not found"
+ * classified unknown. This check turns that into ONE actionable turn failure.
+ *
+ * Throws (handlers' catch writes the ErrorResponse) — a missing binary can
+ * never heal by retrying.
+ */
+async function checkCommandAgentBinary(agentId: string | undefined): Promise<void> {
+  const pkg = getAgentPackaging(agentId ?? 'claude-code');
+  const binaryName = pkg.binaryName();
+  const proc = spawn(['which', binaryName], { stdout: 'ignore', stderr: 'ignore' });
+  if (await proc.exited !== 0) {
+    const hint =
+      pkg.supervisorToolChecks().find(c => c.cmd === binaryName || c.cmd.startsWith(`${binaryName} `))?.hint ??
+      `Install the ${pkg.agentId} agent CLI.`;
+    throw new Error(
+      `Agent binary '${binaryName}' (agent "${pkg.agentId}") is not installed in this environment. ${hint}\n` +
+      `If this task runs in a container built from a custom Dockerfile, add the agent's install ` +
+      `line to that Dockerfile and rebuild (lazy only amends its own default image).`
+    );
+  }
+}
+
 /** Exit code used in one-shot mode to signal that a stop command was received. */
 export const ONE_SHOT_STOP_EXIT_CODE = 42;
 
@@ -118,20 +148,24 @@ export const ONE_SHOT_STOP_EXIT_CODE = 42;
  * Launch settings to stamp on a response so the reconciler can record them on
  * the turn it writes.
  *
- * `cmd.model_id` is the REQUESTED model (the resolved `--model` value the daemon
- * sent — usually a tier alias); it lands on the response as `model`.
- * `reportedModelId` is what the agent said it actually ran, and lands as
- * `model_id`. Omitting a field is meaningful: it records that the setting was
- * not in force / not reported, rather than guessing a default.
+ * `cmd.agent_id` is the agent the daemon dispatched this command to; it lands on
+ * the response as `agent`. `cmd.model_id` is the REQUESTED model (the resolved
+ * `--model` value the daemon sent — usually a tier alias); it lands on the
+ * response as `model`. `reportedModelId` is what the agent said it actually ran,
+ * and lands as `model_id`. Omitting a field is meaningful: it records that the
+ * setting was not in force / not reported, rather than guessing a default. A
+ * `SyncCommand` carries neither `agent_id` nor `effort`, so its
+ * conflict-resolution turn records model alone rather than inventing them.
  *
  * Called per invocation, not per bundle: push-back and maintain are separate
  * agent runs and can report a different concrete model than the work phase.
  */
 function launchSettings(
-  cmd: { model_id?: string; effort?: string },
+  cmd: { agent_id?: string; model_id?: string; effort?: string },
   reportedModelId?: string,
-): { model?: string; model_id?: string; effort?: string } {
+): { agent?: string; model?: string; model_id?: string; effort?: string } {
   return {
+    ...(cmd.agent_id ? { agent: cmd.agent_id } : {}),
     ...(cmd.model_id ? { model: cmd.model_id } : {}),
     ...(reportedModelId ? { model_id: reportedModelId } : {}),
     ...(cmd.effort ? { effort: cmd.effort } : {}),
@@ -562,7 +596,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
   // Write this turn's MCP server config + permissions so Claude Code discovers
   // the lazy tools. Write mode — this turn may commit, journal, and run subtasks.
-  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
+  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, agentId: cmd.agent_id });
 
   // Start the turn with an empty handoff file, so anything collected afterwards
   // is unambiguously from THIS turn's agent.
@@ -582,6 +616,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // Resolve the agent from the command (defaults to claude-code for backward compat)
     const agent = getAgent(cmd.agent_id ?? 'claude-code');
     log(`[supervisor] Using agent: ${agent.id}`);
+    await checkCommandAgentBinary(cmd.agent_id);
 
     // Resolve effective watchdog timeout: config value (0 = use agent default)
     const effectiveWatchdogMs = resolveWatchdogTimeout(
@@ -915,6 +950,23 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const errorMessage = err instanceof Error ? err.message : String(err);
     logError(`[supervisor] Work phase failed: ${errorMessage}`);
 
+    // Detect whether the agent had any effect on the branch. If the turn failed
+    // AND there are no new commits AND the worktree is clean, the agent provably
+    // did not influence the branch — downstream consumers can skip mechanisms
+    // that only make sense when work was done (e.g., pre-accept reflection).
+    let agentHadNoEffect: boolean | undefined;
+    try {
+      const currentSha = await getHeadSha(worktreePath);
+      const hasNewCommits = currentSha !== preTurnSha && preTurnSha !== 'unknown' && currentSha !== 'unknown';
+      const hasUncommitted = await hasUncommittedChanges(worktreePath);
+      agentHadNoEffect = !hasNewCommits && !hasUncommitted;
+      if (agentHadNoEffect) {
+        log('[supervisor] Agent had no effect on the branch (no commits, clean worktree).');
+      }
+    } catch (detectErr) {
+      logWarn(`[supervisor] Could not detect if agent had effect: ${detectErr instanceof Error ? detectErr.message : detectErr}`);
+    }
+
     // Collect the handoff on the failure path too: a watchdog kill or a crash is
     // exactly when the agent's own account of the turn is most worth keeping.
     const errorResponse: ErrorResponse = {
@@ -924,6 +976,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       ...launchSettings(cmd),
       ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       ...(await handoffField(worktreePath, log)),
+      ...(agentHadNoEffect !== undefined ? { agent_had_no_effect: agentHadNoEffect } : {}),
     };
 
     describeTurnFailure(errorResponse, err);
@@ -959,7 +1012,8 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   writeStatus(protocolDir, status);
 
   // MCP config for the conflict-resolution agent. Write mode: resolving a merge
-  // means editing and committing.
+  // means editing and committing. No agentId: the conflict-resolution turn
+  // always runs Claude Code (src/supervisor/merge.ts), whatever the task agent.
   await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
   await clearTurnHandoff(worktreePath, log);
 
@@ -1150,6 +1204,7 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
 
   try {
     const agent = getAgent(cmd.agent_id ?? 'claude-code');
+    await checkCommandAgentBinary(cmd.agent_id);
     const effectiveWatchdogMs = resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
       agent.defaultWatchdogTimeoutMs(),
@@ -1176,7 +1231,7 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
     // answer questions about live task state. Without this the turn ran with
     // whatever ~/.claude.json the container happened to have — nothing at all
     // after a container relaunch, which is how asks lost their lazy tools.
-    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true });
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true, agentId: cmd.agent_id });
 
     const askPrompt = cmd.system_prompt
       ? `${askSystemPrompt}\n\n---\n\n${cmd.system_prompt}`
@@ -1263,6 +1318,7 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
 
   try {
     const agent = getAgent(cmd.agent_id ?? 'claude-code');
+    await checkCommandAgentBinary(cmd.agent_id);
     const effectiveWatchdogMs = resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
       agent.defaultWatchdogTimeoutMs(),
@@ -1274,7 +1330,7 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
     // be able to run commands, edit files, commit, and journal the post-mortem.
     // Which is exactly why this turn needs its own MCP config written: like ask,
     // it can be the first turn in a freshly launched container.
-    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, agentId: cmd.agent_id });
     await clearTurnHandoff(worktreePath, log);
 
     const agentStart = Date.now();
@@ -1365,8 +1421,17 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
  * tokens on a turn record regardless of how it died — attributing them to the
  * session alone is what produced `session.total_usage > sum(turns)` gaps.
  */
-function describeTurnFailure(errorResponse: ErrorResponse, err: unknown): void {
-  if (err instanceof FatalAgentError) {
+export function describeTurnFailure(errorResponse: ErrorResponse, err: unknown): void {
+  if (err instanceof CrashLoopError) {
+    // The fast-crash-loop backstop. It carries the same three fields, but the
+    // class is always `unknown` (the detector runs for nothing else), and the
+    // reconciler deliberately keeps `unknown` on the interrupted + auto-resume
+    // path — see handleErrorResponse. This is diagnosis reaching the human, not
+    // a verdict that the task needs one.
+    errorResponse.failure_class = err.failureClass;
+    errorResponse.failure_reason = err.failureReason;
+    errorResponse.failure_attempts = err.attempts;
+  } else if (err instanceof FatalAgentError) {
     // The retry policy gave up on purpose. Put the classification on the wire
     // so the reconciler blocks the task (reason visible to the human) instead
     // of auto-resuming into the same unrecoverable condition.

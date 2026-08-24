@@ -17,29 +17,32 @@ import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
 import { HostProcessRunner } from './host-process-runner';
 import { loadConfig } from '../config/loader';
+import { getAgentPackaging } from '../agent/registry';
 import { resolveLiveProxyUrl, needsLiveProxyUrl, applyLiveProxyUrl } from '../daemon/auth-env';
 
 /**
- * Point every proxyable role at the live lazy proxy.
+ * Point EVERY role at the live lazy proxy.
  *
- * The proxy is ON BY DEFAULT, so this is the seam that makes "all agent traffic
- * flows through lazy's audit/policy plane" true at launch time. The per-role
- * rules (and the fail-loud contract when the address cannot be resolved) live
- * in `daemon/auth-env`, shared with `lazy pair` and `lazy chat`; the address is
- * resolved ONCE here and applied to both roles.
+ * The proxy is ALWAYS ON, so this is the seam that makes "all agent traffic
+ * flows through lazy's audit/policy plane" true at launch time. The fail-loud
+ * contract when the address cannot be resolved lives in `daemon/auth-env`,
+ * shared with `lazy pair` and `lazy chat`; the address is resolved ONCE here
+ * and applied to both roles.
  *
- * When the proxy is disabled (`[proxy] enabled = false`) targets are returned
- * unchanged and everything connects directly — that is the explicit opt-out.
- * A proxy that is enabled but unreachable is NOT: it throws.
+ * There is no "proxy off" path to return targets unchanged for: an unreachable
+ * proxy throws, and no backend opts out. A role whose `endpoint` names a
+ * different upstream (ollama, another Anthropic-native service) is proxied like
+ * any other — the proxy forwards it there. The only roles skipped here are ones
+ * that already carry a `proxyUrl`.
  */
 async function withProxyTargets(
   roles: { builder: RoleTarget; agent: RoleTarget },
   config: ResolvedConfig,
 ): Promise<{ builder: RoleTarget; agent: RoleTarget }> {
-  const needed = (['builder', 'agent'] as const).filter(r => needsLiveProxyUrl(roles[r], config));
+  const needed = (['builder', 'agent'] as const).filter(r => needsLiveProxyUrl(roles[r]));
   if (needed.length === 0) return roles;
-  // Throws ProxyUnavailableError when the proxy is enabled but its live address
-  // cannot be resolved — a launch never silently escapes the audit plane.
+  // Throws ProxyUnavailableError when the live proxy address cannot be
+  // resolved — a launch never silently escapes the audit plane.
   const proxyUrl = await resolveLiveProxyUrl(config);
   if (!proxyUrl) return roles; // explicit RPC-bypass modes only (test / daemon-self)
   const filled = { ...roles };
@@ -64,8 +67,8 @@ async function withProxyTargets(
  *
  * Targets are re-derived from config exactly the way `createRunner` derives
  * them, so this is a genuine re-resolve rather than a patch of the old value.
- * It throws {@link ProxyUnavailableError} when the proxy is enabled but its live
- * address cannot be resolved — a relaunch must fail loudly rather than come back
+ * It throws {@link ProxyUnavailableError} when the live proxy address
+ * cannot be resolved — a relaunch must fail loudly rather than come back
  * pointed at a dead endpoint, which is the failure this function exists to end.
  *
  * Call it only after the new daemon is known to be serving; calling it earlier
@@ -91,9 +94,13 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
 
   // Host-only agents cannot use container runners. Check against the RESOLVED
   // runner type, not the global default — a per-task host override is exactly
-  // how a non-claude agent is meant to run on a container-default project.
+  // how a host-only agent is meant to run on a container-default project.
+  // Capability comes from the agent's packaging, not a hardcoded id list.
   const agentId = config.agent.agent_id;
-  if (agentId !== 'claude-code' && (runnerType === 'docker' || runnerType === 'podman')) {
+  if (
+    (runnerType === 'docker' || runnerType === 'podman') &&
+    !getAgentPackaging(agentId).supportsContainerRunner()
+  ) {
     throw new Error(
       `The "${agentId}" agent only supports host-process runner. ` +
       `Set runner = "dangerously-host-process-without-any-isolation" in lazy.toml or use a different agent.`

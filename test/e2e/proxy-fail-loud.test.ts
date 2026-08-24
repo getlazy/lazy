@@ -8,9 +8,9 @@ import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 /**
  * The proxy plane fails loud.
  *
- * INVARIANT (the audit plane must not silently degrade): with `[proxy]` enabled
- * — which is the DEFAULT — every launch routes model traffic through lazy's
- * local audit/policy proxy. When the live proxy address cannot be resolved
+ * INVARIANT (the audit plane must not silently degrade): the proxy is ALWAYS
+ * ON — there is no `[proxy] enabled` option any more — so every launch routes
+ * model traffic through lazy's local audit/policy proxy. When the live proxy address cannot be resolved
  * (daemon down, RPC failure, proxy not bound), the launch FAILS with an
  * actionable error. It must NEVER fall through to a direct api.anthropic.com
  * connection: that traffic would be unaudited and unenforced while the audit
@@ -18,8 +18,10 @@ import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
  * silent, the degradation would rot unnoticed. Daemon RPC blips are real, so
  * this path is exercised in practice.
  *
- * `[proxy] enabled = false` is the ONLY way to connect direct: an explicit
- * opt-out from the audit plane, not a fallback.
+ * There is NO opt-out. `[proxy] enabled` was removed: `enabled = false` is
+ * rejected at load and `enabled = true` warns as a dead line; the only way to
+ * send a role somewhere else is an explicit `endpoint` on that role, which was
+ * never proxied to begin with.
  *
  * How the gate is armed here: a daemonless e2e suite runs the CLI with
  * LAZY_TEST=1, under which the daemon RPC is bypassed BY DESIGN (there is no
@@ -48,17 +50,29 @@ describe('proxy fail-loud', () => {
   /** Arm the gate so the CLI behaves as it does in production (no LAZY_TEST bypass). */
   const ARMED = { env: { LAZY_FORCE_PROXY_GATE: '1' } };
 
-  test('launch fails actionably when the proxy is enabled and unresolvable', async () => {
-    // No [proxy] section at all — the proxy is on by default.
+  test('launch fails actionably when the proxy is unresolvable', async () => {
+    // No [proxy] section at all — the proxy is always on.
     const result = await ctx.lazy(['pair'], ARMED);
 
     expectFailure(result);
     // What was attempted and why it is blocked...
-    expectError(result, '[proxy] is enabled but lazy could not resolve the live proxy address');
-    expectError(result, 'api.anthropic.com');
+    expectError(result, 'could not resolve the live proxy address');
+    // Post proxy-role-upstreams the message names "the upstream", not
+    // api.anthropic.com: a role's upstream may be a local Ollama server the
+    // proxy forwards to, so naming Anthropic would be wrong for that config.
+    expectError(result, 'no audit record');
     // ...and what to do about it.
     expectError(result, 'lazy daemon status');
-    expectError(result, 'enabled = false');
+    expectError(result, 'lazy daemon logs');
+    // REGRESSION: the error used to advertise `[proxy] enabled = false` as the
+    // escape hatch. That option is gone — never point a user at it again.
+    if (result.stderr.includes('enabled = false')) {
+      throw new Error(`proxy error still advertises the removed opt-out:\n${result.stderr}`);
+    }
+    // REGRESSION (proxy-role-upstreams): the per-ROLE opt-outs are gone too —
+    // an ollama backend and an explicit `endpoint` are both proxied now, and
+    // this text used to recommend exactly those as the way out.
+    expectError(result, 'no role configuration that opts out');
   });
 
   test('an explicit [proxy] section fails the same way (no partial mode)', async () => {
@@ -70,19 +84,32 @@ describe('proxy fail-loud', () => {
     expectError(result, 'could not resolve the live proxy address');
   });
 
-  // The explicit opt-out: direct connection stays exactly as it was. The launch
-  // proceeds past env building (and only fails later because the `claude` binary
-  // does not exist in the test environment).
-  test('[proxy] enabled = false connects direct, unchanged', async () => {
+  // INVARIANT: `[proxy] enabled = false` — the REMOVED key asking for
+  // something lazy no longer does — is rejected outright, naming the option.
+  // Silently ignoring it would leave the user believing their traffic is
+  // unproxied when every byte of it is proxied — the worst of both worlds
+  // (external-surfaces-validate-inputs).
+  test('a lazy.toml that still says [proxy] enabled = false is rejected', async () => {
     await appendConfig('[proxy]\nenabled = false\n');
 
-    const result = await ctx.lazy(['pair'], ARMED);
+    const result = await ctx.lazy(['list']);
 
-    expectOutput(result, 'Launching Claude Code');
-    // No proxy error anywhere — this is the sanctioned direct path.
-    if (result.stderr.includes('could not resolve the live proxy address')) {
-      throw new Error(`proxy gate fired despite [proxy] enabled = false:\n${result.stderr}`);
-    }
+    expectFailure(result);
+    expectError(result, 'enabled');
+    expectError(result, 'has been removed');
+    expectError(result, 'always on');
+  });
+
+  // `enabled = true` asks for what lazy already does, so the line is merely
+  // dead: the command WARNS about the removed option and still runs. Refusing
+  // to start over a stale line that changes nothing would be pure obstruction.
+  test('[proxy] enabled = true warns but the command still runs', async () => {
+    await appendConfig('[proxy]\nenabled = true\n');
+
+    const result = await ctx.lazy(['list']);
+
+    expectSuccess(result);
+    expectError(result, 'has been removed');
   });
 
   // An ollama role is never proxied (the proxy has a single Anthropic-native
@@ -117,7 +144,7 @@ endpoint = "http://localhost:11434"
     if (!output.includes('could not resolve the live proxy address')) {
       throw new Error(`agent launch did not fail loud on the proxy gate:\n${output}`);
     }
-    if (!output.includes('lazy daemon status') || !output.includes('enabled = false')) {
+    if (!output.includes('lazy daemon status') || !output.includes('lazy daemon logs')) {
       throw new Error(`agent launch failure was not actionable:\n${output}`);
     }
   });

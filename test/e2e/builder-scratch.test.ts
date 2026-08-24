@@ -161,7 +161,7 @@ describe('builder scratch dir', () => {
     const probe = await hostBuilderProbe(ctx.root);
     const dir = scratchDirFor(ctx);
 
-    const result = await ctx.lazy(['builder'], { env: probe.env });
+    const result = await ctx.lazy(['builder', '--yes'], { env: probe.env });
     expectSuccess(result);
 
     // 1. The human is told where it is, at launch.
