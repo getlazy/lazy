@@ -39,6 +39,7 @@ import type { Task } from '../../types';
 import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
 import { startBackgroundImageBuild, type BackgroundImageBuild } from '../../upgrade/background-image-build';
+import { BUILD_TIMEOUT_FLAG, resolveBuildTimeoutMs } from './build-timeout';
 import { maybePromptWorktreeDockerfileOverride } from '../../upgrade/worktree-dockerfile-prompt';
 import { ensureDaemon } from '../../daemon/auto-start';
 import {
@@ -222,7 +223,7 @@ async function printImageSource(root: string): Promise<void> {
 /**
  * Force-rebuild the container image by removing the existing one first.
  */
-async function forceRebuildImage(root: string, binary: string = 'docker'): Promise<string> {
+async function forceRebuildImage(root: string, binary: string = 'docker', timeoutMs: number = 0): Promise<string> {
   const imageName = await resolveImageName(root);
 
   // Remove existing image to force rebuild
@@ -239,7 +240,7 @@ async function forceRebuildImage(root: string, binary: string = 'docker'): Promi
 
   // ensureImage will detect the missing image and rebuild — with --no-cache
   // so Docker doesn't serve stale layers (e.g. cached curl install of Claude Code)
-  return ensureImage(binary, { noCache: true });
+  return ensureImage(binary, { noCache: true, timeoutMs });
 }
 
 /**
@@ -485,7 +486,7 @@ function printImageRefreshBoundary(): void {
  * the agent binary. Running builders/agents are untouched — only newly-created
  * containers pick up the new image (see printImageRefreshBoundary).
  */
-async function refreshImagesOnly(root: string, dryRun: boolean): Promise<void> {
+async function refreshImagesOnly(root: string, dryRun: boolean, timeoutMs: number): Promise<void> {
   const config = await loadConfig(root);
   const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
   if (!isContainerRunner) {
@@ -525,7 +526,7 @@ async function refreshImagesOnly(root: string, dryRun: boolean): Promise<void> {
 
   console.log('\nRefreshing container image for future sessions (--no-cache)...');
   await printImageSource(root);
-  const built = await forceRebuildImage(root, binary);
+  const built = await forceRebuildImage(root, binary, timeoutMs);
   console.log(`  ${theme.success('rebuilt')} container image (${built})`);
   console.log('');
   printImageRefreshBoundary();
@@ -573,12 +574,14 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     { name: 'wait', takesValue: false },
     { name: 'dry-run', takesValue: false },
     { name: 'images', takesValue: false },
+    BUILD_TIMEOUT_FLAG,
   ], 'upgrade');
 
   const force = parsed.flags.get('force') === true;
   const wait = parsed.flags.get('wait') === true;
   const dryRun = parsed.flags.get('dry-run') === true;
   const images = parsed.flags.get('images') === true;
+  const timeoutMs = resolveBuildTimeoutMs(parsed.flags.get('timeout') as string | undefined, 'upgrade');
 
   if (force && wait) {
     console.error('Error: --force and --wait are mutually exclusive.');
@@ -597,7 +600,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.error('Error: --images does not stop running containers, so --force and --wait do not apply.');
       process.exit(1);
     }
-    await refreshImagesOnly(root, dryRun);
+    await refreshImagesOnly(root, dryRun, timeoutMs);
     return;
   }
 
@@ -738,7 +741,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       // before kicking it off so the human's answer can change what gets built.
       await maybePromptWorktreeDockerfileOverride(root);
 
-      imageBuild = startBackgroundImageBuild(root, config.runner.type);
+      imageBuild = startBackgroundImageBuild(root, config.runner.type, undefined, timeoutMs);
       console.log(`\nRebuilding the container image in the background (staged as :${imageBuild.stagingTag})...`);
       await printImageSource(root);
       console.log('  Running containers are untouched; the image is promoted only once you proceed.');
@@ -929,8 +932,8 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 }
 
 export function upgradeUsage(): void {
-  console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run]
-       lazy upgrade --images [--dry-run]
+  console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run] [--timeout <seconds>]
+       lazy upgrade --images [--dry-run] [--timeout <seconds>]
 
 Rebuild the Docker image and agent binary, then restart the daemon.
 
@@ -987,6 +990,10 @@ Options:
   --images    Non-disruptive: rebuild only the container image (--no-cache) for
               future sessions; stop nothing, don't restart the daemon
   --dry-run   Show what would be rebuilt and stopped, without doing anything
+  --timeout <seconds>
+              Kill the image build after N seconds (default: no timeout).
+              Builds are unbounded by default: one killed on a timer wastes the
+              whole wall-clock it ran for and produces nothing.
 
 --force and --wait are mutually exclusive. --images does not stop containers, so
 it cannot be combined with --force or --wait.

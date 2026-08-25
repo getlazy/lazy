@@ -54,6 +54,37 @@ aborts *before* stopping anything, so your builders and agents keep running on
 the intact image. If it fails while the upgrade is collecting it, the failure is
 reported with the staging tag that was not promoted.
 
+## Builds have no time limit
+
+An image build runs for as long as it needs to. `docker build` has no timeout of
+its own, and lazy does not add one: a build killed on a timer wasted every second
+it ran and produced nothing, which is strictly worse than one that runs long and
+succeeds. A slow build is usually a slow network, not a stuck build.
+
+So that an unbounded build never *looks* stuck, lazy streams the build's step
+headers as they happen and prints a "still building…" line with the elapsed time
+when a single step goes quiet for a while.
+
+If you genuinely want a bound — an unattended CI machine, say — every command
+that triggers a build takes an opt-in `--timeout <seconds>`:
+
+```bash
+lazy upgrade --timeout 1800
+lazy upgrade --images --timeout 1800
+lazy system build lazy-runner --timeout 1800
+```
+
+`--timeout 0` spells out the default (no limit), so a script computing the value
+never has to special-case zero. If the bound does fire, the error says plainly
+that *lazy* killed the build, after how long, and that the limit is yours to
+raise or drop — it never surfaces as a bare Docker failure. Layers built before
+the kill stay in the build cache, so retrying resumes rather than starting over.
+
+Builds that lazy starts on its own — a task launching when the Dockerfile hash
+changed, or the 14-day age backstop below — are always unbounded. There is no
+config key for them: nobody is watching those builds, and a stale configured
+limit killing them is the exact failure this default exists to prevent.
+
 ## Related
 
 - `lazy upgrade --images` is the separate **non-disruptive** path: it rebuilds

@@ -14,7 +14,7 @@
  * All writes use atomic temp-file-then-rename to prevent partial reads.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
@@ -23,6 +23,7 @@ import { PROTOCOL_VERSION } from './types';
 import { PROGRESS_FILE } from './progress';
 import type { ResolvedConfig, MaintainEntry } from '../config/types';
 import { buildAgentSandboxArgs } from '../runner/host-sandbox';
+import { logger } from '../utils/logger';
 
 /**
  * Common policy fields for every start/unblock command.
@@ -157,14 +158,52 @@ function safeReadJson<T>(filePath: string): T | null {
 
 /**
  * Write a command for the supervisor to pick up.
- * Clears any previous response before writing the new command.
+ * Sets aside any previous response — never deletes it — before writing the new command.
  */
 export function writeCommand(dir: string, command: Command): void {
   mkdirSync(dir, { recursive: true });
-  // Clear previous response so supervisor knows this is a fresh command
+  // Clear previous response so supervisor knows this is a fresh command.
+  //
+  // INVARIANT: an unconsumed response is NEVER destroyed here. It is the only
+  // record of a turn the agent actually finished, and this used to `unlink` it.
+  // Any command landing between the supervisor writing its response and the
+  // reconciler consuming it therefore erased that turn permanently: no turn
+  // record, and no `agent_session_id` to reconcile — which is why `lazy pair`
+  // afterwards opened a fresh, empty agent session instead of the one that had
+  // just done the work. (Both symptoms are one cause: handleCompletedResponses
+  // writes both, and it never ran.) The window is wide open in practice — the
+  // interrupted sweep's auto-resume writes a command while a human-unblocked
+  // turn is still running. Move it aside instead; sweepSupersededResponses
+  // records it.
   const rPath = responsePath(dir);
   if (existsSync(rPath)) {
-    try { unlinkSync(rPath); } catch { /* best effort */ }
+    try {
+      renameSync(rPath, supersededResponsePath(dir));
+    } catch (err) {
+      // Reaching this branch MEANS A FINISHED TURN IS BEING LOST. Preserving it
+      // failed, and leaving response.json in place is not an option — it would
+      // make the supervisor's NEXT turn look already-answered — so the file
+      // still has to go, and whatever the agent produced goes with it. That is
+      // the exact failure this whole mechanism exists to prevent, so it is
+      // reported at error level naming the directory, never swallowed.
+      logger.error(
+        `Protocol ${dir}: could not set aside an unread response before the next command ` +
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        `That turn's output is being lost — it cannot be recorded as a turn.`,
+      );
+      try {
+        unlinkSync(rPath);
+      } catch (unlinkErr) {
+        // Now the response is neither preserved nor removed, so the next turn
+        // will look already-answered. Nothing here can fix that; the operator
+        // needs to know which directory to look at.
+        logger.error(
+          `Protocol ${dir}: the unread response could not be removed either ` +
+          `(${unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr)}). ` +
+          `The next turn may be mistaken for already-answered.`,
+        );
+      }
+    }
   }
   // INVARIANT: a command starts a turn, and a turn starts with no progress.
   // The agent's self-reported progress line (progress.json) is per-TURN
@@ -229,6 +268,46 @@ export function hasResponse(dir: string): boolean {
 export function consumeResponse(dir: string): void {
   const p = responsePath(dir);
   try { if (existsSync(p)) unlinkSync(p); } catch { /* best effort */ }
+}
+
+// --- Superseded responses (a finished turn a later command displaced) ---
+
+const SUPERSEDED_PREFIX = 'superseded-response-';
+
+/** A fresh, collision-free name for the response being moved aside. */
+function supersededResponsePath(dir: string): string {
+  return join(dir, `${SUPERSEDED_PREFIX}${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+}
+
+/**
+ * Responses that were displaced by a later command before anyone consumed them.
+ *
+ * Each one is a turn the agent finished whose record was never written. Sorted
+ * by filename, which is timestamp-prefixed, so they record in the order they
+ * were displaced. Unparseable files are skipped by `safeReadJson` but left on
+ * disk deliberately — a corrupt response is evidence too, and deleting it would
+ * be the same silent discard this whole path exists to stop.
+ */
+export function listSupersededResponses(dir: string): Array<{ path: string; response: Response }> {
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter(n => n.startsWith(SUPERSEDED_PREFIX) && n.endsWith('.json'));
+  } catch {
+    // No protocol dir (task never started, or already cleaned up) — nothing displaced.
+    return [];
+  }
+  const out: Array<{ path: string; response: Response }> = [];
+  for (const name of names.sort()) {
+    const path = join(dir, name);
+    const response = safeReadJson<Response>(path);
+    if (response) out.push({ path, response });
+  }
+  return out;
+}
+
+/** Drop a superseded response once its turn has been recorded. */
+export function consumeSupersededResponse(path: string): void {
+  try { if (existsSync(path)) unlinkSync(path); } catch { /* best effort */ }
 }
 
 // --- Status operations (supervisor writes, host reads for recovery) ---

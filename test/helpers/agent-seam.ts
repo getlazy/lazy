@@ -24,17 +24,34 @@ import type { TestContext } from './setup';
  * branched from main. An uncommitted lazy.toml edit would simply never reach
  * the supervisor — the turn would run with the 2h default and the test would
  * time out with no useful signal.
+ *
+ * The keys are rewritten IN the `[agent]` table `lazy init` already writes, per
+ * CLAUDE.md ("change a test's lazy.toml by EDITING the key, never by
+ * overwriting the file"). Appending a second `[agent]` section is a TOML
+ * redefinition error — which is exactly what this helper used to do, killing
+ * every suite that called it the moment `[agent]` entered the init template.
+ * Each rewrite is checked, so a template rename fails loudly here instead of
+ * silently running the turn on the 30-minute production default.
  */
 export async function setGuards(
   ctx: TestContext,
   guards: { noProgressMs?: number; windDownMs?: number },
 ): Promise<void> {
   const configPath = join(ctx.root, 'lazy.toml');
-  const existing = await readFile(configPath, 'utf-8');
-  const lines = ['', '[agent]'];
-  if (guards.noProgressMs !== undefined) lines.push(`watchdog_output_timeout_ms = ${guards.noProgressMs}`);
-  if (guards.windDownMs !== undefined) lines.push(`wind_down_timeout_ms = ${guards.windDownMs}`);
-  await writeFile(configPath, `${existing}\n${lines.join('\n')}\n`);
+  let toml = await readFile(configPath, 'utf-8');
+
+  const setKey = (key: string, value: number) => {
+    const before = toml;
+    toml = toml.replace(new RegExp(`^#?\\s*${key}\\s*=.*$`, 'm'), `${key} = ${value}`);
+    if (toml === before) {
+      throw new Error(`setGuards: no \`${key}\` line in the lazy.toml template to rewrite`);
+    }
+  };
+
+  if (guards.noProgressMs !== undefined) setKey('watchdog_output_timeout_ms', guards.noProgressMs);
+  if (guards.windDownMs !== undefined) setKey('wind_down_timeout_ms', guards.windDownMs);
+
+  await writeFile(configPath, toml);
   ctx.git('add', 'lazy.toml');
   const commit = ctx.git('commit', '-m', 'Tighten watchdog guards for this test');
   if (commit.exitCode !== 0) {

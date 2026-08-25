@@ -12,6 +12,7 @@ import { findLazyRoot } from '../cli/init';
 import { loadConfig } from '../config/loader';
 import type { RoleTarget } from '../config/types';
 import { buildMountArgs } from './mounts';
+import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
 import { buildGitMountArgsFor } from './git-mounts';
 import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
 import { cursorLaunchEnvVars } from '../proxy/cursor-route';
@@ -44,7 +45,18 @@ export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
 // Embedded at build/compile time — the agent binary is bundled into the lazy executable.
 // In dev mode this resolves to the placeholder file on disk (which is empty/tiny).
 // In compiled mode it resolves to a $bunfs/ path inside the executable.
-// A placeholder lazy-agent file must exist at the project root for this import to resolve.
+//
+// A `lazy-agent` file MUST exist at the project root for ANY bun build/run of
+// src/ to resolve this import — it is gitignored (.gitignore), so nothing
+// checked in provides it. Two things CREATE it: package.json's `prepare` hook
+// (`ensure:agent-placeholder`, run by `bun install`) writes a tiny placeholder,
+// and `scripts/build.ts` overwrites it with the real cross-compiled agent
+// binary during a release build. One thing DESTROYS it: `install:local` moves
+// the binary out to ~/.lazy/bin, then re-runs `ensure:agent-placeholder` to put
+// a fresh placeholder back — if that step is ever removed, a dev checkout goes
+// unbuildable with "Could not resolve: ../../lazy-agent" until the next
+// `bun install`. See `scripts/release.sh`'s sanity-build guard for the same
+// contract applied to release builds.
 import embeddedAgentBinaryPath from '../../lazy-agent' with { type: 'file' };
 
 import {
@@ -388,10 +400,60 @@ async function writeDockerfileToTempDir(content: string): Promise<{ buildCwd: st
   return { buildCwd: tempDir, dockerfilePath };
 }
 
+/** How often to reassure the human that a quiet build is still running. */
+const BUILD_HEARTBEAT_INTERVAL_MS = 20_000;
+
+/**
+ * Consume a piped stream, echoing structural progress lines to the console and
+ * everything to the log file. Returns the full text for error reporting.
+ */
+async function pumpBuildStream(
+  stream: ReadableStream<Uint8Array>,
+  label: string,
+  onProgress: (line: string) => void,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let full = '';
+
+  for await (const chunk of stream) {
+    const text = decoder.decode(chunk as Uint8Array, { stream: true });
+    full += text;
+    buffered += text;
+    const { lines, remainder } = splitLines(buffered);
+    buffered = remainder;
+    for (const line of lines) {
+      logger.stream(`[build ${label}] ${line}`);
+      if (isBuildProgressLine(line)) onProgress(line.trim());
+    }
+  }
+
+  if (buffered.length > 0) {
+    logger.stream(`[build ${label}] ${buffered}`);
+    if (isBuildProgressLine(buffered)) onProgress(buffered.trim());
+  }
+
+  return full;
+}
+
 /**
  * Run `docker build` with the given parameters. Shared by the config-driven
  * builder (`buildImage`) and the explicit lazy-runner builder
  * (`buildLazyRunnerImage`).
+ *
+ * TIMEOUT POLICY — unbounded unless the caller explicitly asks for a bound.
+ *
+ * `docker build` has no timeout of its own, and neither should lazy. A build
+ * killed on a timer wasted every second it ran and produced nothing, which is
+ * strictly worse than one that runs long and succeeds. This chokepoint used to
+ * hardcode 20 minutes (originally to escape the 60s `spawn` default), and that
+ * cliff cost a real afternoon: the kill surfaced as a bare non-zero exit and
+ * looked like Docker Desktop failing. Do not reinstate a default bound.
+ *
+ * `timeoutMs` is therefore 0 (unbounded) by default and only ever set from an
+ * explicit `--timeout` flag. The timer is owned HERE rather than handed to
+ * `spawn`, so that when it does fire we know for certain that lazy killed the
+ * build and can say so instead of reporting an exit code.
  */
 async function runDockerBuild(
   buildCwd: string,
@@ -401,17 +463,16 @@ async function runDockerBuild(
   binary: string,
   noCache: boolean,
   signal?: AbortSignal,
+  timeoutMs: number = 0,
 ): Promise<void> {
   if (signal?.aborted) throw new Error('Container build cancelled before it started');
 
+  const startedAt = Date.now();
   const tagArgs = tags.flatMap(tag => ['-t', tag]);
   const proc = spawn(
     [binary, 'build', ...(noCache ? ['--no-cache'] : []), ...tagArgs, '--label', `${DOCKERFILE_HASH_LABEL}=${hash}`, '-f', dockerfilePath, '.'],
-    // Image builds download packages (apt, the Claude Code installer, and whatever
-    // else the project's Dockerfile fetches) and can legitimately take many
-    // minutes. The default 60s subprocess timeout kills
-    // the build mid-download, surfacing as "Canceled: context canceled" (exit 130).
-    { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe', timeout: 20 * 60_000 }
+    // timeout: 0 disables spawn()'s own kill timer. Any bound is armed below.
+    { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe', timeout: 0 }
   );
 
   // Cancellation (`lazy upgrade` aborted while its background rebuild is still
@@ -420,32 +481,67 @@ async function runDockerBuild(
   const onAbort = () => { try { proc.kill(); } catch { /* already exited */ } };
   signal?.addEventListener('abort', onAbort, { once: true });
 
-  const outputPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
+  let timedOut = false;
+  const killTimer = timeoutMs > 0
+    ? setTimeout(() => {
+        timedOut = true;
+        try { proc.kill(); } catch { /* already exited */ }
+      }, timeoutMs)
+    : null;
 
-  const [stdout, stderr, exitCode] = await Promise.all([
-    outputPromise,
-    stderrPromise,
-    proc.exited,
-  ]).finally(() => signal?.removeEventListener('abort', onAbort));
+  // Progress. Docker writes BuildKit progress to stderr and the classic
+  // builder writes steps to stdout, so both are echoed. A heartbeat covers the
+  // long silent stretches inside a single step (a big apt or npm download).
+  let lastOutputAt = Date.now();
+  const echo = (line: string) => {
+    lastOutputAt = Date.now();
+    logger.info(`  ${line}`);
+  };
+  const heartbeat = setInterval(() => {
+    if (Date.now() - lastOutputAt >= BUILD_HEARTBEAT_INTERVAL_MS) {
+      lastOutputAt = Date.now();
+      logger.info(`  still building ${tags[0]}... (${formatDuration(Date.now() - startedAt)} elapsed)`);
+    }
+  }, BUILD_HEARTBEAT_INTERVAL_MS);
+
+  let stdout = '';
+  let stderr = '';
+  let exitCode: number | null = null;
+  try {
+    [stdout, stderr, exitCode] = await Promise.all([
+      pumpBuildStream(proc.stdout as ReadableStream<Uint8Array>, 'out', echo),
+      pumpBuildStream(proc.stderr as ReadableStream<Uint8Array>, 'err', echo),
+      proc.exited,
+    ]);
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    if (killTimer) clearTimeout(killTimer);
+    clearInterval(heartbeat);
+  }
 
   if (signal?.aborted) throw new Error('Container build cancelled');
 
-  logger.stream('Container build stdout:\n' + stdout);
-  logger.stream('Container build stderr:\n' + stderr);
+  if (timedOut) {
+    const message = buildTimeoutMessage(Date.now() - startedAt, timeoutMs);
+    logger.error(message);
+    throw new Error(message);
+  }
 
   if (exitCode !== 0) {
-    const stderrLines = stderr.trim().split('\n');
-    const lastOutput = stderrLines.slice(-10).join('\n');
+    // BuildKit reports failures on stderr, the classic builder on stdout —
+    // fall back to stdout so the tail is never empty just because of which
+    // builder the daemon happens to be using.
+    const failureOutput = (stderr.trim() || stdout.trim());
+    const lastOutput = failureOutput.split('\n').slice(-10).join('\n');
     logger.error(`Container build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
     throw new Error(`Container build failed with exit code ${exitCode}`);
   }
 
-  logger.debug('Container build completed successfully');
+  logger.debug(`Container build completed successfully in ${formatDuration(Date.now() - startedAt)}`);
 }
 
-async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false, agentId?: string): Promise<void> {
-  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache, undefined, agentId);
+async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false, agentId?: string, timeoutMs: number = 0): Promise<void> {
+  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache, undefined, agentId, timeoutMs);
 }
 
 /**
@@ -465,6 +561,7 @@ async function buildImageWithTags(
   noCache: boolean = false,
   signal?: AbortSignal,
   agentId?: string,
+  timeoutMs: number = 0,
 ): Promise<void> {
   const customPath = await resolveCustomDockerfile(lazyRoot);
 
@@ -488,7 +585,7 @@ async function buildImageWithTags(
     dockerfileName = temp.dockerfilePath;
   }
 
-  await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal);
+  await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal, timeoutMs);
 }
 
 /**
@@ -514,7 +611,7 @@ export async function resolveImageBuildTags(lazyRoot: string): Promise<string[]>
 export async function buildProjectImageToTag(
   lazyRoot: string,
   tag: string,
-  options: { binary?: string; noCache?: boolean; signal?: AbortSignal } = {},
+  options: { binary?: string; noCache?: boolean; signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<string> {
   const binary = options.binary ?? 'docker';
   await checkDocker(binary);
@@ -522,7 +619,7 @@ export async function buildProjectImageToTag(
   const { repository } = await resolveImageRepository(lazyRoot);
   const ref = `${repository}:${tag}`;
   const currentHash = await calculateDockerfileHash(lazyRoot);
-  await buildImageWithTags(lazyRoot, [ref], currentHash, binary, options.noCache ?? false, options.signal);
+  await buildImageWithTags(lazyRoot, [ref], currentHash, binary, options.noCache ?? false, options.signal, undefined, options.timeoutMs ?? 0);
   return ref;
 }
 
@@ -560,7 +657,7 @@ export async function removeImageTag(ref: string, binary: string = 'docker'): Pr
  *
  * Returns every tag written: the version tag first, then the `:latest` alias.
  */
-export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean } = {}): Promise<string[]> {
+export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean; timeoutMs?: number } = {}): Promise<string[]> {
   const binary = options.binary ?? 'docker';
   const noCache = options.noCache ?? false;
 
@@ -572,7 +669,7 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
 
   const hash = createHash('sha256').update(DEFAULT_DOCKERFILE).digest('hex');
   const { buildCwd, dockerfilePath } = await writeDockerfileToTempDir(DEFAULT_DOCKERFILE);
-  await runDockerBuild(buildCwd, dockerfilePath, tags, hash, binary, noCache);
+  await runDockerBuild(buildCwd, dockerfilePath, tags, hash, binary, noCache, undefined, options.timeoutMs ?? 0);
 
   return tags;
 }
@@ -585,7 +682,7 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
  * to an existing lazy image if one is available. This lets users work offline
  * with a previously-built image even if the Dockerfile has changed.
  */
-export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean; agentId?: string }): Promise<string> {
+export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean; agentId?: string; timeoutMs?: number }): Promise<string> {
   await checkDocker(binary);
 
   const lazyRoot = getLazyRoot();
@@ -631,7 +728,10 @@ export async function ensureImage(binary: string = 'docker', options?: { noCache
   }
 
   try {
-    await buildImage(lazyRoot, repository, currentHash, binary, noCache, options?.agentId);
+    // No timeout unless the caller passed one. The implicit path — a task
+    // starting when the image hash has changed — always passes nothing, so a
+    // build nobody is watching can never be killed on a timer.
+    await buildImage(lazyRoot, repository, currentHash, binary, noCache, options?.agentId, options?.timeoutMs ?? 0);
     return imageName;
   } catch (buildErr) {
     // If not offline, just propagate the build error

@@ -1,6 +1,14 @@
 # Changelog
 
-## [0.22.1128] = 2026-08-23 - Cursor Edition
+## [0.22.1134] - 2026-08-24 - Hotfix for long running Docker builds
+
+### Fixed
+
+- **Container image builds are no longer killed after 20 minutes** — builds run unbounded and stream their progress; `lazy upgrade` / `lazy system build` take an opt-in `--timeout <seconds>`, and a build that bound does kill says lazy killed it rather than looking like Docker failing
+- **git no longer refuses a task worktree with "dubious ownership"** — lazy trusts its own worktree and git dirs in the container's git config, and says what to do if it still happens
+- **A finished turn is never dropped when the next command arrives** — unblocking an interrupted task could lose the whole turn and leave `lazy pair` on an empty session; the turn is now always recorded
+
+## [0.22.1128] - 2026-08-23 - Cursor Edition
 
 ### Added
 

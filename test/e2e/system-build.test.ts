@@ -19,7 +19,7 @@ const MOCK_RESPONSE = {
   usage: { input_tokens: 0, output_tokens: 0 },
 };
 
-async function readBuildLog(path: string): Promise<Array<{ binary: string; noCache: boolean }>> {
+async function readBuildLog(path: string): Promise<Array<{ binary: string; noCache: boolean; timeoutMs: number }>> {
   const content = await readFile(path, 'utf-8');
   return content
     .split('\n')
@@ -128,6 +128,80 @@ describe('lazy system build', () => {
     if (calls.length !== 0) {
       throw new Error(`Expected no build calls, got ${calls.length}`);
     }
+  });
+
+  // INVARIANT: image builds are UNBOUNDED unless a human asks for a bound.
+  // A hardcoded default here once killed real builds on a 20-minute timer and
+  // read as Docker failing. See test/unit/docker-build-timeout.test.ts.
+  test('builds with no timeout unless --timeout is passed', async () => {
+    const result = await ctx.lazyMocked(
+      ['system', 'build', 'lazy-runner'],
+      MOCK_RESPONSE,
+      { env: { LAZY_MOCK_BUILD_LOG: buildLogPath } },
+    );
+
+    expectSuccess(result);
+
+    const calls = await readBuildLog(buildLogPath);
+    if (calls[0].timeoutMs !== 0) {
+      throw new Error(`Expected timeoutMs=0 (unbounded), got ${calls[0].timeoutMs}`);
+    }
+  });
+
+  test('--timeout is opt-in and expressed in seconds', async () => {
+    const result = await ctx.lazyMocked(
+      ['system', 'build', 'lazy-runner', '--timeout', '90'],
+      MOCK_RESPONSE,
+      { env: { LAZY_MOCK_BUILD_LOG: buildLogPath } },
+    );
+
+    expectSuccess(result);
+
+    const calls = await readBuildLog(buildLogPath);
+    if (calls[0].timeoutMs !== 90_000) {
+      throw new Error(`Expected timeoutMs=90000, got ${calls[0].timeoutMs}`);
+    }
+  });
+
+  // --timeout 0 spells out the default rather than meaning "kill instantly",
+  // so a script computing a value never has to special-case zero.
+  test('--timeout 0 means unbounded', async () => {
+    const result = await ctx.lazyMocked(
+      ['system', 'build', 'lazy-runner', '--timeout', '0'],
+      MOCK_RESPONSE,
+      { env: { LAZY_MOCK_BUILD_LOG: buildLogPath } },
+    );
+
+    expectSuccess(result);
+
+    const calls = await readBuildLog(buildLogPath);
+    if (calls[0].timeoutMs !== 0) {
+      throw new Error(`Expected timeoutMs=0, got ${calls[0].timeoutMs}`);
+    }
+  });
+
+  test('rejects a non-numeric --timeout instead of silently ignoring it', async () => {
+    const result = await ctx.lazyMocked(
+      ['system', 'build', 'lazy-runner', '--timeout', 'twenty'],
+      MOCK_RESPONSE,
+      { env: { LAZY_MOCK_BUILD_LOG: buildLogPath } },
+    );
+
+    expectFailure(result);
+    expectError(result, '--timeout expects a whole number of seconds');
+
+    const calls = await readBuildLog(buildLogPath);
+    if (calls.length !== 0) {
+      throw new Error(`Expected no build calls, got ${calls.length}`);
+    }
+  });
+
+  test('system build --help documents --timeout and the unbounded default', async () => {
+    const result = await ctx.lazy(['system', 'build', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, '--timeout <seconds>');
+    expectOutput(result, 'NO time limit by default');
   });
 
   test('system --help mentions the build subcommand', async () => {

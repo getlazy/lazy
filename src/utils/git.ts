@@ -5,6 +5,7 @@
 import { existsSync } from 'node:fs';
 import { logger } from './logger';
 import { spawn } from './spawn';
+import { annotateDubiousOwnership } from './git-ownership';
 
 export interface GitResult {
   stdout: string;
@@ -64,11 +65,21 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
   try {
     const proc = spawn(['git', ...args], spawnOpts) as any;
     const result = await proc.exited;
-    return {
-      stdout: stdoutMode === 'pipe' ? (await Bun.readableStreamToText(proc.stdout)).trim() : '',
-      stderr: stderrMode === 'pipe' ? (await Bun.readableStreamToText(proc.stderr)).trim() : '',
-      exitCode: proc.exitCode ?? result,
-    };
+    const stdout = stdoutMode === 'pipe' ? (await Bun.readableStreamToText(proc.stdout)).trim() : '';
+    let stderr = stderrMode === 'pipe' ? (await Bun.readableStreamToText(proc.stderr)).trim() : '';
+    const exitCode = proc.exitCode ?? result;
+
+    // git's "dubious ownership" refusal tells the human to add a global
+    // safe.directory exception. For a lazy-managed worktree that advice is wrong
+    // — and useless when this git is running in the agent container, where a
+    // host-side git config is never read. Annotate here, the one chokepoint every
+    // git command lazy runs passes through, so the whole blast radius is covered
+    // rather than just the merge path where it was first observed.
+    if (exitCode !== 0 && stderr) {
+      stderr = await annotateDubiousOwnership(stderr, options.cwd);
+    }
+
+    return { stdout, stderr, exitCode };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(`runGit: git command failed with exception: ${message}, args: ${args.join(' ')}`);

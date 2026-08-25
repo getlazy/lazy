@@ -1486,6 +1486,11 @@ function updatePhase(status: SupervisorStatus, phase: SupervisorPhase, dir: stri
 async function getHeadSha(cwd: string): Promise<string> {
   const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
+    // Placeholder for reporting only — but never silent. See the twin in
+    // src/supervisor/merge.ts: when git is refusing the whole worktree this is
+    // the first call to fail, and swallowing it pushes the visible error several
+    // git commands downstream where it no longer names the real cause.
+    logWarn(`[supervisor] Could not read HEAD in ${cwd}: ${result.stderr || 'git rev-parse HEAD failed'}`);
     return 'unknown';
   }
   return result.stdout;

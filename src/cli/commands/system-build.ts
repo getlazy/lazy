@@ -10,6 +10,7 @@
 import { buildLazyRunnerImage } from '../../capture/claude';
 import { IMAGE_TAG, IMAGE_MAX_AGE_DAYS } from '../../capture/image-tag';
 import { parseFlags } from '../helpers';
+import { BUILD_TIMEOUT_FLAG, BUILD_TIMEOUT_USAGE, resolveBuildTimeoutMs } from './build-timeout';
 import { theme } from '../theme';
 import { logger } from '../../utils/logger';
 
@@ -29,6 +30,7 @@ export async function commandSystemBuild(args: string[]): Promise<void> {
 
   const parsed = parseFlags(args, [
     { name: 'no-cache', takesValue: false },
+    BUILD_TIMEOUT_FLAG,
   ], 'system build');
 
   if (parsed.positional.length === 0) {
@@ -50,9 +52,10 @@ export async function commandSystemBuild(args: string[]): Promise<void> {
   }
 
   const noCache = parsed.flags.get('no-cache') === true;
+  const timeoutMs = resolveBuildTimeoutMs(parsed.flags.get('timeout') as string | undefined, 'system build');
 
   try {
-    const tags = await buildLazyRunnerImage({ noCache });
+    const tags = await buildLazyRunnerImage({ noCache, timeoutMs });
     console.log(`${theme.success('Built')} ${tags.join(', ')}`);
   } catch (err) {
     logger.error(err instanceof Error ? err.message : String(err));
@@ -61,7 +64,7 @@ export async function commandSystemBuild(args: string[]): Promise<void> {
 }
 
 export function systemBuildUsage(): void {
-  console.log(`Usage: lazy system build <name> [--no-cache]
+  console.log(`Usage: lazy system build <name> [--no-cache] [--timeout <seconds>]
 
 Prebuild a lazy system image, bypassing the current project's lazy.toml.
 
@@ -83,8 +86,14 @@ Valid names:
 
 Options:
   --no-cache               Force a clean rebuild; do not reuse Docker layers
+${BUILD_TIMEOUT_USAGE}
+
+Builds run with NO time limit by default: a build killed on a timer wastes the
+whole wall-clock it ran for and produces nothing. Use --timeout only if you
+genuinely want a bound; \`--timeout 0\` spells out the default.
 
 Examples:
   lazy system build lazy-runner
-  lazy system build lazy-runner --no-cache`);
+  lazy system build lazy-runner --no-cache
+  lazy system build lazy-runner --timeout 1800`);
 }

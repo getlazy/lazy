@@ -672,6 +672,13 @@ async function checkRemoteChanges(remoteBranch: string, cwd: string): Promise<bo
 async function getHeadSha(cwd: string): Promise<string> {
   const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   if (result.exitCode !== 0) {
+    // 'unknown' is a reporting placeholder — callers use this SHA for log lines
+    // and result payloads, and a merge that then fails for the same underlying
+    // reason surfaces its own error. But it must not be SILENT: when git is
+    // broken for the whole worktree (a dubious-ownership refusal, say) this call
+    // is the first casualty, and staying quiet here is why such a failure used
+    // to appear as a confusing error several git commands later.
+    logWarn(`[merge] Could not read HEAD in ${cwd}: ${result.stderr || 'git rev-parse HEAD failed'}`);
     return 'unknown';
   }
   return result.stdout;

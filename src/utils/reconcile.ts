@@ -19,7 +19,10 @@ import type { TokenUsage, AgentTokenUsage, Task } from '../types';
 import { toTurnUsage, rollUpSessionUsage } from './usage-recording';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
-import { protocolDir as getProtocolDir, readResponse, readStatus, consumeResponse, clearStatus, removeProtocolDir } from '../protocol';
+import {
+  protocolDir as getProtocolDir, readResponse, readStatus, hasResponse, consumeResponse, clearStatus,
+  removeProtocolDir, listSupersededResponses, consumeSupersededResponse,
+} from '../protocol';
 import type { CompletedResponse, ErrorResponse, WorktreeRecovery, AgentHandoffEntry } from '../protocol';
 import { completedResponses } from '../protocol';
 import { getNewCommits, hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
@@ -163,7 +166,16 @@ export async function reconcileTasks(
       await yieldToEventLoop();
     }
 
-    // Sweep 2: process stale responses for interrupted tasks
+    // Sweep 2: recover turns whose response a later command displaced.
+    // Runs before the other response sweeps so a recovered turn is recorded
+    // ahead of whatever the current turn produces — it happened first.
+    try {
+      await sweepSupersededResponses(storage, lazyRoot);
+    } catch (err) {
+      logger.warn(`Sweep superseded responses failed: ${err instanceof Error ? err.message : err}`);
+    }
+
+    // Sweep 3: process stale responses for interrupted tasks
     // This handles the race where the supervisor writes a new response AFTER
     // reconciliation already moved the task to interrupted.
     try {
@@ -172,7 +184,7 @@ export async function reconcileTasks(
       logger.warn(`Sweep interrupted responses failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 3: clean up orphaned runs for terminal-state tasks
+    // Sweep 4: clean up orphaned runs for terminal-state tasks
     // This catches containers/processes that survived a failed cleanup during accept/close/reject.
     try {
       await sweepTerminalContainers(storage, lazyRoot, runner);
@@ -180,7 +192,7 @@ export async function reconcileTasks(
       logger.warn(`Sweep terminal containers failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 4: detect tasks whose branch was already merged into their target
+    // Sweep 5: detect tasks whose branch was already merged into their target
     // This catches the zombie scenario where accept squash-merged the branch
     // but crashed before updating session/task metadata.
     try {
@@ -189,7 +201,7 @@ export async function reconcileTasks(
       logger.warn(`Sweep merged branches failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 5: recover stale pairing states
+    // Sweep 6: recover stale pairing states
     // If a task is in 'pairing' state but the pairing process has exited,
     // transition it back to 'blocked'. This handles: terminal closed,
     // machine rebooted, process killed.
@@ -199,7 +211,7 @@ export async function reconcileTasks(
       logger.warn(`Sweep stale pairing failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 6: recover backlog tasks that actually have committed work.
+    // Sweep 7: recover backlog tasks that actually have committed work.
     // The durable proof of work is the task's git branch — sessions and
     // worktrees are local on-disk state that doesn't travel between machines.
     // If a `backlog` task's branch has commits beyond its base, real work
@@ -211,7 +223,7 @@ export async function reconcileTasks(
       logger.warn(`Recover backlog with commits failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 7: recover tasks stranded in `working` whose turn was never finalized.
+    // Sweep 8: recover tasks stranded in `working` whose turn was never finalized.
     // Defense-in-depth for the primary working sweep above (reconcileTask). If
     // reconcileTask was skipped (transient worktree lock) or threw for a task, a
     // task whose agent finished and committed real work can sit in `working`
@@ -225,7 +237,7 @@ export async function reconcileTasks(
       logger.warn(`Recover stranded working tasks failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 8: recover tasks stranded in `merging` by an accept that died.
+    // Sweep 9: recover tasks stranded in `merging` by an accept that died.
     // `merging` is stamped by the accept orchestration and only that
     // orchestration clears it, so a daemon killed mid-accept leaves the task
     // there with nothing able to finish or undo it — and every exit (reject,
@@ -239,7 +251,7 @@ export async function reconcileTasks(
       logger.warn(`Recover stranded merging tasks failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 9: reap idle blocked containers that are eating concurrency slots.
+    // Sweep 10: reap idle blocked containers that are eating concurrency slots.
     // A blocked task keeps a live (idle-polling) supervisor container with no
     // idle reaper of its own — this is that reaper. Runs BEFORE the drain so a
     // freed slot is filled by a queued task in the same tick.
@@ -249,7 +261,7 @@ export async function reconcileTasks(
       logger.warn(`Reap idle containers failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Sweep 10: drain queued tasks as agent slots free up.
+    // Sweep 11: drain queued tasks as agent slots free up.
     // Tasks queued at the concurrency cap (backlog→queued in launchTask) wait
     // here until a slot frees (a working turn ends or an idle container is reaped).
     try {
@@ -1493,43 +1505,19 @@ export async function handleCompletedResponses(
 }
 
 /**
- * Handle an error response from the supervisor.
- * Records an agent error turn so crash details are visible in lazy show,
- * then transitions the task to 'interrupted'.
- */
-/**
- * Process an error response from the supervisor.
+ * Render a crash/error response as the agent turn a human will read.
  *
- * Exported for unit tests (same as `handleCompletedResponse`) — the fatal /
- * ordinary-crash split below is a decision worth pinning directly.
+ * Extracted so the superseded-response sweep records a displaced crash in
+ * EXACTLY the spelling `handleErrorResponse` uses — the "have I already recorded
+ * this?" check is content-based, so two spellings of one crash would show up as
+ * two turns.
  */
-export async function handleErrorResponse(
-  storage: Storage,
-  taskId: string,
-  session: { id: string },
+function buildErrorTurnContent(
   response: ErrorResponse,
-  protoDir: string,
-  lazyRoot?: string,
-): Promise<void> {
-  const taskShortId = shortId(taskId);
-
-  // A classified failure the supervisor deliberately stopped retrying. It
-  // cannot heal by itself, so the task must land in `blocked` (human's queue),
-  // not `interrupted` (auto-resume's queue) — auto-resuming into a dead
-  // credential or a bad model id just re-crashes on a timer.
-  // `failure_class` is set when the supervisor ended the turn on purpose: a
-  // `fatal_*` class, a `transient_unreachable` that outlived its bounded
-  // retries, or the fast-crash-loop backstop. The first two cannot heal and
-  // must block; the backstop only ever reports `unknown` — by construction, it
-  // runs for no other class — and an unclassifiable failure has never been a
-  // reason to stop auto-resume. So `unknown` is carried for DIAGNOSIS only and
-  // keeps the pre-existing interrupted + auto-resume behavior, exactly as an
-  // absent class does.
-  const classified = response.failure_class;
-  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
-
-  // Build a human-readable error turn content
-  const watchdogKill = isWatchdogKill(response);
+  fatalClass: string | undefined,
+  classified: string | undefined,
+  watchdogKill: boolean,
+): string {
   const heading = fatalClass
     ? '[Agent stopped — unrecoverable failure]'
     : watchdogKill
@@ -1576,9 +1564,47 @@ export async function handleErrorResponse(
     lines.push('Stderr:');
     lines.push(response.stderr);
   }
+  return lines.join('\n');
+}
 
-  const turnContent = lines.join('\n');
+/**
+ * Handle an error response from the supervisor.
+ * Records an agent error turn so crash details are visible in lazy show,
+ * then transitions the task to 'interrupted'.
+ */
+/**
+ * Process an error response from the supervisor.
+ *
+ * Exported for unit tests (same as `handleCompletedResponse`) — the fatal /
+ * ordinary-crash split below is a decision worth pinning directly.
+ */
+export async function handleErrorResponse(
+  storage: Storage,
+  taskId: string,
+  session: { id: string },
+  response: ErrorResponse,
+  protoDir: string,
+  lazyRoot?: string,
+): Promise<void> {
+  const taskShortId = shortId(taskId);
 
+  // A classified failure the supervisor deliberately stopped retrying. It
+  // cannot heal by itself, so the task must land in `blocked` (human's queue),
+  // not `interrupted` (auto-resume's queue) — auto-resuming into a dead
+  // credential or a bad model id just re-crashes on a timer.
+  // `failure_class` is set when the supervisor ended the turn on purpose: a
+  // `fatal_*` class, a `transient_unreachable` that outlived its bounded
+  // retries, or the fast-crash-loop backstop. The first two cannot heal and
+  // must block; the backstop only ever reports `unknown` — by construction, it
+  // runs for no other class — and an unclassifiable failure has never been a
+  // reason to stop auto-resume. So `unknown` is carried for DIAGNOSIS only and
+  // keeps the pre-existing interrupted + auto-resume behavior, exactly as an
+  // absent class does.
+  const classified = response.failure_class;
+  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
+
+  const watchdogKill = isWatchdogKill(response);
+  const turnContent = buildErrorTurnContent(response, fatalClass, classified, watchdogKill);
   await journalWorktreeRecovery(storage, taskId, response.worktree_recovery);
   // A crashed or watchdog-killed turn is exactly when the agent's own account of
   // what it was doing matters most — persist it before recording the error turn.
@@ -1624,6 +1650,33 @@ export async function handleErrorResponse(
       await rollUpSessionUsage(storage, session.id, errorUsage, `Task ${taskShortId}`);
     }
     logger.debug(`Task ${taskShortId}: recorded agent error turn`);
+  }
+
+  // INVARIANT: a sweep acting on a response it read EARLIER must not touch a
+  // turn that started in the meantime. Everything below this point mutates
+  // LIVE state — task status, the supervisor's status checkpoint, auto-resume —
+  // and all of it is wrong if this response has already been superseded.
+  //
+  // The window is real and was observed in the wild: sweepInterruptedResponses
+  // reads response.json, then awaits its way through this function; an `unblock`
+  // landing inside that window moves the task to `working` and launches a turn
+  // the human then watches. The trailing `updateTaskStatus(..., 'interrupted')`
+  // below dragged that LIVE task back into the auto-resume queue, `clearStatus`
+  // wiped the running turn's SHA checkpoints, and the auto-resume it triggered
+  // wrote a command — which is what displaced the running turn's response and
+  // destroyed it. The running supervisor's own fingerprint for this is
+  // "Retry canceled: new command arrived" (src/supervisor/work.ts).
+  //
+  // `writeCommand` moves an unconsumed response aside rather than deleting it,
+  // so "response.json is gone" is the precise signal that a newer command has
+  // taken over. The error turn is already recorded above — evidence is kept
+  // either way; only the live-state mutations are skipped.
+  if (!hasResponse(protoDir)) {
+    logger.warn(
+      `Task ${taskShortId}: this crash report was superseded by a newer command before it could be applied — ` +
+      `recording it as a turn but leaving the task's live state alone (a newer turn owns it).`,
+    );
+    return;
   }
 
   consumeResponse(protoDir);
@@ -1743,6 +1796,183 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
       }
     } catch (err) {
       logger.debug(`Failed to sweep interrupted task ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
+/**
+ * Record a displaced COMPLETED turn — nothing else.
+ *
+ * This is `handleCompletedResponses` with every live-state mutation removed, and
+ * the removals are the point rather than an oversight:
+ *
+ *  - no SHA window on the turn. `status.json` belongs to whatever turn is
+ *    running NOW; reading it here would stamp this turn with another turn's
+ *    checkpoints, and a diff derived from those SHAs would be a lie.
+ *  - no commit detection, no worktree snapshot. Both read the worktree as it is
+ *    at this instant, which is not what it looked like when this turn ended.
+ *  - no `markFeedbackConsumed`. Feedback queued after this turn is still owed to
+ *    the turn that is running now (CLAUDE.md: never lose human feedback).
+ *  - no violations, no `parkTaskPaused`, no status change. The task's status is
+ *    the live turn's to own — clobbering it is precisely the bug this fix exists
+ *    to stop.
+ *
+ * What it DOES do is the whole reason the loss mattered: write the turn record,
+ * and reconcile `agent_session_id` so `lazy pair` resumes the agent session that
+ * did the work instead of opening an empty one.
+ */
+async function recordSupersededWorkTurns(
+  storage: Storage,
+  taskId: string,
+  session: { id: string; agent_session_id: string | null },
+  responses: CompletedResponse[],
+  worktreePath: string,
+): Promise<void> {
+  const taskShortId = shortId(taskId);
+  const work = responses[0];
+  if (!work) return;
+
+  await journalWorktreeRecovery(storage, taskId, work.worktree_recovery);
+  await persistAgentHandoff(storage, taskId, work.agent_handoff);
+
+  const finalSessionId = [...responses].reverse().find(r => r.session_id)?.session_id ?? work.session_id;
+  if (shouldReconcileAgentSessionId(session.agent_session_id, finalSessionId)) {
+    await storage.updateSessionClaudeId(session.id, finalSessionId);
+  }
+
+  // Content-based idempotency, as in handleErrorResponse. The "is the last turn
+  // an agent turn?" shortcut is wrong here by construction: a displaced response
+  // is recovered LATE, so a newer turn has very likely already been recorded
+  // after it — and that would skip this turn forever, which is the loss again.
+  const content = enrichResponseWithPlanContent(work.result, worktreePath);
+  const existingTurns = await storage.getSessionTurns(session.id);
+  if (existingTurns.some(t => t.role === 'agent' && t.content === content)) {
+    logger.debug(`Task ${taskShortId}: displaced turn already recorded, skipping`);
+    return;
+  }
+
+  const seq = await storage.getNextTurnSequence(session.id);
+  await storage.createTurn({
+    sessionId: session.id,
+    sequence: seq,
+    role: 'agent',
+    content,
+    usage: toTurnUsage(work.usage),
+    ...launchSettingsFromResponse(work),
+    mergeConflicts: work.merge_conflicts,
+    ...(work.check_exit_code !== undefined ? { checkExitCode: work.check_exit_code } : {}),
+    ...(work.check_output !== undefined ? { checkOutput: work.check_output } : {}),
+  });
+
+  const supervised = responses.slice(1);
+  if (supervised.length > 0) {
+    await recordSupervisedTurns(storage, session.id, supervised, worktreePath);
+  }
+
+  await rollUpBundleUsage(storage, session.id, responses, taskShortId);
+}
+
+/**
+ * Record a displaced ERROR turn — nothing else, for the same reasons as above.
+ *
+ * A crash whose report was displaced is still evidence: it is what the human
+ * needs to explain a turn that ended without saying why. But acting on it —
+ * interrupting the task, auto-resuming it — would be acting on a report about a
+ * turn that is over, against a task a newer turn now owns.
+ */
+async function recordSupersededErrorTurn(
+  storage: Storage,
+  taskId: string,
+  session: { id: string },
+  response: ErrorResponse,
+): Promise<void> {
+  const taskShortId = shortId(taskId);
+  const classified = response.failure_class;
+  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
+  const content = buildErrorTurnContent(response, fatalClass, classified, isWatchdogKill(response));
+
+  await journalWorktreeRecovery(storage, taskId, response.worktree_recovery);
+  await persistAgentHandoff(storage, taskId, response.agent_handoff);
+
+  const existingTurns = await storage.getSessionTurns(session.id);
+  if (existingTurns.some(t => t.role === 'agent' && t.content === content)) return;
+
+  const seq = await storage.getNextTurnSequence(session.id);
+  const errorUsage = toTurnUsage(response.usage, `Task ${taskShortId}`);
+  await storage.createTurn({
+    sessionId: session.id,
+    sequence: seq,
+    role: 'agent',
+    content,
+    ...(response.agent ? { agent: response.agent } : {}),
+    ...(response.model ? { model: response.model } : {}),
+    ...(response.effort ? { effort: response.effort } : {}),
+    ...(errorUsage ? { usage: errorUsage } : {}),
+    ...(response.agent_had_no_effect !== undefined ? { agent_had_no_effect: response.agent_had_no_effect } : {}),
+  });
+  if (errorUsage) {
+    await rollUpSessionUsage(storage, session.id, errorUsage, `Task ${taskShortId}`);
+  }
+}
+
+/**
+ * Sweep responses that a later command displaced before anyone consumed them.
+ *
+ * Each one is a turn the agent ACTUALLY FINISHED whose record was never
+ * written. `writeCommand` used to delete these outright, which is how a full
+ * turn — the agent's conclusions, what remained to do, and the session id the
+ * work happened in — vanished from a task with no trace anywhere. Preserving
+ * the file is only half the fix; this is the half that turns it back into a
+ * turn record.
+ *
+ * Runs over every non-terminal task, not just working/interrupted ones: the
+ * whole point is that the task's status at this moment is unrelated to the
+ * displaced turn, and filtering by status is exactly the assumption that lost
+ * these in the first place.
+ *
+ * Exported for unit testing.
+ */
+export async function sweepSupersededResponses(storage: Storage, lazyRoot: string): Promise<void> {
+  const tasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
+
+  for (const task of tasks) {
+    const protoDir = getProtocolDir(task.id);
+    const displaced = listSupersededResponses(protoDir);
+    if (displaced.length === 0) continue;
+
+    const taskShortId = shortId(task.id);
+    const session = await storage.getSessionByTaskId(task.id);
+    if (!session) continue;
+
+    const worktreePath = getWorktreePathForRef(lazyRoot, taskRef(task));
+
+    for (const { path, response } of displaced) {
+      try {
+        if (response.status === 'completed') {
+          logger.warn(
+            `Task ${taskShortId}: recovering a completed turn whose response was displaced by a later command — ` +
+            `recording it now (it would previously have been lost).`,
+          );
+          // Records the turn AND reconciles agent_session_id, which is what
+          // makes `lazy pair` resume the session that did the work rather than
+          // opening an empty one. Deliberately records only — no status
+          // transition, because a newer turn may own the task's status now.
+          await recordSupersededWorkTurns(
+            storage, task.id, session, completedResponses(response), worktreePath,
+          );
+        } else {
+          logger.warn(`Task ${taskShortId}: recording a crash report displaced by a later command.`);
+          await recordSupersededErrorTurn(storage, task.id, session, response);
+        }
+        consumeSupersededResponse(path);
+      } catch (err) {
+        // Leave the file in place so the next tick retries — dropping it here
+        // would reintroduce the exact silent loss this sweep exists to stop.
+        logger.warn(
+          `Task ${taskShortId}: could not record displaced response ${path}: ` +
+          `${err instanceof Error ? err.message : err} (will retry next tick)`,
+        );
+      }
     }
   }
 }

@@ -576,6 +576,40 @@ building *from* is wrong — in a source checkout, check that `./lazy-agent` in 
 repo is either the 12-byte placeholder or a real build, and re-run
 `bun run build`.
 
+## `detected dubious ownership in repository at …`
+
+git refuses a repository whose directory belongs to a different user than the one
+running git, and it suggests you fix that with:
+
+```
+git config --global --add safe.directory /path/to/the/worktree
+```
+
+**Do not run that for a lazy worktree.** The path in the message is a worktree
+lazy created and manages, and in almost every case the git that refused it was
+running inside the agent container — where your host's `~/.gitconfig` is never
+read, so the suggested command would change nothing while quietly widening trust
+on your machine.
+
+Lazy marks its own worktree and git directories as trusted in the gitconfig it
+generates for each task at `<worktree>/.lazy-task-sandbox/.gitconfig`, which the
+container uses as its global git config. Nothing else is trusted: every other
+repository visible inside the container still gets git's ownership check in full,
+and your real `~/.gitconfig` is never touched.
+
+If you see this anyway, that generated file did not reach the container. Relaunch
+the task to regenerate it:
+
+```bash
+lazy stop <task>
+lazy unblock <task>
+```
+
+If it survives a relaunch, the failure is on the host side rather than in the
+container — check who owns the path (`ls -ld <worktree>`). It should be the same
+user that runs lazy and its daemon; a worktree owned by `root` usually means some
+command was run under `sudo` that should not have been.
+
 ## Documentation links
 
 Messages like *"Check documentation at https://docs.getlazy.dev/…"* point at

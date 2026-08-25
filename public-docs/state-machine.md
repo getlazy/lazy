@@ -1001,7 +1001,31 @@ for (const task of interruptedTasks) {
 }
 ```
 
-This ensures responses are never lost, even when races occur between reconciler and supervisor.
+This ensures a response the reconciler has not read yet is still processed when the task has already moved to interrupted.
+
+#### Superseded Response Sweep
+
+The sweep above catches a response the reconciler had not looked at yet. It does
+not catch a response that was overwritten before anyone read it.
+
+**Problem**: every command the host sends the agent is a file, and so is every
+response the agent sends back. Sending a new command used to delete an unread
+response first, so that the agent's next turn did not look already-answered. If
+the agent had just finished a turn when you ran `lazy unblock`, that finished
+turn was deleted unread: it never appeared in `lazy show`, and because the same
+step is what records which agent session the turn ran in, `lazy pair` opened an
+empty session instead of resuming it.
+
+**Solution**: an unread response is now set aside rather than deleted, and a
+reconciler sweep records it. The displaced turn shows up in the task's history
+like any other turn, and the session it ran in is recovered, so `lazy pair`
+resumes where the agent left off.
+
+A recovered turn is recorded as **history only** — it does not change the task's
+status and does not disturb whatever turn is running now; the newer turn owns
+the task's current state. If a turn's output genuinely cannot be recovered, the
+daemon log says so and names the task, rather than the turn disappearing in
+silence.
 
 #### Consecutive Interruptions Counter Reset
 

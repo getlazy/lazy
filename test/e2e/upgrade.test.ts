@@ -318,6 +318,22 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'the upgrade fails loudly');
   });
 
+  test('help documents --timeout and the unbounded default', async () => {
+    const result = await ctx.lazy(['upgrade', '--help']);
+
+    expectSuccess(result);
+    expectOutput(result, '--timeout <seconds>');
+    expectOutput(result, 'default: no timeout');
+    expectOutput(result, 'unbounded by default');
+  });
+
+  test('rejects a non-numeric --timeout instead of silently ignoring it', async () => {
+    const result = await ctx.lazyMocked(['upgrade', '--force', '--timeout', 'twenty'], MOCK_CLAUDE_SUCCESS);
+
+    expectFailure(result);
+    expectError(result, '--timeout expects a whole number of seconds');
+  });
+
   test('upgrade with interrupted task auto-resumes it', async () => {
     // Create and start a task (mock makes it go through start → working → blocked via reconciliation)
     const taskId = await createTask(ctx, 'Auto-resume test', 'Do the work');

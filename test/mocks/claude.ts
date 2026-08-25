@@ -56,14 +56,14 @@ export async function ensureImage(): Promise<string> {
  * `--no-cache` and similar flags were passed through correctly.
  */
 export async function buildLazyRunnerImage(
-  options: { binary?: string; noCache?: boolean } = {}
+  options: { binary?: string; noCache?: boolean; timeoutMs?: number } = {}
 ): Promise<string[]> {
   const logPath = process.env.LAZY_MOCK_BUILD_LOG;
   if (logPath) {
     const { appendFile } = await import('fs/promises');
     await appendFile(
       logPath,
-      JSON.stringify({ binary: options.binary ?? 'docker', noCache: options.noCache ?? false }) + '\n'
+      JSON.stringify({ binary: options.binary ?? 'docker', noCache: options.noCache ?? false, timeoutMs: options.timeoutMs ?? 0 }) + '\n'
     );
   }
   return [MOCK_IMAGE_REF, 'lazy-runner:latest'];
@@ -107,14 +107,14 @@ export async function resolveImageBuildTags(_lazyRoot: string): Promise<string[]
 export async function buildProjectImageToTag(
   _lazyRoot: string,
   tag: string,
-  options: { binary?: string; noCache?: boolean; signal?: AbortSignal } = {},
+  options: { binary?: string; noCache?: boolean; signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<string> {
   const logPath = process.env.LAZY_MOCK_BUILD_LOG;
   if (logPath) {
     const { appendFileSync } = await import('fs');
     appendFileSync(
       logPath,
-      JSON.stringify({ stagedTag: tag, binary: options.binary ?? 'docker', noCache: options.noCache ?? false }) + '\n'
+      JSON.stringify({ stagedTag: tag, binary: options.binary ?? 'docker', noCache: options.noCache ?? false, timeoutMs: options.timeoutMs ?? 0 }) + '\n'
     );
   }
   return `lazy-runner:${tag}`;

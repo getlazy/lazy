@@ -50,12 +50,13 @@ export interface BackgroundImageBuildDeps {
   now: () => number;
 }
 
-function defaultDeps(root: string, binary: string): BackgroundImageBuildDeps {
+function defaultDeps(root: string, binary: string, timeoutMs: number): BackgroundImageBuildDeps {
   return {
     // --no-cache for the same reason the foreground rebuild used it: the
     // Dockerfile TEXT is unchanged when a new Claude Code ships, so only busting
     // the cache actually re-fetches it.
-    build: (tag, signal) => buildProjectImageToTag(root, tag, { binary, noCache: true, signal }),
+    // timeoutMs is 0 (unbounded) unless the human passed `lazy upgrade --timeout`.
+    build: (tag, signal) => buildProjectImageToTag(root, tag, { binary, noCache: true, signal, timeoutMs }),
     canonicalTags: () => resolveImageBuildTags(root),
     tag: (sourceRef, targetRefs) => tagImage(sourceRef, targetRefs, binary),
     untag: ref => removeImageTag(ref, binary),
@@ -179,6 +180,7 @@ export function startBackgroundImageBuild(
   root: string,
   binary: string,
   deps?: Partial<BackgroundImageBuildDeps>,
+  timeoutMs: number = 0,
 ): BackgroundImageBuild {
-  return new BackgroundImageBuild(stagingTagFor(), { ...defaultDeps(root, binary), ...deps });
+  return new BackgroundImageBuild(stagingTagFor(), { ...defaultDeps(root, binary, timeoutMs), ...deps });
 }

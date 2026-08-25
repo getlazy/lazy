@@ -18,7 +18,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
 import { handleErrorResponse } from '../../src/utils/reconcile';
-import { protocolDir as getProtocolDir } from '../../src/protocol';
+import { protocolDir as getProtocolDir, writeResponse } from '../../src/protocol';
 import type { ErrorResponse } from '../../src/protocol';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
@@ -84,6 +84,20 @@ async function makeTask(env: Env, status: 'working' | 'interrupted') {
   return { taskId: task.id, sessionId: session.id, protoDir };
 }
 
+/**
+ * Deliver a crash report the way production does: the supervisor WROTE it to
+ * response.json, and the reconciler is acting on the file that is still there.
+ *
+ * That is now load-bearing, not decoration. `handleErrorResponse` treats a
+ * missing response.json as "a newer command superseded this report" and skips
+ * every live-state mutation — because `writeCommand` moves an unconsumed
+ * response aside rather than deleting it, so the file's absence is a signal.
+ * A fixture that never wrote the file would look permanently superseded.
+ */
+function deliver(protoDir: string, response: ErrorResponse) {
+  writeResponse(protoDir, response);
+}
+
 const fatalResponse: ErrorResponse = {
   status: 'error',
   error: 'API Error: 401 {"type":"authentication_error"}',
@@ -123,6 +137,8 @@ describe('reconciler: classified agent failures', () => {
   test('a fatal failure blocks the task instead of interrupting it', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
 
+    deliver(protoDir, fatalResponse);
+
     await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
 
     const task = await env.storage.getTask(taskId);
@@ -131,6 +147,8 @@ describe('reconciler: classified agent failures', () => {
 
   test('the classification is recorded where a human will see it', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    deliver(protoDir, fatalResponse);
 
     await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
 
@@ -150,6 +168,8 @@ describe('reconciler: classified agent failures', () => {
   test('an already-interrupted task still reaches blocked', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'interrupted');
 
+    deliver(protoDir, fatalResponse);
+
     await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
 
     const task = await env.storage.getTask(taskId);
@@ -158,6 +178,8 @@ describe('reconciler: classified agent failures', () => {
 
   test('an unclassified crash keeps the interrupted + auto-resume path', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    deliver(protoDir, plainCrash);
 
     await handleErrorResponse(env.storage, taskId, { id: sessionId }, plainCrash, protoDir, env.lazyRoot);
 
@@ -175,6 +197,8 @@ describe('reconciler: classified agent failures', () => {
   // explicitly rejects.
   test('a crash-loop report stays interrupted, but shows its class and attempts', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    deliver(protoDir, crashLoop);
 
     await handleErrorResponse(env.storage, taskId, { id: sessionId }, crashLoop, protoDir, env.lazyRoot);
 
