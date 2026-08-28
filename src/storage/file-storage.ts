@@ -46,6 +46,8 @@ import type {
   TaskStatus,
   SessionOutcome,
   TurnRole,
+  InFlightTurn,
+  InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
   TaskTreeNode,
@@ -270,6 +272,13 @@ export class FileStorage implements Storage {
       needsWrite = true;
     }
 
+    // Ensure in_flight_turn exists (added for synchronous-turn correlation).
+    // Absent means "no turn in flight" — never rewritten to disk on read, so a
+    // task file only grows the field when something actually claims the slot.
+    if (raw.in_flight_turn === undefined) {
+      raw.in_flight_turn = null;
+    }
+
     // Migrate pending_sync: boolean→number (false→0, true→1, undefined→0)
     if (raw.pending_sync === undefined || raw.pending_sync === false) {
       raw.pending_sync = 0;
@@ -388,6 +397,10 @@ export class FileStorage implements Storage {
     }
     if (raw.user_stopped === undefined) {
       raw.user_stopped = false;
+    }
+    // Ensure reserved_turn_sequence exists (added for turn-sequence reservation)
+    if (raw.reserved_turn_sequence === undefined) {
+      raw.reserved_turn_sequence = 0;
     }
     // Ensure runner_type field exists (null = legacy / no override → monitoring
     // falls back to global config.runner.type)
@@ -739,6 +752,7 @@ export class FileStorage implements Storage {
         metadata: null,
         tags: [],
         pending_sync: 0,
+        in_flight_turn: null,
       };
 
       await this.atomicWriteTask(id, {
@@ -1285,6 +1299,7 @@ export class FileStorage implements Storage {
         user_stopped: false,
         upstream_merge_sha: null,
         runner_type: null,
+        reserved_turn_sequence: 0,
       };
 
       await this.atomicWriteTask(fullId, { 'session.json': session });
@@ -1697,7 +1712,82 @@ export class FileStorage implements Storage {
   async getNextTurnSequence(sessionId: string): Promise<number> {
     const turns = await this.getSessionTurns(sessionId);
     const maxSeq = turns.reduce((max, t) => Math.max(max, t.sequence), 0);
-    return maxSeq + 1;
+    // A reserved sequence has been promised to a waiter that has not written
+    // its turn yet, so it is occupied even though no turn carries it.
+    const reserved = await this.readReservedTurnSequence(sessionId);
+    return Math.max(maxSeq, reserved) + 1;
+  }
+
+  /** Reservation high-water mark for a session (0 when nothing was reserved). */
+  private async readReservedTurnSequence(sessionId: string): Promise<number> {
+    const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+    if (!taskId) return 0;
+    const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
+    return session?.reserved_turn_sequence ?? 0;
+  }
+
+  async reserveTurnSequences(sessionId: string, count: number): Promise<number> {
+    if (count < 1) throw new Error(`reserveTurnSequences: count must be >= 1, got ${count}`);
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) throw new Error(`reserveTurnSequences: no task found for session ${sessionId}`);
+
+      const sessionPath = join(this.taskDir(taskId), 'session.json');
+      const session = await this.readSession(sessionPath);
+      if (!session) throw new Error(`reserveTurnSequences: session ${sessionId} not found`);
+
+      const turnsFile = await this.readJson<TurnsFile>(join(this.taskDir(taskId), 'turns.json'));
+      const maxSeq = (turnsFile?.turns ?? [])
+        .filter(t => t.session_id === session.id)
+        .reduce((max, t) => Math.max(max, t.sequence), 0);
+
+      const first = Math.max(maxSeq, session.reserved_turn_sequence ?? 0) + 1;
+      session.reserved_turn_sequence = first + count - 1;
+      await this.atomicWriteTask(taskId, { 'session.json': session });
+      return first;
+    });
+  }
+
+  // --- In-flight turns ---
+
+  async beginInFlightTurn(taskId: string, turn: InFlightTurn): Promise<boolean> {
+    return this.lock.withLock(async () => {
+      const taskPath = join(this.taskDir(taskId), 'task.json');
+      const task = await this.readTask(taskPath);
+      if (!task) return false;
+
+      const existing = task.in_flight_turn;
+      // An expired record is not a claim — see InFlightTurn.expires_at.
+      if (existing && existing.expires_at > Date.now()) return false;
+
+      task.in_flight_turn = turn;
+      await this.atomicWriteTask(taskId, { 'task.json': task });
+      return true;
+    });
+  }
+
+  async settleInFlightTurn(taskId: string, turnSequence: number, outcome: InFlightTurnOutcome): Promise<boolean> {
+    return this.lock.withLock(async () => {
+      const taskPath = join(this.taskDir(taskId), 'task.json');
+      const task = await this.readTask(taskPath);
+      if (!task?.in_flight_turn || task.in_flight_turn.turn_sequence !== turnSequence) return false;
+
+      task.in_flight_turn = { ...task.in_flight_turn, outcome };
+      await this.atomicWriteTask(taskId, { 'task.json': task });
+      return true;
+    });
+  }
+
+  async clearInFlightTurn(taskId: string, turnSequence?: number): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskPath = join(this.taskDir(taskId), 'task.json');
+      const task = await this.readTask(taskPath);
+      if (!task?.in_flight_turn) return;
+      if (turnSequence !== undefined && task.in_flight_turn.turn_sequence !== turnSequence) return;
+
+      task.in_flight_turn = null;
+      await this.atomicWriteTask(taskId, { 'task.json': task });
+    });
   }
 
   async getTurnCountByTaskId(taskId: string): Promise<number> {

@@ -7,6 +7,9 @@ import { escapeRegex } from '../../utils/regex';
 import { parentTaskIdOf } from '../../task-target';
 import { loadConfig } from '../../config/loader';
 import { resolveAgentForNewTask } from '../../agent/task-agent';
+import {
+  droppedCustomImagePinWarning,
+} from '../../docker/worktree-image';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -166,6 +169,10 @@ export async function commandClone(args: string[]): Promise<void> {
     // Set cloned_from metadata to link back to source task
     await storage.updateTaskMetadata(clonedTask.id, 'cloned_from', sourceTask.id);
 
+    // INVARIANT: clone is a fresh start — do NOT inherit the source's image pin
+    // (may be missing/stale and fail late). Warn so the human can re-pin via TTY.
+    const imagePinWarning = droppedCustomImagePinWarning(sourceTask);
+
     console.log(`Created task ${theme.taskId(displayId(clonedTask))} — clone of ${displayId(sourceTask)}`);
     console.log(`  ${theme.label('Goal:')} ${clonedTask.goal}`);
     if (clonedTask.code) {
@@ -179,6 +186,9 @@ export async function commandClone(args: string[]): Promise<void> {
     }
     if (clonedTask.type !== 'task') {
       console.log(`  ${theme.label('Type:')} ${clonedTask.type}`);
+    }
+    if (imagePinWarning) {
+      console.log(`  ${theme.warning('Warning:')} ${imagePinWarning}`);
     }
 
     console.log(`\nTask is in backlog. Start it with: ${theme.command('lazy start ' + shortId(clonedTask.id))}`);
@@ -216,6 +226,7 @@ What starts fresh:
   - No session, no turns, no commits
   - New git branch from parent's HEAD (or main if no parent)
   - Status: backlog
+  - Container image (root-resolved; warns if source had a per-task pin)
   - Metadata: cloned_from=<source_task_id> recorded
 
 What does NOT carry over:

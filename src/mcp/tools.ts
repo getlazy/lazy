@@ -82,6 +82,7 @@ import { listAgents } from '../agent/registry';
 import { resolveAgentForNewTask } from '../agent/task-agent';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
+import { inheritCustomImageMetadata, droppedCustomImagePinWarning } from '../docker/worktree-image';
 import { computeWorkingSubstate, formatWorkingSubstate, readSupervisorStatusAsync } from '../utils/working-substate';
 import { MAX_PROGRESS_MESSAGE_LENGTH } from '../protocol/progress';
 import { recordProgress } from '../daemon/progress-registry';
@@ -1035,6 +1036,11 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
           await storage.updateTaskPriority(task.id, priority);
         }
 
+        // INVARIANT: custom images are human-consented only — MCP never prompts.
+        // Subtasks still inherit a parent's pin so stacked work stays on the
+        // same image without giving agents a way to choose one.
+        await inheritCustomImageMetadata(storage, task.id, ownTask);
+
         return {
           id: shortId(task.id),
           full_id: task.id,
@@ -1159,6 +1165,9 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
       if (priority) {
         await storage.updateTaskPriority(task.id, priority);
       }
+
+      // INVARIANT: MCP never prompts for a worktree image; inherit only.
+      await inheritCustomImageMetadata(storage, task.id, parentTask);
 
       return {
         id: shortId(task.id),
@@ -4165,6 +4174,10 @@ export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
         await storage.updateTaskModel(child.id, parent.model);
       }
 
+      // INVARIANT: clone is a fresh start — do NOT inherit the source's image
+      // pin. MCP never prompts; warn so the human can re-pin via CLI TTY.
+      const imagePinWarning = droppedCustomImagePinWarning(parent);
+
       return {
         id: shortId(child.id),
         parent_id: shortId(parent.id),
@@ -4172,6 +4185,7 @@ export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
         code: child.code ?? null,
         status: child.status,
         message: 'Variant created. Call lazy_start to begin work.',
+        ...(imagePinWarning ? { warnings: [imagePinWarning] } : {}),
       };
     } finally {
       await storage.close();
@@ -4416,6 +4430,9 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
         // Link new task to old via metadata
         await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
 
+        // INVARIANT: redo is a fresh start — do NOT inherit the old image pin.
+        const imagePinWarning = droppedCustomImagePinWarning(oldTask);
+
         // Abandon the old task
         await storage.abandonTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, MCP_ACTOR);
 
@@ -4426,6 +4443,7 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
           goal: newTask.goal,
           status: newTask.status,
           message: 'New task created. Call lazy_start to begin work.',
+          ...(imagePinWarning ? { warnings: [imagePinWarning] } : {}),
         };
       }
 

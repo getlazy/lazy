@@ -272,6 +272,22 @@ acting inside its own subtree).
   - Status tracks the phase in flight: `working` (with the `agent:pre-accept`
     substate) for the pre-accept turn, `merging` for the whole merge phase.
     Every abort restores the status the task actually had before the accept
+  - While it waits for the pre-accept turn, lazy also watches whether the
+    agent's run is still alive. If the run disappears without answering, the
+    accept aborts within seconds — reporting the run's exit code and last
+    output, restoring the task's prior status, and recording the reason on the
+    task — instead of waiting out the turn's full timeout. A brief grace period
+    covers the normal ending, where the agent answers and then exits.
+  - The merge only proceeds on a validation result that actually came from the
+    pre-accept turn. While the accept waits, the task is marked as having a turn
+    in flight, so an auto-resume or an auto-delivered comment holds off instead
+    of starting a turn on top of it — and the marker lives with the task, so it
+    still holds if the daemon restarts mid-accept. If a result nonetheless
+    arrives that did not come from the pre-accept turn, the accept stops and says
+    so rather than treating it as a pass. Re-accept once the task is idle and a
+    fresh pre-accept turn runs. `lazy ask` claims the same marker, so a second
+    `lazy ask` on a task that is already answering one is refused rather than
+    racing it.
   - Concurrency: the whole accept orchestration runs under a process-level
     per-task lifecycle lock (`src/daemon/task-lifecycle-lock.ts`). The daemon
     serves RPCs concurrently, so without this a human accept and a builder

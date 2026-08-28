@@ -144,6 +144,94 @@ export interface Task {
    * counter goes >0 again, signaling that another sync is needed after completion.
    */
   pending_sync: number;
+  /**
+   * The turn currently in flight for this task, when one was started by a
+   * caller that will read the answer ITSELF rather than leaving it to the
+   * reconciler — see {@link InFlightTurn}. null when no such turn is running.
+   */
+  in_flight_turn?: InFlightTurn | null;
+}
+
+/**
+ * Who started an in-flight turn. Only the two turns the daemon runs
+ * SYNCHRONOUSLY are recorded: an RPC caller is blocked waiting for their
+ * result, so the answer has a designated reader and the ordinary "park the
+ * task and move on" reconciliation is wrong for them.
+ *
+ * Deliberately NOT every turn: an ordinary work turn has no waiter, and a
+ * record left behind by a crashed one would make auto-resume — whose whole job
+ * is to relaunch after a crash — refuse to run.
+ */
+export type InFlightTurnOwner = 'ask' | 'pre_accept';
+
+/**
+ * How an in-flight turn ended, written by whoever reconciled the response.
+ * The waiter polls for this rather than reading the protocol dir.
+ */
+export interface InFlightTurnOutcome {
+  /**
+   * - completed — the agent answered and the turn was recorded.
+   * - error     — the supervisor wrote an ErrorResponse.
+   * - foreign   — a completed response arrived that did not answer this
+   *               command (a `pre_accept` answer with no gate block).
+   */
+  kind: 'completed' | 'error' | 'foreign';
+  /** Sequence of the agent turn that was recorded, when one was. */
+  turn_sequence?: number;
+  /** The agent's answer text, for the waiter to hand back to its caller. */
+  result?: string;
+  /** Token usage the answer reported, so the waiter can report it verbatim. */
+  usage?: AgentTokenUsage;
+  /** Wall-clock the agent process itself took, for the waiter's timings. */
+  agent_duration_ms?: number;
+  /**
+   * Pre-accept gate verdict, copied verbatim from the response. Present only on
+   * a `pre_accept` answer — its ABSENCE on one is what makes the outcome
+   * `foreign` (see the gate-presence INVARIANT in task-lifecycle.ts).
+   */
+  gate?: {
+    passed: boolean;
+    failed_command?: string;
+    exit_code?: number;
+    output?: string;
+  };
+  /** Human-readable explanation for `error` and `foreign`. */
+  message?: string;
+  settled_at: number;
+}
+
+/**
+ * A turn that is running right now, and who is waiting for its answer.
+ *
+ * This is the correlation the protocol dir cannot provide: it is a single-slot
+ * mailbox with no command id, so a waiter reading `response.json` gets whatever
+ * is in the slot — including another command's answer. Here the waiter records,
+ * BEFORE the command is written, the turn sequence its answer will occupy;
+ * every other writer (reconciler, auto-resume, auto-deliver) checks for a live
+ * record and leaves the task alone, and the reconciler settles the response
+ * against this record instead of parking the task.
+ *
+ * Bounded by `expires_at` rather than by liveness: a pid can be recycled (so
+ * "is the starter still alive?" is not answerable safely), but a wait always
+ * has a deadline, and a record past its deadline is stale by construction.
+ */
+export interface InFlightTurn {
+  /** Session the turn belongs to. */
+  session_id: string;
+  owner: InFlightTurnOwner;
+  /** Turn type the answer must carry for the waiter to accept it. */
+  turn_type: TurnType;
+  /** Sequence RESERVED for the agent's answer (see reserveTurnSequences). */
+  turn_sequence: number;
+  /** Sequence of the human/marker turn that opened the exchange. */
+  human_turn_sequence: number;
+  /** Status the task must return to once the turn settles. */
+  restore_status: TaskStatus;
+  started_at: number;
+  /** After this instant the record is stale and any reader may clear it. */
+  expires_at: number;
+  /** Set by the reconciler (or whoever settles the response) when it ends. */
+  outcome?: InFlightTurnOutcome;
 }
 
 /** Whether a tag-history event added or removed a tag. */
@@ -207,6 +295,18 @@ export interface Session {
   user_stopped: boolean;
   /** SHA of the upstream branch at the time of last merge (for accurate diff scope) */
   upstream_merge_sha: string | null;
+  /**
+   * High-water mark of turn sequences handed out by `reserveTurnSequences`.
+   *
+   * `getNextTurnSequence` derives from the turns that EXIST, which allocates
+   * but does not reserve: "my answer will be turn N+1" is identity by
+   * convention, and any turn written in between takes the number. A caller that
+   * must be able to recognize its own answer reserves the sequence up front and
+   * `getNextTurnSequence` returns `max(lastTurn, reserved) + 1` thereafter.
+   *
+   * 0 (or missing, on legacy sessions) means nothing was ever reserved.
+   */
+  reserved_turn_sequence?: number;
 }
 
 export interface MergeConflict {
@@ -369,7 +469,7 @@ export type FeedbackDelivery = 'pending' | 'consumed';
  * new turn flavors appear — storage and UI code should branch on this
  * rather than adding more boolean flags.
  */
-export type TurnType = 'work' | 'ask' | 'nudge' | 'sync';
+export type TurnType = 'work' | 'ask' | 'nudge' | 'sync' | 'pre_accept';
 
 export interface Commit {
   id: string;

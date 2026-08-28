@@ -290,6 +290,7 @@ export class HostProcessRunner implements Runner {
     debug?: boolean,
     daemonConfigPath?: string,
     taskId?: string,
+    _pinnedImage?: string,
   ): Promise<void> {
     // Fail hard before launch if the agent's backend is unreachable.
     await preflightRoleTarget('agent', this.agentTarget());

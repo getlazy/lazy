@@ -1,20 +1,28 @@
 /**
- * Unit tests: worktree Dockerfile prompt for `lazy upgrade`.
+ * Unit tests: worktree Dockerfile adoption for `lazy upgrade` (Part 2).
  *
- * INVARIANT: a task worktree never governs the container image by default; the
- * only override is LAZY_DOCKERFILE_LAZY. Developers often forget to export it
- * when upgrading from a worktree — this prompt asks on a TTY before any image
- * build starts so the answer can change what gets built.
+ * INVARIANT: a task worktree never governs the container image by default.
+ * On a TTY, upgrade offers adoption; on yes it persists daemon runtime state
+ * (adopted-image.json). Each rebuild clears first so adoption cannot silently
+ * outlive the next decision. The old env-override path is gone.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, writeFile, rm, mkdir } from 'fs/promises';
+import { mkdtemp, writeFile, rm, mkdir, readFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   lazyTaskWorktreeCwd,
-  maybePromptWorktreeDockerfileOverride,
+  maybePromptWorktreeDockerfileAdoption,
 } from '../../src/upgrade/worktree-dockerfile-prompt';
+import {
+  readAdoptedImage,
+} from '../../src/daemon/adopted-image';
+import { getAdoptedImagePath } from '../../src/daemon/paths';
+import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { VERSION } from '../../src/version';
+import { IMAGE_TAG } from '../../src/capture/image-tag';
+import { pathExists } from '../../src/utils/fs';
 
 describe('lazyTaskWorktreeCwd', () => {
   let root: string;
@@ -57,19 +65,21 @@ describe('lazyTaskWorktreeCwd', () => {
   });
 });
 
-describe('maybePromptWorktreeDockerfileOverride', () => {
+describe('maybePromptWorktreeDockerfileAdoption', () => {
   let root: string;
   let worktree: string;
   let originalCwd: string;
   let origForceTty: string | undefined;
   let origPromptDefaults: string | undefined;
-  let origOverride: string | undefined;
+  let undoDaemonBase: (() => void) | undefined;
 
   beforeEach(async () => {
     originalCwd = process.cwd();
     origForceTty = process.env.LAZY_FORCE_TTY;
     origPromptDefaults = process.env.LAZY_PROMPT_DEFAULTS;
-    origOverride = process.env.LAZY_DOCKERFILE_LAZY;
+
+    const daemonBase = await mkdtemp(join(tmpdir(), 'lazy-adopt-daemon-'));
+    undoDaemonBase = pinDaemonBaseDir(daemonBase);
 
     root = await mkdtemp(join(tmpdir(), 'lazy-wt-prompt-'));
     worktree = join(root, '.lazy', 'worktrees', 'branch-task');
@@ -87,45 +97,67 @@ describe('maybePromptWorktreeDockerfileOverride', () => {
     else process.env.LAZY_FORCE_TTY = origForceTty;
     if (origPromptDefaults === undefined) delete process.env.LAZY_PROMPT_DEFAULTS;
     else process.env.LAZY_PROMPT_DEFAULTS = origPromptDefaults;
-    if (origOverride === undefined) delete process.env.LAZY_DOCKERFILE_LAZY;
-    else process.env.LAZY_DOCKERFILE_LAZY = origOverride;
+    undoDaemonBase?.();
     await rm(root, { recursive: true, force: true });
   });
 
-  test('does nothing without a TTY', async () => {
+  test('does nothing without a TTY but still clears prior adoption', async () => {
     delete process.env.LAZY_FORCE_TTY;
     delete process.env.LAZY_PROMPT_DEFAULTS;
-    await maybePromptWorktreeDockerfileOverride(root);
-    expect(process.env.LAZY_DOCKERFILE_LAZY).toBeUndefined();
-  });
+    // Seed a prior adoption so we can assert the clear.
+    const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+    const dockerfilePath = join(worktree, 'Dockerfile.lazy');
+    const content = await readFile(dockerfilePath, 'utf-8');
+    await writeAdoptedImage(root, {
+      dockerfilePath,
+      contentHash: hashDockerfileContent(content),
+      imageName: 'lazy-custom-abc:0.22',
+    }, { content });
+    expect(await readAdoptedImage(root)).not.toBeNull();
 
-  test('does nothing when LAZY_DOCKERFILE_LAZY is already set', async () => {
-    process.env.LAZY_FORCE_TTY = '1';
-    process.env.LAZY_PROMPT_DEFAULTS = 'accept';
-    process.env.LAZY_DOCKERFILE_LAZY = '/already/set';
-    await maybePromptWorktreeDockerfileOverride(root);
-    expect(process.env.LAZY_DOCKERFILE_LAZY).toBe('/already/set');
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).toBeNull();
+    expect(await readAdoptedImage(root)).toBeNull();
   });
 
   test('does nothing when worktree Dockerfile.lazy matches the root copy', async () => {
     process.env.LAZY_FORCE_TTY = '1';
     process.env.LAZY_PROMPT_DEFAULTS = 'accept';
     await writeFile(join(worktree, 'Dockerfile.lazy'), 'FROM debian:bookworm-slim\n# root\n');
-    await maybePromptWorktreeDockerfileOverride(root);
-    expect(process.env.LAZY_DOCKERFILE_LAZY).toBeUndefined();
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).toBeNull();
+    expect(await readAdoptedImage(root)).toBeNull();
   });
 
-  test('sets LAZY_DOCKERFILE_LAZY when the human accepts on a TTY', async () => {
+  test('writes adoption when the human accepts on a TTY', async () => {
     process.env.LAZY_FORCE_TTY = '1';
     process.env.LAZY_PROMPT_DEFAULTS = 'accept';
-    await maybePromptWorktreeDockerfileOverride(root);
-    expect(process.env.LAZY_DOCKERFILE_LAZY).toBe(join(worktree, 'Dockerfile.lazy'));
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).not.toBeNull();
+    expect(result!.dockerfilePath).toBe(join(worktree, 'Dockerfile.lazy'));
+    expect(result!.lazyVersion).toBe(VERSION);
+    expect(result!.imageName).toMatch(new RegExp(`^lazy-custom-[0-9a-f]{12}:${IMAGE_TAG}$`));
+    expect(result!.contentHash).toHaveLength(64);
+
+    const onDisk = await readAdoptedImage(root);
+    expect(onDisk).toEqual(result);
+    // Adoption must not invent a process env override — it is daemon state only.
+    expect(process.env.LAZY_DOCKERFILE_LAZY).toBeUndefined();
   });
 
-  test('leaves LAZY_DOCKERFILE_LAZY unset when the human declines', async () => {
+  test('leaves adoption cleared when the human declines', async () => {
     process.env.LAZY_FORCE_TTY = '1';
     process.env.LAZY_PROMPT_DEFAULTS = 'decline';
-    await maybePromptWorktreeDockerfileOverride(root);
-    expect(process.env.LAZY_DOCKERFILE_LAZY).toBeUndefined();
+    const { writeAdoptedImage } = await import('../../src/daemon/adopted-image');
+    await writeAdoptedImage(root, {
+      dockerfilePath: '/old',
+      contentHash: 'old',
+      imageName: 'lazy-custom-old:0.22',
+    });
+
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).toBeNull();
+    expect(await readAdoptedImage(root)).toBeNull();
+    expect(await pathExists(getAdoptedImagePath(root))).toBe(false);
   });
 });

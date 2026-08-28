@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync } from 'fs';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile } from 'fs/promises';
 import { join, isAbsolute } from 'path';
 import { tmpdir } from 'os';
 import type { AgentResponse, TokenUsage } from '../types';
@@ -38,6 +38,7 @@ import { getHome } from '../utils/home';
 import { toTurnUsage } from '../utils/usage-recording';
 import { VERSION } from '../version';
 import { IMAGE_NAME, DOCKERFILE_HASH_LABEL, IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from './image-tag';
+import { analyzeLazyBaseUsage, type LazyBaseUsage } from './dockerfile-base';
 
 // Re-exported so callers keep importing the image identity from one place.
 export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
@@ -127,40 +128,76 @@ function getLazyRoot(): string {
 }
 
 /**
+ * Whether THIS process is an explicit upgrade image build.
+ *
+ * Off by default, and opt-in per process — never per call site. Only
+ * `lazy upgrade` (incl. `--images`) turns it on at command entry; the daemon,
+ * `lazy supervise`, and every launch path leave it off.
+ *
+ * WHY IT EXISTS (and is NOT an env var): Part 2's soft-pin / path-resolve split
+ * needs an upgrade-vs-launch signal. Soft-pin when this is off (launches use
+ * `adopted.imageName` and never rebuild from the worktree path). Path-resolve
+ * when it is on (the upgrade build may return `adopted.dockerfilePath`). A
+ * process-wide latch keeps hash, content-addressed image name, and build in
+ * agreement — same shape as the old env-override latch, without the env var
+ * that wedged daemons when a worktree path went missing.
+ */
+let upgradeImageBuildEnabled = false;
+
+/**
+ * Opt this process into upgrade-build image resolution. Called ONLY by
+ * `lazy upgrade` (incl. `--images`) at command entry, before anything resolves
+ * an image. Nothing in the daemon or a supervisor may call it.
+ */
+export function enableUpgradeImageBuild(): void {
+  upgradeImageBuildEnabled = true;
+}
+
+/** Undo `enableUpgradeImageBuild` — for tests, which share one process. */
+export function resetUpgradeImageBuild(): void {
+  upgradeImageBuildEnabled = false;
+}
+
+/** Whether this process opted into an upgrade image build. */
+export function isUpgradeImageBuild(): boolean {
+  return upgradeImageBuildEnabled;
+}
+
+/**
  * Resolve the custom Dockerfile path.
  * Returns the absolute path if one is in effect and the file exists, null
  * otherwise (default image).
  *
- * Resolution:
- * 1. `LAZY_DOCKERFILE_LAZY` (env override, same family as LAZY_CONFIG): used
- *    verbatim when absolute, resolved against the project root when relative.
- *    Forces custom-image mode even when [docker].dockerfile is unset. Works
- *    uniformly across every command AND the daemon (spawned daemons inherit
- *    the environment), which is the point: export it, `lazy upgrade`, and the
- *    build and every subsequent launch agree on the file. Intended for
- *    developing lazy itself (testing a branch's Dockerfile before it merges)
- *    and for e2e fixtures.
+ * Resolution order:
+ * 1. Daemon-adopted worktree Dockerfile (`adopted-image.json`) when valid —
+ *    ONLY while the upgrade-build latch is on (upgrade that just wrote
+ *    adoption). Routine launches must NOT resolve via this path: they
+ *    soft-pin `imageName` in `ensureImage` instead, so a post-consent agent
+ *    edit of the worktree Dockerfile cannot become a host docker rebuild.
  * 2. `[docker].dockerfile` from config, joined to the PROJECT ROOT.
  *
- * INVARIANT: a task's worktree must never govern the image. Task branches are
- * agent-writable, and deriving the image from one would let an agent's
- * Dockerfile.lazy edits execute as build steps under the daemon's docker on
- * the HOST (build-time RUN runs outside every container guard). Launch paths
- * therefore never anchor image resolution at the task worktree.
+ * INVARIANT: a task's worktree must never *automatically* govern the image.
+ * Task branches are agent-writable, and deriving the image from one without
+ * human consent would let an agent's Dockerfile.lazy edits execute as build
+ * steps under the daemon's docker on the HOST. Launch paths therefore never
+ * anchor image resolution at the task worktree. Human-consented paths:
+ *   - Part 1: CLI TTY create/start/edit → task metadata pin (ensureImage
+ *     honors `pinnedImage` before this function runs)
+ *   - Part 2: CLI TTY `lazy upgrade` → daemon adoption; launches soft-pin
+ *     `imageName`, upgrade builds may resolve the path here while the latch
+ *     is on
  *
  * Exported for `lazy upgrade`'s image-source announcement.
  */
 export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
-  const override = process.env.LAZY_DOCKERFILE_LAZY;
-  if (override) {
-    const absPath = isAbsolute(override) ? override : join(lazyRoot, override);
-    if (!existsSync(absPath)) {
-      throw new Error(
-        `LAZY_DOCKERFILE_LAZY is set to '${override}' (resolved to ${absPath}) but the file does not exist. ` +
-        `Unset it with LAZY_DOCKERFILE_LAZY= or fix the path.`
-      );
-    }
-    return absPath;
+  // Adoption path is ONLY for the explicit upgrade build (latch on). Launches
+  // soft-pin via ensureImage and must not re-hash the worktree file here.
+  // Returns the consented SNAPSHOT (outside any worktree), never the live
+  // worktree path — closes hash/build TOCTOU on agent edits after consent.
+  if (upgradeImageBuildEnabled) {
+    const { resolveAdoptedDockerfileSnapshot } = await import('../daemon/adopted-image');
+    const snapshot = await resolveAdoptedDockerfileSnapshot(lazyRoot);
+    if (snapshot) return snapshot;
   }
 
   const config = await loadConfig(lazyRoot);
@@ -175,6 +212,27 @@ export async function resolveCustomDockerfile(lazyRoot: string): Promise<string 
     );
   }
   return absPath;
+}
+
+/**
+ * Whether the path returned by resolveCustomDockerfile came from daemon
+ * adoption (vs [docker].dockerfile). Used by upgrade's image-source
+ * announcement — only meaningful while the upgrade-build latch is on.
+ */
+export async function isAdoptedDockerfile(
+  lazyRoot: string,
+  dockerfilePath: string | null,
+): Promise<boolean> {
+  if (!dockerfilePath) return false;
+  // Adoption path resolution requires the upgrade latch; without it this
+  // function never returns an adopted path.
+  if (!upgradeImageBuildEnabled) return false;
+  const { getAdoptedDockerfilePath } = await import('../daemon/paths');
+  const { loadValidAdoptedImage } = await import('../daemon/adopted-image');
+  const adopted = await loadValidAdoptedImage(lazyRoot);
+  if (!adopted) return false;
+  // resolveCustomDockerfile returns the snapshot path, not the worktree path.
+  return dockerfilePath === getAdoptedDockerfilePath(lazyRoot);
 }
 
 /**
@@ -389,15 +447,17 @@ async function listExistingLazyImages(binary: string = 'docker'): Promise<string
 }
 
 /**
- * Write Dockerfile content to a temp directory so `docker build -f` has a real
- * file to read. Returns the build context directory and the Dockerfile path.
+ * Write Dockerfile content to a UNIQUE temp directory so `docker build -f`
+ * has a real file to read. Unique per call (mkdtemp) so concurrent builds
+ * cannot clobber each other's Dockerfile. Returns the temp dir and path;
+ * callers that use project root as build context should pass only
+ * `dockerfilePath` to docker and clean up `tempDir` themselves.
  */
-async function writeDockerfileToTempDir(content: string): Promise<{ buildCwd: string; dockerfilePath: string }> {
-  const tempDir = join(tmpdir(), 'lazy-docker-build');
-  await mkdir(tempDir, { recursive: true });
+async function writeDockerfileToTempDir(content: string): Promise<{ buildCwd: string; dockerfilePath: string; tempDir: string }> {
+  const tempDir = await mkdtemp(join(tmpdir(), 'lazy-docker-build-'));
   const dockerfilePath = join(tempDir, 'Dockerfile');
   await writeFile(dockerfilePath, content);
-  return { buildCwd: tempDir, dockerfilePath };
+  return { buildCwd: tempDir, dockerfilePath, tempDir };
 }
 
 /** How often to reassure the human that a quiet build is still running. */
@@ -544,6 +604,148 @@ async function buildImage(lazyRoot: string, repository: string, currentHash: str
   await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache, undefined, agentId, timeoutMs);
 }
 
+/** Does the container runtime have this image locally? */
+async function imageExists(ref: string, binary: string = 'docker'): Promise<boolean> {
+  const proc = spawn(
+    [binary, 'image', 'inspect', ref, '--format', '{{.Id}}'],
+    { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+  );
+  return (await proc.exited) === 0;
+}
+
+/**
+ * Public alias of the local-image probe — used by the worktree-image offer to
+ * decide whether an existing pin is still present (skip re-prompt) or was
+ * pruned (offer rebuild).
+ */
+export async function localImageExists(ref: string, binary: string = 'docker'): Promise<boolean> {
+  return imageExists(ref, binary);
+}
+
+/**
+ * Build a content-addressed `lazy-custom-<hash>` image from an absolute
+ * Dockerfile path — without going through `resolveCustomDockerfile` / the
+ * upgrade-build latch.
+ *
+ * Used when a human consents (TTY prompt) to pin a worktree Dockerfile on a
+ * task. Build context remains the project root (same as today's custom-image
+ * path). The Dockerfile is read ONCE, hashed, then written to a temp file
+ * outside any worktree so `docker build` cannot pick up a post-consent agent
+ * edit of the worktree file (hash/build TOCTOU).
+ *
+ * Do NOT use this to auto-resolve from a worktree — that would let agent-writable
+ * branches drive host docker builds. The caller must have already gotten
+ * human consent.
+ */
+export async function buildImageFromDockerfilePath(
+  lazyRoot: string,
+  dockerfilePath: string,
+  options: { binary?: string; noCache?: boolean; timeoutMs?: number } = {},
+): Promise<{ imageName: string; contentHash: string }> {
+  const binary = options.binary ?? 'docker';
+  await checkDocker(binary);
+
+  const absPath = isAbsolute(dockerfilePath) ? dockerfilePath : join(lazyRoot, dockerfilePath);
+  if (!existsSync(absPath)) {
+    throw new Error(
+      `Cannot build custom image: Dockerfile not found at ${absPath}.`,
+    );
+  }
+
+  // Capture consented bytes once — hash and build must agree on the same text.
+  const content = await readFile(absPath, 'utf-8');
+  const contentHash = createHash('sha256').update(content).digest('hex');
+  const shortHash = contentHash.substring(0, 12);
+  const repository = `lazy-custom-${shortHash}`;
+  const imageName = `${repository}:${IMAGE_TAG}`;
+  const tags = buildTagsFor(repository);
+
+  // Same FROM-lazy-runner preflight as the root custom-image path.
+  const baseUsage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
+  await ensureLazyBaseImage(baseUsage, absPath, binary, options.timeoutMs ?? 0);
+
+  // Build from a temp copy of the consented bytes, not the live worktree path.
+  // Temp is left in place (unique mkdtemp under the OS temp dir) so the `-f`
+  // path remains inspectable; it is outside every worktree.
+  const snap = await writeDockerfileToTempDir(content);
+  logger.info(`Building ${imageName} container image from consented Dockerfile (source ${absPath})...`);
+  try {
+    await runDockerBuild(
+      lazyRoot,
+      snap.dockerfilePath,
+      tags,
+      contentHash,
+      binary,
+      options.noCache ?? false,
+      undefined,
+      options.timeoutMs ?? 0,
+    );
+  } catch (err) {
+    if (baseUsage.unbuildable.length > 0) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${detail}\n` +
+        `${absPath} builds FROM ${baseUsage.unbuildable.join(', ')} — a lazy base image that exists only ` +
+        `locally, never on a registry. If the build failed to pull it, build the base first: ` +
+        `\`lazy system build lazy-runner\`.`,
+      );
+    }
+    throw err;
+  }
+
+  return { imageName, contentHash };
+}
+
+/**
+ * Build the base runner image first when a custom Dockerfile builds FROM it and
+ * it is missing locally.
+ *
+ * `lazy-runner` exists on no registry — it is built here or not at all. Without
+ * this, `docker build` on a `FROM lazy-runner` Dockerfile with no local base
+ * treats the name as a Docker Hub repository and dies with "pull access denied,
+ * repository does not exist", which points at nothing. That is the exact failure
+ * a fresh install hits: the version tag (src/capture/image-tag.ts) forces a
+ * custom-image rebuild after a minor bump, and on a machine that never built the
+ * base — or pruned it — the rebuild has nothing to layer on.
+ *
+ * ONLY-WHEN-MISSING, deliberately. This is not a second freshness mechanism:
+ * `ensureImage`'s own triggers (upgrade / age / Dockerfile hash) govern how
+ * fresh the base image stays for the projects that run it directly. Rebuilding
+ * an existing base here would add a multi-minute build to a path whose job is to
+ * build something else.
+ */
+async function ensureLazyBaseImage(
+  usage: LazyBaseUsage,
+  dockerfilePath: string,
+  binary: string,
+  timeoutMs: number,
+): Promise<void> {
+  if (usage.buildable.length === 0) return;
+
+  const missing: string[] = [];
+  for (const ref of usage.buildable) {
+    if (!(await imageExists(ref, binary))) missing.push(ref);
+  }
+  if (missing.length === 0) return;
+
+  logger.info(
+    `Base image ${missing.join(', ')} not found — building it first, because ${dockerfilePath} builds FROM it ` +
+    `(this can take several minutes).`
+  );
+
+  try {
+    // No --no-cache: the image is absent, so there is nothing stale to bust, and
+    // a warm build cache is the difference between seconds and minutes here.
+    await buildLazyRunnerImage({ binary, timeoutMs });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Failed to build the base image ${IMAGE_NAME}, which ${dockerfilePath} builds FROM: ${detail}\n` +
+      `Build it on its own to see the full output, then retry: \`lazy system build lazy-runner\``
+    );
+  }
+}
+
 /**
  * Build the project's resolved image (custom Dockerfile or the embedded
  * default) and write it under the given tags.
@@ -567,14 +769,32 @@ async function buildImageWithTags(
 
   let buildCwd: string;
   let dockerfileName: string;
+  let baseUsage: LazyBaseUsage | null = null;
 
   if (customPath) {
     // Name the Dockerfile in the announcement: from a worktree it is genuinely
     // ambiguous which copy governs, and a wrong one once cost a whole session.
     logger.info(`Building ${tags[0]} container image from ${customPath}...`);
-    // Custom Dockerfile: build context is project root, Dockerfile path is the custom one
+    // Custom Dockerfile: build context is project root. Read once and build
+    // from a temp copy so a concurrent write to customPath cannot change what
+    // docker sees after we hashed (hash/build TOCTOU). For adoption, customPath
+    // is already the daemon snapshot; the extra copy is still correct.
+    // Temp dirs are unique (mkdtemp) under the OS temp dir — outside every
+    // worktree — and left in place so the `-f` path stays inspectable.
     buildCwd = lazyRoot;
-    dockerfileName = customPath;
+    const content = await readFile(customPath, 'utf-8');
+    const snap = await writeDockerfileToTempDir(content);
+    dockerfileName = snap.dockerfilePath;
+
+    // A custom Dockerfile is the only thing that can build FROM lazy's own base
+    // image; the default one IS the base. Make sure that base exists before
+    // docker tries — and fails — to pull it from a registry.
+    baseUsage = analyzeLazyBaseUsage(
+      content,
+      IMAGE_NAME,
+      buildTagsFor(IMAGE_NAME),
+    );
+    await ensureLazyBaseImage(baseUsage, customPath, binary, timeoutMs);
   } else {
     logger.info(`Building ${tags[0]} container image from the embedded default Dockerfile...`);
     // Write the resolved Dockerfile to a temp directory for the build.
@@ -585,7 +805,25 @@ async function buildImageWithTags(
     dockerfileName = temp.dockerfilePath;
   }
 
-  await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal, timeoutMs);
+  try {
+    await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal, timeoutMs);
+  } catch (err) {
+    // The base refs lazy could NOT supply itself (an agent-suffixed repository,
+    // or a base pinned to a tag no base build writes — see
+    // src/capture/dockerfile-base.ts). If the build died on one of those, docker
+    // reported a registry error for an image that lives on no registry, so name
+    // the real remedy rather than leaving that as the last word.
+    if (baseUsage && baseUsage.unbuildable.length > 0) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${detail}\n` +
+        `${dockerfileName} builds FROM ${baseUsage.unbuildable.join(', ')} — a lazy base image that exists only ` +
+        `locally, never on a registry. If the build failed to pull it, build the base first: ` +
+        `\`lazy system build lazy-runner\`.`
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -682,10 +920,55 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
  * to an existing lazy image if one is available. This lets users work offline
  * with a previously-built image even if the Dockerfile has changed.
  */
-export async function ensureImage(binary: string = 'docker', options?: { noCache?: boolean; agentId?: string; timeoutMs?: number }): Promise<string> {
+export async function ensureImage(
+  binary: string = 'docker',
+  options?: {
+    noCache?: boolean;
+    agentId?: string;
+    timeoutMs?: number;
+    /**
+     * Task-pinned image (metadata.custom_image). When set, use it if present
+     * locally; if missing, FAIL LOUDLY — never fall back to root or adoption.
+     * Resolution order: (1) this pin, (2) daemon-adopted imageName soft-pin
+     * on launches, (3) root [docker].dockerfile (or adopted path during an
+     * explicit upgrade build with the upgrade-build latch on).
+     */
+    pinnedImage?: string;
+  },
+): Promise<string> {
   await checkDocker(binary);
 
+  // Resolution order: task pin → daemon adoption soft-pin (launches) → root.
+  // A missing pin must not silently degrade mid-task.
+  if (options?.pinnedImage) {
+    if (await imageExists(options.pinnedImage, binary)) {
+      logger.debug(`Using task-pinned container image ${options.pinnedImage}`);
+      return options.pinnedImage;
+    }
+    // Lazy import avoids a load-time cycle (worktree-image imports this module).
+    const { missingPinnedImageMessage } = await import('../docker/worktree-image');
+    throw new Error(missingPinnedImageMessage(options.pinnedImage));
+  }
+
   const lazyRoot = getLazyRoot();
+
+  // Part 2 soft-pin: on routine launches (upgrade-build latch OFF), use the
+  // consented imageName directly — never re-hash / rebuild from dockerfilePath,
+  // or a post-consent agent edit of the worktree Dockerfile would become host
+  // docker build steps. Upgrade builds leave the latch ON and fall through
+  // to resolveCustomDockerfile, which may return the adopted path.
+  if (!upgradeImageBuildEnabled) {
+    const { loadValidAdoptedImage, missingAdoptedImageMessage } = await import('../daemon/adopted-image');
+    const adopted = await loadValidAdoptedImage(lazyRoot);
+    if (adopted) {
+      if (await imageExists(adopted.imageName, binary)) {
+        logger.debug(`Using daemon-adopted container image ${adopted.imageName}`);
+        return adopted.imageName;
+      }
+      throw new Error(missingAdoptedImageMessage(adopted.imageName));
+    }
+  }
+
   const { repository } = await resolveImageRepository(lazyRoot, options?.agentId);
   const imageName = `${repository}:${IMAGE_TAG}`;
   const currentHash = await calculateDockerfileHash(lazyRoot, options?.agentId);
@@ -1734,13 +2017,17 @@ export async function launchSupervisorAsync(
   target?: RoleTarget,
   taskId?: string,
   agentId?: string,
+  /**
+   * Task-pinned image from metadata.custom_image. Threaded from the daemon
+   * launch path — never resolved from the worktree here.
+   */
+  pinnedImage?: string,
 ): Promise<void> {
   // Image resolution is deliberately NOT anchored at sandbox.worktreePath:
-  // a task branch that edits Dockerfile.lazy must never have those edits
-  // built and run by the daemon's docker on the host (see
-  // resolveCustomDockerfile for the invariant).
+  // a task branch that edits Dockerfile.lazy must never auto-govern the image.
+  // Human-consented pins arrive as pinnedImage from task metadata only.
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary, { agentId }),
+    ensureImage(binary, { agentId, pinnedImage }),
     ensureAgentBinary(),
   ]);
 

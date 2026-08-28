@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.22.1141]
+
+### Added
+
+- **Per-task worktree images** — from a terminal in a task worktree, `lazy create` / `start` / `edit` can ask to build that worktree's `Dockerfile.lazy` and pin it on the task (subtasks inherit it; `lazy clone` / `lazy redo` warn and use the root image)
+- **`lazy upgrade` worktree adoption** — from a terminal in a task worktree, adopt that Dockerfile for the image build and the daemon until the next upgrade rebuild
+
+### Changed
+
+- **`LAZY_DOCKERFILE_LAZY` is gone** — use the worktree TTY prompts on `lazy create`/`start`/`edit` (per-task pin) or `lazy upgrade` (daemon adoption) instead
+
+### Fixed
+
+- **Agents can no longer reach an upstream's admin endpoints through the proxy** — only the model API is forwarded, so a local Ollama's `/api/pull` and `/api/delete` are refused with a 403 and recorded in the audit log
+- **A custom Dockerfile that does `FROM lazy-runner` no longer fails with "pull access denied"** — lazy builds the missing base image first and says so, and names `lazy system build lazy-runner` when it cannot
+- **`lazy accept` and `lazy ask` no longer hang for half an hour when the agent's run dies** — they notice within seconds, report the exit code and last output, and leave the task where it was
+- **`lazy accept` never merges on a pre-accept turn that validated nothing** — if another turn takes over the task mid-validation, the accept stops instead of treating the missing result as a pass
+- **`lazy ask`** — a second ask on a task that is already answering one is refused instead of racing it
+- **`lazy sync` no longer says "Already up to date" while `lazy accept` reports conflicts** — sync merges the ref accept actually merges into, and warns when the local and remote parent branch differ
+
 ## [0.22.1134] - 2026-08-24 - Hotfix for long running Docker builds
 
 ### Fixed

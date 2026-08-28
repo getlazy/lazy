@@ -21,6 +21,7 @@ import { theme } from '../theme';
 import { parentTaskIdOf } from '../../task-target';
 import { formatMarkdown } from '../../utils/markdown';
 import { initTracing, shutdownTracing, withSpan, currentTraceparent } from '../../tracing';
+import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
 
 
 export async function commandStart(args: string[]): Promise<void> {
@@ -197,6 +198,10 @@ export async function commandStart(args: string[]): Promise<void> {
           process.exit(0);
         }
       }
+
+      // CLI TTY only (skipped for --yes / non-TTY): offer to pin this cwd's
+      // worktree Dockerfile on the task before the daemon launches.
+      await maybeOfferWorktreeImageForTask(root, storage, t.id, { skipPrompt: yes });
     } finally {
       await storage.close();
     }

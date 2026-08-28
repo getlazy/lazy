@@ -118,3 +118,36 @@ wall-clock time sees that, which is why freshness is time-based and the tag
 None of this can leave you running an old *lazy*. The image contains no lazy
 code: `lazy-agent` is bind-mounted into the container at launch, so it is
 current the moment lazy is.
+
+## The base image a custom Dockerfile builds FROM
+
+If your project supplies its own Dockerfile and it starts with
+`FROM lazy-runner`, that base image is one lazy builds on your machine — it
+exists on no registry. On a machine where it has never been built, or where
+`docker system prune` removed it, Docker would treat the name as a Docker Hub
+repository and fail with `pull access denied, repository does not exist`.
+
+Lazy avoids that: before building your custom image it checks for the base and,
+if it is missing, builds it first, saying so —
+
+```
+Base image lazy-runner:latest not found — building it first, because
+/path/to/Dockerfile.lazy builds FROM it (this can take several minutes).
+```
+
+This happens **only when the base is missing**. It is not a fourth freshness
+trigger: an existing base image is left exactly as it is, and the three triggers
+in the table above are what keep it current.
+
+Two `FROM` spellings lazy will not build for you, because a base build would not
+produce the reference you asked for — a base build writes only the current
+`major.minor` tag and the `:latest` alias:
+
+- a base pinned to another tag, e.g. `FROM lazy-runner:0.19`
+- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. These are lazy's own
+  per-agent images (the default Dockerfile plus that agent's install line) and
+  are not a supported `FROM` target — build on `lazy-runner` and add the agent's
+  install line yourself.
+
+In both cases lazy still names the remedy rather than leaving you with the
+registry error: run `lazy system build lazy-runner` and retry.

@@ -139,6 +139,18 @@ export function closeEventFromRecord(record: ProxyAuditRecord): ProxyActivityClo
 export const CREDENTIAL_REFUSED_PREFIX = 'credential refused';
 
 /**
+ * The prefix the proxy puts on a refused-PATH audit error (403), as distinct
+ * from a refused credential (401).
+ *
+ * Deliberately a different string: the two refusals have different remedies. A
+ * credential refusal means the launch outlived its grant; a path refusal means an
+ * agent tried to reach something outside the model API surface
+ * (src/proxy/path-allowlist.ts), which is a security event worth being able to
+ * grep for on its own.
+ */
+export const PATH_REFUSED_PREFIX = 'path refused';
+
+/**
  * The path as a watcher should see it: query string removed.
  *
  * A query string is caller-controlled and carries no signal for "the agent is

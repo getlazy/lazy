@@ -94,6 +94,13 @@ export interface Runner {
      * task id, as before).
      */
     taskId?: string,
+    /**
+     * Task-pinned container image (metadata.custom_image). When set, the docker
+     * runner uses it and fails loud if missing — never falls back to root.
+     * Host-process runners ignore it. Optional; Part 2 may thread daemon
+     * adoption through a related seam.
+     */
+    pinnedImage?: string,
   ): Promise<void>;
 
   /**

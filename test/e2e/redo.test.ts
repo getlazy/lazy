@@ -1,7 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError, extractTaskId } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, writeTaskJson } from '../helpers/storage';
 
 describe('lazy redo', () => {
   let ctx: TestContext;
@@ -165,6 +166,32 @@ describe('lazy redo', () => {
     const newShow = await ctx.lazy(['show', newTaskId]);
     expectSuccess(newShow);
     expectOutput(newShow, 'fix-auth-redo-1');
+  });
+
+  // INVARIANT: redo is a fresh start — do NOT inherit the old image pin.
+  test('redo does not inherit custom_image metadata; warns when old task was pinned', async () => {
+    const { IMAGE_TAG } = await import('../../src/capture/image-tag');
+    const taskId = await createTask(ctx, 'Pinned redo source', 'Prompt');
+    const imageRef = `lazy-custom-redoinherit:${IMAGE_TAG}`;
+    const hash = 'd'.repeat(64);
+
+    const data = readTaskJson(ctx.root, taskId);
+    data.metadata = {
+      ...(data.metadata ?? {}),
+      custom_image: imageRef,
+      custom_image_hash: hash,
+    };
+    writeTaskJson(ctx.root, taskId, data);
+
+    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    expectSuccess(result);
+    expectOutput(result, `custom container image pin (${imageRef})`);
+    expectOutputExcludes(result, 'inherited from previous attempt');
+
+    const newTaskId = extractNewTaskId(result.stdout);
+    const redone = readTaskJson(ctx.root, newTaskId);
+    expect(redone.metadata?.custom_image).toBeUndefined();
+    expect(redone.metadata?.custom_image_hash).toBeUndefined();
   });
 });
 

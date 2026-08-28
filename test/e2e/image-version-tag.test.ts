@@ -22,9 +22,10 @@
  * One test per trigger below, plus the boundary of (2).
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp } from 'fs/promises';
 import { createHash } from 'crypto';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
@@ -38,11 +39,14 @@ import {
   IMAGE_TAG,
   IMAGE_MAX_AGE_DAYS,
   IMAGE_MAX_AGE_MS,
+  enableUpgradeImageBuild,
+  resetUpgradeImageBuild,
 } from '../../src/capture/claude';
 import { imageTagFor } from '../../src/capture/image-tag';
 import { startBackgroundImageBuild } from '../../src/upgrade/background-image-build';
 import { checkStaleLazyImages } from '../../src/cli/commands/doctor';
 import { VERSION } from '../../src/version';
+import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 
 enableInProcessTestMode();
 
@@ -57,8 +61,14 @@ describe('runner image identity and freshness', () => {
   let ctx: TestContext;
   let docker: FakeDocker;
   let originalCwd: string;
+  let undoDaemonBase: (() => void) | undefined;
 
   beforeEach(async () => {
+    // Adoption soft-pin / path-resolve tests write adopted-image.json under
+    // the daemon base — pin it so we never touch the developer's ~/.lazy.
+    const daemonBase = await mkdtemp(join(tmpdir(), 'lazy-img-daemon-'));
+    undoDaemonBase = pinDaemonBaseDir(daemonBase);
+
     ctx = await setupTestLazy();
     docker = await installFakeDocker(ctx.root);
 
@@ -70,7 +80,14 @@ describe('runner image identity and freshness', () => {
 
   afterEach(async () => {
     process.chdir(originalCwd);
+    // The upgrade-build latch is process-wide, and every test file shares one
+    // process — a leaked latch would silently re-enable path resolution for
+    // later suites.
+    resetUpgradeImageBuild();
     await ctx.cleanup();
+    // Unpin AFTER cleanup — same rule as other daemon-base pins.
+    undoDaemonBase?.();
+    undoDaemonBase = undefined;
   });
 
   // --- identity -----------------------------------------------------------
@@ -299,9 +316,9 @@ describe('runner image identity and freshness', () => {
   // `docker run` and refuses the launch with the exact RUN line to add —
   // instead of the crash loop the engineer hit on this repo's Dockerfile.lazy.
 
-  async function useCustomDockerfile(): Promise<void> {
+  async function useCustomDockerfile(content: string = 'FROM debian:bookworm-slim\n'): Promise<void> {
     const dockerfilePath = join(ctx.root, 'Dockerfile.custom');
-    await writeFile(dockerfilePath, 'FROM debian:bookworm-slim\n');
+    await writeFile(dockerfilePath, content);
     const configPath = join(ctx.root, 'lazy.toml');
     const toml = await readFile(configPath, 'utf-8');
     const updated = toml.replace('dockerfile = ""', 'dockerfile = "Dockerfile.custom"');
@@ -357,15 +374,17 @@ describe('runner image identity and freshness', () => {
     expect(dockerfile).toContain('claude.ai/install.sh');
   });
 
-  // --- Dockerfile resolution: root-joined, LAZY_DOCKERFILE_LAZY override ---
+  // --- Dockerfile resolution: root-joined; worktree never auto-governs ---
   //
-  // INVARIANT: a TASK's worktree never governs the container image. Task
-  // branches are agent-writable, and deriving the image from one would let an
-  // agent's Dockerfile.lazy edits execute as build steps under the daemon's
-  // docker on the HOST. The custom Dockerfile path always joins to the
-  // PROJECT ROOT; the only override is the explicit LAZY_DOCKERFILE_LAZY env
-  // var (LAZY_CONFIG family — dev/e2e use), which reaches the daemon by
-  // ordinary env inheritance.
+  // INVARIANT: a TASK's worktree never governs the container image without
+  // human TTY consent. Task branches are agent-writable, and deriving the
+  // image from one would let an agent's Dockerfile.lazy edits execute as
+  // build steps under the daemon's docker on the HOST. The custom Dockerfile
+  // path always joins to the PROJECT ROOT. Human-consented paths:
+  //   - Part 1: per-task pin via create/start/edit TTY (ensureImage pinnedImage)
+  //   - Part 2: upgrade adoption soft-pin (unit-tested in adopted-image.test.ts);
+  //     upgrade builds flip enableUpgradeImageBuild() so resolveCustomDockerfile
+  //     may return the adopted path for the rebuild itself.
 
   async function setupWorktreeWithOwnDockerfile(): Promise<{ wt: string; wtContent: string; rootContent: string }> {
     // The root project uses a custom Dockerfile...
@@ -407,40 +426,131 @@ describe('runner image identity and freshness', () => {
       expect(used).toBe(rootRef);
       const builds = await docker.builds();
       expect(builds.length).toBe(1);
-      expect(builds[0]).toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
+      // Build reads a temp copy of the ROOT Dockerfile (hash/build TOCTOU),
+      // never the live root path and never the worktree's differing copy.
+      expect(builds[0]).toMatch(/-f \S*lazy-docker-build-\S+\/Dockerfile/);
       expect(builds[0]).not.toContain(join(wt, 'Dockerfile.custom'));
+      expect(builds[0]).not.toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
     } finally {
       process.chdir(ctx.root);
     }
   });
 
-  test('LAZY_DOCKERFILE_LAZY overrides the Dockerfile for the whole chain', async () => {
-    const { wt, wtContent } = await setupWorktreeWithOwnDockerfile();
+  // INVARIANT: without the upgrade-build latch, ensureImage soft-pins an
+  // adopted imageName and never rebuilds from the worktree path — even when
+  // the latch is later flipped for an upgrade rebuild of that same adoption.
+  test('upgrade-build latch lets resolveCustomDockerfile see an adopted path; launches do not', async () => {
+    const { wt, wtContent, rootContent } = await setupWorktreeWithOwnDockerfile();
+    const wtDockerfile = join(wt, 'Dockerfile.custom');
+    const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+    const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
+    const imageName = `lazy-custom-${shortHashOf(wtContent)}:${IMAGE_TAG}`;
+    await writeAdoptedImage(ctx.root, {
+      dockerfilePath: wtDockerfile,
+      contentHash: hashDockerfileContent(wtContent),
+      imageName,
+    }, { content: wtContent });
+    await docker.seedImage(imageName, { dockerfileHash: 'consented' });
 
-    // Read at call time (not module load), so setting it here is safe; always
-    // restored in finally per the env-leakage rules.
-    const prev = process.env.LAZY_DOCKERFILE_LAZY;
-    process.env.LAZY_DOCKERFILE_LAZY = join(wt, 'Dockerfile.custom');
-    try {
-      const used = await ensureImage(docker.binPath);
-      expect(used).toBe(`lazy-custom-${shortHashOf(wtContent)}:${IMAGE_TAG}`);
-      const builds = await docker.builds();
-      expect(builds.length).toBe(1);
-      expect(builds[0]).toContain(`-f ${join(wt, 'Dockerfile.custom')}`);
-    } finally {
-      if (prev === undefined) delete process.env.LAZY_DOCKERFILE_LAZY;
-      else process.env.LAZY_DOCKERFILE_LAZY = prev;
-    }
+    // Launch path (latch off): soft-pin the consented image — do not rebuild
+    // from the worktree file.
+    resetUpgradeImageBuild();
+    const launched = await ensureImage(docker.binPath);
+    expect(launched).toBe(imageName);
+    expect(await docker.builds()).toHaveLength(0);
+
+    // Upgrade path (latch on): resolve the consented SNAPSHOT (not the live
+    // worktree path) for the rebuild itself.
+    enableUpgradeImageBuild();
+    const { resolveCustomDockerfile } = await import('../../src/capture/claude');
+    const snapshotPath = getAdoptedDockerfilePath(ctx.root);
+    expect(await resolveCustomDockerfile(ctx.root)).toBe(snapshotPath);
+    expect(await resolveCustomDockerfile(ctx.root)).not.toBe(wtDockerfile);
+    // Soft-pin is skipped; ensureImage builds from consented bytes (snapshot
+    // copied to a unique temp for the docker -f arg — never the worktree).
+    const rebuilt = await ensureImage(docker.binPath);
+    expect(rebuilt).toBe(imageName);
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).not.toContain(`-f ${wtDockerfile}`);
+    // Root Dockerfile was never the source of this rebuild.
+    expect(builds[0]).not.toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
+    expect(rootContent).not.toBe(wtContent); // sanity: they differ
   });
 
-  test('LAZY_DOCKERFILE_LAZY pointing at a missing file fails hard, naming the var', async () => {
-    const prev = process.env.LAZY_DOCKERFILE_LAZY;
-    process.env.LAZY_DOCKERFILE_LAZY = join(ctx.root, 'no-such-dockerfile');
-    try {
-      await expect(resolveImageName(ctx.root)).rejects.toThrow(/LAZY_DOCKERFILE_LAZY/);
-    } finally {
-      if (prev === undefined) delete process.env.LAZY_DOCKERFILE_LAZY;
-      else process.env.LAZY_DOCKERFILE_LAZY = prev;
-    }
+  // --- the lazy-runner base a custom Dockerfile builds FROM ----------------
+  //
+  // `lazy-runner` lives on no registry. A custom Dockerfile that does
+  // `FROM lazy-runner` on a machine where the base was never built (fresh
+  // install, `docker system prune`) made docker try Docker Hub and fail with
+  // "pull access denied, repository does not exist" — a message that points at
+  // nothing. The version tag makes this reachable on any minor bump: it forces a
+  // custom-image rebuild, and the rebuild then has nothing to layer on.
+
+  test('a missing lazy-runner base is built BEFORE the custom image that FROMs it', async () => {
+    const content = 'FROM lazy-runner\nRUN echo hi\n';
+    await useCustomDockerfile(content);
+
+    const used = await ensureImage(docker.binPath);
+    expect(used).toBe(`lazy-custom-${shortHashOf(content)}:${IMAGE_TAG}`);
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(2);
+    // Order matters — the base must exist before the custom build runs.
+    expect(builds[0]).toContain(`-t ${IMAGE_REF}`);
+    // ...including the `:latest` alias, which is what untagged FROM resolves through.
+    expect(builds[0]).toContain('-t lazy-runner:latest');
+    expect(builds[1]).toContain(`-t lazy-custom-${shortHashOf(content)}:${IMAGE_TAG}`);
+    // Custom build uses a temp copy of the Dockerfile (hash/build TOCTOU),
+    // not the live project-root path.
+    expect(builds[1]).toMatch(/-f \S*lazy-docker-build-\S+\/Dockerfile/);
+    expect(builds[1]).not.toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
+  });
+
+  // ONLY-WHEN-MISSING: this is not a second freshness mechanism. ensureImage's
+  // own triggers (upgrade / age / hash) govern how fresh the base stays; adding
+  // a rebuild here would bolt a multi-minute build onto every custom build.
+  test('an existing base image is left alone — no rebuild, no second mechanism', async () => {
+    await useCustomDockerfile('FROM lazy-runner\n');
+    await docker.seedImage('lazy-runner:latest', { id: 'sha256:base' });
+
+    await ensureImage(docker.binPath);
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).toContain('lazy-custom-');
+  });
+
+  test('a custom Dockerfile with no lazy base never triggers a base build', async () => {
+    await useCustomDockerfile('FROM debian:bookworm-slim\n');
+
+    await ensureImage(docker.binPath);
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).not.toContain(`-t ${IMAGE_REF}`);
+  });
+
+  // When lazy cannot supply the base itself, the human must be told the remedy —
+  // a raw registry error for an image that lives on no registry is a dead end.
+  test('a failing base build names `lazy system build lazy-runner` as the remedy', async () => {
+    await useCustomDockerfile('FROM lazy-runner\n');
+    await docker.failBuilds();
+
+    await expect(ensureImage(docker.binPath)).rejects.toThrow(/lazy system build lazy-runner/);
+  });
+
+  // A base pinned to a tag no base build writes (and, on the same rule, an
+  // agent-suffixed `lazy-runner-cursor`) cannot be auto-built: building would
+  // not produce the ref the Dockerfile asked for. It still gets the remedy.
+  test('a base pinned to an unwritable tag is not built, but the failure explains itself', async () => {
+    await useCustomDockerfile('FROM lazy-runner:0.1\n');
+    await docker.failBuilds();
+
+    await expect(ensureImage(docker.binPath)).rejects.toThrow(/lazy-runner:0\.1[\s\S]*lazy system build lazy-runner/);
+    // No base build was attempted — only the custom one, which failed.
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).toContain('lazy-custom-');
   });
 });

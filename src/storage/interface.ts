@@ -24,6 +24,8 @@ import type {
   SessionOutcome,
   TurnRole,
   TurnType,
+  InFlightTurn,
+  InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
   TaskTreeNode,
@@ -410,9 +412,49 @@ export interface Storage {
   getSessionTurns(sessionId: string): Promise<Turn[]>;
 
   /**
-   * Get the next turn sequence number for a session
+   * Get the next turn sequence number for a session.
+   *
+   * Accounts for sequences handed out by {@link reserveTurnSequences} as well
+   * as the turns that already exist, so a reserved slot is never re-used by an
+   * unrelated writer.
    */
   getNextTurnSequence(sessionId: string): Promise<number>;
+
+  /**
+   * Reserve `count` consecutive turn sequences and return the FIRST of them.
+   *
+   * `getNextTurnSequence` allocates from what exists; it does not reserve. A
+   * caller that has to recognize its own answer later ("the agent turn at
+   * sequence N is mine") needs the numbers held, not merely observed — see
+   * {@link Session.reserved_turn_sequence}.
+   */
+  reserveTurnSequences(sessionId: string, count: number): Promise<number>;
+
+  // --- In-flight turns ---
+
+  /**
+   * Claim the task's in-flight turn slot. Returns false when a LIVE (unexpired)
+   * record is already there — the claim is a compare-and-set, so two waiters
+   * can never both believe they own the channel.
+   *
+   * An expired record is overwritten: an in-flight turn is bounded by its
+   * deadline, never by the liveness of whoever started it.
+   */
+  beginInFlightTurn(taskId: string, turn: InFlightTurn): Promise<boolean>;
+
+  /**
+   * Record how the in-flight turn at `turnSequence` ended. Returns false when
+   * no record with that sequence is present, so a settler that raced a clear
+   * (or a stale settler) writes nothing.
+   */
+  settleInFlightTurn(taskId: string, turnSequence: number, outcome: InFlightTurnOutcome): Promise<boolean>;
+
+  /**
+   * Clear the task's in-flight turn record. When `turnSequence` is given, only
+   * a record with that sequence is cleared — a waiter must never clear a record
+   * belonging to a later turn.
+   */
+  clearInFlightTurn(taskId: string, turnSequence?: number): Promise<void>;
 
   /**
    * Get the number of turns for a task (without loading full turn content)

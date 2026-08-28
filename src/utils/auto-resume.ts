@@ -17,6 +17,7 @@ import { loadConfig } from '../config/loader';
 import { resolveAgentModel } from '../agent/agent-model';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
+import { pinnedCustomImage } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
@@ -27,6 +28,7 @@ import { parentTaskIdOf } from '../task-target';
 import { writeDaemonMcpConfig } from '../daemon/task-launcher';
 import { hasDaemonContext } from '../daemon/context';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from './feedback-redelivery';
+import { isTurnInFlight } from '../daemon/in-flight-turn';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsResumeText from '../prompts/system-instructions-resume.md' with { type: 'text' };
@@ -131,6 +133,18 @@ export async function autoResumeTask(
   const tRef = taskRef(task);
   const taskShortId = task.id.substring(0, 8);
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
+
+  // INVARIANT: never write a command into a protocol dir a synchronous daemon
+  // turn (`ask` / `pre_accept`) is waiting on. The protocol has no
+  // command↔response correlation id, so a command written here displaces the
+  // running turn's response (writeCommand renames it aside) and the waiter then
+  // consumes THIS command's answer instead — for pre-accept, a response with no
+  // gate result at all. Both lanes (fast and slow) funnel through here, so this
+  // is the one place that has to say it.
+  if (await isTurnInFlight(storage, task.id)) {
+    logger.debug(`Auto-resume ${taskShortId}: a synchronous daemon turn is in flight for this task, skipping`);
+    return false;
+  }
 
   // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
   // never auto-resume a task that still owes a reviewer an approve/revert
@@ -313,7 +327,7 @@ export async function autoResumeTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, pinnedCustomImage(task));
       } catch (err) {
         logger.warn(`Auto-resume ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         await storage.updateTaskStatus(task.id, 'interrupted', 'system');

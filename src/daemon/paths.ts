@@ -51,6 +51,20 @@ export const MCP_CONFIG_DIR = 'mcp';
 export const DAEMON_LOCK_FILE = 'daemon.lock';
 /** Records the canonical project root the daemon serves (see getRootPath). */
 export const ROOT_FILE = 'root';
+/**
+ * Worktree Dockerfile adoption written by `lazy upgrade` (Part 2 of the
+ * worktree-image flow). Daemon runtime state — not env, not lazy.toml.
+ * See src/daemon/adopted-image.ts.
+ */
+export const ADOPTED_IMAGE_FILE = 'adopted-image.json';
+/**
+ * Snapshot of the Dockerfile bytes consented at adoption time. Upgrade builds
+ * read THIS file (outside any worktree), never the live worktree path — closes
+ * the hash-then-rebuild TOCTOU where an agent edit between hash and
+ * `docker build` would produce a mis-tagged image. Drift checks still compare
+ * the live worktree path recorded in adopted-image.json.
+ */
+export const ADOPTED_DOCKERFILE_FILE = 'adopted-Dockerfile';
 
 /**
  * Derive a human-readable, collision-resistant slug from a project root.
@@ -155,4 +169,26 @@ export function getDaemonLockPath(projectRoot: string): string {
  *  Cleared before each spawn. */
 export function getStartupErrorPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), 'startup-error');
+}
+
+/**
+ * Adopted worktree image: ~/.lazy/daemon/<slug>/adopted-image.json
+ *
+ * Written by `lazy upgrade` when the human consents to run the daemon and all
+ * non-pinned launches on a worktree's Dockerfile until the next upgrade
+ * rebuild. See src/daemon/adopted-image.ts.
+ */
+export function getAdoptedImagePath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), ADOPTED_IMAGE_FILE);
+}
+
+/**
+ * Consented Dockerfile bytes for the upgrade build:
+ * ~/.lazy/daemon/<slug>/adopted-Dockerfile
+ *
+ * Written alongside adopted-image.json. Outside every task worktree so a
+ * post-consent agent edit cannot change what `docker build` reads.
+ */
+export function getAdoptedDockerfilePath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), ADOPTED_DOCKERFILE_FILE);
 }

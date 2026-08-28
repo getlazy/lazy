@@ -29,6 +29,8 @@ import type {
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
+  InFlightTurn,
+  InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
   TaskTreeNode,
@@ -273,6 +275,22 @@ export class RemoteStorage implements Storage {
 
   async getNextTurnSequence(sessionId: string): Promise<number> {
     return this.call<number>('getNextTurnSequence', { sessionId });
+  }
+
+  async reserveTurnSequences(sessionId: string, count: number): Promise<number> {
+    return this.call<number>('reserveTurnSequences', { sessionId, count });
+  }
+
+  async beginInFlightTurn(taskId: string, turn: InFlightTurn): Promise<boolean> {
+    return this.call<boolean>('beginInFlightTurn', { taskId, turn });
+  }
+
+  async settleInFlightTurn(taskId: string, turnSequence: number, outcome: InFlightTurnOutcome): Promise<boolean> {
+    return this.call<boolean>('settleInFlightTurn', { taskId, turnSequence, outcome });
+  }
+
+  async clearInFlightTurn(taskId: string, turnSequence?: number): Promise<void> {
+    return this.call<void>('clearInFlightTurn', { taskId, turnSequence });
   }
 
   async getTurnCountByTaskId(taskId: string): Promise<number> {

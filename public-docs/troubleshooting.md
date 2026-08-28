@@ -610,6 +610,39 @@ container — check who owns the path (`ls -ld <worktree>`). It should be the sa
 user that runs lazy and its daemon; a worktree owned by `root` usually means some
 command was run under `sudo` that should not have been.
 
+## `lazy sync` warns that the local and remote parent branch differ
+
+When a subtask syncs, lazy merges its parent branch in. If your project has a
+remote, that branch can exist in two places at once — locally, and as
+`origin/<branch>` — and they do not always agree. When they do not, sync says so:
+
+```
+Local `lazy/parent-task` and `origin/lazy/parent-task` differ: 2 commit(s) only
+local, 0 only on the remote. Used `lazy/parent-task` — `lazy/parent-task` is
+unprotected, so `lazy accept` merges into the LOCAL branch.
+```
+
+This is information, not an error: the sync succeeded. Lazy always merges from
+the ref `lazy accept` will actually merge into, so the two commands agree about
+what your task is built on.
+
+Which ref that is depends on the parent branch:
+
+- **A parent task's branch, or any other unprotected branch** — accept merges it
+  locally, so sync uses the local branch. A parent task's own commits live only
+  on your machine: agents cannot push, by design.
+- **A protected branch such as `main`** — accept merges on the forge, so sync
+  uses `origin/<branch>`. Any local commits on that branch are not part of the
+  merge until they are pushed, and the warning says so.
+
+**Sync never pushes a parent branch.** If a branch of your own is ahead of the
+remote and you want the remote to carry those commits, push it yourself —
+the warning names the exact command. Lazy leaves it alone because you may be
+part-way through work on that branch.
+
+If you see this warning and the outcome still surprises you, `lazy diff <task>`
+shows what the task is actually built on.
+
 ## Documentation links
 
 Messages like *"Check documentation at https://docs.getlazy.dev/…"* point at

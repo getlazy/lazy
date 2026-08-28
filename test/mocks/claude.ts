@@ -45,9 +45,32 @@ export function checkDocker(): void {
   // No-op in tests
 }
 
-export async function ensureImage(): Promise<string> {
-  // No-op in tests, return the default version-tagged image ref
+export async function ensureImage(
+  _binary?: string,
+  options?: { pinnedImage?: string },
+): Promise<string> {
+  // Honor a task pin when present so e2e paths that thread metadata still see
+  // the pinned ref (fail-loud for a missing pin is covered by unit tests
+  // against the real ensureImage + fake docker).
+  if (options?.pinnedImage) return options.pinnedImage;
   return MOCK_IMAGE_REF;
+}
+
+export async function localImageExists(_ref: string, _binary?: string): Promise<boolean> {
+  // E2e mock: treat every ref as present so CLI "already pinned" skips do not
+  // re-offer. Missing-image fail-loud is unit-tested against real ensureImage.
+  return true;
+}
+
+export async function buildImageFromDockerfilePath(
+  _lazyRoot: string,
+  _dockerfilePath: string,
+  _options?: { binary?: string },
+): Promise<{ imageName: string; contentHash: string }> {
+  return {
+    imageName: `lazy-custom-testhash12:${IMAGE_TAG}`,
+    contentHash: 'a'.repeat(64),
+  };
 }
 
 /**
@@ -74,21 +97,53 @@ export function resolveImageName(_lazyRoot: string): string {
 }
 
 /**
- * Mirrors the real resolution via the REAL loader (which the preload does not
- * alias), so `lazy upgrade`'s image-source announcement prints truthful paths
- * in mocked e2e runs instead of a canned stub: LAZY_DOCKERFILE_LAZY override
- * first, else [docker].dockerfile joined to the project root.
+ * Mirrors the real module's upgrade-build latch: off unless the command under
+ * test is `lazy upgrade`. Soft-pin vs path-resolve for daemon adoption depends
+ * on this; without the export, upgrade e2e would die with "not a function".
+ */
+let upgradeImageBuildEnabled = false;
+
+export function enableUpgradeImageBuild(): void {
+  upgradeImageBuildEnabled = true;
+}
+
+export function resetUpgradeImageBuild(): void {
+  upgradeImageBuildEnabled = false;
+}
+
+export function isUpgradeImageBuild(): boolean {
+  return upgradeImageBuildEnabled;
+}
+
+/**
+ * Mirrors the real resolution: a valid daemon-adopted worktree Dockerfile ONLY
+ * while the upgrade-build latch is on, else [docker].dockerfile. Routine
+ * launches soft-pin adoption in ensureImage and must not resolve the worktree
+ * path here.
  */
 export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
-  const override = process.env.LAZY_DOCKERFILE_LAZY;
-  if (override) {
-    const { isAbsolute } = await import('path');
-    return isAbsolute(override) ? override : join(lazyRoot, override);
+  if (upgradeImageBuildEnabled) {
+    const { resolveAdoptedDockerfileSnapshot } = await import('../../src/daemon/adopted-image');
+    const snapshot = await resolveAdoptedDockerfileSnapshot(lazyRoot);
+    if (snapshot) return snapshot;
   }
   const { loadConfig } = await import('../../src/config/loader');
   const config = await loadConfig(lazyRoot);
   if (!config.docker.dockerfile) return null;
   return join(lazyRoot, config.docker.dockerfile);
+}
+
+export async function isAdoptedDockerfile(
+  lazyRoot: string,
+  dockerfilePath: string | null,
+): Promise<boolean> {
+  if (!dockerfilePath) return false;
+  if (!upgradeImageBuildEnabled) return false;
+  const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
+  const { loadValidAdoptedImage } = await import('../../src/daemon/adopted-image');
+  const adopted = await loadValidAdoptedImage(lazyRoot);
+  if (!adopted) return false;
+  return dockerfilePath === getAdoptedDockerfilePath(lazyRoot);
 }
 
 export function resolveImageRepository(_lazyRoot: string): { repository: string; isCustom: boolean } {
@@ -526,6 +581,16 @@ async function handleMockPreAccept(
   const { join } = await import('path');
   const { truncateLog } = await import('../../src/utils/log-truncate');
 
+  // LAZY_MOCK_PRE_ACCEPT_SUPERVISOR_DIES: return without writing anything at
+  // all — the supervisor that vanished before answering (crash at startup, a
+  // broken image, an OOM kill, or a run that was never really there because a
+  // stale `isRunning` said one was up). Combined with this mock's
+  // `isContainerRunning` — which always reports false — this is the state that
+  // used to leave `lazy accept` polling for the full ~35-minute pre-accept
+  // budget with nothing running. Scoped to pre-accept so `lazy start` in the
+  // same suite still produces a normal turn.
+  if (process.env.LAZY_MOCK_PRE_ACCEPT_SUPERVISOR_DIES) return;
+
   // Mock agent "work" (fixes / CHANGELOG / post-mortem) — commit if configured.
   await maybeCommit(sandbox.worktreePath, 'pre-accept');
 
@@ -570,7 +635,13 @@ async function handleMockPreAccept(
     usage: mockResp.usage,
     start_sha_work: preTurnSha,
     end_sha_work: postWorkSha,
-    pre_accept: preAccept,
+    // LAZY_MOCK_PRE_ACCEPT_FOREIGN_RESPONSE: write a completed response with NO
+    // gate block — what the pre-accept wait actually finds when another command
+    // (an auto-resume's `unblock`, an auto-delivered comment, a manual turn)
+    // took over the protocol channel mid-wait and its ordinary work response
+    // landed in response.json. The real supervisor never emits this shape for a
+    // pre-accept command; the point is that the DAEMON must not merge on it.
+    ...(process.env.LAZY_MOCK_PRE_ACCEPT_FOREIGN_RESPONSE ? {} : { pre_accept: preAccept }),
     ...launchSettingsFromCommand(cmd),
   };
   writeFileSync(join(protocolDir, 'response.json'), JSON.stringify(response, null, 2));

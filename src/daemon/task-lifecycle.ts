@@ -27,8 +27,17 @@ import { resolveAgentModel } from '../agent/agent-model';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
+import type { Runner } from '../runner/types';
 import { stampSessionRunner } from '../runner/session-launch';
-import { createDriver, LocalDriver, type MergeResult } from '../remote';
+import { pinnedCustomImage } from '../docker/worktree-image';
+import {
+  createDriver,
+  LocalDriver,
+  isIntermediateBranch,
+  mergeLandsLocally,
+  resolveUpstreamMergeRef,
+  type MergeResult,
+} from '../remote';
 import {
   PhaseReporter,
   ACCEPT_PHASES,
@@ -49,7 +58,7 @@ import { renderPreAcceptPrompt } from '../supervisor/pre-accept';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, waitForResponse, consumeResponse, clearStatus, completedResponses } from '../protocol';
+import { protocolDir as getProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../cli/helpers';
 import { buildNotesContext, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, getNewNotesSince, runSyncWithRemote, cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../cli/commands/shared';
 import { buildAgentSwitchHandoffContext } from '../agent/switch-handoff';
@@ -78,17 +87,19 @@ import { revokeTaskMcpTokens } from './mcp-tokens';
 import { revokeTaskCredentialGrants } from '../proxy/credential-broker';
 import { setupSandbox } from '../utils/sandbox';
 import { hasDaemonContext } from './context';
+import { withSettleLock } from './in-flight-turn';
 import { runGit } from '../utils/git';
 import { validateBranchInSyncWithRemote } from '../utils/git';
 import { latestViolationTurn, pendingViolations, findStickyModel, launchSettingsFromResponse } from '../utils/turns';
 import { parkTaskPaused } from '../utils/paused-status';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../utils/feedback-redelivery';
 import { isOfflineMode } from '../utils/offline';
+import { waitForSupervisorAnswer, type SupervisorAnswerOutcome } from './supervisor-wait';
 import { readdir, readFile } from 'fs/promises';
 
 import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, PreAcceptCommand, CompletedResponse, ErrorResponse } from '../protocol';
 import { PROTOCOL_VERSION } from '../protocol/types';
-import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor } from '../types';
+import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor, InFlightTurn, InFlightTurnOutcome, InFlightTurnOwner, TurnType } from '../types';
 import { toTurnUsage, rollUpSessionUsage } from '../utils/usage-recording';
 import type { Storage } from '../storage';
 import { sanitizeUserText } from '../utils/sanitize-text';
@@ -898,7 +909,7 @@ export async function launchUnblockTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(task));
       } catch (err) {
         await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
@@ -961,6 +972,271 @@ export interface AskTaskResult {
     wait_ms: number;
     agent_ms?: number;
   };
+}
+
+// =====================================================================
+// Synchronous turns: claim, settle, wait
+// =====================================================================
+//
+// `ask` and `pre_accept` are the only two turns the daemon runs SYNCHRONOUSLY
+// — an RPC caller is blocked waiting for a value, so the answer has a
+// designated reader. Everything else is flushed fire-and-forget by the
+// reconciler. The three helpers below are that mechanism end to end:
+//
+//   claimSyncTurn   — reserve the two turn sequences the exchange will occupy
+//                     and record an InFlightTurn on the task, BEFORE the
+//                     command is written, so no other writer can move the task
+//                     underneath the turn.
+//   settleInFlightTurnFromProtocol — consume `response.json`, record the turn
+//                     at the RESERVED sequence, and write the outcome onto the
+//                     record. Called by the reconciler (the single reader of
+//                     `response.json`), and by the waiter itself when there is
+//                     no reconcile loop — see awaitInFlightOutcome.
+//   awaitInFlightOutcome — the liveness-aware wait, polling STORAGE for the
+//                     outcome instead of the protocol dir.
+
+/**
+ * Slack between a synchronous wait's own budget and the deadline stamped on its
+ * in-flight record. The record must outlive the wait: expiring first would let
+ * the reconciler treat a turn that is still legitimately running as debris.
+ */
+const IN_FLIGHT_CLAIM_MARGIN_MS = 2 * 60 * 1000;
+
+interface SyncTurnClaim {
+  /** Reserved sequence for the human/marker turn that opens the exchange. */
+  humanSeq: number;
+  /** Reserved sequence the agent's answer must occupy. */
+  agentSeq: number;
+  record: InFlightTurn;
+}
+
+/**
+ * Reserve this exchange's turn sequences and claim the task's protocol slot.
+ *
+ * WHY RESERVE. `getNextTurnSequence` allocates at WRITE time — it reports the
+ * next free sequence, it does not hold one. "My answer will be turn N+1" was
+ * therefore identity by convention: any turn written in between took the
+ * number, and the correlation silently pointed at someone else's turn.
+ * `reserveTurnSequences` hands out a range and records it on the session, so
+ * the answer's sequence is fixed before the command is even written.
+ *
+ * An aborted turn leaves its reserved agent sequence unused — a hole in the
+ * numbering. That is deliberate: the sequence was promised to an answer that
+ * may still arrive late, and reusing it would let that late answer be mistaken
+ * for the next turn.
+ */
+async function claimSyncTurn(
+  storage: Storage,
+  task: Task,
+  session: Session,
+  opts: {
+    owner: InFlightTurnOwner;
+    turnType: TurnType;
+    restoreStatus: TaskStatus;
+    timeoutMs: number;
+  },
+): Promise<SyncTurnClaim> {
+  const first = await storage.reserveTurnSequences(session.id, 2);
+  const now = Date.now();
+  const record: InFlightTurn = {
+    session_id: session.id,
+    owner: opts.owner,
+    turn_type: opts.turnType,
+    turn_sequence: first + 1,
+    human_turn_sequence: first,
+    restore_status: opts.restoreStatus,
+    started_at: now,
+    expires_at: now + opts.timeoutMs + IN_FLIGHT_CLAIM_MARGIN_MS,
+  };
+  const claimed = await storage.beginInFlightTurn(task.id, record);
+  if (!claimed) {
+    const current = await storage.getTask(task.id);
+    const held = current?.in_flight_turn;
+    throw new RpcError(409,
+      `Task ${displayId(task)} already has a synchronous turn in flight` +
+      `${held ? ` (${held.owner})` : ''} — wait for it to finish, then retry.`,
+    );
+  }
+  return { humanSeq: first, agentSeq: first + 1, record };
+}
+
+/** What a settle attempt did, for the reconciler's benefit. */
+export type InFlightSettleVerdict =
+  /** Nothing to do — no response yet, or the record is already settled. */
+  | 'none'
+  /** The response was this turn's answer (or its crash); the record now carries an outcome. */
+  | 'settled'
+  /**
+   * A completed response arrived that is NOT this turn's answer. The record is
+   * settled `foreign` so the waiter aborts, and `response.json` is deliberately
+   * left in place — it is some other command's turn and belongs in the ordinary
+   * reconciliation path, not under the "Pre-accept validation" heading.
+   */
+  | 'foreign';
+
+/**
+ * Settle a task's in-flight turn against whatever the supervisor has written.
+ *
+ * This is the ONE implementation of "turn an ask/pre-accept response into task
+ * state" — single reader by implementation, invoked by whoever ticks first.
+ * Two callers drive it: the reconcile tick, and the waiter on each of its own
+ * polls. The waiter drives it because otherwise the 5s reconcile interval would
+ * become the floor on every `lazy ask`'s latency; `withSettleLock` makes the
+ * two mutually exclusive (both run in one process — see its doc), and the
+ * `record.outcome` early exit makes the loser a no-op.
+ */
+export async function settleInFlightTurnFromProtocol(
+  storage: Storage,
+  task: Task,
+  session: Session,
+  record: InFlightTurn,
+  worktreePath: string,
+): Promise<InFlightSettleVerdict> {
+  return withSettleLock(task.id, () =>
+    settleInFlightTurnLocked(storage, task, session, record, worktreePath));
+}
+
+async function settleInFlightTurnLocked(
+  storage: Storage,
+  task: Task,
+  session: Session,
+  record: InFlightTurn,
+  worktreePath: string,
+): Promise<InFlightSettleVerdict> {
+  if (record.outcome) return 'none';
+
+  // Re-read under the lock: the caller's copy of the record may predate a
+  // settle that already ran, and settling twice would double-record the turn.
+  const held = (await storage.getTask(task.id))?.in_flight_turn;
+  if (held && held.turn_sequence === record.turn_sequence && held.outcome) return 'none';
+
+  const protoDir = getProtocolDir(task.id);
+  const response = readResponse(protoDir);
+  if (!response) return 'none';
+
+  const settledAt = Date.now();
+  let outcome: InFlightTurnOutcome;
+  let restoreStatus = true;
+
+  if (response.status === 'error') {
+    if (record.owner === 'ask') {
+      // recordAskErrorTurn deliberately parks the task `interrupted` so the
+      // crashed ask is auto-resumable; do not restore over that.
+      await recordAskErrorTurn(storage, task.id, session.id, response, protoDir, record.turn_sequence);
+      restoreStatus = false;
+    } else {
+      consumeResponse(protoDir);
+      clearStatus(protoDir);
+    }
+    outcome = { kind: 'error', message: response.error ?? 'unknown error', settled_at: settledAt };
+  } else {
+    const completed = completedResponses(response)[0];
+
+    // INVARIANT: a merge never proceeds on a response that did not answer THIS
+    // pre-accept command. `handlePreAcceptCommand` (src/supervisor/index.ts)
+    // sets `pre_accept` on EVERY completed pre-accept response — the
+    // empty-command-list case included, as `{ passed: true }` — and routes
+    // failures to an ErrorResponse. No other command type ever sets it. So an
+    // absent gate means this response belongs to some other command that was
+    // written into the same protocol dir.
+    //
+    // Kept even though the in-flight record now correlates the exchange: the
+    // record says "a pre-accept turn is running", not "this JSON is its
+    // answer". The protocol dir is still a single unaddressed slot, and a
+    // command written before the claim can still land its answer in it. The
+    // gate is the only property of the payload ITSELF that identifies it, so
+    // it stays the last check before anything is recorded or merged.
+    if (record.owner === 'pre_accept' && !completed.pre_accept) {
+      await storage.settleInFlightTurn(task.id, record.turn_sequence, {
+        kind: 'foreign',
+        message:
+          'the response the daemon received did not come from the pre-accept turn ' +
+          '(no gate result), so nothing was validated',
+        settled_at: settledAt,
+      });
+      return 'foreign';
+    }
+
+    if (record.owner === 'ask') {
+      await recordAskCompletedTurn(storage, session, completed, protoDir, record.turn_sequence);
+    } else {
+      await recordPreAcceptTurn(storage, session, completed, worktreePath, protoDir, record.turn_sequence);
+    }
+    outcome = {
+      kind: 'completed',
+      turn_sequence: record.turn_sequence,
+      result: completed.result,
+      usage: completed.usage,
+      agent_duration_ms: completed.agent_duration_ms,
+      ...(completed.pre_accept ? { gate: completed.pre_accept } : {}),
+      settled_at: settledAt,
+    };
+  }
+
+  await storage.settleInFlightTurn(task.id, record.turn_sequence, outcome);
+
+  // Restore the status here, not only in the waiter: the wait may have been
+  // abandoned (an MCP client's idle budget is the same order as these
+  // timeouts), and a task left in `working` with no turn running is the
+  // stranded state this whole mechanism exists to prevent.
+  if (restoreStatus) {
+    const current = await storage.getTask(task.id);
+    if (current?.status === 'working') {
+      await storage.updateTaskStatus(task.id, record.restore_status, 'system');
+    }
+  }
+  return 'settled';
+}
+
+/**
+ * Wait for THIS turn's outcome, aborting early if the supervisor dies.
+ *
+ * Polls storage the way `lazy wait` polls task status — but where `lazy wait`
+ * can only see "the task left `working`", this sees "the turn at MY reserved
+ * sequence settled", which is the distinction the whole task exists to make.
+ */
+async function awaitInFlightOutcome(opts: {
+  storage: Storage;
+  task: Task;
+  session: Session;
+  record: InFlightTurn;
+  worktreePath: string;
+  runner: Runner;
+  runName: string;
+  timeoutMs: number;
+  alreadyRunning: boolean;
+}): Promise<SupervisorAnswerOutcome<InFlightTurnOutcome>> {
+  const { storage, task, session, record, worktreePath } = opts;
+  return waitForSupervisorAnswer<InFlightTurnOutcome>({
+    runner: opts.runner,
+    runName: opts.runName,
+    timeoutMs: opts.timeoutMs,
+    intervalMs: 500,
+    alreadyRunning: opts.alreadyRunning,
+    readAnswer: async () => {
+      // Drive the settle from here as well as from the reconcile tick. Waiting
+      // for the tick alone would put a 5s floor under every ask; and with no
+      // daemon (the in-process RPC fallback) there is no tick at all, so this
+      // is the ONLY settler. The call is serialized against the reconciler and
+      // is a no-op once the record is settled, so driving it is always safe.
+      try {
+        await settleInFlightTurnFromProtocol(storage, task, session, record, worktreePath);
+      } catch (err) {
+        logger.warn(
+          `Task ${displayId(task)}: failed to settle the in-flight ${record.owner} turn: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const fresh = await storage.getTask(task.id);
+      const held = fresh?.in_flight_turn;
+      // Correlate: only an outcome recorded against MY reserved sequence is my
+      // answer. Anything else means the slot was taken over.
+      if (held && held.turn_sequence === record.turn_sequence && held.outcome) {
+        return held.outcome;
+      }
+      return null;
+    },
+  });
 }
 
 /**
@@ -1039,6 +1315,8 @@ export async function launchAskTask(
   // Set when the ask gives up while the supervisor may still write a response —
   // the task must then stay 'working' so the reconciler can finalize the turn.
   let askResponsePending = false;
+  // The in-flight claim, once made — released in the `finally` however we exit.
+  let claim: SyncTurnClaim | null = null;
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
@@ -1086,10 +1364,21 @@ export async function launchAskTask(
     // INVARIANT (CLAUDE.md): human feedback must be durably saved before any
     // operation that might fail can discard it. For an ask, the question is
     // the feedback.
-    const nextSeq = await storage.getNextTurnSequence(sess.id);
+    //
+    // Claim the task's protocol slot FIRST — before the human turn, before the
+    // status flip, before the command is written. Every other writer checks for
+    // a live record, so from here on nothing can move this task underneath the
+    // turn. (`claim` is assigned to the outer `claim` so the `finally` can
+    // release it however this exits.)
+    claim = await claimSyncTurn(storage, task, sess, {
+      owner: 'ask',
+      turnType: 'ask',
+      restoreStatus: statusBeforeAsk,
+      timeoutMs: ASK_TIMEOUT_MS,
+    });
     await storage.createTurn({
       sessionId: sess.id,
-      sequence: nextSeq,
+      sequence: claim.humanSeq,
       role: 'human',
       content: askMessage.trim(),
       agent: task.agent_id,
@@ -1137,12 +1426,13 @@ export async function launchAskTask(
       daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: task.id });
     }
 
-    if (await runner.isRunning(containerName)) {
+    const reusedExistingSupervisor = await runner.isRunning(containerName);
+    if (reusedExistingSupervisor) {
       // Supervisor already running — it will pick up the ask command
     } else {
       await runner.removeRun(containerName);
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(task));
       } catch (err) {
         await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
@@ -1152,9 +1442,29 @@ export async function launchAskTask(
 
     // --- Wait synchronously for the supervisor's response ---
     const waitStart = Date.now();
-    const response = await waitForResponse(protoDir, 500, ASK_TIMEOUT_MS);
+    const outcome = await awaitInFlightOutcome({
+      storage, task, session: sess, record: claim.record, worktreePath,
+      runner, runName: containerName, timeoutMs: ASK_TIMEOUT_MS,
+      alreadyRunning: reusedExistingSupervisor,
+    });
     const waitMs = Date.now() - waitStart;
-    if (!response) {
+
+    if (outcome.kind === 'dead') {
+      // Same gap as pre-accept: a supervisor that died before answering left
+      // the ask polling for the full 10 minutes. No response is coming, so the
+      // `finally` below restoring the pre-ask status is correct — deliberately
+      // NOT setting askResponsePending, which exists for the opposite case
+      // (a supervisor still alive and possibly still writing).
+      const detail = outcome.diagnostics ? ` (${outcome.diagnostics})` : '';
+      throw new RpcError(
+        500,
+        `Ask aborted: the supervisor for ${displayId(task)} is no longer running and never ` +
+        `answered${detail}. Your question is preserved and will be re-delivered on the next turn.`,
+      );
+    }
+
+    const settled = outcome.kind === 'answer' ? outcome.answer : null;
+    if (!settled) {
       // Timeout — leave the supervisor alone (it may still finish later and
       // be picked up by the reconciler); we just can't hand an answer back.
       // The task therefore stays 'working': the reconciler only sweeps working
@@ -1165,38 +1475,33 @@ export async function launchAskTask(
       throw new RpcError(504, `Ask timed out after ${Math.floor(ASK_TIMEOUT_MS / 1000)}s.`);
     }
 
-    if (response.status === 'error') {
-      await recordAskErrorTurn(storage, task.id, sess.id, response, protoDir);
-      throw new RpcError(500, `Ask failed: ${response.error}`);
+    if (settled.kind !== 'completed') {
+      // The turn was recorded by whoever settled it (the reconciler, or this
+      // process when running daemonless); only the RPC result is ours to write.
+      throw new RpcError(500, `Ask failed: ${settled.message ?? 'the turn did not produce an answer'}`);
     }
 
-    // An ask is always a single-invocation, read-only turn — never a bundle.
-    // Normalize defensively to the primary response.
-    const completed = completedResponses(response)[0];
-
-    // --- Completed: record agent turn, restore the pre-ask status ---
-    // An ask is read-only, so it must leave the task exactly as it found it
-    // (e.g. a 'conflict' task stays 'conflict', not silently demoted to
-    // 'blocked').
-    const turnNumber = await recordAskCompletedTurn(storage, sess, completed, protoDir);
-
+    // --- Completed: the agent turn is already recorded at the reserved
+    // sequence, and the pre-ask status already restored. An ask is read-only,
+    // so it must leave the task exactly as it found it (e.g. a 'conflict' task
+    // stays 'conflict', not silently demoted to 'blocked').
     return {
       sessionId: sess.id,
-      turnNumber,
-      answer: completed.result,
-      usage: completed.usage
+      turnNumber: Math.floor((settled.turn_sequence ?? claim.agentSeq) / 2) + 1,
+      answer: settled.result ?? '',
+      usage: settled.usage
         ? {
-            inputTokens: completed.usage.input_tokens ?? 0,
-            outputTokens: completed.usage.output_tokens ?? 0,
-            cacheCreationTokens: completed.usage.cache_creation_input_tokens ?? 0,
-            cacheReadTokens: completed.usage.cache_read_input_tokens ?? 0,
+            inputTokens: settled.usage.input_tokens ?? 0,
+            outputTokens: settled.usage.output_tokens ?? 0,
+            cacheCreationTokens: settled.usage.cache_creation_input_tokens ?? 0,
+            cacheReadTokens: settled.usage.cache_read_input_tokens ?? 0,
           }
         : undefined,
       warnings,
       timings: {
         daemon_ms: Date.now() - daemonStart,
         wait_ms: waitMs,
-        agent_ms: completed.agent_duration_ms,
+        agent_ms: settled.agent_duration_ms,
       },
     };
   } finally {
@@ -1211,6 +1516,19 @@ export async function launchAskTask(
     // Only restore from `working`: a supervisor launch failure deliberately
     // parks the task `interrupted`, and a concurrent transition is not ours to
     // stomp.
+    //
+    // Release the in-flight claim first: the wait is over either way, so the
+    // record has no one left to protect. Releasing it BEFORE the status restore
+    // matters for the timeout path — the answer may still be coming, and once
+    // the record is gone the reconciler picks it up through the ordinary path.
+    try {
+      if (claim) await storage.clearInFlightTurn(task.id, claim.agentSeq);
+    } catch (err) {
+      logger.warn(
+        `Task ${displayId(task)}: failed to clear the in-flight ask record — ` +
+        `it will expire on its own. ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     try {
       const current = await storage.getTask(task.id);
       if (!askResponsePending && current?.status === 'working') {
@@ -1238,6 +1556,8 @@ async function recordAskCompletedTurn(
   session: { id: string; agent_session_id: string | null },
   response: CompletedResponse,
   protoDir: string,
+  /** Sequence reserved for this answer by claimSyncTurn. */
+  reservedSeq: number,
 ): Promise<number> {
   if (response.session_id && !session.agent_session_id) {
     await storage.updateSessionClaudeId(session.id, response.session_id);
@@ -1252,7 +1572,9 @@ async function recordAskCompletedTurn(
   if (lastTurn?.role === 'agent') {
     agentTurnSeq = lastTurn.sequence;
   } else {
-    agentTurnSeq = await storage.getNextTurnSequence(session.id);
+    // The RESERVED sequence, not a freshly allocated one: this turn's identity
+    // was fixed before the command went out (see claimSyncTurn).
+    agentTurnSeq = reservedSeq;
     await storage.createTurn({
       sessionId: session.id,
       sequence: agentTurnSeq,
@@ -1298,6 +1620,8 @@ async function recordAskErrorTurn(
   sessionId: string,
   response: ErrorResponse,
   protoDir: string,
+  /** Sequence reserved for this answer by claimSyncTurn. */
+  reservedSeq: number,
 ): Promise<void> {
   const watchdogKill = isWatchdogKill(response);
   const lines: string[] = [watchdogKill ? WATCHDOG_TURN_HEADING : '[Agent crashed]', ''];
@@ -1321,7 +1645,7 @@ async function recordAskErrorTurn(
   const existingTurns = await storage.getSessionTurns(sessionId);
   const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
   if (lastTurn?.role !== 'agent') {
-    const seq = await storage.getNextTurnSequence(sessionId);
+    const seq = reservedSeq;
     // Tokens the ask had already spent before it died, salvaged by the
     // supervisor (src/supervisor/usage.ts). A crashed ask used to record none.
     const errorUsage = toTurnUsage(response.usage);
@@ -1417,6 +1741,8 @@ async function launchPreAcceptTurn(
 ): Promise<PreAcceptOutcome> {
   const warnings: string[] = [];
   const preAccept = config.automation.pre_accept;
+  // The in-flight claim, once made — released in the `finally` however we exit.
+  let claim: SyncTurnClaim | null = null;
 
   if (!preAccept.enabled) {
     return { warnings };
@@ -1466,12 +1792,20 @@ async function launchPreAcceptTurn(
     const promptBody = renderPreAcceptPrompt(commands, config.automation.maintain);
     const fullPrompt = buildPromptWithInstructions(promptBody, task.goal, projectRoot);
 
+    // Claim the task's protocol slot BEFORE the marker turn, the status flip
+    // and the command write — see claimSyncTurn.
+    claim = await claimSyncTurn(storage, task, sess, {
+      owner: 'pre_accept',
+      turnType: 'pre_accept',
+      restoreStatus: priorStatus,
+      timeoutMs: preAcceptTimeoutMs(config),
+    });
+
     // Record a synthetic system turn so the pre-accept exchange reads as a
     // discrete human→agent pair (mirrors auto-deliver + ask).
-    const humanSeq = await storage.getNextTurnSequence(sess.id);
     await storage.createTurn({
       sessionId: sess.id,
-      sequence: humanSeq,
+      sequence: claim.humanSeq,
       role: 'human',
       content: '[system] Pre-accept validation before merge',
       agent: task.agent_id,
@@ -1479,6 +1813,9 @@ async function launchPreAcceptTurn(
       effort: effortValue,
       actor: 'system',
       autoTriggered: true,
+      // The marker used to carry no turnType at all, so there was nothing to
+      // validate a claimed pre-accept answer against. It carries one now.
+      turnType: 'pre_accept',
     });
 
     await storage.updateTaskStatus(task.id, 'working', 'system');
@@ -1512,12 +1849,13 @@ async function launchPreAcceptTurn(
       daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: task.id });
     }
 
-    if (await runner.isRunning(containerName)) {
+    const reusedExistingSupervisor = await runner.isRunning(containerName);
+    if (reusedExistingSupervisor) {
       // Supervisor already running — it will pick up the pre_accept command.
     } else {
       await runner.removeRun(containerName);
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(task));
       } catch (err) {
         const message = `Pre-accept: failed to launch supervisor: ${err instanceof Error ? err.message : err}. Task returned to ${priorStatus}; accept aborted.`;
         await storage.updateTaskStatus(task.id, priorStatus, 'system');
@@ -1530,8 +1868,29 @@ async function launchPreAcceptTurn(
     await storage.updateSessionContainerName(sess.id, containerName);
 
     const timeoutMs = preAcceptTimeoutMs(config);
-    const response = await waitForResponse(protoDir, 500, timeoutMs);
-    if (!response) {
+    const outcome = await awaitInFlightOutcome({
+      storage, task, session: sess, record: claim.record, worktreePath,
+      runner, runName: containerName, timeoutMs,
+      alreadyRunning: reusedExistingSupervisor,
+    });
+
+    if (outcome.kind === 'dead') {
+      // The supervisor is gone and wrote nothing. Waiting out the full
+      // pre-accept budget (~35 min by default) for a response that can no
+      // longer arrive is what made `lazy accept` look hung with nothing
+      // running; abort on the same terms as the timeout path.
+      const detail = outcome.diagnostics ? ` (${outcome.diagnostics})` : '';
+      const message =
+        `Pre-accept validation aborted: the supervisor for ${displayId(task)} is no longer running ` +
+        `and never reported back${detail}. Task returned to ${priorStatus}; accept aborted. ` +
+        `Check that the runner can launch a supervisor (\`lazy doctor\`), then re-accept.`;
+      await storage.updateTaskStatus(task.id, priorStatus, 'system');
+      await storage.createComment(task.id, message, 'system');
+      throw new RpcError(500, message);
+    }
+
+    const settled = outcome.kind === 'answer' ? outcome.answer : null;
+    if (!settled) {
       // Name the deadline. Three clocks can end a pre-accept turn (see
       // PRE_ACCEPT_TIMEOUT_MARGIN_MS); a message that does not say which one
       // fired sends the reader hunting through three different configs.
@@ -1555,21 +1914,31 @@ async function launchPreAcceptTurn(
       throw new RpcError(504, message);
     }
 
-    if (response.status === 'error') {
-      const detail = response.error ?? 'unknown error';
-      const crashMessage = `Pre-accept turn crashed: ${detail}. Task returned to ${priorStatus}; accept aborted.`;
+    if (settled.kind === 'error') {
+      const crashMessage = `Pre-accept turn crashed: ${settled.message ?? 'unknown error'}. Task returned to ${priorStatus}; accept aborted.`;
       await storage.updateTaskStatus(task.id, priorStatus, 'system');
       await storage.createComment(task.id, crashMessage, 'system');
-      consumeResponse(protoDir);
-      clearStatus(protoDir);
       throw new RpcError(500, crashMessage);
     }
 
-    const completed = completedResponses(response)[0];
-    await recordPreAcceptTurn(storage, sess, completed, worktreePath, protoDir);
+    // The gate-presence INVARIANT lives in settleInFlightTurnFromProtocol, next
+    // to the code that would otherwise record the turn — it must run BEFORE
+    // anything is filed under the "Pre-accept validation" heading. A `foreign`
+    // outcome is that check having refused; all that is left here is aborting
+    // the accept.
+    if (settled.kind === 'foreign' || !settled.gate) {
+      const message =
+        `Pre-accept validation aborted: the response the daemon received did not come from the ` +
+        `pre-accept turn (no gate result), so nothing was validated — another command took over ` +
+        `this task's protocol channel mid-turn. Task returned to ${priorStatus}; accept aborted. ` +
+        `Re-accept when the task is idle — a fresh pre-accept turn will run.`;
+      await storage.updateTaskStatus(task.id, priorStatus, 'system');
+      await storage.createComment(task.id, message, 'system');
+      throw new RpcError(409, message);
+    }
 
-    const gate = completed.pre_accept;
-    if (gate && !gate.passed) {
+    const gate = settled.gate;
+    if (!gate.passed) {
       const cmdLabel = gate.failed_command ? `\`${gate.failed_command}\`` : 'a configured check';
       const exitLabel = gate.exit_code === -2 ? 'timed out' : `exited with ${gate.exit_code ?? 'a non-zero code'}`;
       const outputTail = gate.output ? `\n\n\`\`\`\n${gate.output.slice(-1500)}\n\`\`\`` : '';
@@ -1585,6 +1954,17 @@ async function launchPreAcceptTurn(
     await storage.updateTaskStatus(task.id, priorStatus, 'system');
     return { warnings };
   } finally {
+    // The wait is over however we got here, so the record has no one left to
+    // protect. Leaving it would keep auto-resume and auto-deliver off the task
+    // until it expired.
+    try {
+      if (claim) await storage.clearInFlightTurn(task.id, claim.agentSeq);
+    } catch (err) {
+      logger.warn(
+        `Task ${displayId(task)}: failed to clear the in-flight pre-accept record — ` +
+        `it will expire on its own. ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     await removeLock(worktreePath);
   }
 }
@@ -1600,6 +1980,8 @@ async function recordPreAcceptTurn(
   response: CompletedResponse,
   worktreePath: string,
   protoDir: string,
+  /** Sequence reserved for this answer by claimSyncTurn. */
+  reservedSeq: number,
 ): Promise<void> {
   // Reconcile the agent session id — a resume can rotate it, and the reported id
   // points at the JSONL that exists now.
@@ -1612,12 +1994,15 @@ async function recordPreAcceptTurn(
   const existingTurns = await storage.getSessionTurns(session.id);
   const lastTurn = existingTurns.length > 0 ? existingTurns[existingTurns.length - 1] : null;
   if (lastTurn?.role !== 'agent') {
-    const seq = await storage.getNextTurnSequence(session.id);
+    const seq = reservedSeq;
     await storage.createTurn({
       sessionId: session.id,
       sequence: seq,
       role: 'agent',
       content: `${PRE_ACCEPT_HEADING}\n\n${response.result}`,
+      // Give the answer the same turnType its marker turn carries, so the
+      // exchange is identifiable as a pre-accept pair without parsing headings.
+      turnType: 'pre_accept',
       usage: turnUsage,
       ...launchSettingsFromResponse(response),
       startSha: response.start_sha_work,
@@ -2886,7 +3271,7 @@ async function acceptTaskRun(
   // local git operations, never remote MRs. Such branches are NEVER protected,
   // so we short-circuit the network protection check entirely — it isn't needed
   // and a transient failure must not be able to misroute the merge.
-  const targetIsLazyBranch = mergeTargetBranch.startsWith('lazy/');
+  const targetIsLazyBranch = isIntermediateBranch(mergeTargetBranch);
   let targetIsProtected = false;
   if (driver.needsSync && !targetIsLazyBranch) {
     phases.begin(ACCEPT_PHASES.protection, mergeTargetBranch);
@@ -2921,7 +3306,14 @@ async function acceptTaskRun(
   // immediate squash merge into the parent branch and NEVER pushes the branch,
   // creates an MR/PR, or parks the task in `merging`. Only a protected target
   // (e.g. `main`) goes through the remote driver's MR path below.
-  const useLocalMerge = driver.needsSync && !targetIsProtected;
+  //
+  // `mergeLandsLocally` is the SHARED predicate — sync resolves its merge ref
+  // through the same function (src/remote/upstream-ref.ts) so the two cannot
+  // drift apart and disagree about which ref the parent lives on. A driver with
+  // no remote already merges locally, so only `needsSync` drivers need the
+  // LocalDriver wrapper.
+  const useLocalMerge = driver.needsSync
+    && mergeLandsLocally({ needsSync: driver.needsSync, targetIsProtected });
   const mergeDriver = useLocalMerge
     ? new LocalDriver({ storage, lazyRoot: projectRoot })
     : driver;
@@ -3543,10 +3935,19 @@ export async function syncTask(
       'branch only — no remote fetch will be performed.',
     );
   }
+  // Resolve to the ref `lazy accept` will actually merge into — NOT
+  // unconditionally `origin/<parent>`. An unprotected parent (every `lazy/...`
+  // task branch) is merged into LOCALLY, and a parent task's own agent commits
+  // can never be on origin, so syncing against origin reported "Already up to
+  // date" while accept refused with conflicts. See src/remote/upstream-ref.ts.
   let resolvedParentBranch = parentBranch;
   try {
     const driver = createDriver(config, undefined, { offline });
-    resolvedParentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
+    const resolution = await resolveUpstreamMergeRef(driver, parentBranch, worktreePath, {
+      remoteName: config.remote.git_remote,
+    });
+    resolvedParentBranch = resolution.ref;
+    warnings.push(...resolution.warnings);
   } catch (err) {
     // Fetch failed — increment pending_sync so retry loop picks it up.
     // LocalDriver.resolveUpstreamRef resolves locally without fetching, so
@@ -3690,7 +4091,7 @@ export async function syncTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(task));
       } catch (err) {
         // Supervisor failed to launch — revert the working transition so the
         // task doesn't get stuck waiting for a supervisor that never started.
@@ -4469,7 +4870,7 @@ export async function resumeTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(task));
       } catch (err) {
         await storage.updateTaskStatus(task.id, 'interrupted', actor);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);

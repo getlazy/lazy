@@ -24,9 +24,11 @@ import { loadConfig } from '../config/loader';
 import { resolveAgentModel } from '../agent/agent-model';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
+import { pinnedCustomImage } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
+import { isTurnInFlight } from './in-flight-turn';
 import { logger } from '../utils/logger';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { taskRef, getWorktreePathForRef } from '../cli/helpers';
@@ -131,6 +133,16 @@ export async function autoUnblockTask(
   const tRef = taskRef(task);
   const taskShortId = shortId(task.id);
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
+
+  // INVARIANT: never write a command into a protocol dir a synchronous daemon
+  // turn (`ask` / `pre_accept`) is waiting on — see the same guard in
+  // src/utils/auto-resume.ts. The status gate below is not enough on its own:
+  // it describes what the task looks like NOW, and the whole failure mode is a
+  // second actor moving the task underneath a turn already in flight.
+  if (await isTurnInFlight(storage, task.id)) {
+    logger.debug(`Auto-unblock ${taskShortId}: a synchronous daemon turn is in flight for this task, skipping`);
+    return false;
+  }
 
   // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
   // a task that still owes a reviewer an approve/revert decision on
@@ -274,7 +286,7 @@ export async function autoUnblockTask(
       await runner.removeRun(containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, pinnedCustomImage(task));
       } catch (err) {
         logger.warn(`Auto-unblock ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         await parkTaskPaused(storage, task.id, 'system');
@@ -325,6 +337,13 @@ export async function deliverUpstreamUpdated(
 
   if (task.status !== 'blocked' && task.status !== 'submitted') {
     logger.debug(`Auto-deliver ${taskShortId}: not eligible (${task.status}), skipping upstream.updated`);
+    return false;
+  }
+
+  // A sync relaunches the task's agent, so it writes into the same protocol dir
+  // a synchronous daemon turn may be waiting on. Same invariant as above.
+  if (await isTurnInFlight(storage, task.id)) {
+    logger.debug(`Auto-deliver ${taskShortId}: a synchronous daemon turn is in flight for this task, skipping`);
     return false;
   }
 

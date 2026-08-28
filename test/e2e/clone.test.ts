@@ -1,7 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, writeTaskJson } from '../helpers/storage';
 
 describe('lazy clone', () => {
   let ctx: TestContext;
@@ -336,6 +337,33 @@ describe('lazy clone', () => {
 
     expectFailure(result);
     expectError(result, 'Cannot use both --parent and --default-parent');
+  });
+
+  // INVARIANT: clone is a fresh start — do NOT inherit the source's image pin.
+  // Warn so the human can re-pin via TTY; a silent drop to root is least surprise.
+  test('clone does not inherit custom_image metadata; warns when source was pinned', async () => {
+    const { IMAGE_TAG } = await import('../../src/capture/image-tag');
+    const taskId = await createTask(ctx, 'Pinned source', 'Prompt');
+    const imageRef = `lazy-custom-cloneinherit:${IMAGE_TAG}`;
+    const hash = 'c'.repeat(64);
+
+    const data = readTaskJson(ctx.root, taskId);
+    data.metadata = {
+      ...(data.metadata ?? {}),
+      custom_image: imageRef,
+      custom_image_hash: hash,
+    };
+    writeTaskJson(ctx.root, taskId, data);
+
+    const result = await ctx.lazy(['clone', taskId]);
+    expectSuccess(result);
+    expectOutput(result, `custom container image pin (${imageRef})`);
+    expectOutputExcludes(result, 'inherited from source');
+
+    const clonedTaskId = extractNewTaskId(result.stdout);
+    const cloned = readTaskJson(ctx.root, clonedTaskId);
+    expect(cloned.metadata?.custom_image).toBeUndefined();
+    expect(cloned.metadata?.custom_image_hash).toBeUndefined();
   });
 });
 

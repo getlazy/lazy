@@ -98,6 +98,50 @@ learn which role it is, not to carry a secret — and the ollama upstream then
 receives no credential. An ollama-only project stays exempt from the daemon's
 credential gate while being fully proxied.
 
+## What the proxy forwards
+
+The proxy scopes **what** it forwards, not just where. It is a model-API proxy,
+so only the model API rides through it. This covers everything sent to the
+Anthropic upstream and to a role upstream — that is, every request except the
+Cursor passthrough described below:
+
+| Request | Anthropic upstream | Role upstream (e.g. Ollama) |
+| --- | --- | --- |
+| `POST /v1/messages` | forwarded | forwarded |
+| `POST /v1/messages/count_tokens` | forwarded | forwarded |
+| `HEAD`/`GET /api/hello` (reachability probe) | forwarded | forwarded |
+| `GET /v1/models…` | forwarded | refused |
+| anything else on these two upstreams | refused | refused |
+
+A refused request comes back as a **403** with a `permission_error` body naming
+the method and path that was refused and listing what that upstream does
+forward. The request never reaches the upstream, and the refusal is written to
+the audit trail — visible in `lazy stats audit` and live in `lazy watch` — with
+the same grant-derived attribution as any other proxied request.
+
+**The Cursor route is the one exception.** Requests under
+`/_lazy/cursor/<placeholder>/…` ([see below](#cursor)) go to a third upstream,
+Cursor's own API, and are forwarded verbatim — the table above does not apply to
+them. That is deliberate: `cursor-agent` speaks a protocol whose endpoints lazy
+does not model, and unlike a role endpoint the upstream is a hosted API rather
+than a server you run, so there is no administrative surface next to the
+inference surface to scope away. Those requests are still audited.
+
+Role upstreams are held tighter than the Anthropic one on purpose. A role
+endpoint is usually a model server *you* run, and its administrative surface
+sits right next to its inference surface: an Ollama server answers `/api/pull`,
+`/api/delete` and `/api/create` on the same port it answers inference on. An
+agent holds a placeholder that routes to that endpoint, so without this scoping
+it could ask your model server to delete your models. Inference and the probe
+are all a role upstream ever needs; model discovery is left out because there it
+is an inventory listing with no inference behind it.
+
+The list is source, not a config knob: it lives in `src/proxy/path-allowlist.ts`
+with a stated reason per entry, so growing lazy's forwarding surface is a
+reviewable change rather than a setting someone can widen in passing. If an
+agent you run legitimately needs another endpoint, that is the file to change —
+and a change worth reading.
+
 ## Failure semantics
 
 Every failure is loud, per lazy's no-silent-fallback rule.
@@ -145,7 +189,8 @@ scoped request to every task's traffic is the opposite of what was asked for.
 
 - **A request with no credential at all** is forwarded unchanged with nothing
   added. Claude Code probes `HEAD /api/hello` before authenticating; 401-ing it
-  would break startup.
+  would break startup. It still has to be a path the proxy forwards — the
+  surface above is not scoped to credentialed callers.
 - **A real credential presented by something with no grant** (a host
   `cursor-agent` login session) is forwarded as-is and recorded unattributed.
   Only a value that *looks* like a lazy placeholder yet fails lookup earns a 401.

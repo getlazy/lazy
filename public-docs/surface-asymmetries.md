@@ -112,6 +112,26 @@ inherited parent's release branch.
 
 ## 4. Human-only commands with no MCP equivalent
 
+- **Per-task custom container images** — when you run `lazy create`, `lazy start`,
+  or `lazy edit` from a terminal inside a task worktree whose `Dockerfile.lazy`
+  differs from the project's reference, lazy may ask whether to build that
+  Dockerfile and use it for **this task**. That is a human TTY consent only:
+  build steps run under the host's docker, so an agent must not be able to
+  choose the image. There is deliberately no MCP tool, flag, or schema field
+  for pinning a custom image. Non-interactive callers (`--yes`, scripts, the
+  builder) never see the prompt and always get the project-root image (or a
+  daemon-adopted upgrade image, if one is in effect). A subtask inherits a
+  parent's already-pinned image on create so stacked work stays consistent
+  without giving agents a chooser. `lazy clone` / `lazy redo` (and MCP
+  `lazy_clone` / `lazy_redo`) are fresh starts — they use the root image and
+  warn when the source or previous attempt had a pin, so you can re-pin from a
+  task worktree TTY if needed.
+- **Upgrade worktree adoption** — when you run `lazy upgrade` from a terminal
+  inside a task worktree whose `Dockerfile.lazy` differs, lazy may ask whether
+  to adopt that Dockerfile for the image build **and** the daemon. Adoption is
+  human TTY consent only and has no MCP surface. It lasts until the next
+  upgrade rebuild decides again, and is visible in `lazy doctor` and on daemon
+  startup.
 - **`lazy approve`** — records the one-time human approval that unlocks an
   accept into a protected branch. Its usage text says it outright: *"There is
   deliberately NO `--yes` for this command, and no MCP equivalent: the approval

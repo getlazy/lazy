@@ -440,9 +440,16 @@ Docker image configuration for agent containers.
 dockerfile = "Dockerfile.lazy"
 ```
 
-The path always resolves against the **project root** — a task worktree's copy of the Dockerfile never governs the image (task branches are agent-writable, and an image derived from one would let an agent's Dockerfile edits execute as build steps on the host).
+The path always resolves against the **project root** — a task worktree's copy of the Dockerfile never governs the image *automatically* (task branches are agent-writable, and an image derived from one without consent would let an agent's Dockerfile edits execute as build steps on the host).
 
-To build from a different file — typically a source branch's `Dockerfile.lazy` you want to test before it merges, or an e2e fixture — export **`LAZY_DOCKERFILE_LAZY`** (same family as `LAZY_CONFIG`): an absolute path is used verbatim, a relative one resolves against the project root. It overrides `dockerfile` for every command uniformly, forces custom-image mode even when `dockerfile` is empty, and reaches the daemon by ordinary environment inheritance — so export it, run `lazy upgrade`, and the build and every subsequent container launch agree on the file. A daemon started *without* the variable keeps ignoring it until restarted (`lazy upgrade` restarts it for you). `lazy upgrade` prints the exact `Config:` and `Dockerfile:` paths it reads, marking the override, so the source is always visible; a set-but-missing path is a hard error naming the variable. When you run `lazy upgrade` interactively from a task worktree whose `Dockerfile.lazy` differs from the root's, lazy asks whether to set the override for that run (skipped without a TTY).
+Two human-consented ways to use a worktree's Dockerfile:
+
+1. **Per-task pin** — from a terminal, `lazy create` / `start` / `edit` in a task worktree can ask to build that worktree's `Dockerfile.lazy` and pin it on the task (subtasks inherit it; `lazy clone` / `lazy redo` start fresh with the root image and warn if the source had a pin). Later turns use the pin with no prompt.
+2. **Upgrade adoption** — from a terminal, `lazy upgrade` (incl. `--images`) in a task worktree can ask to adopt that Dockerfile for the image build **and** the restarted daemon. Adoption is stored in daemon runtime state (not `lazy.toml`), applies to all launches that do not already have a per-task pin, and lasts until the next upgrade rebuild decides again. `lazy doctor` and the daemon startup log report it.
+
+For a permanent project-wide custom image, set `dockerfile` in `lazy.toml` to a path under the project root.
+
+`lazy upgrade` prints the exact `Config:` and `Dockerfile:` paths it reads, marking adoption when present, so the source is always visible.
 
 ---
 

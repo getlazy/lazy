@@ -89,3 +89,10 @@ export { GitHubDriver, detectGitHub } from './github-driver';
 export type { GhResult, DriverDeps } from './github-driver';
 export { GitLabDriver, detectGitLab } from './gitlab-driver';
 export type { GlResult, GitLabDriverDeps } from './gitlab-driver';
+export {
+  isIntermediateBranch,
+  mergeLandsLocally,
+  isAcceptTargetProtected,
+  resolveUpstreamMergeRef,
+} from './upstream-ref';
+export type { UpstreamRefResolution } from './upstream-ref';

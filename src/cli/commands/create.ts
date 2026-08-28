@@ -11,6 +11,11 @@ import { sanitizeUserText } from '../../utils/sanitize-text';
 import { runGit } from '../../utils/git';
 import { normalizeTag } from '../../utils/tags';
 import { getActor } from '../../constants';
+import {
+  inheritCustomImageMetadata,
+  maybeOfferWorktreeImageForTask,
+  pinnedCustomImage,
+} from '../../docker/worktree-image';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -291,6 +296,23 @@ export async function commandCreate(args: string[]): Promise<void> {
       }
       console.log(`  Tags:   ${applied.map(tg => '#' + tg).join(' ')}`);
     }
+
+    // Subtasks inherit the parent's pinned worktree image (if any) before the
+    // TTY offer — so a child of a pinned parent stays on that image without a
+    // second prompt, and MCP create gets the same inheritance without ever
+    // prompting.
+    if (parentTask) {
+      const inherited = await inheritCustomImageMetadata(storage, t.id, parentTask);
+      if (inherited) {
+        console.log(`  Image:  ${pinnedCustomImage(parentTask)} (inherited from parent)`);
+      }
+    }
+
+    // CLI TTY only: offer to build+pin this cwd's worktree Dockerfile when it
+    // differs from the reference. Never runs under --yes (create has none) or
+    // non-TTY; MCP never calls this helper.
+    const root = requireLazyRoot();
+    await maybeOfferWorktreeImageForTask(root, storage, t.id);
 
     console.log(`\nStart working on it with: lazy start ${displayId(t)}`);
   } finally {

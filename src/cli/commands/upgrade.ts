@@ -26,7 +26,10 @@ import { hostname } from 'os';
 import { join } from 'path';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
-import { ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile } from '../../capture/claude';
+import {
+  ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile,
+  enableUpgradeImageBuild, isAdoptedDockerfile,
+} from '../../capture/claude';
 import { verifyAgentBinary, formatAgentBinaryError } from '../../agent/binary-identity';
 import { logger } from '../../utils/logger';
 import { loadConfig, resolveConfigPath } from '../../config/loader';
@@ -40,7 +43,7 @@ import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
 import { startBackgroundImageBuild, type BackgroundImageBuild } from '../../upgrade/background-image-build';
 import { BUILD_TIMEOUT_FLAG, resolveBuildTimeoutMs } from './build-timeout';
-import { maybePromptWorktreeDockerfileOverride } from '../../upgrade/worktree-dockerfile-prompt';
+import { maybePromptWorktreeDockerfileAdoption } from '../../upgrade/worktree-dockerfile-prompt';
 import { ensureDaemon } from '../../daemon/auto-start';
 import {
   findLegacyDaemonMcpConfigs,
@@ -210,14 +213,19 @@ async function waitForWorkingTasks(storage: Storage, workingContainers: Containe
  * warning is deliberately silent when a worktree's lazy.toml is byte-identical
  * to the root's (see findConfigDir), and building from an unexpected
  * Dockerfile once cost a whole debugging session — so upgrade always names
- * its inputs, including when LAZY_DOCKERFILE_LAZY overrides the Dockerfile.
+ * its inputs, including when a worktree Dockerfile was adopted.
  */
 async function printImageSource(root: string): Promise<void> {
   const configPath = await resolveConfigPath(root);
   const dockerfilePath = await resolveCustomDockerfile(root);
-  const overrideNote = process.env.LAZY_DOCKERFILE_LAZY ? ' (from LAZY_DOCKERFILE_LAZY)' : '';
+  const adopted = await isAdoptedDockerfile(root, dockerfilePath);
+  const sourceNote = adopted ? ' (daemon-adopted from worktree)' : '';
   console.log(`  Config:     ${configPath}`);
-  console.log(`  Dockerfile: ${dockerfilePath ? `${dockerfilePath}${overrideNote}` : 'embedded default ([docker].dockerfile is not set)'}`);
+  console.log(`  Dockerfile: ${dockerfilePath ? `${dockerfilePath}${sourceNote}` : 'embedded default ([docker].dockerfile is not set)'}`);
+  if (adopted) {
+    console.log('              Adopted for the daemon and all launches that do not have a');
+    console.log('              per-task image pin, until the next `lazy upgrade` rebuild.');
+  }
 }
 
 /**
@@ -520,9 +528,9 @@ async function refreshImagesOnly(root: string, dryRun: boolean, timeoutMs: numbe
     return;
   }
 
-  // Ask about LAZY_DOCKERFILE_LAZY before the build starts — same ordering
+  // Ask about worktree adoption before the build starts — same ordering
   // constraint as the full upgrade's background rebuild.
-  await maybePromptWorktreeDockerfileOverride(root);
+  await maybePromptWorktreeDockerfileAdoption(root);
 
   console.log('\nRefreshing container image for future sessions (--no-cache)...');
   await printImageSource(root);
@@ -589,6 +597,12 @@ export async function commandUpgrade(args: string[]): Promise<void> {
   }
 
   const root = requireLazyRoot();
+
+  // `lazy upgrade` IS the explicit image-build path. Opt into path-based
+  // adoption resolution (vs soft-pin on launches) so a just-written
+  // adopted-image.json is what this command builds from. Soft-pin stays off
+  // for the daemon this command restarts — that process never calls this.
+  enableUpgradeImageBuild();
 
   // Non-disruptive image-only refresh: a separate, self-contained path that
   // touches no running containers and never restarts the daemon. --force/--wait
@@ -737,9 +751,10 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     const config = await loadConfig(root);
     const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
     if (isContainerRunner) {
-      // The background rebuild reads LAZY_DOCKERFILE_LAZY at start time — ask
-      // before kicking it off so the human's answer can change what gets built.
-      await maybePromptWorktreeDockerfileOverride(root);
+      // The background rebuild reads adoption / Dockerfile resolution at start
+      // time — ask before kicking it off so the human's answer can change what
+      // gets built, and so adoption is cleared/rewritten for this rebuild.
+      await maybePromptWorktreeDockerfileAdoption(root);
 
       imageBuild = startBackgroundImageBuild(root, config.runner.type, undefined, timeoutMs);
       console.log(`\nRebuilding the container image in the background (staged as :${imageBuild.stagingTag})...`);
@@ -980,9 +995,11 @@ typed-but-unsent message cannot be preserved. With --force or no TTY this
 warning is printed but not blocked on, and unsent builder input may be lost.
 
 When run interactively from a task worktree whose Dockerfile.lazy differs from
-the project root's, you'll be asked whether to set LAZY_DOCKERFILE_LAZY for
-this upgrade so the build uses the worktree's copy. Without a TTY the question
-is skipped (the default root Dockerfile applies).
+the project root's, you'll be asked whether to adopt the worktree's copy for
+the image build AND the restarted daemon (and all launches without a per-task
+image pin). Adoption sticks until the next upgrade rebuild decides again.
+Without a TTY the question is skipped (the default root Dockerfile applies, and
+any prior adoption is cleared).
 
 Options:
   --force     Don't prompt, stop everything including working containers

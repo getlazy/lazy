@@ -1,8 +1,13 @@
 /**
  * Anthropic-native passthrough proxy server.
  *
- * Forwards every request to the configured upstream unchanged (path, method,
- * body, auth headers). Streams the SSE response body back untouched — never
+ * Forwards ALLOWED requests to the configured upstream unchanged (path, method,
+ * body, auth headers). What counts as allowed is the declared forwarding surface
+ * in src/proxy/path-allowlist.ts — the proxy scopes WHAT it forwards, not just
+ * WHERE, so a granted agent cannot reach an upstream's administrative endpoints
+ * (ollama's /api/pull, /api/delete) through it. A refused request is 403'd with
+ * an actionable body and recorded in the audit log; nothing is silently dropped.
+ * Streams the SSE response body back untouched — never
  * buffers it. Strips stale content-encoding/content-length from the response
  * before forwarding (Bun's fetch transparently decodes gzip from real Anthropic;
  * forwarding the compressed-length headers to the client causes ZlibErrors).
@@ -53,8 +58,14 @@ import { extractRequest } from './extractor';
 import { AuditQueue, type AuditSink } from './audit';
 import {
   activityPath, closeEventFromRecord, proxyActivity,
-  CREDENTIAL_REFUSED_PREFIX, type ProxyActivityBus,
+  CREDENTIAL_REFUSED_PREFIX, PATH_REFUSED_PREFIX, type ProxyActivityBus,
 } from './activity';
+import {
+  decideProxyPath,
+  pathRefusalBody,
+  pathRefusalMessage,
+  pathRefusalReasonText,
+} from './path-allowlist';
 import { enforceResponseBody } from './enforce';
 import { extractUsage, teeUsageStream } from './usage';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from './policy';
@@ -229,8 +240,9 @@ const CURSOR_BODY_SUBSTITUTION_LIMIT = 64 * 1024;
 const ASCII = new TextEncoder();
 
 /**
- * Enqueue an audit record for a request the proxy REFUSED on credential
- * grounds, and return the 401.
+ * Enqueue an audit record for a request the proxy REFUSED, and return the
+ * refusal response. Credential refusals (401) are the default shape; a path
+ * refusal (403) passes `status`, `errorPrefix` and its own body.
  *
  * A refusal is the single most security-interesting thing this proxy does — a
  * revoked task hammering the proxy, or a container presenting a placeholder it
@@ -253,8 +265,17 @@ function refuse(
     taskId: string | null;
     reason: string;
     message: string;
+    /** Refusal status. Defaults to 401 (credential grounds). */
+    status?: number;
+    /** Audit-error prefix. Defaults to the credential one. */
+    errorPrefix?: string;
+    /** Response body builder. Defaults to the authentication-error shape. */
+    body?: (message: string) => string;
   },
 ): Response {
+  const status = opts.status ?? 401;
+  const errorPrefix = opts.errorPrefix ?? CREDENTIAL_REFUSED_PREFIX;
+  const body = opts.body ?? credentialErrorBody;
   ctx.auditQueue.enqueue({
     id: ctx.id,
     seq: ctx.seq,
@@ -272,18 +293,18 @@ function refuse(
     requestShape: null,
     toolUses: [],
     toolResults: [],
-    status: 401,
+    status,
     usage: null,
     stopReason: null,
     // The prefix is shared rather than spelled here: `lazy watch`'s remedy line
     // keys off it (see CREDENTIAL_REFUSED_PREFIX in ./activity).
-    error: `${CREDENTIAL_REFUSED_PREFIX}: ${opts.reason}`,
+    error: `${errorPrefix}: ${opts.reason}`,
     durationMs: Date.now() - ctx.startMs,
     reroute: null,
     enforcement: null,
   });
-  return new Response(credentialErrorBody(opts.message), {
-    status: 401,
+  return new Response(body(opts.message), {
+    status,
     headers: { 'content-type': 'application/json' },
   });
 }
@@ -567,7 +588,9 @@ export function createProxyServer(
 
       // --- Cursor passthrough route ---
       // Opaque by design: forwarded verbatim, never parsed by the
-      // Anthropic-shaped extractor, never enforced against, no usage capture.
+      // Anthropic-shaped extractor, never enforced against, no usage capture —
+      // and deliberately NOT subject to the path allowlist below. See the
+      // "NOT COVERED" note in src/proxy/path-allowlist.ts for why.
       if (isCursorProxyPath(url.pathname)) {
         const route = parseCursorProxyPath(path);
         if (!route) {
@@ -668,6 +691,46 @@ export function createProxyServer(
       const role = caller ? caller.grant.role : req.headers.get('x-lazy-role');
       const taskId = caller ? caller.grant.taskId : req.headers.get('x-lazy-task-id');
 
+      // Which upstream this request is bound for. Resolved HERE rather than at
+      // the forwarding site because the allowlist tier depends on it: a role
+      // upstream is a non-Anthropic backend and gets the tighter list.
+      const roleUpstream = caller ? roleUpstreams[caller.grant.role] : undefined;
+
+      // --- Forwarding-surface allowlist ---
+      // Applied BEFORE the body is buffered, the extractor runs, or anything is
+      // announced: a request lazy will not forward should not become work, and
+      // the refusal record is the only thing worth keeping about it.
+      //
+      // Applied to ALL non-cursor traffic, verified caller or not. Restricting
+      // it to granted callers would leave the surface open to exactly the class
+      // of client that presents no credential, and there is no legitimate
+      // non-model-API request through this proxy from any client.
+      const tier = roleUpstream ? 'role' : 'primary';
+      const pathDecision = decideProxyPath(req.method, url.pathname, tier);
+      if (!pathDecision.allowed) {
+        const upstreamForRecord = roleUpstream ?? upstream;
+        logger.warn(
+          `[proxy] seq=${currentSeq} REFUSED ${req.method} ${url.pathname} → ${upstreamForRecord} ` +
+            `(${pathRefusalReasonText(pathDecision.reason)}) task=${taskId ?? '-'} role=${role ?? '-'}`,
+        );
+        return refuse(
+          { id, seq: currentSeq, startMs, auditQueue },
+          req,
+          {
+            path,
+            upstream: upstreamForRecord,
+            backend: 'proxy',
+            role,
+            taskId,
+            reason: pathRefusalReasonText(pathDecision.reason),
+            message: pathRefusalMessage(req.method, url.pathname, tier, pathDecision.reason),
+            status: 403,
+            errorPrefix: PATH_REFUSED_PREFIX,
+            body: pathRefusalBody,
+          },
+        );
+      }
+
       // Buffer the request body for audit extraction; forward verbatim (and
       // re-send on failover — the body is already in memory, so a reroute costs
       // nothing extra to buffer).
@@ -712,7 +775,6 @@ export function createProxyServer(
       // is routed there and ONLY there — see `roleUpstreams` for why that list
       // gets no failover chain. Everything else is primary-then-fallbacks, and
       // the primary never overrides the model (undefined); fallbacks may.
-      const roleUpstream = caller ? roleUpstreams[caller.grant.role] : undefined;
       const targets: ProxyFallbackTarget[] = roleUpstream
         ? [{ upstream: roleUpstream, model: undefined }]
         : [{ upstream, model: undefined }, ...fallbacks];

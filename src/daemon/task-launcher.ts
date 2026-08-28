@@ -28,7 +28,8 @@ import { resolveAgentModel } from '../agent/agent-model';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
-import { createDriver } from '../remote';
+import { pinnedCustomImage } from '../docker/worktree-image';
+import { createDriver, resolveUpstreamMergeRef } from '../remote';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
 import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-tokens';
@@ -611,7 +612,15 @@ export async function launchTask(
     parentBranch = await getBranchNameFromId(tParentId, storage);
 
     try {
-      const parentRef = await driver.resolveUpstreamRef(parentBranch, projectRoot);
+      // Branch from the ref the child will eventually merge back into. A parent
+      // TASK branch is unprotected, so accept merges into its LOCAL branch — and
+      // its agent's commits are never on origin. Cutting a stacked child from
+      // `origin/<parent>` would start it behind its own parent.
+      const resolution = await resolveUpstreamMergeRef(driver, parentBranch, projectRoot, {
+        remoteName: config.remote.git_remote,
+      });
+      warnings.push(...resolution.warnings);
+      const parentRef = resolution.ref;
       const resolveResult = await runGit(['rev-parse', parentRef], { cwd: projectRoot });
       if (resolveResult.exitCode === 0) {
         startSha = resolveResult.stdout;
@@ -661,7 +670,15 @@ export async function launchTask(
     };
 
     try {
-      const parentRef = await driver.resolveUpstreamRef(parentBranch, projectRoot);
+      // Same resolution as the child-task path: a protected integration branch
+      // resolves to `origin/<branch>` as before, while an unprotected local
+      // target (which accept merges into locally) is not silently replaced by a
+      // stale remote ref.
+      const resolution = await resolveUpstreamMergeRef(driver, parentBranch, projectRoot, {
+        remoteName: config.remote.git_remote,
+      });
+      warnings.push(...resolution.warnings);
+      const parentRef = resolution.ref;
       const resolveResult = await runGit(['rev-parse', parentRef], { cwd: projectRoot });
       if (resolveResult.exitCode === 0) {
         startSha = resolveResult.stdout;
@@ -921,15 +938,20 @@ export async function launchTask(
     ensureProtocolDir(protoDir);
 
     if (parentBranch) {
-      // Resolve to the LIVE remote-tracking ref (e.g. `origin/main`) so the
-      // supervisor's pre-work sync merges the current remote upstream, not a
-      // stale local branch. Per CLAUDE.md "fail hard on remote failures — no
-      // silent fallbacks": a fetch failure here must be visible, never swallowed
-      // into a silent stale/local-ref merge. With `--force-local` the caller has
-      // opted into local HEAD, so degrade to the local branch name but still
-      // surface a warning.
+      // Resolve to the ref the supervisor's pre-work sync should merge: the
+      // LIVE remote-tracking ref (e.g. `origin/main`) for a protected target, so
+      // it never merges a stale local branch — but the LOCAL branch for an
+      // unprotected parent that accept merges into locally and whose agent
+      // commits are not on origin. Per CLAUDE.md "fail hard on remote failures —
+      // no silent fallbacks": a fetch failure here must be visible, never
+      // swallowed. With `--force-local` the caller has opted into local HEAD, so
+      // degrade to the local branch name but still surface a warning.
       try {
-        parentBranch = await driver.resolveUpstreamRef(parentBranch, worktreePath);
+        const resolution = await resolveUpstreamMergeRef(driver, parentBranch, worktreePath, {
+          remoteName: config.remote.git_remote,
+        });
+        warnings.push(...resolution.warnings);
+        parentBranch = resolution.ref;
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         if (params.forceLocal) {
@@ -984,7 +1006,7 @@ export async function launchTask(
         await withSpan('docker.launch_supervisor', {
           'lazy.runner': runner.type,
           'lazy.container': containerName,
-        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef));
+        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(t)));
       } catch (err) {
         await storage.updateTaskStatus(t.id, 'interrupted', getActor());
         if (!worktreeExisted) {

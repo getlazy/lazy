@@ -588,6 +588,66 @@ const SCRATCH_LARGE_BYTES = 100 * 1024 * 1024;
 
 // A sync spawn is acceptable throughout this function: `lazy doctor` is a
 // one-shot CLI health check, not a daemon path — blocking here is fine.
+/**
+ * Report daemon worktree-image adoption state (Part 2 of the worktree-image
+ * flow). Silent when nothing is adopted — a green line for the common case
+ * would be noise. Surfaces valid, expired, missing-dockerfile, and
+ * content-drifted states so the human can see what the daemon will (or will
+ * not) launch with.
+ */
+export async function checkAdoptedImage(root: string): Promise<CheckResult | null> {
+  const { inspectAdoptedImage, clearAdoptedImage } = await import('../../daemon/adopted-image');
+  const { VERSION } = await import('../../version');
+  const result = await inspectAdoptedImage(root);
+
+  if (result.status === 'none') return null;
+
+  if (result.status === 'valid') {
+    return {
+      ok: true,
+      label: 'Worktree image adopted',
+      detail:
+        `${result.state.imageName} from ${result.state.dockerfilePath} ` +
+        `(lazy ${result.state.lazyVersion}, adopted ${result.state.adoptedAt}). ` +
+        `Applies to the daemon and launches without a per-task pin until the next \`lazy upgrade\` rebuild.`,
+    };
+  }
+
+  if (result.status === 'expired') {
+    // Expire in place so doctor both diagnoses and cleans — same lifecycle as
+    // daemon startup / resolveCustomDockerfile.
+    await clearAdoptedImage(root);
+    return {
+      ok: true,
+      label: 'Worktree image adoption expired',
+      warning:
+        `Adoption was for lazy ${result.state.lazyVersion} but this binary is ${VERSION} — cleared. ` +
+        `Re-run \`lazy upgrade\` from a worktree TTY to adopt again.`,
+    };
+  }
+
+  if (result.status === 'content-drifted') {
+    await clearAdoptedImage(root);
+    return {
+      ok: true,
+      label: 'Worktree image adoption cleared',
+      warning:
+        `Adopted Dockerfile at ${result.state.dockerfilePath} changed after consent — cleared so ` +
+        `launches do not rebuild from post-consent edits. Re-run \`lazy upgrade\` from a worktree TTY to adopt again.`,
+    };
+  }
+
+  // missing-dockerfile
+  await clearAdoptedImage(root);
+  return {
+    ok: true,
+    label: 'Worktree image adoption cleared',
+    warning:
+      `Adopted Dockerfile was missing at ${result.state.dockerfilePath} — cleared so launches ` +
+      `are not wedged. Re-run \`lazy upgrade\` from a worktree TTY to adopt again.`,
+  };
+}
+
 function checkContainerImage(imageName: string, binary: string = 'docker'): CheckResult {
   try {
     const result = spawnSyncUnsupervised(
@@ -2521,6 +2581,14 @@ export async function commandDoctor(args: string[]): Promise<void> {
     }
 
     results.push(await checkPostgresConnectivity(config!));
+
+    // Deliberately OUTSIDE the runtime-healthy gate below: a lingering
+    // adoption is most confusing precisely when image things are already
+    // going wrong, so it must not be suppressed by a sick runtime.
+    if (isContainerRunner) {
+      const adoptedResult = await checkAdoptedImage(root);
+      if (adoptedResult) results.push(adoptedResult);
+    }
 
     // Container-dependent checks (Docker or Podman) — only if runtime is healthy
     if (isContainerRunner && runnerDiagnosticsOk) {

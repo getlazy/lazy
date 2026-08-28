@@ -33,6 +33,8 @@ import type {
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
+  InFlightTurn,
+  InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
   TaskTreeNode,
@@ -324,6 +326,10 @@ export class PostgresStorage implements Storage {
       // Backfill the tags column on databases created before tagging existed.
       await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb`;
 
+      // Backfill in_flight_turn (synchronous-turn correlation). NULL = nothing
+      // in flight, which is the correct reading for every pre-existing row.
+      await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS in_flight_turn JSONB`;
+
       await sql`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`;
       await sql`CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)`;
       await sql`CREATE INDEX IF NOT EXISTS idx_tasks_code ON tasks(code) WHERE code IS NOT NULL`;
@@ -350,6 +356,7 @@ export class PostgresStorage implements Storage {
           consecutive_interruptions INTEGER NOT NULL DEFAULT 0,
           auto_resumed BOOLEAN NOT NULL DEFAULT FALSE,
           user_stopped BOOLEAN NOT NULL DEFAULT FALSE,
+          reserved_turn_sequence INTEGER NOT NULL DEFAULT 0,
           started_at BIGINT NOT NULL,
           ended_at BIGINT
         )
@@ -361,6 +368,15 @@ export class PostgresStorage implements Storage {
       await sql`
         DO $$ BEGIN
           ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_stopped BOOLEAN NOT NULL DEFAULT FALSE;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$
+      `;
+
+      // Migration: add reserved_turn_sequence (turn-sequence reservation).
+      // 0 means nothing was ever reserved, which is right for existing rows.
+      await sql`
+        DO $$ BEGIN
+          ALTER TABLE sessions ADD COLUMN IF NOT EXISTS reserved_turn_sequence INTEGER NOT NULL DEFAULT 0;
         EXCEPTION WHEN duplicate_column THEN NULL;
         END $$
       `;
@@ -1044,6 +1060,7 @@ export class PostgresStorage implements Storage {
       created_at: now,
       completed_at: null,
       pending_sync: 0,
+      in_flight_turn: null,
     };
   }
 
@@ -1066,7 +1083,9 @@ export class PostgresStorage implements Storage {
     // pending_sync is required on Task; rows predating the column read as
     // undefined, which would make `task.pending_sync > 0` silently false.
     const pendingSync = typeof row.pending_sync === 'number' ? row.pending_sync : 0;
-    return { ...rest, metadata, target, tags, pending_sync: pendingSync } as unknown as Task;
+    // JSONB column; NULL (and rows predating it) read as "nothing in flight".
+    const inFlightTurn = (row.in_flight_turn as InFlightTurn | null | undefined) ?? null;
+    return { ...rest, metadata, target, tags, pending_sync: pendingSync, in_flight_turn: inFlightTurn } as unknown as Task;
   }
 
   private rowsToTasks(rows: Record<string, unknown>[]): Task[] {
@@ -1352,6 +1371,7 @@ export class PostgresStorage implements Storage {
       consecutive_interruptions: 0,
       auto_resumed: false,
       user_stopped: false,
+      reserved_turn_sequence: 0,
       started_at: now,
       ended_at: null,
     };
@@ -1370,6 +1390,8 @@ export class PostgresStorage implements Storage {
     return {
       ...rest,
       agent_session_id: (rest.agent_session_id as string | null | undefined) ?? (legacyId as string | null | undefined) ?? null,
+      // Rows predating the reservation column read as 0 = nothing reserved.
+      reserved_turn_sequence: typeof rest.reserved_turn_sequence === 'number' ? rest.reserved_turn_sequence : 0,
     } as unknown as Session;
   }
 
@@ -1604,7 +1626,73 @@ export class PostgresStorage implements Storage {
     const [result] = await this.sql<{ max: number | null }[]>`
       SELECT MAX(sequence) as max FROM turns WHERE session_id = ${sessionId}
     `;
-    return (result?.max ?? -1) + 1;
+    const next = (result?.max ?? -1) + 1;
+    const [row] = await this.sql<{ reserved_turn_sequence: number | null }[]>`
+      SELECT reserved_turn_sequence FROM sessions WHERE id = ${sessionId}
+    `;
+    // 0 = nothing was ever reserved. Guarded rather than folded into the max so
+    // an unreserved session keeps this backend's existing numbering exactly.
+    const reserved = row?.reserved_turn_sequence ?? 0;
+    return reserved > 0 ? Math.max(next, reserved + 1) : next;
+  }
+
+  async reserveTurnSequences(sessionId: string, count: number): Promise<number> {
+    if (count < 1) throw new Error(`reserveTurnSequences: count must be >= 1, got ${count}`);
+    // Single statement so concurrent reservers serialize on the row lock: the
+    // new high-water mark is computed from the row and the turns table at once.
+    const [row] = await this.sql<{ reserved_turn_sequence: number }[]>`
+      UPDATE sessions SET reserved_turn_sequence = GREATEST(
+        reserved_turn_sequence,
+        COALESCE((SELECT MAX(sequence) FROM turns WHERE session_id = ${sessionId}), 0),
+        0
+      ) + ${count}
+      WHERE id = ${sessionId}
+      RETURNING reserved_turn_sequence
+    `;
+    if (!row) throw new Error(`reserveTurnSequences: session ${sessionId} not found`);
+    return row.reserved_turn_sequence - count + 1;
+  }
+
+  // --- In-flight turns ---
+
+  async beginInFlightTurn(taskId: string, turn: InFlightTurn): Promise<boolean> {
+    // Compare-and-set in one statement: the claim only lands when the slot is
+    // empty or holds an EXPIRED record (see InFlightTurn.expires_at).
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE tasks SET in_flight_turn = ${this.sql.json(turn as unknown as Parameters<typeof this.sql.json>[0])}
+      WHERE id = ${taskId}
+        AND (
+          in_flight_turn IS NULL
+          OR COALESCE((in_flight_turn->>'expires_at')::bigint, 0) <= ${Date.now()}
+        )
+      RETURNING id
+    `;
+    return rows.length > 0;
+  }
+
+  async settleInFlightTurn(taskId: string, turnSequence: number, outcome: InFlightTurnOutcome): Promise<boolean> {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE tasks
+      SET in_flight_turn = jsonb_set(in_flight_turn, '{outcome}', ${this.sql.json(outcome as unknown as Parameters<typeof this.sql.json>[0])})
+      WHERE id = ${taskId}
+        AND in_flight_turn IS NOT NULL
+        AND (in_flight_turn->>'turn_sequence')::bigint = ${turnSequence}
+      RETURNING id
+    `;
+    return rows.length > 0;
+  }
+
+  async clearInFlightTurn(taskId: string, turnSequence?: number): Promise<void> {
+    if (turnSequence === undefined) {
+      await this.sql`UPDATE tasks SET in_flight_turn = NULL WHERE id = ${taskId}`;
+      return;
+    }
+    await this.sql`
+      UPDATE tasks SET in_flight_turn = NULL
+      WHERE id = ${taskId}
+        AND in_flight_turn IS NOT NULL
+        AND (in_flight_turn->>'turn_sequence')::bigint = ${turnSequence}
+    `;
   }
 
   async getTurnCountByTaskId(taskId: string): Promise<number> {

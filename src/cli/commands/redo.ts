@@ -18,6 +18,9 @@ import { theme } from '../theme';
 import { escapeRegex } from '../../utils/regex';
 import { latestWorkAgentTurn } from '../../utils/turns';
 import { turnText } from '../../utils/turn-content';
+import {
+  droppedCustomImagePinWarning,
+} from '../../docker/worktree-image';
 
 /**
  * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
@@ -218,6 +221,9 @@ export async function commandRedo(args: string[]): Promise<void> {
     // Set redo_of metadata to link back to old task
     await storage.updateTaskMetadata(newTask.id, 'redo_of', oldTask.id);
 
+    // INVARIANT: redo is a fresh start — do NOT inherit the old task's image pin.
+    const imagePinWarning = droppedCustomImagePinWarning(oldTask);
+
     // --- Now close the old task (single call, with correct reason) ---
     // "Closing" is the user-facing verb since `lazy abandon` was removed in
     // favour of `lazy close`; the underlying terminal status is still
@@ -248,6 +254,9 @@ export async function commandRedo(args: string[]): Promise<void> {
     console.log(`  ${theme.label('Goal:')} ${newTask.goal}`);
     if (newModel) {
       console.log(`  ${theme.label('Model:')} ${newModel}`);
+    }
+    if (imagePinWarning) {
+      console.log(`  ${theme.warning('Warning:')} ${imagePinWarning}`);
     }
 
   } finally {
@@ -303,6 +312,7 @@ What starts fresh:
   - Git branch (cut from the parent's current HEAD at start time)
   - Session (new agent session)
   - Turn history (only injected as context, not replayed)
+  - Container image (root-resolved; warns if the old task had a per-task pin)
 
 Examples:
   lazy redo abc123                        # Redo task, start immediately

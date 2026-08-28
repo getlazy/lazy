@@ -166,11 +166,23 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     daemonConfigPath?: string,
     taskId?: string,
+    pinnedImage?: string,
   ): Promise<void> {
     // Fail hard before launch if the agent's backend is unreachable — never
     // silently fall back to a different backend (CLAUDE.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
-    await launchSupervisorAsync(sandbox, runName, protocolDir, debug ?? false, this.binary, daemonConfigPath, this.agentTarget(), taskId, this._agent?.id);
+    await launchSupervisorAsync(
+      sandbox,
+      runName,
+      protocolDir,
+      debug ?? false,
+      this.binary,
+      daemonConfigPath,
+      this.agentTarget(),
+      taskId,
+      this._agent?.id,
+      pinnedImage,
+    );
   }
 
   async runClaudeSync(

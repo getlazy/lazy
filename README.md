@@ -1014,11 +1014,16 @@ open -a Docker
 sudo systemctl start docker
 ```
 
-### Custom Dockerfile says "image not found: lazy-runner"
+### Custom Dockerfile says "pull access denied" for lazy-runner
 
-If your project's `Dockerfile.lazy` starts with `FROM lazy-runner`, the base
-runner image must already exist locally. On a fresh machine it doesn't yet —
-prebuild it explicitly:
+`lazy-runner` is built on your machine and exists on no registry, so if it is
+missing, Docker assumes the name is a Docker Hub repository and reports
+`pull access denied, repository does not exist`.
+
+Normally you never see this: when your `Dockerfile.lazy` starts with
+`FROM lazy-runner` and the base image is absent, lazy builds the base first and
+says so ("Base image lazy-runner:latest not found — building it first..."). You
+can still prebuild it yourself:
 
 ```bash
 lazy system build lazy-runner
@@ -1026,6 +1031,15 @@ lazy system build lazy-runner
 
 This bypasses the current project's `lazy.toml` and builds the base image
 directly. Add `--no-cache` to force a clean rebuild.
+
+Two `FROM` spellings lazy cannot build for you, because building would not
+produce the image you asked for — for these, run the command above yourself:
+
+- a base pinned to an older tag, e.g. `FROM lazy-runner:0.19` (a base build only
+  ever writes the current `major.minor` tag and the `:latest` alias)
+- an agent-suffixed image, e.g. `FROM lazy-runner-cursor` — these are lazy's own
+  per-agent images and are not meant as a `FROM` target; use `FROM lazy-runner`
+  and add the agent's install line yourself
 
 ### Runner images are tagged with the lazy release version
 

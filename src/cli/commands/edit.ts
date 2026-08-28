@@ -1,4 +1,4 @@
-import { requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit } from '../helpers';
+import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit } from '../helpers';
 import { openEditor, promptLine, promptYesNo, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { isTerminalStatus, VALID_TASK_TYPES } from '../../types';
 import type { Task, TaskType } from '../../types';
@@ -7,6 +7,7 @@ import { parentTaskIdOf, taskTarget, branchTarget } from '../../task-target';
 import { resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS } from '../../config/types';
 import type { EffortLevel } from '../../config/types';
 import { listAgents } from '../../agent/registry';
+import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
 
 /**
  * Check if setting parentId as the parent of taskId would create a cycle.
@@ -339,6 +340,11 @@ export async function commandEdit(args: string[]): Promise<void> {
     if (!updated) {
       console.log('No changes made');
     }
+
+    // CLI TTY only: offer to pin this cwd's worktree Dockerfile after edits.
+    // Runs even when "No changes made" so a human can still opt into an image
+    // pin from edit without changing other fields.
+    await maybeOfferWorktreeImageForTask(requireLazyRoot(), storage, t.id);
   } finally {
     await storage.close();
   }

@@ -38,6 +38,8 @@ import type { AutoReactTrigger } from '../daemon/auto-react-budget';
 import { resetSlowLaneState, getLastProjectAutoResumeAt, recordProjectAutoResume } from '../daemon/auto-resume-queue';
 import { tryAdmitAgentSlot, releaseAgentSlot, countActiveAgents, effectiveAgentLimit, orderQueuedTasks, selectContainersToReap } from '../daemon/concurrency';
 import { sweepStrandedMerging } from '../daemon/stranded-merge';
+import { taskTurnInFlight, isInFlightLive } from '../daemon/in-flight-turn';
+import { settleInFlightTurnFromProtocol } from '../daemon/task-lifecycle';
 import { loadConfig } from '../config/loader';
 import { runGit } from './git';
 import { reparentChildren, formatReparentWarning } from '../cli/orphan';
@@ -405,6 +407,38 @@ async function reconcileTask(storage: Storage, taskId: string, lazyRoot: string,
   const taskRunner = session.runner_type && session.runner_type !== runner.type
     ? await createRunner(lazyRoot, session.runner_type)
     : runner;
+
+  // A synchronous daemon turn (ask / pre-accept) in flight?
+  //
+  // INVARIANT: the reconciler never PARKS a task whose turn has a waiter. The
+  // worktree lock cannot express this — `checkLock` is re-entrant on pid and
+  // the reconcile loop shares the daemon process that holds the lock, so the
+  // pre-accept lock is invisible here. Parking such a turn consumed the
+  // pre-accept response out from under `launchPreAcceptTurn` and let a later
+  // tick reap the container, leaving `lazy accept` polling for a deleted file
+  // until its ~35-minute budget expired.
+  //
+  // The reconciler stays the SINGLE READER of `response.json`, so it does not
+  // skip the task — it settles the response against the in-flight record and
+  // hands the outcome to the waiter through storage. See
+  // src/daemon/in-flight-turn.ts for the record, and
+  // settleInFlightTurnFromProtocol for the two variants (an ask records the
+  // turn and restores the pre-ask status instead of parking; a pre-accept
+  // hands its gate result back to the accept that is waiting for it).
+  const inFlight = task.in_flight_turn ?? null;
+  if (isInFlightLive(inFlight)) {
+    const verdict = await settleInFlightTurnFromProtocol(
+      storage, task, session, inFlight!, getWorktreePathForRef(lazyRoot, tRef),
+    );
+    if (verdict !== 'foreign') {
+      logger.debug(`Task ${taskShortId}: synchronous ${inFlight!.owner} turn in flight (${verdict}), leaving it to its waiter`);
+      return;
+    }
+    // 'foreign' — the response is some OTHER command's turn. The waiter has
+    // been told to abort; the turn itself is ordinary work, so fall through and
+    // reconcile it normally rather than leaving it in the slot.
+    logger.info(`Task ${taskShortId}: response did not answer the in-flight ${inFlight!.owner} turn — reconciling it as an ordinary turn`);
+  }
 
   // Skip tasks that are being actively worked on by another process (e.g., lazy start/unblock)
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
@@ -1760,6 +1794,14 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
       const taskShortId = shortId(task.id);
       const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
 
+      // Same in-flight guard as reconcileTask — the worktree lock is invisible
+      // to a sweep running in the daemon process that holds it. A sweep never
+      // settles: reconcileTask is where a live record is driven forward.
+      if (taskTurnInFlight(task)) {
+        logger.debug(`Task ${taskShortId}: synchronous daemon turn in flight, skipping interrupted sweep`);
+        continue;
+      }
+
       // Skip tasks with active worktree locks (another process is working on them)
       if (await checkLock(worktreePath)) {
         logger.debug(`Task ${taskShortId}: worktree locked, skipping interrupted sweep`);
@@ -2264,7 +2306,11 @@ export async function recoverStrandedWorkingTasks(
       const taskShortId = shortId(task.id);
       const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
 
-      // Don't touch tasks another process owns, or a human is pairing on.
+      // Don't touch tasks another process owns, or a human is pairing on —
+      // nor one with a synchronous daemon turn in flight (the worktree lock is
+      // pid-re-entrant and so cannot say that). A task with a waiter is not
+      // stranded, however long it has been `working`.
+      if (taskTurnInFlight(task)) continue;
       if (await checkLock(worktreePath)) continue;
       if (checkPairingLock(worktreePath)) continue;
 

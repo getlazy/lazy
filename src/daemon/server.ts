@@ -287,12 +287,19 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     process.chdir(projectRoot);
   }
 
-  // Container-image resolution honors LAZY_DOCKERFILE_LAZY (see
-  // resolveCustomDockerfile in src/capture/claude.ts). Say so once at startup:
-  // every container this daemon launches will resolve that file, and a daemon
-  // started WITHOUT the var keeps ignoring it until restarted.
-  if (process.env.LAZY_DOCKERFILE_LAZY) {
-    logger.info(`Container images follow LAZY_DOCKERFILE_LAZY=${process.env.LAZY_DOCKERFILE_LAZY}`);
+  // Announce a valid worktree adoption (or expire a stale one) so the human
+  // sees what the daemon will launch with — principle of least surprise.
+  {
+    const { loadValidAdoptedImage } = await import('./adopted-image');
+    const adopted = await loadValidAdoptedImage(projectRoot);
+    if (adopted) {
+      logger.info(
+        `Adopted worktree image: ${adopted.imageName} ` +
+        `(from ${adopted.dockerfilePath}, hash ${adopted.contentHash.slice(0, 12)}…, ` +
+        `lazy ${adopted.lazyVersion}). Applies to all launches without a per-task pin ` +
+        `until the next \`lazy upgrade\` rebuild.`
+      );
+    }
   }
 
   const socketPath = options.socketPath ?? getSocketPath(projectRoot);

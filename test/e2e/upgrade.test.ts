@@ -1,6 +1,7 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
-import { readFile, writeFile, unlink } from 'fs/promises';
+import { tmpdir } from 'os';
+import { readFile, writeFile, unlink, mkdtemp } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectError, expectFailure, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -229,16 +230,41 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'Dockerfile: embedded default');
   });
 
-  test('--images marks a LAZY_DOCKERFILE_LAZY override in the Dockerfile line', async () => {
-    const dockerfilePath = join(ctx.root, 'Dockerfile.override');
-    await writeFile(dockerfilePath, 'FROM debian:bookworm-slim\n');
+  // Part 2: a daemon-adopted worktree Dockerfile is announced the same way so
+  // the human can see what the next build / daemon restart will use. The path
+  // named is the consented SNAPSHOT under the daemon dir, not the live
+  // worktree file (builds read only those bytes).
+  test('--images marks a daemon-adopted Dockerfile in the Dockerfile line', async () => {
+    const { pinDaemonBaseDir } = await import('../helpers/daemon-base-dir');
+    const daemonBase = await mkdtemp(join(tmpdir(), 'lazy-upgrade-adopt-'));
+    const undoDaemonBase = pinDaemonBaseDir(daemonBase);
+    // Child CLI must see the same daemon base as this in-process write.
+    process.env.LAZY_DAEMON_BASE_DIR = daemonBase;
 
-    const result = await ctx.lazyMocked(['upgrade', '--images', '--dry-run'], MOCK_CLAUDE_SUCCESS, {
-      env: { LAZY_DOCKERFILE_LAZY: dockerfilePath },
-    });
+    try {
+      const dockerfilePath = join(ctx.root, 'Dockerfile.adopted');
+      const content = 'FROM debian:bookworm-slim\n# adopted\n';
+      await writeFile(dockerfilePath, content);
+      const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+      const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
+      const { VERSION } = await import('../../src/version');
+      await writeAdoptedImage(ctx.root, {
+        dockerfilePath,
+        contentHash: hashDockerfileContent(content),
+        imageName: 'lazy-custom-aaaaaaaaaaaa:0.22',
+        lazyVersion: VERSION,
+      }, { content });
 
-    expectSuccess(result);
-    expectOutput(result, `Dockerfile: ${dockerfilePath} (from LAZY_DOCKERFILE_LAZY)`);
+      const result = await ctx.lazyMocked(['upgrade', '--images', '--dry-run'], MOCK_CLAUDE_SUCCESS, {
+        env: { LAZY_DAEMON_BASE_DIR: daemonBase },
+      });
+
+      expectSuccess(result);
+      const snapshotPath = getAdoptedDockerfilePath(ctx.root);
+      expectOutput(result, `Dockerfile: ${snapshotPath} (daemon-adopted from worktree)`);
+    } finally {
+      undoDaemonBase();
+    }
   });
 
   test('a full upgrade names the image source alongside the background build', async () => {

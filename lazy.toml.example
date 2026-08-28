@@ -247,10 +247,15 @@ driver = "local"
 [docker]
 # Path to custom Dockerfile, relative to the project root. Empty = use the base
 # image (Ubuntu with Claude Code + passwordless sudo; agents apt-get what they
-# need). A task worktree's copy never governs the image. To build from another
-# file (e.g. a source branch's Dockerfile.lazy before it merges), export
-# LAZY_DOCKERFILE_LAZY=<path> — it overrides this key for every command and,
-# via ordinary env inheritance, for the daemon you (re)start.
+# need). A task worktree's copy never auto-governs the image. Launch resolution:
+# (1) a task's already-pinned metadata.custom_image, (2) a daemon-adopted
+# worktree image from a consented `lazy upgrade`, (3) this key. From a terminal
+# in a task worktree, `lazy create` / `start` / `edit` may ask once whether to
+# build that worktree's Dockerfile.lazy and pin it on the task (subtasks inherit
+# the pin; MCP never prompts). `lazy upgrade` from a worktree TTY may ask to
+# adopt that Dockerfile for the image build and the daemon until the next
+# upgrade rebuild — stored in daemon runtime state, not here; `lazy doctor`
+# reports it.
 dockerfile = ""
 
 [documents]

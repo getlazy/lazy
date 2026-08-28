@@ -3,7 +3,7 @@ import { requireLazyRoot, requireStorage, displayId, parseFlags, resolveTaskOrEx
 import { getCurrentBranch, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
 import { loadConfig } from '../../config/loader';
-import { createDriver } from '../../remote';
+import { createDriver, resolveUpstreamMergeRef } from '../../remote';
 import { queryDiff } from '../../daemon/rpc-fallback';
 import { parentTaskIdOf } from '../../task-target';
 
@@ -127,12 +127,17 @@ async function handleTurnDiff(
     fallbackFromRef = await getRemoteDefaultBranch(root);
   }
 
-  // Resolve the base ref through the driver to get origin/<branch> when using
-  // a remote driver, or the local branch when using local driver.
+  // Resolve the base ref the same way accept and sync do: origin/<branch> for a
+  // protected target, the local branch when that is what accept merges into.
+  // Rendering a turn diff against a stale origin ref while the local parent has
+  // moved on shows the parent's commits as if the task had made them.
   try {
     const config = await loadConfig(root);
     const driver = createDriver(config);
-    fallbackFromRef = await driver.resolveUpstreamRef(fallbackFromRef, worktreePath);
+    const resolution = await resolveUpstreamMergeRef(driver, fallbackFromRef, worktreePath, {
+      remoteName: config.remote.git_remote,
+    });
+    fallbackFromRef = resolution.ref;
   } catch {
     // Non-fatal: use the local ref if driver resolution fails
   }
