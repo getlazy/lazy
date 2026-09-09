@@ -160,7 +160,15 @@ first, the same one `lazy upgrade` already had.
 
 A `lazy.toml` that exists but cannot be read is always a hard error, never a
 silent fallback to defaults: running with settings you didn't write is worse
-than not running. The message names the file and the parse error.
+than not running. The message names the file, the line that failed and its
+text, and what the parser objected to:
+
+```
+Failed to parse /path/to/lazy.toml: line 8: port = = 26024 — TOML Parse error: Expected a value but found '='
+```
+
+The daemon applies the same rule before it starts anything at all, so a broken
+`lazy.toml` never gets as far as a daemon running on guessed values.
 
 The same applies to a value that parses as TOML but isn't usable — an unknown
 effort level, a port outside 1–65535, a malformed `[docs] url`. Each is

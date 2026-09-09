@@ -18,6 +18,11 @@
  * the created timestamp that backs the age-based freshness check) plus an
  * `images.tsv` that backs `docker images --format`. Every invocation is appended
  * to `invocations.log`, so tests assert on the argv lazy actually passed.
+ *
+ * Builds additionally record their CONTEXT — the cwd and the tree found there.
+ * Argv alone cannot show it (lazy always passes `.`), and "which tree did this
+ * build see" is exactly what the worktree-image flow gets wrong when it
+ * regresses.
  */
 
 import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
@@ -64,14 +69,33 @@ case "\${1:-}" in
   build)
     shift
     tags=()
+    dockerfile=""
     hash=""
     while [ \$# -gt 0 ]; do
       case "\$1" in
         -t) tags+=("\$2"); shift 2 ;;
         --label) hash="\${2#lazy.dockerfile.hash=}"; shift 2 ;;
+        -f) dockerfile="\$2"; shift 2 ;;
         *) shift ;;
       esac
     done
+    # Record the BUILD CONTEXT (cwd + the tree docker would have seen). Recorded
+    # before the fail check so a failing build is still inspectable, and one
+    # record per build attempt so indices line up with builds().
+    mkdir -p "\$STATE/contexts"
+    c=\$(cat "\$STATE/context-count" 2>/dev/null || echo 0)
+    c=\$((c + 1))
+    echo "\$c" > "\$STATE/context-count"
+    printf '%s\\n' "\$PWD" >> "\$STATE/build-cwds.log"
+    (cd "\$PWD" && find . -mindepth 1 | sed 's|^\\./||' | LC_ALL=C sort) > "\$STATE/contexts/\$c.files" 2>/dev/null
+    # Keep the one file whose CONTENT decides a build: the Dockerfile \`-f\`
+    # named. It is a temp copy of the consented bytes that lazy deletes the
+    # moment the build returns, so a test cannot read it afterwards — copy it
+    # while it exists. The file, not the tree: the root-Dockerfile path builds
+    # with the whole project as its context, and copying that every build would
+    # be absurd.
+    mkdir -p "\$STATE/contexts/\$c.content"
+    [ -n "\$dockerfile" ] && [ -f "\$dockerfile" ] && cp "\$dockerfile" "\$STATE/contexts/\$c.content/dockerfile" 2>/dev/null
     if [ -f "\$STATE/fail-build" ]; then
       echo "fake docker: build failed on purpose" >&2
       exit 1
@@ -120,6 +144,22 @@ export interface FakeDocker {
   seedImage(ref: string, opts?: { dockerfileHash?: string; id?: string; size?: string; createdAt?: Date | string }): Promise<void>;
   /** Every `docker build` invocation so far, as the joined argv string. */
   builds(): Promise<string[]>;
+  /**
+   * The cwd of each build attempt, in order — i.e. the docker BUILD CONTEXT
+   * directory, which `builds()` cannot show because lazy always passes `.`.
+   */
+  buildCwds(): Promise<string[]>;
+  /**
+   * Paths (relative, sorted) the build context of attempt `index` contained.
+   * Same 0-based ordering as `builds()` / `buildCwds()`.
+   */
+  buildContextFiles(index: number): Promise<string[]>;
+  /**
+   * Content of the Dockerfile `-f` named for attempt `index`; null when that
+   * build named none. Snapshotted at build time, because lazy builds from a
+   * temp copy it deletes the moment the build returns.
+   */
+  buildContextContent(index: number, which: 'dockerfile'): Promise<string | null>;
   /** Every invocation so far, as joined argv strings. */
   invocations(): Promise<string[]>;
   /** Make the next build fail (offline-fallback tests). */
@@ -128,13 +168,24 @@ export interface FakeDocker {
   failRuns(): Promise<void>;
 }
 
-export async function installFakeDocker(baseDir: string): Promise<FakeDocker> {
-  const binDir = join(baseDir, 'fake-docker-bin');
-  const stateDir = join(baseDir, 'fake-docker-state');
+export async function installFakeDocker(
+  baseDir: string,
+  options: {
+    /**
+     * Executable name to install under. `podman` is the second runtime lazy
+     * supports and is passed as the `binary` argument exactly like docker, so a
+     * suite covering both installs one fake per name (each with its own state).
+     */
+    name?: string;
+  } = {},
+): Promise<FakeDocker> {
+  const name = options.name ?? 'docker';
+  const binDir = join(baseDir, `fake-${name}-bin`);
+  const stateDir = join(baseDir, `fake-${name}-state`);
   await mkdir(binDir, { recursive: true });
   await mkdir(join(stateDir, 'images'), { recursive: true });
 
-  const scriptPath = join(binDir, 'docker');
+  const scriptPath = join(binDir, name);
   // The state directory is baked into the script rather than passed via env:
   // Bun snapshots the environment for spawned processes at startup, so a
   // variable set later in the test process never reaches the fake.
@@ -178,6 +229,20 @@ export async function installFakeDocker(baseDir: string): Promise<FakeDocker> {
     },
     async builds() {
       return (await readLines('invocations.log')).filter(line => line.startsWith('build '));
+    },
+    async buildCwds() {
+      return readLines('build-cwds.log');
+    },
+    async buildContextFiles(index) {
+      return readLines(join('contexts', `${index + 1}.files`));
+    },
+    async buildContextContent(index, which) {
+      try {
+        return await readFile(join(stateDir, 'contexts', `${index + 1}.content`, which), 'utf-8');
+      } catch {
+        // Absent from that build's context — a real answer, not a failure.
+        return null;
+      }
     },
     async invocations() {
       return readLines('invocations.log');

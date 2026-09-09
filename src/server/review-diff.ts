@@ -141,6 +141,18 @@ export function parseUnifiedDiff(diffText: string): DiffFile[] {
       files.push(current);
       continue;
     }
+    if (raw.startsWith('diff --')) {
+      // Some OTHER `diff --<something>` header — not a git patch section. The
+      // daemon appends a synthetic `diff --lazy a/comments b/comments` block
+      // to `lazy diff`, and anything else pasted into a patch can do the same.
+      // Falling through here made the following `+++ b/comments` rename the
+      // LAST REAL FILE to "comments" and swallow its hunks (the phantom
+      // "comments" file on the review page). Close the current file and skip
+      // until the next real `diff --git`.
+      current = null;
+      hunk = null;
+      continue;
+    }
     if (!current) continue;
 
     if (raw.startsWith('--- ')) {

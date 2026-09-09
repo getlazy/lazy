@@ -38,6 +38,8 @@ import { installFakeDocker } from '../helpers/fake-docker';
 import { runGit } from '../../src/utils/git';
 
 const ADOPTED_CONTENT = 'FROM debian:bookworm-slim\n# adopted\n';
+/** Stand-in for the worktree HEAD recorded as provenance at adoption time. */
+const CONTEXT_COMMIT = 'ab'.repeat(20);
 
 async function writeValidAdoption(
   root: string,
@@ -49,6 +51,9 @@ async function writeValidAdoption(
     dockerfilePath: dockerfile,
     contentHash,
     imageName,
+    // Provenance only: HEAD when the adoption was recorded. The build reads
+    // the worktree live, so this never gates validity.
+    contextCommit: CONTEXT_COMMIT,
   });
 }
 
@@ -122,10 +127,46 @@ describe('adopted-image persistence', () => {
       dockerfilePath: gone,
       contentHash: 'e'.repeat(64),
       imageName: `lazy-custom-eeeeeeeeeeee:${IMAGE_TAG}`,
+      contextCommit: CONTEXT_COMMIT,
     });
     expect(await inspectAdoptedImage(root)).toMatchObject({ status: 'missing-dockerfile' });
     expect(await loadValidAdoptedImage(root)).toBeNull();
     expect(await readAdoptedImage(root)).toBeNull();
+  });
+
+  // INVARIANT: legacy adoptions written before provenance existed keep working.
+  // A stored image that exists must still launch; only a MISSING image fails.
+  test('an adoption without recorded provenance stays valid', async () => {
+    await writeAdoptedImage(root, {
+      dockerfilePath: dockerfile,
+      contentHash: hashDockerfileContent(ADOPTED_CONTENT),
+      imageName: `lazy-custom-000000000000:${IMAGE_TAG}`,
+    });
+    expect(await inspectAdoptedImage(root)).toMatchObject({ status: 'valid' });
+    expect((await loadValidAdoptedImage(root))?.imageName).toBe(
+      `lazy-custom-000000000000:${IMAGE_TAG}`,
+    );
+  });
+
+  test('write/read round-trips the recorded provenance', async () => {
+    const written = await writeValidAdoption(root, dockerfile);
+    expect(written.contextCommit).toBe(CONTEXT_COMMIT);
+    expect(await readAdoptedImage(root)).toEqual(written);
+  });
+
+  test('adoptedBuildContextRoot resolves the consented worktree directory', async () => {
+    await writeValidAdoption(root, dockerfile);
+    const { adoptedBuildContextRoot } = await import('../../src/daemon/adopted-image');
+    const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
+
+    // The build context is the directory holding the consented Dockerfile —
+    // derived from the adoption's own path, so adoptions written before any
+    // provenance field existed resolve identically.
+    expect(await adoptedBuildContextRoot(root, getAdoptedDockerfilePath(root))).toBe(root);
+
+    // The root [docker].dockerfile keeps the project root as its context — it
+    // must never pick up the adopted worktree.
+    expect(await adoptedBuildContextRoot(root, dockerfile)).toBeNull();
   });
 
   // INVARIANT: post-consent agent edits must not become host docker rebuilds.
@@ -294,6 +335,21 @@ describe('checkAdoptedImage (doctor)', () => {
     expect(result!.label).toBe('Worktree image adopted');
     expect(result!.detail).toContain(`lazy-custom-ffffffffffff:${IMAGE_TAG}`);
     expect(result!.detail).toContain(dockerfile);
+    // Doctor names the build context directory, and HEAD as provenance.
+    expect(result!.detail).toContain(`build context ${root}`);
+    expect(result!.detail).toContain(CONTEXT_COMMIT.slice(0, 12));
+  });
+
+  test('reports a legacy adoption that has no recorded provenance', async () => {
+    await writeAdoptedImage(root, {
+      dockerfilePath: dockerfile,
+      contentHash: hashDockerfileContent(ADOPTED_CONTENT),
+      imageName: `lazy-custom-333333333333:${IMAGE_TAG}`,
+    });
+    const result = await checkAdoptedImage(root);
+    expect(result!.label).toBe('Worktree image adopted');
+    expect(result!.detail).toContain(`build context ${root}`);
+    expect(await readAdoptedImage(root)).not.toBeNull();
   });
 
   test('expires a stale adoption and warns', async () => {

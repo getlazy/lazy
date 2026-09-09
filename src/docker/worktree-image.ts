@@ -6,9 +6,14 @@
  * MCP, builder, and scripts never prompt and never pin — they keep the
  * root-resolved image. Agents must not be able to choose the image.
  *
+ * The build context is that worktree directory — never the project root, whose
+ * tree belongs to a different branch and would resolve the Dockerfile's COPY
+ * paths against the wrong files.
+ *
  * Persistence is task metadata (not a first-class Task field):
- *   custom_image      — full image ref, e.g. lazy-custom-abc123def456:0.22
- *   custom_image_hash — full sha256 of the Dockerfile content that was built
+ *   custom_image         — full image ref, e.g. lazy-custom-abc123def456:0.22
+ *   custom_image_hash    — full sha256 of the Dockerfile content that was built
+ *   custom_image_context — worktree HEAD when the image was built (informational)
  *
  * Launch resolution: stored task image if set (fail loud if missing), else
  * daemon-adopted image (Part 2), else root.
@@ -16,7 +21,7 @@
 
 import { createHash } from 'crypto';
 import { readFile, realpath } from 'fs/promises';
-import { isAbsolute, join, relative } from 'path';
+import { dirname, isAbsolute, join, relative } from 'path';
 import { getDataDir } from '../cli/init';
 import { isTTY, promptYesNo } from '../cli/editor';
 import { theme } from '../cli/theme';
@@ -39,6 +44,15 @@ export const CUSTOM_IMAGE_META_KEY = 'custom_image';
 
 /** Task metadata: full sha256 of the Dockerfile content used for the pin. */
 export const CUSTOM_IMAGE_HASH_META_KEY = 'custom_image_hash';
+
+/**
+ * Task metadata: the worktree's HEAD when the pinned image was built.
+ *
+ * INFORMATIONAL ONLY — provenance for `lazy show`, not a guarantee about the
+ * image. The build reads the worktree live, so uncommitted files in it were in
+ * the context too and this commit does not describe them.
+ */
+export const CUSTOM_IMAGE_CONTEXT_META_KEY = 'custom_image_context';
 
 /**
  * Return the absolute cwd when it is a lazy task worktree under `projectRoot`,
@@ -73,6 +87,20 @@ export async function lazyTaskWorktreeCwd(projectRoot: string): Promise<string |
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
 
   return cwd;
+}
+
+/**
+ * The worktree's HEAD, for the informational provenance field. Never throws and
+ * never blocks a build: a directory outside git, or a repo with no commits yet,
+ * simply has no HEAD to record.
+ */
+export async function worktreeHead(dir: string): Promise<string | null> {
+  const head = await runGit(['rev-parse', 'HEAD'], {
+    cwd: dir,
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  return head.exitCode === 0 && head.stdout.length > 0 ? head.stdout : null;
 }
 
 /** Full sha256 of Dockerfile (or other) text — matches what we store on the task. */
@@ -195,6 +223,12 @@ export function pinnedCustomImageHash(task: Task | null | undefined): string | u
   return hash && hash.length > 0 ? hash : undefined;
 }
 
+/** Read the worktree HEAD recorded when the pinned image was built, if any. */
+export function pinnedCustomImageContext(task: Task | null | undefined): string | undefined {
+  const commit = task?.metadata?.[CUSTOM_IMAGE_CONTEXT_META_KEY];
+  return commit && commit.length > 0 ? commit : undefined;
+}
+
 /**
  * Copy parent custom_image / custom_image_hash onto a newly created child.
  * No-op when the parent has no pin. Used by CLI and MCP create alike.
@@ -210,6 +244,12 @@ export async function inheritCustomImageMetadata(
 
   await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_META_KEY, image);
   await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_HASH_META_KEY, hash);
+  // Provenance travels with the pin: without it the child records an image
+  // nothing can say which tree built.
+  const context = pinnedCustomImageContext(parent);
+  if (context) {
+    await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_CONTEXT_META_KEY, context);
+  }
   return true;
 }
 
@@ -272,7 +312,12 @@ export async function maybeOfferWorktreeImageForTask(
     // Pin is stale (pruned). Fall through so the human can rebuild.
   }
 
+  // Name the build context on screen: the human is consenting to a docker
+  // build over this whole directory, not just to the Dockerfile they edited.
+  const contextDir = dirname(diff.worktreeDockerfile);
   console.log('');
+  console.log(`  Dockerfile: ${diff.worktreeDockerfile}`);
+  console.log(`  Context:    ${contextDir} (this worktree, as it is on disk)`);
   const accepted = await promptYesNo(
     `This worktree's ${WORKTREE_DOCKERFILE} differs from ${diff.referenceLabel} — ` +
       `build it and use it for this task? Build steps run under the host's docker.`,
@@ -289,10 +334,17 @@ export async function maybeOfferWorktreeImageForTask(
 
   await storage.updateTaskMetadata(taskId, CUSTOM_IMAGE_META_KEY, built.imageName);
   await storage.updateTaskMetadata(taskId, CUSTOM_IMAGE_HASH_META_KEY, built.contentHash);
+  // Provenance, not a guarantee: HEAD when the image was built. Absent when the
+  // worktree is not a git checkout — which is fine, the build still ran.
+  const head = await worktreeHead(contextDir);
+  if (head) {
+    await storage.updateTaskMetadata(taskId, CUSTOM_IMAGE_CONTEXT_META_KEY, head);
+  }
 
   console.log(
     `  ${theme.success('Pinned')} ${built.imageName} for this task ` +
-      `(hash ${built.contentHash.slice(0, 12)}…). Later turns use it with no prompt.`,
+      `(hash ${built.contentHash.slice(0, 12)}…${head ? `, HEAD ${head.slice(0, 12)}` : ''}). ` +
+      `Later turns use it with no prompt.`,
   );
   console.log('');
 

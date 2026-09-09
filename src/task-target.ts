@@ -28,8 +28,7 @@
  */
 
 import type { Task, TaskTarget } from './types';
-
-const LAZY_REF_PREFIX = 'lazy/';
+import { looksLikeTaskBranch } from './git/branch-prefix';
 
 /**
  * Smart constructor for the `task` variant (stacked on another task).
@@ -54,7 +53,7 @@ export function branchTarget(branch: string): TaskTarget {
   if (trimmed === '') {
     throw new Error('TaskTarget: branch must be a non-empty branch name');
   }
-  if (trimmed.startsWith(LAZY_REF_PREFIX)) {
+  if (looksLikeTaskBranch(trimmed)) {
     throw new Error(
       `TaskTarget: branch must be a real integration branch, not a lazy task ref ('${branch}')`,
     );

@@ -73,6 +73,7 @@ function rejectIfReadOnly(toolName: string): void {
 
 // Re-use storage and helpers from existing CLI infrastructure
 import { requireStorage, shortId, requireLazyRoot, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef } from '../cli/helpers';
+import { looksLikeTaskBranch, taskRefFromBranch } from '../git/branch-prefix';
 import { INTERNAL_GIT_TOOL_NAME, createInternalGitHandler } from './internal-git';
 import type { Storage, SearchResult } from '../storage';
 import type { Task, TaskTarget, TaskPriority } from '../types';
@@ -1074,7 +1075,7 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
           if (verify.exitCode !== 0) {
             throw new Error(`Parent '${parent}' is neither a known task nor a local git branch.`);
           }
-          if (parent.startsWith('lazy/')) {
+          if (looksLikeTaskBranch(parent)) {
             throw new Error(`parent must be an integration branch, not a lazy task branch ('${parent}').`);
           }
           explicitBranchTarget = parent;
@@ -2224,7 +2225,7 @@ async function computeDiffCwdAndRange(
   lazyRoot: string,
 ): Promise<{ cwd: string; diffRange: string }> {
   // Worktrees live under <projectRoot>/.lazy/worktrees/, NOT under the storage path.
-  const tRef = session.git_branch.replace('lazy/', '');
+  const tRef = taskRefFromBranch(session.git_branch);
   const worktreePath = getWorktreePathForRef(lazyRoot, tRef);
   const cwd = (await pathExists(worktreePath)) ? worktreePath : lazyRoot;
 

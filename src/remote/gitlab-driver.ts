@@ -52,6 +52,7 @@ import type { Task } from '../types';
 import { targetBranchOf } from '../task-target';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
+import { looksLikeTaskBranch } from '../git/branch-prefix';
 import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
 import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
@@ -1425,7 +1426,7 @@ export class GitLabDriver implements RepositoryDriver {
       );
     }
     const branch = targetBranchOf(task);
-    if (branch?.startsWith('lazy/')) {
+    if (branch && looksLikeTaskBranch(branch)) {
       throw new Error(
         `Refusing to create an MR for task ${task.id}: integration target ('${branch}') is a lazy task branch, ` +
         `not a real integration branch. A lazy task-branch parent means the merge must be a local git operation, ` +

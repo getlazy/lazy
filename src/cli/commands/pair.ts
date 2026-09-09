@@ -17,6 +17,7 @@ import { runClaude } from '../../capture/claude';
 import { loadConfig } from '../../config/loader';
 import { runInteractiveSupervisor } from '../../supervisor/interactive';
 import { createDriver } from '../../remote';
+import { autoPushEnabled } from '../../remote/auto-push';
 import { isOfflineMode } from '../../utils/offline';
 import { logger, LogLevel } from '../../utils/logger';
 import { encodeProjectPath } from '../../import/claude-code-logs';
@@ -588,7 +589,9 @@ export async function commandPair(args: string[]): Promise<void> {
       try {
         const config = await loadConfig(root);
         const offline = await isOfflineMode(join(root, '.lazy'), config.remote.offline);
-        if (!offline) {
+        // Nobody asked for this push — it stands in for the next sync tick — so
+        // it is one of the automatic pushes `<driver>_auto_push = false` covers.
+        if (!offline && autoPushEnabled(config)) {
           const driver = createDriver(config);
           await driver.pushBranch(sess.git_branch);
         }

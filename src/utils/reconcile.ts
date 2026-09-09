@@ -32,6 +32,7 @@ import { checkLock, removeLock } from './lock';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../cli/helpers';
+import { taskBranchFor, DEFAULT_BRANCH_PREFIX } from '../git/branch-prefix';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import type { AutoReactTrigger } from '../daemon/auto-react-budget';
@@ -2226,11 +2227,16 @@ async function sweepStalePairing(storage: Storage, lazyRoot: string): Promise<vo
  *      it ran, but the branch (with all its commits) travels with the repo.
  *      A `backlog` task whose branch already has commits should be `blocked`.
  *
- * Recovery strategy: for each `backlog` task, check if `lazy/<ref>` exists
- * and has any commits beyond `branched_from_sha`. If yes, transition to
+ * Recovery strategy: for each `backlog` task, check whether its task branch
+ * exists and has any commits beyond `branched_from_sha`. If yes, transition to
  * `blocked` so the task is recoverable via `lazy unblock` or `lazy resume`.
  * The transition itself is validated by the canonical state-machine table
  * in `src/task-state-machine.ts`.
+ *
+ * Both branch namespaces are tried: a project that changed `[git]
+ * default_branch_prefix` has pre-switch branches under the built-in `lazy/`
+ * one, and those tasks' durable work must stay recoverable. Read-only either
+ * way — the worst case of an extra probe is one `rev-list` that exits non-zero.
  */
 export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: string): Promise<void> {
   try {
@@ -2245,19 +2251,30 @@ export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: stri
         if (!task.branched_from_sha) continue;
 
         const tRef = await taskRefFromId(task.id, storage);
-        const branch = `lazy/${tRef}`;
+        // The configured namespace first, then the built-in one for branches
+        // created before the prefix was changed. Deduped so the common case
+        // (no prefix configured) stays exactly one git call.
+        const candidates = [...new Set([taskBranchFor(tRef), `${DEFAULT_BRANCH_PREFIX}/${tRef}`])];
 
-        // Single git call: count commits on the branch beyond the base.
-        // If the branch doesn't exist, rev-list exits non-zero and we skip.
-        // (We deliberately avoid a separate `branchExists` precheck — both for
-        // efficiency and because some tests globally mock that helper.)
-        const result = await runGit(
-          ['rev-list', '--count', `${task.branched_from_sha}..${branch}`],
-          { cwd: lazyRoot },
-        );
-        if (result.exitCode !== 0) continue;
-        const ahead = parseInt(result.stdout.trim(), 10) || 0;
-        if (ahead === 0) continue;
+        // One git call per candidate: count commits on the branch beyond the
+        // base. If the branch doesn't exist, rev-list exits non-zero and we
+        // move on. (We deliberately avoid a separate `branchExists` precheck —
+        // both for efficiency and because some tests globally mock that helper.)
+        let branch = '';
+        let ahead = 0;
+        for (const candidate of candidates) {
+          const result = await runGit(
+            ['rev-list', '--count', `${task.branched_from_sha}..${candidate}`],
+            { cwd: lazyRoot },
+          );
+          if (result.exitCode !== 0) continue;
+          const count = parseInt(result.stdout.trim(), 10) || 0;
+          if (count === 0) continue;
+          branch = candidate;
+          ahead = count;
+          break;
+        }
+        if (!branch) continue;
 
         logger.warn(`Task ${taskShortId}: backlog task has ${ahead} commit(s) on ${branch}, recovering to blocked`);
         await storage.updateTaskStatus(task.id, 'blocked', 'system');

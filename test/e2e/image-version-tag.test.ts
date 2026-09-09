@@ -22,7 +22,7 @@
  * One test per trigger below, plus the boundary of (2).
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFile, writeFile, mkdir, mkdtemp } from 'fs/promises';
+import { readFile, realpath, writeFile, mkdir, mkdtemp } from 'fs/promises';
 import { createHash } from 'crypto';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -47,6 +47,7 @@ import { startBackgroundImageBuild } from '../../src/upgrade/background-image-bu
 import { checkStaleLazyImages } from '../../src/cli/commands/doctor';
 import { VERSION } from '../../src/version';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { commitAll } from '../helpers/git-repo';
 
 enableInProcessTestMode();
 
@@ -386,7 +387,12 @@ describe('runner image identity and freshness', () => {
   //     upgrade builds flip enableUpgradeImageBuild() so resolveCustomDockerfile
   //     may return the adopted path for the rebuild itself.
 
-  async function setupWorktreeWithOwnDockerfile(): Promise<{ wt: string; wtContent: string; rootContent: string }> {
+  async function setupWorktreeWithOwnDockerfile(): Promise<{
+    wt: string;
+    wtContent: string;
+    rootContent: string;
+    wtHead: string;
+  }> {
     // The root project uses a custom Dockerfile...
     const rootContent = 'FROM debian:bookworm-slim\n# root variant\n';
     await writeFile(join(ctx.root, 'Dockerfile.custom'), rootContent);
@@ -398,13 +404,22 @@ describe('runner image identity and freshness', () => {
 
     // ...and a task worktree carries its own lazy.toml plus a CHANGED
     // Dockerfile — the shape of a task branch (possibly agent-authored) that
-    // edits the Dockerfile, e.g. adding an install line.
+    // edits the Dockerfile, e.g. adding an install line. A REAL linked git
+    // worktree, as lazy creates: its `.git` is a file pointing back at the main
+    // repo (which is why findGitRoot still answers the project root from in
+    // here), and its HEAD is a commit a consented build can be snapshotted from.
     const wt = join(ctx.root, '.lazy', 'worktrees', 'dockerfile-branch');
-    await mkdir(wt, { recursive: true });
+    await mkdir(join(ctx.root, '.lazy', 'worktrees'), { recursive: true });
+    const added = ctx.git('worktree', 'add', '-q', '-b', 'lazy/dockerfile-branch', wt);
+    expect(added.exitCode).toBe(0);
     await writeFile(join(wt, 'lazy.toml'), updated);
     const wtContent = rootContent + 'RUN curl https://cursor.com/install -fsS | bash\n';
     await writeFile(join(wt, 'Dockerfile.custom'), wtContent);
-    return { wt, wtContent, rootContent };
+    // A file that exists on the branch and NOT at the project root — the shape
+    // of the COPY that broke when the root was used as the build context.
+    await writeFile(join(wt, 'worktree-only.txt'), 'only on this branch\n');
+    const wtHead = await commitAll(wt, 'worktree fixture');
+    return { wt, wtContent, rootContent, wtHead };
   }
 
   const shortHashOf = (content: string) =>
@@ -431,6 +446,26 @@ describe('runner image identity and freshness', () => {
       expect(builds[0]).toMatch(/-f \S*lazy-docker-build-\S+\/Dockerfile/);
       expect(builds[0]).not.toContain(join(wt, 'Dockerfile.custom'));
       expect(builds[0]).not.toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
+
+      // INVARIANT: snapshotted build contexts are for CONSENTED worktree
+      // Dockerfiles only. The plain `[docker].dockerfile` path is unchanged by
+      // that work — it still runs in the PROJECT ROOT with `.` as the context
+      // argument. Asserted, not eyeballed: this is the whole blast radius of
+      // the `buildCwd` conditional in buildImageWithTags.
+      const [cwd] = await docker.buildCwds();
+      expect(cwd).toBe(await realpath(ctx.root));
+      expect(cwd).not.toMatch(/lazy-build-ctx-/);
+      // Trailing `.` — a directory context rooted at that cwd.
+      expect(builds[0].endsWith(' .')).toBe(true);
+      // Byte-for-byte argv: `build`, the tags, the hash label, `-f <temp>`, `.`
+      // — no extra flags, and nothing pointing into an extracted tree.
+      expect(builds[0]).toMatch(
+        /^build(?: -t \S+)+ --label lazy\.dockerfile\.hash=[0-9a-f]{64} -f \S+\/Dockerfile \.$/,
+      );
+      // The context this build saw is the project root's real tree, not an
+      // extraction: the file only the branch has must be absent.
+      const rootFiles = await docker.buildContextFiles(0);
+      expect(rootFiles).not.toContain('worktree-only.txt');
     } finally {
       process.chdir(ctx.root);
     }
@@ -440,15 +475,22 @@ describe('runner image identity and freshness', () => {
   // adopted imageName and never rebuilds from the worktree path — even when
   // the latch is later flipped for an upgrade rebuild of that same adoption.
   test('upgrade-build latch lets resolveCustomDockerfile see an adopted path; launches do not', async () => {
-    const { wt, wtContent, rootContent } = await setupWorktreeWithOwnDockerfile();
+    const { wt, wtContent, rootContent, wtHead } = await setupWorktreeWithOwnDockerfile();
     const wtDockerfile = join(wt, 'Dockerfile.custom');
     const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
     const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
-    const imageName = `lazy-custom-${shortHashOf(wtContent)}:${IMAGE_TAG}`;
+    const { consentedBuildIdentity } = await import('../../src/capture/image-tag');
+    const contentHash = hashDockerfileContent(wtContent);
+    // An adoption names its image after the consented Dockerfile AND the
+    // directory it builds against — the same bytes in another worktree are
+    // another image.
+    const identity = consentedBuildIdentity(contentHash, wt);
+    const imageName = `lazy-custom-${identity.substring(0, 12)}:${IMAGE_TAG}`;
     await writeAdoptedImage(ctx.root, {
       dockerfilePath: wtDockerfile,
-      contentHash: hashDockerfileContent(wtContent),
+      contentHash,
       imageName,
+      contextCommit: wtHead,
     }, { content: wtContent });
     await docker.seedImage(imageName, { dockerfileHash: 'consented' });
 
@@ -476,6 +518,18 @@ describe('runner image identity and freshness', () => {
     // Root Dockerfile was never the source of this rebuild.
     expect(builds[0]).not.toContain(`-f ${join(ctx.root, 'Dockerfile.custom')}`);
     expect(rootContent).not.toBe(wtContent); // sanity: they differ
+
+    // ...and the CONTEXT is the consented WORKTREE directory — not the project
+    // root, whose tree belongs to main and would resolve the Dockerfile's COPY
+    // paths against the wrong branch.
+    const [cwd] = await docker.buildCwds();
+    expect(cwd).toBe(await realpath(wt));
+    expect(cwd).not.toBe(await realpath(ctx.root));
+    const contextFiles = await docker.buildContextFiles(0);
+    // `worktree-only.txt` exists only on this branch: it is in the context
+    // precisely because the context followed the Dockerfile.
+    expect(contextFiles).toContain('worktree-only.txt');
+    expect(contextFiles).toContain('Dockerfile.custom');
   });
 
   // --- the lazy-runner base a custom Dockerfile builds FROM ----------------

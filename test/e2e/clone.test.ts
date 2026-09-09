@@ -352,6 +352,7 @@ describe('lazy clone', () => {
       ...(data.metadata ?? {}),
       custom_image: imageRef,
       custom_image_hash: hash,
+      custom_image_context: 'e'.repeat(40),
     };
     writeTaskJson(ctx.root, taskId, data);
 
@@ -364,6 +365,9 @@ describe('lazy clone', () => {
     const cloned = readTaskJson(ctx.root, clonedTaskId);
     expect(cloned.metadata?.custom_image).toBeUndefined();
     expect(cloned.metadata?.custom_image_hash).toBeUndefined();
+    // The build context the pin was made against goes with it: a stale commit
+    // recorded against no image is provenance for nothing.
+    expect(cloned.metadata?.custom_image_context).toBeUndefined();
   });
 });
 

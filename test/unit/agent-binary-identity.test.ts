@@ -10,6 +10,15 @@ import {
   AGENT_SELFCHECK_SENTINEL,
 } from '../../src/agent/binary-identity';
 import { extractEmbeddedAgentBinary } from '../../src/capture/claude';
+// Captured BEFORE any mock.module() call below replaces the registry entry, so
+// afterEach can put the real module back. bun's mock.restore() does NOT undo
+// mock.module — without this, every later test FILE in the same `bun test`
+// process imports the stub (a full-directory run turned worktree-image.test.ts
+// red while it passed alone).
+import * as captureClaudeNs from '../../src/capture/claude';
+// Spread into a PLAIN object at load time: bun's mock.module hot-swaps the live
+// namespace in place, so holding the namespace itself would hand back the stub.
+const realCaptureClaude = { ...captureClaudeNs };
 
 /**
  * INVARIANT: nothing may install a file at the agent-binary path without first
@@ -182,6 +191,7 @@ describe('lazy upgrade agent-binary rebuild', () => {
     else process.env.HOME = restoreHome;
     rmSync(home, { recursive: true, force: true });
     mock.restore();
+    mock.module('../../src/capture/claude', () => realCaptureClaude);
   });
 
   // INVARIANT: the rebuild removes the STALENESS MARKER, never the binary.

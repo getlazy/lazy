@@ -22,7 +22,10 @@
  *
  * Upgrade's own build (latch on) resolves the *snapshot* (`adopted-Dockerfile`),
  * never the live worktree path — so a write between consent and `docker build`
- * cannot produce a mis-tagged image of unconsented bytes.
+ * cannot produce a mis-tagged image of unconsented bytes. The docker BUILD
+ * CONTEXT is the worktree that held the consented Dockerfile
+ * (`adoptedBuildContextRoot`), because its COPY paths name files on that
+ * branch — the project root has a different tree.
  *
  * Deliberately NOT an env var and NOT lazy.toml — daemon runtime state only.
  * Per-task pins (metadata.custom_image) never touch this file.
@@ -51,17 +54,27 @@ export interface AdoptedImageState {
   lazyVersion: string;
   /** ISO timestamp when adoption was written. */
   adoptedAt: string;
+  /**
+   * INFORMATIONAL ONLY: the worktree's HEAD when adoption was recorded, so
+   * `lazy doctor` / `lazy upgrade` can say which branch state was consented
+   * to. The build reads the worktree LIVE, so this is not a statement about
+   * what went into the image. Optional — a record written before it existed
+   * still parses, and nothing invalidates an adoption for lacking it.
+   */
+  contextCommit?: string;
 }
 
 function isAdoptedImageState(value: unknown): value is AdoptedImageState {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
+  const optionalString = (x: unknown) => x === undefined || typeof x === 'string';
   return (
     typeof v.dockerfilePath === 'string' &&
     typeof v.contentHash === 'string' &&
     typeof v.imageName === 'string' &&
     typeof v.lazyVersion === 'string' &&
-    typeof v.adoptedAt === 'string'
+    typeof v.adoptedAt === 'string' &&
+    optionalString(v.contextCommit)
   );
 }
 
@@ -131,6 +144,7 @@ export async function writeAdoptedImage(
     imageName: state.imageName,
     lazyVersion: state.lazyVersion ?? VERSION,
     adoptedAt: state.adoptedAt ?? new Date().toISOString(),
+    ...(state.contextCommit === undefined ? {} : { contextCommit: state.contextCommit }),
   };
 
   // Prefer the caller-supplied consented bytes; else snapshot from the
@@ -322,6 +336,29 @@ export async function resolveAdoptedDockerfileSnapshot(
     return null;
   }
   return snapshot;
+}
+
+/**
+ * The directory an adopted image must be built with as its docker context, when
+ * `dockerfilePath` is the adopted snapshot. Null for any other Dockerfile —
+ * notably the root `[docker].dockerfile`, which keeps the project root.
+ *
+ * It is the WORKTREE that held the consented Dockerfile, not the snapshot
+ * file's own directory (that holds only the Dockerfile). Derived from the
+ * recorded worktree path rather than stored as a second field, so an adoption
+ * written by any version — including one predating build contexts entirely —
+ * resolves the same way.
+ */
+export async function adoptedBuildContextRoot(
+  projectRoot: string,
+  dockerfilePath: string,
+): Promise<string | null> {
+  if (dockerfilePath !== getAdoptedDockerfilePath(projectRoot)) return null;
+
+  const adopted = await loadValidAdoptedImage(projectRoot);
+  if (!adopted) return null;
+
+  return dirname(adopted.dockerfilePath);
 }
 
 /**

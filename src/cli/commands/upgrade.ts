@@ -223,6 +223,16 @@ async function printImageSource(root: string): Promise<void> {
   console.log(`  Config:     ${configPath}`);
   console.log(`  Dockerfile: ${dockerfilePath ? `${dockerfilePath}${sourceNote}` : 'embedded default ([docker].dockerfile is not set)'}`);
   if (adopted) {
+    // An adopted Dockerfile builds against its own worktree, not the project
+    // root — say which, so "built from what?" is answerable before the build
+    // rather than after a confusing COPY failure.
+    const { loadValidAdoptedImage } = await import('../../daemon/adopted-image');
+    const { dirname } = await import('path');
+    const state = await loadValidAdoptedImage(root);
+    if (state) {
+      const head = state.contextCommit ? ` (HEAD ${state.contextCommit.slice(0, 12)} when adopted)` : '';
+      console.log(`  Context:    ${dirname(state.dockerfilePath)}${head}`);
+    }
     console.log('              Adopted for the daemon and all launches that do not have a');
     console.log('              per-task image pin, until the next `lazy upgrade` rebuild.');
   }

@@ -66,7 +66,9 @@ Pre-conditions:
 
 Notes:
   - Until submit, the branch is pushed by daemon auto-push and CI runs,
-    but there is no PR and no review comments
+    but there is no PR and no review comments. With
+    [remote] <driver>_auto_push = false there is no automatic push either,
+    and submit is the first thing to publish the branch
   - Use 'lazy accept <task_id>' to merge after review
   - Use 'lazy unblock <task_id>' to send feedback and return to working
 

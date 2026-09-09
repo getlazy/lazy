@@ -38,6 +38,7 @@ import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../.
 import type { ShellInfo } from '../../shell/detect';
 import { spawnSyncUnsupervised } from '../../utils/spawn';
 import { runGit } from '../../utils/git';
+import { looksLikeTaskBranch } from '../../git/branch-prefix';
 import { which } from 'bun';
 import {
   listMissingConversations,
@@ -597,17 +598,25 @@ const SCRATCH_LARGE_BYTES = 100 * 1024 * 1024;
  */
 export async function checkAdoptedImage(root: string): Promise<CheckResult | null> {
   const { inspectAdoptedImage, clearAdoptedImage } = await import('../../daemon/adopted-image');
+  const { dirname } = await import('path');
   const { VERSION } = await import('../../version');
   const result = await inspectAdoptedImage(root);
 
   if (result.status === 'none') return null;
 
   if (result.status === 'valid') {
+    // Name the directory the image was built from, not just the Dockerfile:
+    // those two coming from different trees is the bug this reporting exists
+    // for. The HEAD is provenance only — the build read that directory live.
+    const head = result.state.contextCommit
+      ? ` (HEAD ${result.state.contextCommit.slice(0, 12)} when adopted)`
+      : '';
     return {
       ok: true,
       label: 'Worktree image adopted',
       detail:
-        `${result.state.imageName} from ${result.state.dockerfilePath} ` +
+        `${result.state.imageName} from ${result.state.dockerfilePath}, ` +
+        `build context ${dirname(result.state.dockerfilePath)}${head} ` +
         `(lazy ${result.state.lazyVersion}, adopted ${result.state.adoptedAt}). ` +
         `Applies to the daemon and launches without a per-task pin until the next \`lazy upgrade\` rebuild.`,
     };
@@ -1603,7 +1612,7 @@ async function checkTaskBranchUpstreamTracking(): Promise<CheckResult> {
       return { ok: true, label: 'No task branches with upstream tracking' };
     }
 
-    const branches = result.stdout.split('\n').filter((b: string) => b.trim() && b.startsWith('lazy/'));
+    const branches = result.stdout.split('\n').filter((b: string) => b.trim() && looksLikeTaskBranch(b.trim()));
     if (branches.length === 0) {
       return { ok: true, label: 'No task branches with upstream tracking' };
     }

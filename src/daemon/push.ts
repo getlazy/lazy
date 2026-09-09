@@ -15,6 +15,7 @@
 
 import { loadConfig } from '../config/loader';
 import { createDriver, type RepositoryDriver } from '../remote';
+import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { localBranchExists } from '../git/operations';
 import { logger } from '../utils/logger';
 
@@ -68,6 +69,16 @@ async function drainPushQueue(projectRoot: string): Promise<void> {
 
     try {
       const config = await loadConfig(projectRoot, { cwd: projectRoot });
+
+      // The post-turn push is an AUTOMATIC push — exactly what
+      // `<driver>_auto_push = false` opts out of. Drop the queue rather than
+      // holding it: these branches are not "pending", they are not wanted.
+      if (!autoPushEnabled(config)) {
+        logger.debug(`Push skipped: ${autoPushConfigKey(config)} = false`);
+        retryQueues.delete(projectRoot);
+        return;
+      }
+
       driver = createDriver(config);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

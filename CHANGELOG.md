@@ -1,6 +1,16 @@
 # Changelog
 
-## [0.22.1141]
+## [0.22.1148] - 2026-09-08 - Hotfix
+
+### Fixed
+
+- **The web review page no longer shows a phantom "comments" file** — a task comment could rename the last changed file to `comments` and hide its diff; comments now render only as threads
+- **`[git] default_branch_prefix` is finally honoured** — set it to `wip` and task branches are named `wip/<task>`; a prefix git cannot use is rejected when the config loads
+- **`[remote] github_auto_push = false` now stops the automatic pushes** — task branches stay local; `lazy submit` and `lazy accept` still push when a merge needs it
+- **A consented worktree image is built against that worktree's own directory** — its `Dockerfile.lazy` `COPY`s resolve on its branch, not the project root, and the prompt names the context before you answer
+- **A broken `lazy.toml` no longer kills the daemon with a bare parse error** — startup refuses up front, naming the file, the offending line and the fix
+
+## [0.22.1141] - 2026-08-27 - Hotfix 
 
 ### Added
 
@@ -18,7 +28,12 @@
 - **`lazy accept` and `lazy ask` no longer hang for half an hour when the agent's run dies** — they notice within seconds, report the exit code and last output, and leave the task where it was
 - **`lazy accept` never merges on a pre-accept turn that validated nothing** — if another turn takes over the task mid-validation, the accept stops instead of treating the missing result as a pass
 - **`lazy ask`** — a second ask on a task that is already answering one is refused instead of racing it
+- **The web review page no longer shows a phantom "comments" file** — a task comment could rename the last changed file to `comments` and hide its diff; comments now render only as threads
 - **`lazy sync` no longer says "Already up to date" while `lazy accept` reports conflicts** — sync merges the ref accept actually merges into, and warns when the local and remote parent branch differ
+- **`[git] default_branch_prefix` is finally honoured** — set it to `wip` and task branches are named `wip/<task>`; a prefix git cannot use is rejected when the config loads
+- **`[remote] github_auto_push = false` now stops the automatic pushes** — task branches stay local; `lazy submit` and `lazy accept` still push when a merge needs it
+- **A consented worktree image is built against that worktree's own directory** — its `Dockerfile.lazy` `COPY`s resolve on its branch, not the project root, and the prompt names the context before you answer
+- **A broken `lazy.toml` no longer kills the daemon with a bare parse error** — startup refuses up front, naming the file, the offending line and the fix
 
 ## [0.22.1134] - 2026-08-24 - Hotfix for long running Docker builds
 

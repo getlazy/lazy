@@ -41,6 +41,12 @@ export interface LazyOptions {
   env?: Record<string, string>;
   /** Pipe this string to the command's stdin */
   input?: string;
+  /**
+   * Working directory for the command. Defaults to the project root. Set it to
+   * a task worktree to exercise the commands that behave differently when run
+   * from inside one (the worktree Dockerfile prompts).
+   */
+  cwd?: string;
 }
 
 export interface TestContext {
@@ -573,9 +579,9 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   const ctx: TestContext = {
     root,
     protocolBase,
-    lazy: (args, optsArg) => runLazy(root, args, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
+    lazy: (args, optsArg) => runLazy(optsArg?.cwd ?? root, args, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
     lazyMocked: (args, mockResponse, optsArg) =>
-      runLazyMocked(root, args, mockResponse, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
+      runLazyMocked(optsArg?.cwd ?? root, args, mockResponse, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
     git: (...args) => spawnGit(root, ...args),
     setClaudeScenario: async (scenario) => {
       if (!fake) throw new Error('setClaudeScenario requires setupTestLazy({ fakeClaude: true })');

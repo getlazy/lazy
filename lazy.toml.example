@@ -65,7 +65,13 @@ backend = "external"
 external_path = ""
 
 [git]
-# Default prefix for lazy branches (e.g., "lazy/abc123")
+# Default prefix for lazy task branches (e.g., "lazy/abc123"). Set "wip" and new
+# task branches are named "wip/abc123"; a trailing slash is optional. Changing it
+# renames nothing — existing branches keep their names.
+# Everything under the prefix is treated as a task branch, so don't point it at a
+# namespace you use for real integration branches ("release" would swallow
+# release/2.0). Always read from the PROJECT ROOT's lazy.toml, never a worktree's.
+# A prefix git cannot use in a branch name is rejected when the config loads.
 default_branch_prefix = "lazy"
 # Git LFS environment check at task start, for repos that use LFS.
 # With a broken or missing LFS filter git commits raw file content instead of a
@@ -236,11 +242,15 @@ driver = "local"
 # Git remote name (default: "origin"). Change if your remote is named differently.
 # git_remote = "origin"
 # When using the GitHub driver, these options are also available:
-# github_auto_push = true   # Automatically push after each agent turn
+# github_auto_push = true   # Push task branches automatically (task start, after each
+#                           # agent turn, background sync, end of pair). false keeps them
+#                           # local; `lazy submit` / `lazy accept` still push when needed.
 # github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = false
 # Authentication is handled by gh CLI (run: gh auth login)
 # When using the GitLab driver, these options are also available:
-# gitlab_auto_push = true   # Automatically push after each agent turn
+# gitlab_auto_push = true   # Push task branches automatically (task start, after each
+#                           # agent turn, background sync, end of pair). false keeps them
+#                           # local; `lazy submit` / `lazy accept` still push when needed.
 # gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = false
 # Authentication is handled by glab CLI (run: glab auth login)
 

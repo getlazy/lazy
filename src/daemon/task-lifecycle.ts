@@ -81,6 +81,7 @@ import { isFeatureEnabled } from '../utils/features';
 import { isTerminalStatus, isActiveStatus, isBlockedStatus } from '../types';
 import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../task-target';
 import { logger } from '../utils/logger';
+import { looksLikeTaskBranch } from '../git/branch-prefix';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
 import { revokeTaskMcpTokens } from './mcp-tokens';
@@ -244,7 +245,7 @@ export async function resolveParentBranchWithFallback(
     // sync time. Note: targetBranchOf does NOT strip 'lazy/', so the raw stored
     // branch is inspected here.
     const stored = task.target.kind === 'branch' ? task.target.branch : '';
-    let branch = (stored && !stored.startsWith('lazy/')) ? stored : '';
+    let branch = (stored && !looksLikeTaskBranch(stored)) ? stored : '';
     if (!branch) {
       const cfg = await loadConfig(projectRoot);
       branch = await getRemoteDefaultBranch(projectRoot, cfg.remote.git_remote);
@@ -4463,7 +4464,7 @@ export async function submitTask(
   const submitTargetBranch = submitParentId
     ? await getBranchNameFromId(submitParentId, storage)
     : (targetBranchOf(task) ?? 'main');
-  if (submitParentId || submitTargetBranch.startsWith('lazy/')) {
+  if (submitParentId || looksLikeTaskBranch(submitTargetBranch)) {
     throw new RpcError(400,
       `Task ${displayId(task)} integrates into \`${submitTargetBranch}\`, an intermediate task branch — ` +
       `lazy does not open merge requests for it. ` +

@@ -17,7 +17,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { isTTY, promptYesNo } from '../cli/editor';
 import { theme } from '../cli/theme';
-import { IMAGE_TAG } from '../capture/image-tag';
+import { consentedBuildIdentity, IMAGE_TAG } from '../capture/image-tag';
 import {
   clearAdoptedImage,
   hashDockerfileContent,
@@ -26,6 +26,7 @@ import {
 } from '../daemon/adopted-image';
 import {
   lazyTaskWorktreeCwd,
+  worktreeHead,
   WORKTREE_DOCKERFILE,
 } from '../docker/worktree-image';
 import { pathExists } from '../utils/fs';
@@ -75,11 +76,16 @@ export async function maybePromptWorktreeDockerfileAdoption(
     return null;
   }
 
+  const content = await readFile(worktreeDockerfile, 'utf-8');
+
   console.log('');
   console.log(theme.warning('Running `lazy upgrade` from a task worktree.'));
   console.log(`  Directory:  ${worktreeCwd}`);
   console.log(`  Default:    ${rootDockerfile}`);
   console.log(`  Here:       ${worktreeDockerfile}`);
+  // Name the build context: adopting consents to a docker build over this whole
+  // directory, not just to the Dockerfile on screen.
+  console.log(`  Context:    ${worktreeCwd} (this worktree, as it is on disk)`);
   console.log('');
   console.log('  By default the image build uses the project root Dockerfile, not this');
   console.log("  worktree's copy. Adopting builds from the worktree AND keeps the daemon");
@@ -97,26 +103,33 @@ export async function maybePromptWorktreeDockerfileAdoption(
     return null;
   }
 
-  const content = await readFile(worktreeDockerfile, 'utf-8');
   const contentHash = hashDockerfileContent(content);
-  const shortHash = contentHash.substring(0, 12);
+  // The image name covers the Dockerfile bytes AND the directory they build
+  // against, so the same Dockerfile in two worktrees cannot share one image.
+  // contentHash stays a pure content hash: drift detection compares the live
+  // worktree file against it.
+  const shortHash = consentedBuildIdentity(contentHash, worktreeCwd).substring(0, 12);
   const imageName = `lazy-custom-${shortHash}:${IMAGE_TAG}`;
 
   // Snapshot the consented bytes at prompt time (adopted-Dockerfile) so the
   // later upgrade build cannot re-read a post-consent agent edit of the
-  // worktree file.
+  // worktree file. contextCommit is provenance only — the build reads the
+  // worktree live.
+  const head = await worktreeHead(worktreeCwd);
   const state = await writeAdoptedImage(
     projectRoot,
     {
       dockerfilePath: worktreeDockerfile,
       contentHash,
       imageName,
+      ...(head ? { contextCommit: head } : {}),
     },
     { content },
   );
 
   console.log(
-    `  ${theme.success('Adopted')} ${state.imageName} from ${worktreeDockerfile}`,
+    `  ${theme.success('Adopted')} ${state.imageName} from ${worktreeDockerfile}` +
+      `${head ? ` (HEAD ${head.slice(0, 12)})` : ''}`,
   );
   console.log(
     `  Daemon + launches will use it until the next \`lazy upgrade\` rebuild ` +

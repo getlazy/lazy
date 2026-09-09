@@ -35,6 +35,7 @@
  * The tag itself is therefore only an identity, not a freshness signal.
  */
 
+import { createHash } from 'crypto';
 import { VERSION } from '../version';
 import { majorMinor } from '../utils/version-parts';
 
@@ -92,3 +93,31 @@ export function imageTagFor(version: string): string {
 
 /** The tag THIS lazy runs, e.g. `lazy-runner:0.21`. */
 export const IMAGE_TAG = imageTagFor(VERSION);
+
+/**
+ * Identity of a human-consented worktree image: the Dockerfile bytes AND the
+ * directory they build against.
+ *
+ * The pure content hash is not enough. Two task worktrees of the same repo
+ * routinely hold byte-identical `Dockerfile.lazy` copies while their trees
+ * differ — that is the normal state of two branches cut from one base. Keyed on
+ * content alone they would share a single `lazy-custom-<hash>` image, so
+ * whichever built first would win and the other task would silently run an
+ * image built from the wrong branch's files: the same wrong-tree bug this flow
+ * exists to prevent, one step further along.
+ *
+ * The key covers the context DIRECTORY, not a commit. The build reads that
+ * directory live, so there is no single tree object to name — and the path is
+ * exactly what went into the image, at the cost of no git invocation at all.
+ * `contentHash` stays a pure content hash: drift detection compares Dockerfile
+ * bytes against it and must not move when a worktree is merely relocated.
+ *
+ * Lives here rather than in src/docker/ because src/docker/worktree-image.ts
+ * imports the build from src/capture/claude.ts — the reverse import would be a
+ * cycle.
+ */
+export function consentedBuildIdentity(contentHash: string, contextDir: string): string {
+  return createHash('sha256')
+    .update(`dockerfile:${contentHash}\ncontext:${contextDir}\n`)
+    .digest('hex');
+}

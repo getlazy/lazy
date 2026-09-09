@@ -22,6 +22,7 @@ import { removeLock } from '../../utils/lock';
 import { isTerminalStatus } from '../../types';
 import type { Task, Turn, Comment } from '../../types';
 import { createDriver, type RemoteComment } from '../../remote';
+import { autoPushEnabled } from '../../remote/auto-push';
 
 import { commandAccept } from './accept';
 import { theme, dim } from '../theme';
@@ -571,7 +572,14 @@ export async function syncTaskFromRemote(
     // If no remote ref exists yet, try to create one so comments can be synced.
     // This mirrors the exportTasks() flow in sync.ts: push branch, then
     // create a PR/MR via markReadyForReview if the task has commits.
-    if (!driver.hasRemoteRef(task)) {
+    //
+    // Nobody asked for that push — it is a side effect of syncing comments, and
+    // it also opens a PR — so `<driver>_auto_push = false` suppresses it. The
+    // task then simply has no remote ref and the early return below skips
+    // comment sync for it, which is the same state as before any turn ran.
+    // `lazy submit` remains the explicit way to publish the branch and open the
+    // PR, and is deliberately NOT gated.
+    if (!driver.hasRemoteRef(task) && autoPushEnabled(config)) {
       const session = await storage.getSessionByTaskId(task.id);
       // INVARIANT: PRs only for protected branches; subtask→parent merges are
       // local. A child task (stacked on another task) must NEVER get an MR/PR —

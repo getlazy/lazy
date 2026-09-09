@@ -248,11 +248,15 @@ describe('lazy upgrade', () => {
       const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
       const { getAdoptedDockerfilePath } = await import('../../src/daemon/paths');
       const { VERSION } = await import('../../src/version');
+      // An adoption records the worktree HEAD as provenance — informational
+      // only, since the build reads the consented directory live.
+      const contextCommit = ctx.git('rev-parse', 'HEAD').stdout.trim();
       await writeAdoptedImage(ctx.root, {
         dockerfilePath,
         contentHash: hashDockerfileContent(content),
         imageName: 'lazy-custom-aaaaaaaaaaaa:0.22',
         lazyVersion: VERSION,
+        contextCommit,
       }, { content });
 
       const result = await ctx.lazyMocked(['upgrade', '--images', '--dry-run'], MOCK_CLAUDE_SUCCESS, {
@@ -262,6 +266,12 @@ describe('lazy upgrade', () => {
       expectSuccess(result);
       const snapshotPath = getAdoptedDockerfilePath(ctx.root);
       expectOutput(result, `Dockerfile: ${snapshotPath} (daemon-adopted from worktree)`);
+      // ...and which DIRECTORY that Dockerfile builds against, since the
+      // adopted image is not built with the project root as its context.
+      expectOutput(
+        result,
+        `Context:    ${ctx.root} (HEAD ${contextCommit.slice(0, 12)} when adopted)`,
+      );
     } finally {
       undoDaemonBase();
     }

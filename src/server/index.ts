@@ -26,6 +26,7 @@ import { acceptRemedyOf, type AcceptRemedy } from '../types';
 import { askUnavailableReason, acceptBlockedByViolations, type ReviewActions } from './review-actions';
 import { STYLESHEET_PATH, bundledStylesheet, stylesheetFromDisk } from './styles';
 import { taskRefFromId } from '../cli/helpers';
+import { taskBranchFor } from '../git/branch-prefix';
 import { parentTaskIdOf } from '../task-target';
 import { MAX_PORT_ATTEMPTS } from '../config/constants';
 import { DAEMON_IDLE_TIMEOUT_S, WEB_REQUEST_DEADLINE_MS } from '../daemon/heartbeat';
@@ -513,7 +514,7 @@ async function handleTaskDetail(storage: Storage, taskId: string): Promise<Respo
   const protection = (await protectionForTasks(storage, [task])).get(task.id) ?? null;
   // The base branch used to live only on the deleted /pr page; it is the one
   // thing that page showed which this one did not, so it moves here.
-  const baseBranch = parentId ? 'lazy/' + await taskRefFromId(parentId, storage) : 'main';
+  const baseBranch = parentId ? taskBranchFor(await taskRefFromId(parentId, storage)) : 'main';
 
   return html(taskDetailHtml(task, session, turns, commits, comments, journal, followUps, children, promptVersions, parentTask, protection, baseBranch));
 }

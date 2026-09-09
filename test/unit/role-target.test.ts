@@ -31,6 +31,17 @@ describe('resolveRoleTarget', () => {
     expect(r.model).toBe('claude-haiku-4-5-20251001');
   });
 
+  // Fable 5.1 is a concrete Anthropic id, not a short alias. Pass-through must
+  // keep the full id so the agent (and the API) get 5.1 rather than whatever
+  // Claude Code currently binds `fable` to.
+  test('anthropic role passes claude-fable-5-1 through unchanged', () => {
+    const config = configWith({ builder: anthropic('claude-fable-5-1'), agent: anthropic() });
+    expect(resolveRoleTarget('builder', config).model).toBe('claude-fable-5-1');
+    const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-fable-5-1' });
+    expect(r.backend).toBe('anthropic');
+    expect(r.model).toBe('claude-fable-5-1');
+  });
+
   test('anthropic role with no preferred model falls back to the configured model', () => {
     const config = configWith({ builder: anthropic('claude-opus-4-8'), agent: anthropic() });
     expect(resolveRoleTarget('builder', config).model).toBe('claude-opus-4-8');
@@ -108,9 +119,11 @@ describe('resolveRoleTarget', () => {
 describe('isKnownAnthropicModel', () => {
   // INVARIANT (fix-builder-model-ollama-precedence): any `claude-*` id is the
   // escape hatch for models newer than our short-name list, so it's always
-  // recognized without a hard-coded entry.
+  // recognized without a hard-coded entry. Fable 5.1 is one such id — lazy does
+  // not hard-code it; the prefix is enough for builder --model validation.
   test('recognizes any claude-* id (escape hatch for future models)', () => {
     expect(isKnownAnthropicModel('claude-opus-4-8')).toBe(true);
+    expect(isKnownAnthropicModel('claude-fable-5-1')).toBe(true);
     expect(isKnownAnthropicModel('claude-something-not-shipped-yet')).toBe(true);
   });
 

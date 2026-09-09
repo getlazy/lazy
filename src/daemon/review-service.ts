@@ -157,7 +157,13 @@ export function createReviewActions(projectRoot: string): ReviewActions {
     },
 
     async getDiff(taskId: string): Promise<string> {
-      const result = (await handleDiff(projectRoot, { taskId, full: true })) as { output: string };
+      // includeComments: false — the review page PARSES this as a unified
+      // diff, and the synthetic `diff --lazy a/comments b/comments` section is
+      // not a git patch. The page renders comments as threads anyway; sending
+      // them as diff text once produced a phantom "comments" file.
+      const result = (await handleDiff(projectRoot, {
+        taskId, full: true, includeComments: false,
+      })) as { output: string };
       return result.output ?? '';
     },
 

@@ -9,6 +9,7 @@ import { validateMounts } from '../capture/mounts';
 import { DEFAULT_CURSOR_UPSTREAM } from '../proxy/cursor-route';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from '../proxy/policy';
 import { DEFAULT_DOCS_URL, normalizeDocsUrl, setDocsBaseUrl } from '../docs/links';
+import { setBranchPrefix, getBranchPrefix, branchPrefixError } from '../git/branch-prefix';
 import { endpointForHost } from '../utils/role-target';
 import { findDeprecatedConfigKeys } from './schema';
 
@@ -23,6 +24,7 @@ let _configOverrideWarned = false;
  */
 export function resetConfigOverrideWarning(): void {
   _configOverrideWarned = false;
+  _rootPrefixWarned = false;
 }
 
 /**
@@ -49,6 +51,69 @@ async function configOverrideIsMeaningful(configPath: string, rootConfigPath: st
     // to today's behaviour and warn. Deliberate suppression of a read error: the
     // only consequence is that the user sees the warning they'd have seen before.
     return true;
+  }
+}
+
+let _rootPrefixWarned = false;
+
+/**
+ * Resolve `[git] default_branch_prefix` from the PROJECT ROOT's lazy.toml —
+ * regardless of which config file this particular load resolved.
+ *
+ * Every other setting comes from the nearest lazy.toml walking up from `cwd`,
+ * and the daemon relies on that: several call sites deliberately load a task's
+ * config with `cwd` set to its worktree (watchdog guards, feature flags). But
+ * lazy.toml is tracked in git, so every task worktree carries a copy on an
+ * agent-writable branch, and the branch prefix is installed process-wide
+ * (src/git/branch-prefix.ts). Taking it from the resolved file would let one
+ * task's committed lazy.toml re-point branch naming — and `looksLikeTaskBranch`,
+ * which decides whether accept merges locally or through the forge — for every
+ * other task in the same long-lived daemon.
+ *
+ * `lazyRoot` is always the main repository (`findGitRoot` follows a worktree's
+ * `.git` file back to it), so joining the config filename to it names the
+ * project's own file. An absolute LAZY_CONFIG names the authoritative file
+ * explicitly and is used as-is.
+ *
+ * @param resolvedPrefix - the value from the config this load actually read,
+ *   used when there is no separate root config to consult.
+ */
+async function projectBranchPrefix(
+  lazyRoot: string,
+  configPath: string,
+  resolvedPrefix: string,
+): Promise<{ prefix: string; source: string }> {
+  const rootPath = process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)
+    ? process.env.LAZY_CONFIG
+    : join(resolve(lazyRoot), CONFIG_FILENAME);
+  if (resolve(rootPath) === resolve(configPath)) return { prefix: resolvedPrefix, source: configPath };
+
+  // Held outside the try so the failure path can name the offending line.
+  let rootContent: string | undefined;
+  try {
+    rootContent = await readFile(rootPath, 'utf-8');
+    const parsed = Bun.TOML.parse(rootContent) as LazyConfig;
+    return {
+      prefix: parsed.git?.default_branch_prefix ?? DEFAULT_CONFIG.git.default_branch_prefix,
+      source: rootPath,
+    };
+  } catch (error) {
+    // No root config at all — a project with a `.lazy/` directory but no
+    // lazy.toml at the root. The file we did read is the only config there is.
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return { prefix: resolvedPrefix, source: configPath };
+    }
+    // The root config exists but is unreadable or broken. Any load anchored at
+    // the root already fails hard on that; this one must not, or a bad root
+    // config would take down every worktree-scoped load too. Say so once.
+    if (!_rootPrefixWarned) {
+      _rootPrefixWarned = true;
+      console.warn(
+        `Warning: could not read [git] default_branch_prefix from ${rootPath} ` +
+        `(${describeTomlError(error, rootContent)}). Using the value from ${configPath}.`,
+      );
+    }
+    return { prefix: resolvedPrefix, source: configPath };
   }
 }
 
@@ -405,25 +470,69 @@ export async function resolveConfigPath(lazyRoot: string, startDir?: string): Pr
 }
 
 /**
+ * A lazy.toml long enough that locating the bad line by re-parsing prefixes is
+ * no longer free. Well past any real config (the init template is ~120 lines);
+ * a file this size gets the bare reason rather than a slow error path.
+ */
+const MAX_LINES_TO_LOCATE = 2000;
+
+/**
+ * Find the first line of `content` that the TOML parser cannot accept.
+ *
+ * Bun gives us no position (see {@link describeTomlError}), so derive one: the
+ * last PREFIX of the file that parses cleanly ends immediately before the
+ * offending line. Growing prefixes and keeping the last success — rather than
+ * stopping at the first failure — because a prefix cut inside a multi-line
+ * array or string fails for a reason that is not the user's bug, while a prefix
+ * that parses has every construct closed.
+ *
+ * Returns null when no line can be blamed (an empty file, or content that
+ * parses fine because the caller's error was not a parse error at all).
+ */
+function locateTomlError(content: string): { line: number; text: string } | null {
+  const lines = content.split('\n');
+  if (lines.length > MAX_LINES_TO_LOCATE) return null;
+
+  let lastGood = 0;
+  for (let n = 1; n <= lines.length; n++) {
+    try {
+      Bun.TOML.parse(lines.slice(0, n).join('\n'));
+      lastGood = n;
+    } catch {
+      // Not the answer on its own: this prefix may simply end mid-construct.
+      // Only the LAST prefix that parses locates anything, so keep scanning.
+      // Nothing is being suppressed — the caller already holds the real error.
+    }
+  }
+
+  // Line numbers are 1-based, so the line after prefix `lastGood` is at index
+  // `lastGood`. A blank or comment line always parses on top of a clean prefix,
+  // so the line found here is never one of those.
+  const text = lines[lastGood]?.trim();
+  if (!text) return null;
+  return { line: lastGood + 1, text };
+}
+
+/**
  * Render a `Bun.TOML.parse` failure as one line a human can act on.
  *
- * Bun throws a `BuildMessage` whose `.message` is only the bare reason
- * ("Cannot redefine key 'type'") — the line number and the offending source
- * line live on a non-enumerable `.position`. Without them the user is told
- * *what* is wrong but not *where*, which for a 300-line lazy.toml is close to
- * useless. `position.file` is Bun's internal name ("input.toml") and is
- * deliberately NOT used; the caller names the real path.
+ * Bun's TOML parser throws a plain `SyntaxError` whose `.message` is the bare
+ * reason ("Cannot redefine table 'server'") and which carries NO source
+ * position: its `line`/`column` properties are the JS call site inside this
+ * file, and there is no `.position`. Without a line the user is told *what* is
+ * wrong but not *where*, which for a 300-line lazy.toml is close to useless —
+ * and the advice below this call ("check the line named above") named nothing.
+ * So pass `content` and the line is located here instead.
  */
-function describeTomlError(error: unknown): string {
-  // NOT `error instanceof Error`: Bun's BuildMessage is not an Error subclass,
-  // so that test falls through to String(error) and yields a "BuildMessage: "
+function describeTomlError(error: unknown, content?: string): string {
+  // NOT `error instanceof Error`: if Bun ever throws a BuildMessage here again
+  // that test falls through to String(error) and yields a "BuildMessage: "
   // prefix the user has no use for. Read `.message` when it is a string.
   const raw = (error as { message?: unknown } | null)?.message;
   const reason = typeof raw === 'string' && raw ? raw : String(error);
-  const position = (error as { position?: { line?: number; lineText?: string } } | null)?.position;
-  if (!position?.line) return reason;
-  const source = position.lineText ? `: ${position.lineText.trim()}` : '';
-  return `line ${position.line}${source} — ${reason}`;
+  const located = content ? locateTomlError(content) : null;
+  if (!located) return reason;
+  return `line ${located.line}: ${located.text} — ${reason}`;
 }
 
 /** Emitted once per process, so a repeated loadConfig does not repeat itself. */
@@ -513,12 +622,15 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
   // If no config file exists (and LAZY_CONFIG was not set), return defaults
   if (!(await pathExists(configPath))) {
     setDocsBaseUrl(DEFAULT_CONFIG.docs.url);
+    setBranchPrefix(DEFAULT_CONFIG.git.default_branch_prefix);
     return DEFAULT_CONFIG;
   }
 
   let parsed: LazyConfig;
+  // Held outside the try so the failure path can name the offending line.
+  let configContent: string | undefined;
   try {
-    const configContent = await readFile(configPath, 'utf-8');
+    configContent = await readFile(configPath, 'utf-8');
     parsed = Bun.TOML.parse(configContent) as LazyConfig;
   } catch (error) {
     // A config file that EXISTS but does not parse is a bug in the user's
@@ -533,7 +645,7 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
     // would go to the stock upstream anyway; `[storage] external_path` would be ignored and
     // the store would split. Each one surfaces far from its cause.
     throw new Error(
-      `Failed to parse ${configPath}: ${describeTomlError(error)}\n` +
+      `Failed to parse ${configPath}: ${describeTomlError(error, configContent)}\n` +
       `\n` +
       `lazy will not fall back to defaults for a config file that exists but is broken — ` +
       `every setting in it would be silently discarded, and lazy would run with defaults ` +
@@ -866,6 +978,34 @@ export async function loadConfig(lazyRoot: string, options?: { cwd?: string }): 
   // place the configured value reaches them. See src/docs/links.ts.
   setDocsBaseUrl(config.docs.url);
 
+  // Same reason, same shape: task branch names are built by synchronous helpers
+  // all over the CLI, daemon and drivers that never see a ResolvedConfig. This
+  // is the one place `[git] default_branch_prefix` reaches them.
+  // See src/git/branch-prefix.ts.
+  //
+  // Deliberately NOT `config.git.default_branch_prefix`: a branch namespace is a
+  // project-wide fact, so it comes from the project root's lazy.toml even when
+  // this load resolved a worktree's copy. See projectBranchPrefix() above.
+  const branchPrefix = await projectBranchPrefix(lazyRoot, configPath, config.git.default_branch_prefix);
+
+  // The prefix becomes the leading segment of a real git branch name, so an
+  // unusable value is rejected here, at the boundary — not by `git branch`
+  // partway through starting a task, with a worktree already on disk. Only the
+  // value that is actually USED is checked: a worktree copy whose prefix is
+  // ignored must not fail the load.
+  const prefixError = branchPrefixError(branchPrefix.prefix);
+  if (prefixError) {
+    throw new Error(
+      `Invalid default_branch_prefix "${branchPrefix.prefix}" in ${branchPrefix.source} ` +
+      `[git] section: it ${prefixError}.\n` +
+      `The prefix names the branch namespace lazy creates task branches in — ` +
+      `default_branch_prefix = "wip" gives branches called "wip/<task>".`
+    );
+  }
+
+  setBranchPrefix(branchPrefix.prefix);
+  config.git.default_branch_prefix = getBranchPrefix();
+
   return config;
 }
 
@@ -953,7 +1093,7 @@ backend = "${backend}"
 ${pathLine}
 
 [git]
-# Default prefix for lazy branches (e.g., "lazy/abc123")
+# Default prefix for lazy task branches (e.g., "lazy/abc123"); changing it renames nothing
 default_branch_prefix = "lazy"
 # Git LFS environment check at task start, for repos that use LFS.
 # "refuse" (default) blocks the start when the LFS filter would not run,
@@ -1083,10 +1223,12 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 # Ollama-only project). 'lazy system online' will NOT clear it.
 # offline = false
 # When using the GitHub driver, these options are also available:
-# github_auto_push = true   # Automatically push after each agent turn
+# github_auto_push = true   # Push task branches automatically; false keeps them local
+#                           # (lazy submit / lazy accept still push when a merge needs it)
 # Authentication is handled by gh CLI (run: gh auth login)
 # When using the GitLab driver, these options are also available:
-# gitlab_auto_push = true   # Automatically push after each agent turn
+# gitlab_auto_push = true   # Push task branches automatically; false keeps them local
+#                           # (lazy submit / lazy accept still push when a merge needs it)
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync } from 'fs';
 import { mkdir, mkdtemp, writeFile, readFile } from 'fs/promises';
-import { join, isAbsolute } from 'path';
+import { join, isAbsolute, dirname } from 'path';
 import { tmpdir } from 'os';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
@@ -37,8 +37,9 @@ export { DEFAULT_DOCKERFILE };
 import { getHome } from '../utils/home';
 import { toTurnUsage } from '../utils/usage-recording';
 import { VERSION } from '../version';
-import { IMAGE_NAME, DOCKERFILE_HASH_LABEL, IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from './image-tag';
+import { IMAGE_NAME, DOCKERFILE_HASH_LABEL, IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS, consentedBuildIdentity } from './image-tag';
 import { analyzeLazyBaseUsage, type LazyBaseUsage } from './dockerfile-base';
+import { adoptedBuildContextRoot } from '../daemon/adopted-image';
 
 // Re-exported so callers keep importing the image identity from one place.
 export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
@@ -236,6 +237,24 @@ export async function isAdoptedDockerfile(
 }
 
 /**
+ * Repository name (no tag) of a valid daemon-adopted image, or null.
+ *
+ * The adoption prompt names the image from the consented Dockerfile bytes AND
+ * the commit whose tree is its build context, so the name cannot be re-derived
+ * from content alone. Gated on the upgrade-build latch for the same reason
+ * `resolveCustomDockerfile`'s adoption branch is: routine launches soft-pin
+ * `imageName` in `ensureImage` and must not resolve adoption here.
+ */
+async function adoptedImageRepository(lazyRoot: string): Promise<string | null> {
+  if (!upgradeImageBuildEnabled) return null;
+  const { loadValidAdoptedImage } = await import('../daemon/adopted-image');
+  const adopted = await loadValidAdoptedImage(lazyRoot);
+  if (!adopted) return null;
+  const colon = adopted.imageName.lastIndexOf(':');
+  return colon > 0 ? adopted.imageName.substring(0, colon) : adopted.imageName;
+}
+
+/**
  * Get the Dockerfile content to use for building the lazy container.
  *
  * Resolution order:
@@ -303,6 +322,14 @@ export async function resolveImageRepository(lazyRoot: string, agentId?: string)
   const { isCustom, content } = await getDockerfileContent(lazyRoot, agentId);
 
   if (isCustom) {
+    // An adopted worktree Dockerfile was NAMED at the consent prompt, from its
+    // content AND the commit that froze its build context. Re-deriving a name
+    // from content alone here would answer a different question than the build
+    // did, so the two could drift apart — read the consented name instead.
+    const adoptedRepository = await adoptedImageRepository(lazyRoot);
+    if (adoptedRepository) {
+      return { repository: adoptedRepository, isCustom: true };
+    }
     const hash = createHash('sha256').update(content).digest('hex').substring(0, 12);
     return { repository: `lazy-custom-${hash}`, isCustom: true };
   }
@@ -628,10 +655,20 @@ export async function localImageExists(ref: string, binary: string = 'docker'): 
  * upgrade-build latch.
  *
  * Used when a human consents (TTY prompt) to pin a worktree Dockerfile on a
- * task. Build context remains the project root (same as today's custom-image
- * path). The Dockerfile is read ONCE, hashed, then written to a temp file
- * outside any worktree so `docker build` cannot pick up a post-consent agent
- * edit of the worktree file (hash/build TOCTOU).
+ * task. The build context is THAT DOCKERFILE'S OWN DIRECTORY — the worktree the
+ * human was standing in — never the project root, whose tree belongs to a
+ * different branch and would resolve the Dockerfile's COPY paths against the
+ * wrong files. `.dockerignore`, submodules and LFS behave exactly as they do in
+ * that checkout; lazy does nothing special with any of them.
+ *
+ * The consented bytes are read ONCE, hashed, and built from a temp copy that
+ * `-f` points at, so a write to the worktree file between hash and build cannot
+ * change what docker reads (hash/build TOCTOU). The rest of the context is the
+ * live directory, which is what "build this worktree" means.
+ *
+ * The image name covers the Dockerfile bytes AND the context directory, so the
+ * same Dockerfile in two worktrees cannot share one image — see
+ * {@link consentedBuildIdentity}.
  *
  * Do NOT use this to auto-resolve from a worktree — that would let agent-writable
  * branches drive host docker builds. The caller must have already gotten
@@ -640,8 +677,12 @@ export async function localImageExists(ref: string, binary: string = 'docker'): 
 export async function buildImageFromDockerfilePath(
   lazyRoot: string,
   dockerfilePath: string,
-  options: { binary?: string; noCache?: boolean; timeoutMs?: number } = {},
-): Promise<{ imageName: string; contentHash: string }> {
+  options: {
+    binary?: string;
+    noCache?: boolean;
+    timeoutMs?: number;
+  } = {},
+): Promise<{ imageName: string; contentHash: string; contextDir: string }> {
   const binary = options.binary ?? 'docker';
   await checkDocker(binary);
 
@@ -655,7 +696,11 @@ export async function buildImageFromDockerfilePath(
   // Capture consented bytes once — hash and build must agree on the same text.
   const content = await readFile(absPath, 'utf-8');
   const contentHash = createHash('sha256').update(content).digest('hex');
-  const shortHash = contentHash.substring(0, 12);
+
+  const contextDir = dirname(absPath);
+  // Content alone is not the identity: the same Dockerfile against a different
+  // tree is a different image.
+  const shortHash = consentedBuildIdentity(contentHash, contextDir).substring(0, 12);
   const repository = `lazy-custom-${shortHash}`;
   const imageName = `${repository}:${IMAGE_TAG}`;
   const tags = buildTagsFor(repository);
@@ -664,14 +709,15 @@ export async function buildImageFromDockerfilePath(
   const baseUsage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
   await ensureLazyBaseImage(baseUsage, absPath, binary, options.timeoutMs ?? 0);
 
-  // Build from a temp copy of the consented bytes, not the live worktree path.
-  // Temp is left in place (unique mkdtemp under the OS temp dir) so the `-f`
-  // path remains inspectable; it is outside every worktree.
+  // Build from a temp copy of the consented bytes, with the worktree as context.
   const snap = await writeDockerfileToTempDir(content);
-  logger.info(`Building ${imageName} container image from consented Dockerfile (source ${absPath})...`);
+  logger.info(
+    `Building ${imageName} container image from consented Dockerfile ` +
+      `(source ${absPath}, context ${contextDir})...`,
+  );
   try {
     await runDockerBuild(
-      lazyRoot,
+      contextDir,
       snap.dockerfilePath,
       tags,
       contentHash,
@@ -693,7 +739,7 @@ export async function buildImageFromDockerfilePath(
     throw err;
   }
 
-  return { imageName, contentHash };
+  return { imageName, contentHash, contextDir };
 }
 
 /**
@@ -774,15 +820,24 @@ async function buildImageWithTags(
   if (customPath) {
     // Name the Dockerfile in the announcement: from a worktree it is genuinely
     // ambiguous which copy governs, and a wrong one once cost a whole session.
-    logger.info(`Building ${tags[0]} container image from ${customPath}...`);
-    // Custom Dockerfile: build context is project root. Read once and build
-    // from a temp copy so a concurrent write to customPath cannot change what
-    // docker sees after we hashed (hash/build TOCTOU). For adoption, customPath
-    // is already the daemon snapshot; the extra copy is still correct.
+    // Read once and build from a copy so a concurrent write to customPath
+    // cannot change what docker sees after we hashed (hash/build TOCTOU). For
+    // adoption, customPath is already the daemon snapshot; the extra copy is
+    // still correct.
+    const content = await readFile(customPath, 'utf-8');
+
+    // An ADOPTED worktree Dockerfile builds against the WORKTREE the human
+    // consented to — its COPY paths name files on that branch, which the
+    // project root does not have. The plain `[docker].dockerfile` path keeps
+    // the project root as its context: it lives at the root and describes the
+    // root's tree.
+    const adoptedContext = await adoptedBuildContextRoot(lazyRoot, customPath);
+    buildCwd = adoptedContext ?? lazyRoot;
+    logger.info(
+      `Building ${tags[0]} container image from ${customPath} (context ${buildCwd})...`,
+    );
     // Temp dirs are unique (mkdtemp) under the OS temp dir — outside every
     // worktree — and left in place so the `-f` path stays inspectable.
-    buildCwd = lazyRoot;
-    const content = await readFile(customPath, 'utf-8');
     const snap = await writeDockerfileToTempDir(content);
     dockerfileName = snap.dockerfilePath;
 

@@ -15,7 +15,7 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, mkdir, rm, appendFile, readFile, unlink } from 'fs/promises';
+import { mkdtemp, mkdir, rm, readFile, unlink } from 'fs/promises';
 import { basename, join } from 'path';
 import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
@@ -89,6 +89,30 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
     }
   }
 
+  const configPath = () => join(ctx.root, 'lazy.toml');
+
+  /**
+   * Rewrite one key in the init-produced lazy.toml.
+   *
+   * EDIT the key, never append a section: the `lazy init` template already
+   * writes [agent], [server], [runner] and others, so appending a second copy
+   * is a TOML *redefinition* error. That is a real config error, but it is the
+   * wrong one — every test below would then be exercising "duplicate table"
+   * rather than the invalid value or the syntax error it names, and the
+   * assertions on the offending value would pass or fail for reasons unrelated
+   * to their premise. (This suite shipped doing exactly that; the loader's own
+   * error message coaches against it.)
+   */
+  async function replaceInConfig(from: string, to: string): Promise<void> {
+    const before = await readFile(configPath(), 'utf-8');
+    const after = before.replace(from, to);
+    // A `.replace()` that matched nothing is a silent no-op: the config stays
+    // valid, the daemon starts, and the "fails loudly" assertions fail with no
+    // hint that the fixture — not the daemon — is what changed.
+    expect(after).not.toBe(before);
+    await Bun.write(configPath(), after);
+  }
+
   /**
    * Break the project's lazy.toml. An invalid `[agent] effort` is a plain typo
    * — the config file is present and readable, but the values in it cannot be
@@ -96,7 +120,12 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
    * treated like "not found".
    */
   async function breakConfig(): Promise<void> {
-    await appendFile(join(ctx.root, 'lazy.toml'), '\n[agent]\neffort = "definitely-not-an-effort"\n');
+    await replaceInConfig('# effort = "medium"', 'effort = "definitely-not-an-effort"');
+  }
+
+  /** Undo {@link breakConfig}, restoring the template's commented-out default. */
+  async function fixConfig(): Promise<void> {
+    await replaceInConfig('effort = "definitely-not-an-effort"', '# effort = "medium"');
   }
 
   /**
@@ -106,7 +135,7 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
    * daemon as a loadConfig throw, and the gate must not distinguish them.
    */
   async function mangleConfig(): Promise<void> {
-    await appendFile(join(ctx.root, 'lazy.toml'), '\n[server]\nport = = 26024\n');
+    await replaceInConfig('port = 26024', 'port = = 26024');
   }
 
   const startWithBrokenConfig = (port: number, socket: string) =>
@@ -211,12 +240,8 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
     await expect(startWithBrokenConfig(port, join(tmpDir, 'fixed-fail.sock')))
       .rejects.toThrow(/Daemon failed to load/);
 
-    // Fix it: drop the bogus override entirely.
-    const raw = await readFile(join(ctx.root, 'lazy.toml'), 'utf-8');
-    await Bun.write(
-      join(ctx.root, 'lazy.toml'),
-      raw.replace('\n[agent]\neffort = "definitely-not-an-effort"\n', '\n'),
-    );
+    // Fix it: put the bogus override back the way the template had it.
+    await fixConfig();
 
     const daemon = await startDaemonServer({
       projectRoot: ctx.root,

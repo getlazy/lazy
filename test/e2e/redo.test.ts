@@ -180,6 +180,7 @@ describe('lazy redo', () => {
       ...(data.metadata ?? {}),
       custom_image: imageRef,
       custom_image_hash: hash,
+      custom_image_context: 'f'.repeat(40),
     };
     writeTaskJson(ctx.root, taskId, data);
 
@@ -192,6 +193,9 @@ describe('lazy redo', () => {
     const redone = readTaskJson(ctx.root, newTaskId);
     expect(redone.metadata?.custom_image).toBeUndefined();
     expect(redone.metadata?.custom_image_hash).toBeUndefined();
+    // The build context the pin was made against goes with it: a stale commit
+    // recorded against no image is provenance for nothing.
+    expect(redone.metadata?.custom_image_context).toBeUndefined();
   });
 });
 

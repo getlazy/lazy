@@ -30,6 +30,17 @@ describe('resolveAgentModel', () => {
     expect(resolveAgentModel(config, { preferredModel: null })).toBe('claude-opus-4-8');
   });
 
+  // Fable 5.1 (`claude-fable-5-1`) is a concrete Anthropic id. Launch-time
+  // resolution must pass it through — both as a sticky/task model and as an
+  // explicit override — so a task pinned to 5.1 does not collapse to the `fable`
+  // short alias (which Claude Code may still resolve to Fable 5).
+  test('passes claude-fable-5-1 through as preferred and override model', () => {
+    const config = configWith({ builder: anthropic(), agent: anthropic() }, 'claude-opus-4-8');
+    expect(resolveAgentModel(config, { preferredModel: 'claude-fable-5-1' })).toBe('claude-fable-5-1');
+    expect(resolveAgentModel(config, { overrideModel: 'claude-fable-5-1' })).toBe('claude-fable-5-1');
+    expect(resolveAgentModel(config, { agentId: 'claude-code', preferredModel: 'claude-fable-5-1' })).toBe('claude-fable-5-1');
+  });
+
   // INVARIANT: an agent may declare its own default model, and it outranks
   // [models] default. `opus` is an Anthropic name chosen for Claude Code; a
   // Cursor task has no business inheriting it (that is what walled a real user

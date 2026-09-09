@@ -127,6 +127,44 @@ describe('parseUnifiedDiff', () => {
     expect(parseUnifiedDiff('just some prose\nnot a diff\n')).toEqual([]);
   });
 
+  // INVARIANT: a non-git `diff --<anything>` header must never merge into the
+  // file before it. The daemon appends a synthetic
+  // `diff --lazy a/comments b/comments` section to `lazy diff` output; when the
+  // parser did not recognise it, its `+++ b/comments` line renamed the LAST
+  // REAL FILE to "comments" and the comment lines were appended to that file's
+  // hunks — the phantom "comments" file reported on the review page.
+  test('a synthetic `diff --lazy` section does not swallow the previous file', () => {
+    const withComments =
+      'diff --git a/CLAUDE.md b/CLAUDE.md\n' +
+      '--- a/CLAUDE.md\n' +
+      '+++ b/CLAUDE.md\n' +
+      '@@ -1,2 +1,2 @@\n' +
+      ' intro\n' +
+      '-old line\n' +
+      '+new line\n' +
+      '\n' +
+      'diff --lazy a/comments b/comments\n' +
+      '--- /dev/null\n' +
+      '+++ b/comments\n' +
+      '@@ -0,0 +1,2 @@\n' +
+      '+[2026-09-02]\n' +
+      '+please fix the heading\n';
+
+    const files = parseUnifiedDiff(withComments);
+    expect(files.map(f => f.path)).toEqual(['CLAUDE.md']);
+    expect(files[0].hunks).toHaveLength(1);
+    expect(files[0].additions).toBe(1);
+    expect(files[0].hunks[0].lines.map(l => l.content)).toEqual(['intro', 'old line', 'new line']);
+  });
+
+  test('parsing resumes at the next `diff --git` after an unknown diff header', () => {
+    const files = parseUnifiedDiff(
+      'diff --lazy a/comments b/comments\n--- /dev/null\n+++ b/comments\n@@ -0,0 +1,1 @@\n+a note\n' +
+      'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n+new\n',
+    );
+    expect(files.map(f => f.path)).toEqual(['x']);
+  });
+
   test('"\\ No newline at end of file" does not consume a line number', () => {
     const files = parseUnifiedDiff(
       'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n',

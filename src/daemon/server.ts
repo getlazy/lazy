@@ -28,9 +28,9 @@
 
 import { randomUUID } from 'crypto';
 import { mkdirSync, existsSync, unlinkSync } from 'fs';
-import { unlink, writeFile } from 'fs/promises';
+import { mkdir, unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
-import { getSocketPath, getStartupErrorPath } from './paths';
+import { getDaemonDir, getSocketPath, getStartupErrorPath } from './paths';
 import { writePid, generateToken, readToken, readWebPort, writeWebPort, cleanupOwnDaemonFiles, acquireDaemonLock, releaseDaemonLock, type AutoReactBudgetEntry } from './lifecycle';
 import { startDaemonStateFileWatch } from './state-files';
 import { writeDaemonRoot } from './registry';
@@ -180,6 +180,93 @@ function bearerToken(req: Request): string | null {
 }
 
 /**
+ * Record a hard startup failure and return the Error the caller must throw
+ * (`throw await recordStartupFailure(...)` — returning rather than throwing
+ * keeps the abort visible to the compiler's control-flow analysis at every call
+ * site). Two steps, in this order:
+ *
+ *  1. logger.error FIRST — the logger appends (O_APPEND), so the message lands
+ *     at the END of daemon.log, after the earlier startup lines. This is what
+ *     `tail daemon.log` shows.
+ *  2. Write the startup-error marker so the parent process (the CLI that
+ *     spawned this detached daemon via startDaemonBackground) can surface the
+ *     reason in the user's terminal after its readiness poll times out, instead
+ *     of a generic "Daemon did not start within 5 seconds". The parent cleared
+ *     any stale marker before spawning, so its presence means "this child wrote
+ *     it". Best-effort: the file-backed log remains the source of truth if the
+ *     marker write fails.
+ *
+ * The returned Error is marked already-logged so the top-level CLI catch in
+ * src/index.ts doesn't append a second untimestamped copy (in background mode
+ * its console.* writes land back in daemon.log via O_APPEND).
+ *
+ * The daemon directory is created here rather than assumed: the earliest
+ * preconditions (config, credentials) deliberately run before ANY side effect,
+ * which includes the mkdir the socket path would otherwise have done — and a
+ * refusal whose marker silently failed to write is a refusal the user never
+ * sees.
+ */
+async function recordStartupFailure(projectRoot: string, errorMessage: string): Promise<Error> {
+  logger.error(errorMessage);
+  try {
+    await mkdir(getDaemonDir(projectRoot), { recursive: true });
+    await writeFile(getStartupErrorPath(projectRoot), errorMessage, { mode: 0o644 });
+  } catch (markerErr) {
+    logger.warn(`Failed to write startup-error marker: ${markerErr instanceof Error ? markerErr.message : String(markerErr)}`);
+  }
+  return markLoggedToFile(new Error(errorMessage));
+}
+
+/**
+ * Load the project's config, or abort startup.
+ *
+ * INVARIANT: a lazy.toml that exists but does not load is a hard startup
+ * failure, never a fall-through to defaults. Every value in it is a decision
+ * the user made — where storage lives, which port the dashboard serves, which
+ * interface it is reachable from, which runner every task container uses.
+ * Guessing them serves a daemon the user did not ask for and then hands those
+ * guesses to every task it launches; the resulting symptom ("why is my runner
+ * docker?") is arbitrarily far from the cause. A MISSING lazy.toml is not this
+ * case — loadConfig returns defaults for it without throwing.
+ *
+ * THIS RUNS FIRST, before every other startup step, and that ordering is the
+ * whole point. Config is read by the credential gate (via the `[ollama]` flag)
+ * and by daemon storage init, both of which run before the daemon has bound
+ * anything — so whichever of them touched it first used to surface the loader's
+ * RAW error and this gate never got the chance to wrap it. The user saw a bare
+ * parse error with no indication that it had stopped their daemon. Adding a
+ * startup step that reads config BEFORE this call re-opens exactly that hole.
+ *
+ * Searching from projectRoot explicitly: loadConfig otherwise defaults its
+ * search to process.cwd(), which for a detached daemon is whatever directory
+ * the CLI that spawned it happened to be in (and for an in-process test daemon
+ * is the test runner's cwd).
+ */
+async function loadDaemonConfigOrFail(projectRoot: string) {
+  try {
+    return await loadConfig(projectRoot, { cwd: projectRoot });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const configPath = await resolveConfigPath(projectRoot, projectRoot);
+    throw await recordStartupFailure(
+      projectRoot,
+      `Daemon failed to load ${configPath}: ${detail}\n` +
+      `\n` +
+      `The daemon reads lazy.toml to decide where its storage lives, which port the ` +
+      `dashboard serves on, which interface it binds, and the runner every task ` +
+      `container uses. It will not start on guessed values: it would serve on a port ` +
+      `you did not configure with a runner you may not have, and hand both to every ` +
+      `task it launches.\n` +
+      `\n` +
+      `To fix:\n` +
+      `  • Correct the error above in ${configPath}\n` +
+      `  • Compare against the documented example: lazy.toml.example\n` +
+      `  • Once lazy.toml loads, check the rest of the setup: lazy doctor`,
+    );
+  }
+}
+
+/**
  * Start the daemon HTTP server on a unix socket, with optional TCP web server.
  *
  * Creates PID file, generates bearer token, binds to unix socket.
@@ -216,6 +303,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   logger.info(`Daemon starting for project: ${projectRoot} (PID ${process.pid})`);
 
+  // The config precondition — see loadDaemonConfigOrFail. FIRST, before the
+  // credential gate and before any side effect, because both of the steps that
+  // follow read config themselves and would otherwise surface the loader's raw
+  // error in place of this one. Nothing has been created yet, so a refusal here
+  // leaves nothing to clean up.
+  const startupConfig = await loadDaemonConfigOrFail(projectRoot);
+
   // INVARIANT: a daemon never exists without a model credential.
   //
   // This is the AUTHORITATIVE enforcement point — the callers (auto-start,
@@ -243,24 +337,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     try {
       await assertDaemonCredentials(projectRoot);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error(message);
-      // Write the startup-error marker so a detached child's refusal reaches
-      // the caller's terminal (startDaemonBackground reads it after its
-      // readiness poll) and `lazy daemon status` can explain why there is no
-      // daemon. The parent pre-flight normally catches this first; the marker
-      // is what covers the case where the child's environment differs from the
-      // spawning process's. Best-effort — the throw below is the real signal.
-      try {
-        await writeFile(getStartupErrorPath(projectRoot), message, { mode: 0o644 });
-      } catch (markerErr) {
-        logger.warn(
-          `Failed to write startup-error marker: ${markerErr instanceof Error ? markerErr.message : String(markerErr)}`,
-        );
-      }
-      // Mark as already logged so the top-level CLI catch doesn't emit a second
-      // untimestamped copy into daemon.log via the O_APPEND stderr redirect.
-      throw markLoggedToFile(new Error(message));
+      // The marker recordStartupFailure writes is what carries a detached
+      // child's refusal to the caller's terminal (startDaemonBackground reads
+      // it after its readiness poll) and lets `lazy daemon status` explain why
+      // there is no daemon. The parent pre-flight normally catches this first;
+      // the marker covers the case where the child's environment differs from
+      // the spawning process's.
+      throw await recordStartupFailure(projectRoot, err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -919,37 +1002,24 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   };
 
   /**
-   * Record a hard startup failure and return the Error the caller must throw
+   * Record a hard startup failure that happens AFTER the daemon has started
+   * building itself, and return the Error the caller must throw
    * (`throw await failStartup(msg)` — returning rather than throwing keeps the
    * abort visible to the compiler's control-flow analysis at every call site).
    *
-   * This is the single shape every hard startup precondition (web bind, config
-   * load, proxy) ends in, so they stay consistent as more are added:
+   * This is the single shape every hard startup precondition from here on (web
+   * bind, proxy) ends in, so they stay consistent as more are added: log and
+   * record via {@link recordStartupFailure}, then tear the partial daemon down
+   * — never leave half a daemon running.
    *
-   *  1. logger.error BEFORE teardown — the logger appends (O_APPEND), so the
-   *     message lands at the END of daemon.log, after the earlier startup
-   *     lines. This is what `tail daemon.log` shows.
-   *  2. Write the startup-error marker so the parent process (the CLI that
-   *     spawned this detached daemon via startDaemonBackground) can surface
-   *     the reason in the user's terminal after its readiness poll times out,
-   *     instead of a generic "Daemon did not start within 5 seconds". The
-   *     parent cleared any stale marker before spawning, so its presence
-   *     means "this child wrote it". Best-effort: the file-backed log remains
-   *     the source of truth if the marker write fails.
-   *  3. Tear the partial daemon down — never leave half a daemon running.
-   *  4. Mark the error as already-logged so the top-level CLI catch in
-   *     src/index.ts doesn't append a second untimestamped copy (in background
-   *     mode its console.* writes land back in daemon.log via O_APPEND).
+   * The preconditions that run before anything exists (config, credentials)
+   * call recordStartupFailure directly: there is nothing to tear down, and the
+   * teardown closes over bindings those steps precede.
    */
   const failStartup = async (errorMessage: string): Promise<Error> => {
-    logger.error(errorMessage);
-    try {
-      await writeFile(getStartupErrorPath(projectRoot), errorMessage, { mode: 0o644 });
-    } catch (markerErr) {
-      logger.warn(`Failed to write startup-error marker: ${markerErr instanceof Error ? markerErr.message : String(markerErr)}`);
-    }
+    const error = await recordStartupFailure(projectRoot, errorMessage);
     await teardownPartialStart();
-    return markLoggedToFile(new Error(errorMessage));
+    return error;
   };
 
   const shouldBindWeb =
@@ -963,50 +1033,17 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // stay valid across the restart. A user who moves [server] port off the
     // default still wins — that's authoritative — so persistence only steers
     // the default case (see the movedConfigPort note below).
-    let configPort: number | undefined;
+    // From the config loaded at the top of startup — see loadDaemonConfigOrFail
+    // for why a lazy.toml that will not load never reaches this far, and why
+    // that check cannot live here.
+    const configPort = startupConfig.server.port;
     // Bind interface: defaults to loopback so the unauthenticated dashboard and
     // the /mcp + /rpc endpoints are not exposed to the LAN. Users opt into
     // remote access via [server] bind in lazy.toml.
-    let bindHost: string = DEFAULT_SERVER_BIND;
+    const bindHost = startupConfig.server.bind;
     // Runner type decides whether containers need a bridge-reachable bind on
     // Linux.
-    let runnerType: RunnerType;
-    try {
-      // Search from projectRoot explicitly — loadConfig otherwise defaults its
-      // search to process.cwd(), which for a detached daemon is whatever
-      // directory the CLI that spawned it happened to be in (and for an
-      // in-process test daemon is the test runner's cwd). Matches the proxy
-      // load below.
-      const config = await loadConfig(projectRoot, { cwd: projectRoot });
-      configPort = config.server.port;
-      bindHost = config.server.bind;
-      runnerType = config.runner.type;
-    } catch (err) {
-      // INVARIANT: a lazy.toml that exists but does not load is a hard startup
-      // failure, never a fall-through to defaults. Every value read here is a
-      // decision the user made — which port the dashboard serves on, which
-      // interface it is reachable from, which runner every task container
-      // uses. Guessing them serves a daemon the user did not ask for, on a
-      // port they did not configure, and then hands those guesses to every
-      // task it launches; the resulting symptom ("why is my runner docker?")
-      // is arbitrarily far from the cause. A missing lazy.toml is NOT this
-      // case — loadConfig returns defaults for it without throwing.
-      const detail = err instanceof Error ? err.message : String(err);
-      const configPath = await resolveConfigPath(projectRoot, projectRoot);
-      throw await failStartup(
-        `Daemon failed to load ${configPath}: ${detail}\n` +
-        `\n` +
-        `The daemon reads lazy.toml to decide the dashboard port, the interface it binds, ` +
-        `and the runner every task container uses. It will not start on guessed values: ` +
-        `it would serve on a port you did not configure with a runner you may not have, ` +
-        `and hand both to every task it launches.\n` +
-        `\n` +
-        `To fix:\n` +
-        `  • Correct the error above in ${configPath}\n` +
-        `  • Compare against the documented example: lazy.toml.example\n` +
-        `  • Once lazy.toml loads, check the rest of the setup: lazy doctor`,
-      );
-    }
+    const runnerType: RunnerType = startupConfig.runner.type;
 
     // A config port equal to the default is treated as "unset" for persistence:
     // the `lazy init` template writes `port = 26024` (the default) explicitly,
@@ -1015,8 +1052,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // config port expresses intent to move off the default, and it is honored
     // verbatim (above the persisted port). Everything else prefers the last-bound
     // port so a restart stays put and mounted MCP configs remain valid.
-    const movedConfigPort =
-      configPort !== undefined && configPort !== DEFAULT_WEB_PORT ? configPort : undefined;
+    const movedConfigPort = configPort !== DEFAULT_WEB_PORT ? configPort : undefined;
     const desiredPort =
       options.webPort
       ?? movedConfigPort

@@ -1,4 +1,5 @@
 import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { looksLikeTaskBranch } from '../../git/branch-prefix';
 import { openEditor, promptLine, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import type { Task, TaskType, TaskPriority } from '../../types';
 import { VALID_TASK_TYPES, VALID_TASK_PRIORITIES } from '../../types';
@@ -209,7 +210,7 @@ export async function commandCreate(args: string[]): Promise<void> {
           console.error(`--parent '${parentValue}' is neither a known task nor a local git branch.`);
           process.exit(1);
         }
-        if (parentValue.startsWith('lazy/')) {
+        if (looksLikeTaskBranch(parentValue)) {
           console.error(`--parent must be an integration branch, not a lazy task branch ('${parentValue}').`);
           process.exit(1);
         }

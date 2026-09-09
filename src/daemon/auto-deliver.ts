@@ -32,6 +32,7 @@ import { isTurnInFlight } from './in-flight-turn';
 import { logger } from '../utils/logger';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { taskRef, getWorktreePathForRef } from '../cli/helpers';
+import { taskBranchFor } from '../git/branch-prefix';
 import { parentTaskIdOf } from '../task-target';
 import { branchExists } from '../git/operations';
 import { shouldAutoReact, recordAutoReact, type AutoReactTrigger } from './auto-react-budget';
@@ -71,7 +72,7 @@ async function isParentBranchAhead(
   if (!parentTask) return { ahead: false, parentTip: null };
 
   const parentRef = taskRef(parentTask);
-  const parentBranch = `lazy/${parentRef}`;
+  const parentBranch = taskBranchFor(parentRef);
 
   if (!await branchExists(parentBranch, lazyRoot) || !await branchExists(session.git_branch, lazyRoot)) {
     return { ahead: false, parentTip: null };
@@ -663,7 +664,7 @@ async function detectParentBranchChanges(
       const parentTask = await storage.getTask(parentId);
       if (!parentTask) continue;
 
-      const parentBranch = `lazy/${taskRef(parentTask)}`;
+      const parentBranch = taskBranchFor(taskRef(parentTask));
 
       // Get current parent branch tip
       const tipResult = await runGit(['rev-parse', parentBranch], { cwd: lazyRoot });

@@ -17,6 +17,7 @@
 import { shortId, displayId, getWorktreePath, taskRef } from '../cli/helpers';
 import { loadConfig } from '../config/loader';
 import { createDriver, type RepositoryDriver } from '../remote';
+import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { regenerateFidelity } from '../synthesis/fidelity';
 import { getSummarizer } from '../synthesis/summarizer';
 import type { Summarizer } from '../synthesis/summarizer';
@@ -670,18 +671,27 @@ export async function runSync(root: string, storage: Storage, log: SyncLogger): 
     log.error(`  Error: ${error}`);
   }
 
-  // Export direction: lazy → remote
+  // Export direction: lazy → remote.
+  //
+  // This is the daemon's own background tick, not a push the user asked for, so
+  // it is one of the automatic pushes `<driver>_auto_push = false` opts out of.
+  // Every other sync phase (fetch, comments, CI, PR artifacts) still runs — the
+  // setting is about not pushing branches, not about going offline.
   log.phase('Exporting task branches...');
-  const exportResult = await exportTasks(storage, root, driver, log);
-
-  if (exportResult.pushed > 0) {
-    log.detail(`  ${exportResult.pushed} branch(es) pushed`);
+  if (!autoPushEnabled(config)) {
+    log.detail(`  Skipped — ${autoPushConfigKey(config)} = false`);
   } else {
-    log.detail('  Nothing to export');
-  }
+    const exportResult = await exportTasks(storage, root, driver, log);
 
-  for (const error of exportResult.errors) {
-    log.error(`  Error: ${error}`);
+    if (exportResult.pushed > 0) {
+      log.detail(`  ${exportResult.pushed} branch(es) pushed`);
+    } else {
+      log.detail('  Nothing to export');
+    }
+
+    for (const error of exportResult.errors) {
+      log.error(`  Error: ${error}`);
+    }
   }
 
   // Post turns to PRs (agent summaries + human review feedback)

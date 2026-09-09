@@ -64,12 +64,15 @@ export async function localImageExists(_ref: string, _binary?: string): Promise<
 
 export async function buildImageFromDockerfilePath(
   _lazyRoot: string,
-  _dockerfilePath: string,
-  _options?: { binary?: string },
-): Promise<{ imageName: string; contentHash: string }> {
+  dockerfilePath: string,
+  _options?: { binary?: string; noCache?: boolean; timeoutMs?: number },
+): Promise<{ imageName: string; contentHash: string; contextDir: string }> {
+  const { dirname } = await import('path');
   return {
     imageName: `lazy-custom-testhash12:${IMAGE_TAG}`,
     contentHash: 'a'.repeat(64),
+    // The build context is the directory holding the consented Dockerfile.
+    contextDir: dirname(dockerfilePath),
   };
 }
 

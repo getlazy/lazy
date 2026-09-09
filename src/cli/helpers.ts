@@ -8,6 +8,7 @@ import { join } from 'path';
 import { findLazyRoot, getDataDir } from './init';
 import type { Storage } from '../storage';
 import { repoHasCommits } from '../git/operations';
+import { taskBranchFor } from '../git/branch-prefix';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
 import type { Task, TokenUsage } from '../types';
@@ -161,16 +162,19 @@ export function getWorktreePathForRef(root: string, tRef: string): string {
 
 /**
  * Get the git branch name for a task.
+ *
+ * The namespace comes from `[git] default_branch_prefix`, installed process-wide
+ * by loadConfig — never a `lazy/` literal (see src/git/branch-prefix.ts).
  */
 export function getBranchName(task: Task): string {
-  return `lazy/${taskRef(task)}`;
+  return taskBranchFor(taskRef(task));
 }
 
 /**
  * Get the git branch name for a task by ID.
  */
 export async function getBranchNameFromId(taskId: string, storage: Storage): Promise<string> {
-  return `lazy/${await taskRefFromId(taskId, storage)}`;
+  return taskBranchFor(await taskRefFromId(taskId, storage));
 }
 
 /**

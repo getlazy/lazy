@@ -30,6 +30,7 @@ import { createRunner } from '../runner';
 import { stampSessionRunner } from '../runner/session-launch';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { createDriver, resolveUpstreamMergeRef } from '../remote';
+import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
 import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-tokens';
@@ -38,6 +39,7 @@ import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMi
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
+import { taskBranchFor, looksLikeTaskBranch } from '../git/branch-prefix';
 import { buildNotesContext, buildSystemPrompt } from '../cli/commands/shared';
 import { buildMemorySection } from '../memory';
 import { checkOrphanedChild, retargetOrphanedChild } from '../cli/orphan';
@@ -589,15 +591,19 @@ export async function launchTask(
   const tRef = taskRef(t);
   const branchName = isLinkedTask && existingSession
     ? existingSession.git_branch
-    : `lazy/${tRef}`;
+    : taskBranchFor(tRef);
 
   // --- Determine parent branch and start SHA ---
   const tParentId = parentTaskIdOf(t);
   // Explicit branch target stored at create time (`lazy create --parent release-x`).
-  // '' and a stale 'lazy/…' ref are "needs runtime resolution" sentinels, not real
-  // targets (see src/task-target.ts) — treat both as absent.
+  // '' and a stale task-branch ref are "needs runtime resolution" sentinels, not
+  // real targets (see src/task-target.ts) — treat both as absent. The check
+  // accepts the built-in `lazy/` namespace as well as the configured one: a
+  // project that changed `[git] default_branch_prefix` still has stale refs
+  // written under the old namespace, and using one as a real integration target
+  // is the dangerous direction. Mirrors resolveSyncTarget in task-lifecycle.ts.
   const storedRawTarget = t.target.kind === 'branch' ? t.target.branch : '';
-  const storedBranchTarget = storedRawTarget && !storedRawTarget.startsWith('lazy/')
+  const storedBranchTarget = storedRawTarget && !looksLikeTaskBranch(storedRawTarget)
     ? storedRawTarget
     : undefined;
   let startSha: string;
@@ -914,22 +920,32 @@ export async function launchTask(
         await storage.updateTaskTarget(t.id, branchTarget(mergeTarget));
       }
 
-      try {
-        const publishResult = await withSpan('remote.publish_branch', {
-          'git.branch': branchName,
-          'git.target': mergeTarget,
-        }, () => driver.publishBranch({
-          branch: branchName,
-          targetBranch: mergeTarget,
-          task: t,
-        }));
-        if (publishResult.metadata) {
-          for (const [key, value] of Object.entries(publishResult.metadata)) {
-            await storage.updateTaskMetadata(t.id, key, value);
+      // Publishing at task start pushes the (still empty) branch to the forge
+      // before the agent has done anything — the earliest and most visible of
+      // the automatic pushes, and the first thing a user who set
+      // `<driver>_auto_push = false` notices still happening. Skipping it leaves
+      // the task purely local until `lazy submit` or `lazy accept` needs a
+      // remote ref, which is exactly what the opt-out asks for.
+      if (!autoPushEnabled(config)) {
+        logger.debug(`Branch publish skipped: ${autoPushConfigKey(config)} = false`);
+      } else {
+        try {
+          const publishResult = await withSpan('remote.publish_branch', {
+            'git.branch': branchName,
+            'git.target': mergeTarget,
+          }, () => driver.publishBranch({
+            branch: branchName,
+            targetBranch: mergeTarget,
+            task: t,
+          }));
+          if (publishResult.metadata) {
+            for (const [key, value] of Object.entries(publishResult.metadata)) {
+              await storage.updateTaskMetadata(t.id, key, value);
+            }
           }
+        } catch (err) {
+          warnings.push(`Failed to publish branch (non-fatal): ${err instanceof Error ? err.message : err}`);
         }
-      } catch (err) {
-        warnings.push(`Failed to publish branch (non-fatal): ${err instanceof Error ? err.message : err}`);
       }
     }
 

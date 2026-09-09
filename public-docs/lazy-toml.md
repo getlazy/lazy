@@ -158,8 +158,28 @@ Git-related configuration.
 
 | Key                     | Type     | Default  | Description |
 |-------------------------|----------|----------|-------------|
-| `default_branch_prefix` | `string` | `"lazy"` | Prefix for task branches (e.g., `lazy/fix-bug`). |
+| `default_branch_prefix` | `string` | `"lazy"` | Prefix for task branches (e.g., `lazy/fix-bug`). Set it to `"wip"` and new task branches are named `wip/fix-bug`. A trailing slash is optional — `"wip"` and `"wip/"` mean the same thing. |
 | `lfs_check`             | `string` | `"refuse"` | Start-time git LFS check on repos that use LFS: `"refuse"` blocks the start when the LFS filter would not run, `"warn"` starts anyway and records a warning, `"off"` disables it. Does not affect the accept-time guard, which always runs — see [LFS guard](lfs-guard.md). |
+
+Changing `default_branch_prefix` renames nothing. Branches that already exist keep
+their names and their tasks keep working; the new prefix applies to branches created
+from then on. Change it between releases rather than with tasks in flight.
+
+Two things to know before you pick a value:
+
+- **Everything under the prefix is treated as a task branch.** Lazy merges task
+  branches locally rather than opening a pull request for them, so don't point the
+  prefix at a namespace you already use for real integration branches. With
+  `default_branch_prefix = "release"`, a branch named `release/2.0` would be taken
+  for a task branch. A namespace of your own — `wip`, `tasks`, `agent` — avoids this.
+- **The prefix comes from the project root's `lazy.toml`.** Other settings can be
+  overridden by a `lazy.toml` deeper in the tree; this one cannot, because every
+  task worktree shares one git repository and therefore one branch namespace.
+
+A prefix git cannot use in a branch name (spaces, a leading `/`, and so on) is
+rejected when the config loads, naming the file and the key — rather than failing
+later, partway through starting a task. An empty value means "unset": you get the
+default `lazy`.
 
 ---
 
@@ -374,7 +394,7 @@ Available when `driver = "github"`. Authentication is handled by `gh` CLI (`gh a
 
 | Key                | Type   | Default | Description |
 |--------------------|--------|---------|-------------|
-| `github_auto_push` | `bool` | `true`  | Automatically push after each agent turn. |
+| `github_auto_push` | `bool` | `true`  | Automatically push task branches (after each agent turn, on the background sync, and when a task starts). Set `false` to keep task branches local until you ask for a push — see [what `auto_push = false` covers](#what-auto_push--false-covers). |
 | `github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection` | `bool` | `false` | Sync PR comments in public repos. **Security risk** — enables prompt injection via public comments. |
 
 #### GitHub Enterprise Server
@@ -409,7 +429,7 @@ Available when `driver = "gitlab"`. Authentication is handled by `glab` CLI (`gl
 
 | Key                | Type   | Default | Description |
 |--------------------|--------|---------|-------------|
-| `gitlab_auto_push` | `bool` | `true`  | Automatically push after each agent turn. |
+| `gitlab_auto_push` | `bool` | `true`  | Automatically push task branches (after each agent turn, on the background sync, and when a task starts). Set `false` to keep task branches local until you ask for a push — see [what `auto_push = false` covers](#what-auto_push--false-covers). |
 | `gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection` | `bool` | `false` | Sync MR comments in public repos. **Security risk** — enables prompt injection via public comments. |
 
 ```toml
@@ -420,6 +440,23 @@ auto_approve = false
 # offline = true   # stay offline permanently (no midnight auto-expiry)
 github_auto_push = true
 ```
+
+#### What `auto_push = false` covers
+
+`github_auto_push = false` (and `gitlab_auto_push = false`) means "don't push my task
+branches behind my back". It turns off the pushes lazy fires on its own:
+
+- publishing a task's branch when the task starts
+- the push after each agent turn
+- the branch export on the background sync
+- the push at the end of a `lazy pair` session
+
+Your task branches then stay local, and the forge never sees them until you ask.
+
+It is not a global "never push". Commands you run by name still do what their name
+says: `lazy submit` pushes the branch so it can open the PR/MR, and `lazy accept`
+pushes the parent branch when a merge needs it — without that push the remote parent
+would permanently diverge from your local one.
 
 The driver-specific keys (`github_*`, `gitlab_*`) are always valid at the schema level — lazy won't warn about GitHub keys while you're temporarily using the `local` driver.
 
@@ -446,6 +483,20 @@ Two human-consented ways to use a worktree's Dockerfile:
 
 1. **Per-task pin** — from a terminal, `lazy create` / `start` / `edit` in a task worktree can ask to build that worktree's `Dockerfile.lazy` and pin it on the task (subtasks inherit it; `lazy clone` / `lazy redo` start fresh with the root image and warn if the source had a pin). Later turns use the pin with no prompt.
 2. **Upgrade adoption** — from a terminal, `lazy upgrade` (incl. `--images`) in a task worktree can ask to adopt that Dockerfile for the image build **and** the restarted daemon. Adoption is stored in daemon runtime state (not `lazy.toml`), applies to all launches that do not already have a per-task pin, and lasts until the next upgrade rebuild decides again. `lazy doctor` and the daemon startup log report it.
+
+**The build context follows the Dockerfile.** A worktree's `Dockerfile.lazy` describes the tree it lives in — its `COPY` lines name files on that branch. So a consented build (either flow above) uses **that worktree directory** as the docker build context, not the project root, and the prompt names it before you answer:
+
+```
+Context:    /path/to/.lazy/worktrees/my-task (this worktree, as it is on disk)
+```
+
+Three things follow from that:
+
+- **It is the directory as it is on disk**, exactly like running `docker build` in it yourself: uncommitted and untracked files are part of the build, and `.dockerignore`, submodules and Git LFS behave as they do in that checkout. The one thing that is not read live is `Dockerfile.lazy` itself — the exact bytes you were shown at the prompt are what gets built.
+- **Two worktrees with the same `Dockerfile.lazy` build two different images**, instead of one silently reusing an image built from the other's files.
+- **The worktree's commit at build time is recorded with the image** and shown by `lazy show`, `lazy doctor` and `lazy upgrade` as "HEAD when built". It tells you when the image was built, not what went into it — the build read the directory live.
+
+A plain `dockerfile = "..."` in `lazy.toml` is unaffected: it lives at the project root and is built with the project root as its context, as before.
 
 For a permanent project-wide custom image, set `dockerfile` in `lazy.toml` to a path under the project root.
 

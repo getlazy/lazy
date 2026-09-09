@@ -672,6 +672,45 @@ describe('lazy web review surface', () => {
     expect(threads.threads).toHaveLength(0);
   });
 
+  // INVARIANT: the review page never receives non-diff content as diff. The
+  // daemon's `lazy diff` output appends a synthetic
+  // `diff --lazy a/comments b/comments` section for comments newer than the
+  // last agent turn; feeding that to the page's unified-diff parser renamed
+  // the last real file to "comments" and hid its own hunks.
+  test('a task comment does not produce a phantom "comments" file on the review page', async () => {
+    const taskId = await createTask(ctx, 'Phantom comments file', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    // Wait for the mock agent's commit to show up as a real file in the diff.
+    let html = '';
+    let deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      html = await (await fetch(`${base}/review/${taskId}`)).text();
+      if (html.includes('data-file="agent-output-')) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    expect(html).toContain('data-file="agent-output-');
+
+    // A comment newer than the last agent turn is what triggers the synthetic
+    // section in the daemon's diff output.
+    await ctx.lazy(['comment', taskId, '-m', 'please fix the heading']);
+
+    // Precondition: the CLI diff — documented to carry comments — really does
+    // emit the synthetic section, so the page assertions below are meaningful
+    // and the CLI's behaviour is unchanged by the fix.
+    const cli = await ctx.lazy(['diff', taskId, '--full']);
+    expect(cli.stdout).toContain('diff --lazy a/comments b/comments');
+    expect(cli.stdout).toContain('please fix the heading');
+
+    html = await (await fetch(`${base}/review/${taskId}`)).text();
+
+    // The real file is still there, under its real name...
+    expect(html).toContain('data-file="agent-output-');
+    // ...and there is no file called "comments".
+    expect(html).not.toContain('data-file="comments"');
+    expect(html).not.toContain('diff --lazy');
+  });
+
   test('unknown tasks 404 on both the page and the threads API', async () => {
     expect((await fetch(`${base}/review/deadbeef`)).status).toBe(404);
     expect((await fetch(`${base}/api/review/deadbeef/threads`)).status).toBe(404);

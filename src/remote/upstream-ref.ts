@@ -30,6 +30,7 @@
 import type { RepositoryDriver } from './driver';
 import { runGit, type GitResult } from '../utils/git';
 import { logger } from '../utils/logger';
+import { looksLikeTaskBranch } from '../git/branch-prefix';
 
 type GitFn = (args: string[], cwd?: string) => Promise<GitResult>;
 
@@ -41,7 +42,7 @@ const defaultGit: GitFn = (args, cwd) => runGit(args, { cwd });
  * network protection check for them — and why we can too.
  */
 export function isIntermediateBranch(branch: string): boolean {
-  return branch.startsWith('lazy/');
+  return looksLikeTaskBranch(branch);
 }
 
 /**

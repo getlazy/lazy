@@ -662,6 +662,13 @@ function renderNotesDiff(comments: Comment[]): string {
  *   surface — which "how to get the full diff" hint to render ('cli' default,
  *             or 'mcp' so an agent is told the tool call rather than a shell
  *             command it may not be able to run)
+ *   includeComments — append the synthetic `diff --lazy a/comments b/comments`
+ *             section for comments newer than the last agent turn. Default
+ *             TRUE: it is documented behaviour of `lazy diff` and `lazy_diff`.
+ *             Surfaces that PARSE the output as a real patch (the web review
+ *             page) must pass false — that section is not a git patch, and
+ *             feeding it to a diff parser produced a phantom "comments" file
+ *             that consumed the last real file's name and hunks.
  */
 export async function handleDiff(projectRoot: string, params: Record<string, unknown>) {
   if (typeof params.taskId !== 'string' || !params.taskId) {
@@ -671,6 +678,7 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
     ? params.files.filter((f): f is string => typeof f === 'string' && f.length > 0)
     : undefined;
   const surface = params.surface === 'mcp' ? 'mcp' : 'cli';
+  const includeComments = params.includeComments !== false;
 
   const storage = await getOrCreateStorage();
   const result = await storage.resolveTask(params.taskId);
@@ -734,15 +742,18 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
   }
 
   // Find notes since last agent turn
-  let noteCutoff: number | null = null;
-  const turns = await storage.getSessionTurns(sess.id);
-  const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
-  if (lastAgentTurn) {
-    noteCutoff = lastAgentTurn.timestamp;
-  }
+  let newNotes: Comment[] = [];
+  if (includeComments) {
+    let noteCutoff: number | null = null;
+    const turns = await storage.getSessionTurns(sess.id);
+    const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
+    if (lastAgentTurn) {
+      noteCutoff = lastAgentTurn.timestamp;
+    }
 
-  const allNotes = await storage.getTaskComments(task.id);
-  const newNotes = noteCutoff ? getNewNotesSince(allNotes, noteCutoff) : allNotes;
+    const allNotes = await storage.getTaskComments(task.id);
+    newNotes = noteCutoff ? getNewNotesSince(allNotes, noteCutoff) : allNotes;
+  }
   const notesDiffSection = renderNotesDiff(newNotes);
 
   const diffRange = useTwoDotDiff ? `${fromRef}..HEAD` : `${fromRef}...HEAD`;
